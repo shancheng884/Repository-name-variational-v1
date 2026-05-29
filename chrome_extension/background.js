@@ -7,7 +7,7 @@ const DEFAULT_CONFIG = {
   restEndpoint: "ws://127.0.0.1:8767",
   domainFilter: "variational",
   restAllowlist: [
-    "https://omni.variational.io/api/quotes/indicative"
+    "https://omni.variational.io/api/"
   ],
   wsAllowlist: [
     "wss://omni-ws-server.prod.ap-northeast-1.variational.io/events",
@@ -242,25 +242,50 @@ function normalizeUrlParts(rawUrl) {
   try {
     const parsed = new URL(rawUrl);
     return {
+      hostname: parsed.hostname.toLowerCase(),
+      pathname: parsed.pathname.toLowerCase(),
       originPath: `${parsed.origin}${parsed.pathname}`,
       full: parsed.toString()
     };
   } catch {
     return {
+      hostname: "",
+      pathname: "",
       originPath: rawUrl,
       full: rawUrl
     };
   }
 }
 
+function isLikelyVariationalRestUrl(url) {
+  const target = normalizeUrlParts(url);
+  return target.hostname.includes("variational.io") && target.pathname.includes("/api/");
+}
+
+function isLikelyVariationalWsUrl(url) {
+  const target = normalizeUrlParts(url);
+  if (!target.hostname.includes("variational.io")) {
+    return false;
+  }
+  return target.pathname.includes("/events") || target.pathname.includes("/portfolio");
+}
+
 function getMatchedRestPattern(url) {
   const patterns = state.config.restAllowlist || [];
-  return getMatchedPattern(url, patterns);
+  return (
+    getMatchedPattern(url, patterns) ||
+    (isLikelyVariationalRestUrl(url) ? "auto:variational_rest" : null) ||
+    (matchesDomainFilter(url) ? "auto:domain_rest" : null)
+  );
 }
 
 function getMatchedWsPattern(url) {
   const patterns = state.config.wsAllowlist || [];
-  return getMatchedPattern(url, patterns);
+  return (
+    getMatchedPattern(url, patterns) ||
+    (isLikelyVariationalWsUrl(url) ? "auto:variational_ws" : null) ||
+    (matchesDomainFilter(url) ? "auto:domain_ws" : null)
+  );
 }
 
 function getMatchedPattern(url, patterns) {

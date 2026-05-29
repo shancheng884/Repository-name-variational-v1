@@ -17,8 +17,13 @@ import websockets
 
 
 QUOTES_INDICATIVE_PATH = "/api/quotes/indicative"
+ORDERS_V2_PATH = "/api/orders/v2"
+POSITIONS_PATH = "/api/positions"
+PORTFOLIO_PATH = "/api/portfolio"
 WS_EVENTS_PATH = "/events"
 WS_PORTFOLIO_PATH = "/portfolio"
+WS_PRICES_PATH = "/prices"
+TRADE_EVENT_KEYWORDS = ("trade", "fill", "filled", "order", "execution")
 QUOTE_LOG_INTERVAL_SECONDS = 30
 PORTFOLIO_LOG_INTERVAL_SECONDS = 300
 HEARTBEAT_STALE_SECONDS = 11
@@ -63,6 +68,7 @@ class VariationalMonitor:
     _stale_alert_sent: bool = False
     _last_hourly_alert_hour: int = 0
     _next_trade_event_seq: int = 1
+    _seen_trade_event_keys: set[str] = field(default_factory=set)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     async def process_rest_event(self, payload: dict[str, Any]) -> list[str]:
@@ -71,7 +77,12 @@ class VariationalMonitor:
 
         url = str(payload.get("url", ""))
         endpoint = classify_rest_endpoint(url)
-        if endpoint != QUOTES_INDICATIVE_PATH:
+        if endpoint not in {
+            QUOTES_INDICATIVE_PATH,
+            ORDERS_V2_PATH,
+            POSITIONS_PATH,
+            PORTFOLIO_PATH,
+        }:
             return []
 
         body = decode_response_body(payload)
@@ -83,12 +94,36 @@ class VariationalMonitor:
             return [f"[MONITOR] REST body is not JSON for {url}"]
 
         async with self._lock:
-            self._update_quote(parsed)
+            lines: list[str] = []
+            now_ts = asyncio.get_running_loop().time()
+
+            if endpoint == QUOTES_INDICATIVE_PATH:
+                if isinstance(parsed, dict):
+                    parsed = {
+                        **parsed,
+                        "__source_url": url,
+                        "__source_endpoint": endpoint,
+                    }
+                self._update_quote(parsed)
+                self._mark_heartbeat(now_ts, payload.get("timestamp"))
+            elif endpoint == ORDERS_V2_PATH:
+                for event in self._iter_rest_trade_messages(parsed):
+                    trade_line = self._update_trade_event(event)
+                    if trade_line:
+                        lines.append(trade_line)
+                self._mark_heartbeat(now_ts, payload.get("timestamp"))
+            elif endpoint == POSITIONS_PATH:
+                self._update_positions_from_rest(parsed)
+                self._mark_heartbeat(now_ts, payload.get("timestamp"))
+            elif endpoint == PORTFOLIO_PATH:
+                self._update_portfolio_summary_from_rest(parsed)
+                self._mark_heartbeat(now_ts, payload.get("timestamp"))
+
             self.last_update_at = utc_now()
             if self.snapshot_file is not None:
                 await asyncio.to_thread(write_json_file, self.snapshot_file, self.snapshot())
 
-        return []
+        return lines
 
     async def process_ws_event(self, payload: dict[str, Any]) -> list[str]:
         kind = str(payload.get("kind", ""))
@@ -124,10 +159,32 @@ class VariationalMonitor:
                             lines.append(f"{portfolio_line} trigger=trade")
                             self._last_portfolio_log_ts = now_ts
             elif stream == WS_PORTFOLIO_PATH:
+                for event in self._iter_market_messages(parsed):
+                    trade_line = self._update_trade_event(event)
+                    if trade_line:
+                        lines.append(trade_line)
                 self._update_portfolio(parsed)
+                self._mark_heartbeat(now_ts, payload.get("timestamp"))
+            elif stream == WS_PRICES_PATH:
+                updated_quote = False
+                for event in self._iter_market_messages(parsed):
+                    self._update_heartbeat(event, now_ts)
+                    quote_event = {
+                        **event,
+                        "__source_url": url,
+                        "__source_stream": stream,
+                    }
+                    if self._update_quote(quote_event):
+                        updated_quote = True
+                    trade_line = self._update_trade_event(event)
+                    if trade_line:
+                        lines.append(trade_line)
+                if updated_quote or lines:
+                    self._mark_heartbeat(now_ts, payload.get("timestamp"))
 
             if not lines and stream != WS_PORTFOLIO_PATH:
-                return []
+                if stream != WS_PRICES_PATH or not self.quotes:
+                    return []
 
             self.last_update_at = utc_now()
             if self.snapshot_file is not None:
@@ -150,6 +207,65 @@ class VariationalMonitor:
 
         return []
 
+    def _iter_market_messages(self, payload: Any) -> list[dict[str, Any]]:
+        candidates = self._iter_event_messages(payload)
+        out: list[dict[str, Any]] = []
+        seen: set[int] = set()
+
+        def add(item: Any) -> None:
+            if not isinstance(item, dict):
+                return
+            marker = id(item)
+            if marker in seen:
+                return
+            seen.add(marker)
+            out.append(item)
+
+        for item in candidates:
+            add(item)
+            pricing = item.get("pricing")
+            channel = item.get("channel")
+            if isinstance(pricing, dict):
+                merged = dict(pricing)
+                if isinstance(channel, str):
+                    merged["channel"] = channel
+                add(merged)
+            for key in ("data", "payload", "quote", "quotes", "prices", "items", "results"):
+                nested = item.get(key)
+                if isinstance(nested, dict):
+                    add(nested)
+                elif isinstance(nested, list):
+                    for subitem in nested:
+                        add(subitem)
+
+        if isinstance(payload, dict):
+            for key in ("data", "payload", "quote", "quotes", "prices", "items", "results"):
+                nested = payload.get(key)
+                if isinstance(nested, dict):
+                    add(nested)
+                elif isinstance(nested, list):
+                    for subitem in nested:
+                        add(subitem)
+
+        return out
+
+    def _iter_rest_trade_messages(self, payload: Any) -> list[dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+
+        result = payload.get("result")
+        if not isinstance(result, list):
+            return []
+
+        out: list[dict[str, Any]] = []
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            if not self._looks_like_trade_event(item):
+                continue
+            out.append(item)
+        return out
+
     async def emit_periodic_logs(self) -> tuple[list[str], list[str]]:
         lines: list[str] = []
         alerts: list[str] = []
@@ -171,19 +287,43 @@ class VariationalMonitor:
 
         return lines, alerts
 
-    def _update_quote(self, payload: Any) -> None:
+    def _update_quote(self, payload: Any) -> bool:
         if not isinstance(payload, dict):
-            return
+            return False
 
         instrument = payload.get("instrument")
-        if not isinstance(instrument, dict):
-            return
+        asset = None
+        if isinstance(instrument, dict):
+            asset = instrument.get("underlying") or instrument.get("symbol") or instrument.get("asset")
 
-        asset = str(instrument.get("underlying", "UNKNOWN"))
-        bid = payload.get("bid")
-        ask = payload.get("ask")
-        mark = payload.get("mark_price")
-        ts = payload.get("timestamp")
+        if not asset:
+            asset = payload.get("underlying") or payload.get("symbol") or payload.get("asset") or payload.get("market")
+
+        channel = payload.get("channel")
+        if not asset and isinstance(channel, str) and channel.startswith("instrument_price:"):
+            parts = channel.split(":", 1)
+            if len(parts) == 2:
+                market_parts = parts[1].split("-")
+                if len(market_parts) >= 2 and market_parts[1]:
+                    asset = market_parts[1]
+
+        bid = payload.get("bid") or payload.get("best_bid") or payload.get("b")
+        ask = payload.get("ask") or payload.get("best_ask") or payload.get("a")
+        mark = payload.get("mark_price") or payload.get("price") or payload.get("mid")
+        underlying_price = payload.get("underlying_price")
+        ts = payload.get("timestamp") or payload.get("updated_at") or payload.get("created_at")
+
+        if bid is None and ask is None and mark is not None:
+            bid = mark
+            ask = mark
+
+        if mark is None and underlying_price is not None:
+            mark = underlying_price
+
+        if not asset or (bid is None and ask is None and mark is None):
+            return False
+
+        asset = str(asset).upper()
 
         self.quotes[asset] = {
             "asset": asset,
@@ -194,37 +334,36 @@ class VariationalMonitor:
             "raw": payload,
         }
         self.current_quote_asset = asset
+        return True
 
     def _update_trade_event(self, payload: Any) -> str | None:
-        if not isinstance(payload, dict):
-            return None
-        event_type = str(payload.get("type", "")).strip().lower()
-        if "trade" not in event_type:
+        summary = self._extract_trade_summary(payload)
+        if summary is None:
             return None
 
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        trade_id = str(summary.get("trade_id", ""))
+        dedupe_key = self._trade_event_dedupe_key(summary)
+        if dedupe_key in self._seen_trade_event_keys:
+            return None
 
-        instrument = data.get("instrument")
-        asset = "UNKNOWN"
-        if isinstance(instrument, dict):
-            asset = str(instrument.get("underlying", "UNKNOWN"))
-
-        trade_id = str(data.get("id", ""))
         summary = {
-            "timestamp": data.get("created_at") or payload.get("timestamp") or "-",
+            "timestamp": summary.get("timestamp") or "-",
             "trade_id": trade_id,
-            "side": data.get("side", "-"),
-            "asset": asset,
-            "price": data.get("price", "-"),
-            "qty": data.get("qty", "-"),
-            "status": data.get("status", "-"),
-            "role": data.get("role", "-"),
+            "side": summary.get("side", "-"),
+            "asset": summary.get("asset", "UNKNOWN"),
+            "price": summary.get("price", "-"),
+            "qty": summary.get("qty", "-"),
+            "status": summary.get("status", "-"),
+            "role": summary.get("role", "-"),
             "received_at": utc_now(),
             "raw": payload,
         }
 
         summary["event_seq"] = self._next_trade_event_seq
         self._next_trade_event_seq += 1
+        self._seen_trade_event_keys.add(dedupe_key)
+        if len(self._seen_trade_event_keys) > self.trade_event_limit * 4:
+            self._rebuild_seen_trade_event_keys()
 
         if trade_id:
             self.recent_trades = [t for t in self.recent_trades if t.get("trade_id") != trade_id]
@@ -239,6 +378,125 @@ class VariationalMonitor:
             f"[MONITOR] TRADE {summary['side']} {summary['qty']} {summary['asset']} "
             f"@{summary['price']} status={summary['status']} role={summary['role']} id={trade_id_short}"
         )
+
+    @staticmethod
+    def _trade_event_dedupe_key(summary: dict[str, Any]) -> str:
+        trade_id = str(summary.get("trade_id", "")).strip()
+        status = str(summary.get("status", "")).strip().lower()
+        if trade_id:
+            # Allow the same trade to progress from pending -> filled/cleared
+            # without being collapsed into a single event.
+            return f"id:{trade_id}|status:{status}"
+        return "|".join(
+            [
+                str(summary.get("timestamp", "")).strip(),
+                str(summary.get("side", "")).strip().lower(),
+                str(summary.get("asset", "")).strip().upper(),
+                str(summary.get("price", "")).strip(),
+                str(summary.get("qty", "")).strip(),
+                str(summary.get("status", "")).strip().lower(),
+            ]
+        )
+
+    def _rebuild_seen_trade_event_keys(self) -> None:
+        rebuilt: set[str] = set()
+        for event in self.trade_events:
+            rebuilt.add(self._trade_event_dedupe_key(event))
+        self._seen_trade_event_keys = rebuilt
+
+    @staticmethod
+    def _looks_like_trade_event(payload: dict[str, Any]) -> bool:
+        fields = [
+            payload.get("type"),
+            payload.get("event"),
+            payload.get("event_type"),
+            payload.get("topic"),
+            payload.get("channel"),
+            payload.get("status"),
+            payload.get("state"),
+            payload.get("order_status"),
+            payload.get("execution_status"),
+        ]
+        for value in fields:
+            text = str(value or "").strip().lower()
+            if any(keyword in text for keyword in TRADE_EVENT_KEYWORDS):
+                return True
+
+        return any(
+            key in payload
+            for key in (
+                "trade_id",
+                "order_id",
+                "execution_id",
+                "fill_price",
+                "filled_qty",
+                "filled_quantity",
+                "filled_size",
+            )
+        )
+
+    @staticmethod
+    def _extract_trade_summary(payload: Any) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+
+        nested_data = payload.get("data")
+        if isinstance(nested_data, dict) and VariationalMonitor._looks_like_trade_event(nested_data):
+            data = nested_data
+        else:
+            nested_payload = payload.get("payload")
+            if isinstance(nested_payload, dict) and VariationalMonitor._looks_like_trade_event(nested_payload):
+                data = nested_payload
+            else:
+                data = payload
+
+        if not VariationalMonitor._looks_like_trade_event(data) and not VariationalMonitor._looks_like_trade_event(payload):
+            return None
+
+        instrument = data.get("instrument")
+        asset = None
+        if isinstance(instrument, dict):
+            asset = instrument.get("underlying") or instrument.get("symbol") or instrument.get("asset")
+        if not asset:
+            asset = data.get("underlying") or data.get("symbol") or data.get("asset") or data.get("market")
+
+        channel = data.get("channel") or payload.get("channel")
+        if not asset and isinstance(channel, str) and channel.startswith("instrument_price:"):
+            parts = channel.split(":", 1)
+            if len(parts) == 2:
+                market_parts = parts[1].split("-")
+                if len(market_parts) >= 2 and market_parts[1]:
+                    asset = market_parts[1]
+
+        event_type = str(
+            data.get("type")
+            or payload.get("type")
+            or data.get("event_type")
+            or payload.get("event_type")
+            or ""
+        ).strip().lower()
+        status = (
+            data.get("status")
+            or data.get("state")
+            or data.get("order_status")
+            or data.get("execution_status")
+            or payload.get("status")
+            or payload.get("state")
+            or "-"
+        )
+        if status == "-" and ("fill" in event_type or "execution" in event_type or event_type == "confirmed"):
+            status = "filled"
+
+        return {
+            "timestamp": data.get("created_at") or data.get("updated_at") or payload.get("timestamp") or payload.get("published_at"),
+            "trade_id": data.get("trade_id") or data.get("id") or data.get("order_id") or data.get("execution_id") or data.get("client_order_id") or "",
+            "side": data.get("side") or data.get("direction") or data.get("order_side") or "-",
+            "asset": str(asset).upper() if asset else "UNKNOWN",
+            "price": data.get("price") or data.get("fill_price") or data.get("avg_price") or data.get("average_price") or data.get("execution_price") or "-",
+            "qty": data.get("qty") or data.get("quantity") or data.get("filled_qty") or data.get("filled_quantity") or data.get("filled_size") or data.get("size") or data.get("amount") or data.get("base_amount") or "-",
+            "status": status,
+            "role": data.get("role") or data.get("liquidity_role") or data.get("maker_taker") or "-",
+        }
 
     def _update_portfolio(self, payload: Any) -> None:
         if not isinstance(payload, dict):
@@ -290,6 +548,47 @@ class VariationalMonitor:
             "raw": pool if isinstance(pool, dict) else {},
         }
 
+    def _update_positions_from_rest(self, payload: Any) -> None:
+        if not isinstance(payload, list):
+            return
+
+        next_positions: dict[str, dict[str, Any]] = {}
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            position_info = item.get("position_info")
+            if not isinstance(position_info, dict):
+                continue
+            instrument = position_info.get("instrument")
+            if not isinstance(instrument, dict):
+                continue
+
+            asset = str(instrument.get("underlying", "UNKNOWN"))
+            next_positions[asset] = {
+                "asset": asset,
+                "qty": position_info.get("qty"),
+                "avg_entry_price": position_info.get("avg_entry_price"),
+                "updated_at": position_info.get("updated_at"),
+                "value": item.get("value"),
+                "upnl": item.get("upnl"),
+                "rpnl": item.get("rpnl"),
+                "raw": item,
+            }
+
+        self.positions = next_positions
+
+    def _update_portfolio_summary_from_rest(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        self.portfolio_summary = {
+            "balance": payload.get("balance"),
+            "upnl": payload.get("upnl"),
+            "margin_usage": payload.get("margin_usage") if isinstance(payload.get("margin_usage"), dict) else {},
+            "published_at": payload.get("updated_at") or utc_now(),
+            "raw": payload,
+        }
+
     def _should_log_quote(self, now_ts: float) -> bool:
         if self._last_quote_log_ts is None:
             return True
@@ -306,8 +605,11 @@ class VariationalMonitor:
         if payload.get("type") != "heartbeat":
             return
 
+        self._mark_heartbeat(now_ts, payload.get("timestamp"))
+
+    def _mark_heartbeat(self, now_ts: float, timestamp: Any = None) -> None:
+        
         self._last_heartbeat_monotonic = now_ts
-        timestamp = payload.get("timestamp")
         if isinstance(timestamp, str):
             self.last_heartbeat_iso = timestamp
         else:
@@ -694,6 +996,12 @@ def classify_rest_endpoint(url: str) -> str | None:
         return None
     if path == QUOTES_INDICATIVE_PATH:
         return QUOTES_INDICATIVE_PATH
+    if path == ORDERS_V2_PATH:
+        return ORDERS_V2_PATH
+    if path == POSITIONS_PATH:
+        return POSITIONS_PATH
+    if path == PORTFOLIO_PATH:
+        return PORTFOLIO_PATH
     return None
 
 
@@ -702,10 +1010,13 @@ def classify_ws_stream(url: str) -> str | None:
         path = urlparse(url).path
     except ValueError:
         return None
-    if path == WS_EVENTS_PATH:
+    lowered = path.lower()
+    if lowered == WS_EVENTS_PATH or lowered.endswith(WS_EVENTS_PATH):
         return WS_EVENTS_PATH
-    if path == WS_PORTFOLIO_PATH:
+    if lowered == WS_PORTFOLIO_PATH or lowered.endswith(WS_PORTFOLIO_PATH):
         return WS_PORTFOLIO_PATH
+    if lowered == WS_PRICES_PATH or lowered.endswith(WS_PRICES_PATH) or "/prices" in lowered:
+        return WS_PRICES_PATH
     return None
 
 

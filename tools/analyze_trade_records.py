@@ -1,0 +1,378 @@
+import argparse
+import csv
+import json
+from collections import Counter, defaultdict
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any
+
+
+def to_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def median(values: list[Decimal]) -> Decimal | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / Decimal("2")
+
+
+def avg(values: list[Decimal]) -> Decimal | None:
+    if not values:
+        return None
+    return sum(values, Decimal("0")) / Decimal(len(values))
+
+
+def fmt(value: Decimal | None, places: int = 4) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.{places}f}"
+
+
+def clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() == "none":
+        return ""
+    return text
+
+
+def infer_record_kind(row: dict[str, Any]) -> str:
+    explicit = clean_text(row.get("record_kind", ""))
+    if explicit:
+        return explicit
+    if clean_text(row.get("trade_key", "")) or clean_text(row.get("trade_id", "")):
+        return "execution_lifecycle"
+    return "unknown"
+
+
+def infer_hedge_completion_status(row: dict[str, Any]) -> str:
+    explicit = clean_text(row.get("hedge_completion_status", ""))
+    if explicit:
+        return explicit
+
+    var_filled_at = clean_text(row.get("variational_filled_at", ""))
+    lighter_filled_at = clean_text(row.get("lighter_filled_at", ""))
+    processing_stage = clean_text(row.get("processing_stage", ""))
+    failure_stage = clean_text(row.get("failure_stage", ""))
+
+    if not var_filled_at:
+        return "no_variational_fill"
+    if lighter_filled_at or processing_stage == "lighter_filled":
+        return "hedged"
+    if processing_stage in {"live_submit_started", "live_submit_sent"}:
+        return "hedge_pending"
+    if processing_stage in {"live_submit_failed", "live_submit_timed_out"}:
+        return "naked_variational_leg"
+    if failure_stage == "hedge_plan":
+        return "hedge_blocked_before_submit"
+    if processing_stage in {"dry_run_pending", "dry_run_planned"}:
+        return "dry_run_only"
+    if processing_stage == "blocked_by_mode":
+        return "not_live_mode"
+    return "open"
+
+
+def infer_rollback_action(row: dict[str, Any]) -> str:
+    explicit = clean_text(row.get("rollback_action", ""))
+    if explicit:
+        return explicit
+    if infer_hedge_completion_status(row) == "naked_variational_leg":
+        return "manual_review_required"
+    return "none"
+
+
+def load_from_csv(csv_path: Path, asset_filter: set[str]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            asset = clean_text(row.get("asset", "")).upper()
+            if not asset:
+                continue
+            if asset_filter and asset not in asset_filter:
+                continue
+            rows.append(row)
+    return rows
+
+
+def load_from_jsonl(jsonl_path: Path, asset_filter: set[str], date_filter: str) -> list[dict[str, Any]]:
+    latest_by_trade_key: dict[str, dict[str, Any]] = {}
+    with jsonl_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            event = json.loads(line)
+            logged_at = clean_text(event.get("logged_at", ""))
+            if date_filter and not logged_at.startswith(date_filter):
+                continue
+
+            mode = clean_text(event.get("mode", "")).lower()
+            if mode != "live":
+                continue
+
+            asset = clean_text(event.get("asset", "")).upper()
+            if not asset:
+                continue
+            if asset_filter and asset not in asset_filter:
+                continue
+
+            trade_key = clean_text(event.get("trade_key", ""))
+            if not trade_key:
+                continue
+
+            latest_by_trade_key[trade_key] = event
+
+    return list(latest_by_trade_key.values())
+
+
+def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    stats: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "rows": 0,
+            "filled_rows": 0,
+            "record_kinds": Counter(),
+            "latency_ms": [],
+            "edge_bps": [],
+            "fill_diff": [],
+            "plan_fill_diff": [],
+            "var_notional": [],
+            "lighter_notional": [],
+            "failure_reasons": Counter(),
+            "hedge_completion_statuses": Counter(),
+            "rollback_actions": Counter(),
+        }
+    )
+
+    for row in rows:
+        asset = clean_text(row.get("asset", "")).upper()
+        if not asset:
+            continue
+
+        bucket = stats[asset]
+        bucket["rows"] += 1
+
+        record_kind = infer_record_kind(row)
+        bucket["record_kinds"][record_kind] += 1
+
+        processing_stage = clean_text(row.get("processing_stage", ""))
+        if processing_stage == "lighter_filled":
+            bucket["filled_rows"] += 1
+
+        failure_reason = row.get("failure_reason")
+        failure_reason_text = "" if failure_reason is None else str(failure_reason).strip()
+        if failure_reason_text and failure_reason_text.lower() != "none":
+            bucket["failure_reasons"][failure_reason_text] += 1
+
+        hedge_completion_status = infer_hedge_completion_status(row)
+        bucket["hedge_completion_statuses"][hedge_completion_status] += 1
+
+        rollback_action = infer_rollback_action(row)
+        bucket["rollback_actions"][rollback_action] += 1
+
+        for key, column in (
+            ("latency_ms", "live_fill_latency_ms"),
+            ("edge_bps", "live_edge_bps"),
+            ("fill_diff", "fill_diff_var_minus_lighter"),
+            ("plan_fill_diff", "plan_vs_lighter_fill_diff"),
+            ("var_notional", "variational_notional"),
+            ("lighter_notional", "lighter_notional"),
+        ):
+            value = to_decimal(row.get(column))
+            if value is not None:
+                bucket[key].append(value)
+
+    return stats
+
+
+def collect_completed_details(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    completed: list[dict[str, Any]] = []
+    for row in rows:
+        if str(row.get("processing_stage", "")).strip() != "lighter_filled":
+            continue
+        variational_filled_at = clean_text(row.get("variational_filled_at", ""))
+        lighter_filled_at = clean_text(row.get("lighter_filled_at", ""))
+        if not variational_filled_at or not lighter_filled_at:
+            continue
+        completed.append(
+            {
+                "asset": clean_text(row.get("asset", "")).upper(),
+                "trade_id": clean_text(row.get("trade_id", "")),
+                "side": clean_text(row.get("side_raw", row.get("side", ""))),
+                "qty": clean_text(row.get("qty", "")),
+                "variational_filled_price": to_decimal(row.get("variational_filled_price")),
+                "lighter_filled_price": to_decimal(row.get("lighter_filled_price")),
+                "live_fill_latency_ms": to_decimal(row.get("live_fill_latency_ms")),
+                "live_edge_bps": to_decimal(row.get("live_edge_bps")),
+                "variational_filled_at": variational_filled_at,
+                "lighter_filled_at": lighter_filled_at,
+            }
+        )
+    completed.sort(key=lambda item: (item["asset"], item["variational_filled_at"], item["trade_id"]))
+    return completed
+
+
+def print_summary(stats: dict[str, dict[str, Any]], source_label: str) -> None:
+    if not stats:
+        print("No matching rows found.")
+        return
+
+    print(f"Source: {source_label}")
+    print()
+    print("record kind breakdown")
+    for asset in sorted(stats):
+        counter = stats[asset]["record_kinds"]
+        breakdown = ", ".join(f"{kind}={count}" for kind, count in counter.most_common())
+        print(f"{asset}: {breakdown}")
+    print()
+    print(
+        "asset rows filled avg_latency_ms median_latency_ms avg_edge_bps "
+        "avg_fill_diff avg_plan_fill_diff avg_var_notional avg_lighter_notional"
+    )
+
+    for asset in sorted(stats):
+        bucket = stats[asset]
+        print(
+            "{asset} {rows} {filled} {avg_latency} {median_latency} {avg_edge} {avg_fill} {avg_plan_fill} {avg_var_notional} {avg_lighter_notional}".format(
+                asset=asset,
+                rows=bucket["rows"],
+                filled=bucket["filled_rows"],
+                avg_latency=fmt(avg(bucket["latency_ms"]), 3),
+                median_latency=fmt(median(bucket["latency_ms"]), 3),
+                avg_edge=fmt(avg(bucket["edge_bps"]), 3),
+                avg_fill=fmt(avg(bucket["fill_diff"]), 4),
+                avg_plan_fill=fmt(avg(bucket["plan_fill_diff"]), 4),
+                avg_var_notional=fmt(avg(bucket["var_notional"]), 4),
+                avg_lighter_notional=fmt(avg(bucket["lighter_notional"]), 4),
+            )
+        )
+
+    print()
+    print("failure breakdown")
+    for asset in sorted(stats):
+        counter = stats[asset]["failure_reasons"]
+        if not counter:
+            print(f"{asset}: none")
+            continue
+        breakdown = ", ".join(f"{reason}={count}" for reason, count in counter.most_common())
+        print(f"{asset}: {breakdown}")
+
+    print()
+    print("hedge completion breakdown")
+    for asset in sorted(stats):
+        counter = stats[asset]["hedge_completion_statuses"]
+        if not counter:
+            print(f"{asset}: none")
+            continue
+        breakdown = ", ".join(f"{status}={count}" for status, count in counter.most_common())
+        print(f"{asset}: {breakdown}")
+
+    print()
+    print("rollback action breakdown")
+    for asset in sorted(stats):
+        counter = stats[asset]["rollback_actions"]
+        if not counter:
+            print(f"{asset}: none")
+            continue
+        breakdown = ", ".join(f"{action}={count}" for action, count in counter.most_common())
+        print(f"{asset}: {breakdown}")
+
+
+def print_completed_details(rows: list[dict[str, Any]]) -> None:
+    completed = collect_completed_details(rows)
+    print()
+    print("completed fill details")
+    if not completed:
+        print("none")
+        return
+
+    print(
+        "asset side qty avg_edge_bps latency_ms var_price lighter_price var_filled_at trade_id"
+    )
+    for item in completed:
+        print(
+            "{asset} {side} {qty} {edge} {latency} {var_price} {lighter_price} {filled_at} {trade_id}".format(
+                asset=item["asset"],
+                side=item["side"],
+                qty=item["qty"],
+                edge=fmt(item["live_edge_bps"], 3),
+                latency=fmt(item["live_fill_latency_ms"], 3),
+                var_price=fmt(item["variational_filled_price"], 4),
+                lighter_price=fmt(item["lighter_filled_price"], 4),
+                filled_at=item["variational_filled_at"] or "-",
+                trade_id=item["trade_id"] or "-",
+            )
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Analyze live hedge records by asset.")
+    parser.add_argument(
+        "--source",
+        choices=("jsonl", "csv"),
+        default="jsonl",
+        help="Data source. Default: jsonl",
+    )
+    parser.add_argument(
+        "--jsonl",
+        default="log/order_metrics.jsonl",
+        help="Path to order_metrics.jsonl. Default: log/order_metrics.jsonl",
+    )
+    parser.add_argument(
+        "--csv",
+        default="log/trade_records.csv",
+        help="Path to trade_records.csv. Default: log/trade_records.csv",
+    )
+    parser.add_argument(
+        "--assets",
+        default="",
+        help="Optional comma-separated asset filter, e.g. SOL,BTC,ETH",
+    )
+    parser.add_argument(
+        "--date",
+        default="",
+        help="Optional logged_at date filter for jsonl, e.g. 2026-05-23",
+    )
+    args = parser.parse_args()
+
+    asset_filter = {asset.strip().upper() for asset in args.assets.split(",") if asset.strip()}
+
+    if args.source == "jsonl":
+        jsonl_path = Path(args.jsonl)
+        if not jsonl_path.exists():
+            raise SystemExit(f"JSONL file not found: {jsonl_path}")
+        rows = load_from_jsonl(jsonl_path, asset_filter, args.date.strip())
+        stats = summarize(rows)
+        source_label = str(jsonl_path)
+        if args.date.strip():
+            source_label += f" (date={args.date.strip()})"
+        print_summary(stats, source_label)
+        print_completed_details(rows)
+        return 0
+
+    csv_path = Path(args.csv)
+    if not csv_path.exists():
+        raise SystemExit(f"CSV file not found: {csv_path}")
+    rows = load_from_csv(csv_path, asset_filter)
+    stats = summarize(rows)
+    print_summary(stats, str(csv_path))
+    print_completed_details(rows)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

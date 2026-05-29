@@ -8,7 +8,7 @@ import os
 import signal
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -18,7 +18,6 @@ from typing import Any
 import requests
 import websockets
 from dotenv import load_dotenv
-from lighter.signer_client import SignerClient
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -30,6 +29,56 @@ from variational.listener import (
     VariationalMonitor,
     run_receiver_server,
 )
+from paper_engine import (
+    PaperEntryCandidate,
+    PaperPositionState,
+    paper_entry_candidate,
+    paper_entry_execution_prices,
+    paper_exit_execution_prices,
+    paper_fee_cost_usd,
+    paper_latency_drift_cost_usd,
+    paper_lighter_taker_cost_usd,
+    paper_var_spread_cost_usd,
+)
+
+MODE_OBSERVE = "observe"
+MODE_DRY_RUN = "dry-run"
+MODE_LIVE = "live"
+MODE_PAPER = "paper"
+MODE_CHOICES = (MODE_OBSERVE, MODE_DRY_RUN, MODE_LIVE, MODE_PAPER)
+
+STAGE_EVENT_RECEIVED = "event_received"
+STAGE_EVENT_FILTERED = "event_filtered"
+STAGE_RECORD_CREATED = "record_created"
+STAGE_VARIATIONAL_FILLED = "variational_filled"
+STAGE_DRY_RUN_PENDING = "dry_run_pending"
+STAGE_DRY_RUN_PLANNED = "dry_run_planned"
+STAGE_BLOCKED_BY_MODE = "blocked_by_mode"
+STAGE_LIVE_SUBMIT_STARTED = "live_submit_started"
+STAGE_LIVE_SUBMIT_SENT = "live_submit_sent"
+STAGE_LIVE_SUBMIT_FAILED = "live_submit_failed"
+STAGE_LIVE_SUBMIT_TIMED_OUT = "live_submit_timed_out"
+STAGE_LIGHTER_FILLED = "lighter_filled"
+
+FAILURE_STAGE_FILTER = "filter"
+FAILURE_STAGE_HEDGE_PLAN = "hedge_plan"
+FAILURE_STAGE_DRY_RUN_PLAN = "dry_run_plan"
+FAILURE_STAGE_LIVE_SUBMIT = "live_submit"
+FAILURE_STAGE_MODE_GUARD = "mode_guard"
+RISK_GUARD_FAILURE_REASONS = {
+    "lighter_order_book_not_ready",
+    "lighter_order_book_stale",
+    "hedge_base_amount_rounds_to_zero",
+    "hedge_base_amount_exceeds_risk_limit",
+    "hedge_below_lighter_min_base_amount",
+    "hedge_below_lighter_min_quote_amount",
+    "hedge_price_deviation_exceeds_risk_limit",
+    "live_asset_not_allowed",
+    "live_qty_exceeds_limit",
+    "live_notional_exceeds_limit",
+    "live_edge_bps_below_threshold",
+    "live_cooldown_active",
+}
 
 VARIATIONAL_TICKER_OVERRIDES = {
     "LIT": "LIGHTER",
@@ -43,9 +92,32 @@ LOG_DIR = Path("./log")
 OUTPUT_DIR = LOG_DIR
 APP_LOG_FILE = LOG_DIR / "runtime.log"
 TRADE_RECORDS_CSV_FILE = LOG_DIR / "trade_records.csv"
+INSTANCE_LOCK_FILE = LOG_DIR / "main.instance.lock"
 READY_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
+RISK_GUARD_MAX_BASE_AMOUNT = 1000
+RISK_GUARD_MAX_PRICE_DEVIATION_BPS = Decimal("500")
+DEFAULT_LIVE_MAX_NOTIONAL_USD = Decimal("0")
+DEFAULT_LIVE_MAX_QTY = Decimal("0")
+DEFAULT_LIVE_REQUIRE_MIN_EDGE_BPS = Decimal("0")
+DEFAULT_LIVE_COOLDOWN_SECONDS = 3.0
+DEFAULT_LIVE_SUBMIT_TIMEOUT_SECONDS = 30.0
+DEFAULT_PAPER_NOTIONAL_USD = Decimal("30")
+DEFAULT_PAPER_ENTRY_DEVIATION_BPS = Decimal("3")
+DEFAULT_PAPER_EXIT_DEVIATION_BPS = Decimal("0.5")
+DEFAULT_PAPER_MAX_VAR_HALF_SPREAD_BPS = Decimal("2")
+DEFAULT_PAPER_MAX_HOLDING_SECONDS = 1800.0
+DEFAULT_PAPER_COOLDOWN_SECONDS = 10.0
+DEFAULT_PAPER_MIN_SAMPLES = 30
+DEFAULT_PAPER_INTERVAL_SECONDS = 1.0
+DEFAULT_PAPER_LATENCY_DRIFT_BPS = Decimal("0.5")
+LIGHTER_INIT_RETRY_ATTEMPTS = 3
+LIGHTER_INIT_RETRY_DELAY_SECONDS = 1.0
+VAR_QUOTE_DIAGNOSTIC_INTERVAL_SECONDS = 30.0
+VARIATIONAL_METADATA_STATS_URL = "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats"
+VARIATIONAL_METADATA_STATS_TTL_SECONDS = 30.0
+VARIATIONAL_METADATA_QUOTE_SIZE = "size_1k"
 DASHBOARD_REFRESH_SECONDS = 1.0
 DASHBOARD_ORDERS = 8
 SPREAD_HISTORY_SECONDS = 3600.0
@@ -53,6 +125,15 @@ ASSET_SWITCH_CONFIRM_TICKS = 3
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 LIGHTER_WS_PING_INTERVAL_SECONDS = 30
 LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
+HEALTH_VARIATIONAL_HEARTBEAT_DEGRADED_SECONDS = HEARTBEAT_STALE_SECONDS
+HEALTH_VARIATIONAL_HEARTBEAT_STALE_SECONDS = HEARTBEAT_STALE_SECONDS * 2
+HEALTH_QUOTE_DEGRADED_SECONDS = 30.0
+HEALTH_QUOTE_STALE_SECONDS = 90.0
+HEALTH_TRADE_EVENT_DEGRADED_SECONDS = 60.0
+HEALTH_TRADE_EVENT_STALE_SECONDS = 180.0
+HEALTH_LIGHTER_BOOK_DEGRADED_SECONDS = 10.0
+HEALTH_LIGHTER_BOOK_STALE_SECONDS = 30.0
+TRADE_EVENT_STARTUP_GRACE_SECONDS = 5.0
 
 
 def utc_now() -> str:
@@ -72,6 +153,101 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return format(value, "f")
+
+
+def decimal_percent_to_bps(value: Decimal | None) -> Decimal | None:
+    if value is None:
+        return None
+    return value * Decimal("100")
+
+
+def first_decimal_from_keys(payload: dict[str, Any], keys: tuple[str, ...]) -> Decimal | None:
+    for key in keys:
+        if key in payload:
+            value = to_decimal(payload.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def nested_dicts(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = [payload]
+    for key in ("data", "payload", "quote", "indicative", "prices", "result"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            items.append(value)
+    return items
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def acquire_instance_lock(lock_path: Path) -> int:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(
+        {
+            "pid": os.getpid(),
+            "created_at": utc_now(),
+            "argv": list(os.sys.argv),
+        },
+        ensure_ascii=True,
+    )
+
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                raw = lock_path.read_text(encoding="utf-8")
+                existing = json.loads(raw)
+            except Exception:
+                existing = {}
+
+            existing_pid = int(existing.get("pid", 0) or 0)
+            if existing_pid and _pid_is_running(existing_pid):
+                raise RuntimeError(
+                    (
+                        "Another main.py instance is already running "
+                        f"(pid={existing_pid}, lock_file={lock_path}). Stop it before starting a new one."
+                    )
+                )
+
+            with contextlib.suppress(FileNotFoundError):
+                lock_path.unlink()
+            continue
+
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                lock_path.unlink()
+            raise
+        return os.getpid()
+
+
+def release_instance_lock(lock_path: Path, owner_pid: int) -> None:
+    try:
+        raw = lock_path.read_text(encoding="utf-8")
+        existing = json.loads(raw)
+    except FileNotFoundError:
+        return
+    except Exception:
+        existing = {}
+
+    existing_pid = int(existing.get("pid", 0) or 0)
+    if existing_pid not in {0, owner_pid}:
+        return
+
+    with contextlib.suppress(FileNotFoundError):
+        lock_path.unlink()
 
 
 def resolve_variational_ticker(ticker: str) -> str:
@@ -124,9 +300,15 @@ def book_spread_percent(bid: Decimal | None, ask: Decimal | None) -> Decimal | N
     return ((ask - bid) / mid) * Decimal("100")
 
 
+def basis_points_diff(value: Decimal | None, reference: Decimal | None) -> Decimal | None:
+    if value is None or reference is None or reference == 0:
+        return None
+    return (abs(value - reference) / reference) * Decimal("10000")
+
+
 def normalize_variational_status(status: str) -> str:
     lowered = status.strip().lower()
-    if lowered == "confirmed":
+    if lowered in {"confirmed", "fill", "filled", "executed", "execution", "cleared"}:
         return "filled"
     return lowered
 
@@ -138,7 +320,7 @@ class OrderLifecycle:
     side: str
     qty: Decimal
     asset: str
-    auto_hedge_enabled: bool
+    mode: str
     last_variational_status: str
 
     var_fill_price: Decimal | None = None
@@ -150,9 +332,25 @@ class OrderLifecycle:
     lighter_fill_ts_iso: str | None = None
     lighter_tx_hash: str | None = None
     hedge_error: str | None = None
+    lighter_reference_bid: Decimal | None = None
+    lighter_reference_ask: Decimal | None = None
+    dry_run_plan_side: str | None = None
+    dry_run_plan_price: Decimal | None = None
+    dry_run_plan_base_amount: int | None = None
+    live_notional_usd: Decimal | None = None
+    live_edge_bps: Decimal | None = None
+    live_fill_latency_ms: Decimal | None = None
+    live_submit_started_at_iso: str | None = None
+    processing_stage: str = STAGE_EVENT_RECEIVED
+    stage_history: list[str] = field(default_factory=lambda: [STAGE_EVENT_RECEIVED])
+    failure_stage: str | None = None
+    failure_reason: str | None = None
+    record_created_at: str = field(default_factory=utc_now)
+    last_updated_at: str = field(default_factory=utc_now)
 
     def to_payload(self) -> dict[str, Any]:
         return {
+            "record_kind": "execution_lifecycle",
             "trade_key": self.trade_key,
             "trade_id": self.trade_id,
             "side": self.side,
@@ -164,10 +362,112 @@ class OrderLifecycle:
             "lighter_client_order_id": self.lighter_client_order_id,
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
             "lighter_filled_at": self.lighter_fill_ts_iso,
-            "auto_hedge_enabled": self.auto_hedge_enabled,
+            "mode": self.mode,
+            "lighter_reference_bid": decimal_to_str(self.lighter_reference_bid),
+            "lighter_reference_ask": decimal_to_str(self.lighter_reference_ask),
+            "dry_run_plan_side": self.dry_run_plan_side,
+            "dry_run_plan_price": decimal_to_str(self.dry_run_plan_price),
+            "dry_run_plan_base_amount": self.dry_run_plan_base_amount,
+            "live_notional_usd": decimal_to_str(self.live_notional_usd),
+            "live_edge_bps": decimal_to_str(self.live_edge_bps),
+            "live_fill_latency_ms": decimal_to_str(self.live_fill_latency_ms),
+            "live_submit_started_at": self.live_submit_started_at_iso,
+            "hedge_completion_status": self.hedge_completion_status,
+            "rollback_action": self.rollback_action,
             "hedge_error": self.hedge_error,
+            "processing_stage": self.processing_stage,
+            "strategy_state": self.strategy_state,
+            "stage_history": list(self.stage_history),
+            "failure_stage": self.failure_stage,
+            "failure_reason": self.failure_reason,
+            "record_created_at": self.record_created_at,
+            "last_updated_at": self.last_updated_at,
             "last_variational_status": self.last_variational_status,
         }
+
+    @property
+    def strategy_state(self) -> str:
+        if self.failure_reason or self.failure_stage:
+            return "fallback"
+        if self.processing_stage == STAGE_BLOCKED_BY_MODE:
+            return "closed"
+        if self.processing_stage in {STAGE_EVENT_RECEIVED, STAGE_RECORD_CREATED, STAGE_EVENT_FILTERED}:
+            return "idle"
+        if self.processing_stage in {STAGE_VARIATIONAL_FILLED, STAGE_DRY_RUN_PENDING, STAGE_DRY_RUN_PLANNED}:
+            return "entry_pending"
+        if self.processing_stage == STAGE_LIVE_SUBMIT_STARTED:
+            return "exit_pending"
+        if self.processing_stage in {STAGE_LIVE_SUBMIT_SENT, STAGE_LIGHTER_FILLED}:
+            return "in_position"
+        if self.processing_stage == STAGE_LIVE_SUBMIT_FAILED:
+            return "fallback"
+        if self.processing_stage == STAGE_LIVE_SUBMIT_TIMED_OUT:
+            return "fallback"
+        return "idle"
+
+    @property
+    def hedge_completion_status(self) -> str:
+        if self.var_fill_ts_iso is None:
+            return "no_variational_fill"
+        if self.lighter_fill_ts_iso is not None:
+            return "hedged"
+        if self.processing_stage in {STAGE_LIVE_SUBMIT_STARTED, STAGE_LIVE_SUBMIT_SENT}:
+            return "hedge_pending"
+        if self.processing_stage in {STAGE_LIVE_SUBMIT_FAILED, STAGE_LIVE_SUBMIT_TIMED_OUT}:
+            return "naked_variational_leg"
+        if self.failure_stage == FAILURE_STAGE_HEDGE_PLAN:
+            return "hedge_blocked_before_submit"
+        if self.processing_stage in {STAGE_DRY_RUN_PENDING, STAGE_DRY_RUN_PLANNED}:
+            return "dry_run_only"
+        if self.processing_stage == STAGE_BLOCKED_BY_MODE:
+            return "not_live_mode"
+        return "open"
+
+    @property
+    def rollback_action(self) -> str:
+        if self.hedge_completion_status == "naked_variational_leg":
+            return "manual_review_required"
+        return "none"
+
+
+@dataclass(slots=True)
+class CrossSpreadSnapshot:
+    asset: str
+    var_bid: Decimal
+    var_ask: Decimal
+    var_mid: Decimal
+    var_half_spread_bps: Decimal
+    var_buy_price: Decimal | None
+    var_sell_price: Decimal | None
+    var_full_spread_bps: Decimal | None
+    var_spread_source: str
+    lighter_bid: Decimal
+    lighter_ask: Decimal
+    lighter_mid: Decimal
+    lighter_buy_price: Decimal
+    lighter_sell_price: Decimal
+    lighter_half_spread_bps: Decimal
+    lighter_buy_fill_price: Decimal
+    lighter_sell_fill_price: Decimal
+    long_var_short_lighter_pct: Decimal
+    short_var_long_lighter_pct: Decimal
+    long_median_5m_pct: Decimal | None
+    short_median_5m_pct: Decimal | None
+    long_sample_count_5m: int
+    short_sample_count_5m: int
+
+
+@dataclass(slots=True)
+class StartupDiagnostics:
+    passed: list[str]
+    warnings: list[str]
+    blocking_errors: list[str]
+
+
+@dataclass(slots=True)
+class HealthStatus:
+    overall: str
+    components: list[tuple[str, str, str]]
 
 
 class VariationalRuntime:
@@ -203,9 +503,30 @@ class VariationalRuntime:
 class VariationalToLighterRuntime:
     def __init__(self, args: argparse.Namespace):
         self.args = args
+        self.mode = args.mode
+        self.risk_guard_max_base_amount = args.risk_guard_max_base_amount
+        self.risk_guard_max_price_deviation_bps = Decimal(str(args.risk_guard_max_price_deviation_bps))
+        self.live_max_notional_usd = Decimal(str(args.live_max_notional_usd))
+        self.live_max_qty = Decimal(str(args.live_max_qty))
+        self.live_require_min_edge_bps = Decimal(str(args.live_require_min_edge_bps))
+        self.live_cooldown_seconds = float(args.live_cooldown_seconds)
+        self.paper_notional_usd = Decimal(str(args.paper_notional_usd))
+        self.paper_entry_deviation_bps = Decimal(str(args.paper_entry_deviation_bps))
+        self.paper_exit_deviation_bps = Decimal(str(args.paper_exit_deviation_bps))
+        self.paper_max_var_half_spread_bps = Decimal(str(args.paper_max_var_half_spread_bps))
+        self.paper_max_holding_seconds = float(args.paper_max_holding_seconds)
+        self.paper_cooldown_seconds = float(args.paper_cooldown_seconds)
+        self.paper_min_samples = int(args.paper_min_samples)
+        self.paper_interval_seconds = float(args.paper_interval_seconds)
+        self.paper_fee_bps_per_leg = Decimal(str(args.paper_fee_bps_per_leg))
+        self.paper_latency_drift_bps = Decimal(str(args.paper_latency_drift_bps))
         self.ticker: str | None = None
         self.variational_ticker: str | None = None
         self.accepted_assets: set[str] = set()
+        self.live_allowed_assets = {
+            asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()
+        }
+        self.live_submit_timeout_seconds = float(args.live_submit_timeout_seconds)
 
         self.stop_flag = False
         self.logger = logging.getLogger("var_lighter_runtime")
@@ -224,13 +545,15 @@ class VariationalToLighterRuntime:
             host=FORWARDER_HOST,
             ws_port=FORWARDER_WS_PORT,
             rest_port=FORWARDER_REST_PORT,
-            output_dir=None,
+            output_dir=output_dir,
             quiet=True,
         )
 
         self.orders_file = output_dir / "order_metrics.jsonl" if output_dir else None
+        self.opportunities_file = output_dir / "opportunities.jsonl" if output_dir else None
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
         self._order_write_lock = asyncio.Lock()
+        self._opportunity_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
         self._trade_records_snapshot_sig: str | None = None
 
@@ -244,16 +567,19 @@ class VariationalToLighterRuntime:
         self._asset_switch_candidate_hits = 0
 
         self.trade_event_cursor = 0
+        self.trade_event_min_timestamp: datetime | None = None
 
         self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
-        self.account_index = required_int_env("LIGHTER_ACCOUNT_INDEX")
-        self.api_key_index = required_int_env("LIGHTER_API_KEY_INDEX")
-        self.lighter_client: SignerClient | None = None
+        self.account_index: int | None = None
+        self.api_key_index: int | None = None
+        self.lighter_client: Any | None = None
         self._lighter_signer_lock = asyncio.Lock()
 
         self.lighter_market_index = 0
         self.base_amount_multiplier = 0
         self.price_multiplier = 0
+        self.lighter_min_base_amount: Decimal | None = None
+        self.lighter_min_quote_amount: Decimal | None = None
 
         self.lighter_order_book = {"bids": {}, "asks": {}}
         self.lighter_best_bid: Decimal | None = None
@@ -264,25 +590,216 @@ class VariationalToLighterRuntime:
         self.lighter_order_book_sequence_gap = False
         self.lighter_order_book_lock = asyncio.Lock()
 
+        self.last_variational_trade_event_at: str | None = None
+        self.last_lighter_order_book_update_at: str | None = None
+        self.last_live_submit_monotonic_by_asset: dict[str, float] = {}
+        self.paper_position: PaperPosition | None = None
+        self.paper_last_closed_monotonic: float | None = None
+        self.paper_opportunity_counter = 0
+        self._last_var_quote_diagnostic_at = 0.0
+        self._variational_metadata_stats: dict[str, Any] | None = None
+        self._variational_metadata_stats_at = 0.0
+        self._last_metadata_stats_error_at = 0.0
+
         self.lighter_ws_task: asyncio.Task[None] | None = None
         self.trade_task: asyncio.Task[None] | None = None
+        self.spread_task: asyncio.Task[None] | None = None
+        self.paper_task: asyncio.Task[None] | None = None
         self.dashboard_task: asyncio.Task[None] | None = None
+        self.watchdog_task: asyncio.Task[None] | None = None
+
+    @staticmethod
+    def now_iso() -> str:
+        return utc_now()
+
+    @staticmethod
+    def set_record_stage(
+        record: OrderLifecycle,
+        stage: str,
+        *,
+        failure_stage: str | None = None,
+        failure_reason: str | None = None,
+        clear_failure: bool = False,
+    ) -> None:
+        record.processing_stage = stage
+        if not record.stage_history or record.stage_history[-1] != stage:
+            record.stage_history.append(stage)
+        record.last_updated_at = utc_now()
+        if clear_failure:
+            record.failure_stage = None
+            record.failure_reason = None
+        if failure_stage is not None:
+            record.failure_stage = failure_stage
+        if failure_reason is not None:
+            record.failure_reason = failure_reason
+
+    def is_observe_mode(self) -> bool:
+        return self.mode == MODE_OBSERVE
+
+    def is_dry_run_mode(self) -> bool:
+        return self.mode == MODE_DRY_RUN
+
+    def is_live_mode(self) -> bool:
+        return self.mode == MODE_LIVE
+
+    def is_paper_mode(self) -> bool:
+        return self.mode == MODE_PAPER
+
+    def requires_lighter_market_data(self) -> bool:
+        return self.is_dry_run_mode() or self.is_live_mode() or self.is_paper_mode()
+
+    def requires_lighter_trading_credentials(self) -> bool:
+        return self.is_live_mode()
+
+    def live_config_snapshot(self) -> dict[str, Any]:
+        return {
+            "max_notional_usd": decimal_to_str(self.live_max_notional_usd),
+            "max_qty": decimal_to_str(self.live_max_qty),
+            "require_min_edge_bps": decimal_to_str(self.live_require_min_edge_bps),
+            "cooldown_seconds": self.live_cooldown_seconds,
+            "submit_timeout_seconds": self.live_submit_timeout_seconds,
+            "allowed_assets": sorted(self.live_allowed_assets),
+            "rollback_action": "manual_review_required",
+        }
+
+    def paper_config_snapshot(self) -> dict[str, Any]:
+        return {
+            "notional_usd": decimal_to_str(self.paper_notional_usd),
+            "entry_deviation_bps": decimal_to_str(self.paper_entry_deviation_bps),
+            "exit_deviation_bps": decimal_to_str(self.paper_exit_deviation_bps),
+            "max_var_half_spread_bps": decimal_to_str(self.paper_max_var_half_spread_bps),
+            "max_holding_seconds": self.paper_max_holding_seconds,
+            "cooldown_seconds": self.paper_cooldown_seconds,
+            "min_samples": self.paper_min_samples,
+            "interval_seconds": self.paper_interval_seconds,
+            "fee_bps_per_leg": decimal_to_str(self.paper_fee_bps_per_leg),
+            "latency_drift_bps": decimal_to_str(self.paper_latency_drift_bps),
+        }
 
     def print_startup_next_steps(self) -> None:
         is_zh = self.args.lang == "zh"
+        mode_line = f"当前模式: {self.mode}" if is_zh else f"Current mode: {self.mode}"
         if is_zh:
             lines = [
+                mode_line,
                 "Python 脚本已就位，请回到 Chrome 加载并启动扩展。若 Chrome 插件已启动，请刷新网页。",
+                "observe 只监听；dry-run 模拟手动成交后的对冲；paper 自动模拟机会；live 才会真实下单。",
                 "Use `python main.py --lang en` for the English dashboard.",
             ]
             title = "启动指引"
         else:
             lines = [
+                mode_line,
                 "Python runtime is ready. Go back to Chrome and load/start the extension.",
+                "observe listens only; dry-run simulates manual-fill hedges; paper auto-simulates opportunities; live sends real orders.",
                 "If the Chrome extension has already started, please refresh the webpage."
             ]
             title = "Startup Guide"
         self.dashboard_console.print(Panel("\n".join(lines), title=title, border_style="yellow"))
+
+    def run_startup_diagnostics(self) -> StartupDiagnostics:
+        passed: list[str] = []
+        warnings: list[str] = []
+        blocking_errors: list[str] = []
+
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            passed.append(f"log_dir_ready={LOG_DIR.resolve()}")
+        except Exception as exc:
+            blocking_errors.append(f"log_dir_unavailable: {exc}")
+
+        passed.append(f"mode={self.mode}")
+        passed.append(f"forwarder_ws=ws://{FORWARDER_HOST}:{FORWARDER_WS_PORT}")
+        passed.append(f"forwarder_rest=ws://{FORWARDER_HOST}:{FORWARDER_REST_PORT}")
+        passed.append(f"risk_guard_max_base_amount={self.risk_guard_max_base_amount}")
+        passed.append(f"risk_guard_max_price_deviation_bps={self.risk_guard_max_price_deviation_bps}")
+        passed.append(f"live_config={json.dumps(self.live_config_snapshot(), ensure_ascii=True, sort_keys=True)}")
+        passed.append(f"paper_config={json.dumps(self.paper_config_snapshot(), ensure_ascii=True, sort_keys=True)}")
+
+        if self.is_observe_mode():
+            passed.append("observe_mode_skips_lighter_trading_credentials")
+
+        if self.is_paper_mode():
+            passed.append("paper_mode_auto_simulates_opportunities_without_real_orders")
+
+        if self.requires_lighter_market_data():
+            passed.append(f"lighter_market_data_required_for_mode={self.mode}")
+
+        if env_flag("LIGHTER_WS_SERVER_PINGS"):
+            warnings.append("lighter_ws_server_pings=true")
+
+        account_index = os.getenv("LIGHTER_ACCOUNT_INDEX", "").strip()
+        api_key_index = os.getenv("LIGHTER_API_KEY_INDEX", "").strip()
+        private_key = os.getenv("LIGHTER_PRIVATE_KEY", "").strip()
+        api_key_private_key = os.getenv("API_KEY_PRIVATE_KEY", "").strip()
+
+        if self.is_dry_run_mode():
+            passed.append("dry_run_mode_uses_lighter_market_data_without_real_order_submission")
+            if account_index or api_key_index or private_key or api_key_private_key:
+                warnings.append("dry_run_mode_detected_live_trading_credentials")
+
+        if self.is_live_mode():
+            passed.append("live_rollback_action=manual_review_required")
+            if not account_index:
+                blocking_errors.append("LIGHTER_ACCOUNT_INDEX is not set")
+            else:
+                try:
+                    int(account_index)
+                    passed.append("LIGHTER_ACCOUNT_INDEX_ok")
+                except ValueError:
+                    blocking_errors.append(f"LIGHTER_ACCOUNT_INDEX must be integer: {account_index}")
+
+            if not api_key_index:
+                blocking_errors.append("LIGHTER_API_KEY_INDEX is not set")
+            else:
+                try:
+                    int(api_key_index)
+                    passed.append("LIGHTER_API_KEY_INDEX_ok")
+                except ValueError:
+                    blocking_errors.append(f"LIGHTER_API_KEY_INDEX must be integer: {api_key_index}")
+
+            if api_key_private_key or private_key:
+                passed.append("lighter_private_key_present")
+            else:
+                blocking_errors.append("LIGHTER_PRIVATE_KEY or API_KEY_PRIVATE_KEY is not set")
+
+        return StartupDiagnostics(
+            passed=passed,
+            warnings=warnings,
+            blocking_errors=blocking_errors,
+        )
+
+    def print_startup_diagnostics(self, diagnostics: StartupDiagnostics) -> None:
+        is_zh = self.args.lang == "zh"
+        title = "启动自检" if is_zh else "Startup Diagnostics"
+        lines: list[str] = []
+
+        passed_label = "passed" if not is_zh else "通过"
+        warnings_label = "warnings" if not is_zh else "警告"
+        blocking_label = "blocking_errors" if not is_zh else "阻断错误"
+
+        lines.append(f"{passed_label}: {len(diagnostics.passed)}")
+        for item in diagnostics.passed:
+            lines.append(f"  [ok] {item}")
+
+        lines.append(f"{warnings_label}: {len(diagnostics.warnings)}")
+        for item in diagnostics.warnings:
+            lines.append(f"  [warn] {item}")
+
+        lines.append(f"{blocking_label}: {len(diagnostics.blocking_errors)}")
+        for item in diagnostics.blocking_errors:
+            lines.append(f"  [error] {item}")
+
+        border_style = "red" if diagnostics.blocking_errors else ("yellow" if diagnostics.warnings else "green")
+        self.dashboard_console.print(Panel("\n".join(lines), title=title, border_style=border_style))
+
+    def log_startup_diagnostics(self, diagnostics: StartupDiagnostics) -> None:
+        for item in diagnostics.passed:
+            self.logger.info("startup_diagnostics passed: %s", item)
+        for item in diagnostics.warnings:
+            self.logger.warning("startup_diagnostics warning: %s", item)
+        for item in diagnostics.blocking_errors:
+            self.logger.error("startup_diagnostics blocking_error: %s", item)
 
     def setup_signal_handlers(self) -> None:
         signal.signal(signal.SIGINT, self.shutdown)
@@ -291,20 +808,40 @@ class VariationalToLighterRuntime:
     def shutdown(self, signum=None, frame=None) -> None:
         self.stop_flag = True
 
-    def initialize_lighter_client(self) -> SignerClient:
+    def initialize_lighter_client(self) -> Any:
+        if not self.requires_lighter_trading_credentials():
+            raise RuntimeError(f"Lighter client is only available in {MODE_LIVE} mode")
         if self.lighter_client is None:
+            from lighter.signer_client import SignerClient
+
+            if self.account_index is None or self.api_key_index is None:
+                self.load_lighter_trading_credentials()
             api_key_private_key = os.getenv("API_KEY_PRIVATE_KEY", "").strip() or required_env("LIGHTER_PRIVATE_KEY")
-            self.lighter_client = SignerClient(
-                url=self.lighter_base_url,
-                account_index=self.account_index,
-                api_private_keys={self.api_key_index: api_key_private_key},
-            )
-            err = self.lighter_client.check_client()
-            if err is not None:
-                raise RuntimeError(f"CheckClient error: {err}")
+            last_error: Exception | None = None
+            for attempt in range(1, LIGHTER_INIT_RETRY_ATTEMPTS + 1):
+                try:
+                    self.lighter_client = SignerClient(
+                        url=self.lighter_base_url,
+                        account_index=self.account_index,
+                        api_private_keys={self.api_key_index: api_key_private_key},
+                    )
+                    err = self.lighter_client.check_client()
+                    if err is not None:
+                        raise RuntimeError(f"CheckClient error: {err}")
+                    break
+                except Exception as exc:
+                    self.lighter_client = None
+                    last_error = exc
+                    if attempt >= LIGHTER_INIT_RETRY_ATTEMPTS:
+                        raise RuntimeError(f"Failed to initialize Lighter client after {attempt} attempts: {exc}") from exc
+                    time.sleep(LIGHTER_INIT_RETRY_DELAY_SECONDS)
         return self.lighter_client
 
-    def get_lighter_market_config(self) -> tuple[int, int, int]:
+    def load_lighter_trading_credentials(self) -> None:
+        self.account_index = required_int_env("LIGHTER_ACCOUNT_INDEX")
+        self.api_key_index = required_int_env("LIGHTER_API_KEY_INDEX")
+
+    def get_lighter_market_config(self) -> tuple[int, int, int, Decimal | None, Decimal | None]:
         if not self.ticker:
             raise RuntimeError("Ticker is not resolved yet")
         response = requests.get(
@@ -319,7 +856,13 @@ class VariationalToLighterRuntime:
             if market.get("symbol") == self.ticker:
                 price_decimals = int(market["supported_price_decimals"])
                 size_decimals = int(market["supported_size_decimals"])
-                return int(market["market_id"]), pow(10, size_decimals), pow(10, price_decimals)
+                return (
+                    int(market["market_id"]),
+                    pow(10, size_decimals),
+                    pow(10, price_decimals),
+                    to_decimal(market.get("min_base_amount")),
+                    to_decimal(market.get("min_quote_amount")),
+                )
 
         raise RuntimeError(f"Ticker {self.ticker} not found in Lighter order books")
 
@@ -355,6 +898,8 @@ class VariationalToLighterRuntime:
             self.record_order.clear()
             self.lighter_client_order_to_trade_key.clear()
         self.cross_spread_history.clear()
+        self.paper_position = None
+        self.paper_last_closed_monotonic = None
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
 
@@ -376,7 +921,23 @@ class VariationalToLighterRuntime:
                 resolve_variational_ticker(next_ticker),
             }
 
-            self.lighter_market_index, self.base_amount_multiplier, self.price_multiplier = self.get_lighter_market_config()
+            if not self.requires_lighter_market_data():
+                await self._reset_state_for_asset_switch()
+                self.logger.info(
+                    "Switched market (%s): variational_asset=%s -> lighter_ticker=%s (observe mode skips Lighter market data)",
+                    reason,
+                    self.variational_ticker,
+                    self.ticker,
+                )
+                return
+
+            (
+                self.lighter_market_index,
+                self.base_amount_multiplier,
+                self.price_multiplier,
+                self.lighter_min_base_amount,
+                self.lighter_min_quote_amount,
+            ) = self.get_lighter_market_config()
             await self.reset_lighter_order_book()
             await self._reset_state_for_asset_switch()
 
@@ -387,22 +948,24 @@ class VariationalToLighterRuntime:
             self.lighter_ws_task = asyncio.create_task(self.handle_lighter_ws())
             await self.wait_for_lighter_order_book_ready()
             self.logger.info(
-                "Switched market (%s): variational_asset=%s -> lighter_ticker=%s market_id=%s",
+                "Switched market (%s): variational_asset=%s -> lighter_ticker=%s market_id=%s min_base_amount=%s min_quote_amount=%s",
                 reason,
                 self.variational_ticker,
                 self.ticker,
                 self.lighter_market_index,
+                self.lighter_min_base_amount,
+                self.lighter_min_quote_amount,
             )
 
-    async def wait_for_variational_ready(self) -> None:
+    async def wait_for_variational_ready(self) -> bool:
         deadline = time.time() + READY_TIMEOUT_SECONDS
         while not self.stop_flag and time.time() < deadline:
             state = await self.runtime.monitor.get_trading_state()
             hb_age = state.get("heartbeat_age")
             if hb_age is not None and hb_age <= HEARTBEAT_STALE_SECONDS:
-                return
+                return True
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
-        raise RuntimeError("Timed out waiting for Variational events stream heartbeat")
+        return False
 
     async def wait_for_lighter_order_book_ready(self) -> None:
         deadline = time.time() + READY_TIMEOUT_SECONDS
@@ -475,6 +1038,14 @@ class VariationalToLighterRuntime:
 
             record.lighter_fill_ts_iso = now_iso
             record.lighter_fill_price = fill_price
+            if record.var_fill_ts_iso:
+                with contextlib.suppress(Exception):
+                    var_fill_dt = datetime.fromisoformat(record.var_fill_ts_iso.replace("Z", "+00:00"))
+                    lighter_fill_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+                    record.live_fill_latency_ms = Decimal(
+                        str((lighter_fill_dt - var_fill_dt).total_seconds() * 1000)
+                    )
+            self.set_record_stage(record, STAGE_LIGHTER_FILLED, clear_failure=True)
             payload = record.to_payload()
 
         await self.append_order_log("lighter_fill", payload)
@@ -496,28 +1067,29 @@ class VariationalToLighterRuntime:
                 ) as ws:
                     await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
-                    account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
-                    try:
-                        async with self._lighter_signer_lock:
-                            if not self.lighter_client:
-                                self.initialize_lighter_client()
-                            auth_token, err = self.lighter_client.create_auth_token_with_expiry(
-                                api_key_index=self.api_key_index
-                            )
-                        if err is None:
-                            await ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "subscribe",
-                                        "channel": account_orders_channel,
-                                        "auth": auth_token,
-                                    }
+                    if self.requires_lighter_trading_credentials():
+                        account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
+                        try:
+                            async with self._lighter_signer_lock:
+                                if not self.lighter_client:
+                                    self.initialize_lighter_client()
+                                auth_token, err = self.lighter_client.create_auth_token_with_expiry(
+                                    api_key_index=self.api_key_index
                                 )
-                            )
-                        else:
-                            self.logger.warning("Failed to create Lighter WS auth token: %s", err)
-                    except Exception as exc:
-                        self.logger.warning("Error creating Lighter WS auth token: %s", exc)
+                            if err is None:
+                                await ws.send(
+                                    json.dumps(
+                                        {
+                                            "type": "subscribe",
+                                            "channel": account_orders_channel,
+                                            "auth": auth_token,
+                                        }
+                                    )
+                                )
+                            else:
+                                self.logger.warning("Failed to create Lighter WS auth token: %s", err)
+                        except Exception as exc:
+                            self.logger.warning("Error creating Lighter WS auth token: %s", exc)
 
                     while not self.stop_flag:
                         raw = await ws.recv()
@@ -536,6 +1108,7 @@ class VariationalToLighterRuntime:
                                 self.update_lighter_order_book("asks", order_book.get("asks", []))
                                 self.lighter_snapshot_loaded = True
                                 self.lighter_order_book_ready = True
+                                self.last_lighter_order_book_update_at = utc_now()
                                 self.lighter_best_bid = (
                                     max(self.lighter_order_book["bids"].keys())
                                     if self.lighter_order_book["bids"]
@@ -559,6 +1132,7 @@ class VariationalToLighterRuntime:
                                     self.update_lighter_order_book("bids", order_book.get("bids", []))
                                     self.update_lighter_order_book("asks", order_book.get("asks", []))
                                     self.lighter_order_book_offset = new_offset
+                                    self.last_lighter_order_book_update_at = utc_now()
                                     self.lighter_best_bid = (
                                         max(self.lighter_order_book["bids"].keys())
                                         if self.lighter_order_book["bids"]
@@ -596,7 +1170,48 @@ class VariationalToLighterRuntime:
         async with self.lighter_order_book_lock:
             return self.lighter_best_bid, self.lighter_best_ask
 
-    async def get_variational_best_bid_ask(self, preferred_asset: str | None):
+    def _lighter_order_book_age_seconds(self) -> float | None:
+        return self._age_seconds_from_iso(self.last_lighter_order_book_update_at)
+
+    def _lighter_order_book_is_stale(self) -> bool:
+        age = self._lighter_order_book_age_seconds()
+        return age is None or age >= HEALTH_LIGHTER_BOOK_STALE_SECONDS
+
+    async def get_lighter_top_sizes(self) -> tuple[Decimal | None, Decimal | None]:
+        async with self.lighter_order_book_lock:
+            bid_size: Decimal | None = None
+            ask_size: Decimal | None = None
+            if self.lighter_best_bid is not None:
+                bid_size = self.lighter_order_book["bids"].get(self.lighter_best_bid)
+            if self.lighter_best_ask is not None:
+                ask_size = self.lighter_order_book["asks"].get(self.lighter_best_ask)
+            return bid_size, ask_size
+
+    async def estimate_lighter_fill_price(self, side: str, quantity: Decimal) -> Decimal | None:
+        if quantity <= 0:
+            return None
+        book_side = "asks" if side.upper() == "BUY" else "bids"
+        async with self.lighter_order_book_lock:
+            levels = self.lighter_order_book.get(book_side, {})
+            if not levels:
+                return None
+            prices = sorted(levels.keys()) if book_side == "asks" else sorted(levels.keys(), reverse=True)
+            remaining = quantity
+            notional = Decimal("0")
+            for price in prices:
+                size = levels.get(price)
+                if size is None or size <= 0:
+                    continue
+                fill_qty = min(remaining, size)
+                notional += fill_qty * price
+                remaining -= fill_qty
+                if remaining <= 0:
+                    break
+        if remaining > 0:
+            return None
+        return notional / quantity
+
+    async def get_variational_quote(self, preferred_asset: str | None) -> dict[str, Any] | None:
         async with self.runtime.monitor._lock:
             quote = None
             if preferred_asset:
@@ -607,8 +1222,107 @@ class VariationalToLighterRuntime:
                 quote = self.runtime.monitor.quotes.get(self.runtime.monitor.current_quote_asset)
 
             if quote is None:
-                return None, None, None
-            return to_decimal(quote.get("bid")), to_decimal(quote.get("ask")), str(quote.get("asset", ""))
+                return None
+            quote = dict(quote)
+
+        if self.is_paper_mode():
+            quote = await self.apply_variational_indicative_quote(quote)
+        return quote
+
+    @staticmethod
+    def _fetch_variational_metadata_stats_sync() -> dict[str, Any]:
+        response = requests.get(VARIATIONAL_METADATA_STATS_URL, timeout=5)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("metadata stats response is not a JSON object")
+        return payload
+
+    async def get_variational_metadata_stats(self) -> dict[str, Any] | None:
+        now = time.monotonic()
+        if (
+            self._variational_metadata_stats is not None
+            and now - self._variational_metadata_stats_at < VARIATIONAL_METADATA_STATS_TTL_SECONDS
+        ):
+            return self._variational_metadata_stats
+
+        try:
+            payload = await asyncio.to_thread(self._fetch_variational_metadata_stats_sync)
+        except Exception as exc:
+            if now - self._last_metadata_stats_error_at >= VAR_QUOTE_DIAGNOSTIC_INTERVAL_SECONDS:
+                self._last_metadata_stats_error_at = now
+                self.logger.warning("variational_metadata_stats_fetch_failed error=%s", exc)
+            return self._variational_metadata_stats
+
+        self._variational_metadata_stats = payload
+        self._variational_metadata_stats_at = now
+        return payload
+
+    async def apply_variational_indicative_quote(self, quote: dict[str, Any]) -> dict[str, Any]:
+        asset = str(quote.get("asset") or self.variational_ticker or self.ticker or "").strip().upper()
+        if not asset:
+            return quote
+
+        metadata = await self.get_variational_metadata_stats()
+        listings = metadata.get("listings") if isinstance(metadata, dict) else None
+        if not isinstance(listings, list):
+            return quote
+
+        listing = next(
+            (
+                item
+                for item in listings
+                if isinstance(item, dict) and str(item.get("ticker") or "").strip().upper() == asset
+            ),
+            None,
+        )
+        if not isinstance(listing, dict):
+            return quote
+
+        quotes = listing.get("quotes")
+        if not isinstance(quotes, dict):
+            return quote
+
+        quote_sizes = (VARIATIONAL_METADATA_QUOTE_SIZE, "base", "size_100k", "size_1m")
+        quote_size = next((key for key in quote_sizes if isinstance(quotes.get(key), dict)), None)
+        if quote_size is None:
+            return quote
+
+        sized_quote = quotes.get(quote_size)
+        if not isinstance(sized_quote, dict):
+            return quote
+
+        bid = to_decimal(sized_quote.get("bid"))
+        ask = to_decimal(sized_quote.get("ask"))
+        if bid is None or ask is None:
+            return quote
+        if ask < bid:
+            bid, ask = ask, bid
+
+        raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
+        return {
+            **quote,
+            "asset": asset,
+            "bid": decimal_to_str(bid),
+            "ask": decimal_to_str(ask),
+            "mark_price": quote.get("mark_price") or listing.get("mark_price"),
+            "timestamp": quotes.get("updated_at") or quote.get("timestamp"),
+            "raw": {
+                **raw,
+                "__indicative_source_url": VARIATIONAL_METADATA_STATS_URL,
+                "__indicative_source_endpoint": "/metadata/stats",
+                "__indicative_quote_size": quote_size,
+                "__indicative_bid": decimal_to_str(bid),
+                "__indicative_ask": decimal_to_str(ask),
+                "__indicative_updated_at": quotes.get("updated_at"),
+            },
+        }
+
+    async def get_variational_best_bid_ask(self, preferred_asset: str | None):
+        quote = await self.get_variational_quote(preferred_asset)
+        if quote is None:
+            return None, None, None
+        return to_decimal(quote.get("bid")), to_decimal(quote.get("ask")), str(quote.get("asset", ""))
 
     @staticmethod
     def trade_key(event: dict[str, Any]) -> str:
@@ -621,9 +1335,11 @@ class VariationalToLighterRuntime:
     async def append_order_log(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.orders_file is None:
             return
+        stage_history = payload.get("stage_history")
         row = {
             "event": event_type,
             "logged_at": utc_now(),
+            "stage_flow_text": self._fmt_stage_history(stage_history, limit=20),
             **payload,
         }
         line = json.dumps(row, ensure_ascii=True) + "\n"
@@ -631,40 +1347,262 @@ class VariationalToLighterRuntime:
             await asyncio.to_thread(self.orders_file.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(self._append_line, self.orders_file, line)
 
+    async def append_opportunity_log(self, event_type: str, payload: dict[str, Any]) -> None:
+        if self.opportunities_file is None:
+            return
+        row = {
+            "event": event_type,
+            "logged_at": utc_now(),
+            **payload,
+        }
+        line = json.dumps(row, ensure_ascii=True) + "\n"
+        async with self._opportunity_write_lock:
+            await asyncio.to_thread(self.opportunities_file.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(self._append_line, self.opportunities_file, line)
+
     @staticmethod
     def _append_line(path: Path, line: str) -> None:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
 
-    async def place_lighter_order(self, record: OrderLifecycle) -> None:
-        if not self.args.auto_hedge:
-            return
-
+    async def build_hedge_plan(self, record: OrderLifecycle) -> tuple[str, Decimal, int] | None:
         side = "SELL" if record.side == "buy" else "BUY"
-
+        if self._lighter_order_book_is_stale():
+            async with self._record_lock:
+                record.hedge_error = "Lighter order book is stale"
+                self.set_record_stage(
+                    record,
+                    record.processing_stage,
+                    failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                    failure_reason="lighter_order_book_stale",
+                )
+                payload = record.to_payload()
+            await self.append_order_log("lighter_error", payload)
+            return None
         best_bid, best_ask = await self.get_lighter_best_bid_ask()
+        async with self._record_lock:
+            record.lighter_reference_bid = best_bid
+            record.lighter_reference_ask = best_ask
+
         if best_bid is None or best_ask is None:
             async with self._record_lock:
                 record.hedge_error = "Lighter order book not ready"
+                self.set_record_stage(
+                    record,
+                    record.processing_stage,
+                    failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                    failure_reason="lighter_order_book_not_ready",
+                )
                 payload = record.to_payload()
             await self.append_order_log("lighter_error", payload)
-            return
+            return None
 
         slippage = Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000")
         if side == "BUY":
-            is_ask = False
             limit_price = best_ask * (Decimal("1") + slippage)
         else:
-            is_ask = True
             limit_price = best_bid * (Decimal("1") - slippage)
+
+        notional = record.qty * limit_price
+        edge_bps = basis_points_diff(limit_price, record.var_fill_price)
+        async with self._record_lock:
+            record.live_notional_usd = notional
+            record.live_edge_bps = edge_bps
 
         base_amount = int(record.qty * self.base_amount_multiplier)
         if base_amount <= 0:
             async with self._record_lock:
                 record.hedge_error = f"Hedge base amount rounds to zero ({record.qty})"
+                self.set_record_stage(
+                    record,
+                    record.processing_stage,
+                    failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                    failure_reason="hedge_base_amount_rounds_to_zero",
+                )
                 payload = record.to_payload()
             await self.append_order_log("lighter_error", payload)
+            return None
+
+        if self.lighter_min_base_amount is not None and record.qty < self.lighter_min_base_amount:
+            async with self._record_lock:
+                record.hedge_error = (
+                    f"Hedge qty {record.qty} is below Lighter min base amount {self.lighter_min_base_amount}"
+                )
+                self.set_record_stage(
+                    record,
+                    record.processing_stage,
+                    failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                    failure_reason="hedge_below_lighter_min_base_amount",
+                )
+                payload = record.to_payload()
+            await self.append_order_log("lighter_error", payload)
+            return None
+
+        if base_amount > self.risk_guard_max_base_amount:
+            async with self._record_lock:
+                record.hedge_error = (
+                    f"Hedge base amount {base_amount} exceeds risk limit {self.risk_guard_max_base_amount}"
+                )
+                self.set_record_stage(
+                    record,
+                    record.processing_stage,
+                    failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                    failure_reason="hedge_base_amount_exceeds_risk_limit",
+                )
+                payload = record.to_payload()
+            await self.append_order_log("lighter_error", payload)
+            return None
+
+        price_reference = record.var_fill_price
+        deviation_bps = edge_bps
+        if deviation_bps is not None and deviation_bps > self.risk_guard_max_price_deviation_bps:
+            async with self._record_lock:
+                record.hedge_error = (
+                    f"Hedge price deviation {deviation_bps:.2f}bps exceeds risk limit "
+                    f"{self.risk_guard_max_price_deviation_bps}bps"
+                )
+                self.set_record_stage(
+                    record,
+                    record.processing_stage,
+                    failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                    failure_reason="hedge_price_deviation_exceeds_risk_limit",
+                )
+                payload = record.to_payload()
+            await self.append_order_log("lighter_error", payload)
+            return None
+
+        if self.lighter_min_quote_amount is not None and notional < self.lighter_min_quote_amount:
+            async with self._record_lock:
+                record.hedge_error = (
+                    f"Hedge notional {notional} is below Lighter min quote amount {self.lighter_min_quote_amount}"
+                )
+                self.set_record_stage(
+                    record,
+                    record.processing_stage,
+                    failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                    failure_reason="hedge_below_lighter_min_quote_amount",
+                )
+                payload = record.to_payload()
+            await self.append_order_log("lighter_error", payload)
+            return None
+
+        if self.is_live_mode():
+            if self.live_allowed_assets and record.asset.upper() not in self.live_allowed_assets:
+                async with self._record_lock:
+                    record.hedge_error = (
+                        f"Live trading is restricted to assets {sorted(self.live_allowed_assets)}, got {record.asset}"
+                    )
+                    self.set_record_stage(
+                        record,
+                        record.processing_stage,
+                        failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                        failure_reason="live_asset_not_allowed",
+                    )
+                    payload = record.to_payload()
+                await self.append_order_log("lighter_error", payload)
+                return None
+
+            if self.live_max_qty > 0 and record.qty > self.live_max_qty:
+                async with self._record_lock:
+                    record.hedge_error = f"Live qty {record.qty} exceeds live max qty {self.live_max_qty}"
+                    self.set_record_stage(
+                        record,
+                        record.processing_stage,
+                        failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                        failure_reason="live_qty_exceeds_limit",
+                    )
+                    payload = record.to_payload()
+                await self.append_order_log("lighter_error", payload)
+                return None
+
+            if self.live_max_notional_usd > 0 and notional > self.live_max_notional_usd:
+                async with self._record_lock:
+                    record.hedge_error = (
+                        f"Live notional {notional} exceeds live max notional {self.live_max_notional_usd}"
+                    )
+                    self.set_record_stage(
+                        record,
+                        record.processing_stage,
+                        failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                        failure_reason="live_notional_exceeds_limit",
+                    )
+                    payload = record.to_payload()
+                await self.append_order_log("lighter_error", payload)
+                return None
+
+            if edge_bps is not None and edge_bps < self.live_require_min_edge_bps:
+                async with self._record_lock:
+                    record.hedge_error = (
+                        f"Live edge {edge_bps:.2f}bps is below required minimum {self.live_require_min_edge_bps}bps"
+                    )
+                    self.set_record_stage(
+                        record,
+                        record.processing_stage,
+                        failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                        failure_reason="live_edge_bps_below_threshold",
+                    )
+                    payload = record.to_payload()
+                await self.append_order_log("lighter_error", payload)
+                return None
+
+            now_monotonic = time.monotonic()
+            asset_key = record.asset.upper()
+            last_submit_monotonic = self.last_live_submit_monotonic_by_asset.get(asset_key)
+            if last_submit_monotonic is not None and now_monotonic - last_submit_monotonic < self.live_cooldown_seconds:
+                remaining = self.live_cooldown_seconds - (now_monotonic - last_submit_monotonic)
+                async with self._record_lock:
+                    record.hedge_error = f"Live cooldown active, wait {remaining:.2f}s"
+                    self.set_record_stage(
+                        record,
+                        record.processing_stage,
+                        failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                        failure_reason="live_cooldown_active",
+                    )
+                    payload = record.to_payload()
+                await self.append_order_log("lighter_error", payload)
+                return None
+
+        return side, limit_price, base_amount
+
+    async def record_dry_run_plan(self, record: OrderLifecycle) -> None:
+        plan = await self.build_hedge_plan(record)
+        if plan is None:
             return
+
+        side, limit_price, base_amount = plan
+        async with self._record_lock:
+            record.dry_run_plan_side = side
+            record.dry_run_plan_price = limit_price
+            record.dry_run_plan_base_amount = base_amount
+            record.hedge_error = None
+            self.set_record_stage(record, STAGE_DRY_RUN_PLANNED, clear_failure=True)
+            payload = record.to_payload()
+        await self.append_order_log("lighter_dry_run_plan", payload)
+
+    async def place_lighter_order(self, record: OrderLifecycle) -> None:
+        if not self.is_live_mode():
+            async with self._record_lock:
+                record.hedge_error = f"Real Lighter hedge is only allowed in {MODE_LIVE} mode"
+                self.set_record_stage(
+                    record,
+                    STAGE_BLOCKED_BY_MODE,
+                    failure_stage=FAILURE_STAGE_MODE_GUARD,
+                    failure_reason="real_lighter_hedge_requires_live_mode",
+                )
+                payload = record.to_payload()
+            await self.append_order_log("lighter_blocked", payload)
+            return
+
+        async with self._record_lock:
+            self.set_record_stage(record, STAGE_LIVE_SUBMIT_STARTED, clear_failure=True)
+            record.live_submit_started_at_iso = utc_now()
+
+        plan = await self.build_hedge_plan(record)
+        if plan is None:
+            return
+
+        side, limit_price, base_amount = plan
+        is_ask = side == "SELL"
 
         price_i = int(limit_price * self.price_multiplier)
         async with self._record_lock:
@@ -692,17 +1630,56 @@ class VariationalToLighterRuntime:
                 raise RuntimeError(f"Sign error: {error}")
 
             async with self._record_lock:
+                record.dry_run_plan_side = side
+                record.dry_run_plan_price = limit_price
+                record.dry_run_plan_base_amount = base_amount
                 record.lighter_side = side
                 record.lighter_client_order_id = client_order_id
                 record.lighter_tx_hash = tx_hash
                 record.hedge_error = None
+                self.set_record_stage(record, STAGE_LIVE_SUBMIT_SENT, clear_failure=True)
                 self.lighter_client_order_to_trade_key[client_order_id] = record.trade_key
+                self.last_live_submit_monotonic_by_asset[asset_key] = time.monotonic()
         except Exception as exc:
             async with self._record_lock:
                 record.lighter_side = side
                 record.hedge_error = str(exc)
+                self.set_record_stage(
+                    record,
+                    STAGE_LIVE_SUBMIT_FAILED,
+                    failure_stage=FAILURE_STAGE_LIVE_SUBMIT,
+                    failure_reason=str(exc),
+                )
                 payload = record.to_payload()
             await self.append_order_log("lighter_error", payload)
+
+    async def watchdog_live_submissions(self) -> None:
+        while not self.stop_flag:
+            timed_out: list[dict[str, Any]] = []
+            async with self._record_lock:
+                for record in self.records.values():
+                    if record.processing_stage != STAGE_LIVE_SUBMIT_SENT:
+                        continue
+                    if record.lighter_fill_ts_iso is not None:
+                        continue
+                    if record.processing_stage == STAGE_LIVE_SUBMIT_FAILED:
+                        continue
+                    started_at = self._age_seconds_from_iso(record.live_submit_started_at_iso)
+                    if started_at is None or started_at < self.live_submit_timeout_seconds:
+                        continue
+                    record.hedge_error = (
+                        f"Live submit timed out after {started_at:.1f}s without lighter fill"
+                    )
+                    self.set_record_stage(
+                        record,
+                        STAGE_LIVE_SUBMIT_TIMED_OUT,
+                        failure_stage=FAILURE_STAGE_LIVE_SUBMIT,
+                        failure_reason="live_submit_timeout",
+                    )
+                    timed_out.append(record.to_payload())
+            for payload in timed_out:
+                await self.append_order_log("lighter_timeout", payload)
+            await asyncio.sleep(1.0)
 
     def should_track_variational_event(self, event: dict[str, Any]) -> bool:
         side = str(event.get("side", "")).strip().lower()
@@ -718,9 +1695,26 @@ class VariationalToLighterRuntime:
             return False
         return asset in self.accepted_assets
 
+    def is_historical_trade_event(self, event: dict[str, Any]) -> bool:
+        if self.trade_event_min_timestamp is None:
+            return False
+
+        event_ts_raw = str(event.get("timestamp", "")).strip()
+        event_ts = self._parse_iso_ts(event_ts_raw)
+        if event_ts is None:
+            return False
+
+        cutoff = self.trade_event_min_timestamp.timestamp() - TRADE_EVENT_STARTUP_GRACE_SECONDS
+        return event_ts.timestamp() < cutoff
+
     async def process_variational_trade_event(self, event: dict[str, Any]) -> None:
         if not self.should_track_variational_event(event):
             return
+
+        if self.is_historical_trade_event(event):
+            return
+
+        self.last_variational_trade_event_at = utc_now()
 
         key = self.trade_key(event)
         side = str(event.get("side", "")).strip().lower()
@@ -747,9 +1741,10 @@ class VariationalToLighterRuntime:
                     side=side,
                     qty=qty,
                     asset=asset if asset else "UNKNOWN",
-                    auto_hedge_enabled=self.args.auto_hedge,
+                    mode=self.mode,
                     last_variational_status=status,
                 )
+                self.set_record_stage(record, STAGE_RECORD_CREATED, clear_failure=True)
                 self.records[key] = record
                 self.record_order.append(key)
                 created = True
@@ -757,6 +1752,7 @@ class VariationalToLighterRuntime:
             else:
                 previous_status = record.last_variational_status
                 record.last_variational_status = status
+                self.set_record_stage(record, STAGE_EVENT_FILTERED)
 
             if created:
                 previous_status = ""
@@ -771,6 +1767,7 @@ class VariationalToLighterRuntime:
             if should_set_fill:
                 record.var_fill_ts_iso = fill_iso
                 record.var_fill_price = to_decimal(event.get("price"))
+                self.set_record_stage(record, STAGE_VARIATIONAL_FILLED, clear_failure=True)
                 filled_payload = record.to_payload()
             else:
                 filled_payload = None
@@ -778,7 +1775,21 @@ class VariationalToLighterRuntime:
         if filled_payload is not None:
             await self.append_order_log("variational_fill", filled_payload)
 
-        if created and created_record is not None and self.args.auto_hedge:
+        if not created or created_record is None:
+            return
+
+        if self.is_observe_mode():
+            async with self._record_lock:
+                self.set_record_stage(created_record, STAGE_BLOCKED_BY_MODE, clear_failure=True)
+            return
+
+        if self.is_dry_run_mode():
+            async with self._record_lock:
+                self.set_record_stage(created_record, STAGE_DRY_RUN_PENDING, clear_failure=True)
+            await self.record_dry_run_plan(created_record)
+            return
+
+        if self.is_live_mode():
             await self.place_lighter_order(created_record)
 
     async def trade_loop(self) -> None:
@@ -829,6 +1840,137 @@ class VariationalToLighterRuntime:
             return "-"
         return f"{value:.4f}%"
 
+    @staticmethod
+    def _fmt_stage(value: str | None) -> str:
+        if not value:
+            return "-"
+        return value
+
+    @staticmethod
+    def _fmt_stage_history(history: list[str] | None, limit: int = 4) -> str:
+        if not history:
+            return "-"
+        compact = history[-limit:]
+        return " -> ".join(compact)
+
+    @staticmethod
+    def _fmt_failure(value: str | None) -> str:
+        if not value:
+            return "-"
+        return value
+
+    @staticmethod
+    def _is_risk_guard_failure(failure_reason: str | None, failure_stage: str | None) -> bool:
+        if failure_reason in RISK_GUARD_FAILURE_REASONS:
+            return True
+        return failure_stage == FAILURE_STAGE_HEDGE_PLAN
+
+    @staticmethod
+    def _parse_iso_ts(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            normalized = value.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _age_seconds_from_iso(value: str | None) -> float | None:
+        dt = VariationalToLighterRuntime._parse_iso_ts(value)
+        if dt is None:
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+
+    @staticmethod
+    def _classify_age(age_seconds: float | None, degraded_after: float, stale_after: float) -> str:
+        if age_seconds is None:
+            return "stale"
+        if age_seconds >= stale_after:
+            return "stale"
+        if age_seconds >= degraded_after:
+            return "degraded"
+        return "healthy"
+
+    @staticmethod
+    def _classify_optional_age(age_seconds: float | None, degraded_after: float, stale_after: float) -> str:
+        if age_seconds is None:
+            return "idle"
+        return VariationalToLighterRuntime._classify_age(age_seconds, degraded_after, stale_after)
+
+    @staticmethod
+    def _status_rank(status: str) -> int:
+        if status == "idle":
+            return -1
+        if status == "healthy":
+            return 0
+        if status == "degraded":
+            return 1
+        return 2
+
+    @staticmethod
+    def _fmt_age(age_seconds: float | None) -> str:
+        if age_seconds is None:
+            return "-"
+        return f"{age_seconds:.1f}s"
+
+    @staticmethod
+    def _status_color(status: str) -> str:
+        if status == "idle":
+            return "cyan"
+        if status == "healthy":
+            return "green"
+        if status == "degraded":
+            return "yellow"
+        return "red"
+
+    def build_health_status(self) -> HealthStatus:
+        components: list[tuple[str, str, str]] = []
+
+        quote_age = self._age_seconds_from_iso(self.runtime.monitor.last_update_at)
+        quote_status = self._classify_age(
+            quote_age,
+            HEALTH_QUOTE_DEGRADED_SECONDS,
+            HEALTH_QUOTE_STALE_SECONDS,
+        )
+        components.append(("variational_quote", quote_status, f"last_update_age={self._fmt_age(quote_age)}"))
+
+        heartbeat_age = self._age_seconds_from_iso(self.runtime.monitor.last_heartbeat_iso)
+        heartbeat_status = self._classify_age(
+            heartbeat_age,
+            HEALTH_VARIATIONAL_HEARTBEAT_DEGRADED_SECONDS,
+            HEALTH_VARIATIONAL_HEARTBEAT_STALE_SECONDS,
+        )
+        components.append(("variational_heartbeat", heartbeat_status, f"age={self._fmt_age(heartbeat_age)}"))
+
+        trade_event_age = self._age_seconds_from_iso(self.last_variational_trade_event_at)
+        trade_event_status = self._classify_optional_age(
+            trade_event_age,
+            HEALTH_TRADE_EVENT_DEGRADED_SECONDS,
+            HEALTH_TRADE_EVENT_STALE_SECONDS,
+        )
+        components.append(("variational_trade_event", trade_event_status, f"age={self._fmt_age(trade_event_age)}"))
+
+        if self.requires_lighter_market_data():
+            lighter_book_age = self._age_seconds_from_iso(self.last_lighter_order_book_update_at)
+            lighter_book_status = self._classify_age(
+                lighter_book_age,
+                HEALTH_LIGHTER_BOOK_DEGRADED_SECONDS,
+                HEALTH_LIGHTER_BOOK_STALE_SECONDS,
+            )
+            components.append(("lighter_order_book", lighter_book_status, f"age={self._fmt_age(lighter_book_age)}"))
+
+        overall = "healthy"
+        if any(self._status_rank(status) == 2 for _, status, _ in components):
+            overall = "stale"
+        elif any(self._status_rank(status) == 1 for _, status, _ in components):
+            overall = "degraded"
+
+        return HealthStatus(overall=overall, components=components)
+
     def _fmt_signal_pct(
         self,
         current: Decimal | None,
@@ -869,6 +2011,20 @@ class VariationalToLighterRuntime:
             return diff, pct
         diff = spread_value(lighter_fill_price, var_fill_price)
         pct = spread_percent(diff, var_fill_price)
+        return diff, pct
+
+    @staticmethod
+    def _notional_value(qty: Decimal | None, price: Decimal | None) -> Decimal | None:
+        if qty is None or price is None:
+            return None
+        return qty * price
+
+    @staticmethod
+    def _price_diff(reference: Decimal | None, actual: Decimal | None) -> tuple[Decimal | None, Decimal | None]:
+        if reference is None or actual is None:
+            return None, None
+        diff = actual - reference
+        pct = spread_percent(diff, reference)
         return diff, pct
 
     @staticmethod
@@ -913,9 +2069,427 @@ class VariationalToLighterRuntime:
             return None
         return float(median(values))
 
-    async def render_dashboard(self) -> Group:
-        var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
+    def _cross_spread_sample_count(self, window_seconds: float, long_side: bool) -> int:
+        now = time.monotonic()
+        cutoff = now - window_seconds
+        value_index = 1 if long_side else 2
+        return sum(
+            1
+            for row in self.cross_spread_history
+            if row[0] >= cutoff and row[value_index] is not None
+        )
+
+    async def get_raw_cross_spreads(self) -> tuple[Decimal | None, Decimal | None]:
+        quote = await self.get_variational_quote(self.variational_ticker)
         lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
+        if quote is None or lighter_bid is None or lighter_ask is None:
+            return None, None
+        var_bid = to_decimal(quote.get("bid"))
+        var_ask = to_decimal(quote.get("ask"))
+        if var_bid is None or var_ask is None:
+            return None, None
+        var_buy_price, var_sell_price, _ = self.extract_variational_button_prices(quote)
+        if var_buy_price is None or var_sell_price is None:
+            var_buy_price = max(var_bid, var_ask)
+            var_sell_price = min(var_bid, var_ask)
+        return (
+            spread_percent(spread_value(var_buy_price, lighter_bid), var_buy_price),
+            spread_percent(spread_value(lighter_ask, var_sell_price), lighter_ask),
+        )
+
+    def extract_variational_button_prices(
+        self,
+        quote: dict[str, Any],
+    ) -> tuple[Decimal | None, Decimal | None, str]:
+        raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
+        candidates = nested_dicts(raw) + nested_dicts(quote)
+        buy_keys = (
+            "buy_price",
+            "buyPrice",
+            "long_price",
+            "longPrice",
+            "ask_price",
+            "askPrice",
+            "ask",
+            "best_ask",
+            "a",
+        )
+        sell_keys = (
+            "sell_price",
+            "sellPrice",
+            "short_price",
+            "shortPrice",
+            "bid_price",
+            "bidPrice",
+            "bid",
+            "best_bid",
+            "b",
+        )
+        for candidate in candidates:
+            buy_price = first_decimal_from_keys(candidate, buy_keys)
+            sell_price = first_decimal_from_keys(candidate, sell_keys)
+            if buy_price is not None and sell_price is not None:
+                if buy_price >= sell_price:
+                    return buy_price, sell_price, "button_or_quote_fields"
+                return sell_price, buy_price, "button_or_quote_fields_reordered"
+        return None, None, "unavailable"
+
+    def _log_variational_quote_diagnostic(
+        self,
+        quote: dict[str, Any],
+        *,
+        reason: str,
+        var_buy_price: Decimal | None,
+        var_sell_price: Decimal | None,
+        var_bid: Decimal | None,
+        var_ask: Decimal | None,
+        var_spread_source: str,
+    ) -> None:
+        now = time.monotonic()
+        if now - self._last_var_quote_diagnostic_at < VAR_QUOTE_DIAGNOSTIC_INTERVAL_SECONDS:
+            return
+        self._last_var_quote_diagnostic_at = now
+
+        raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
+
+        def short_keys(payload: dict[str, Any]) -> list[str]:
+            return sorted(str(key) for key in payload.keys())[:80]
+
+        nested_summary: list[dict[str, Any]] = []
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                nested_summary.append({"path": str(key), "keys": short_keys(value)})
+            elif isinstance(value, list):
+                first_dict = next((item for item in value if isinstance(item, dict)), None)
+                if first_dict is not None:
+                    nested_summary.append({"path": f"{key}[0]", "keys": short_keys(first_dict)})
+        nested_summary = nested_summary[:20]
+
+        self.logger.warning(
+            "var_quote_diagnostic reason=%s asset=%s source=%s source_url=%s source_stream=%s "
+            "var_bid=%s var_ask=%s var_buy=%s var_sell=%s quote_keys=%s raw_keys=%s nested=%s",
+            reason,
+            quote.get("asset"),
+            var_spread_source,
+            raw.get("__source_url"),
+            raw.get("__source_stream") or raw.get("__source_endpoint"),
+            decimal_to_str(var_bid),
+            decimal_to_str(var_ask),
+            decimal_to_str(var_buy_price),
+            decimal_to_str(var_sell_price),
+            short_keys(quote),
+            short_keys(raw),
+            json.dumps(nested_summary, ensure_ascii=True),
+        )
+
+    async def spread_loop(self) -> None:
+        while not self.stop_flag:
+            long_pct, short_pct = await self.get_raw_cross_spreads()
+            self._record_cross_spreads(long_pct, short_pct)
+            await asyncio.sleep(DASHBOARD_REFRESH_SECONDS)
+
+    async def get_cross_spread_snapshot(self) -> CrossSpreadSnapshot | None:
+        quote = await self.get_variational_quote(self.variational_ticker)
+        if quote is None:
+            return None
+        var_bid = to_decimal(quote.get("bid"))
+        var_ask = to_decimal(quote.get("ask"))
+        quote_asset = str(quote.get("asset", ""))
+        lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
+        if var_bid is None or var_ask is None or lighter_bid is None or lighter_ask is None:
+            return None
+
+        var_buy_price, var_sell_price, var_spread_source = self.extract_variational_button_prices(quote)
+        if var_buy_price is None or var_sell_price is None:
+            var_buy_price = max(var_bid, var_ask)
+            var_sell_price = min(var_bid, var_ask)
+            var_spread_source = "bid_ask_fallback"
+
+        asset = (quote_asset or self.variational_ticker or self.ticker or "UNKNOWN").upper()
+        var_mid = (var_buy_price + var_sell_price) / Decimal("2")
+        lighter_mid = (lighter_bid + lighter_ask) / Decimal("2")
+        lighter_buy_price = lighter_ask
+        lighter_sell_price = lighter_bid
+        planned_qty = self.paper_notional_usd / var_mid if var_mid > 0 else Decimal("0")
+        lighter_buy_fill_price = await self.estimate_lighter_fill_price("BUY", planned_qty) or lighter_buy_price
+        lighter_sell_fill_price = await self.estimate_lighter_fill_price("SELL", planned_qty) or lighter_sell_price
+        long_pct = spread_percent(spread_value(var_buy_price, lighter_sell_fill_price), var_buy_price)
+        short_pct = spread_percent(spread_value(lighter_buy_fill_price, var_sell_price), lighter_buy_fill_price)
+
+        long_median_5m = self._median_cross_spread(5 * 60, long_side=True)
+        short_median_5m = self._median_cross_spread(5 * 60, long_side=False)
+        long_median_pct = Decimal(str(long_median_5m)) if long_median_5m is not None else None
+        short_median_pct = Decimal(str(short_median_5m)) if short_median_5m is not None else None
+        long_count = self._cross_spread_sample_count(5 * 60, long_side=True)
+        short_count = self._cross_spread_sample_count(5 * 60, long_side=False)
+
+        var_full_spread = var_buy_price - var_sell_price
+        var_full_spread_pct = spread_percent(var_full_spread, var_mid)
+        var_full_spread_bps = decimal_percent_to_bps(var_full_spread_pct)
+        if var_full_spread_bps is None:
+            return None
+        var_half_spread_bps = var_full_spread_bps / Decimal("2")
+        lighter_full_spread_pct = spread_percent(lighter_buy_price - lighter_sell_price, lighter_mid)
+        lighter_full_spread_bps = decimal_percent_to_bps(lighter_full_spread_pct)
+        if lighter_full_spread_bps is None:
+            return None
+        lighter_half_spread_bps = lighter_full_spread_bps / Decimal("2")
+
+        if var_full_spread_bps == 0 or var_buy_price == var_sell_price:
+            self._log_variational_quote_diagnostic(
+                quote,
+                reason="zero_or_equal_var_button_spread",
+                var_buy_price=var_buy_price,
+                var_sell_price=var_sell_price,
+                var_bid=var_bid,
+                var_ask=var_ask,
+                var_spread_source=var_spread_source,
+            )
+
+        return CrossSpreadSnapshot(
+            asset=asset,
+            var_bid=var_bid,
+            var_ask=var_ask,
+            var_mid=var_mid,
+            var_half_spread_bps=var_half_spread_bps,
+            var_buy_price=var_buy_price,
+            var_sell_price=var_sell_price,
+            var_full_spread_bps=var_full_spread_bps,
+            var_spread_source=var_spread_source,
+            lighter_bid=lighter_bid,
+            lighter_ask=lighter_ask,
+            lighter_mid=lighter_mid,
+            lighter_buy_price=lighter_buy_price,
+            lighter_sell_price=lighter_sell_price,
+            lighter_half_spread_bps=lighter_half_spread_bps,
+            lighter_buy_fill_price=lighter_buy_fill_price,
+            lighter_sell_fill_price=lighter_sell_fill_price,
+            long_var_short_lighter_pct=long_pct,
+            short_var_long_lighter_pct=short_pct,
+            long_median_5m_pct=long_median_pct,
+            short_median_5m_pct=short_median_pct,
+            long_sample_count_5m=long_count,
+            short_sample_count_5m=short_count,
+        )
+
+    def _next_paper_opportunity_id(self) -> str:
+        self.paper_opportunity_counter += 1
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return f"paper_{stamp}_{self.paper_opportunity_counter:04d}"
+
+    async def _paper_depth_enough(self, direction: str, planned_qty: Decimal) -> tuple[bool, Decimal | None, Decimal | None]:
+        top_bid_size, top_ask_size = await self.get_lighter_top_sizes()
+        if direction == "long_var_short_lighter":
+            return top_bid_size is not None and top_bid_size >= planned_qty, top_bid_size, top_ask_size
+        if direction == "short_var_long_lighter":
+            return top_ask_size is not None and top_ask_size >= planned_qty, top_bid_size, top_ask_size
+        return False, top_bid_size, top_ask_size
+
+    async def maybe_enter_paper_position(self, snapshot: CrossSpreadSnapshot) -> None:
+        if self.paper_position is not None:
+            return
+        if self.paper_last_closed_monotonic is not None:
+            if time.monotonic() - self.paper_last_closed_monotonic < self.paper_cooldown_seconds:
+                return
+        if snapshot.var_half_spread_bps > self.paper_max_var_half_spread_bps:
+            return
+
+        candidate = paper_entry_candidate(snapshot, self.paper_entry_deviation_bps, self.paper_min_samples)
+        if candidate is None:
+            return
+        direction = candidate.direction
+        current_pct = candidate.current_pct
+        median_pct = candidate.median_pct
+        deviation_bps = candidate.deviation_bps
+        sample_count = candidate.sample_count
+        if snapshot.var_mid <= 0:
+            return
+        planned_qty = self.paper_notional_usd / snapshot.var_mid
+        depth_enough, top_bid_size, top_ask_size = await self._paper_depth_enough(direction, planned_qty)
+        if not depth_enough:
+            return
+        entry_var_execution_price, entry_lighter_execution_price = paper_entry_execution_prices(snapshot, direction)
+        entry_var_spread_cost_usd = paper_var_spread_cost_usd(snapshot, planned_qty)
+        entry_lighter_taker_cost_usd = paper_lighter_taker_cost_usd(snapshot, planned_qty)
+        entry_fee_usd = paper_fee_cost_usd(self.paper_notional_usd, self.paper_fee_bps_per_leg)
+        entry_latency_drift_cost_usd = paper_latency_drift_cost_usd(self.paper_notional_usd, self.paper_latency_drift_bps)
+
+        now_iso = utc_now()
+        opportunity_id = self._next_paper_opportunity_id()
+        self.paper_position = PaperPositionState(
+            opportunity_id=opportunity_id,
+            asset=snapshot.asset,
+            direction=direction,
+            entered_at_iso=now_iso,
+            entered_at_monotonic=time.monotonic(),
+            entry_spread_pct=current_pct,
+            entry_median_pct=median_pct,
+            entry_deviation_bps=deviation_bps,
+            entry_var_mid=snapshot.var_mid,
+            entry_lighter_mid=snapshot.lighter_mid,
+            entry_var_execution_price=entry_var_execution_price,
+            entry_lighter_execution_price=entry_lighter_execution_price,
+            entry_var_half_spread_bps=snapshot.var_half_spread_bps,
+            entry_var_spread_cost_usd=entry_var_spread_cost_usd,
+            entry_lighter_half_spread_bps=snapshot.lighter_half_spread_bps,
+            entry_lighter_taker_cost_usd=entry_lighter_taker_cost_usd,
+            entry_fee_usd=entry_fee_usd,
+            entry_latency_drift_cost_usd=entry_latency_drift_cost_usd,
+            planned_notional_usd=self.paper_notional_usd,
+            planned_qty=planned_qty,
+        )
+        await self.append_opportunity_log(
+            "paper_entered",
+            {
+                "record_kind": "paper_opportunity",
+                "opportunity_id": opportunity_id,
+                "opportunity_type": "mixed",
+                "execution_mode": "paper",
+                "asset": snapshot.asset,
+                "direction": direction,
+                "status": "paper_entered",
+                "entry_time": now_iso,
+                "entry_var_bid": decimal_to_str(snapshot.var_bid),
+                "entry_var_ask": decimal_to_str(snapshot.var_ask),
+                "entry_var_buy_price": decimal_to_str(snapshot.var_buy_price),
+                "entry_var_sell_price": decimal_to_str(snapshot.var_sell_price),
+                "entry_var_mid": decimal_to_str(snapshot.var_mid),
+                "entry_var_execution_price": decimal_to_str(entry_var_execution_price),
+                "entry_var_full_spread_bps": decimal_to_str(snapshot.var_full_spread_bps),
+                "entry_var_half_spread_bps": decimal_to_str(snapshot.var_half_spread_bps),
+                "entry_var_spread_source": snapshot.var_spread_source,
+                "entry_var_spread_cost_usd": decimal_to_str(entry_var_spread_cost_usd),
+                "entry_lighter_bid": decimal_to_str(snapshot.lighter_bid),
+                "entry_lighter_ask": decimal_to_str(snapshot.lighter_ask),
+                "entry_lighter_mid": decimal_to_str(snapshot.lighter_mid),
+                "entry_lighter_execution_price": decimal_to_str(entry_lighter_execution_price),
+                "entry_lighter_half_spread_bps": decimal_to_str(snapshot.lighter_half_spread_bps),
+                "entry_lighter_taker_cost_usd": decimal_to_str(entry_lighter_taker_cost_usd),
+                "entry_fee_usd": decimal_to_str(entry_fee_usd),
+                "entry_latency_drift_cost_usd": decimal_to_str(entry_latency_drift_cost_usd),
+                "entry_cross_exchange_spread_bps": decimal_to_str(decimal_percent_to_bps(current_pct)),
+                "entry_spread_median_bps": decimal_to_str(decimal_percent_to_bps(median_pct)),
+                "entry_spread_deviation_bps": decimal_to_str(deviation_bps),
+                "entry_deviation_threshold_bps": decimal_to_str(self.paper_entry_deviation_bps),
+                "spread_window_seconds": 300,
+                "spread_sample_count": sample_count,
+                "lighter_top_bid_size": decimal_to_str(top_bid_size),
+                "lighter_top_ask_size": decimal_to_str(top_ask_size),
+                "lighter_depth_enough": depth_enough,
+                "planned_notional_usd": decimal_to_str(self.paper_notional_usd),
+                "planned_qty": decimal_to_str(planned_qty),
+            },
+        )
+
+    async def maybe_close_paper_position(self, snapshot: CrossSpreadSnapshot) -> None:
+        position = self.paper_position
+        if position is None:
+            return
+        current_pct, median_pct, _ = self._paper_direction_values(snapshot, position.direction)
+        if current_pct is None or median_pct is None:
+            return
+        current_deviation_bps = decimal_percent_to_bps(current_pct - position.entry_median_pct)
+        holding_seconds = time.monotonic() - position.entered_at_monotonic
+        exit_reason: str | None = None
+        if current_deviation_bps <= self.paper_exit_deviation_bps:
+            exit_reason = "spread_reverted"
+        elif holding_seconds >= self.paper_max_holding_seconds:
+            exit_reason = "timeout_exit"
+        if exit_reason is None:
+            return
+
+        exit_var_execution_price, exit_lighter_execution_price = paper_exit_execution_prices(snapshot, position.direction)
+        signal_spread_pnl_usd = ((position.entry_spread_pct - current_pct) / Decimal("100")) * position.planned_notional_usd
+        exit_var_spread_cost_usd = paper_var_spread_cost_usd(snapshot, position.planned_qty)
+        exit_lighter_taker_cost_usd = paper_lighter_taker_cost_usd(snapshot, position.planned_qty)
+        exit_fee_usd = paper_fee_cost_usd(position.planned_notional_usd, self.paper_fee_bps_per_leg)
+        exit_latency_drift_cost_usd = paper_latency_drift_cost_usd(position.planned_notional_usd, self.paper_latency_drift_bps)
+        if position.direction == "long_var_short_lighter":
+            var_leg_pnl_usd = (exit_var_execution_price - position.entry_var_execution_price) * position.planned_qty
+            lighter_leg_pnl_usd = (position.entry_lighter_execution_price - exit_lighter_execution_price) * position.planned_qty
+        else:
+            var_leg_pnl_usd = (position.entry_var_execution_price - exit_var_execution_price) * position.planned_qty
+            lighter_leg_pnl_usd = (exit_lighter_execution_price - position.entry_lighter_execution_price) * position.planned_qty
+        gross_pair_pnl_usd = var_leg_pnl_usd + lighter_leg_pnl_usd
+        fees_usd = position.entry_fee_usd + exit_fee_usd
+        latency_drift_cost_usd = position.entry_latency_drift_cost_usd + exit_latency_drift_cost_usd
+        net_pnl = gross_pair_pnl_usd - fees_usd - latency_drift_cost_usd
+        now_iso = utc_now()
+        self.paper_position = None
+        self.paper_last_closed_monotonic = time.monotonic()
+        await self.append_opportunity_log(
+            "paper_closed",
+            {
+                "record_kind": "paper_opportunity",
+                "opportunity_id": position.opportunity_id,
+                "opportunity_type": "mixed",
+                "execution_mode": "paper",
+                "asset": position.asset,
+                "direction": position.direction,
+                "status": "paper_closed",
+                "entry_time": position.entered_at_iso,
+                "exit_time": now_iso,
+                "exit_reason": exit_reason,
+                "holding_seconds": f"{holding_seconds:.3f}",
+                "exit_var_bid": decimal_to_str(snapshot.var_bid),
+                "exit_var_ask": decimal_to_str(snapshot.var_ask),
+                "exit_var_buy_price": decimal_to_str(snapshot.var_buy_price),
+                "exit_var_sell_price": decimal_to_str(snapshot.var_sell_price),
+                "exit_var_mid": decimal_to_str(snapshot.var_mid),
+                "exit_var_execution_price": decimal_to_str(exit_var_execution_price),
+                "exit_var_full_spread_bps": decimal_to_str(snapshot.var_full_spread_bps),
+                "exit_var_half_spread_bps": decimal_to_str(snapshot.var_half_spread_bps),
+                "exit_var_spread_source": snapshot.var_spread_source,
+                "entry_var_spread_cost_usd": decimal_to_str(position.entry_var_spread_cost_usd),
+                "exit_var_spread_cost_usd": decimal_to_str(exit_var_spread_cost_usd),
+                "exit_lighter_bid": decimal_to_str(snapshot.lighter_bid),
+                "exit_lighter_ask": decimal_to_str(snapshot.lighter_ask),
+                "exit_lighter_mid": decimal_to_str(snapshot.lighter_mid),
+                "exit_lighter_execution_price": decimal_to_str(exit_lighter_execution_price),
+                "entry_lighter_taker_cost_usd": decimal_to_str(position.entry_lighter_taker_cost_usd),
+                "exit_lighter_taker_cost_usd": decimal_to_str(exit_lighter_taker_cost_usd),
+                "gross_lighter_taker_cost_usd": decimal_to_str(position.entry_lighter_taker_cost_usd + exit_lighter_taker_cost_usd),
+                "entry_fee_usd": decimal_to_str(position.entry_fee_usd),
+                "exit_fee_usd": decimal_to_str(exit_fee_usd),
+                "entry_latency_drift_cost_usd": decimal_to_str(position.entry_latency_drift_cost_usd),
+                "exit_latency_drift_cost_usd": decimal_to_str(exit_latency_drift_cost_usd),
+                "gross_latency_drift_cost_usd": decimal_to_str(latency_drift_cost_usd),
+                "entry_cross_exchange_spread_bps": decimal_to_str(decimal_percent_to_bps(position.entry_spread_pct)),
+                "exit_cross_exchange_spread_bps": decimal_to_str(decimal_percent_to_bps(current_pct)),
+                "entry_spread_median_bps": decimal_to_str(decimal_percent_to_bps(position.entry_median_pct)),
+                "exit_spread_median_bps": decimal_to_str(decimal_percent_to_bps(median_pct)),
+                "entry_spread_deviation_bps": decimal_to_str(position.entry_deviation_bps),
+                "exit_spread_deviation_bps": decimal_to_str(current_deviation_bps),
+                "exit_deviation_threshold_bps": decimal_to_str(self.paper_exit_deviation_bps),
+                "planned_notional_usd": decimal_to_str(position.planned_notional_usd),
+                "planned_qty": decimal_to_str(position.planned_qty),
+                "signal_spread_pnl_usd": decimal_to_str(signal_spread_pnl_usd),
+                "var_leg_pnl_usd": decimal_to_str(var_leg_pnl_usd),
+                "lighter_leg_pnl_usd": decimal_to_str(lighter_leg_pnl_usd),
+                "gross_pair_pnl_usd": decimal_to_str(gross_pair_pnl_usd),
+                "entry_spread_pnl_usd": decimal_to_str(gross_pair_pnl_usd),
+                "gross_var_spread_cost_usd": decimal_to_str(position.entry_var_spread_cost_usd + exit_var_spread_cost_usd),
+                "fees_usd": decimal_to_str(fees_usd),
+                "latency_drift_cost_usd": decimal_to_str(latency_drift_cost_usd),
+                "net_pnl_conservative_usd": decimal_to_str(net_pnl),
+                "final_status": "closed",
+            },
+        )
+
+    async def paper_loop(self) -> None:
+        while not self.stop_flag:
+            snapshot = await self.get_cross_spread_snapshot()
+            if snapshot is not None:
+                await self.maybe_close_paper_position(snapshot)
+                await self.maybe_enter_paper_position(snapshot)
+            await asyncio.sleep(self.paper_interval_seconds)
+
+    async def render_dashboard(self) -> Group:
+        health = self.build_health_status()
+        var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
+        lighter_bid, lighter_ask = (None, None)
+        if self.requires_lighter_market_data():
+            lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
         var_book_spread = spread_value(var_bid, var_ask)
         lighter_book_spread = spread_value(lighter_bid, lighter_ask)
         var_book_spread_pct = book_spread_percent(var_bid, var_ask)
@@ -926,10 +2500,6 @@ class VariationalToLighterRuntime:
 
         long_var_short_lighter_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
         short_var_long_lighter_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
-        self._record_cross_spreads(
-            long_var_short_lighter_pct,
-            short_var_long_lighter_pct,
-        )
 
         long_pct_median_5m = self._median_cross_spread(5 * 60, long_side=True)
         long_pct_median_30m = self._median_cross_spread(30 * 60, long_side=True)
@@ -944,9 +2514,7 @@ class VariationalToLighterRuntime:
 
         is_zh = self.args.lang == "zh"
         header_title = "Variational <-> Lighter"
-        auto_hedge_label = "自动对冲" if is_zh else "auto_hedge"
-        auto_hedge_on = "开" if is_zh else "ON"
-        auto_hedge_off = "关" if is_zh else "OFF"
+        mode_label = "模式" if is_zh else "mode"
         quote_title = "最优买一 / 卖一" if is_zh else "Best Bid / Ask"
         col_exchange = "交易所" if is_zh else "Exchange"
         col_bid = "买一" if is_zh else "Bid"
@@ -962,24 +2530,57 @@ class VariationalToLighterRuntime:
         col_median_1h_pct = "1小时中位数%" if is_zh else "Median 1h %"
         metric_long_short = "做多 Var / 做空 Lighter" if is_zh else "Long Var / Short Lighter"
         metric_short_long = "做空 Var / 做多 Lighter" if is_zh else "Short Var / Long Lighter"
+        health_title = "健康状态" if is_zh else "Health"
+        col_component = "组件" if is_zh else "Component"
+        col_health_status = "状态" if is_zh else "Status"
+        col_health_detail = "详情" if is_zh else "Detail"
         orders_title = "最近订单（最新在前）" if is_zh else "Recent Orders (latest first)"
         col_trade_id = "订单ID" if is_zh else "Trade ID"
         col_side = "方向" if is_zh else "Side"
         col_qty = "数量" if is_zh else "Qty"
         col_var_fill_px = "Var 成交价" if is_zh else "Var Fill Px"
         col_lighter_fill_px = "Lighter 成交价" if is_zh else "Lighter Fill Px"
+        col_stage = "处理阶段" if is_zh else "Stage"
+        col_stage_flow = "阶段轨迹" if is_zh else "Stage Flow"
+        col_failure = "失败原因" if is_zh else "Failure"
+        col_notional = "名义金额" if is_zh else "Notional"
         col_fill_diff = "成交价差(按方向)" if is_zh else "Fill Diff (Directional)"
         col_fill_diff_pct = "成交价差%(按方向)" if is_zh else "Fill Diff % (Directional)"
+        col_plan_slippage = "计划/实价偏差" if is_zh else "Plan/Fill Diff"
+        col_edge_bps = "对冲偏离bps" if is_zh else "Hedge Edge bps"
+        col_latency_ms = "成交耗时ms" if is_zh else "Fill Latency ms"
         no_orders_text = "（暂无订单）" if is_zh else "(no tracked orders yet)"
         variational_label = "Variational"
         lighter_label = "Lighter"
-        hedge_color = "green" if self.args.auto_hedge else "red"
-        hedge_text = auto_hedge_on if self.args.auto_hedge else auto_hedge_off
+        mode_color = "green" if self.is_live_mode() else ("yellow" if self.is_dry_run_mode() else "cyan")
+        risk_guard_label = "风控" if is_zh else "risk_guard"
+        risk_guard_text = (
+            f"{risk_guard_label}(max_base={self.risk_guard_max_base_amount}, "
+            f"max_dev_bps={self.risk_guard_max_price_deviation_bps})"
+        )
 
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
-            f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | {utc_now()}",
-            border_style="cyan",
+            f"[bold {mode_color}]{mode_label}={self.mode}[/] | "
+            f"[bold {self._status_color(health.overall)}]health={health.overall}[/] | "
+            f"{risk_guard_text} | {utc_now()}",
+            border_style=self._status_color(health.overall),
+        )
+
+        health_table = Table(title=health_title, show_header=True, expand=True)
+        health_table.add_column(col_component, style="bold")
+        health_table.add_column(col_health_status)
+        health_table.add_column(col_health_detail)
+        for component, status, detail in health.components:
+            color = self._status_color(status)
+            health_table.add_row(component, f"[{color}]{status}[/{color}]", detail)
+        health_table.add_row(
+            "risk_guard",
+            "configured",
+            (
+                f"max_base_amount={self.risk_guard_max_base_amount}, "
+                f"max_price_deviation_bps={self.risk_guard_max_price_deviation_bps}"
+            ),
         )
 
         quote_table = Table(title=quote_title, show_header=True, expand=True)
@@ -1045,12 +2646,26 @@ class VariationalToLighterRuntime:
         orders_table.add_column(col_qty, justify="right")
         orders_table.add_column(col_var_fill_px, justify="right")
         orders_table.add_column(col_lighter_fill_px, justify="right")
+        orders_table.add_column(col_stage)
+        orders_table.add_column(col_stage_flow)
+        orders_table.add_column(col_failure)
+        orders_table.add_column(col_notional, justify="right")
         orders_table.add_column(col_fill_diff, justify="right")
         orders_table.add_column(col_fill_diff_pct, justify="right")
+        orders_table.add_column(col_plan_slippage, justify="right")
+        orders_table.add_column(col_edge_bps, justify="right")
+        orders_table.add_column(col_latency_ms, justify="right")
 
         if not rows:
             orders_table.add_row(
                 no_orders_text,
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
                 "-",
                 "-",
                 "-",
@@ -1067,19 +2682,35 @@ class VariationalToLighterRuntime:
                     row.var_fill_price,
                     row.lighter_fill_price,
                 )
+                notional = self._notional_value(row.qty, row.var_fill_price)
+                plan_fill_diff, _ = self._price_diff(row.dry_run_plan_price, row.lighter_fill_price)
                 side_zh, side_en = self._direction_labels(row.side)
                 side_display = side_zh if is_zh else side_en
+                is_risk_blocked = self._is_risk_guard_failure(
+                    payload.get("failure_reason"),
+                    payload.get("failure_stage"),
+                )
+                trade_style = "[bold red]{}[/bold red]" if is_risk_blocked else "{}"
+                stage_style = "[bold yellow]{}[/bold yellow]" if is_risk_blocked else "{}"
+                failure_style = "[bold red]{}[/bold red]" if is_risk_blocked else "{}"
                 orders_table.add_row(
-                    trade_display,
+                    trade_style.format(trade_display),
                     side_display,
                     self._fmt_price(row.qty),
                     payload["variational_filled_price"] or "-",
                     payload["lighter_filled_price"] or "-",
+                    stage_style.format(self._fmt_stage(payload["processing_stage"])),
+                    stage_style.format(self._fmt_stage_history(payload.get("stage_history"))),
+                    failure_style.format(self._fmt_failure(payload["failure_reason"])),
+                    self._fmt_price(notional),
                     self._fmt_price(fill_diff),
                     self._fmt_pct(fill_diff_pct),
+                    self._fmt_price(plan_fill_diff),
+                    self._fmt_price(row.live_edge_bps),
+                    self._fmt_price(row.live_fill_latency_ms),
                 )
 
-        return Group(header, quote_table, spread_table, orders_table)
+        return Group(header, health_table, quote_table, spread_table, orders_table)
 
     async def export_trade_records_csv(self) -> None:
         if self.trade_records_csv_file is None:
@@ -1098,9 +2729,15 @@ class VariationalToLighterRuntime:
                     record.var_fill_price,
                     record.lighter_fill_price,
                 )
+                var_notional = self._notional_value(record.qty, record.var_fill_price)
+                lighter_notional = self._notional_value(record.qty, record.lighter_fill_price)
+                plan_fill_diff, plan_fill_diff_pct = self._price_diff(record.dry_run_plan_price, record.lighter_fill_price)
+                ref_bid_fill_diff, ref_bid_fill_diff_pct = self._price_diff(record.lighter_reference_bid, record.lighter_fill_price)
+                ref_ask_fill_diff, ref_ask_fill_diff_pct = self._price_diff(record.lighter_reference_ask, record.lighter_fill_price)
                 side_zh, side_en = self._direction_labels(record.side)
                 rows.append(
                     {
+                        "record_kind": payload["record_kind"],
                         "trade_key": record.trade_key,
                         "trade_id": record.trade_id,
                         "asset": record.asset,
@@ -1114,9 +2751,34 @@ class VariationalToLighterRuntime:
                         "lighter_client_order_id": payload["lighter_client_order_id"],
                         "lighter_filled_price": payload["lighter_filled_price"],
                         "lighter_filled_at": payload["lighter_filled_at"],
+                        "variational_notional": decimal_to_str(var_notional),
+                        "lighter_notional": decimal_to_str(lighter_notional),
+                        "live_notional_usd": payload["live_notional_usd"],
+                        "live_edge_bps": payload["live_edge_bps"],
+                        "live_fill_latency_ms": payload["live_fill_latency_ms"],
+                        "live_submit_started_at": payload["live_submit_started_at"],
+                        "hedge_completion_status": payload["hedge_completion_status"],
+                        "rollback_action": payload["rollback_action"],
                         "fill_diff_var_minus_lighter": decimal_to_str(fill_diff),
                         "fill_diff_pct_vs_var": decimal_to_str(fill_diff_pct),
-                        "auto_hedge_enabled": payload["auto_hedge_enabled"],
+                        "mode": payload["mode"],
+                        "lighter_reference_bid": payload["lighter_reference_bid"],
+                        "lighter_reference_ask": payload["lighter_reference_ask"],
+                        "dry_run_plan_side": payload["dry_run_plan_side"],
+                        "dry_run_plan_price": payload["dry_run_plan_price"],
+                        "dry_run_plan_base_amount": payload["dry_run_plan_base_amount"],
+                        "plan_vs_lighter_fill_diff": decimal_to_str(plan_fill_diff),
+                        "plan_vs_lighter_fill_diff_pct": decimal_to_str(plan_fill_diff_pct),
+                        "ref_bid_vs_lighter_fill_diff": decimal_to_str(ref_bid_fill_diff),
+                        "ref_bid_vs_lighter_fill_diff_pct": decimal_to_str(ref_bid_fill_diff_pct),
+                        "ref_ask_vs_lighter_fill_diff": decimal_to_str(ref_ask_fill_diff),
+                        "ref_ask_vs_lighter_fill_diff_pct": decimal_to_str(ref_ask_fill_diff_pct),
+                        "processing_stage": payload["processing_stage"],
+                        "stage_history": " -> ".join(payload.get("stage_history") or []),
+                        "failure_stage": payload["failure_stage"],
+                        "failure_reason": payload["failure_reason"],
+                        "record_created_at": payload["record_created_at"],
+                        "last_updated_at": payload["last_updated_at"],
                         "hedge_error": payload["hedge_error"],
                         "last_variational_status": payload["last_variational_status"],
                     }
@@ -1127,6 +2789,7 @@ class VariationalToLighterRuntime:
             return
 
         fieldnames = [
+            "record_kind",
             "trade_key",
             "trade_id",
             "asset",
@@ -1140,9 +2803,34 @@ class VariationalToLighterRuntime:
             "lighter_client_order_id",
             "lighter_filled_price",
             "lighter_filled_at",
+            "variational_notional",
+            "lighter_notional",
+            "live_notional_usd",
+            "live_edge_bps",
+            "live_fill_latency_ms",
+            "live_submit_started_at",
+            "hedge_completion_status",
+            "rollback_action",
             "fill_diff_var_minus_lighter",
             "fill_diff_pct_vs_var",
-            "auto_hedge_enabled",
+            "mode",
+            "lighter_reference_bid",
+            "lighter_reference_ask",
+            "dry_run_plan_side",
+            "dry_run_plan_price",
+            "dry_run_plan_base_amount",
+            "plan_vs_lighter_fill_diff",
+            "plan_vs_lighter_fill_diff_pct",
+            "ref_bid_vs_lighter_fill_diff",
+            "ref_bid_vs_lighter_fill_diff_pct",
+            "ref_ask_vs_lighter_fill_diff",
+            "ref_ask_vs_lighter_fill_diff_pct",
+            "processing_stage",
+            "stage_history",
+            "failure_stage",
+            "failure_reason",
+            "record_created_at",
+            "last_updated_at",
             "hedge_error",
             "last_variational_status",
         ]
@@ -1180,6 +2868,11 @@ class VariationalToLighterRuntime:
 
     async def run(self) -> None:
         self.setup_signal_handlers()
+        diagnostics = self.run_startup_diagnostics()
+        self.print_startup_diagnostics(diagnostics)
+        self.log_startup_diagnostics(diagnostics)
+        if diagnostics.blocking_errors:
+            raise RuntimeError("Startup diagnostics failed")
         await self.runtime.start()
         self.print_startup_next_steps()
         self.logger.info(
@@ -1190,16 +2883,32 @@ class VariationalToLighterRuntime:
             FORWARDER_REST_PORT,
         )
 
-        await self.wait_for_variational_ready()
-        self.logger.info("Variational heartbeat is live")
-        self.initialize_lighter_client()
-        initial_asset = await self.wait_for_ticker_resolution()
-        await self.activate_asset(initial_asset, reason="startup")
+        variational_ready = await self.wait_for_variational_ready()
+        if variational_ready:
+            self.logger.info("Variational heartbeat is live")
+        else:
+            self.logger.warning(
+                "Variational heartbeat did not arrive within %ss; continuing in stale state until browser events appear",
+                READY_TIMEOUT_SECONDS,
+            )
+        if self.requires_lighter_trading_credentials():
+            self.load_lighter_trading_credentials()
+            self.initialize_lighter_client()
+        if self.requires_lighter_market_data():
+            initial_asset = await self.wait_for_ticker_resolution()
+            await self.activate_asset(initial_asset, reason="startup")
 
         self.trade_event_cursor = await self.runtime.monitor.get_latest_trade_event_seq()
+        self.trade_event_min_timestamp = datetime.now(timezone.utc)
         self.logger.info("Tracking new Variational trade events from seq>%s", self.trade_event_cursor)
 
         self.trade_task = asyncio.create_task(self.trade_loop())
+        if self.requires_lighter_market_data():
+            self.spread_task = asyncio.create_task(self.spread_loop())
+        if self.is_live_mode():
+            self.watchdog_task = asyncio.create_task(self.watchdog_live_submissions())
+        if self.is_paper_mode():
+            self.paper_task = asyncio.create_task(self.paper_loop())
         self.dashboard_task = asyncio.create_task(self.dashboard_loop())
 
         while not self.stop_flag:
@@ -1215,6 +2924,18 @@ class VariationalToLighterRuntime:
         if self.trade_task and not self.trade_task.done():
             self.trade_task.cancel()
             await asyncio.gather(self.trade_task, return_exceptions=True)
+
+        if self.spread_task and not self.spread_task.done():
+            self.spread_task.cancel()
+            await asyncio.gather(self.spread_task, return_exceptions=True)
+
+        if self.paper_task and not self.paper_task.done():
+            self.paper_task.cancel()
+            await asyncio.gather(self.paper_task, return_exceptions=True)
+
+        if self.watchdog_task and not self.watchdog_task.done():
+            self.watchdog_task.cancel()
+            await asyncio.gather(self.watchdog_task, return_exceptions=True)
 
         if self.lighter_ws_task and not self.lighter_ws_task.done():
             self.lighter_ws_task.cancel()
@@ -1242,23 +2963,162 @@ def parse_args() -> argparse.Namespace:
         help="Dashboard language: zh (Chinese) or en (English). Default: zh",
     )
     parser.add_argument(
-        "--no-hedge",
-        action="store_false",
-        dest="auto_hedge",
-        help="Disable automatic Lighter hedge placement (default: enabled)",
+        "--mode",
+        choices=MODE_CHOICES,
+        default=MODE_OBSERVE,
+        help="Runtime mode: observe only, dry-run hedge simulation, or live hedge execution.",
     )
-    parser.set_defaults(auto_hedge=True)
-    return parser.parse_args()
+    parser.add_argument(
+        "--confirm-live",
+        action="store_true",
+        help="Required together with --mode live to allow real Lighter hedge orders.",
+    )
+    parser.add_argument(
+        "--risk-guard-max-base-amount",
+        type=int,
+        default=RISK_GUARD_MAX_BASE_AMOUNT,
+        help=(
+            "Maximum allowed Lighter base amount for hedge planning. "
+            f"Default: {RISK_GUARD_MAX_BASE_AMOUNT}"
+        ),
+    )
+    parser.add_argument(
+        "--risk-guard-max-price-deviation-bps",
+        type=float,
+        default=float(RISK_GUARD_MAX_PRICE_DEVIATION_BPS),
+        help=(
+            "Maximum allowed deviation between hedge plan price and Variational fill price, in bps. "
+            f"Default: {RISK_GUARD_MAX_PRICE_DEVIATION_BPS}"
+        ),
+    )
+    parser.add_argument(
+        "--live-max-notional-usd",
+        type=float,
+        default=float(DEFAULT_LIVE_MAX_NOTIONAL_USD),
+        help=(
+            "Maximum allowed per-order live notional in quote currency before blocking the hedge. Set 0 to disable. "
+            f"Default: {DEFAULT_LIVE_MAX_NOTIONAL_USD}"
+        ),
+    )
+    parser.add_argument(
+        "--live-max-qty",
+        type=float,
+        default=float(DEFAULT_LIVE_MAX_QTY),
+        help=(
+            "Maximum allowed per-order live qty before blocking the hedge. Set 0 to disable. "
+            f"Default: {DEFAULT_LIVE_MAX_QTY}"
+        ),
+    )
+    parser.add_argument(
+        "--live-require-min-edge-bps",
+        type=float,
+        default=float(DEFAULT_LIVE_REQUIRE_MIN_EDGE_BPS),
+        help=(
+            "Minimum required hedge deviation in bps for live orders. "
+            f"Default: {DEFAULT_LIVE_REQUIRE_MIN_EDGE_BPS}"
+        ),
+    )
+    parser.add_argument(
+        "--live-cooldown-seconds",
+        type=float,
+        default=DEFAULT_LIVE_COOLDOWN_SECONDS,
+        help=(
+            "Minimum cooldown between real live hedge submissions in seconds. "
+            f"Default: {DEFAULT_LIVE_COOLDOWN_SECONDS}"
+        ),
+    )
+    parser.add_argument(
+        "--live-submit-timeout-seconds",
+        type=float,
+        default=DEFAULT_LIVE_SUBMIT_TIMEOUT_SECONDS,
+        help=(
+            "Maximum time to wait for a live hedge to reach lighter_filled before marking it timed out. "
+            f"Default: {DEFAULT_LIVE_SUBMIT_TIMEOUT_SECONDS}"
+        ),
+    )
+    parser.add_argument(
+        "--live-allowed-assets",
+        default="BTC,SOL,ETH",
+        help="Comma-separated allowlist for live trading assets. Default: BTC,SOL,ETH",
+    )
+    parser.add_argument(
+        "--paper-notional-usd",
+        type=float,
+        default=float(DEFAULT_PAPER_NOTIONAL_USD),
+        help=f"Paper-mode simulated notional per opportunity. Default: {DEFAULT_PAPER_NOTIONAL_USD}",
+    )
+    parser.add_argument(
+        "--paper-entry-deviation-bps",
+        type=float,
+        default=float(DEFAULT_PAPER_ENTRY_DEVIATION_BPS),
+        help=f"Paper-mode entry threshold versus 5m spread median, in bps. Default: {DEFAULT_PAPER_ENTRY_DEVIATION_BPS}",
+    )
+    parser.add_argument(
+        "--paper-exit-deviation-bps",
+        type=float,
+        default=float(DEFAULT_PAPER_EXIT_DEVIATION_BPS),
+        help=f"Paper-mode exit threshold versus entry median, in bps. Default: {DEFAULT_PAPER_EXIT_DEVIATION_BPS}",
+    )
+    parser.add_argument(
+        "--paper-max-var-half-spread-bps",
+        type=float,
+        default=float(DEFAULT_PAPER_MAX_VAR_HALF_SPREAD_BPS),
+        help=f"Maximum allowed Variational half spread for paper entries, in bps. Default: {DEFAULT_PAPER_MAX_VAR_HALF_SPREAD_BPS}",
+    )
+    parser.add_argument(
+        "--paper-max-holding-seconds",
+        type=float,
+        default=DEFAULT_PAPER_MAX_HOLDING_SECONDS,
+        help=f"Maximum simulated holding time before timeout exit. Default: {DEFAULT_PAPER_MAX_HOLDING_SECONDS}",
+    )
+    parser.add_argument(
+        "--paper-cooldown-seconds",
+        type=float,
+        default=DEFAULT_PAPER_COOLDOWN_SECONDS,
+        help=f"Cooldown after a paper close before another entry. Default: {DEFAULT_PAPER_COOLDOWN_SECONDS}",
+    )
+    parser.add_argument(
+        "--paper-min-samples",
+        type=int,
+        default=DEFAULT_PAPER_MIN_SAMPLES,
+        help=f"Minimum 5m spread samples before paper entry. Default: {DEFAULT_PAPER_MIN_SAMPLES}",
+    )
+    parser.add_argument(
+        "--paper-interval-seconds",
+        type=float,
+        default=DEFAULT_PAPER_INTERVAL_SECONDS,
+        help=f"Paper-mode evaluation interval. Default: {DEFAULT_PAPER_INTERVAL_SECONDS}",
+    )
+    parser.add_argument(
+        "--paper-fee-bps-per-leg",
+        type=float,
+        default=0.5,
+        help="Paper-mode fee bps per leg, applied on entry and exit. Default: 0.5",
+    )
+    parser.add_argument(
+        "--paper-latency-drift-bps",
+        type=float,
+        default=float(DEFAULT_PAPER_LATENCY_DRIFT_BPS),
+        help=f"Paper-mode extra latency drift penalty in bps per side. Default: {DEFAULT_PAPER_LATENCY_DRIFT_BPS}",
+    )
+    args = parser.parse_args()
+    if args.mode == MODE_LIVE and not args.confirm_live:
+        parser.error("--mode live requires --confirm-live")
+    return args
 
 
 async def _amain() -> None:
     load_dotenv()
     args = parse_args()
+    owner_pid = acquire_instance_lock(INSTANCE_LOCK_FILE)
     runtime = VariationalToLighterRuntime(args)
     try:
         await runtime.run()
     finally:
-        await runtime.close()
+        try:
+            await runtime.close()
+        finally:
+            release_instance_lock(INSTANCE_LOCK_FILE, owner_pid)
 
 
 def main() -> None:
