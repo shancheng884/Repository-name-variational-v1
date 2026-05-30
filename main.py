@@ -727,6 +727,19 @@ class VariationalToLighterRuntime:
             title = "Startup Guide"
         self.dashboard_console.print(Panel("\n".join(lines), title=title, border_style="yellow"))
 
+    def track_background_task(self, task: asyncio.Task[None], name: str) -> asyncio.Task[None]:
+        task.add_done_callback(lambda completed: self._handle_background_task_done(name, completed))
+        return task
+
+    def _handle_background_task_done(self, name: str, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        self.logger.exception("background_task_failed: %s", name, exc_info=exc)
+        self.stop_flag = True
+
     def run_startup_diagnostics(self) -> StartupDiagnostics:
         passed: list[str] = []
         warnings: list[str] = []
@@ -2522,12 +2535,18 @@ class VariationalToLighterRuntime:
         )
 
     async def paper_loop(self) -> None:
-        while not self.stop_flag:
-            snapshot = await self.get_cross_spread_snapshot()
-            if snapshot is not None:
-                await self.maybe_close_paper_position(snapshot)
-                await self.maybe_enter_paper_position(snapshot)
-            await asyncio.sleep(self.paper_interval_seconds)
+        try:
+            while not self.stop_flag:
+                snapshot = await self.get_cross_spread_snapshot()
+                if snapshot is not None:
+                    await self.maybe_close_paper_position(snapshot)
+                    await self.maybe_enter_paper_position(snapshot)
+                await asyncio.sleep(self.paper_interval_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.exception("paper_loop_failed")
+            raise
 
     async def render_dashboard(self) -> Group:
         health = self.build_health_status()
@@ -2947,14 +2966,14 @@ class VariationalToLighterRuntime:
         self.trade_event_min_timestamp = datetime.now(timezone.utc)
         self.logger.info("Tracking new Variational trade events from seq>%s", self.trade_event_cursor)
 
-        self.trade_task = asyncio.create_task(self.trade_loop())
+        self.trade_task = self.track_background_task(asyncio.create_task(self.trade_loop()), "trade_loop")
         if self.requires_lighter_market_data():
-            self.spread_task = asyncio.create_task(self.spread_loop())
+            self.spread_task = self.track_background_task(asyncio.create_task(self.spread_loop()), "spread_loop")
         if self.is_live_mode():
-            self.watchdog_task = asyncio.create_task(self.watchdog_live_submissions())
+            self.watchdog_task = self.track_background_task(asyncio.create_task(self.watchdog_live_submissions()), "watchdog_live_submissions")
         if self.is_paper_mode():
-            self.paper_task = asyncio.create_task(self.paper_loop())
-        self.dashboard_task = asyncio.create_task(self.dashboard_loop())
+            self.paper_task = self.track_background_task(asyncio.create_task(self.paper_loop()), "paper_loop")
+        self.dashboard_task = self.track_background_task(asyncio.create_task(self.dashboard_loop()), "dashboard_loop")
 
         while not self.stop_flag:
             await asyncio.sleep(0.25)
