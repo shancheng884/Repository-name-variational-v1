@@ -32,6 +32,7 @@ from variational.listener import (
 from paper_engine import (
     PaperEntryCandidate,
     PaperPositionState,
+    percent_to_bps,
     paper_direction_values,
     paper_entry_candidate,
     paper_entry_execution_prices,
@@ -157,9 +158,7 @@ def decimal_to_str(value: Decimal | None) -> str | None:
 
 
 def decimal_percent_to_bps(value: Decimal | None) -> Decimal | None:
-    if value is None:
-        return None
-    return value * Decimal("100")
+    return percent_to_bps(value)
 
 
 def find_open_paper_opportunity_ids(path: Path | None) -> list[str]:
@@ -3201,6 +3200,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.mode == MODE_LIVE and not args.confirm_live:
         parser.error("--mode live requires --confirm-live")
+    if args.mode == MODE_LIVE and args.live_max_notional_usd <= 0:
+        parser.error("--mode live requires --live-max-notional-usd to be set to a positive small-test limit")
     return args
 
 

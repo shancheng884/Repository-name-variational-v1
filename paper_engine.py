@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 
+def percent_to_bps(value: Decimal | None) -> Decimal | None:
+    if value is None:
+        return None
+    return value * Decimal("100")
+
+
 @dataclass(slots=True)
 class PaperEntryCandidate:
     direction: str
@@ -51,7 +57,9 @@ def paper_entry_candidate(snapshot, min_deviation_bps: Decimal, min_samples: int
         current_pct, median_pct, sample_count = paper_direction_values(snapshot, direction)
         if current_pct is None or median_pct is None:
             continue
-        deviation_bps = (current_pct - median_pct) * Decimal("10000")
+        deviation_bps = percent_to_bps(current_pct - median_pct)
+        if deviation_bps is None:
+            continue
         if deviation_bps >= min_deviation_bps and sample_count >= min_samples:
             candidates.append(
                 PaperEntryCandidate(
