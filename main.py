@@ -161,6 +161,36 @@ def decimal_percent_to_bps(value: Decimal | None) -> Decimal | None:
     return value * Decimal("100")
 
 
+def find_open_paper_opportunity_ids(path: Path | None) -> list[str]:
+    if path is None or not path.exists():
+        return []
+
+    open_ids: set[str] = set()
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("record_kind") != "paper_opportunity":
+                    continue
+                opportunity_id = str(row.get("opportunity_id", "")).strip()
+                if not opportunity_id:
+                    continue
+                status = str(row.get("status", "")).strip()
+                if status == "paper_entered":
+                    open_ids.add(opportunity_id)
+                elif status == "paper_closed":
+                    open_ids.discard(opportunity_id)
+    except OSError:
+        return []
+    return sorted(open_ids)
+
+
 def first_decimal_from_keys(payload: dict[str, Any], keys: tuple[str, ...]) -> Decimal | None:
     for key in keys:
         if key in payload:
@@ -721,6 +751,13 @@ class VariationalToLighterRuntime:
 
         if self.is_paper_mode():
             passed.append("paper_mode_auto_simulates_opportunities_without_real_orders")
+            open_paper_ids = find_open_paper_opportunity_ids(self.opportunities_file)
+            if open_paper_ids:
+                blocking_errors.append(
+                    "paper_resume_guard_open_positions_detected: "
+                    + ",".join(open_paper_ids)
+                    + " | close or archive old paper logs before restarting paper mode"
+                )
 
         if self.requires_lighter_market_data():
             passed.append(f"lighter_market_data_required_for_mode={self.mode}")
