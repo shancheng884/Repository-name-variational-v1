@@ -32,6 +32,7 @@ from variational.listener import (
 from paper_engine import (
     PaperEntryCandidate,
     PaperPositionState,
+    paper_direction_values,
     paper_entry_candidate,
     paper_entry_execution_prices,
     paper_exit_execution_prices,
@@ -2444,7 +2445,7 @@ class VariationalToLighterRuntime:
         if holding_seconds >= self.paper_max_holding_seconds:
             exit_reason = "timeout_exit"
         else:
-            current_pct, median_pct, _ = self._paper_direction_values(snapshot, position.direction)
+            current_pct, median_pct, _ = paper_direction_values(snapshot, position.direction)
             if current_pct is None or median_pct is None:
                 return
             current_deviation_bps = decimal_percent_to_bps(current_pct - position.entry_median_pct)
