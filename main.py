@@ -2385,21 +2385,29 @@ class VariationalToLighterRuntime:
         position = self.paper_position
         if position is None:
             return
-        current_pct, median_pct, _ = self._paper_direction_values(snapshot, position.direction)
-        if current_pct is None or median_pct is None:
-            return
-        current_deviation_bps = decimal_percent_to_bps(current_pct - position.entry_median_pct)
         holding_seconds = time.monotonic() - position.entered_at_monotonic
         exit_reason: str | None = None
-        if current_deviation_bps <= self.paper_exit_deviation_bps:
-            exit_reason = "spread_reverted"
-        elif holding_seconds >= self.paper_max_holding_seconds:
+        current_pct: Decimal | None = None
+        median_pct: Decimal | None = None
+        current_deviation_bps: Decimal | None = None
+
+        if holding_seconds >= self.paper_max_holding_seconds:
             exit_reason = "timeout_exit"
+        else:
+            current_pct, median_pct, _ = self._paper_direction_values(snapshot, position.direction)
+            if current_pct is None or median_pct is None:
+                return
+            current_deviation_bps = decimal_percent_to_bps(current_pct - position.entry_median_pct)
+            if current_deviation_bps <= self.paper_exit_deviation_bps:
+                exit_reason = "spread_reverted"
         if exit_reason is None:
             return
 
         exit_var_execution_price, exit_lighter_execution_price = paper_exit_execution_prices(snapshot, position.direction)
-        signal_spread_pnl_usd = ((position.entry_spread_pct - current_pct) / Decimal("100")) * position.planned_notional_usd
+        if current_pct is not None:
+            signal_spread_pnl_usd = ((position.entry_spread_pct - current_pct) / Decimal("100")) * position.planned_notional_usd
+        else:
+            signal_spread_pnl_usd = None
         exit_var_spread_cost_usd = paper_var_spread_cost_usd(snapshot, position.planned_qty)
         exit_lighter_taker_cost_usd = paper_lighter_taker_cost_usd(snapshot, position.planned_qty)
         exit_fee_usd = paper_fee_cost_usd(position.planned_notional_usd, self.paper_fee_bps_per_leg)
