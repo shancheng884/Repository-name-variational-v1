@@ -49,6 +49,7 @@ def summarize(rows: list[dict[str, Any]], assets: set[str], since: str) -> dict[
         "paper": {
             "closed": 0,
             "open": 0,
+            "open_by_id": {},
             "net_pnl": [],
             "gross_pnl": [],
             "fees": [],
@@ -78,16 +79,20 @@ def summarize(rows: list[dict[str, Any]], assets: set[str], since: str) -> dict[
         record_kind = clean_text(row.get("record_kind", ""))
         if record_kind == "paper_opportunity":
             status = clean_text(row.get("status", "")) or clean_text(row.get("final_status", ""))
+            opportunity_id = clean_text(row.get("opportunity_id", ""))
             net_pnl = to_decimal(row.get("net_pnl_usd")) or to_decimal(row.get("net_pnl_conservative_usd"))
             gross_pnl = to_decimal(row.get("gross_pnl_usd")) or to_decimal(row.get("entry_spread_pnl_usd"))
             fees = to_decimal(row.get("fees_usd"))
             bucket = data["paper"]
             bucket["by_status"][status or "unknown"] += 1
-            bucket["by_asset"][asset]["closed" if status == "paper_closed" else "open"] += 1
             if status == "paper_closed":
                 bucket["closed"] += 1
+                bucket["by_asset"][asset]["closed"] += 1
+                if opportunity_id:
+                    bucket["open_by_id"].pop(opportunity_id, None)
             else:
-                bucket["open"] += 1
+                if opportunity_id:
+                    bucket["open_by_id"][opportunity_id] = asset
             if net_pnl is not None:
                 bucket["net_pnl"].append(net_pnl)
                 bucket["by_asset"][asset]["net_pnl"].append(net_pnl)
@@ -123,6 +128,10 @@ def summarize(rows: list[dict[str, Any]], assets: set[str], since: str) -> dict[
         if rollback_action:
             bucket["rollback_actions"][rollback_action] += 1
 
+    paper = data["paper"]
+    paper["open"] = len(paper["open_by_id"])
+    for asset in paper["open_by_id"].values():
+        paper["by_asset"][asset]["open"] += 1
     return data
 
 
