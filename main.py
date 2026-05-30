@@ -2364,6 +2364,7 @@ class VariationalToLighterRuntime:
         entry_lighter_taker_cost_usd = paper_lighter_taker_cost_usd(snapshot, planned_qty)
         entry_fee_usd = paper_fee_cost_usd(self.paper_notional_usd, self.paper_fee_bps_per_leg)
         entry_latency_drift_cost_usd = paper_latency_drift_cost_usd(self.paper_notional_usd, self.paper_latency_drift_bps)
+        lighter_book_age_seconds = self._lighter_order_book_age_seconds()
 
         now_iso = utc_now()
         opportunity_id = self._next_paper_opportunity_id()
@@ -2413,11 +2414,19 @@ class VariationalToLighterRuntime:
                 "entry_lighter_bid": decimal_to_str(snapshot.lighter_bid),
                 "entry_lighter_ask": decimal_to_str(snapshot.lighter_ask),
                 "entry_lighter_mid": decimal_to_str(snapshot.lighter_mid),
+                "entry_lighter_buy_fill_price": decimal_to_str(snapshot.lighter_buy_fill_price),
+                "entry_lighter_sell_fill_price": decimal_to_str(snapshot.lighter_sell_fill_price),
                 "entry_lighter_execution_price": decimal_to_str(entry_lighter_execution_price),
                 "entry_lighter_half_spread_bps": decimal_to_str(snapshot.lighter_half_spread_bps),
                 "entry_lighter_taker_cost_usd": decimal_to_str(entry_lighter_taker_cost_usd),
                 "entry_fee_usd": decimal_to_str(entry_fee_usd),
                 "entry_latency_drift_cost_usd": decimal_to_str(entry_latency_drift_cost_usd),
+                "entry_long_var_short_lighter_bps": decimal_to_str(
+                    decimal_percent_to_bps(snapshot.long_var_short_lighter_pct)
+                ),
+                "entry_short_var_long_lighter_bps": decimal_to_str(
+                    decimal_percent_to_bps(snapshot.short_var_long_lighter_pct)
+                ),
                 "entry_cross_exchange_spread_bps": decimal_to_str(decimal_percent_to_bps(current_pct)),
                 "entry_spread_median_bps": decimal_to_str(decimal_percent_to_bps(median_pct)),
                 "entry_spread_deviation_bps": decimal_to_str(deviation_bps),
@@ -2427,6 +2436,9 @@ class VariationalToLighterRuntime:
                 "lighter_top_bid_size": decimal_to_str(top_bid_size),
                 "lighter_top_ask_size": decimal_to_str(top_ask_size),
                 "lighter_depth_enough": depth_enough,
+                "lighter_order_book_age_seconds": f"{lighter_book_age_seconds:.3f}"
+                if lighter_book_age_seconds is not None
+                else None,
                 "planned_notional_usd": decimal_to_str(self.paper_notional_usd),
                 "planned_qty": decimal_to_str(planned_qty),
             },
@@ -2463,6 +2475,12 @@ class VariationalToLighterRuntime:
         exit_lighter_taker_cost_usd = paper_lighter_taker_cost_usd(snapshot, position.planned_qty)
         exit_fee_usd = paper_fee_cost_usd(position.planned_notional_usd, self.paper_fee_bps_per_leg)
         exit_latency_drift_cost_usd = paper_latency_drift_cost_usd(position.planned_notional_usd, self.paper_latency_drift_bps)
+        exit_top_bid_size, exit_top_ask_size = await self.get_lighter_top_sizes()
+        if position.direction == "long_var_short_lighter":
+            exit_lighter_depth_enough = exit_top_ask_size is not None and exit_top_ask_size >= position.planned_qty
+        else:
+            exit_lighter_depth_enough = exit_top_bid_size is not None and exit_top_bid_size >= position.planned_qty
+        lighter_book_age_seconds = self._lighter_order_book_age_seconds()
         if position.direction == "long_var_short_lighter":
             var_leg_pnl_usd = (exit_var_execution_price - position.entry_var_execution_price) * position.planned_qty
             lighter_leg_pnl_usd = (position.entry_lighter_execution_price - exit_lighter_execution_price) * position.planned_qty
@@ -2504,6 +2522,8 @@ class VariationalToLighterRuntime:
                 "exit_lighter_bid": decimal_to_str(snapshot.lighter_bid),
                 "exit_lighter_ask": decimal_to_str(snapshot.lighter_ask),
                 "exit_lighter_mid": decimal_to_str(snapshot.lighter_mid),
+                "exit_lighter_buy_fill_price": decimal_to_str(snapshot.lighter_buy_fill_price),
+                "exit_lighter_sell_fill_price": decimal_to_str(snapshot.lighter_sell_fill_price),
                 "exit_lighter_execution_price": decimal_to_str(exit_lighter_execution_price),
                 "entry_lighter_taker_cost_usd": decimal_to_str(position.entry_lighter_taker_cost_usd),
                 "exit_lighter_taker_cost_usd": decimal_to_str(exit_lighter_taker_cost_usd),
@@ -2513,6 +2533,12 @@ class VariationalToLighterRuntime:
                 "entry_latency_drift_cost_usd": decimal_to_str(position.entry_latency_drift_cost_usd),
                 "exit_latency_drift_cost_usd": decimal_to_str(exit_latency_drift_cost_usd),
                 "gross_latency_drift_cost_usd": decimal_to_str(latency_drift_cost_usd),
+                "exit_long_var_short_lighter_bps": decimal_to_str(
+                    decimal_percent_to_bps(snapshot.long_var_short_lighter_pct)
+                ),
+                "exit_short_var_long_lighter_bps": decimal_to_str(
+                    decimal_percent_to_bps(snapshot.short_var_long_lighter_pct)
+                ),
                 "entry_cross_exchange_spread_bps": decimal_to_str(decimal_percent_to_bps(position.entry_spread_pct)),
                 "exit_cross_exchange_spread_bps": decimal_to_str(decimal_percent_to_bps(current_pct)),
                 "entry_spread_median_bps": decimal_to_str(decimal_percent_to_bps(position.entry_median_pct)),
@@ -2520,6 +2546,12 @@ class VariationalToLighterRuntime:
                 "entry_spread_deviation_bps": decimal_to_str(position.entry_deviation_bps),
                 "exit_spread_deviation_bps": decimal_to_str(current_deviation_bps),
                 "exit_deviation_threshold_bps": decimal_to_str(self.paper_exit_deviation_bps),
+                "exit_lighter_top_bid_size": decimal_to_str(exit_top_bid_size),
+                "exit_lighter_top_ask_size": decimal_to_str(exit_top_ask_size),
+                "exit_lighter_depth_enough": exit_lighter_depth_enough,
+                "exit_lighter_order_book_age_seconds": f"{lighter_book_age_seconds:.3f}"
+                if lighter_book_age_seconds is not None
+                else None,
                 "planned_notional_usd": decimal_to_str(position.planned_notional_usd),
                 "planned_qty": decimal_to_str(position.planned_qty),
                 "signal_spread_pnl_usd": decimal_to_str(signal_spread_pnl_usd),

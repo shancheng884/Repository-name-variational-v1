@@ -155,12 +155,38 @@ def group_by_opportunity(events: list[dict[str, Any]]) -> dict[str, dict[str, An
     return grouped
 
 
+def filter_by_exit_reason(
+    grouped: dict[str, dict[str, Any]], exit_reason_filter: set[str]
+) -> dict[str, dict[str, Any]]:
+    if not exit_reason_filter:
+        return grouped
+    filtered: dict[str, dict[str, Any]] = {}
+    for opportunity_id, bucket in grouped.items():
+        closed = bucket.get("closed")
+        if not closed:
+            continue
+        exit_reason = clean_text(closed.get("exit_reason", "")).lower()
+        if exit_reason in exit_reason_filter:
+            filtered[opportunity_id] = bucket
+    return filtered
+
+
 def summarize(grouped: dict[str, dict[str, Any]], fee_bps: Decimal) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "total_opportunities": len(grouped),
         "closed_opportunities": 0,
         "open_opportunities": 0,
         "exit_reasons": Counter(),
+        "by_exit_reason": defaultdict(
+            lambda: {
+                "count": 0,
+                "gross_pnl": [],
+                "net_pnl": [],
+                "fee_adjusted_pnl": [],
+                "var_spread_cost": [],
+                "holding": [],
+            }
+        ),
         "by_direction": defaultdict(
             lambda: {
                 "count": 0,
@@ -227,7 +253,11 @@ def summarize(grouped: dict[str, dict[str, Any]], fee_bps: Decimal) -> dict[str,
             fee_usd = notional * fee_bps / Decimal("10000") * Decimal("4")
         adjusted = pnl - fee_usd if pnl is not None else None
 
-        for target in (summary["by_direction"][direction], summary["by_asset"][asset]):
+        for target in (
+            summary["by_direction"][direction],
+            summary["by_asset"][asset],
+            summary["by_exit_reason"][exit_reason],
+        ):
             target["count"] += 1
             if gross_pnl is not None:
                 target["gross_pnl"].append(gross_pnl)
@@ -348,6 +378,11 @@ def main() -> int:
         help="Optional comma-separated direction filter, e.g. long_var_short_lighter,short_var_long_lighter",
     )
     parser.add_argument(
+        "--exit-reason",
+        default="",
+        help="Optional comma-separated exit reason filter, e.g. spread_reverted,timeout_exit",
+    )
+    parser.add_argument(
         "--date",
         default="",
         help="Optional UTC date filter, e.g. 2026-05-25",
@@ -396,6 +431,7 @@ def main() -> int:
     jsonl_path = Path(args.jsonl)
     assets = {item.strip().upper() for item in args.assets.split(",") if item.strip()}
     directions = {item.strip().lower() for item in args.direction.split(",") if item.strip()}
+    exit_reasons = {item.strip().lower() for item in args.exit_reason.split(",") if item.strip()}
     fee_bps = Decimal(str(args.fee_bps))
     min_entry_dev_bps = Decimal(str(args.min_entry_dev_bps)) if args.min_entry_dev_bps is not None else None
     max_holding_seconds = Decimal(str(args.max_holding_seconds)) if args.max_holding_seconds is not None else None
@@ -410,6 +446,7 @@ def main() -> int:
         max_holding_seconds,
     )
     grouped = group_by_opportunity(events)
+    grouped = filter_by_exit_reason(grouped, exit_reasons)
     summary = summarize(grouped, fee_bps)
     avg_gross_pnl = avg(summary["gross_pnl"])
     median_gross_pnl = median(summary["gross_pnl"])
@@ -432,6 +469,7 @@ def main() -> int:
             "since_filter": args.since.strip(),
             "assets": ",".join(sorted(assets)),
             "directions": ",".join(sorted(directions)),
+            "exit_reasons": ",".join(sorted(exit_reasons)),
             "fee_bps": str(fee_bps),
             "min_entry_dev_bps": "" if min_entry_dev_bps is None else str(min_entry_dev_bps),
             "max_holding_seconds": "" if max_holding_seconds is None else str(max_holding_seconds),
@@ -467,6 +505,8 @@ def main() -> int:
         print(f"Asset filter: {','.join(sorted(assets))}")
     if directions:
         print(f"Direction filter: {','.join(sorted(directions))}")
+    if exit_reasons:
+        print(f"Exit reason filter: {','.join(sorted(exit_reasons))}")
     if min_entry_dev_bps is not None:
         print(f"Min entry deviation bps: {min_entry_dev_bps}")
     if max_holding_seconds is not None:
@@ -505,6 +545,7 @@ def main() -> int:
 
         print_bucket_table("by asset", summary["by_asset"])
         print_bucket_table("by direction", summary["by_direction"])
+        print_bucket_table("by exit reason", summary["by_exit_reason"])
         print_recent_closed(grouped, args.recent)
     return 0
 
