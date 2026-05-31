@@ -838,6 +838,10 @@ class VariationalToLighterRuntime:
             f"{remaining_seconds:.3f}" if remaining_seconds is not None else "-",
         )
 
+    @staticmethod
+    def auto_live_eager_hedge_started(record: OrderLifecycle | None) -> bool:
+        return record is not None and record.processing_stage in {STAGE_LIVE_SUBMIT_SENT, STAGE_LIGHTER_FILLED}
+
     def requires_lighter_market_data(self) -> bool:
         return self.is_dry_run_mode() or self.is_live_mode() or self.is_paper_mode()
 
@@ -2970,6 +2974,7 @@ class VariationalToLighterRuntime:
                 self.logger.warning("auto_live_var_submit_failed side=%s error=%s", var_side, result.get("error"))
                 return
 
+            entry_eager_started = not self.auto_live_eager_hedge
             if self.auto_live_eager_hedge:
                 lighter_record, payload = await self.place_lighter_order_from_plan(
                     asset=snapshot.asset,
@@ -2979,7 +2984,8 @@ class VariationalToLighterRuntime:
                     cycle_id=cycle_id,
                     role="entry",
                 )
-                if lighter_record is not None:
+                entry_eager_started = self.auto_live_eager_hedge_started(lighter_record)
+                if lighter_record is not None and entry_eager_started:
                     self.pending_auto_live_matches.append(
                         PendingAutoLiveMatch(
                             record_key=lighter_record.trade_key,
@@ -3001,6 +3007,27 @@ class VariationalToLighterRuntime:
                             payload.get("processing_stage"),
                             lighter_record.trade_key,
                         )
+                elif lighter_record is not None:
+                    self.logger.warning(
+                        "auto_live_entry_eager_hedge_failed cycle_id=%s asset=%s side=%s qty=%s stage=%s failure_reason=%s",
+                        cycle_id,
+                        snapshot.asset,
+                        var_side,
+                        order_qty,
+                        lighter_record.processing_stage,
+                        lighter_record.failure_reason or lighter_record.hedge_error or "unknown",
+                    )
+                    return
+
+            if not entry_eager_started:
+                self.logger.warning(
+                    "auto_live_entry_eager_hedge_failed cycle_id=%s asset=%s side=%s qty=%s stage=not_started failure_reason=no_lighter_record",
+                    cycle_id,
+                    snapshot.asset,
+                    var_side,
+                    order_qty,
+                )
+                return
 
             entry_var_execution_price, entry_lighter_execution_price = paper_entry_execution_prices(snapshot, direction)
             self.auto_live_position = AutoLivePositionState(
@@ -3068,6 +3095,7 @@ class VariationalToLighterRuntime:
                 result.get("error"),
             )
             return
+        exit_eager_started = not self.auto_live_eager_hedge
         if self.auto_live_eager_hedge:
             lighter_record, payload = await self.place_lighter_order_from_plan(
                 asset=snapshot.asset,
@@ -3077,7 +3105,8 @@ class VariationalToLighterRuntime:
                 cycle_id=position.cycle_id,
                 role="exit",
             )
-            if lighter_record is not None:
+            exit_eager_started = self.auto_live_eager_hedge_started(lighter_record)
+            if lighter_record is not None and exit_eager_started:
                 self.pending_auto_live_matches.append(
                     PendingAutoLiveMatch(
                         record_key=lighter_record.trade_key,
@@ -3099,6 +3128,26 @@ class VariationalToLighterRuntime:
                         payload.get("processing_stage"),
                         lighter_record.trade_key,
                     )
+            elif lighter_record is not None:
+                self.logger.warning(
+                    "auto_live_exit_eager_hedge_failed cycle_id=%s asset=%s side=%s qty=%s stage=%s failure_reason=%s",
+                    position.cycle_id,
+                    snapshot.asset,
+                    exit_side,
+                    position.planned_qty,
+                    lighter_record.processing_stage,
+                    lighter_record.failure_reason or lighter_record.hedge_error or "unknown",
+                )
+                return
+        if not exit_eager_started:
+            self.logger.warning(
+                "auto_live_exit_eager_hedge_failed cycle_id=%s asset=%s side=%s qty=%s stage=not_started failure_reason=no_lighter_record",
+                position.cycle_id,
+                snapshot.asset,
+                exit_side,
+                position.planned_qty,
+            )
+            return
         self.logger.info(
             "auto_live_exit_submitted cycle_id=%s asset=%s side=%s qty=%s reason=%s",
             position.cycle_id,
