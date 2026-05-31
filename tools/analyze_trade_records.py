@@ -111,6 +111,7 @@ def load_from_csv(csv_path: Path, asset_filter: set[str]) -> list[dict[str, Any]
 
 def load_from_jsonl(jsonl_path: Path, asset_filter: set[str], date_filter: str) -> list[dict[str, Any]]:
     latest_by_trade_key: dict[str, dict[str, Any]] = {}
+    failures_by_trade_key: dict[str, Counter[str]] = defaultdict(Counter)
     with jsonl_path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
             line = raw_line.strip()
@@ -135,9 +136,46 @@ def load_from_jsonl(jsonl_path: Path, asset_filter: set[str], date_filter: str) 
             if not trade_key:
                 continue
 
+            failure_reason = clean_text(event.get("failure_reason", ""))
+            hedge_error = clean_text(event.get("hedge_error", ""))
+            if failure_reason:
+                failures_by_trade_key[trade_key][failure_reason] += 1
+            elif hedge_error:
+                failures_by_trade_key[trade_key][hedge_error] += 1
+
             latest_by_trade_key[trade_key] = event
 
-    return list(latest_by_trade_key.values())
+    rows = list(latest_by_trade_key.values())
+    for row in rows:
+        trade_key = clean_text(row.get("trade_key", ""))
+        failures = failures_by_trade_key.get(trade_key)
+        if failures:
+            row["_observed_failure_reasons"] = failures
+    return rows
+
+
+def calibration_edge_bps(row: dict[str, Any]) -> Decimal | None:
+    var_price = to_decimal(row.get("variational_filled_price"))
+    lighter_price = to_decimal(row.get("lighter_filled_price"))
+    if var_price is None or lighter_price is None or var_price == 0:
+        return None
+    side = clean_text(row.get("side_raw", row.get("side", ""))).lower()
+    if side == "buy":
+        return (lighter_price - var_price) / var_price * Decimal("10000")
+    if side == "sell":
+        return (var_price - lighter_price) / var_price * Decimal("10000")
+    return None
+
+
+def fill_diff_var_minus_lighter(row: dict[str, Any]) -> Decimal | None:
+    explicit = to_decimal(row.get("fill_diff_var_minus_lighter"))
+    if explicit is not None:
+        return explicit
+    var_price = to_decimal(row.get("variational_filled_price"))
+    lighter_price = to_decimal(row.get("lighter_filled_price"))
+    if var_price is None or lighter_price is None:
+        return None
+    return var_price - lighter_price
 
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -153,8 +191,18 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             "var_notional": [],
             "lighter_notional": [],
             "failure_reasons": Counter(),
+            "observed_failure_reasons": Counter(),
             "hedge_completion_statuses": Counter(),
             "rollback_actions": Counter(),
+            "by_side": defaultdict(
+                lambda: {
+                    "rows": 0,
+                    "filled_rows": 0,
+                    "latency_ms": [],
+                    "calibration_edge_bps": [],
+                    "fill_diff": [],
+                }
+            ),
         }
     )
 
@@ -178,6 +226,10 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         if failure_reason_text and failure_reason_text.lower() != "none":
             bucket["failure_reasons"][failure_reason_text] += 1
 
+        observed_failures = row.get("_observed_failure_reasons")
+        if isinstance(observed_failures, Counter):
+            bucket["observed_failure_reasons"].update(observed_failures)
+
         hedge_completion_status = infer_hedge_completion_status(row)
         bucket["hedge_completion_statuses"][hedge_completion_status] += 1
 
@@ -187,7 +239,6 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         for key, column in (
             ("latency_ms", "live_fill_latency_ms"),
             ("edge_bps", "live_edge_bps"),
-            ("fill_diff", "fill_diff_var_minus_lighter"),
             ("plan_fill_diff", "plan_vs_lighter_fill_diff"),
             ("var_notional", "variational_notional"),
             ("lighter_notional", "lighter_notional"),
@@ -195,6 +246,24 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             value = to_decimal(row.get(column))
             if value is not None:
                 bucket[key].append(value)
+        fill_diff = fill_diff_var_minus_lighter(row)
+        if fill_diff is not None:
+            bucket["fill_diff"].append(fill_diff)
+
+        side = clean_text(row.get("side_raw", row.get("side", ""))).lower() or "unknown"
+        side_bucket = bucket["by_side"][side]
+        side_bucket["rows"] += 1
+        if processing_stage == "lighter_filled":
+            side_bucket["filled_rows"] += 1
+        latency = to_decimal(row.get("live_fill_latency_ms"))
+        if latency is not None:
+            side_bucket["latency_ms"].append(latency)
+        fill_diff = fill_diff_var_minus_lighter(row)
+        if fill_diff is not None:
+            side_bucket["fill_diff"].append(fill_diff)
+        edge = calibration_edge_bps(row)
+        if edge is not None:
+            side_bucket["calibration_edge_bps"].append(edge)
 
     return stats
 
@@ -218,6 +287,7 @@ def collect_completed_details(rows: list[dict[str, Any]]) -> list[dict[str, Any]
                 "lighter_filled_price": to_decimal(row.get("lighter_filled_price")),
                 "live_fill_latency_ms": to_decimal(row.get("live_fill_latency_ms")),
                 "live_edge_bps": to_decimal(row.get("live_edge_bps")),
+                "calibration_edge_bps": calibration_edge_bps(row),
                 "variational_filled_at": variational_filled_at,
                 "lighter_filled_at": lighter_filled_at,
             }
@@ -272,6 +342,16 @@ def print_summary(stats: dict[str, dict[str, Any]], source_label: str) -> None:
         print(f"{asset}: {breakdown}")
 
     print()
+    print("observed failure history")
+    for asset in sorted(stats):
+        counter = stats[asset]["observed_failure_reasons"]
+        if not counter:
+            print(f"{asset}: none")
+            continue
+        breakdown = ", ".join(f"{reason}={count}" for reason, count in counter.most_common())
+        print(f"{asset}: {breakdown}")
+
+    print()
     print("hedge completion breakdown")
     for asset in sorted(stats):
         counter = stats[asset]["hedge_completion_statuses"]
@@ -291,6 +371,29 @@ def print_summary(stats: dict[str, dict[str, Any]], source_label: str) -> None:
         breakdown = ", ".join(f"{action}={count}" for action, count in counter.most_common())
         print(f"{asset}: {breakdown}")
 
+    print()
+    print("by side calibration")
+    print("asset side rows filled avg_latency_ms median_latency_ms avg_calibration_edge_bps avg_fill_diff")
+    for asset in sorted(stats):
+        by_side = stats[asset]["by_side"]
+        if not by_side:
+            print(f"{asset} none")
+            continue
+        for side in sorted(by_side):
+            bucket = by_side[side]
+            print(
+                "{asset} {side} {rows} {filled} {avg_latency} {median_latency} {avg_edge} {avg_fill_diff}".format(
+                    asset=asset,
+                    side=side,
+                    rows=bucket["rows"],
+                    filled=bucket["filled_rows"],
+                    avg_latency=fmt(avg(bucket["latency_ms"]), 3),
+                    median_latency=fmt(median(bucket["latency_ms"]), 3),
+                    avg_edge=fmt(avg(bucket["calibration_edge_bps"]), 3),
+                    avg_fill_diff=fmt(avg(bucket["fill_diff"]), 4),
+                )
+            )
+
 
 def print_completed_details(rows: list[dict[str, Any]]) -> None:
     completed = collect_completed_details(rows)
@@ -301,15 +404,16 @@ def print_completed_details(rows: list[dict[str, Any]]) -> None:
         return
 
     print(
-        "asset side qty avg_edge_bps latency_ms var_price lighter_price var_filled_at trade_id"
+        "asset side qty avg_edge_bps calibration_edge_bps latency_ms var_price lighter_price var_filled_at trade_id"
     )
     for item in completed:
         print(
-            "{asset} {side} {qty} {edge} {latency} {var_price} {lighter_price} {filled_at} {trade_id}".format(
+            "{asset} {side} {qty} {edge} {calibration_edge} {latency} {var_price} {lighter_price} {filled_at} {trade_id}".format(
                 asset=item["asset"],
                 side=item["side"],
                 qty=item["qty"],
                 edge=fmt(item["live_edge_bps"], 3),
+                calibration_edge=fmt(item["calibration_edge_bps"], 3),
                 latency=fmt(item["live_fill_latency_ms"], 3),
                 var_price=fmt(item["variational_filled_price"], 4),
                 lighter_price=fmt(item["lighter_filled_price"], 4),
