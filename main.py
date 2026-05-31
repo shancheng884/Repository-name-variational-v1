@@ -10,7 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_UP
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -2337,6 +2337,15 @@ class VariationalToLighterRuntime:
         return float(value)
 
     @staticmethod
+    def _format_auto_live_order_qty(asset: str, planned_qty: Decimal) -> Decimal:
+        asset_upper = asset.strip().upper()
+        if asset_upper == "BTC":
+            # Variational's BTC size input behaved reliably at 5 decimals in manual tests.
+            normalized = max(planned_qty, Decimal("0.00021"))
+            return normalized.quantize(Decimal("0.00001"), rounding=ROUND_UP)
+        return planned_qty.normalize()
+
+    @staticmethod
     def _fmt_median_pct(value: float | None) -> str:
         if value is None:
             return "-"
@@ -2833,24 +2842,25 @@ class VariationalToLighterRuntime:
             if snapshot.var_mid <= 0:
                 return
             planned_qty = self.paper_notional_usd / snapshot.var_mid
-            depth_enough, _, _ = await self._paper_depth_enough(direction, planned_qty)
+            order_qty = self._format_auto_live_order_qty(snapshot.asset, planned_qty)
+            depth_enough, _, _ = await self._paper_depth_enough(direction, order_qty)
             if not depth_enough:
                 return
             var_side = self._auto_live_direction_to_var_side(direction)
             precheck = await self.send_variational_place_order(
                 side=var_side,
-                amount=decimal_to_str(planned_qty) or str(planned_qty),
-                expected_min_btc_qty=planned_qty if snapshot.asset.upper() == "BTC" else None,
+                amount=decimal_to_str(order_qty) or str(order_qty),
+                expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
                 confirm=False,
             )
-            order_qty = to_decimal((precheck.get("result") or {}).get("orderQuantityBtc"))
-            if snapshot.asset.upper() == "BTC" and (order_qty is None or order_qty < planned_qty):
-                self.logger.warning("auto_live_precheck_rejected asset=%s side=%s expected_qty=%s got=%s", snapshot.asset, var_side, planned_qty, order_qty)
+            observed_order_qty = to_decimal((precheck.get("result") or {}).get("orderQuantityBtc"))
+            if snapshot.asset.upper() == "BTC" and (observed_order_qty is None or observed_order_qty < order_qty):
+                self.logger.warning("auto_live_precheck_rejected asset=%s side=%s expected_qty=%s got=%s", snapshot.asset, var_side, order_qty, observed_order_qty)
                 return
             result = await self.send_variational_place_order(
                 side=var_side,
-                amount=decimal_to_str(planned_qty) or str(planned_qty),
-                expected_min_btc_qty=planned_qty if snapshot.asset.upper() == "BTC" else None,
+                amount=decimal_to_str(order_qty) or str(order_qty),
+                expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
                 confirm=True,
             )
             if not result.get("ok"):
@@ -2861,7 +2871,7 @@ class VariationalToLighterRuntime:
                 lighter_record, payload = await self.place_lighter_order_from_plan(
                     asset=snapshot.asset,
                     side=var_side,
-                    qty=planned_qty,
+                    qty=order_qty,
                     var_fill_price=snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price or snapshot.var_mid,
                 )
                 if lighter_record is not None:
@@ -2870,7 +2880,7 @@ class VariationalToLighterRuntime:
                             record_key=lighter_record.trade_key,
                             asset=snapshot.asset,
                             side=var_side.lower(),
-                            qty=planned_qty,
+                            qty=order_qty,
                             created_at_monotonic=time.monotonic(),
                         )
                     )
@@ -2879,7 +2889,7 @@ class VariationalToLighterRuntime:
                             "auto_live_eager_hedge_started asset=%s side=%s qty=%s stage=%s",
                             snapshot.asset,
                             var_side,
-                            planned_qty,
+                            order_qty,
                             payload.get("processing_stage"),
                         )
 
@@ -2897,13 +2907,13 @@ class VariationalToLighterRuntime:
                 entry_var_execution_price=entry_var_execution_price,
                 entry_lighter_execution_price=entry_lighter_execution_price,
                 planned_notional_usd=self.paper_notional_usd,
-                planned_qty=planned_qty,
+                planned_qty=order_qty,
             )
             self.logger.info(
                 "auto_live_entry_submitted asset=%s direction=%s qty=%s var_side=%s",
                 snapshot.asset,
                 direction,
-                planned_qty,
+                order_qty,
                 var_side,
             )
             return
