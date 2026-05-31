@@ -756,9 +756,23 @@ async function handlePrepareOrderInputSweepDryRun(payload) {
 
 function findSubmitButton(snapshot, side) {
   const sideText = side.toLowerCase() === "buy" ? "buy" : "sell";
-  return (snapshot?.submitCandidates || []).find((item) => {
+  const candidates = snapshot?.submitCandidates || [];
+  const primary = candidates.find((item) => {
     const text = String(item.text || "").toLowerCase();
     return !item.disabled && text.includes(sideText) && text.includes("btc") && item.rect;
+  });
+  if (primary) {
+    return primary;
+  }
+  const relaxedKeywords = sideText === "sell"
+    ? ["sell", "close", "reduce", "position", "market"]
+    : ["buy", "open", "increase", "position", "market"];
+  return candidates.find((item) => {
+    if (item.disabled || !item.rect) {
+      return false;
+    }
+    const text = String(item.text || "").toLowerCase();
+    return relaxedKeywords.some((keyword) => text.includes(keyword));
   }) || null;
 }
 
@@ -826,7 +840,11 @@ async function handlePlaceOrder(payload) {
         requestId,
         ok: false,
         error: "No enabled submit button found after preparing order form.",
-        result: prepared,
+        result: {
+          ...prepared,
+          submitCandidates: prepared.selectedAttempt?.snapshotAfter?.submitCandidates || [],
+          panelNodes: prepared.selectedAttempt?.snapshotAfter?.panelNodes || []
+        },
         timestamp: nowIso()
       });
       return;
