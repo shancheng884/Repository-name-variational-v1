@@ -508,6 +508,24 @@ async function handlePlaceOrderDryRun(payload) {
         }
         return null;
       };
+      const ancestorsOf = (el) => {
+        const out = [];
+        let cur = el;
+        while (cur && out.length < 12) {
+          const item = describePanelNode(cur);
+          if (item) {
+            item.childElementCount = cur.childElementCount || 0;
+            item.innerTextPreview = (cur.innerText || cur.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 500);
+            out.push(item);
+          }
+          cur = cur.parentElement;
+        }
+        return out;
+      };
+      const centerOf = (item) => ({
+        x: item.rect.x + Math.round(item.rect.width / 2),
+        y: item.rect.y + Math.round(item.rect.height / 2)
+      });
       const all = Array.from(document.querySelectorAll('button, input, textarea, [role="button"], [contenteditable="true"]')).filter(visible);
       const inputs = all.filter((el) => ['INPUT', 'TEXTAREA'].includes(el.tagName) || el.getAttribute('contenteditable') === 'true').map(describe);
       const buttons = all.filter((el) => el.tagName === 'BUTTON' || el.getAttribute('role') === 'button').map(describe);
@@ -519,6 +537,33 @@ async function handlePlaceOrderDryRun(payload) {
       const buyButton = all.find((el) => (el.innerText || '').trim().toLowerCase() === 'buy');
       const sellButton = all.find((el) => (el.innerText || '').trim().toLowerCase() === 'sell');
       const panelRoot = nearestCommonAncestor(buyButton, sellButton);
+      const buyDescription = describe(buyButton);
+      const sellDescription = describe(sellButton);
+      const nearRect = buyDescription && sellDescription
+        ? {
+            left: Math.min(buyDescription.rect.x, sellDescription.rect.x) - 260,
+            right: Math.max(buyDescription.rect.x + buyDescription.rect.width, sellDescription.rect.x + sellDescription.rect.width) + 260,
+            top: Math.min(buyDescription.rect.y, sellDescription.rect.y) - 420,
+            bottom: Math.max(buyDescription.rect.y + buyDescription.rect.height, sellDescription.rect.y + sellDescription.rect.height) + 160
+          }
+        : null;
+      const nearNodes = nearRect
+        ? Array.from(document.querySelectorAll('button, input, textarea, [role="button"], [contenteditable="true"], [tabindex], div, span'))
+            .filter(visible)
+            .map(describePanelNode)
+            .filter((item) => item && item.rect.x >= nearRect.left && item.rect.x <= nearRect.right && item.rect.y >= nearRect.top && item.rect.y <= nearRect.bottom)
+            .filter((item) => item.text || item.ariaLabel || item.placeholder || item.name || item.id || item.value || ['INPUT', 'TEXTAREA'].includes(item.tag))
+            .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x))
+            .slice(0, 220)
+        : [];
+      const pointSamples = buyDescription && sellDescription
+        ? [-360, -300, -240, -180, -120, -60, 0, 60, 120].map((dy) => {
+            const center = centerOf(buyDescription);
+            const el = document.elementFromPoint(center.x, center.y + dy);
+            const item = describePanelNode(el);
+            return { dx: 0, dy, element: item };
+          })
+        : [];
       const panelNodes = panelRoot
         ? Array.from(panelRoot.querySelectorAll('button, input, textarea, [role="button"], [contenteditable="true"], [tabindex], div, span'))
             .filter(visible)
@@ -539,6 +584,10 @@ async function handlePlaceOrderDryRun(payload) {
         sideButtons: sideButtons.slice(0, 20),
         panelText,
         panelNodes,
+        buyAncestors: ancestorsOf(buyButton),
+        sellAncestors: ancestorsOf(sellButton),
+        nearNodes,
+        pointSamples,
         buttons: buttons.slice(0, 40)
       };
     })()`
