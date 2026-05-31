@@ -358,6 +358,9 @@ def collect_completed_details(rows: list[dict[str, Any]]) -> list[dict[str, Any]
                 "trade_id": clean_text(row.get("matched_variational_trade_id", "")) or clean_text(row.get("trade_id", "")),
                 "side": clean_text(row.get("side_raw", row.get("side", ""))),
                 "qty": clean_text(row.get("qty", "")),
+                "auto_live_cycle_id": clean_text(row.get("auto_live_cycle_id", "")),
+                "auto_live_role": clean_text(row.get("auto_live_role", "")),
+                "auto_live_merge_path": clean_text(row.get("auto_live_merge_path", "")),
                 "synthetic_eager_fill": clean_bool(row.get("synthetic_eager_fill")),
                 "variational_filled_price": to_decimal(row.get("variational_filled_price")),
                 "lighter_filled_price": to_decimal(row.get("lighter_filled_price")),
@@ -392,6 +395,9 @@ def collect_unmatched_synthetic_eager_details(rows: list[dict[str, Any]]) -> lis
                 "side": clean_text(row.get("side_raw", row.get("side", ""))),
                 "qty": clean_text(row.get("qty", "")),
                 "trade_id": clean_text(row.get("trade_id", "")),
+                "auto_live_cycle_id": clean_text(row.get("auto_live_cycle_id", "")),
+                "auto_live_role": clean_text(row.get("auto_live_role", "")),
+                "auto_live_merge_path": clean_text(row.get("auto_live_merge_path", "")),
                 "processing_stage": clean_text(row.get("processing_stage", "")),
                 "variational_filled_at": clean_text(row.get("variational_filled_at", "")),
                 "lighter_filled_at": clean_text(row.get("lighter_filled_at", "")),
@@ -545,14 +551,17 @@ def print_completed_details(rows: list[dict[str, Any]]) -> None:
         return
 
     print(
-        "asset side qty avg_edge_bps calibration_edge_bps latency_ms submit_call_ms submit_to_fill_ms "
+        "asset cycle_id role merge_path side qty avg_edge_bps calibration_edge_bps latency_ms submit_call_ms submit_to_fill_ms "
         "var_seen_to_fill_ms var_event_to_seen_ms synthetic_eager_fill var_price lighter_price var_filled_at trade_id"
     )
     for item in completed:
         print(
-            "{asset} {side} {qty} {edge} {calibration_edge} {latency} {submit_call} {submit_to_fill} "
+            "{asset} {cycle_id} {role} {merge_path} {side} {qty} {edge} {calibration_edge} {latency} {submit_call} {submit_to_fill} "
             "{var_seen_to_fill} {event_to_seen} {synthetic_eager_fill} {var_price} {lighter_price} {filled_at} {trade_id}".format(
                 asset=item["asset"],
+                cycle_id=item["auto_live_cycle_id"] or "-",
+                role=item["auto_live_role"] or "-",
+                merge_path=item["auto_live_merge_path"] or "-",
                 side=item["side"],
                 qty=item["qty"],
                 edge=fmt(item["live_edge_bps"], 3),
@@ -579,11 +588,14 @@ def print_unmatched_synthetic_eager_details(rows: list[dict[str, Any]]) -> None:
         print("none")
         return
 
-    print("asset side qty processing_stage var_filled_at lighter_filled_at trade_id failure_reason")
+    print("asset cycle_id role merge_path side qty processing_stage var_filled_at lighter_filled_at trade_id failure_reason")
     for item in details:
         print(
-            "{asset} {side} {qty} {processing_stage} {var_filled_at} {lighter_filled_at} {trade_id} {failure_reason}".format(
+            "{asset} {cycle_id} {role} {merge_path} {side} {qty} {processing_stage} {var_filled_at} {lighter_filled_at} {trade_id} {failure_reason}".format(
                 asset=item["asset"],
+                cycle_id=item["auto_live_cycle_id"] or "-",
+                role=item["auto_live_role"] or "-",
+                merge_path=item["auto_live_merge_path"] or "-",
                 side=item["side"] or "-",
                 qty=item["qty"] or "-",
                 processing_stage=item["processing_stage"] or "-",

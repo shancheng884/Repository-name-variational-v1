@@ -382,6 +382,9 @@ class OrderLifecycle:
     var_fill_ts_iso: str | None = None
     synthetic_eager_fill: bool = False
     matched_variational_trade_id: str | None = None
+    auto_live_cycle_id: int | None = None
+    auto_live_role: str | None = None
+    auto_live_merge_path: str | None = None
 
     lighter_side: str | None = None
     lighter_client_order_id: int | None = None
@@ -427,6 +430,9 @@ class OrderLifecycle:
             "variational_filled_at": self.var_fill_ts_iso,
             "synthetic_eager_fill": self.synthetic_eager_fill,
             "matched_variational_trade_id": self.matched_variational_trade_id,
+            "auto_live_cycle_id": self.auto_live_cycle_id,
+            "auto_live_role": self.auto_live_role,
+            "auto_live_merge_path": self.auto_live_merge_path,
             "lighter_order_side": self.lighter_side,
             "lighter_client_order_id": self.lighter_client_order_id,
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
@@ -560,6 +566,7 @@ class CrossSpreadSnapshot:
 
 @dataclass(slots=True)
 class AutoLivePositionState:
+    cycle_id: int
     asset: str
     direction: str
     entered_at_iso: str
@@ -581,6 +588,8 @@ class PendingAutoLiveMatch:
     asset: str
     side: str
     qty: Decimal
+    cycle_id: int | None
+    role: str
     created_at_monotonic: float
 
 
@@ -745,6 +754,8 @@ class VariationalToLighterRuntime:
         self.pending_auto_live_matches: list[PendingAutoLiveMatch] = []
         self.auto_live_last_closed_monotonic: float | None = None
         self.auto_live_completed_cycles = 0
+        self.auto_live_next_cycle_id = 1
+        self._last_auto_live_guard_log: tuple[str, int, int] | None = None
         self.paper_last_closed_monotonic: float | None = None
         self.paper_opportunity_counter = 0
         self._last_var_quote_diagnostic_at = 0.0
@@ -808,6 +819,24 @@ class VariationalToLighterRuntime:
             if cooldown_elapsed < self.auto_live_cooldown_seconds:
                 return "cooldown_active"
         return None
+
+    def maybe_log_auto_live_guard(self, reason: str) -> None:
+        marker = (reason, self.auto_live_completed_cycles, self.auto_live_next_cycle_id)
+        if self._last_auto_live_guard_log == marker:
+            return
+        self._last_auto_live_guard_log = marker
+        remaining_seconds: float | None = None
+        if reason == "cooldown_active" and self.auto_live_last_closed_monotonic is not None:
+            elapsed = time.monotonic() - self.auto_live_last_closed_monotonic
+            remaining_seconds = max(0.0, self.auto_live_cooldown_seconds - elapsed)
+        self.logger.info(
+            "auto_live_guard_blocked reason=%s next_cycle_id=%s completed_cycles=%s max_cycles=%s cooldown_remaining_seconds=%s",
+            reason,
+            self.auto_live_next_cycle_id,
+            self.auto_live_completed_cycles,
+            self.auto_live_max_cycles,
+            f"{remaining_seconds:.3f}" if remaining_seconds is not None else "-",
+        )
 
     def requires_lighter_market_data(self) -> bool:
         return self.is_dry_run_mode() or self.is_live_mode() or self.is_paper_mode()
@@ -1089,6 +1118,8 @@ class VariationalToLighterRuntime:
         self.pending_auto_live_matches.clear()
         self.auto_live_last_closed_monotonic = None
         self.auto_live_completed_cycles = 0
+        self.auto_live_next_cycle_id = 1
+        self._last_auto_live_guard_log = None
         self.paper_last_closed_monotonic = None
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
@@ -1298,6 +1329,8 @@ class VariationalToLighterRuntime:
         side: str,
         qty: Decimal,
         var_fill_price: Decimal,
+        cycle_id: int | None = None,
+        role: str | None = None,
     ) -> tuple[OrderLifecycle | None, dict[str, Any] | None]:
         synthetic_key = f"auto:{asset}:{side.lower()}:{int(time.time() * 1000)}"
         record = OrderLifecycle(
@@ -1313,6 +1346,9 @@ class VariationalToLighterRuntime:
             live_var_fill_seen_at_iso=utc_now(),
             live_var_fill_seen_monotonic=time.monotonic(),
             synthetic_eager_fill=True,
+            auto_live_cycle_id=cycle_id,
+            auto_live_role=role,
+            auto_live_merge_path="synthetic_created",
         )
         async with self._record_lock:
             self.set_record_stage(record, STAGE_RECORD_CREATED, clear_failure=True)
@@ -1332,7 +1368,7 @@ class VariationalToLighterRuntime:
             if now_monotonic - item.created_at_monotonic <= self.auto_live_match_window_seconds
         ]
 
-    def consume_pending_auto_live_match(self, *, asset: str, side: str, qty: Decimal) -> str | None:
+    def consume_pending_auto_live_match(self, *, asset: str, side: str, qty: Decimal) -> PendingAutoLiveMatch | None:
         self.prune_pending_auto_live_matches()
         side_lower = side.strip().lower()
         for idx, item in enumerate(self.pending_auto_live_matches):
@@ -1341,7 +1377,7 @@ class VariationalToLighterRuntime:
             if abs(item.qty - qty) > Decimal("0.00000001"):
                 continue
             match = self.pending_auto_live_matches.pop(idx)
-            return match.record_key
+            return match
         return None
 
     def _rekey_record_locked(self, record: OrderLifecycle, new_trade_key: str) -> None:
@@ -2078,7 +2114,8 @@ class VariationalToLighterRuntime:
 
         created = False
         created_record: OrderLifecycle | None = None
-        matched_trade_key = self.consume_pending_auto_live_match(asset=asset, side=side, qty=qty)
+        matched_auto_live = self.consume_pending_auto_live_match(asset=asset, side=side, qty=qty)
+        matched_trade_key = matched_auto_live.record_key if matched_auto_live is not None else None
 
         async with self._record_lock:
             record = self.records.get(matched_trade_key or key)
@@ -2091,6 +2128,8 @@ class VariationalToLighterRuntime:
                     asset=asset if asset else "UNKNOWN",
                     mode=self.mode,
                     last_variational_status=status,
+                    auto_live_cycle_id=matched_auto_live.cycle_id if matched_auto_live is not None else None,
+                    auto_live_role=matched_auto_live.role if matched_auto_live is not None else None,
                 )
                 self.set_record_stage(record, STAGE_RECORD_CREATED, clear_failure=True)
                 self.records[record.trade_key] = record
@@ -2101,6 +2140,9 @@ class VariationalToLighterRuntime:
                 record.trade_id = trade_id or record.trade_id
                 previous_status = record.last_variational_status
                 record.last_variational_status = status
+                if matched_auto_live is not None:
+                    record.auto_live_cycle_id = matched_auto_live.cycle_id
+                    record.auto_live_role = matched_auto_live.role
                 self.set_record_stage(record, STAGE_EVENT_FILTERED)
 
             if created:
@@ -2116,6 +2158,8 @@ class VariationalToLighterRuntime:
             if should_set_fill:
                 if trade_id:
                     self._rekey_record_locked(record, f"id:{trade_id}")
+                if record.synthetic_eager_fill:
+                    record.auto_live_merge_path = "synthetic_matched_real_var_fill"
                 record.synthetic_eager_fill = False
                 record.matched_variational_trade_id = trade_id or record.matched_variational_trade_id
                 record.trade_id = trade_id or record.trade_id
@@ -2888,10 +2932,12 @@ class VariationalToLighterRuntime:
                 return
             guard_reason = self.auto_live_guard_reason()
             if guard_reason is not None:
+                self.maybe_log_auto_live_guard(guard_reason)
                 return
             candidate = paper_entry_candidate(snapshot, self.paper_entry_deviation_bps, self.paper_min_samples)
             if candidate is None:
                 return
+            cycle_id = self.auto_live_next_cycle_id
             direction = candidate.direction
             current_pct = candidate.current_pct
             median_pct = candidate.median_pct
@@ -2930,6 +2976,8 @@ class VariationalToLighterRuntime:
                     side=var_side,
                     qty=order_qty,
                     var_fill_price=snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price or snapshot.var_mid,
+                    cycle_id=cycle_id,
+                    role="entry",
                 )
                 if lighter_record is not None:
                     self.pending_auto_live_matches.append(
@@ -2938,20 +2986,25 @@ class VariationalToLighterRuntime:
                             asset=snapshot.asset,
                             side=var_side.lower(),
                             qty=order_qty,
+                            cycle_id=cycle_id,
+                            role="entry",
                             created_at_monotonic=time.monotonic(),
                         )
                     )
                     if payload is not None:
                         self.logger.info(
-                            "auto_live_eager_hedge_started asset=%s side=%s qty=%s stage=%s",
+                            "auto_live_eager_hedge_started cycle_id=%s role=entry asset=%s side=%s qty=%s stage=%s record_key=%s",
+                            cycle_id,
                             snapshot.asset,
                             var_side,
                             order_qty,
                             payload.get("processing_stage"),
+                            lighter_record.trade_key,
                         )
 
             entry_var_execution_price, entry_lighter_execution_price = paper_entry_execution_prices(snapshot, direction)
             self.auto_live_position = AutoLivePositionState(
+                cycle_id=cycle_id,
                 asset=snapshot.asset,
                 direction=direction,
                 entered_at_iso=utc_now(),
@@ -2967,7 +3020,8 @@ class VariationalToLighterRuntime:
                 planned_qty=order_qty,
             )
             self.logger.info(
-                "auto_live_entry_submitted asset=%s direction=%s qty=%s var_side=%s",
+                "auto_live_entry_submitted cycle_id=%s asset=%s direction=%s qty=%s var_side=%s",
+                cycle_id,
                 snapshot.asset,
                 direction,
                 order_qty,
@@ -3020,6 +3074,8 @@ class VariationalToLighterRuntime:
                 side=exit_side,
                 qty=position.planned_qty,
                 var_fill_price=snapshot.var_sell_price if exit_side == "SELL" else snapshot.var_buy_price or snapshot.var_mid,
+                cycle_id=position.cycle_id,
+                role="exit",
             )
             if lighter_record is not None:
                 self.pending_auto_live_matches.append(
@@ -3028,19 +3084,24 @@ class VariationalToLighterRuntime:
                         asset=snapshot.asset,
                         side=exit_side.lower(),
                         qty=position.planned_qty,
+                        cycle_id=position.cycle_id,
+                        role="exit",
                         created_at_monotonic=time.monotonic(),
                     )
                 )
                 if payload is not None:
                     self.logger.info(
-                        "auto_live_eager_hedge_started asset=%s side=%s qty=%s stage=%s",
+                        "auto_live_eager_hedge_started cycle_id=%s role=exit asset=%s side=%s qty=%s stage=%s record_key=%s",
+                        position.cycle_id,
                         snapshot.asset,
                         exit_side,
                         position.planned_qty,
                         payload.get("processing_stage"),
+                        lighter_record.trade_key,
                     )
         self.logger.info(
-            "auto_live_exit_submitted asset=%s side=%s qty=%s reason=%s",
+            "auto_live_exit_submitted cycle_id=%s asset=%s side=%s qty=%s reason=%s",
+            position.cycle_id,
             snapshot.asset,
             exit_side,
             position.planned_qty,
@@ -3049,6 +3110,8 @@ class VariationalToLighterRuntime:
         self.auto_live_position = None
         self.auto_live_last_closed_monotonic = time.monotonic()
         self.auto_live_completed_cycles += 1
+        self.auto_live_next_cycle_id += 1
+        self._last_auto_live_guard_log = None
 
     async def paper_loop(self) -> None:
         try:
@@ -3323,6 +3386,9 @@ class VariationalToLighterRuntime:
                         "trade_id": record.trade_id,
                         "synthetic_eager_fill": payload["synthetic_eager_fill"],
                         "matched_variational_trade_id": payload["matched_variational_trade_id"],
+                        "auto_live_cycle_id": payload["auto_live_cycle_id"],
+                        "auto_live_role": payload["auto_live_role"],
+                        "auto_live_merge_path": payload["auto_live_merge_path"],
                         "asset": record.asset,
                         "side_raw": record.side,
                         "direction_zh": side_zh,
@@ -3388,6 +3454,9 @@ class VariationalToLighterRuntime:
             "trade_id",
             "synthetic_eager_fill",
             "matched_variational_trade_id",
+            "auto_live_cycle_id",
+            "auto_live_role",
+            "auto_live_merge_path",
             "asset",
             "side_raw",
             "direction_zh",
