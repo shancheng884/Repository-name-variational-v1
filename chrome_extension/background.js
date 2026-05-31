@@ -762,6 +762,16 @@ function findSubmitButton(snapshot, side) {
   }) || null;
 }
 
+function parseBtcQuantityFromSnapshot(snapshot) {
+  const text = (snapshot?.panelNodes || []).map((item) => item.text || "").join("\n");
+  const match = text.match(/Order Quantity\s+([0-9.]+)\s+BTC/i);
+  if (!match) {
+    return null;
+  }
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
 async function prepareOrderFormWithKeyboard(side, amount) {
   const snapshotExpression = `(() => {
     ${buildVariationalOrderDomSnapshot.toString()}
@@ -807,6 +817,7 @@ async function handlePlaceOrder(payload) {
     const side = String(payload.side || "").toUpperCase();
     const amount = String(payload.amount || "");
     const confirm = Boolean(payload.confirm);
+    const expectedMinBtcQty = Number(payload.expectedMinBtcQty || 0);
     const prepared = await prepareOrderFormWithKeyboard(side, amount);
     const submitButton = prepared.selectedAttempt?.submitButton || null;
     if (!submitButton) {
@@ -816,6 +827,18 @@ async function handlePlaceOrder(payload) {
         ok: false,
         error: "No enabled submit button found after preparing order form.",
         result: prepared,
+        timestamp: nowIso()
+      });
+      return;
+    }
+    const orderQuantityBtc = parseBtcQuantityFromSnapshot(prepared.selectedAttempt?.snapshotAfter);
+    if (expectedMinBtcQty > 0 && (orderQuantityBtc == null || orderQuantityBtc < expectedMinBtcQty)) {
+      commandForwarder.send({
+        type: "ORDER_RESULT",
+        requestId,
+        ok: false,
+        error: `Order Quantity ${orderQuantityBtc ?? 'unknown'} BTC is below expected minimum ${expectedMinBtcQty} BTC. Not clicking.`,
+        result: { ...prepared, submitButton, orderQuantityBtc, clicked: false },
         timestamp: nowIso()
       });
       return;
@@ -831,7 +854,7 @@ async function handlePlaceOrder(payload) {
         requestId,
         ok: false,
         error: "PLACE_ORDER requires confirm=true. Prepared form but did not click submit.",
-        result: { ...prepared, submitButton, clickPoint: submitClickPoint, clicked: false },
+        result: { ...prepared, submitButton, orderQuantityBtc, clickPoint: submitClickPoint, clicked: false },
         timestamp: nowIso()
       });
       return;
@@ -845,6 +868,7 @@ async function handlePlaceOrder(payload) {
       result: {
         ...prepared,
         submitButton,
+        orderQuantityBtc,
         clickPoint: submitClickPoint,
         clicked: true,
         clickedAt: nowIso()

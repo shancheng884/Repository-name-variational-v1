@@ -15,6 +15,7 @@ async def place_order(
     side: str,
     amount: str,
     confirm: bool,
+    expected_min_btc_qty: str,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     request_id = str(uuid.uuid4())
@@ -27,6 +28,7 @@ async def place_order(
                     "side": side.upper(),
                     "amount": amount,
                     "confirm": confirm,
+                    "expectedMinBtcQty": expected_min_btc_qty,
                 },
                 ensure_ascii=True,
             )
@@ -44,6 +46,11 @@ def main() -> int:
     parser.add_argument("--side", choices=("BUY", "SELL", "buy", "sell"), required=True)
     parser.add_argument("--amount", required=True, help="Variational Size value, normally USD when the panel is in $ mode.")
     parser.add_argument("--max-amount", default="5", help="Safety cap for --amount. Default: 5")
+    parser.add_argument(
+        "--expected-min-btc-qty",
+        default="0",
+        help="If set above 0, require page Order Quantity to be at least this BTC amount before clicking.",
+    )
     parser.add_argument("--confirm", action="store_true", help="Actually click the submit button. Without this, no click occurs.")
     parser.add_argument("--timeout-seconds", type=float, default=15.0)
     args = parser.parse_args()
@@ -56,8 +63,20 @@ def main() -> int:
         parser.error("--max-amount must be positive")
     if amount > max_amount:
         parser.error(f"--amount {amount} exceeds --max-amount {max_amount}")
+    expected_min_btc_qty = Decimal(str(args.expected_min_btc_qty))
+    if expected_min_btc_qty < 0:
+        parser.error("--expected-min-btc-qty must be non-negative")
 
-    result = asyncio.run(place_order(args.endpoint, args.side, str(amount), args.confirm, args.timeout_seconds))
+    result = asyncio.run(
+        place_order(
+            args.endpoint,
+            args.side,
+            str(amount),
+            args.confirm,
+            str(expected_min_btc_qty),
+            args.timeout_seconds,
+        )
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result.get("ok") else 1
 
