@@ -451,6 +451,10 @@ async function handleCommandSocketMessage(data) {
     await handlePrepareOrderKeyboardDryRun(payload);
     return;
   }
+  if (type === "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN") {
+    await handlePrepareOrderInputSweepDryRun(payload);
+    return;
+  }
   if (type === "PLACE_ORDER") {
     commandForwarder.send({
       type: "ORDER_RESULT",
@@ -602,6 +606,30 @@ async function dispatchKey(tabId, params) {
   await sendDebuggerCommand(tabId, "Input.dispatchKeyEvent", params);
 }
 
+async function clickPoint(tabId, x, y) {
+  await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+  await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+}
+
+async function clearFocusedInput(tabId) {
+  await dispatchKey(tabId, { type: "keyDown", key: "Control", code: "ControlLeft", windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 2 });
+  await dispatchKey(tabId, { type: "keyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
+  await dispatchKey(tabId, { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
+  await dispatchKey(tabId, { type: "keyUp", key: "Control", code: "ControlLeft", windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17 });
+  await dispatchKey(tabId, { type: "keyDown", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+  await dispatchKey(tabId, { type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+}
+
+async function keyboardFillAt(tabId, rect, amount) {
+  const x = rect.x + Math.round(rect.width / 2);
+  const y = rect.y + Math.round(rect.height / 2);
+  await clickPoint(tabId, x, y);
+  await clearFocusedInput(tabId);
+  await sendDebuggerCommand(tabId, "Input.insertText", { text: amount });
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  return { x, y };
+}
+
 async function handlePrepareOrderKeyboardDryRun(payload) {
   const requestId = payload.requestId;
   try {
@@ -630,18 +658,7 @@ async function handlePrepareOrderKeyboardDryRun(payload) {
 
     const x = input.rect.x + Math.round(input.rect.width / 2);
     const y = input.rect.y + Math.round(input.rect.height / 2);
-    await sendDebuggerCommand(state.attachedTabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
-    await sendDebuggerCommand(state.attachedTabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
-    await dispatchKey(state.attachedTabId, { type: "keyDown", key: "Control", code: "ControlLeft", windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 2 });
-    await dispatchKey(state.attachedTabId, { type: "keyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
-    await dispatchKey(state.attachedTabId, { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
-    await dispatchKey(state.attachedTabId, { type: "keyUp", key: "Control", code: "ControlLeft", windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17 });
-    await dispatchKey(state.attachedTabId, { type: "keyDown", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
-    await dispatchKey(state.attachedTabId, { type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
-    for (const char of amount) {
-      await dispatchKey(state.attachedTabId, { type: "char", text: char, unmodifiedText: char });
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await keyboardFillAt(state.attachedTabId, input.rect, amount);
     const afterResult = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
       expression: locateExpression,
       returnByValue: true,
@@ -664,6 +681,77 @@ async function handlePrepareOrderKeyboardDryRun(payload) {
   } catch (error) {
     commandForwarder.send({
       type: "PREPARE_ORDER_KEYBOARD_DRY_RUN_RESULT",
+      requestId,
+      ok: false,
+      error: error.message,
+      timestamp: nowIso()
+    });
+  }
+}
+
+async function handlePrepareOrderInputSweepDryRun(payload) {
+  const requestId = payload.requestId;
+  try {
+    if (state.attachedTabId == null) {
+      throw new Error("No attached tab.");
+    }
+    const side = String(payload.side || "").toUpperCase();
+    const amount = String(payload.amount || "");
+    const snapshotExpression = `(() => {
+      ${buildVariationalOrderDomSnapshot.toString()}
+      return buildVariationalOrderDomSnapshot(${JSON.stringify("__SIDE__")}, ${JSON.stringify("__AMOUNT__")});
+    })()`
+      .replaceAll('"__SIDE__"', JSON.stringify(side))
+      .replaceAll('"__AMOUNT__"', JSON.stringify(amount));
+    const beforeResult = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
+      expression: snapshotExpression,
+      returnByValue: true,
+      awaitPromise: false,
+      userGesture: true
+    });
+    const snapshotBefore = beforeResult.result?.value || null;
+    const candidates = (snapshotBefore?.inputs || [])
+      .filter((item) => item.type !== "range" && item.rect && item.rect.width > 0 && item.rect.height > 0)
+      .slice(0, 8);
+    const attempts = [];
+    for (const candidate of candidates) {
+      const clickPointResult = await keyboardFillAt(state.attachedTabId, candidate.rect, amount);
+      const afterResult = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
+        expression: snapshotExpression,
+        returnByValue: true,
+        awaitPromise: false,
+        userGesture: true
+      });
+      const snapshotAfter = afterResult.result?.value || null;
+      attempts.push({
+        candidate,
+        clickPoint: clickPointResult,
+        mainInput: snapshotAfter?.mainInput || null,
+        submitCandidates: snapshotAfter?.submitCandidates || [],
+        panelNodes: snapshotAfter?.panelNodes || []
+      });
+      const submit = (snapshotAfter?.submitCandidates || []).find((item) => {
+        const text = String(item.text || "").toLowerCase();
+        return !item.disabled && (text.includes("buy") || text.includes("sell") || text.includes("market") || text.includes("place"));
+      });
+      if (submit) {
+        break;
+      }
+    }
+    commandForwarder.send({
+      type: "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN_RESULT",
+      requestId,
+      ok: true,
+      result: {
+        action: "input_sweep_without_submit",
+        snapshotBefore,
+        attempts
+      },
+      timestamp: nowIso()
+    });
+  } catch (error) {
+    commandForwarder.send({
+      type: "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN_RESULT",
       requestId,
       ok: false,
       error: error.message,

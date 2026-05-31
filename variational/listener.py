@@ -864,6 +864,9 @@ class CommandBroker:
         if msg_type == "PREPARE_ORDER_KEYBOARD_DRY_RUN":
             await self._handle_prepare_order_keyboard_dry_run(websocket, payload)
             return
+        if msg_type == "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN":
+            await self._handle_prepare_order_input_sweep_dry_run(websocket, payload)
+            return
         if msg_type == "PLACE_ORDER":
             await self._handle_place_order(websocket, payload)
             return
@@ -873,6 +876,7 @@ class CommandBroker:
             "PLACE_ORDER_DRY_RUN_RESULT",
             "PREPARE_ORDER_DRY_RUN_RESULT",
             "PREPARE_ORDER_KEYBOARD_DRY_RUN_RESULT",
+            "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN_RESULT",
         }:
             await self._handle_command_result(payload)
             return
@@ -1021,6 +1025,18 @@ class CommandBroker:
             payload,
             "PREPARE_ORDER_KEYBOARD_DRY_RUN",
             "PREPARE_ORDER_KEYBOARD_DRY_RUN_RESULT",
+        )
+
+    async def _handle_prepare_order_input_sweep_dry_run(
+        self,
+        websocket: websockets.ServerConnection,
+        payload: dict[str, Any],
+    ) -> None:
+        await self._forward_order_command(
+            websocket,
+            payload,
+            "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN",
+            "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN_RESULT",
         )
 
     async def _forward_order_command(
