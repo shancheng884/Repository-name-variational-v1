@@ -456,13 +456,7 @@ async function handleCommandSocketMessage(data) {
     return;
   }
   if (type === "PLACE_ORDER") {
-    commandForwarder.send({
-      type: "ORDER_RESULT",
-      requestId: payload.requestId,
-      ok: false,
-      error: "PLACE_ORDER is not implemented in the extension yet.",
-      timestamp: nowIso()
-    });
+    await handlePlaceOrder(payload);
     return;
   }
 }
@@ -752,6 +746,114 @@ async function handlePrepareOrderInputSweepDryRun(payload) {
   } catch (error) {
     commandForwarder.send({
       type: "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN_RESULT",
+      requestId,
+      ok: false,
+      error: error.message,
+      timestamp: nowIso()
+    });
+  }
+}
+
+function findSubmitButton(snapshot, side) {
+  const sideText = side.toLowerCase() === "buy" ? "buy" : "sell";
+  return (snapshot?.submitCandidates || []).find((item) => {
+    const text = String(item.text || "").toLowerCase();
+    return !item.disabled && text.includes(sideText) && text.includes("btc") && item.rect;
+  }) || null;
+}
+
+async function prepareOrderFormWithKeyboard(side, amount) {
+  const snapshotExpression = `(() => {
+    ${buildVariationalOrderDomSnapshot.toString()}
+    return buildVariationalOrderDomSnapshot(${JSON.stringify("__SIDE__")}, ${JSON.stringify("__AMOUNT__")});
+  })()`
+    .replaceAll('"__SIDE__"', JSON.stringify(side))
+    .replaceAll('"__AMOUNT__"', JSON.stringify(amount));
+  const beforeResult = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
+    expression: snapshotExpression,
+    returnByValue: true,
+    awaitPromise: false,
+    userGesture: true
+  });
+  const snapshotBefore = beforeResult.result?.value || null;
+  const candidates = (snapshotBefore?.inputs || [])
+    .filter((item) => item.type !== "range" && item.rect && item.rect.width > 0 && item.rect.height > 0)
+    .slice(0, 8);
+  let selectedAttempt = null;
+  for (const candidate of candidates) {
+    const inputClickPoint = await keyboardFillAt(state.attachedTabId, candidate.rect, amount);
+    const afterResult = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
+      expression: snapshotExpression,
+      returnByValue: true,
+      awaitPromise: false,
+      userGesture: true
+    });
+    const snapshotAfter = afterResult.result?.value || null;
+    const submitButton = findSubmitButton(snapshotAfter, side);
+    selectedAttempt = { candidate, inputClickPoint, snapshotAfter, submitButton };
+    if (submitButton) {
+      break;
+    }
+  }
+  return { snapshotBefore, selectedAttempt };
+}
+
+async function handlePlaceOrder(payload) {
+  const requestId = payload.requestId;
+  try {
+    if (state.attachedTabId == null) {
+      throw new Error("No attached tab.");
+    }
+    const side = String(payload.side || "").toUpperCase();
+    const amount = String(payload.amount || "");
+    const confirm = Boolean(payload.confirm);
+    const prepared = await prepareOrderFormWithKeyboard(side, amount);
+    const submitButton = prepared.selectedAttempt?.submitButton || null;
+    if (!submitButton) {
+      commandForwarder.send({
+        type: "ORDER_RESULT",
+        requestId,
+        ok: false,
+        error: "No enabled submit button found after preparing order form.",
+        result: prepared,
+        timestamp: nowIso()
+      });
+      return;
+    }
+
+    const submitClickPoint = {
+      x: submitButton.rect.x + Math.round(submitButton.rect.width / 2),
+      y: submitButton.rect.y + Math.round(submitButton.rect.height / 2)
+    };
+    if (!confirm) {
+      commandForwarder.send({
+        type: "ORDER_RESULT",
+        requestId,
+        ok: false,
+        error: "PLACE_ORDER requires confirm=true. Prepared form but did not click submit.",
+        result: { ...prepared, submitButton, clickPoint: submitClickPoint, clicked: false },
+        timestamp: nowIso()
+      });
+      return;
+    }
+
+    await clickPoint(state.attachedTabId, submitClickPoint.x, submitClickPoint.y);
+    commandForwarder.send({
+      type: "ORDER_RESULT",
+      requestId,
+      ok: true,
+      result: {
+        ...prepared,
+        submitButton,
+        clickPoint: submitClickPoint,
+        clicked: true,
+        clickedAt: nowIso()
+      },
+      timestamp: nowIso()
+    });
+  } catch (error) {
+    commandForwarder.send({
+      type: "ORDER_RESULT",
       requestId,
       ok: false,
       error: error.message,

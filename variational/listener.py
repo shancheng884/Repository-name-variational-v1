@@ -911,75 +911,7 @@ class CommandBroker:
             print(f"[COMMAND] registered role={role}", flush=True)
 
     async def _handle_place_order(self, websocket: websockets.ServerConnection, payload: dict[str, Any]) -> None:
-        request_id = str(payload.get("requestId") or uuid.uuid4())
-        side = str(payload.get("side", "")).upper()
-        amount = str(payload.get("amount", "")).strip()
-
-        if side not in {"BUY", "SELL"}:
-            await self._send(
-                websocket,
-                {
-                    "type": "ORDER_RESULT",
-                    "requestId": request_id,
-                    "ok": False,
-                    "error": "Invalid side. Use BUY or SELL.",
-                    "timestamp": utc_now(),
-                },
-            )
-            return
-        try:
-            if float(amount) <= 0:
-                raise ValueError
-        except ValueError:
-            await self._send(
-                websocket,
-                {
-                    "type": "ORDER_RESULT",
-                    "requestId": request_id,
-                    "ok": False,
-                    "error": "Invalid amount. Must be positive.",
-                    "timestamp": utc_now(),
-                },
-            )
-            return
-
-        async with self._lock:
-            extension = self._extension
-            if extension is None:
-                await self._send(
-                    websocket,
-                    {
-                        "type": "ORDER_RESULT",
-                        "requestId": request_id,
-                        "ok": False,
-                        "error": "No extension command client connected.",
-                        "timestamp": utc_now(),
-                    },
-                )
-                return
-
-            self._pending_requests[request_id] = websocket
-            forward_payload = {
-                "type": "PLACE_ORDER",
-                "requestId": request_id,
-                "side": side,
-                "amount": amount,
-                "market": payload.get("market"),
-                "account": payload.get("account"),
-                "timeoutMs": payload.get("timeoutMs"),
-                "timestamp": utc_now(),
-            }
-            await self._send(extension, forward_payload)
-
-        await self._send(
-            websocket,
-            {
-                "type": "ORDER_DISPATCHED",
-                "requestId": request_id,
-                "ok": True,
-                "timestamp": utc_now(),
-            },
-        )
+        await self._forward_order_command(websocket, payload, "PLACE_ORDER", "ORDER_RESULT")
 
     async def _handle_page_probe(self, websocket: websockets.ServerConnection, payload: dict[str, Any]) -> None:
         request_id = str(payload.get("requestId") or uuid.uuid4())
@@ -1094,16 +1026,17 @@ class CommandBroker:
                 return
 
             self._pending_requests[request_id] = websocket
-            await self._send(
-                extension,
+            forward_payload = dict(payload)
+            forward_payload.update(
                 {
                     "type": command_type,
                     "requestId": request_id,
                     "side": side,
                     "amount": amount,
                     "timestamp": utc_now(),
-                },
+                }
             )
+            await self._send(extension, forward_payload)
 
     async def _handle_command_result(self, payload: dict[str, Any]) -> None:
         request_id = str(payload.get("requestId", "")).strip()
