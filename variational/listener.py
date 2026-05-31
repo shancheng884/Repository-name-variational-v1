@@ -855,10 +855,13 @@ class CommandBroker:
         if msg_type == "PAGE_PROBE":
             await self._handle_page_probe(websocket, payload)
             return
+        if msg_type == "PLACE_ORDER_DRY_RUN":
+            await self._handle_place_order_dry_run(websocket, payload)
+            return
         if msg_type == "PLACE_ORDER":
             await self._handle_place_order(websocket, payload)
             return
-        if msg_type in {"ORDER_RESULT", "PAGE_PROBE_RESULT"}:
+        if msg_type in {"ORDER_RESULT", "PAGE_PROBE_RESULT", "PLACE_ORDER_DRY_RUN_RESULT"}:
             await self._handle_command_result(payload)
             return
 
@@ -986,6 +989,66 @@ class CommandBroker:
                 {
                     "type": "PAGE_PROBE",
                     "requestId": request_id,
+                    "timestamp": utc_now(),
+                },
+            )
+
+    async def _handle_place_order_dry_run(self, websocket: websockets.ServerConnection, payload: dict[str, Any]) -> None:
+        request_id = str(payload.get("requestId") or uuid.uuid4())
+        side = str(payload.get("side", "")).upper()
+        amount = str(payload.get("amount", "")).strip()
+
+        if side not in {"BUY", "SELL"}:
+            await self._send(
+                websocket,
+                {
+                    "type": "PLACE_ORDER_DRY_RUN_RESULT",
+                    "requestId": request_id,
+                    "ok": False,
+                    "error": "Invalid side. Use BUY or SELL.",
+                    "timestamp": utc_now(),
+                },
+            )
+            return
+        try:
+            if float(amount) <= 0:
+                raise ValueError
+        except ValueError:
+            await self._send(
+                websocket,
+                {
+                    "type": "PLACE_ORDER_DRY_RUN_RESULT",
+                    "requestId": request_id,
+                    "ok": False,
+                    "error": "Invalid amount. Must be positive.",
+                    "timestamp": utc_now(),
+                },
+            )
+            return
+
+        async with self._lock:
+            extension = self._extension
+            if extension is None:
+                await self._send(
+                    websocket,
+                    {
+                        "type": "PLACE_ORDER_DRY_RUN_RESULT",
+                        "requestId": request_id,
+                        "ok": False,
+                        "error": "No extension command client connected.",
+                        "timestamp": utc_now(),
+                    },
+                )
+                return
+
+            self._pending_requests[request_id] = websocket
+            await self._send(
+                extension,
+                {
+                    "type": "PLACE_ORDER_DRY_RUN",
+                    "requestId": request_id,
+                    "side": side,
+                    "amount": amount,
                     "timestamp": utc_now(),
                 },
             )

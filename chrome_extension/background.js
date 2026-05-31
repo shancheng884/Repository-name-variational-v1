@@ -439,6 +439,10 @@ async function handleCommandSocketMessage(data) {
     await handlePageProbe(payload);
     return;
   }
+  if (type === "PLACE_ORDER_DRY_RUN") {
+    await handlePlaceOrderDryRun(payload);
+    return;
+  }
   if (type === "PLACE_ORDER") {
     commandForwarder.send({
       type: "ORDER_RESULT",
@@ -448,6 +452,84 @@ async function handleCommandSocketMessage(data) {
       timestamp: nowIso()
     });
     return;
+  }
+}
+
+async function handlePlaceOrderDryRun(payload) {
+  const requestId = payload.requestId;
+  try {
+    if (state.attachedTabId == null) {
+      throw new Error("No attached tab.");
+    }
+    const side = String(payload.side || "").toUpperCase();
+    const amount = String(payload.amount || "");
+    const expression = `(() => {
+      const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const describe = (el) => {
+        if (!el) return null;
+        const rect = el.getBoundingClientRect();
+        return {
+          tag: el.tagName,
+          type: el.getAttribute('type') || '',
+          text: (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().slice(0, 120),
+          ariaLabel: el.getAttribute('aria-label') || '',
+          placeholder: el.getAttribute('placeholder') || '',
+          name: el.getAttribute('name') || '',
+          id: el.id || '',
+          className: String(el.className || '').slice(0, 160),
+          disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+          rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) }
+        };
+      };
+      const all = Array.from(document.querySelectorAll('button, input, textarea, [role="button"], [contenteditable="true"]')).filter(visible);
+      const inputs = all.filter((el) => ['INPUT', 'TEXTAREA'].includes(el.tagName) || el.getAttribute('contenteditable') === 'true').map(describe);
+      const buttons = all.filter((el) => el.tagName === 'BUTTON' || el.getAttribute('role') === 'button').map(describe);
+      const sideNeedle = ${JSON.stringify("__SIDE__")}.toLowerCase() === 'buy' ? ['buy', 'long'] : ['sell', 'short'];
+      const sideButtons = buttons.filter((item) => {
+        const haystack = [item.text, item.ariaLabel, item.id, item.className].join(' ').toLowerCase();
+        return sideNeedle.some((needle) => haystack.includes(needle));
+      });
+      return {
+        href: location.href,
+        title: document.title,
+        readyState: document.readyState,
+        side: ${JSON.stringify("__SIDE__")},
+        amount: ${JSON.stringify("__AMOUNT__")},
+        inputCount: inputs.length,
+        buttonCount: buttons.length,
+        inputs: inputs.slice(0, 30),
+        sideButtons: sideButtons.slice(0, 20),
+        buttons: buttons.slice(0, 40)
+      };
+    })()`
+      .replaceAll('"__SIDE__"', JSON.stringify(side))
+      .replaceAll('"__AMOUNT__"', JSON.stringify(amount));
+    const result = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+      awaitPromise: false,
+      userGesture: false
+    });
+    commandForwarder.send({
+      type: "PLACE_ORDER_DRY_RUN_RESULT",
+      requestId,
+      ok: true,
+      result: result.result?.value || null,
+      timestamp: nowIso()
+    });
+  } catch (error) {
+    commandForwarder.send({
+      type: "PLACE_ORDER_DRY_RUN_RESULT",
+      requestId,
+      ok: false,
+      error: error.message,
+      timestamp: nowIso()
+    });
   }
 }
 
