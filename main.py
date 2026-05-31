@@ -1493,7 +1493,9 @@ class VariationalToLighterRuntime:
                 return None
             quote = dict(quote)
 
-        if self.is_paper_mode():
+        bid = to_decimal(quote.get("bid"))
+        ask = to_decimal(quote.get("ask"))
+        if self.is_paper_mode() or bid is None or ask is None or ask <= bid:
             quote = await self.apply_variational_indicative_quote(quote)
         return quote
 
@@ -2411,9 +2413,6 @@ class VariationalToLighterRuntime:
             "longPrice",
             "ask_price",
             "askPrice",
-            "ask",
-            "best_ask",
-            "a",
         )
         sell_keys = (
             "sell_price",
@@ -2422,9 +2421,6 @@ class VariationalToLighterRuntime:
             "shortPrice",
             "bid_price",
             "bidPrice",
-            "bid",
-            "best_bid",
-            "b",
         )
         for candidate in candidates:
             buy_price = first_decimal_from_keys(candidate, buy_keys)
