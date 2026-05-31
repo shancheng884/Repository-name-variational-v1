@@ -5,6 +5,7 @@ const AUTO_RELOAD_COOLDOWN_MS = 5000;
 const DEFAULT_CONFIG = {
   wsEndpoint: "ws://127.0.0.1:8766",
   restEndpoint: "ws://127.0.0.1:8767",
+  commandEndpoint: "ws://127.0.0.1:8768",
   domainFilter: "variational",
   restAllowlist: [
     "https://omni.variational.io/api/"
@@ -27,9 +28,11 @@ const state = {
 };
 
 class ForwardSocket {
-  constructor(label, configKey) {
+  constructor(label, configKey, options = {}) {
     this.label = label;
     this.configKey = configKey;
+    this.onOpen = options.onOpen || null;
+    this.onMessage = options.onMessage || null;
     this.ws = null;
     this.status = "disconnected";
     this.queue = [];
@@ -69,10 +72,20 @@ class ForwardSocket {
         }
         this.status = "connected";
         this.flush();
+        if (this.onOpen) {
+          this.onOpen(this);
+        }
         if (this.configKey === "wsEndpoint") {
           autoReloadAttachedTab("forward receiver connected");
         }
         notifyStatus();
+      };
+
+      socket.onmessage = (event) => {
+        if (this.ws !== socket || !this.onMessage) {
+          return;
+        }
+        this.onMessage(event.data, this);
       };
 
       socket.onclose = () => {
@@ -154,6 +167,10 @@ class ForwardSocket {
 
 const wsForwarder = new ForwardSocket("websocket", "wsEndpoint");
 const restForwarder = new ForwardSocket("rest", "restEndpoint");
+const commandForwarder = new ForwardSocket("command", "commandEndpoint", {
+  onOpen: (socket) => socket.send({ type: "REGISTER", role: "extension", timestamp: nowIso() }),
+  onMessage: (data) => handleCommandSocketMessage(data)
+});
 
 function autoReloadAttachedTab(reason) {
   if (!state.active || state.attachedTabId == null) {
@@ -189,6 +206,7 @@ function sanitizeConfig(incoming = {}) {
   return {
     wsEndpoint: asStringOrDefault(incoming.wsEndpoint, DEFAULT_CONFIG.wsEndpoint),
     restEndpoint: asStringOrDefault(incoming.restEndpoint, DEFAULT_CONFIG.restEndpoint),
+    commandEndpoint: asStringOrDefault(incoming.commandEndpoint, DEFAULT_CONFIG.commandEndpoint),
     domainFilter: asStringOrDefault(incoming.domainFilter, DEFAULT_CONFIG.domainFilter),
     restAllowlist: sanitizeRestAllowlist(incoming.restAllowlist),
     wsAllowlist: sanitizeAllowlist(incoming.wsAllowlist, DEFAULT_CONFIG.wsAllowlist)
@@ -372,6 +390,7 @@ async function startForwarding(tabId = null) {
   state.lastError = null;
   wsForwarder.connect();
   restForwarder.connect();
+  commandForwarder.connect();
   autoReloadAttachedTab("forwarder started");
   notifyStatus();
   return getStatus();
@@ -399,6 +418,67 @@ function cleanupForwardingState() {
   state.lastAutoReloadAt = 0;
   wsForwarder.close();
   restForwarder.close();
+  commandForwarder.close();
+}
+
+async function handleCommandSocketMessage(data) {
+  let payload;
+  try {
+    payload = JSON.parse(data);
+  } catch (error) {
+    state.lastError = `Command message parse failed: ${error.message}`;
+    notifyStatus();
+    return;
+  }
+
+  const type = String(payload.type || "").toUpperCase();
+  if (type === "REGISTER_ACK" || type === "PONG") {
+    return;
+  }
+  if (type === "PAGE_PROBE") {
+    await handlePageProbe(payload);
+    return;
+  }
+  if (type === "PLACE_ORDER") {
+    commandForwarder.send({
+      type: "ORDER_RESULT",
+      requestId: payload.requestId,
+      ok: false,
+      error: "PLACE_ORDER is not implemented in the extension yet.",
+      timestamp: nowIso()
+    });
+    return;
+  }
+}
+
+async function handlePageProbe(payload) {
+  const requestId = payload.requestId;
+  try {
+    if (state.attachedTabId == null) {
+      throw new Error("No attached tab.");
+    }
+    const result = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
+      expression: "({ title: document.title, href: location.href, readyState: document.readyState })",
+      returnByValue: true,
+      awaitPromise: false,
+      userGesture: false
+    });
+    commandForwarder.send({
+      type: "PAGE_PROBE_RESULT",
+      requestId,
+      ok: true,
+      result: result.result?.value || null,
+      timestamp: nowIso()
+    });
+  } catch (error) {
+    commandForwarder.send({
+      type: "PAGE_PROBE_RESULT",
+      requestId,
+      ok: false,
+      error: error.message,
+      timestamp: nowIso()
+    });
+  }
 }
 
 function getStatus() {
@@ -408,7 +488,8 @@ function getStatus() {
     config: state.config,
     sockets: {
       websocket: wsForwarder.status,
-      rest: restForwarder.status
+      rest: restForwarder.status,
+      command: commandForwarder.status
     },
     lastError: state.lastError
   };

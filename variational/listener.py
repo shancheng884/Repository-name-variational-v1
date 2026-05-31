@@ -852,11 +852,14 @@ class CommandBroker:
         if msg_type == "PING":
             await self._send(websocket, {"type": "PONG", "timestamp": utc_now()})
             return
+        if msg_type == "PAGE_PROBE":
+            await self._handle_page_probe(websocket, payload)
+            return
         if msg_type == "PLACE_ORDER":
             await self._handle_place_order(websocket, payload)
             return
-        if msg_type == "ORDER_RESULT":
-            await self._handle_order_result(payload)
+        if msg_type in {"ORDER_RESULT", "PAGE_PROBE_RESULT"}:
+            await self._handle_command_result(payload)
             return
 
         await self._send(
@@ -959,7 +962,35 @@ class CommandBroker:
             },
         )
 
-    async def _handle_order_result(self, payload: dict[str, Any]) -> None:
+    async def _handle_page_probe(self, websocket: websockets.ServerConnection, payload: dict[str, Any]) -> None:
+        request_id = str(payload.get("requestId") or uuid.uuid4())
+
+        async with self._lock:
+            extension = self._extension
+            if extension is None:
+                await self._send(
+                    websocket,
+                    {
+                        "type": "PAGE_PROBE_RESULT",
+                        "requestId": request_id,
+                        "ok": False,
+                        "error": "No extension command client connected.",
+                        "timestamp": utc_now(),
+                    },
+                )
+                return
+
+            self._pending_requests[request_id] = websocket
+            await self._send(
+                extension,
+                {
+                    "type": "PAGE_PROBE",
+                    "requestId": request_id,
+                    "timestamp": utc_now(),
+                },
+            )
+
+    async def _handle_command_result(self, payload: dict[str, Any]) -> None:
         request_id = str(payload.get("requestId", "")).strip()
         if not request_id:
             return
@@ -969,7 +1000,10 @@ class CommandBroker:
         if requester is not None:
             await self._send(requester, payload)
             if not self.quiet:
-                print(f"[COMMAND] order_result requestId={request_id} ok={payload.get('ok')}", flush=True)
+                print(
+                    f"[COMMAND] result type={payload.get('type')} requestId={request_id} ok={payload.get('ok')}",
+                    flush=True,
+                )
 
     async def _send(self, websocket: websockets.ServerConnection, payload: dict[str, Any]) -> None:
         try:

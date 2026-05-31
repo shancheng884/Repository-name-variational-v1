@@ -24,9 +24,11 @@ from rich.panel import Panel
 from rich.table import Table
 
 from variational.listener import (
+    CommandBroker,
     HEARTBEAT_STALE_SECONDS,
     EventSink,
     VariationalMonitor,
+    run_command_server,
     run_receiver_server,
 )
 from paper_engine import (
@@ -91,6 +93,7 @@ VARIATIONAL_ASSET_TO_LIGHTER_TICKER = {v: k for k, v in VARIATIONAL_TICKER_OVERR
 FORWARDER_HOST = "127.0.0.1"
 FORWARDER_WS_PORT = 8766
 FORWARDER_REST_PORT = 8767
+FORWARDER_COMMAND_PORT = 8768
 LOG_DIR = Path("./log")
 OUTPUT_DIR = LOG_DIR
 APP_LOG_FILE = LOG_DIR / "runtime.log"
@@ -565,20 +568,25 @@ class VariationalRuntime:
         host: str,
         ws_port: int,
         rest_port: int,
+        command_port: int,
         output_dir: Path | None,
         quiet: bool,
     ) -> None:
         self.monitor = VariationalMonitor(trade_limit=500, snapshot_file=None)
         self.sink = EventSink(output_dir=output_dir, quiet=quiet, monitor=self.monitor)
+        self.command_broker = CommandBroker(quiet=quiet)
         self.host = host
         self.ws_port = ws_port
         self.rest_port = rest_port
+        self.command_port = command_port
         self.ws_server = None
         self.rest_server = None
+        self.command_server = None
 
     async def start(self) -> None:
         self.ws_server = await run_receiver_server("ws", self.host, self.ws_port, self.sink)
         self.rest_server = await run_receiver_server("rest", self.host, self.rest_port, self.sink)
+        self.command_server = await run_command_server(self.host, self.command_port, self.command_broker)
 
     async def stop(self) -> None:
         if self.ws_server is not None:
@@ -587,6 +595,9 @@ class VariationalRuntime:
         if self.rest_server is not None:
             self.rest_server.close()
             await self.rest_server.wait_closed()
+        if self.command_server is not None:
+            self.command_server.close()
+            await self.command_server.wait_closed()
 
 
 class VariationalToLighterRuntime:
@@ -637,6 +648,7 @@ class VariationalToLighterRuntime:
             host=FORWARDER_HOST,
             ws_port=FORWARDER_WS_PORT,
             rest_port=FORWARDER_REST_PORT,
+            command_port=FORWARDER_COMMAND_PORT,
             output_dir=output_dir,
             quiet=True,
         )
@@ -817,6 +829,7 @@ class VariationalToLighterRuntime:
         passed.append(f"mode={self.mode}")
         passed.append(f"forwarder_ws=ws://{FORWARDER_HOST}:{FORWARDER_WS_PORT}")
         passed.append(f"forwarder_rest=ws://{FORWARDER_HOST}:{FORWARDER_REST_PORT}")
+        passed.append(f"forwarder_command=ws://{FORWARDER_HOST}:{FORWARDER_COMMAND_PORT}")
         passed.append(f"risk_guard_max_base_amount={self.risk_guard_max_base_amount}")
         passed.append(f"risk_guard_max_price_deviation_bps={self.risk_guard_max_price_deviation_bps}")
         passed.append(f"live_config={json.dumps(self.live_config_snapshot(), ensure_ascii=True, sort_keys=True)}")
@@ -3090,11 +3103,13 @@ class VariationalToLighterRuntime:
         await self.runtime.start()
         self.print_startup_next_steps()
         self.logger.info(
-            "Listening for Variational forwarder events on ws://%s:%s and ws://%s:%s",
+            "Listening for Variational forwarder events on ws://%s:%s, ws://%s:%s, command ws://%s:%s",
             FORWARDER_HOST,
             FORWARDER_WS_PORT,
             FORWARDER_HOST,
             FORWARDER_REST_PORT,
+            FORWARDER_HOST,
+            FORWARDER_COMMAND_PORT,
         )
 
         variational_ready = await self.wait_for_variational_ready()

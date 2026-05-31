@@ -4,6 +4,7 @@ const inputs = {
   domainFilter: $("domainFilter"),
   wsEndpoint: $("wsEndpoint"),
   restEndpoint: $("restEndpoint"),
+  commandEndpoint: $("commandEndpoint"),
   restAllowlist: $("restAllowlist")
 };
 
@@ -16,6 +17,7 @@ function toStatusText(status) {
     `Domain filter: ${status.config.domainFilter}`,
     `WS socket (${status.config.wsEndpoint}): ${status.sockets.websocket}`,
     `REST socket (${status.config.restEndpoint}): ${status.sockets.rest}`,
+    `COMMAND socket (${status.config.commandEndpoint}): ${status.sockets.command}`,
     `REST allowlist entries: ${(status.config.restAllowlist || []).length}`,
     `Last error: ${status.lastError || "-"}`
   ].join("\n");
@@ -25,6 +27,7 @@ function updateFormFromStatus(status) {
   inputs.domainFilter.value = status.config.domainFilter || "";
   inputs.wsEndpoint.value = status.config.wsEndpoint || "";
   inputs.restEndpoint.value = status.config.restEndpoint || "";
+  inputs.commandEndpoint.value = status.config.commandEndpoint || "";
   inputs.restAllowlist.value = (status.config.restAllowlist || []).join("\n");
 }
 
@@ -53,6 +56,7 @@ function readConfig() {
     domainFilter: inputs.domainFilter.value.trim(),
     wsEndpoint: inputs.wsEndpoint.value.trim(),
     restEndpoint: inputs.restEndpoint.value.trim(),
+    commandEndpoint: inputs.commandEndpoint.value.trim(),
     restAllowlist
   };
 }
