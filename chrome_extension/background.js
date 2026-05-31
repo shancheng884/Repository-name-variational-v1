@@ -443,6 +443,10 @@ async function handleCommandSocketMessage(data) {
     await handlePlaceOrderDryRun(payload);
     return;
   }
+  if (type === "PREPARE_ORDER_DRY_RUN") {
+    await handlePrepareOrderDryRun(payload);
+    return;
+  }
   if (type === "PLACE_ORDER") {
     commandForwarder.send({
       type: "ORDER_RESULT",
@@ -452,6 +456,123 @@ async function handleCommandSocketMessage(data) {
       timestamp: nowIso()
     });
     return;
+  }
+}
+
+function buildVariationalOrderDomSnapshot(side, amount) {
+  const visible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const describe = (el) => {
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    return {
+      tag: el.tagName,
+      type: el.getAttribute('type') || '',
+      text: (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().slice(0, 120),
+      ariaLabel: el.getAttribute('aria-label') || '',
+      placeholder: el.getAttribute('placeholder') || '',
+      name: el.getAttribute('name') || '',
+      id: el.id || '',
+      className: String(el.className || '').slice(0, 160),
+      disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+      rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) }
+    };
+  };
+  const describePanelNode = (el) => {
+    const item = describe(el);
+    if (!item) return null;
+    item.value = typeof el.value === 'string' ? el.value.slice(0, 120) : '';
+    item.text = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().replace(/\s+/g, ' ').slice(0, 220);
+    return item;
+  };
+  const all = Array.from(document.querySelectorAll('button, input, textarea, [role="button"], [contenteditable="true"]')).filter(visible);
+  const inputs = all.filter((el) => ['INPUT', 'TEXTAREA'].includes(el.tagName) || el.getAttribute('contenteditable') === 'true');
+  const buttons = all.filter((el) => el.tagName === 'BUTTON' || el.getAttribute('role') === 'button');
+  const sideNeedle = side.toLowerCase() === 'buy' ? ['buy', 'long'] : ['sell', 'short'];
+  const sideButton = buttons.find((el) => {
+    const haystack = [el.innerText, el.getAttribute('aria-label'), el.id, el.className].join(' ').toLowerCase();
+    return sideNeedle.some((needle) => haystack.includes(needle));
+  }) || null;
+  const textInputs = inputs.filter((el) => (el.getAttribute('type') || '').toLowerCase() !== 'range');
+  const mainInput = textInputs
+    .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+    .sort((a, b) => (b.rect.width - a.rect.width) || (a.rect.y - b.rect.y))[0]?.el || null;
+  return {
+    href: location.href,
+    title: document.title,
+    readyState: document.readyState,
+    side,
+    amount,
+    inputCount: inputs.length,
+    buttonCount: buttons.length,
+    inputs: inputs.map(describePanelNode).slice(0, 30),
+    sideButton: describePanelNode(sideButton),
+    mainInput: describePanelNode(mainInput),
+    buttons: buttons.map(describePanelNode).slice(0, 50)
+  };
+}
+
+async function handlePrepareOrderDryRun(payload) {
+  const requestId = payload.requestId;
+  try {
+    if (state.attachedTabId == null) {
+      throw new Error("No attached tab.");
+    }
+    const side = String(payload.side || "").toUpperCase();
+    const amount = String(payload.amount || "");
+    const expression = `(() => {
+      ${buildVariationalOrderDomSnapshot.toString()}
+      const snapshotBefore = buildVariationalOrderDomSnapshot(${JSON.stringify("__SIDE__")}, ${JSON.stringify("__AMOUNT__")});
+      const input = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]'))
+        .filter((el) => {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && (el.getAttribute('type') || '').toLowerCase() !== 'range';
+        })
+        .sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
+      if (!input) {
+        return { ok: false, error: 'No text input candidate found', snapshotBefore };
+      }
+      input.focus();
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+      if (nativeInputValueSetter && input instanceof HTMLInputElement) {
+        nativeInputValueSetter.call(input, ${JSON.stringify("__AMOUNT__")});
+      } else {
+        input.value = ${JSON.stringify("__AMOUNT__")};
+      }
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      const snapshotAfter = buildVariationalOrderDomSnapshot(${JSON.stringify("__SIDE__")}, ${JSON.stringify("__AMOUNT__")});
+      return { ok: true, action: 'prepared_without_submit', snapshotBefore, snapshotAfter };
+    })()`
+      .replaceAll('"__SIDE__"', JSON.stringify(side))
+      .replaceAll('"__AMOUNT__"', JSON.stringify(amount));
+    const result = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+      awaitPromise: false,
+      userGesture: true
+    });
+    const value = result.result?.value || null;
+    commandForwarder.send({
+      type: "PREPARE_ORDER_DRY_RUN_RESULT",
+      requestId,
+      ok: Boolean(value?.ok),
+      result: value,
+      timestamp: nowIso()
+    });
+  } catch (error) {
+    commandForwarder.send({
+      type: "PREPARE_ORDER_DRY_RUN_RESULT",
+      requestId,
+      ok: false,
+      error: error.message,
+      timestamp: nowIso()
+    });
   }
 }
 
