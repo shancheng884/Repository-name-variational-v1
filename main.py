@@ -380,6 +380,8 @@ class OrderLifecycle:
 
     var_fill_price: Decimal | None = None
     var_fill_ts_iso: str | None = None
+    synthetic_eager_fill: bool = False
+    matched_variational_trade_id: str | None = None
 
     lighter_side: str | None = None
     lighter_client_order_id: int | None = None
@@ -423,6 +425,8 @@ class OrderLifecycle:
             "asset": self.asset,
             "variational_filled_price": decimal_to_str(self.var_fill_price),
             "variational_filled_at": self.var_fill_ts_iso,
+            "synthetic_eager_fill": self.synthetic_eager_fill,
+            "matched_variational_trade_id": self.matched_variational_trade_id,
             "lighter_order_side": self.lighter_side,
             "lighter_client_order_id": self.lighter_client_order_id,
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
@@ -1303,11 +1307,12 @@ class VariationalToLighterRuntime:
             qty=qty,
             asset=asset,
             mode=self.mode,
-            last_variational_status="filled",
+            last_variational_status="submitted",
             var_fill_price=var_fill_price,
             var_fill_ts_iso=utc_now(),
             live_var_fill_seen_at_iso=utc_now(),
             live_var_fill_seen_monotonic=time.monotonic(),
+            synthetic_eager_fill=True,
         )
         async with self._record_lock:
             self.set_record_stage(record, STAGE_RECORD_CREATED, clear_failure=True)
@@ -2086,6 +2091,9 @@ class VariationalToLighterRuntime:
                     should_set_fill = True
 
             if should_set_fill:
+                record.synthetic_eager_fill = False
+                record.matched_variational_trade_id = trade_id or record.matched_variational_trade_id
+                record.trade_id = trade_id or record.trade_id
                 record.var_fill_ts_iso = fill_iso
                 record.var_fill_price = to_decimal(event.get("price"))
                 if record.live_var_fill_seen_at_iso is None:
@@ -3288,6 +3296,8 @@ class VariationalToLighterRuntime:
                         "record_kind": payload["record_kind"],
                         "trade_key": record.trade_key,
                         "trade_id": record.trade_id,
+                        "synthetic_eager_fill": payload["synthetic_eager_fill"],
+                        "matched_variational_trade_id": payload["matched_variational_trade_id"],
                         "asset": record.asset,
                         "side_raw": record.side,
                         "direction_zh": side_zh,
@@ -3351,6 +3361,8 @@ class VariationalToLighterRuntime:
             "record_kind",
             "trade_key",
             "trade_id",
+            "synthetic_eager_fill",
+            "matched_variational_trade_id",
             "asset",
             "side_raw",
             "direction_zh",

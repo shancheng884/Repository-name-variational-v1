@@ -50,6 +50,11 @@ def clean_text(value: Any) -> str:
     return text
 
 
+def clean_bool(value: Any) -> bool:
+    text = clean_text(value).lower()
+    return text in {"1", "true", "yes", "on"}
+
+
 def infer_record_kind(row: dict[str, Any]) -> str:
     explicit = clean_text(row.get("record_kind", ""))
     if explicit:
@@ -294,9 +299,10 @@ def collect_completed_details(rows: list[dict[str, Any]]) -> list[dict[str, Any]
         completed.append(
             {
                 "asset": clean_text(row.get("asset", "")).upper(),
-                "trade_id": clean_text(row.get("trade_id", "")),
+                "trade_id": clean_text(row.get("matched_variational_trade_id", "")) or clean_text(row.get("trade_id", "")),
                 "side": clean_text(row.get("side_raw", row.get("side", ""))),
                 "qty": clean_text(row.get("qty", "")),
+                "synthetic_eager_fill": clean_bool(row.get("synthetic_eager_fill")),
                 "variational_filled_price": to_decimal(row.get("variational_filled_price")),
                 "lighter_filled_price": to_decimal(row.get("lighter_filled_price")),
                 "live_fill_latency_ms": to_decimal(row.get("live_fill_latency_ms")),
@@ -313,7 +319,7 @@ def collect_completed_details(rows: list[dict[str, Any]]) -> list[dict[str, Any]
                 "lighter_filled_at": lighter_filled_at,
             }
         )
-    completed.sort(key=lambda item: (item["asset"], item["variational_filled_at"], item["trade_id"]))
+    completed.sort(key=lambda item: (item["asset"], item["variational_filled_at"], item["trade_id"], item["synthetic_eager_fill"]))
     return completed
 
 
