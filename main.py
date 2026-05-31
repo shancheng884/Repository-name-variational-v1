@@ -343,6 +343,16 @@ def elapsed_ms(start: float | None, end: float | None) -> Decimal | None:
     return Decimal(str(max(0.0, (end - start) * 1000)))
 
 
+def elapsed_iso_ms(start_iso: str | None, end_iso: str | None) -> Decimal | None:
+    if not start_iso or not end_iso:
+        return None
+    with contextlib.suppress(Exception):
+        start = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+        return Decimal(str((end - start).total_seconds() * 1000))
+    return None
+
+
 def normalize_variational_status(status: str) -> str:
     lowered = status.strip().lower()
     if lowered in {"confirmed", "fill", "filled", "executed", "execution", "cleared"}:
@@ -419,6 +429,10 @@ class OrderLifecycle:
             "live_edge_bps": decimal_to_str(self.live_edge_bps),
             "live_fill_latency_ms": decimal_to_str(self.live_fill_latency_ms),
             "live_var_fill_seen_at": self.live_var_fill_seen_at_iso,
+            "live_var_event_to_seen_ms": decimal_to_str(elapsed_iso_ms(
+                self.var_fill_ts_iso,
+                self.live_var_fill_seen_at_iso,
+            )),
             "live_plan_started_at": self.live_plan_started_at_iso,
             "live_plan_ready_at": self.live_plan_ready_at_iso,
             "live_submit_started_at": self.live_submit_started_at_iso,
@@ -1896,8 +1910,9 @@ class VariationalToLighterRuntime:
             if should_set_fill:
                 record.var_fill_ts_iso = fill_iso
                 record.var_fill_price = to_decimal(event.get("price"))
-                record.live_var_fill_seen_at_iso = now_iso
-                record.live_var_fill_seen_monotonic = time.monotonic()
+                if record.live_var_fill_seen_at_iso is None:
+                    record.live_var_fill_seen_at_iso = now_iso
+                    record.live_var_fill_seen_monotonic = time.monotonic()
                 self.set_record_stage(record, STAGE_VARIATIONAL_FILLED, clear_failure=True)
                 filled_payload = record.to_payload()
             else:
@@ -2934,6 +2949,7 @@ class VariationalToLighterRuntime:
                         "live_edge_bps": payload["live_edge_bps"],
                         "live_fill_latency_ms": payload["live_fill_latency_ms"],
                         "live_var_fill_seen_at": payload["live_var_fill_seen_at"],
+                        "live_var_event_to_seen_ms": payload["live_var_event_to_seen_ms"],
                         "live_plan_started_at": payload["live_plan_started_at"],
                         "live_plan_ready_at": payload["live_plan_ready_at"],
                         "live_submit_started_at": payload["live_submit_started_at"],
@@ -2996,6 +3012,7 @@ class VariationalToLighterRuntime:
             "live_edge_bps",
             "live_fill_latency_ms",
             "live_var_fill_seen_at",
+            "live_var_event_to_seen_ms",
             "live_plan_started_at",
             "live_plan_ready_at",
             "live_submit_started_at",

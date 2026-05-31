@@ -185,6 +185,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             "filled_rows": 0,
             "record_kinds": Counter(),
             "latency_ms": [],
+            "var_event_to_seen_ms": [],
             "var_seen_to_plan_start_ms": [],
             "plan_latency_ms": [],
             "plan_ready_to_submit_start_ms": [],
@@ -244,6 +245,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
         for key, column in (
             ("latency_ms", "live_fill_latency_ms"),
+            ("var_event_to_seen_ms", "live_var_event_to_seen_ms"),
             ("var_seen_to_plan_start_ms", "live_var_seen_to_plan_start_ms"),
             ("plan_latency_ms", "live_plan_latency_ms"),
             ("plan_ready_to_submit_start_ms", "live_plan_ready_to_submit_start_ms"),
@@ -298,6 +300,7 @@ def collect_completed_details(rows: list[dict[str, Any]]) -> list[dict[str, Any]
                 "variational_filled_price": to_decimal(row.get("variational_filled_price")),
                 "lighter_filled_price": to_decimal(row.get("lighter_filled_price")),
                 "live_fill_latency_ms": to_decimal(row.get("live_fill_latency_ms")),
+                "live_var_event_to_seen_ms": to_decimal(row.get("live_var_event_to_seen_ms")),
                 "live_var_seen_to_plan_start_ms": to_decimal(row.get("live_var_seen_to_plan_start_ms")),
                 "live_plan_latency_ms": to_decimal(row.get("live_plan_latency_ms")),
                 "live_plan_ready_to_submit_start_ms": to_decimal(row.get("live_plan_ready_to_submit_start_ms")),
@@ -353,12 +356,12 @@ def print_summary(stats: dict[str, dict[str, Any]], source_label: str) -> None:
     print("latency breakdown")
     print(
         "asset avg_var_to_plan_ms avg_plan_ms avg_plan_to_submit_ms "
-        "avg_submit_call_ms avg_submit_to_fill_ms avg_var_seen_to_fill_ms"
+        "avg_submit_call_ms avg_submit_to_fill_ms avg_var_seen_to_fill_ms avg_var_event_to_seen_ms"
     )
     for asset in sorted(stats):
         bucket = stats[asset]
         print(
-            "{asset} {var_to_plan} {plan} {plan_to_submit} {submit_call} {submit_to_fill} {var_to_fill}".format(
+            "{asset} {var_to_plan} {plan} {plan_to_submit} {submit_call} {submit_to_fill} {var_to_fill} {event_to_seen}".format(
                 asset=asset,
                 var_to_plan=fmt(avg(bucket["var_seen_to_plan_start_ms"]), 3),
                 plan=fmt(avg(bucket["plan_latency_ms"]), 3),
@@ -366,6 +369,7 @@ def print_summary(stats: dict[str, dict[str, Any]], source_label: str) -> None:
                 submit_call=fmt(avg(bucket["submit_call_latency_ms"]), 3),
                 submit_to_fill=fmt(avg(bucket["submit_sent_to_fill_ms"]), 3),
                 var_to_fill=fmt(avg(bucket["var_seen_to_lighter_fill_ms"]), 3),
+                event_to_seen=fmt(avg(bucket["var_event_to_seen_ms"]), 3),
             )
         )
 
@@ -443,12 +447,12 @@ def print_completed_details(rows: list[dict[str, Any]]) -> None:
 
     print(
         "asset side qty avg_edge_bps calibration_edge_bps latency_ms submit_call_ms submit_to_fill_ms "
-        "var_seen_to_fill_ms var_price lighter_price var_filled_at trade_id"
+        "var_seen_to_fill_ms var_event_to_seen_ms var_price lighter_price var_filled_at trade_id"
     )
     for item in completed:
         print(
             "{asset} {side} {qty} {edge} {calibration_edge} {latency} {submit_call} {submit_to_fill} "
-            "{var_seen_to_fill} {var_price} {lighter_price} {filled_at} {trade_id}".format(
+            "{var_seen_to_fill} {event_to_seen} {var_price} {lighter_price} {filled_at} {trade_id}".format(
                 asset=item["asset"],
                 side=item["side"],
                 qty=item["qty"],
@@ -458,6 +462,7 @@ def print_completed_details(rows: list[dict[str, Any]]) -> None:
                 submit_call=fmt(item["live_submit_call_latency_ms"], 3),
                 submit_to_fill=fmt(item["live_submit_sent_to_fill_ms"], 3),
                 var_seen_to_fill=fmt(item["live_var_seen_to_lighter_fill_ms"], 3),
+                event_to_seen=fmt(item["live_var_event_to_seen_ms"], 3),
                 var_price=fmt(item["variational_filled_price"], 4),
                 lighter_price=fmt(item["lighter_filled_price"], 4),
                 filled_at=item["variational_filled_at"] or "-",
