@@ -486,6 +486,28 @@ async function handlePlaceOrderDryRun(payload) {
           rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) }
         };
       };
+      const describePanelNode = (el) => {
+        const item = describe(el);
+        if (!item) return null;
+        item.value = typeof el.value === 'string' ? el.value.slice(0, 120) : '';
+        item.text = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().replace(/\s+/g, ' ').slice(0, 220);
+        return item;
+      };
+      const nearestCommonAncestor = (a, b) => {
+        if (!a || !b) return null;
+        const seen = new Set();
+        let cur = a;
+        while (cur) {
+          seen.add(cur);
+          cur = cur.parentElement;
+        }
+        cur = b;
+        while (cur) {
+          if (seen.has(cur)) return cur;
+          cur = cur.parentElement;
+        }
+        return null;
+      };
       const all = Array.from(document.querySelectorAll('button, input, textarea, [role="button"], [contenteditable="true"]')).filter(visible);
       const inputs = all.filter((el) => ['INPUT', 'TEXTAREA'].includes(el.tagName) || el.getAttribute('contenteditable') === 'true').map(describe);
       const buttons = all.filter((el) => el.tagName === 'BUTTON' || el.getAttribute('role') === 'button').map(describe);
@@ -494,6 +516,17 @@ async function handlePlaceOrderDryRun(payload) {
         const haystack = [item.text, item.ariaLabel, item.id, item.className].join(' ').toLowerCase();
         return sideNeedle.some((needle) => haystack.includes(needle));
       });
+      const buyButton = all.find((el) => (el.innerText || '').trim().toLowerCase() === 'buy');
+      const sellButton = all.find((el) => (el.innerText || '').trim().toLowerCase() === 'sell');
+      const panelRoot = nearestCommonAncestor(buyButton, sellButton);
+      const panelNodes = panelRoot
+        ? Array.from(panelRoot.querySelectorAll('button, input, textarea, [role="button"], [contenteditable="true"], [tabindex], div, span'))
+            .filter(visible)
+            .map(describePanelNode)
+            .filter((item) => item && (item.text || item.ariaLabel || item.placeholder || item.name || item.id || item.value))
+            .slice(0, 160)
+        : [];
+      const panelText = panelRoot ? (panelRoot.innerText || panelRoot.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 3000) : '';
       return {
         href: location.href,
         title: document.title,
@@ -504,6 +537,8 @@ async function handlePlaceOrderDryRun(payload) {
         buttonCount: buttons.length,
         inputs: inputs.slice(0, 30),
         sideButtons: sideButtons.slice(0, 20),
+        panelText,
+        panelNodes,
         buttons: buttons.slice(0, 40)
       };
     })()`
