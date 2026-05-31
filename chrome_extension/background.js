@@ -539,7 +539,7 @@ async function handlePrepareOrderDryRun(payload) {
     }
     const side = String(payload.side || "").toUpperCase();
     const amount = String(payload.amount || "");
-    const expression = `(() => {
+    const expression = `(async () => {
       ${buildVariationalOrderDomSnapshot.toString()}
       const snapshotBefore = buildVariationalOrderDomSnapshot(${JSON.stringify("__SIDE__")}, ${JSON.stringify("__AMOUNT__")});
       const input = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]'))
@@ -574,11 +574,13 @@ async function handlePrepareOrderDryRun(payload) {
       userGesture: true
     });
     const value = result.result?.value || null;
+    const exceptionText = result.exceptionDetails?.exception?.description || result.exceptionDetails?.text || "";
     commandForwarder.send({
       type: "PREPARE_ORDER_DRY_RUN_RESULT",
       requestId,
-      ok: Boolean(value?.ok),
+      ok: Boolean(value?.ok) && !exceptionText,
       result: value,
+      error: exceptionText || value?.error || "",
       timestamp: nowIso()
     });
   } catch (error) {
