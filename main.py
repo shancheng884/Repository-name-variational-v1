@@ -1653,6 +1653,7 @@ class VariationalToLighterRuntime:
 
         side, limit_price, base_amount = plan
         is_ask = side == "SELL"
+        asset_key = record.asset.upper()
 
         price_i = int(limit_price * self.price_multiplier)
         async with self._record_lock:
