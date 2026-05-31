@@ -73,6 +73,13 @@ def infer_hedge_completion_status(row: dict[str, Any]) -> str:
     lighter_filled_at = clean_text(row.get("lighter_filled_at", ""))
     processing_stage = clean_text(row.get("processing_stage", ""))
     failure_stage = clean_text(row.get("failure_stage", ""))
+    synthetic_eager_fill = clean_bool(row.get("synthetic_eager_fill"))
+    matched_variational_trade_id = clean_text(row.get("matched_variational_trade_id", ""))
+
+    if synthetic_eager_fill and not matched_variational_trade_id:
+        if lighter_filled_at or processing_stage == "lighter_filled":
+            return "hedged_from_synthetic_eager_unmatched"
+        return "synthetic_eager_waiting_for_var_fill"
 
     if not var_filled_at:
         return "no_variational_fill"
@@ -206,6 +213,9 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             "observed_failure_reasons": Counter(),
             "hedge_completion_statuses": Counter(),
             "rollback_actions": Counter(),
+            "synthetic_unmatched_rows": 0,
+            "synthetic_unmatched_hedged_rows": 0,
+            "synthetic_matched_rows": 0,
             "by_side": defaultdict(
                 lambda: {
                     "rows": 0,
@@ -244,6 +254,15 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
         hedge_completion_status = infer_hedge_completion_status(row)
         bucket["hedge_completion_statuses"][hedge_completion_status] += 1
+
+        synthetic_eager_fill = clean_bool(row.get("synthetic_eager_fill"))
+        matched_variational_trade_id = clean_text(row.get("matched_variational_trade_id", ""))
+        if synthetic_eager_fill and not matched_variational_trade_id:
+            bucket["synthetic_unmatched_rows"] += 1
+            if processing_stage == "lighter_filled":
+                bucket["synthetic_unmatched_hedged_rows"] += 1
+        if matched_variational_trade_id:
+            bucket["synthetic_matched_rows"] += 1
 
         rollback_action = infer_rollback_action(row)
         bucket["rollback_actions"][rollback_action] += 1
@@ -321,6 +340,29 @@ def collect_completed_details(rows: list[dict[str, Any]]) -> list[dict[str, Any]
         )
     completed.sort(key=lambda item: (item["asset"], item["variational_filled_at"], item["trade_id"], item["synthetic_eager_fill"]))
     return completed
+
+
+def collect_unmatched_synthetic_eager_details(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for row in rows:
+        if not clean_bool(row.get("synthetic_eager_fill")):
+            continue
+        if clean_text(row.get("matched_variational_trade_id", "")):
+            continue
+        details.append(
+            {
+                "asset": clean_text(row.get("asset", "")).upper(),
+                "side": clean_text(row.get("side_raw", row.get("side", ""))),
+                "qty": clean_text(row.get("qty", "")),
+                "trade_id": clean_text(row.get("trade_id", "")),
+                "processing_stage": clean_text(row.get("processing_stage", "")),
+                "variational_filled_at": clean_text(row.get("variational_filled_at", "")),
+                "lighter_filled_at": clean_text(row.get("lighter_filled_at", "")),
+                "failure_reason": clean_text(row.get("failure_reason", "")),
+            }
+        )
+    details.sort(key=lambda item: (item["asset"], item["variational_filled_at"], item["trade_id"]))
+    return details
 
 
 def print_summary(stats: dict[str, dict[str, Any]], source_label: str) -> None:
@@ -420,6 +462,20 @@ def print_summary(stats: dict[str, dict[str, Any]], source_label: str) -> None:
         print(f"{asset}: {breakdown}")
 
     print()
+    print("synthetic eager merge breakdown")
+    print("asset synthetic_unmatched synthetic_unmatched_hedged synthetic_matched")
+    for asset in sorted(stats):
+        bucket = stats[asset]
+        print(
+            "{asset} {unmatched} {unmatched_hedged} {matched}".format(
+                asset=asset,
+                unmatched=bucket["synthetic_unmatched_rows"],
+                unmatched_hedged=bucket["synthetic_unmatched_hedged_rows"],
+                matched=bucket["synthetic_matched_rows"],
+            )
+        )
+
+    print()
     print("by side calibration")
     print("asset side rows filled avg_latency_ms median_latency_ms avg_calibration_edge_bps avg_fill_diff")
     for asset in sorted(stats):
@@ -453,12 +509,12 @@ def print_completed_details(rows: list[dict[str, Any]]) -> None:
 
     print(
         "asset side qty avg_edge_bps calibration_edge_bps latency_ms submit_call_ms submit_to_fill_ms "
-        "var_seen_to_fill_ms var_event_to_seen_ms var_price lighter_price var_filled_at trade_id"
+        "var_seen_to_fill_ms var_event_to_seen_ms synthetic_eager_fill var_price lighter_price var_filled_at trade_id"
     )
     for item in completed:
         print(
             "{asset} {side} {qty} {edge} {calibration_edge} {latency} {submit_call} {submit_to_fill} "
-            "{var_seen_to_fill} {event_to_seen} {var_price} {lighter_price} {filled_at} {trade_id}".format(
+            "{var_seen_to_fill} {event_to_seen} {synthetic_eager_fill} {var_price} {lighter_price} {filled_at} {trade_id}".format(
                 asset=item["asset"],
                 side=item["side"],
                 qty=item["qty"],
@@ -469,10 +525,35 @@ def print_completed_details(rows: list[dict[str, Any]]) -> None:
                 submit_to_fill=fmt(item["live_submit_sent_to_fill_ms"], 3),
                 var_seen_to_fill=fmt(item["live_var_seen_to_lighter_fill_ms"], 3),
                 event_to_seen=fmt(item["live_var_event_to_seen_ms"], 3),
+                synthetic_eager_fill=str(item["synthetic_eager_fill"]).lower(),
                 var_price=fmt(item["variational_filled_price"], 4),
                 lighter_price=fmt(item["lighter_filled_price"], 4),
                 filled_at=item["variational_filled_at"] or "-",
                 trade_id=item["trade_id"] or "-",
+            )
+        )
+
+
+def print_unmatched_synthetic_eager_details(rows: list[dict[str, Any]]) -> None:
+    details = collect_unmatched_synthetic_eager_details(rows)
+    print()
+    print("unmatched synthetic eager details")
+    if not details:
+        print("none")
+        return
+
+    print("asset side qty processing_stage var_filled_at lighter_filled_at trade_id failure_reason")
+    for item in details:
+        print(
+            "{asset} {side} {qty} {processing_stage} {var_filled_at} {lighter_filled_at} {trade_id} {failure_reason}".format(
+                asset=item["asset"],
+                side=item["side"] or "-",
+                qty=item["qty"] or "-",
+                processing_stage=item["processing_stage"] or "-",
+                var_filled_at=item["variational_filled_at"] or "-",
+                lighter_filled_at=item["lighter_filled_at"] or "-",
+                trade_id=item["trade_id"] or "-",
+                failure_reason=item["failure_reason"] or "-",
             )
         )
 
@@ -520,6 +601,7 @@ def main() -> int:
             source_label += f" (date={args.date.strip()})"
         print_summary(stats, source_label)
         print_completed_details(rows)
+        print_unmatched_synthetic_eager_details(rows)
         return 0
 
     csv_path = Path(args.csv)
@@ -529,6 +611,7 @@ def main() -> int:
     stats = summarize(rows)
     print_summary(stats, str(csv_path))
     print_completed_details(rows)
+    print_unmatched_synthetic_eager_details(rows)
     return 0
 
 
