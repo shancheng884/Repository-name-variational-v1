@@ -185,6 +185,12 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             "filled_rows": 0,
             "record_kinds": Counter(),
             "latency_ms": [],
+            "var_seen_to_plan_start_ms": [],
+            "plan_latency_ms": [],
+            "plan_ready_to_submit_start_ms": [],
+            "submit_call_latency_ms": [],
+            "submit_sent_to_fill_ms": [],
+            "var_seen_to_lighter_fill_ms": [],
             "edge_bps": [],
             "fill_diff": [],
             "plan_fill_diff": [],
@@ -238,6 +244,12 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
         for key, column in (
             ("latency_ms", "live_fill_latency_ms"),
+            ("var_seen_to_plan_start_ms", "live_var_seen_to_plan_start_ms"),
+            ("plan_latency_ms", "live_plan_latency_ms"),
+            ("plan_ready_to_submit_start_ms", "live_plan_ready_to_submit_start_ms"),
+            ("submit_call_latency_ms", "live_submit_call_latency_ms"),
+            ("submit_sent_to_fill_ms", "live_submit_sent_to_fill_ms"),
+            ("var_seen_to_lighter_fill_ms", "live_var_seen_to_lighter_fill_ms"),
             ("edge_bps", "live_edge_bps"),
             ("plan_fill_diff", "plan_vs_lighter_fill_diff"),
             ("var_notional", "variational_notional"),
@@ -286,6 +298,12 @@ def collect_completed_details(rows: list[dict[str, Any]]) -> list[dict[str, Any]
                 "variational_filled_price": to_decimal(row.get("variational_filled_price")),
                 "lighter_filled_price": to_decimal(row.get("lighter_filled_price")),
                 "live_fill_latency_ms": to_decimal(row.get("live_fill_latency_ms")),
+                "live_var_seen_to_plan_start_ms": to_decimal(row.get("live_var_seen_to_plan_start_ms")),
+                "live_plan_latency_ms": to_decimal(row.get("live_plan_latency_ms")),
+                "live_plan_ready_to_submit_start_ms": to_decimal(row.get("live_plan_ready_to_submit_start_ms")),
+                "live_submit_call_latency_ms": to_decimal(row.get("live_submit_call_latency_ms")),
+                "live_submit_sent_to_fill_ms": to_decimal(row.get("live_submit_sent_to_fill_ms")),
+                "live_var_seen_to_lighter_fill_ms": to_decimal(row.get("live_var_seen_to_lighter_fill_ms")),
                 "live_edge_bps": to_decimal(row.get("live_edge_bps")),
                 "calibration_edge_bps": calibration_edge_bps(row),
                 "variational_filled_at": variational_filled_at,
@@ -328,6 +346,26 @@ def print_summary(stats: dict[str, dict[str, Any]], source_label: str) -> None:
                 avg_plan_fill=fmt(avg(bucket["plan_fill_diff"]), 4),
                 avg_var_notional=fmt(avg(bucket["var_notional"]), 4),
                 avg_lighter_notional=fmt(avg(bucket["lighter_notional"]), 4),
+            )
+        )
+
+    print()
+    print("latency breakdown")
+    print(
+        "asset avg_var_to_plan_ms avg_plan_ms avg_plan_to_submit_ms "
+        "avg_submit_call_ms avg_submit_to_fill_ms avg_var_seen_to_fill_ms"
+    )
+    for asset in sorted(stats):
+        bucket = stats[asset]
+        print(
+            "{asset} {var_to_plan} {plan} {plan_to_submit} {submit_call} {submit_to_fill} {var_to_fill}".format(
+                asset=asset,
+                var_to_plan=fmt(avg(bucket["var_seen_to_plan_start_ms"]), 3),
+                plan=fmt(avg(bucket["plan_latency_ms"]), 3),
+                plan_to_submit=fmt(avg(bucket["plan_ready_to_submit_start_ms"]), 3),
+                submit_call=fmt(avg(bucket["submit_call_latency_ms"]), 3),
+                submit_to_fill=fmt(avg(bucket["submit_sent_to_fill_ms"]), 3),
+                var_to_fill=fmt(avg(bucket["var_seen_to_lighter_fill_ms"]), 3),
             )
         )
 
@@ -404,17 +442,22 @@ def print_completed_details(rows: list[dict[str, Any]]) -> None:
         return
 
     print(
-        "asset side qty avg_edge_bps calibration_edge_bps latency_ms var_price lighter_price var_filled_at trade_id"
+        "asset side qty avg_edge_bps calibration_edge_bps latency_ms submit_call_ms submit_to_fill_ms "
+        "var_seen_to_fill_ms var_price lighter_price var_filled_at trade_id"
     )
     for item in completed:
         print(
-            "{asset} {side} {qty} {edge} {calibration_edge} {latency} {var_price} {lighter_price} {filled_at} {trade_id}".format(
+            "{asset} {side} {qty} {edge} {calibration_edge} {latency} {submit_call} {submit_to_fill} "
+            "{var_seen_to_fill} {var_price} {lighter_price} {filled_at} {trade_id}".format(
                 asset=item["asset"],
                 side=item["side"],
                 qty=item["qty"],
                 edge=fmt(item["live_edge_bps"], 3),
                 calibration_edge=fmt(item["calibration_edge_bps"], 3),
                 latency=fmt(item["live_fill_latency_ms"], 3),
+                submit_call=fmt(item["live_submit_call_latency_ms"], 3),
+                submit_to_fill=fmt(item["live_submit_sent_to_fill_ms"], 3),
+                var_seen_to_fill=fmt(item["live_var_seen_to_lighter_fill_ms"], 3),
                 var_price=fmt(item["variational_filled_price"], 4),
                 lighter_price=fmt(item["lighter_filled_price"], 4),
                 filled_at=item["variational_filled_at"] or "-",

@@ -76,6 +76,7 @@ RISK_GUARD_FAILURE_REASONS = {
     "hedge_below_lighter_min_quote_amount",
     "hedge_price_deviation_exceeds_risk_limit",
     "live_asset_not_allowed",
+    "live_side_not_allowed",
     "live_qty_exceeds_limit",
     "live_notional_exceeds_limit",
     "live_edge_bps_below_threshold",
@@ -336,6 +337,12 @@ def basis_points_diff(value: Decimal | None, reference: Decimal | None) -> Decim
     return (abs(value - reference) / reference) * Decimal("10000")
 
 
+def elapsed_ms(start: float | None, end: float | None) -> Decimal | None:
+    if start is None or end is None:
+        return None
+    return Decimal(str(max(0.0, (end - start) * 1000)))
+
+
 def normalize_variational_status(status: str) -> str:
     lowered = status.strip().lower()
     if lowered in {"confirmed", "fill", "filled", "executed", "execution", "cleared"}:
@@ -370,7 +377,17 @@ class OrderLifecycle:
     live_notional_usd: Decimal | None = None
     live_edge_bps: Decimal | None = None
     live_fill_latency_ms: Decimal | None = None
+    live_var_fill_seen_at_iso: str | None = None
+    live_plan_started_at_iso: str | None = None
+    live_plan_ready_at_iso: str | None = None
     live_submit_started_at_iso: str | None = None
+    live_submit_sent_at_iso: str | None = None
+    live_var_fill_seen_monotonic: float | None = None
+    live_plan_started_monotonic: float | None = None
+    live_plan_ready_monotonic: float | None = None
+    live_submit_started_monotonic: float | None = None
+    live_submit_sent_monotonic: float | None = None
+    live_lighter_fill_seen_monotonic: float | None = None
     processing_stage: str = STAGE_EVENT_RECEIVED
     stage_history: list[str] = field(default_factory=lambda: [STAGE_EVENT_RECEIVED])
     failure_stage: str | None = None
@@ -401,7 +418,35 @@ class OrderLifecycle:
             "live_notional_usd": decimal_to_str(self.live_notional_usd),
             "live_edge_bps": decimal_to_str(self.live_edge_bps),
             "live_fill_latency_ms": decimal_to_str(self.live_fill_latency_ms),
+            "live_var_fill_seen_at": self.live_var_fill_seen_at_iso,
+            "live_plan_started_at": self.live_plan_started_at_iso,
+            "live_plan_ready_at": self.live_plan_ready_at_iso,
             "live_submit_started_at": self.live_submit_started_at_iso,
+            "live_submit_sent_at": self.live_submit_sent_at_iso,
+            "live_var_seen_to_plan_start_ms": decimal_to_str(elapsed_ms(
+                self.live_var_fill_seen_monotonic,
+                self.live_plan_started_monotonic,
+            )),
+            "live_plan_latency_ms": decimal_to_str(elapsed_ms(
+                self.live_plan_started_monotonic,
+                self.live_plan_ready_monotonic,
+            )),
+            "live_plan_ready_to_submit_start_ms": decimal_to_str(elapsed_ms(
+                self.live_plan_ready_monotonic,
+                self.live_submit_started_monotonic,
+            )),
+            "live_submit_call_latency_ms": decimal_to_str(elapsed_ms(
+                self.live_submit_started_monotonic,
+                self.live_submit_sent_monotonic,
+            )),
+            "live_submit_sent_to_fill_ms": decimal_to_str(elapsed_ms(
+                self.live_submit_sent_monotonic,
+                self.live_lighter_fill_seen_monotonic,
+            )),
+            "live_var_seen_to_lighter_fill_ms": decimal_to_str(elapsed_ms(
+                self.live_var_fill_seen_monotonic,
+                self.live_lighter_fill_seen_monotonic,
+            )),
             "hedge_completion_status": self.hedge_completion_status,
             "rollback_action": self.rollback_action,
             "hedge_error": self.hedge_error,
@@ -556,6 +601,9 @@ class VariationalToLighterRuntime:
         self.live_allowed_assets = {
             asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()
         }
+        self.live_allowed_sides = {
+            side.strip().lower() for side in str(args.live_allowed_sides).split(",") if side.strip()
+        }
         self.live_submit_timeout_seconds = float(args.live_submit_timeout_seconds)
 
         self.stop_flag = False
@@ -689,6 +737,7 @@ class VariationalToLighterRuntime:
             "cooldown_seconds": self.live_cooldown_seconds,
             "submit_timeout_seconds": self.live_submit_timeout_seconds,
             "allowed_assets": sorted(self.live_allowed_assets),
+            "allowed_sides": sorted(self.live_allowed_sides),
             "rollback_action": "manual_review_required",
         }
 
@@ -1075,6 +1124,7 @@ class VariationalToLighterRuntime:
             fill_price = filled_quote / filled_base
 
         now_iso = utc_now()
+        now_monotonic = time.monotonic()
 
         async with self._record_lock:
             trade_key = self.lighter_client_order_to_trade_key.get(client_order_id)
@@ -1087,6 +1137,7 @@ class VariationalToLighterRuntime:
                 return
 
             record.lighter_fill_ts_iso = now_iso
+            record.live_lighter_fill_seen_monotonic = now_monotonic
             record.lighter_fill_price = fill_price
             if record.var_fill_ts_iso:
                 with contextlib.suppress(Exception):
@@ -1537,6 +1588,22 @@ class VariationalToLighterRuntime:
             return None
 
         if self.is_live_mode():
+            if self.live_allowed_sides and record.side not in self.live_allowed_sides:
+                async with self._record_lock:
+                    record.hedge_error = (
+                        f"Live trading is restricted to Variational sides {sorted(self.live_allowed_sides)}, "
+                        f"got {record.side}"
+                    )
+                    self.set_record_stage(
+                        record,
+                        record.processing_stage,
+                        failure_stage=FAILURE_STAGE_HEDGE_PLAN,
+                        failure_reason="live_side_not_allowed",
+                    )
+                    payload = record.to_payload()
+                await self.append_order_log("lighter_error", payload)
+                return None
+
             if self.live_allowed_assets and record.asset.upper() not in self.live_allowed_assets:
                 async with self._record_lock:
                     record.hedge_error = (
@@ -1645,18 +1712,25 @@ class VariationalToLighterRuntime:
 
         async with self._record_lock:
             self.set_record_stage(record, STAGE_LIVE_SUBMIT_STARTED, clear_failure=True)
-            record.live_submit_started_at_iso = utc_now()
+            record.live_plan_started_at_iso = utc_now()
+            record.live_plan_started_monotonic = time.monotonic()
 
         plan = await self.build_hedge_plan(record)
         if plan is None:
             return
 
+        plan_ready_iso = utc_now()
+        plan_ready_monotonic = time.monotonic()
         side, limit_price, base_amount = plan
         is_ask = side == "SELL"
         asset_key = record.asset.upper()
 
         price_i = int(limit_price * self.price_multiplier)
         async with self._record_lock:
+            record.live_plan_ready_at_iso = plan_ready_iso
+            record.live_plan_ready_monotonic = plan_ready_monotonic
+            record.live_submit_started_at_iso = utc_now()
+            record.live_submit_started_monotonic = time.monotonic()
             client_order_id = int(time.time() * 1000)
             while client_order_id in self.lighter_client_order_to_trade_key:
                 client_order_id += 1
@@ -1677,6 +1751,8 @@ class VariationalToLighterRuntime:
                     trigger_price=0,
                 )
 
+            submit_sent_iso = utc_now()
+            submit_sent_monotonic = time.monotonic()
             if error is not None:
                 raise RuntimeError(f"Sign error: {error}")
 
@@ -1687,6 +1763,8 @@ class VariationalToLighterRuntime:
                 record.lighter_side = side
                 record.lighter_client_order_id = client_order_id
                 record.lighter_tx_hash = tx_hash
+                record.live_submit_sent_at_iso = submit_sent_iso
+                record.live_submit_sent_monotonic = submit_sent_monotonic
                 record.hedge_error = None
                 self.set_record_stage(record, STAGE_LIVE_SUBMIT_SENT, clear_failure=True)
                 self.lighter_client_order_to_trade_key[client_order_id] = record.trade_key
@@ -1818,6 +1896,8 @@ class VariationalToLighterRuntime:
             if should_set_fill:
                 record.var_fill_ts_iso = fill_iso
                 record.var_fill_price = to_decimal(event.get("price"))
+                record.live_var_fill_seen_at_iso = now_iso
+                record.live_var_fill_seen_monotonic = time.monotonic()
                 self.set_record_stage(record, STAGE_VARIATIONAL_FILLED, clear_failure=True)
                 filled_payload = record.to_payload()
             else:
@@ -2853,7 +2933,17 @@ class VariationalToLighterRuntime:
                         "live_notional_usd": payload["live_notional_usd"],
                         "live_edge_bps": payload["live_edge_bps"],
                         "live_fill_latency_ms": payload["live_fill_latency_ms"],
+                        "live_var_fill_seen_at": payload["live_var_fill_seen_at"],
+                        "live_plan_started_at": payload["live_plan_started_at"],
+                        "live_plan_ready_at": payload["live_plan_ready_at"],
                         "live_submit_started_at": payload["live_submit_started_at"],
+                        "live_submit_sent_at": payload["live_submit_sent_at"],
+                        "live_var_seen_to_plan_start_ms": payload["live_var_seen_to_plan_start_ms"],
+                        "live_plan_latency_ms": payload["live_plan_latency_ms"],
+                        "live_plan_ready_to_submit_start_ms": payload["live_plan_ready_to_submit_start_ms"],
+                        "live_submit_call_latency_ms": payload["live_submit_call_latency_ms"],
+                        "live_submit_sent_to_fill_ms": payload["live_submit_sent_to_fill_ms"],
+                        "live_var_seen_to_lighter_fill_ms": payload["live_var_seen_to_lighter_fill_ms"],
                         "hedge_completion_status": payload["hedge_completion_status"],
                         "rollback_action": payload["rollback_action"],
                         "fill_diff_var_minus_lighter": decimal_to_str(fill_diff),
@@ -2905,7 +2995,17 @@ class VariationalToLighterRuntime:
             "live_notional_usd",
             "live_edge_bps",
             "live_fill_latency_ms",
+            "live_var_fill_seen_at",
+            "live_plan_started_at",
+            "live_plan_ready_at",
             "live_submit_started_at",
+            "live_submit_sent_at",
+            "live_var_seen_to_plan_start_ms",
+            "live_plan_latency_ms",
+            "live_plan_ready_to_submit_start_ms",
+            "live_submit_call_latency_ms",
+            "live_submit_sent_to_fill_ms",
+            "live_var_seen_to_lighter_fill_ms",
             "hedge_completion_status",
             "rollback_action",
             "fill_diff_var_minus_lighter",
@@ -3139,6 +3239,11 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated allowlist for live trading assets. Default: BTC,SOL,ETH",
     )
     parser.add_argument(
+        "--live-allowed-sides",
+        default="buy,sell",
+        help="Comma-separated allowlist for Variational live fill sides. Use buy to only hedge Var buys. Default: buy,sell",
+    )
+    parser.add_argument(
         "--paper-notional-usd",
         type=float,
         default=float(DEFAULT_PAPER_NOTIONAL_USD),
@@ -3203,6 +3308,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--mode live requires --confirm-live")
     if args.mode == MODE_LIVE and args.live_max_notional_usd <= 0:
         parser.error("--mode live requires --live-max-notional-usd to be set to a positive small-test limit")
+    live_allowed_sides = {side.strip().lower() for side in str(args.live_allowed_sides).split(",") if side.strip()}
+    invalid_live_allowed_sides = sorted(live_allowed_sides - {"buy", "sell"})
+    if invalid_live_allowed_sides:
+        parser.error(f"--live-allowed-sides only accepts buy,sell; got {invalid_live_allowed_sides}")
+    args.live_allowed_sides = ",".join(sorted(live_allowed_sides))
     return args
 
 
