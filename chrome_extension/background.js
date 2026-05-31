@@ -447,6 +447,10 @@ async function handleCommandSocketMessage(data) {
     await handlePrepareOrderDryRun(payload);
     return;
   }
+  if (type === "PREPARE_ORDER_KEYBOARD_DRY_RUN") {
+    await handlePrepareOrderKeyboardDryRun(payload);
+    return;
+  }
   if (type === "PLACE_ORDER") {
     commandForwarder.send({
       type: "ORDER_RESULT",
@@ -586,6 +590,80 @@ async function handlePrepareOrderDryRun(payload) {
   } catch (error) {
     commandForwarder.send({
       type: "PREPARE_ORDER_DRY_RUN_RESULT",
+      requestId,
+      ok: false,
+      error: error.message,
+      timestamp: nowIso()
+    });
+  }
+}
+
+async function dispatchKey(tabId, params) {
+  await sendDebuggerCommand(tabId, "Input.dispatchKeyEvent", params);
+}
+
+async function handlePrepareOrderKeyboardDryRun(payload) {
+  const requestId = payload.requestId;
+  try {
+    if (state.attachedTabId == null) {
+      throw new Error("No attached tab.");
+    }
+    const side = String(payload.side || "").toUpperCase();
+    const amount = String(payload.amount || "");
+    const locateExpression = `(() => {
+      ${buildVariationalOrderDomSnapshot.toString()}
+      return buildVariationalOrderDomSnapshot(${JSON.stringify("__SIDE__")}, ${JSON.stringify("__AMOUNT__")});
+    })()`
+      .replaceAll('"__SIDE__"', JSON.stringify(side))
+      .replaceAll('"__AMOUNT__"', JSON.stringify(amount));
+    const beforeResult = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
+      expression: locateExpression,
+      returnByValue: true,
+      awaitPromise: false,
+      userGesture: true
+    });
+    const snapshotBefore = beforeResult.result?.value || null;
+    const input = snapshotBefore?.mainInput;
+    if (!input?.rect) {
+      throw new Error("No main input candidate found.");
+    }
+
+    const x = input.rect.x + Math.round(input.rect.width / 2);
+    const y = input.rect.y + Math.round(input.rect.height / 2);
+    await sendDebuggerCommand(state.attachedTabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+    await sendDebuggerCommand(state.attachedTabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+    await dispatchKey(state.attachedTabId, { type: "keyDown", key: "Control", code: "ControlLeft", windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 2 });
+    await dispatchKey(state.attachedTabId, { type: "keyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
+    await dispatchKey(state.attachedTabId, { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
+    await dispatchKey(state.attachedTabId, { type: "keyUp", key: "Control", code: "ControlLeft", windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17 });
+    await dispatchKey(state.attachedTabId, { type: "keyDown", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+    await dispatchKey(state.attachedTabId, { type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+    for (const char of amount) {
+      await dispatchKey(state.attachedTabId, { type: "char", text: char, unmodifiedText: char });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const afterResult = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
+      expression: locateExpression,
+      returnByValue: true,
+      awaitPromise: false,
+      userGesture: true
+    });
+    const snapshotAfter = afterResult.result?.value || null;
+    commandForwarder.send({
+      type: "PREPARE_ORDER_KEYBOARD_DRY_RUN_RESULT",
+      requestId,
+      ok: true,
+      result: {
+        action: "keyboard_prepared_without_submit",
+        clickPoint: { x, y },
+        snapshotBefore,
+        snapshotAfter
+      },
+      timestamp: nowIso()
+    });
+  } catch (error) {
+    commandForwarder.send({
+      type: "PREPARE_ORDER_KEYBOARD_DRY_RUN_RESULT",
       requestId,
       ok: false,
       error: error.message,
