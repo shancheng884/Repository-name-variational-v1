@@ -120,6 +120,9 @@ DEFAULT_PAPER_INTERVAL_SECONDS = 1.0
 DEFAULT_PAPER_LATENCY_DRIFT_BPS = Decimal("0.5")
 DEFAULT_AUTO_LIVE_COMMAND_TIMEOUT_SECONDS = 15.0
 DEFAULT_AUTO_LIVE_MATCH_WINDOW_SECONDS = 10.0
+DEFAULT_AUTO_LIVE_MIN_HOLDING_SECONDS = 15.0
+DEFAULT_AUTO_LIVE_COOLDOWN_SECONDS = 60.0
+DEFAULT_AUTO_LIVE_MAX_CYCLES = 1
 LIGHTER_INIT_RETRY_ATTEMPTS = 3
 LIGHTER_INIT_RETRY_DELAY_SECONDS = 1.0
 VAR_QUOTE_DIAGNOSTIC_INTERVAL_SECONDS = 30.0
@@ -643,6 +646,9 @@ class VariationalToLighterRuntime:
         self.auto_live_eager_hedge = bool(args.auto_live_eager_hedge)
         self.auto_live_command_timeout_seconds = float(args.auto_live_command_timeout_seconds)
         self.auto_live_match_window_seconds = float(args.auto_live_match_window_seconds)
+        self.auto_live_min_holding_seconds = float(args.auto_live_min_holding_seconds)
+        self.auto_live_cooldown_seconds = float(args.auto_live_cooldown_seconds)
+        self.auto_live_max_cycles = int(args.auto_live_max_cycles)
         self.paper_notional_usd = Decimal(str(args.paper_notional_usd))
         self.paper_entry_deviation_bps = Decimal(str(args.paper_entry_deviation_bps))
         self.paper_exit_deviation_bps = Decimal(str(args.paper_exit_deviation_bps))
@@ -733,6 +739,8 @@ class VariationalToLighterRuntime:
         self.paper_position: PaperPosition | None = None
         self.auto_live_position: AutoLivePositionState | None = None
         self.pending_auto_live_matches: list[PendingAutoLiveMatch] = []
+        self.auto_live_last_closed_monotonic: float | None = None
+        self.auto_live_completed_cycles = 0
         self.paper_last_closed_monotonic: float | None = None
         self.paper_opportunity_counter = 0
         self._last_var_quote_diagnostic_at = 0.0
@@ -787,6 +795,15 @@ class VariationalToLighterRuntime:
 
     def is_auto_live_enabled(self) -> bool:
         return self.is_live_mode() and (self.auto_live_entry or self.auto_live_exit)
+
+    def auto_live_guard_reason(self) -> str | None:
+        if self.auto_live_max_cycles > 0 and self.auto_live_completed_cycles >= self.auto_live_max_cycles:
+            return "max_cycles_reached"
+        if self.auto_live_last_closed_monotonic is not None:
+            cooldown_elapsed = time.monotonic() - self.auto_live_last_closed_monotonic
+            if cooldown_elapsed < self.auto_live_cooldown_seconds:
+                return "cooldown_active"
+        return None
 
     def requires_lighter_market_data(self) -> bool:
         return self.is_dry_run_mode() or self.is_live_mode() or self.is_paper_mode()
@@ -1064,6 +1081,10 @@ class VariationalToLighterRuntime:
             self.lighter_client_order_to_trade_key.clear()
         self.cross_spread_history.clear()
         self.paper_position = None
+        self.auto_live_position = None
+        self.pending_auto_live_matches.clear()
+        self.auto_live_last_closed_monotonic = None
+        self.auto_live_completed_cycles = 0
         self.paper_last_closed_monotonic = None
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
@@ -2832,6 +2853,9 @@ class VariationalToLighterRuntime:
         if position is None:
             if not self.auto_live_entry:
                 return
+            guard_reason = self.auto_live_guard_reason()
+            if guard_reason is not None:
+                return
             candidate = paper_entry_candidate(snapshot, self.paper_entry_deviation_bps, self.paper_min_samples)
             if candidate is None:
                 return
@@ -2930,6 +2954,8 @@ class VariationalToLighterRuntime:
         if holding_seconds >= self.paper_max_holding_seconds:
             exit_reason = "timeout_exit"
         else:
+            if holding_seconds < self.auto_live_min_holding_seconds:
+                return
             current_pct, median_pct, _ = paper_direction_values(snapshot, position.direction)
             if current_pct is None or median_pct is None:
                 return
@@ -2955,6 +2981,31 @@ class VariationalToLighterRuntime:
                 result.get("error"),
             )
             return
+        if self.auto_live_eager_hedge:
+            lighter_record, payload = await self.place_lighter_order_from_plan(
+                asset=snapshot.asset,
+                side=exit_side,
+                qty=position.planned_qty,
+                var_fill_price=snapshot.var_sell_price if exit_side == "SELL" else snapshot.var_buy_price or snapshot.var_mid,
+            )
+            if lighter_record is not None:
+                self.pending_auto_live_matches.append(
+                    PendingAutoLiveMatch(
+                        record_key=lighter_record.trade_key,
+                        asset=snapshot.asset,
+                        side=exit_side.lower(),
+                        qty=position.planned_qty,
+                        created_at_monotonic=time.monotonic(),
+                    )
+                )
+                if payload is not None:
+                    self.logger.info(
+                        "auto_live_eager_hedge_started asset=%s side=%s qty=%s stage=%s",
+                        snapshot.asset,
+                        exit_side,
+                        position.planned_qty,
+                        payload.get("processing_stage"),
+                    )
         self.logger.info(
             "auto_live_exit_submitted asset=%s side=%s qty=%s reason=%s",
             snapshot.asset,
@@ -2963,6 +3014,8 @@ class VariationalToLighterRuntime:
             exit_reason,
         )
         self.auto_live_position = None
+        self.auto_live_last_closed_monotonic = time.monotonic()
+        self.auto_live_completed_cycles += 1
 
     async def paper_loop(self) -> None:
         try:
@@ -3593,6 +3646,24 @@ def parse_args() -> argparse.Namespace:
         help=f"How long to keep an eager Lighter hedge record available for later Variational fill matching. Default: {DEFAULT_AUTO_LIVE_MATCH_WINDOW_SECONDS}",
     )
     parser.add_argument(
+        "--auto-live-min-holding-seconds",
+        type=float,
+        default=DEFAULT_AUTO_LIVE_MIN_HOLDING_SECONDS,
+        help=f"Minimum holding time before auto-live is allowed to submit an exit on spread reversion. Default: {DEFAULT_AUTO_LIVE_MIN_HOLDING_SECONDS}",
+    )
+    parser.add_argument(
+        "--auto-live-cooldown-seconds",
+        type=float,
+        default=DEFAULT_AUTO_LIVE_COOLDOWN_SECONDS,
+        help=f"Cooldown after an auto-live exit before another auto-live entry is allowed. Default: {DEFAULT_AUTO_LIVE_COOLDOWN_SECONDS}",
+    )
+    parser.add_argument(
+        "--auto-live-max-cycles",
+        type=int,
+        default=DEFAULT_AUTO_LIVE_MAX_CYCLES,
+        help=f"Maximum completed auto-live entry/exit cycles to allow in one process. Set 0 to disable the limit. Default: {DEFAULT_AUTO_LIVE_MAX_CYCLES}",
+    )
+    parser.add_argument(
         "--paper-notional-usd",
         type=float,
         default=float(DEFAULT_PAPER_NOTIONAL_USD),
@@ -3661,6 +3732,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--auto-live-exit currently requires --auto-live-entry so the runtime can track the live position it opened")
     if (args.auto_live_entry or args.auto_live_exit or args.auto_live_eager_hedge) and args.mode != MODE_LIVE:
         parser.error("--auto-live-entry/exit/eager-hedge only work in --mode live")
+    if args.auto_live_min_holding_seconds < 0:
+        parser.error("--auto-live-min-holding-seconds must be >= 0")
+    if args.auto_live_cooldown_seconds < 0:
+        parser.error("--auto-live-cooldown-seconds must be >= 0")
+    if args.auto_live_max_cycles < 0:
+        parser.error("--auto-live-max-cycles must be >= 0")
     live_allowed_sides = {side.strip().lower() for side in str(args.live_allowed_sides).split(",") if side.strip()}
     invalid_live_allowed_sides = sorted(live_allowed_sides - {"buy", "sell"})
     if invalid_live_allowed_sides:
