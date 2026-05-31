@@ -501,6 +501,19 @@ function buildVariationalOrderDomSnapshot(side, amount) {
   const mainInput = textInputs
     .map((el) => ({ el, rect: el.getBoundingClientRect() }))
     .sort((a, b) => (b.rect.width - a.rect.width) || (a.rect.y - b.rect.y))[0]?.el || null;
+  const submitCandidates = buttons
+    .map((el) => ({ el, rect: el.getBoundingClientRect(), item: describePanelNode(el) }))
+    .filter(({ rect, item }) => item && rect.x >= 1450 && rect.y >= 180 && rect.y <= 760)
+    .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x))
+    .map(({ item }) => item)
+    .slice(0, 30);
+  const panelNodes = Array.from(document.querySelectorAll('button, input, textarea, [role="button"], [contenteditable="true"], [tabindex], div, span'))
+    .filter(visible)
+    .map(describePanelNode)
+    .filter((item) => item && item.rect.x >= 1450 && item.rect.y >= 140 && item.rect.y <= 760)
+    .filter((item) => item.text || item.ariaLabel || item.placeholder || item.name || item.id || item.value || ['INPUT', 'TEXTAREA'].includes(item.tag))
+    .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x))
+    .slice(0, 120);
   return {
     href: location.href,
     title: document.title,
@@ -512,6 +525,8 @@ function buildVariationalOrderDomSnapshot(side, amount) {
     inputs: inputs.map(describePanelNode).slice(0, 30),
     sideButton: describePanelNode(sideButton),
     mainInput: describePanelNode(mainInput),
+    submitCandidates,
+    panelNodes,
     buttons: buttons.map(describePanelNode).slice(0, 50)
   };
 }
@@ -546,6 +561,7 @@ async function handlePrepareOrderDryRun(payload) {
       }
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 250));
       const snapshotAfter = buildVariationalOrderDomSnapshot(${JSON.stringify("__SIDE__")}, ${JSON.stringify("__AMOUNT__")});
       return { ok: true, action: 'prepared_without_submit', snapshotBefore, snapshotAfter };
     })()`
@@ -554,7 +570,7 @@ async function handlePrepareOrderDryRun(payload) {
     const result = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
       expression,
       returnByValue: true,
-      awaitPromise: false,
+      awaitPromise: true,
       userGesture: true
     });
     const value = result.result?.value || null;
