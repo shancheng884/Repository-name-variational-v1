@@ -1344,6 +1344,29 @@ class VariationalToLighterRuntime:
             return match.record_key
         return None
 
+    def _rekey_record_locked(self, record: OrderLifecycle, new_trade_key: str) -> None:
+        old_trade_key = record.trade_key
+        if not new_trade_key or new_trade_key == old_trade_key:
+            return
+
+        existing = self.records.get(new_trade_key)
+        if existing is not None and existing is not record:
+            return
+
+        self.records.pop(old_trade_key, None)
+        record.trade_key = new_trade_key
+        self.records[new_trade_key] = record
+
+        updated_order = deque(
+            ((new_trade_key if key == old_trade_key else key) for key in self.record_order),
+            maxlen=self.record_order.maxlen,
+        )
+        self.record_order = updated_order
+
+        for client_order_id, trade_key in list(self.lighter_client_order_to_trade_key.items()):
+            if trade_key == old_trade_key:
+                self.lighter_client_order_to_trade_key[client_order_id] = new_trade_key
+
     def build_lighter_ws_url(self) -> str:
         if env_flag("LIGHTER_WS_SERVER_PINGS"):
             return f"{LIGHTER_WS_URL}?server_pings=true"
@@ -2091,6 +2114,8 @@ class VariationalToLighterRuntime:
                     should_set_fill = True
 
             if should_set_fill:
+                if trade_id:
+                    self._rekey_record_locked(record, f"id:{trade_id}")
                 record.synthetic_eager_fill = False
                 record.matched_variational_trade_id = trade_id or record.matched_variational_trade_id
                 record.trade_id = trade_id or record.trade_id
