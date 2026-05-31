@@ -163,7 +163,44 @@ def load_from_jsonl(jsonl_path: Path, asset_filter: set[str], date_filter: str) 
         failures = failures_by_trade_key.get(trade_key)
         if failures:
             row["_observed_failure_reasons"] = failures
-    return rows
+
+    return dedupe_rows_by_effective_trade_id(rows)
+
+
+def dedupe_rows_by_effective_trade_id(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped_by_trade_id: dict[str, dict[str, Any]] = {}
+    passthrough_rows: list[dict[str, Any]] = []
+
+    for row in rows:
+        effective_trade_id = clean_text(row.get("matched_variational_trade_id", "")) or clean_text(row.get("trade_id", ""))
+        if not effective_trade_id:
+            passthrough_rows.append(row)
+            continue
+
+        existing = deduped_by_trade_id.get(effective_trade_id)
+        if existing is None:
+            deduped_by_trade_id[effective_trade_id] = row
+            continue
+
+        row_is_synthetic = clean_bool(row.get("synthetic_eager_fill"))
+        existing_is_synthetic = clean_bool(existing.get("synthetic_eager_fill"))
+        preferred = existing
+        secondary = row
+
+        if existing_is_synthetic and not row_is_synthetic:
+            preferred = row
+            secondary = existing
+
+        preferred_failures = preferred.get("_observed_failure_reasons")
+        secondary_failures = secondary.get("_observed_failure_reasons")
+        if isinstance(preferred_failures, Counter) and isinstance(secondary_failures, Counter):
+            preferred["_observed_failure_reasons"] = preferred_failures + secondary_failures
+        elif secondary_failures:
+            preferred["_observed_failure_reasons"] = secondary_failures
+
+        deduped_by_trade_id[effective_trade_id] = preferred
+
+    return passthrough_rows + list(deduped_by_trade_id.values())
 
 
 def calibration_edge_bps(row: dict[str, Any]) -> Decimal | None:
