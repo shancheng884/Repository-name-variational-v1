@@ -118,6 +118,8 @@ DEFAULT_PAPER_COOLDOWN_SECONDS = 10.0
 DEFAULT_PAPER_MIN_SAMPLES = 30
 DEFAULT_PAPER_INTERVAL_SECONDS = 1.0
 DEFAULT_PAPER_LATENCY_DRIFT_BPS = Decimal("0.5")
+DEFAULT_AUTO_LIVE_COMMAND_TIMEOUT_SECONDS = 15.0
+DEFAULT_AUTO_LIVE_MATCH_WINDOW_SECONDS = 10.0
 LIGHTER_INIT_RETRY_ATTEMPTS = 3
 LIGHTER_INIT_RETRY_DELAY_SECONDS = 1.0
 VAR_QUOTE_DIAGNOSTIC_INTERVAL_SECONDS = 30.0
@@ -550,6 +552,32 @@ class CrossSpreadSnapshot:
 
 
 @dataclass(slots=True)
+class AutoLivePositionState:
+    asset: str
+    direction: str
+    entered_at_iso: str
+    entered_at_monotonic: float
+    entry_spread_pct: Decimal
+    entry_median_pct: Decimal
+    entry_deviation_bps: Decimal
+    entry_var_mid: Decimal
+    entry_lighter_mid: Decimal
+    entry_var_execution_price: Decimal
+    entry_lighter_execution_price: Decimal
+    planned_notional_usd: Decimal
+    planned_qty: Decimal
+
+
+@dataclass(slots=True)
+class PendingAutoLiveMatch:
+    record_key: str
+    asset: str
+    side: str
+    qty: Decimal
+    created_at_monotonic: float
+
+
+@dataclass(slots=True)
 class StartupDiagnostics:
     passed: list[str]
     warnings: list[str]
@@ -610,6 +638,11 @@ class VariationalToLighterRuntime:
         self.live_max_qty = Decimal(str(args.live_max_qty))
         self.live_require_min_edge_bps = Decimal(str(args.live_require_min_edge_bps))
         self.live_cooldown_seconds = float(args.live_cooldown_seconds)
+        self.auto_live_entry = bool(args.auto_live_entry)
+        self.auto_live_exit = bool(args.auto_live_exit)
+        self.auto_live_eager_hedge = bool(args.auto_live_eager_hedge)
+        self.auto_live_command_timeout_seconds = float(args.auto_live_command_timeout_seconds)
+        self.auto_live_match_window_seconds = float(args.auto_live_match_window_seconds)
         self.paper_notional_usd = Decimal(str(args.paper_notional_usd))
         self.paper_entry_deviation_bps = Decimal(str(args.paper_entry_deviation_bps))
         self.paper_exit_deviation_bps = Decimal(str(args.paper_exit_deviation_bps))
@@ -698,6 +731,8 @@ class VariationalToLighterRuntime:
         self.last_lighter_order_book_update_at: str | None = None
         self.last_live_submit_monotonic_by_asset: dict[str, float] = {}
         self.paper_position: PaperPosition | None = None
+        self.auto_live_position: AutoLivePositionState | None = None
+        self.pending_auto_live_matches: list[PendingAutoLiveMatch] = []
         self.paper_last_closed_monotonic: float | None = None
         self.paper_opportunity_counter = 0
         self._last_var_quote_diagnostic_at = 0.0
@@ -709,6 +744,7 @@ class VariationalToLighterRuntime:
         self.trade_task: asyncio.Task[None] | None = None
         self.spread_task: asyncio.Task[None] | None = None
         self.paper_task: asyncio.Task[None] | None = None
+        self.auto_live_task: asyncio.Task[None] | None = None
         self.dashboard_task: asyncio.Task[None] | None = None
         self.watchdog_task: asyncio.Task[None] | None = None
 
@@ -748,6 +784,9 @@ class VariationalToLighterRuntime:
 
     def is_paper_mode(self) -> bool:
         return self.mode == MODE_PAPER
+
+    def is_auto_live_enabled(self) -> bool:
+        return self.is_live_mode() and (self.auto_live_entry or self.auto_live_exit)
 
     def requires_lighter_market_data(self) -> bool:
         return self.is_dry_run_mode() or self.is_live_mode() or self.is_paper_mode()
@@ -1177,6 +1216,107 @@ class VariationalToLighterRuntime:
             payload = record.to_payload()
 
         await self.append_order_log("lighter_fill", payload)
+
+    @staticmethod
+    def _auto_live_direction_to_var_side(direction: str) -> str:
+        if direction == "long_var_short_lighter":
+            return "BUY"
+        if direction == "short_var_long_lighter":
+            return "SELL"
+        raise ValueError(f"Unsupported auto-live direction: {direction}")
+
+    @staticmethod
+    def _auto_live_direction_to_lighter_side(direction: str) -> str:
+        if direction == "long_var_short_lighter":
+            return "SELL"
+        if direction == "short_var_long_lighter":
+            return "BUY"
+        raise ValueError(f"Unsupported auto-live direction: {direction}")
+
+    @staticmethod
+    def _opposite_var_side(side: str) -> str:
+        return "SELL" if side.strip().upper() == "BUY" else "BUY"
+
+    async def send_variational_place_order(
+        self,
+        *,
+        side: str,
+        amount: str,
+        expected_min_btc_qty: Decimal | None,
+        confirm: bool,
+    ) -> dict[str, Any]:
+        request_id = str(int(time.time() * 1000))
+        payload = {
+            "type": "PLACE_ORDER",
+            "requestId": request_id,
+            "side": side.upper(),
+            "amount": amount,
+            "confirm": bool(confirm),
+            "expectedMinBtcQty": decimal_to_str(expected_min_btc_qty) if expected_min_btc_qty is not None else "0",
+        }
+        async with websockets.connect(
+            f"ws://{FORWARDER_HOST}:{FORWARDER_COMMAND_PORT}",
+            ping_interval=20,
+            ping_timeout=20,
+        ) as websocket:
+            await websocket.send(json.dumps(payload, ensure_ascii=True))
+            while True:
+                raw = await asyncio.wait_for(websocket.recv(), timeout=self.auto_live_command_timeout_seconds)
+                message = json.loads(raw)
+                if message.get("requestId") == request_id:
+                    return message
+
+    async def place_lighter_order_from_plan(
+        self,
+        *,
+        asset: str,
+        side: str,
+        qty: Decimal,
+        var_fill_price: Decimal,
+    ) -> tuple[OrderLifecycle | None, dict[str, Any] | None]:
+        synthetic_key = f"auto:{asset}:{side.lower()}:{int(time.time() * 1000)}"
+        record = OrderLifecycle(
+            trade_key=synthetic_key,
+            trade_id=synthetic_key,
+            side=side.lower(),
+            qty=qty,
+            asset=asset,
+            mode=self.mode,
+            last_variational_status="filled",
+            var_fill_price=var_fill_price,
+            var_fill_ts_iso=utc_now(),
+            live_var_fill_seen_at_iso=utc_now(),
+            live_var_fill_seen_monotonic=time.monotonic(),
+        )
+        async with self._record_lock:
+            self.set_record_stage(record, STAGE_RECORD_CREATED, clear_failure=True)
+            self.set_record_stage(record, STAGE_VARIATIONAL_FILLED, clear_failure=True)
+            self.records[synthetic_key] = record
+            self.record_order.append(synthetic_key)
+        await self.place_lighter_order(record)
+        async with self._record_lock:
+            payload = record.to_payload()
+        return record, payload
+
+    def prune_pending_auto_live_matches(self) -> None:
+        now_monotonic = time.monotonic()
+        self.pending_auto_live_matches = [
+            item
+            for item in self.pending_auto_live_matches
+            if now_monotonic - item.created_at_monotonic <= self.auto_live_match_window_seconds
+        ]
+
+    def consume_pending_auto_live_match(self, *, asset: str, side: str, qty: Decimal) -> str | None:
+        self.prune_pending_auto_live_matches()
+        side_lower = side.strip().lower()
+        for idx, item in enumerate(self.pending_auto_live_matches):
+            if item.asset != asset or item.side != side_lower:
+                continue
+            if abs(item.qty - qty) > Decimal("0.00000001"):
+                continue
+            match = self.pending_auto_live_matches.pop(idx)
+            return match.record_key
+        return None
 
     def build_lighter_ws_url(self) -> str:
         if env_flag("LIGHTER_WS_SERVER_PINGS"):
@@ -1887,12 +2027,13 @@ class VariationalToLighterRuntime:
 
         created = False
         created_record: OrderLifecycle | None = None
+        matched_trade_key = self.consume_pending_auto_live_match(asset=asset, side=side, qty=qty)
 
         async with self._record_lock:
-            record = self.records.get(key)
+            record = self.records.get(matched_trade_key or key)
             if record is None:
                 record = OrderLifecycle(
-                    trade_key=key,
+                    trade_key=matched_trade_key or key,
                     trade_id=trade_id,
                     side=side,
                     qty=qty,
@@ -1901,11 +2042,12 @@ class VariationalToLighterRuntime:
                     last_variational_status=status,
                 )
                 self.set_record_stage(record, STAGE_RECORD_CREATED, clear_failure=True)
-                self.records[key] = record
-                self.record_order.append(key)
+                self.records[record.trade_key] = record
+                self.record_order.append(record.trade_key)
                 created = True
                 created_record = record
             else:
+                record.trade_id = trade_id or record.trade_id
                 previous_status = record.last_variational_status
                 record.last_variational_status = status
                 self.set_record_stage(record, STAGE_EVENT_FILTERED)
@@ -2675,6 +2817,147 @@ class VariationalToLighterRuntime:
             },
         )
 
+    async def maybe_run_auto_live(self, snapshot: CrossSpreadSnapshot) -> None:
+        if not self.is_auto_live_enabled():
+            return
+        if snapshot.var_half_spread_bps > self.paper_max_var_half_spread_bps:
+            return
+
+        position = self.auto_live_position
+        if position is None:
+            if not self.auto_live_entry:
+                return
+            candidate = paper_entry_candidate(snapshot, self.paper_entry_deviation_bps, self.paper_min_samples)
+            if candidate is None:
+                return
+            direction = candidate.direction
+            current_pct = candidate.current_pct
+            median_pct = candidate.median_pct
+            deviation_bps = candidate.deviation_bps
+            if snapshot.var_mid <= 0:
+                return
+            planned_qty = self.paper_notional_usd / snapshot.var_mid
+            depth_enough, _, _ = await self._paper_depth_enough(direction, planned_qty)
+            if not depth_enough:
+                return
+            var_side = self._auto_live_direction_to_var_side(direction)
+            precheck = await self.send_variational_place_order(
+                side=var_side,
+                amount=decimal_to_str(planned_qty) or str(planned_qty),
+                expected_min_btc_qty=planned_qty if snapshot.asset.upper() == "BTC" else None,
+                confirm=False,
+            )
+            order_qty = to_decimal((precheck.get("result") or {}).get("orderQuantityBtc"))
+            if snapshot.asset.upper() == "BTC" and (order_qty is None or order_qty < planned_qty):
+                self.logger.warning("auto_live_precheck_rejected asset=%s side=%s expected_qty=%s got=%s", snapshot.asset, var_side, planned_qty, order_qty)
+                return
+            result = await self.send_variational_place_order(
+                side=var_side,
+                amount=decimal_to_str(planned_qty) or str(planned_qty),
+                expected_min_btc_qty=planned_qty if snapshot.asset.upper() == "BTC" else None,
+                confirm=True,
+            )
+            if not result.get("ok"):
+                self.logger.warning("auto_live_var_submit_failed side=%s error=%s", var_side, result.get("error"))
+                return
+
+            if self.auto_live_eager_hedge:
+                lighter_record, payload = await self.place_lighter_order_from_plan(
+                    asset=snapshot.asset,
+                    side=var_side,
+                    qty=planned_qty,
+                    var_fill_price=snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price or snapshot.var_mid,
+                )
+                if lighter_record is not None:
+                    self.pending_auto_live_matches.append(
+                        PendingAutoLiveMatch(
+                            record_key=lighter_record.trade_key,
+                            asset=snapshot.asset,
+                            side=var_side.lower(),
+                            qty=planned_qty,
+                            created_at_monotonic=time.monotonic(),
+                        )
+                    )
+                    if payload is not None:
+                        self.logger.info(
+                            "auto_live_eager_hedge_started asset=%s side=%s qty=%s stage=%s",
+                            snapshot.asset,
+                            var_side,
+                            planned_qty,
+                            payload.get("processing_stage"),
+                        )
+
+            entry_var_execution_price, entry_lighter_execution_price = paper_entry_execution_prices(snapshot, direction)
+            self.auto_live_position = AutoLivePositionState(
+                asset=snapshot.asset,
+                direction=direction,
+                entered_at_iso=utc_now(),
+                entered_at_monotonic=time.monotonic(),
+                entry_spread_pct=current_pct,
+                entry_median_pct=median_pct,
+                entry_deviation_bps=deviation_bps,
+                entry_var_mid=snapshot.var_mid,
+                entry_lighter_mid=snapshot.lighter_mid,
+                entry_var_execution_price=entry_var_execution_price,
+                entry_lighter_execution_price=entry_lighter_execution_price,
+                planned_notional_usd=self.paper_notional_usd,
+                planned_qty=planned_qty,
+            )
+            self.logger.info(
+                "auto_live_entry_submitted asset=%s direction=%s qty=%s var_side=%s",
+                snapshot.asset,
+                direction,
+                planned_qty,
+                var_side,
+            )
+            return
+
+        if not self.auto_live_exit:
+            return
+
+        holding_seconds = time.monotonic() - position.entered_at_monotonic
+        exit_reason: str | None = None
+        current_pct: Decimal | None = None
+        median_pct: Decimal | None = None
+        current_deviation_bps: Decimal | None = None
+
+        if holding_seconds >= self.paper_max_holding_seconds:
+            exit_reason = "timeout_exit"
+        else:
+            current_pct, median_pct, _ = paper_direction_values(snapshot, position.direction)
+            if current_pct is None or median_pct is None:
+                return
+            current_deviation_bps = decimal_percent_to_bps(current_pct - position.entry_median_pct)
+            if current_deviation_bps <= self.paper_exit_deviation_bps:
+                exit_reason = "spread_reverted"
+        if exit_reason is None:
+            return
+
+        exit_side = self._opposite_var_side(self._auto_live_direction_to_var_side(position.direction))
+        result = await self.send_variational_place_order(
+            side=exit_side,
+            amount=decimal_to_str(position.planned_qty) or str(position.planned_qty),
+            expected_min_btc_qty=position.planned_qty if snapshot.asset.upper() == "BTC" else None,
+            confirm=True,
+        )
+        if not result.get("ok"):
+            self.logger.warning(
+                "auto_live_exit_submit_failed asset=%s side=%s reason=%s error=%s",
+                snapshot.asset,
+                exit_side,
+                exit_reason,
+                result.get("error"),
+            )
+            return
+        self.logger.info(
+            "auto_live_exit_submitted asset=%s side=%s qty=%s reason=%s",
+            snapshot.asset,
+            exit_side,
+            position.planned_qty,
+            exit_reason,
+        )
+        self.auto_live_position = None
+
     async def paper_loop(self) -> None:
         try:
             while not self.stop_flag:
@@ -2682,6 +2965,7 @@ class VariationalToLighterRuntime:
                 if snapshot is not None:
                     await self.maybe_close_paper_position(snapshot)
                     await self.maybe_enter_paper_position(snapshot)
+                    await self.maybe_run_auto_live(snapshot)
                 await asyncio.sleep(self.paper_interval_seconds)
         except asyncio.CancelledError:
             raise
@@ -3136,7 +3420,7 @@ class VariationalToLighterRuntime:
             self.spread_task = self.track_background_task(asyncio.create_task(self.spread_loop()), "spread_loop")
         if self.is_live_mode():
             self.watchdog_task = self.track_background_task(asyncio.create_task(self.watchdog_live_submissions()), "watchdog_live_submissions")
-        if self.is_paper_mode():
+        if self.is_paper_mode() or self.is_auto_live_enabled():
             self.paper_task = self.track_background_task(asyncio.create_task(self.paper_loop()), "paper_loop")
         self.dashboard_task = self.track_background_task(asyncio.create_task(self.dashboard_loop()), "dashboard_loop")
 
@@ -3276,6 +3560,33 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated allowlist for Variational live fill sides. Use buy to only hedge Var buys. Default: buy,sell",
     )
     parser.add_argument(
+        "--auto-live-entry",
+        action="store_true",
+        help="In live mode, automatically submit a Variational entry when the current paper entry signal qualifies.",
+    )
+    parser.add_argument(
+        "--auto-live-exit",
+        action="store_true",
+        help="In live mode, automatically submit a Variational exit when the current paper exit signal qualifies.",
+    )
+    parser.add_argument(
+        "--auto-live-eager-hedge",
+        action="store_true",
+        help="In live mode, after an auto-submitted Variational order, immediately start the matching Lighter hedge without waiting for the Variational fill event.",
+    )
+    parser.add_argument(
+        "--auto-live-command-timeout-seconds",
+        type=float,
+        default=DEFAULT_AUTO_LIVE_COMMAND_TIMEOUT_SECONDS,
+        help=f"Timeout for command-broker PLACE_ORDER calls used by auto-live. Default: {DEFAULT_AUTO_LIVE_COMMAND_TIMEOUT_SECONDS}",
+    )
+    parser.add_argument(
+        "--auto-live-match-window-seconds",
+        type=float,
+        default=DEFAULT_AUTO_LIVE_MATCH_WINDOW_SECONDS,
+        help=f"How long to keep an eager Lighter hedge record available for later Variational fill matching. Default: {DEFAULT_AUTO_LIVE_MATCH_WINDOW_SECONDS}",
+    )
+    parser.add_argument(
         "--paper-notional-usd",
         type=float,
         default=float(DEFAULT_PAPER_NOTIONAL_USD),
@@ -3340,6 +3651,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--mode live requires --confirm-live")
     if args.mode == MODE_LIVE and args.live_max_notional_usd <= 0:
         parser.error("--mode live requires --live-max-notional-usd to be set to a positive small-test limit")
+    if args.auto_live_exit and not args.auto_live_entry:
+        parser.error("--auto-live-exit currently requires --auto-live-entry so the runtime can track the live position it opened")
+    if (args.auto_live_entry or args.auto_live_exit or args.auto_live_eager_hedge) and args.mode != MODE_LIVE:
+        parser.error("--auto-live-entry/exit/eager-hedge only work in --mode live")
     live_allowed_sides = {side.strip().lower() for side in str(args.live_allowed_sides).split(",") if side.strip()}
     invalid_live_allowed_sides = sorted(live_allowed_sides - {"buy", "sell"})
     if invalid_live_allowed_sides:
