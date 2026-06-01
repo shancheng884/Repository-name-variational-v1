@@ -136,6 +136,15 @@ def parse_runtime_log(path: Path, asset_filter: set[str]) -> list[Cycle]:
     def current_cycle(asset: str, cycle_id: str) -> Cycle | None:
         return active_by_asset_cycle.get((asset.upper(), cycle_id))
 
+    def new_pre_entry_cycle(asset: str, cycle_id: str) -> Cycle:
+        base_key = (asset.upper(), cycle_id)
+        occurrence_by_asset_cycle[base_key] = occurrence_by_asset_cycle.get(base_key, 0) + 1
+        occurrence = occurrence_by_asset_cycle[base_key]
+        cycle = Cycle(key=(asset.upper(), cycle_id, occurrence), asset=asset.upper(), cycle_id=cycle_id, occurrence=occurrence)
+        cycles.append(cycle)
+        active_by_asset_cycle[base_key] = cycle
+        return cycle
+
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             ts = parse_log_ts(line)
@@ -159,14 +168,7 @@ def parse_runtime_log(path: Path, asset_filter: set[str]) -> list[Cycle]:
                 cycle_id = match.group("cycle_id")
                 cycle = current_cycle(asset, cycle_id)
                 if cycle is None or cycle.entry_at is not None:
-                    cycle = Cycle(
-                        key=(asset, cycle_id, occurrence_by_asset_cycle.get((asset, cycle_id), 0) + 1),
-                        asset=asset,
-                        cycle_id=cycle_id,
-                        occurrence=occurrence_by_asset_cycle.get((asset, cycle_id), 0) + 1,
-                    )
-                    cycles.append(cycle)
-                    active_by_asset_cycle[(asset, cycle_id)] = cycle
+                    cycle = new_pre_entry_cycle(asset, cycle_id)
                 status = match.group("status")
                 cycle.entry_precheck_status = status
                 if status == "failed":
