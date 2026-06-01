@@ -19,12 +19,12 @@ EXIT_RE = re.compile(
     r"side=(?P<side>\S+) qty=(?P<qty>\S+) reason=(?P<reason>\S+)"
 )
 ENTRY_PRECHECK_RE = re.compile(
-    r"auto_live_entry_precheck_failed cycle_id=(?P<cycle_id>\S+) asset=(?P<asset>\S+) "
-    r"side=(?P<side>\S+) qty=(?P<qty>\S+) reason=(?P<reason>\S+) edge_bps=(?P<edge>\S+)"
+    r"auto_live_entry_precheck_(?P<status>passed|failed) cycle_id=(?P<cycle_id>\S+) asset=(?P<asset>\S+) "
+    r"side=(?P<side>\S+) qty=(?P<qty>\S+) (?:reason=(?P<reason>\S+) )?edge_bps=(?P<edge>\S+)"
 )
 EXIT_PRECHECK_RE = re.compile(
-    r"auto_live_exit_precheck_failed cycle_id=(?P<cycle_id>\S+) asset=(?P<asset>\S+) "
-    r"side=(?P<side>\S+) qty=(?P<qty>\S+) reason=(?P<reason>\S+) edge_bps=(?P<edge>\S+)"
+    r"auto_live_exit_precheck_(?P<status>passed|failed) cycle_id=(?P<cycle_id>\S+) asset=(?P<asset>\S+) "
+    r"side=(?P<side>\S+) qty=(?P<qty>\S+) (?:reason=(?P<reason>\S+) )?edge_bps=(?P<edge>\S+)"
 )
 MANUAL_REVIEW_RE = re.compile(
     r"auto_live_manual_review_required cycle_id=(?P<cycle_id>\S+) asset=(?P<asset>\S+) "
@@ -49,8 +49,10 @@ class Cycle:
     manual_review_at: datetime | None = None
     manual_review_reason: str = ""
     last_exit_precheck_at: datetime | None = None
+    exit_precheck_status: str = ""
     last_exit_precheck_edge_bps: Decimal | None = None
     last_exit_precheck_reason: str = ""
+    entry_precheck_status: str = ""
     entry_precheck_failures: int = 0
     last_entry_precheck_edge_bps: Decimal | None = None
     last_entry_precheck_reason: str = ""
@@ -113,9 +115,19 @@ def parse_runtime_log(path: Path, asset_filter: set[str]) -> list[Cycle]:
 
     def new_cycle(ts: datetime, asset: str, cycle_id: str) -> Cycle:
         base_key = (asset.upper(), cycle_id)
-        occurrence_by_asset_cycle[base_key] = occurrence_by_asset_cycle.get(base_key, 0) + 1
-        occurrence = occurrence_by_asset_cycle[base_key]
+        previous = active_by_asset_cycle.get(base_key)
+        if previous is not None and previous.entry_at is None:
+            occurrence = previous.occurrence
+        else:
+            occurrence_by_asset_cycle[base_key] = occurrence_by_asset_cycle.get(base_key, 0) + 1
+            occurrence = occurrence_by_asset_cycle[base_key]
         cycle = Cycle(key=(asset.upper(), cycle_id, occurrence), asset=asset.upper(), cycle_id=cycle_id, occurrence=occurrence)
+        if previous is not None and previous.entry_at is None:
+            cycle.entry_precheck_status = previous.entry_precheck_status
+            cycle.entry_precheck_failures = previous.entry_precheck_failures
+            cycle.last_entry_precheck_edge_bps = previous.last_entry_precheck_edge_bps
+            cycle.last_entry_precheck_reason = previous.last_entry_precheck_reason
+            cycles.remove(previous)
         cycle.entry_at = ts
         cycles.append(cycle)
         active_by_asset_cycle[base_key] = cycle
@@ -155,9 +167,12 @@ def parse_runtime_log(path: Path, asset_filter: set[str]) -> list[Cycle]:
                     )
                     cycles.append(cycle)
                     active_by_asset_cycle[(asset, cycle_id)] = cycle
-                cycle.entry_precheck_failures += 1
+                status = match.group("status")
+                cycle.entry_precheck_status = status
+                if status == "failed":
+                    cycle.entry_precheck_failures += 1
                 cycle.last_entry_precheck_edge_bps = parse_decimal(match.group("edge"))
-                cycle.last_entry_precheck_reason = match.group("reason")
+                cycle.last_entry_precheck_reason = match.group("reason") or ""
                 continue
 
             if match := EXIT_PRECHECK_RE.search(line):
@@ -168,8 +183,9 @@ def parse_runtime_log(path: Path, asset_filter: set[str]) -> list[Cycle]:
                 if cycle is None:
                     continue
                 cycle.last_exit_precheck_at = ts
+                cycle.exit_precheck_status = match.group("status")
                 cycle.last_exit_precheck_edge_bps = parse_decimal(match.group("edge"))
-                cycle.last_exit_precheck_reason = match.group("reason")
+                cycle.last_exit_precheck_reason = match.group("reason") or ""
                 continue
 
             if match := MANUAL_REVIEW_RE.search(line):
@@ -233,14 +249,16 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
     print("cycle details")
     print(
         "asset cycle_id occurrence status entry_at entry_side direction qty holding_seconds "
-        "exit_at exit_side exit_reason exit_precheck_edge_bps exit_precheck_reason "
-        "manual_review_at manual_review_reason entry_precheck_failures last_entry_precheck_edge_bps"
+        "entry_precheck_status entry_precheck_edge_bps entry_precheck_reason "
+        "exit_at exit_side exit_reason exit_precheck_status exit_precheck_edge_bps exit_precheck_reason "
+        "manual_review_at manual_review_reason entry_precheck_failures"
     )
     for cycle in selected:
         print(
             "{asset} {cycle_id} {occurrence} {status} {entry_at} {entry_side} {direction} {qty} {holding} "
-            "{exit_at} {exit_side} {exit_reason} {exit_edge} {exit_precheck_reason} "
-            "{manual_at} {manual_reason} {entry_precheck_failures} {entry_edge}".format(
+            "{entry_precheck_status} {entry_edge} {entry_precheck_reason} "
+            "{exit_at} {exit_side} {exit_reason} {exit_precheck_status} {exit_edge} {exit_precheck_reason} "
+            "{manual_at} {manual_reason} {entry_precheck_failures}".format(
                 asset=cycle.asset,
                 cycle_id=cycle.cycle_id,
                 occurrence=cycle.occurrence,
@@ -250,15 +268,18 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
                 direction=cycle.direction or "-",
                 qty=cycle.qty or "-",
                 holding=fmt(cycle.holding_seconds, 3),
+                entry_precheck_status=cycle.entry_precheck_status or "-",
+                entry_edge=fmt(cycle.last_entry_precheck_edge_bps, 3),
+                entry_precheck_reason=cycle.last_entry_precheck_reason or "-",
                 exit_at=cycle.exit_at.isoformat(sep=" ") if cycle.exit_at else "-",
                 exit_side=cycle.exit_side or "-",
                 exit_reason=cycle.exit_reason or "-",
+                exit_precheck_status=cycle.exit_precheck_status or "-",
                 exit_edge=fmt(cycle.last_exit_precheck_edge_bps, 3),
                 exit_precheck_reason=cycle.last_exit_precheck_reason or "-",
                 manual_at=cycle.manual_review_at.isoformat(sep=" ") if cycle.manual_review_at else "-",
                 manual_reason=cycle.manual_review_reason or "-",
                 entry_precheck_failures=cycle.entry_precheck_failures,
-                entry_edge=fmt(cycle.last_entry_precheck_edge_bps, 3),
             )
         )
 

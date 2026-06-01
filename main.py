@@ -3172,6 +3172,14 @@ class VariationalToLighterRuntime:
                             decimal_to_str(precheck_edge_bps) or "-",
                         )
                     return
+                self.logger.info(
+                    "auto_live_entry_precheck_passed cycle_id=%s asset=%s side=%s qty=%s edge_bps=%s",
+                    cycle_id,
+                    snapshot.asset,
+                    var_side,
+                    order_qty,
+                    decimal_to_str(precheck_edge_bps) or "-",
+                )
             precheck = await self.send_variational_place_order(
                 side=var_side,
                 amount=decimal_to_str(order_qty) or str(order_qty),
@@ -3352,6 +3360,14 @@ class VariationalToLighterRuntime:
                     )
                 self.require_auto_live_manual_review(position, f"exit_precheck_failed:{precheck_reason}")
                 return
+            self.logger.info(
+                "auto_live_exit_precheck_passed cycle_id=%s asset=%s side=%s qty=%s edge_bps=%s",
+                position.cycle_id,
+                snapshot.asset,
+                exit_side,
+                position.planned_qty,
+                decimal_to_str(precheck_edge_bps) or "-",
+            )
         result = await self.send_variational_place_order(
             side=exit_side,
             amount=decimal_to_str(position.planned_qty) or str(position.planned_qty),
