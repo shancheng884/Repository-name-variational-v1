@@ -762,6 +762,8 @@ class VariationalToLighterRuntime:
         self.auto_live_last_closed_monotonic: float | None = None
         self.auto_live_completed_cycles = 0
         self.auto_live_next_cycle_id = 1
+        self.auto_live_manual_review_required = False
+        self.auto_live_manual_review_reason: str | None = None
         self._last_auto_live_guard_log: tuple[str, int, int] | None = None
         self.paper_last_closed_monotonic: float | None = None
         self.paper_opportunity_counter = 0
@@ -819,6 +821,8 @@ class VariationalToLighterRuntime:
         return self.is_live_mode() and (self.auto_live_entry or self.auto_live_exit)
 
     def auto_live_guard_reason(self) -> str | None:
+        if self.auto_live_manual_review_required:
+            return "manual_review_required"
         if self.auto_live_max_cycles > 0 and self.auto_live_completed_cycles >= self.auto_live_max_cycles:
             return "max_cycles_reached"
         if self.auto_live_last_closed_monotonic is not None:
@@ -836,6 +840,16 @@ class VariationalToLighterRuntime:
         if reason == "cooldown_active" and self.auto_live_last_closed_monotonic is not None:
             elapsed = time.monotonic() - self.auto_live_last_closed_monotonic
             remaining_seconds = max(0.0, self.auto_live_cooldown_seconds - elapsed)
+        if reason == "manual_review_required":
+            position = self.auto_live_position
+            self.logger.warning(
+                "auto_live_manual_review_required cycle_id=%s asset=%s qty=%s reason=%s action=stop_auto_live_until_restart",
+                position.cycle_id if position is not None else "-",
+                position.asset if position is not None else "-",
+                position.planned_qty if position is not None else "-",
+                self.auto_live_manual_review_reason or (position.manual_review_reason if position is not None else None) or "unknown",
+            )
+            return
         self.logger.info(
             "auto_live_guard_blocked reason=%s next_cycle_id=%s completed_cycles=%s max_cycles=%s cooldown_remaining_seconds=%s",
             reason,
@@ -844,6 +858,18 @@ class VariationalToLighterRuntime:
             self.auto_live_max_cycles,
             f"{remaining_seconds:.3f}" if remaining_seconds is not None else "-",
         )
+
+    def require_auto_live_manual_review(self, position: AutoLivePositionState | None, reason: str) -> None:
+        already_required = self.auto_live_manual_review_required and self.auto_live_manual_review_reason == reason
+        self.auto_live_manual_review_required = True
+        self.auto_live_manual_review_reason = reason
+        if position is not None:
+            position.manual_review_required = True
+            position.manual_review_reason = reason
+            position.manual_review_logged = True
+        if not already_required:
+            self._last_auto_live_guard_log = None
+        self.maybe_log_auto_live_guard("manual_review_required")
 
     @staticmethod
     def auto_live_eager_hedge_started(record: OrderLifecycle | None) -> bool:
@@ -3129,15 +3155,7 @@ class VariationalToLighterRuntime:
             return
 
         if position.manual_review_required:
-            if not position.manual_review_logged:
-                self.logger.warning(
-                    "auto_live_manual_review_required cycle_id=%s asset=%s qty=%s reason=%s action=stop_auto_live_until_restart",
-                    position.cycle_id,
-                    position.asset,
-                    position.planned_qty,
-                    position.manual_review_reason or "unknown",
-                )
-                position.manual_review_logged = True
+            self.require_auto_live_manual_review(position, position.manual_review_reason or "unknown")
             return
 
         if position.exit_submitted:
@@ -3150,6 +3168,7 @@ class VariationalToLighterRuntime:
                 position.exit_reason or "-",
                 position.exit_submitted_at_iso or "-",
             )
+            self.require_auto_live_manual_review(position, "exit_already_submitted")
             return
 
         holding_seconds = time.monotonic() - position.entered_at_monotonic
@@ -3191,9 +3210,7 @@ class VariationalToLighterRuntime:
                     precheck_reason,
                     decimal_to_str(precheck_edge_bps) or "-",
                 )
-                position.manual_review_required = True
-                position.manual_review_reason = f"exit_precheck_failed:{precheck_reason}"
-                position.manual_review_logged = False
+                self.require_auto_live_manual_review(position, f"exit_precheck_failed:{precheck_reason}")
                 return
         result = await self.send_variational_place_order(
             side=exit_side,
@@ -3265,9 +3282,7 @@ class VariationalToLighterRuntime:
                     position.planned_qty,
                     position.exit_submitted_at_iso,
                 )
-                position.manual_review_required = True
-                position.manual_review_reason = "exit_eager_hedge_failed"
-                position.manual_review_logged = False
+                self.require_auto_live_manual_review(position, "exit_eager_hedge_failed")
                 return
         if not exit_eager_started:
             self.logger.warning(
@@ -3285,9 +3300,7 @@ class VariationalToLighterRuntime:
                 position.planned_qty,
                 position.exit_submitted_at_iso,
             )
-            position.manual_review_required = True
-            position.manual_review_reason = "exit_eager_hedge_not_started"
-            position.manual_review_logged = False
+            self.require_auto_live_manual_review(position, "exit_eager_hedge_not_started")
             return
         self.logger.info(
             "auto_live_exit_submitted cycle_id=%s asset=%s side=%s qty=%s reason=%s",
