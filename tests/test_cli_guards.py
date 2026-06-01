@@ -59,3 +59,46 @@ def test_auto_live_reset_state_requires_flat_start_confirmation(monkeypatch) -> 
 
     with pytest.raises(SystemExit):
         parse_args()
+
+
+def test_auto_live_entry_max_precheck_edge_must_be_non_negative(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--mode",
+            "live",
+            "--confirm-live",
+            "--live-max-notional-usd",
+            "25",
+            "--auto-live-entry",
+            "--auto-live-i-confirm-flat-start",
+            "--auto-live-entry-max-precheck-edge-bps",
+            "-1",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_auto_live_entry_max_precheck_edge_accepts_positive_value(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--mode",
+            "live",
+            "--confirm-live",
+            "--live-max-notional-usd",
+            "25",
+            "--auto-live-entry",
+            "--auto-live-i-confirm-flat-start",
+            "--auto-live-entry-max-precheck-edge-bps",
+            "80",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.auto_live_entry_max_precheck_edge_bps == 80

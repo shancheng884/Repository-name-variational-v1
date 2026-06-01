@@ -11,6 +11,7 @@ def _runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.auto_live_entry = True
     runtime.auto_live_i_confirm_flat_start = True
     runtime.auto_live_reset_state_after_manual_flat = False
+    runtime.auto_live_entry_max_precheck_edge_bps = Decimal("0")
     runtime.auto_live_state_file = tmp_path / "auto_live_state.json"
     runtime.args = argparse.Namespace(lang="en")
     runtime.risk_guard_max_base_amount = 1000

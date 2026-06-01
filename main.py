@@ -679,6 +679,7 @@ class VariationalToLighterRuntime:
         self.auto_live_command_timeout_seconds = float(args.auto_live_command_timeout_seconds)
         self.auto_live_match_window_seconds = float(args.auto_live_match_window_seconds)
         self.auto_live_min_holding_seconds = float(args.auto_live_min_holding_seconds)
+        self.auto_live_entry_max_precheck_edge_bps = Decimal(str(args.auto_live_entry_max_precheck_edge_bps))
         self.auto_live_cooldown_seconds = float(args.auto_live_cooldown_seconds)
         self.auto_live_max_cycles = int(args.auto_live_max_cycles)
         self.paper_notional_usd = Decimal(str(args.paper_notional_usd))
@@ -1034,6 +1035,7 @@ class VariationalToLighterRuntime:
             "allowed_sides": sorted(self.live_allowed_sides),
             "rollback_action": "manual_review_required",
             "auto_live_flat_start_confirmed": self.auto_live_i_confirm_flat_start,
+            "auto_live_entry_max_precheck_edge_bps": decimal_to_str(self.auto_live_entry_max_precheck_edge_bps),
         }
 
     def paper_config_snapshot(self) -> dict[str, Any]:
@@ -3172,6 +3174,30 @@ class VariationalToLighterRuntime:
                             decimal_to_str(precheck_edge_bps) or "-",
                         )
                     return
+                if (
+                    self.auto_live_entry_max_precheck_edge_bps > 0
+                    and precheck_edge_bps is not None
+                    and precheck_edge_bps > self.auto_live_entry_max_precheck_edge_bps
+                ):
+                    precheck_reason = "entry_precheck_edge_exceeds_auto_live_limit"
+                    if self.should_log_auto_live_precheck_failure(
+                        "entry",
+                        cycle_id,
+                        snapshot.asset,
+                        var_side,
+                        precheck_reason,
+                    ):
+                        self.logger.warning(
+                            "auto_live_entry_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s limit_bps=%s action=skip_var_entry",
+                            cycle_id,
+                            snapshot.asset,
+                            var_side,
+                            order_qty,
+                            precheck_reason,
+                            decimal_to_str(precheck_edge_bps) or "-",
+                            decimal_to_str(self.auto_live_entry_max_precheck_edge_bps),
+                        )
+                    return
                 self.logger.info(
                     "auto_live_entry_precheck_passed cycle_id=%s asset=%s side=%s qty=%s edge_bps=%s",
                     cycle_id,
@@ -4127,6 +4153,12 @@ def parse_args() -> argparse.Namespace:
         help=f"Minimum holding time before auto-live is allowed to submit an exit on spread reversion. Default: {DEFAULT_AUTO_LIVE_MIN_HOLDING_SECONDS}",
     )
     parser.add_argument(
+        "--auto-live-entry-max-precheck-edge-bps",
+        type=float,
+        default=0.0,
+        help="Maximum Lighter hedge precheck edge bps allowed for auto-live entries. Set 0 to disable. Default: 0",
+    )
+    parser.add_argument(
         "--auto-live-cooldown-seconds",
         type=float,
         default=DEFAULT_AUTO_LIVE_COOLDOWN_SECONDS,
@@ -4221,6 +4253,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--auto-live-entry requires --auto-live-i-confirm-flat-start after manually confirming Var BTC = 0 and Lighter BTC = 0")
     if args.auto_live_min_holding_seconds < 0:
         parser.error("--auto-live-min-holding-seconds must be >= 0")
+    if args.auto_live_entry_max_precheck_edge_bps < 0:
+        parser.error("--auto-live-entry-max-precheck-edge-bps must be >= 0")
     if args.auto_live_cooldown_seconds < 0:
         parser.error("--auto-live-cooldown-seconds must be >= 0")
     if args.auto_live_max_cycles < 0:
