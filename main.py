@@ -580,6 +580,10 @@ class AutoLivePositionState:
     entry_lighter_execution_price: Decimal
     planned_notional_usd: Decimal
     planned_qty: Decimal
+    exit_submitted: bool = False
+    exit_submitted_at_iso: str | None = None
+    exit_side: str | None = None
+    exit_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -3059,6 +3063,18 @@ class VariationalToLighterRuntime:
         if not self.auto_live_exit:
             return
 
+        if position.exit_submitted:
+            self.logger.warning(
+                "auto_live_exit_already_submitted cycle_id=%s asset=%s side=%s qty=%s reason=%s submitted_at=%s action=manual_review_required",
+                position.cycle_id,
+                position.asset,
+                position.exit_side or "-",
+                position.planned_qty,
+                position.exit_reason or "-",
+                position.exit_submitted_at_iso or "-",
+            )
+            return
+
         holding_seconds = time.monotonic() - position.entered_at_monotonic
         exit_reason: str | None = None
         current_pct: Decimal | None = None
@@ -3095,6 +3111,10 @@ class VariationalToLighterRuntime:
                 result.get("error"),
             )
             return
+        position.exit_submitted = True
+        position.exit_submitted_at_iso = utc_now()
+        position.exit_side = exit_side
+        position.exit_reason = exit_reason
         exit_eager_started = not self.auto_live_eager_hedge
         if self.auto_live_eager_hedge:
             lighter_record, payload = await self.place_lighter_order_from_plan(
@@ -3138,6 +3158,14 @@ class VariationalToLighterRuntime:
                     lighter_record.processing_stage,
                     lighter_record.failure_reason or lighter_record.hedge_error or "unknown",
                 )
+                self.logger.warning(
+                    "auto_live_exit_manual_review_required cycle_id=%s asset=%s side=%s qty=%s reason=eager_hedge_failed var_exit_submitted_at=%s",
+                    position.cycle_id,
+                    snapshot.asset,
+                    exit_side,
+                    position.planned_qty,
+                    position.exit_submitted_at_iso,
+                )
                 return
         if not exit_eager_started:
             self.logger.warning(
@@ -3146,6 +3174,14 @@ class VariationalToLighterRuntime:
                 snapshot.asset,
                 exit_side,
                 position.planned_qty,
+            )
+            self.logger.warning(
+                "auto_live_exit_manual_review_required cycle_id=%s asset=%s side=%s qty=%s reason=eager_hedge_not_started var_exit_submitted_at=%s",
+                position.cycle_id,
+                snapshot.asset,
+                exit_side,
+                position.planned_qty,
+                position.exit_submitted_at_iso,
             )
             return
         self.logger.info(
