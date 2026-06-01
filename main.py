@@ -871,6 +871,28 @@ class VariationalToLighterRuntime:
         if not already_required:
             self._last_auto_live_guard_log = None
         self.maybe_log_auto_live_guard("manual_review_required")
+        if already_required:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(
+            self.append_order_log(
+                "auto_live_manual_review_required",
+                {
+                    "record_kind": "auto_live_manual_review",
+                    "mode": self.mode,
+                    "asset": position.asset if position is not None else self.variational_ticker or self.ticker or "",
+                    "auto_live_cycle_id": position.cycle_id if position is not None else None,
+                    "direction": position.direction if position is not None else None,
+                    "qty": decimal_to_str(position.planned_qty) if position is not None else None,
+                    "reason": reason,
+                    "rollback_action": "manual_review_required",
+                    "action": "stop_auto_live_until_restart",
+                },
+            )
+        )
 
     def should_log_auto_live_precheck_failure(
         self,

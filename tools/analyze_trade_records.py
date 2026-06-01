@@ -124,6 +124,7 @@ def load_from_csv(csv_path: Path, asset_filter: set[str]) -> list[dict[str, Any]
 def load_from_jsonl(jsonl_path: Path, asset_filter: set[str], date_filter: str) -> list[dict[str, Any]]:
     latest_by_trade_key: dict[str, dict[str, Any]] = {}
     failures_by_trade_key: dict[str, Counter[str]] = defaultdict(Counter)
+    passthrough_rows: list[dict[str, Any]] = []
     with jsonl_path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
             line = raw_line.strip()
@@ -146,6 +147,8 @@ def load_from_jsonl(jsonl_path: Path, asset_filter: set[str], date_filter: str) 
 
             trade_key = clean_text(event.get("trade_key", ""))
             if not trade_key:
+                if infer_record_kind(event) != "execution_lifecycle":
+                    passthrough_rows.append(event)
                 continue
 
             failure_reason = clean_text(event.get("failure_reason", ""))
@@ -164,7 +167,7 @@ def load_from_jsonl(jsonl_path: Path, asset_filter: set[str], date_filter: str) 
         if failures:
             row["_observed_failure_reasons"] = failures
 
-    return dedupe_rows_by_effective_trade_id(rows)
+    return passthrough_rows + dedupe_rows_by_effective_trade_id(rows)
 
 
 def dedupe_rows_by_effective_trade_id(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -250,6 +253,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             "observed_failure_reasons": Counter(),
             "hedge_completion_statuses": Counter(),
             "rollback_actions": Counter(),
+            "manual_review_reasons": Counter(),
             "synthetic_unmatched_rows": 0,
             "synthetic_unmatched_hedged_rows": 0,
             "synthetic_matched_rows": 0,
@@ -303,6 +307,10 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
         rollback_action = infer_rollback_action(row)
         bucket["rollback_actions"][rollback_action] += 1
+
+        if record_kind == "auto_live_manual_review":
+            bucket["manual_review_reasons"][clean_text(row.get("reason", "")) or "unknown"] += 1
+            continue
 
         for key, column in (
             ("latency_ms", "live_fill_latency_ms"),
@@ -408,6 +416,26 @@ def collect_unmatched_synthetic_eager_details(rows: list[dict[str, Any]]) -> lis
     return details
 
 
+def collect_manual_review_details(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for row in rows:
+        if infer_record_kind(row) != "auto_live_manual_review":
+            continue
+        details.append(
+            {
+                "asset": clean_text(row.get("asset", "")).upper(),
+                "auto_live_cycle_id": clean_text(row.get("auto_live_cycle_id", "")),
+                "direction": clean_text(row.get("direction", "")),
+                "qty": clean_text(row.get("qty", "")),
+                "reason": clean_text(row.get("reason", "")),
+                "action": clean_text(row.get("action", "")),
+                "logged_at": clean_text(row.get("logged_at", "")),
+            }
+        )
+    details.sort(key=lambda item: (item["asset"], item["logged_at"], item["auto_live_cycle_id"]))
+    return details
+
+
 def print_summary(stats: dict[str, dict[str, Any]], source_label: str) -> None:
     if not stats:
         print("No matching rows found.")
@@ -502,6 +530,16 @@ def print_summary(stats: dict[str, dict[str, Any]], source_label: str) -> None:
             print(f"{asset}: none")
             continue
         breakdown = ", ".join(f"{action}={count}" for action, count in counter.most_common())
+        print(f"{asset}: {breakdown}")
+
+    print()
+    print("manual review breakdown")
+    for asset in sorted(stats):
+        counter = stats[asset]["manual_review_reasons"]
+        if not counter:
+            print(f"{asset}: none")
+            continue
+        breakdown = ", ".join(f"{reason}={count}" for reason, count in counter.most_common())
         print(f"{asset}: {breakdown}")
 
     print()
@@ -607,6 +645,29 @@ def print_unmatched_synthetic_eager_details(rows: list[dict[str, Any]]) -> None:
         )
 
 
+def print_manual_review_details(rows: list[dict[str, Any]]) -> None:
+    details = collect_manual_review_details(rows)
+    print()
+    print("manual review details")
+    if not details:
+        print("none")
+        return
+
+    print("asset cycle_id direction qty reason action logged_at")
+    for item in details:
+        print(
+            "{asset} {cycle_id} {direction} {qty} {reason} {action} {logged_at}".format(
+                asset=item["asset"] or "-",
+                cycle_id=item["auto_live_cycle_id"] or "-",
+                direction=item["direction"] or "-",
+                qty=item["qty"] or "-",
+                reason=item["reason"] or "-",
+                action=item["action"] or "-",
+                logged_at=item["logged_at"] or "-",
+            )
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze live hedge records by asset.")
     parser.add_argument(
@@ -651,6 +712,7 @@ def main() -> int:
         print_summary(stats, source_label)
         print_completed_details(rows)
         print_unmatched_synthetic_eager_details(rows)
+        print_manual_review_details(rows)
         return 0
 
     csv_path = Path(args.csv)
@@ -661,6 +723,7 @@ def main() -> int:
     print_summary(stats, str(csv_path))
     print_completed_details(rows)
     print_unmatched_synthetic_eager_details(rows)
+    print_manual_review_details(rows)
     return 0
 
 
