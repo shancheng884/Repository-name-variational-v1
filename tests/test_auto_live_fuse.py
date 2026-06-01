@@ -15,6 +15,7 @@ def _runtime_for_fuse_test() -> VariationalToLighterRuntime:
     runtime.auto_live_cooldown_seconds = 60.0
     runtime.auto_live_position = None
     runtime._last_auto_live_guard_log = None
+    runtime._last_auto_live_precheck_failure_log = {}
     runtime.logger = logging.getLogger("test_auto_live_fuse")
     return runtime
 
@@ -59,3 +60,33 @@ def test_manual_review_guard_takes_priority_over_max_cycles() -> None:
     runtime.require_auto_live_manual_review(None, "exit_already_submitted")
 
     assert runtime.auto_live_guard_reason() == "manual_review_required"
+
+
+def test_auto_live_precheck_failure_logging_is_throttled() -> None:
+    runtime = _runtime_for_fuse_test()
+
+    assert runtime.should_log_auto_live_precheck_failure(
+        "entry",
+        1,
+        "BTC",
+        "SELL",
+        "hedge_price_deviation_exceeds_risk_limit",
+        interval_seconds=10.0,
+    ) is True
+    assert runtime.should_log_auto_live_precheck_failure(
+        "entry",
+        1,
+        "BTC",
+        "SELL",
+        "hedge_price_deviation_exceeds_risk_limit",
+        interval_seconds=10.0,
+    ) is False
+
+    assert runtime.should_log_auto_live_precheck_failure(
+        "entry",
+        1,
+        "BTC",
+        "BUY",
+        "hedge_price_deviation_exceeds_risk_limit",
+        interval_seconds=10.0,
+    ) is True

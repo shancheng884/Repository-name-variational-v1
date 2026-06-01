@@ -765,6 +765,7 @@ class VariationalToLighterRuntime:
         self.auto_live_manual_review_required = False
         self.auto_live_manual_review_reason: str | None = None
         self._last_auto_live_guard_log: tuple[str, int, int] | None = None
+        self._last_auto_live_precheck_failure_log: dict[tuple[str, int, str, str, str], float] = {}
         self.paper_last_closed_monotonic: float | None = None
         self.paper_opportunity_counter = 0
         self._last_var_quote_diagnostic_at = 0.0
@@ -870,6 +871,24 @@ class VariationalToLighterRuntime:
         if not already_required:
             self._last_auto_live_guard_log = None
         self.maybe_log_auto_live_guard("manual_review_required")
+
+    def should_log_auto_live_precheck_failure(
+        self,
+        kind: str,
+        cycle_id: int,
+        asset: str,
+        side: str,
+        reason: str | None,
+        *,
+        interval_seconds: float = 10.0,
+    ) -> bool:
+        key = (kind, cycle_id, asset.upper(), side.upper(), reason or "unknown")
+        now = time.monotonic()
+        last_logged_at = self._last_auto_live_precheck_failure_log.get(key)
+        if last_logged_at is not None and now - last_logged_at < interval_seconds:
+            return False
+        self._last_auto_live_precheck_failure_log[key] = now
+        return True
 
     @staticmethod
     def auto_live_eager_hedge_started(record: OrderLifecycle | None) -> bool:
@@ -1200,6 +1219,7 @@ class VariationalToLighterRuntime:
         self.auto_live_completed_cycles = 0
         self.auto_live_next_cycle_id = 1
         self._last_auto_live_guard_log = None
+        self._last_auto_live_precheck_failure_log.clear()
         self.paper_last_closed_monotonic = None
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
@@ -3039,15 +3059,22 @@ class VariationalToLighterRuntime:
                     var_fill_price=precheck_price,
                 )
                 if not precheck_ok:
-                    self.logger.warning(
-                        "auto_live_entry_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s action=skip_var_entry",
+                    if self.should_log_auto_live_precheck_failure(
+                        "entry",
                         cycle_id,
                         snapshot.asset,
                         var_side,
-                        order_qty,
                         precheck_reason,
-                        decimal_to_str(precheck_edge_bps) or "-",
-                    )
+                    ):
+                        self.logger.warning(
+                            "auto_live_entry_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s action=skip_var_entry",
+                            cycle_id,
+                            snapshot.asset,
+                            var_side,
+                            order_qty,
+                            precheck_reason,
+                            decimal_to_str(precheck_edge_bps) or "-",
+                        )
                     return
             precheck = await self.send_variational_place_order(
                 side=var_side,
@@ -3201,15 +3228,22 @@ class VariationalToLighterRuntime:
                 var_fill_price=precheck_price,
             )
             if not precheck_ok:
-                self.logger.warning(
-                    "auto_live_exit_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s action=skip_var_exit",
+                if self.should_log_auto_live_precheck_failure(
+                    "exit",
                     position.cycle_id,
                     snapshot.asset,
                     exit_side,
-                    position.planned_qty,
                     precheck_reason,
-                    decimal_to_str(precheck_edge_bps) or "-",
-                )
+                ):
+                    self.logger.warning(
+                        "auto_live_exit_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s action=skip_var_exit",
+                        position.cycle_id,
+                        snapshot.asset,
+                        exit_side,
+                        position.planned_qty,
+                        precheck_reason,
+                        decimal_to_str(precheck_edge_bps) or "-",
+                    )
                 self.require_auto_live_manual_review(position, f"exit_precheck_failed:{precheck_reason}")
                 return
         result = await self.send_variational_place_order(
