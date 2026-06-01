@@ -664,6 +664,7 @@ class VariationalToLighterRuntime:
         self.auto_live_entry = bool(args.auto_live_entry)
         self.auto_live_exit = bool(args.auto_live_exit)
         self.auto_live_eager_hedge = bool(args.auto_live_eager_hedge)
+        self.auto_live_i_confirm_flat_start = bool(args.auto_live_i_confirm_flat_start)
         self.auto_live_command_timeout_seconds = float(args.auto_live_command_timeout_seconds)
         self.auto_live_match_window_seconds = float(args.auto_live_match_window_seconds)
         self.auto_live_min_holding_seconds = float(args.auto_live_min_holding_seconds)
@@ -975,6 +976,7 @@ class VariationalToLighterRuntime:
             "allowed_assets": sorted(self.live_allowed_assets),
             "allowed_sides": sorted(self.live_allowed_sides),
             "rollback_action": "manual_review_required",
+            "auto_live_flat_start_confirmed": self.auto_live_i_confirm_flat_start,
         }
 
     def paper_config_snapshot(self) -> dict[str, Any]:
@@ -1076,6 +1078,8 @@ class VariationalToLighterRuntime:
 
         if self.is_live_mode():
             passed.append("live_rollback_action=manual_review_required")
+            if self.auto_live_entry and self.auto_live_i_confirm_flat_start:
+                passed.append("auto_live_flat_start_manually_confirmed")
             if not account_index:
                 blocking_errors.append("LIGHTER_ACCOUNT_INDEX is not set")
             else:
@@ -4029,6 +4033,11 @@ def parse_args() -> argparse.Namespace:
         help=f"Maximum completed auto-live entry/exit cycles to allow in one process. Set 0 to disable the limit. Default: {DEFAULT_AUTO_LIVE_MAX_CYCLES}",
     )
     parser.add_argument(
+        "--auto-live-i-confirm-flat-start",
+        action="store_true",
+        help="Required with --auto-live-entry to confirm Var and Lighter positions were manually checked flat before startup.",
+    )
+    parser.add_argument(
         "--paper-notional-usd",
         type=float,
         default=float(DEFAULT_PAPER_NOTIONAL_USD),
@@ -4097,6 +4106,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--auto-live-exit currently requires --auto-live-entry so the runtime can track the live position it opened")
     if (args.auto_live_entry or args.auto_live_exit or args.auto_live_eager_hedge) and args.mode != MODE_LIVE:
         parser.error("--auto-live-entry/exit/eager-hedge only work in --mode live")
+    if args.auto_live_entry and not args.auto_live_i_confirm_flat_start:
+        parser.error("--auto-live-entry requires --auto-live-i-confirm-flat-start after manually confirming Var BTC = 0 and Lighter BTC = 0")
     if args.auto_live_min_holding_seconds < 0:
         parser.error("--auto-live-min-holding-seconds must be >= 0")
     if args.auto_live_cooldown_seconds < 0:
