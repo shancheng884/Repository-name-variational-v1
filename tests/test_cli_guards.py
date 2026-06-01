@@ -40,3 +40,22 @@ def test_auto_live_entry_accepts_flat_start_confirmation(monkeypatch) -> None:
 
     assert args.auto_live_entry is True
     assert args.auto_live_i_confirm_flat_start is True
+
+
+def test_auto_live_reset_state_requires_flat_start_confirmation(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--mode",
+            "live",
+            "--confirm-live",
+            "--live-max-notional-usd",
+            "25",
+            "--auto-live-entry",
+            "--auto-live-reset-state-after-manual-flat",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()

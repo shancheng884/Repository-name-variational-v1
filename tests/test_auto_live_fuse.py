@@ -14,6 +14,7 @@ def _runtime_for_fuse_test() -> VariationalToLighterRuntime:
     runtime.auto_live_last_closed_monotonic = None
     runtime.auto_live_cooldown_seconds = 60.0
     runtime.auto_live_position = None
+    runtime.auto_live_state_file = None
     runtime._last_auto_live_guard_log = None
     runtime._last_auto_live_precheck_failure_log = {}
     runtime.logger = logging.getLogger("test_auto_live_fuse")

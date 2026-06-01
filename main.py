@@ -99,6 +99,7 @@ OUTPUT_DIR = LOG_DIR
 APP_LOG_FILE = LOG_DIR / "runtime.log"
 TRADE_RECORDS_CSV_FILE = LOG_DIR / "trade_records.csv"
 INSTANCE_LOCK_FILE = LOG_DIR / "main.instance.lock"
+AUTO_LIVE_STATE_FILE = LOG_DIR / "auto_live_state.json"
 READY_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
@@ -164,6 +165,15 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return format(value, "f")
+
+
+def clean_state_value(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() == "none":
+        return ""
+    return text
 
 
 def decimal_percent_to_bps(value: Decimal | None) -> Decimal | None:
@@ -665,6 +675,7 @@ class VariationalToLighterRuntime:
         self.auto_live_exit = bool(args.auto_live_exit)
         self.auto_live_eager_hedge = bool(args.auto_live_eager_hedge)
         self.auto_live_i_confirm_flat_start = bool(args.auto_live_i_confirm_flat_start)
+        self.auto_live_reset_state_after_manual_flat = bool(args.auto_live_reset_state_after_manual_flat)
         self.auto_live_command_timeout_seconds = float(args.auto_live_command_timeout_seconds)
         self.auto_live_match_window_seconds = float(args.auto_live_match_window_seconds)
         self.auto_live_min_holding_seconds = float(args.auto_live_min_holding_seconds)
@@ -716,6 +727,7 @@ class VariationalToLighterRuntime:
         self.orders_file = output_dir / "order_metrics.jsonl" if output_dir else None
         self.opportunities_file = output_dir / "opportunities.jsonl" if output_dir else None
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
+        self.auto_live_state_file = output_dir / AUTO_LIVE_STATE_FILE.name if output_dir else None
         self._order_write_lock = asyncio.Lock()
         self._opportunity_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
@@ -869,6 +881,17 @@ class VariationalToLighterRuntime:
             position.manual_review_required = True
             position.manual_review_reason = reason
             position.manual_review_logged = True
+            self.write_auto_live_state(
+                {
+                    "status": "manual_review_required",
+                    "asset": position.asset,
+                    "cycle_id": position.cycle_id,
+                    "direction": position.direction,
+                    "qty": decimal_to_str(position.planned_qty),
+                    "reason": reason,
+                    "action": "stop_auto_live_until_restart",
+                }
+            )
         if not already_required:
             self._last_auto_live_guard_log = None
         self.maybe_log_auto_live_guard("manual_review_required")
@@ -912,6 +935,40 @@ class VariationalToLighterRuntime:
             return False
         self._last_auto_live_precheck_failure_log[key] = now
         return True
+
+    def load_auto_live_state(self) -> dict[str, Any]:
+        if self.auto_live_state_file is None or not self.auto_live_state_file.exists():
+            return {"status": "flat"}
+        try:
+            with self.auto_live_state_file.open("r", encoding="utf-8") as handle:
+                state = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            return {"status": "unknown", "reason": f"state_load_failed:{exc}"}
+        if not isinstance(state, dict):
+            return {"status": "unknown", "reason": "state_file_not_object"}
+        status = str(state.get("status", "")).strip() or "unknown"
+        return {**state, "status": status}
+
+    def write_auto_live_state(self, state: dict[str, Any]) -> None:
+        if self.auto_live_state_file is None:
+            return
+        row = {"updated_at": utc_now(), **state}
+        self.auto_live_state_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.auto_live_state_file.with_suffix(self.auto_live_state_file.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(row, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_path.replace(self.auto_live_state_file)
+
+    async def write_auto_live_state_async(self, state: dict[str, Any]) -> None:
+        await asyncio.to_thread(self.write_auto_live_state, state)
+
+    def auto_live_state_summary(self, state: dict[str, Any]) -> str:
+        status = clean_state_value(state.get("status"))
+        parts = [f"status={status or 'unknown'}"]
+        for key in ("asset", "cycle_id", "direction", "qty", "reason", "updated_at"):
+            value = clean_state_value(state.get(key))
+            if value:
+                parts.append(f"{key}={value}")
+        return " ".join(parts)
 
     @staticmethod
     def auto_live_eager_hedge_started(record: OrderLifecycle | None) -> bool:
@@ -1080,6 +1137,19 @@ class VariationalToLighterRuntime:
             passed.append("live_rollback_action=manual_review_required")
             if self.auto_live_entry and self.auto_live_i_confirm_flat_start:
                 passed.append("auto_live_flat_start_manually_confirmed")
+                state = self.load_auto_live_state()
+                state_status = clean_state_value(state.get("status")) or "unknown"
+                if self.auto_live_reset_state_after_manual_flat:
+                    self.write_auto_live_state({"status": "flat", "reason": "manual_flat_start_reset"})
+                    passed.append("auto_live_state_reset_after_manual_flat")
+                elif state_status == "flat":
+                    passed.append("auto_live_state_flat")
+                else:
+                    blocking_errors.append(
+                        "auto_live_state_not_flat: "
+                        + self.auto_live_state_summary(state)
+                        + " | manually confirm Var/Lighter flat, then restart with --auto-live-reset-state-after-manual-flat"
+                    )
             if not account_index:
                 blocking_errors.append("LIGHTER_ACCOUNT_INDEX is not set")
             else:
@@ -3194,6 +3264,16 @@ class VariationalToLighterRuntime:
                 planned_notional_usd=self.paper_notional_usd,
                 planned_qty=order_qty,
             )
+            await self.write_auto_live_state_async(
+                {
+                    "status": "open",
+                    "asset": snapshot.asset,
+                    "cycle_id": cycle_id,
+                    "direction": direction,
+                    "qty": decimal_to_str(order_qty),
+                    "entered_at": self.auto_live_position.entered_at_iso,
+                }
+            )
             self.logger.info(
                 "auto_live_entry_submitted cycle_id=%s asset=%s direction=%s qty=%s var_side=%s",
                 cycle_id,
@@ -3375,6 +3455,16 @@ class VariationalToLighterRuntime:
         self.auto_live_completed_cycles += 1
         self.auto_live_next_cycle_id += 1
         self._last_auto_live_guard_log = None
+        await self.write_auto_live_state_async(
+            {
+                "status": "flat",
+                "asset": snapshot.asset,
+                "cycle_id": position.cycle_id,
+                "direction": position.direction,
+                "qty": decimal_to_str(position.planned_qty),
+                "reason": f"exit_submitted:{exit_reason}",
+            }
+        )
 
     async def paper_loop(self) -> None:
         try:
@@ -4036,6 +4126,11 @@ def parse_args() -> argparse.Namespace:
         "--auto-live-i-confirm-flat-start",
         action="store_true",
         help="Required with --auto-live-entry to confirm Var and Lighter positions were manually checked flat before startup.",
+    )
+    parser.add_argument(
+        "--auto-live-reset-state-after-manual-flat",
+        action="store_true",
+        help="After manually confirming Var and Lighter are flat, reset log/auto_live_state.json to flat during startup.",
     )
     parser.add_argument(
         "--paper-notional-usd",
