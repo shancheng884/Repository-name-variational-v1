@@ -584,6 +584,9 @@ class AutoLivePositionState:
     exit_submitted_at_iso: str | None = None
     exit_side: str | None = None
     exit_reason: str | None = None
+    manual_review_required: bool = False
+    manual_review_reason: str | None = None
+    manual_review_logged: bool = False
 
 
 @dataclass(slots=True)
@@ -3125,6 +3128,18 @@ class VariationalToLighterRuntime:
         if not self.auto_live_exit:
             return
 
+        if position.manual_review_required:
+            if not position.manual_review_logged:
+                self.logger.warning(
+                    "auto_live_manual_review_required cycle_id=%s asset=%s qty=%s reason=%s action=stop_auto_live_until_restart",
+                    position.cycle_id,
+                    position.asset,
+                    position.planned_qty,
+                    position.manual_review_reason or "unknown",
+                )
+                position.manual_review_logged = True
+            return
+
         if position.exit_submitted:
             self.logger.warning(
                 "auto_live_exit_already_submitted cycle_id=%s asset=%s side=%s qty=%s reason=%s submitted_at=%s action=manual_review_required",
@@ -3176,6 +3191,9 @@ class VariationalToLighterRuntime:
                     precheck_reason,
                     decimal_to_str(precheck_edge_bps) or "-",
                 )
+                position.manual_review_required = True
+                position.manual_review_reason = f"exit_precheck_failed:{precheck_reason}"
+                position.manual_review_logged = False
                 return
         result = await self.send_variational_place_order(
             side=exit_side,
@@ -3247,6 +3265,9 @@ class VariationalToLighterRuntime:
                     position.planned_qty,
                     position.exit_submitted_at_iso,
                 )
+                position.manual_review_required = True
+                position.manual_review_reason = "exit_eager_hedge_failed"
+                position.manual_review_logged = False
                 return
         if not exit_eager_started:
             self.logger.warning(
@@ -3264,6 +3285,9 @@ class VariationalToLighterRuntime:
                 position.planned_qty,
                 position.exit_submitted_at_iso,
             )
+            position.manual_review_required = True
+            position.manual_review_reason = "exit_eager_hedge_not_started"
+            position.manual_review_logged = False
             return
         self.logger.info(
             "auto_live_exit_submitted cycle_id=%s asset=%s side=%s qty=%s reason=%s",
