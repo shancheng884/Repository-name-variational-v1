@@ -846,6 +846,49 @@ class VariationalToLighterRuntime:
     def auto_live_eager_hedge_started(record: OrderLifecycle | None) -> bool:
         return record is not None and record.processing_stage in {STAGE_LIVE_SUBMIT_SENT, STAGE_LIGHTER_FILLED}
 
+    async def auto_live_lighter_precheck(
+        self,
+        *,
+        asset: str,
+        var_side: str,
+        qty: Decimal,
+        var_fill_price: Decimal,
+    ) -> tuple[bool, str, Decimal | None]:
+        if self._lighter_order_book_is_stale():
+            return False, "lighter_order_book_stale", None
+        best_bid, best_ask = await self.get_lighter_best_bid_ask()
+        if best_bid is None or best_ask is None:
+            return False, "lighter_order_book_not_ready", None
+
+        lighter_side = "SELL" if var_side.strip().upper() == "BUY" else "BUY"
+        slippage = Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000")
+        limit_price = best_ask * (Decimal("1") + slippage) if lighter_side == "BUY" else best_bid * (Decimal("1") - slippage)
+        notional = qty * limit_price
+        edge_bps = basis_points_diff(limit_price, var_fill_price)
+        base_amount = int(qty * self.base_amount_multiplier)
+
+        if base_amount <= 0:
+            return False, "hedge_base_amount_rounds_to_zero", edge_bps
+        if self.lighter_min_base_amount is not None and qty < self.lighter_min_base_amount:
+            return False, "hedge_below_lighter_min_base_amount", edge_bps
+        if base_amount > self.risk_guard_max_base_amount:
+            return False, "hedge_base_amount_exceeds_risk_limit", edge_bps
+        if edge_bps is not None and edge_bps > self.risk_guard_max_price_deviation_bps:
+            return False, "hedge_price_deviation_exceeds_risk_limit", edge_bps
+        if self.lighter_min_quote_amount is not None and notional < self.lighter_min_quote_amount:
+            return False, "hedge_below_lighter_min_quote_amount", edge_bps
+        if self.live_allowed_sides and var_side.strip().lower() not in self.live_allowed_sides:
+            return False, "live_side_not_allowed", edge_bps
+        if self.live_allowed_assets and asset.upper() not in self.live_allowed_assets:
+            return False, "live_asset_not_allowed", edge_bps
+        if self.live_max_qty > 0 and qty > self.live_max_qty:
+            return False, "live_qty_exceeds_limit", edge_bps
+        if self.live_max_notional_usd > 0 and notional > self.live_max_notional_usd:
+            return False, "live_notional_exceeds_limit", edge_bps
+        if edge_bps is not None and edge_bps < self.live_require_min_edge_bps:
+            return False, "live_edge_bps_below_threshold", edge_bps
+        return True, "ok", edge_bps
+
     def requires_lighter_market_data(self) -> bool:
         return self.is_dry_run_mode() or self.is_live_mode() or self.is_paper_mode()
 
@@ -2958,6 +3001,25 @@ class VariationalToLighterRuntime:
             if not depth_enough:
                 return
             var_side = self._auto_live_direction_to_var_side(direction)
+            if self.auto_live_eager_hedge:
+                precheck_price = snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price or snapshot.var_mid
+                precheck_ok, precheck_reason, precheck_edge_bps = await self.auto_live_lighter_precheck(
+                    asset=snapshot.asset,
+                    var_side=var_side,
+                    qty=order_qty,
+                    var_fill_price=precheck_price,
+                )
+                if not precheck_ok:
+                    self.logger.warning(
+                        "auto_live_entry_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s action=skip_var_entry",
+                        cycle_id,
+                        snapshot.asset,
+                        var_side,
+                        order_qty,
+                        precheck_reason,
+                        decimal_to_str(precheck_edge_bps) or "-",
+                    )
+                    return
             precheck = await self.send_variational_place_order(
                 side=var_side,
                 amount=decimal_to_str(order_qty) or str(order_qty),
@@ -3096,6 +3158,25 @@ class VariationalToLighterRuntime:
             return
 
         exit_side = self._opposite_var_side(self._auto_live_direction_to_var_side(position.direction))
+        if self.auto_live_eager_hedge:
+            precheck_price = snapshot.var_sell_price if exit_side == "SELL" else snapshot.var_buy_price or snapshot.var_mid
+            precheck_ok, precheck_reason, precheck_edge_bps = await self.auto_live_lighter_precheck(
+                asset=snapshot.asset,
+                var_side=exit_side,
+                qty=position.planned_qty,
+                var_fill_price=precheck_price,
+            )
+            if not precheck_ok:
+                self.logger.warning(
+                    "auto_live_exit_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s action=skip_var_exit",
+                    position.cycle_id,
+                    snapshot.asset,
+                    exit_side,
+                    position.planned_qty,
+                    precheck_reason,
+                    decimal_to_str(precheck_edge_bps) or "-",
+                )
+                return
         result = await self.send_variational_place_order(
             side=exit_side,
             amount=decimal_to_str(position.planned_qty) or str(position.planned_qty),
