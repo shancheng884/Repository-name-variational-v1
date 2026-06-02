@@ -167,7 +167,7 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     return format(value, "f")
 
 
-def elapsed_ms(start_monotonic: float | None) -> str:
+def elapsed_ms_str(start_monotonic: float | None) -> str:
     if start_monotonic is None:
         return "-"
     return f"{(time.monotonic() - start_monotonic) * 1000:.3f}"
@@ -3167,7 +3167,7 @@ class VariationalToLighterRuntime:
                     qty=order_qty,
                     var_fill_price=precheck_price,
                 )
-                entry_precheck_ms = elapsed_ms(entry_precheck_started)
+                entry_precheck_ms = elapsed_ms_str(entry_precheck_started)
                 if not precheck_ok:
                     if self.should_log_auto_live_precheck_failure(
                         "entry",
@@ -3228,7 +3228,7 @@ class VariationalToLighterRuntime:
                 expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
                 confirm=False,
             )
-            entry_var_preview_ms = elapsed_ms(entry_var_preview_started)
+            entry_var_preview_ms = elapsed_ms_str(entry_var_preview_started)
             observed_order_qty = to_decimal((precheck.get("result") or {}).get("orderQuantityBtc"))
             if snapshot.asset.upper() == "BTC" and (observed_order_qty is None or observed_order_qty < order_qty):
                 self.logger.warning("auto_live_precheck_rejected asset=%s side=%s expected_qty=%s got=%s", snapshot.asset, var_side, order_qty, observed_order_qty)
@@ -3240,7 +3240,7 @@ class VariationalToLighterRuntime:
                 expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
                 confirm=True,
             )
-            entry_var_submit_ms = elapsed_ms(entry_var_submit_started)
+            entry_var_submit_ms = elapsed_ms_str(entry_var_submit_started)
             if not result.get("ok"):
                 self.logger.warning("auto_live_var_submit_failed side=%s error=%s", var_side, result.get("error"))
                 return
@@ -3256,7 +3256,7 @@ class VariationalToLighterRuntime:
                     cycle_id=cycle_id,
                     role="entry",
                 )
-                entry_lighter_submit_ms = elapsed_ms(entry_lighter_submit_started)
+                entry_lighter_submit_ms = elapsed_ms_str(entry_lighter_submit_started)
                 entry_eager_started = self.auto_live_eager_hedge_started(lighter_record)
                 if lighter_record is not None and entry_eager_started:
                     self.pending_auto_live_matches.append(
@@ -3337,7 +3337,7 @@ class VariationalToLighterRuntime:
                 direction,
                 order_qty,
                 var_side,
-                elapsed_ms(entry_signal_monotonic),
+                elapsed_ms_str(entry_signal_monotonic),
                 entry_precheck_ms,
                 entry_var_preview_ms,
                 entry_var_submit_ms,
@@ -3399,7 +3399,7 @@ class VariationalToLighterRuntime:
                 qty=position.planned_qty,
                 var_fill_price=precheck_price,
             )
-            exit_precheck_ms = elapsed_ms(exit_precheck_started)
+            exit_precheck_ms = elapsed_ms_str(exit_precheck_started)
             if not precheck_ok:
                 if self.should_log_auto_live_precheck_failure(
                     "exit",
@@ -3436,7 +3436,7 @@ class VariationalToLighterRuntime:
             expected_min_btc_qty=position.planned_qty if snapshot.asset.upper() == "BTC" else None,
             confirm=True,
         )
-        exit_var_submit_ms = elapsed_ms(exit_var_submit_started)
+        exit_var_submit_ms = elapsed_ms_str(exit_var_submit_started)
         if not result.get("ok"):
             self.logger.warning(
                 "auto_live_exit_submit_failed asset=%s side=%s reason=%s error=%s",
@@ -3461,7 +3461,7 @@ class VariationalToLighterRuntime:
                 cycle_id=position.cycle_id,
                 role="exit",
             )
-            exit_lighter_submit_ms = elapsed_ms(exit_lighter_submit_started)
+            exit_lighter_submit_ms = elapsed_ms_str(exit_lighter_submit_started)
             exit_eager_started = self.auto_live_eager_hedge_started(lighter_record)
             if lighter_record is not None and exit_eager_started:
                 self.pending_auto_live_matches.append(
@@ -3531,7 +3531,7 @@ class VariationalToLighterRuntime:
             exit_side,
             position.planned_qty,
             exit_reason,
-            elapsed_ms(exit_signal_monotonic),
+            elapsed_ms_str(exit_signal_monotonic),
             exit_precheck_ms,
             exit_var_submit_ms,
             exit_lighter_submit_ms,
