@@ -31,6 +31,7 @@ MANUAL_REVIEW_RE = re.compile(
     r"qty=(?P<qty>\S+) reason=(?P<reason>\S+) action=(?P<action>\S+)"
 )
 GUARD_RE = re.compile(r"auto_live_guard_blocked reason=(?P<reason>\S+).*")
+KEY_VALUE_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\S+)")
 
 
 @dataclass
@@ -56,6 +57,15 @@ class Cycle:
     entry_precheck_failures: int = 0
     last_entry_precheck_edge_bps: Decimal | None = None
     last_entry_precheck_reason: str = ""
+    entry_precheck_ms: Decimal | None = None
+    entry_var_preview_ms: Decimal | None = None
+    entry_var_submit_ms: Decimal | None = None
+    entry_lighter_submit_ms: Decimal | None = None
+    entry_total_ms: Decimal | None = None
+    exit_precheck_ms: Decimal | None = None
+    exit_var_submit_ms: Decimal | None = None
+    exit_lighter_submit_ms: Decimal | None = None
+    exit_total_ms: Decimal | None = None
 
     @property
     def status(self) -> str:
@@ -91,6 +101,10 @@ def parse_log_ts(line: str) -> datetime | None:
         return datetime.strptime(line[:23], LOG_TS_FORMAT)
     except ValueError:
         return None
+
+
+def parse_key_values(line: str) -> dict[str, str]:
+    return {match.group("key"): match.group("value") for match in KEY_VALUE_RE.finditer(line)}
 
 
 def fmt(value: Any, places: int = 3) -> str:
@@ -156,9 +170,15 @@ def parse_runtime_log(path: Path, asset_filter: set[str]) -> list[Cycle]:
                 if not include(asset):
                     continue
                 cycle = new_cycle(ts, asset, match.group("cycle_id"))
+                fields = parse_key_values(line)
                 cycle.direction = match.group("direction")
                 cycle.qty = match.group("qty")
                 cycle.entry_side = match.group("side")
+                cycle.entry_total_ms = parse_decimal(fields.get("entry_total_ms", ""))
+                cycle.entry_precheck_ms = parse_decimal(fields.get("entry_precheck_ms", ""))
+                cycle.entry_var_preview_ms = parse_decimal(fields.get("var_preview_ms", ""))
+                cycle.entry_var_submit_ms = parse_decimal(fields.get("var_submit_ms", ""))
+                cycle.entry_lighter_submit_ms = parse_decimal(fields.get("lighter_submit_ms", ""))
                 continue
 
             if match := ENTRY_PRECHECK_RE.search(line):
@@ -170,11 +190,13 @@ def parse_runtime_log(path: Path, asset_filter: set[str]) -> list[Cycle]:
                 if cycle is None or cycle.entry_at is not None:
                     cycle = new_pre_entry_cycle(asset, cycle_id)
                 status = match.group("status")
+                fields = parse_key_values(line)
                 cycle.entry_precheck_status = status
                 if status == "failed":
                     cycle.entry_precheck_failures += 1
                 cycle.last_entry_precheck_edge_bps = parse_decimal(match.group("edge"))
                 cycle.last_entry_precheck_reason = match.group("reason") or ""
+                cycle.entry_precheck_ms = parse_decimal(fields.get("duration_ms", ""))
                 continue
 
             if match := EXIT_PRECHECK_RE.search(line):
@@ -184,10 +206,12 @@ def parse_runtime_log(path: Path, asset_filter: set[str]) -> list[Cycle]:
                 cycle = current_cycle(asset, match.group("cycle_id"))
                 if cycle is None:
                     continue
+                fields = parse_key_values(line)
                 cycle.last_exit_precheck_at = ts
                 cycle.exit_precheck_status = match.group("status")
                 cycle.last_exit_precheck_edge_bps = parse_decimal(match.group("edge"))
                 cycle.last_exit_precheck_reason = match.group("reason") or ""
+                cycle.exit_precheck_ms = parse_decimal(fields.get("duration_ms", ""))
                 continue
 
             if match := MANUAL_REVIEW_RE.search(line):
@@ -210,9 +234,14 @@ def parse_runtime_log(path: Path, asset_filter: set[str]) -> list[Cycle]:
                 cycle = current_cycle(asset, match.group("cycle_id"))
                 if cycle is None:
                     continue
+                fields = parse_key_values(line)
                 cycle.exit_at = ts
                 cycle.exit_side = match.group("side")
                 cycle.exit_reason = match.group("reason")
+                cycle.exit_total_ms = parse_decimal(fields.get("exit_total_ms", ""))
+                cycle.exit_precheck_ms = parse_decimal(fields.get("exit_precheck_ms", ""))
+                cycle.exit_var_submit_ms = parse_decimal(fields.get("var_submit_ms", ""))
+                cycle.exit_lighter_submit_ms = parse_decimal(fields.get("lighter_submit_ms", ""))
                 if not cycle.qty:
                     cycle.qty = match.group("qty")
                 continue
@@ -252,14 +281,18 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
     print(
         "asset cycle_id occurrence status entry_at entry_side direction qty holding_seconds "
         "entry_precheck_status entry_precheck_edge_bps entry_precheck_reason "
+        "entry_precheck_ms entry_var_preview_ms entry_var_submit_ms entry_lighter_submit_ms entry_total_ms "
         "exit_at exit_side exit_reason exit_precheck_status exit_precheck_edge_bps exit_precheck_reason "
+        "exit_precheck_ms exit_var_submit_ms exit_lighter_submit_ms exit_total_ms "
         "manual_review_at manual_review_reason entry_precheck_failures"
     )
     for cycle in selected:
         print(
             "{asset} {cycle_id} {occurrence} {status} {entry_at} {entry_side} {direction} {qty} {holding} "
             "{entry_precheck_status} {entry_edge} {entry_precheck_reason} "
+            "{entry_precheck_ms} {entry_var_preview_ms} {entry_var_submit_ms} {entry_lighter_submit_ms} {entry_total_ms} "
             "{exit_at} {exit_side} {exit_reason} {exit_precheck_status} {exit_edge} {exit_precheck_reason} "
+            "{exit_precheck_ms} {exit_var_submit_ms} {exit_lighter_submit_ms} {exit_total_ms} "
             "{manual_at} {manual_reason} {entry_precheck_failures}".format(
                 asset=cycle.asset,
                 cycle_id=cycle.cycle_id,
@@ -273,12 +306,21 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
                 entry_precheck_status=cycle.entry_precheck_status or "-",
                 entry_edge=fmt(cycle.last_entry_precheck_edge_bps, 3),
                 entry_precheck_reason=cycle.last_entry_precheck_reason or "-",
+                entry_precheck_ms=fmt(cycle.entry_precheck_ms, 3),
+                entry_var_preview_ms=fmt(cycle.entry_var_preview_ms, 3),
+                entry_var_submit_ms=fmt(cycle.entry_var_submit_ms, 3),
+                entry_lighter_submit_ms=fmt(cycle.entry_lighter_submit_ms, 3),
+                entry_total_ms=fmt(cycle.entry_total_ms, 3),
                 exit_at=cycle.exit_at.isoformat(sep=" ") if cycle.exit_at else "-",
                 exit_side=cycle.exit_side or "-",
                 exit_reason=cycle.exit_reason or "-",
                 exit_precheck_status=cycle.exit_precheck_status or "-",
                 exit_edge=fmt(cycle.last_exit_precheck_edge_bps, 3),
                 exit_precheck_reason=cycle.last_exit_precheck_reason or "-",
+                exit_precheck_ms=fmt(cycle.exit_precheck_ms, 3),
+                exit_var_submit_ms=fmt(cycle.exit_var_submit_ms, 3),
+                exit_lighter_submit_ms=fmt(cycle.exit_lighter_submit_ms, 3),
+                exit_total_ms=fmt(cycle.exit_total_ms, 3),
                 manual_at=cycle.manual_review_at.isoformat(sep=" ") if cycle.manual_review_at else "-",
                 manual_reason=cycle.manual_review_reason or "-",
                 entry_precheck_failures=cycle.entry_precheck_failures,

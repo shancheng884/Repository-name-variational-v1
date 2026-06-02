@@ -167,6 +167,12 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     return format(value, "f")
 
 
+def elapsed_ms(start_monotonic: float | None) -> str:
+    if start_monotonic is None:
+        return "-"
+    return f"{(time.monotonic() - start_monotonic) * 1000:.3f}"
+
+
 def clean_state_value(value: Any) -> str:
     if value is None:
         return ""
@@ -3148,14 +3154,20 @@ class VariationalToLighterRuntime:
             if not depth_enough:
                 return
             var_side = self._auto_live_direction_to_var_side(direction)
+            entry_signal_monotonic = time.monotonic()
+            entry_precheck_ms = "-"
+            entry_var_submit_ms = "-"
+            entry_lighter_submit_ms = "-"
             if self.auto_live_eager_hedge:
                 precheck_price = snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price or snapshot.var_mid
+                entry_precheck_started = time.monotonic()
                 precheck_ok, precheck_reason, precheck_edge_bps = await self.auto_live_lighter_precheck(
                     asset=snapshot.asset,
                     var_side=var_side,
                     qty=order_qty,
                     var_fill_price=precheck_price,
                 )
+                entry_precheck_ms = elapsed_ms(entry_precheck_started)
                 if not precheck_ok:
                     if self.should_log_auto_live_precheck_failure(
                         "entry",
@@ -3165,13 +3177,14 @@ class VariationalToLighterRuntime:
                         precheck_reason,
                     ):
                         self.logger.warning(
-                            "auto_live_entry_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s action=skip_var_entry",
+                            "auto_live_entry_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s duration_ms=%s action=skip_var_entry",
                             cycle_id,
                             snapshot.asset,
                             var_side,
                             order_qty,
                             precheck_reason,
                             decimal_to_str(precheck_edge_bps) or "-",
+                            entry_precheck_ms,
                         )
                     return
                 if (
@@ -3188,46 +3201,53 @@ class VariationalToLighterRuntime:
                         precheck_reason,
                     ):
                         self.logger.warning(
-                            "auto_live_entry_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s limit_bps=%s action=skip_var_entry",
+                            "auto_live_entry_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s duration_ms=%s limit_bps=%s action=skip_var_entry",
                             cycle_id,
                             snapshot.asset,
                             var_side,
                             order_qty,
                             precheck_reason,
                             decimal_to_str(precheck_edge_bps) or "-",
+                            entry_precheck_ms,
                             decimal_to_str(self.auto_live_entry_max_precheck_edge_bps),
                         )
                     return
                 self.logger.info(
-                    "auto_live_entry_precheck_passed cycle_id=%s asset=%s side=%s qty=%s edge_bps=%s",
+                    "auto_live_entry_precheck_passed cycle_id=%s asset=%s side=%s qty=%s edge_bps=%s duration_ms=%s",
                     cycle_id,
                     snapshot.asset,
                     var_side,
                     order_qty,
                     decimal_to_str(precheck_edge_bps) or "-",
+                    entry_precheck_ms,
                 )
+            entry_var_preview_started = time.monotonic()
             precheck = await self.send_variational_place_order(
                 side=var_side,
                 amount=decimal_to_str(order_qty) or str(order_qty),
                 expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
                 confirm=False,
             )
+            entry_var_preview_ms = elapsed_ms(entry_var_preview_started)
             observed_order_qty = to_decimal((precheck.get("result") or {}).get("orderQuantityBtc"))
             if snapshot.asset.upper() == "BTC" and (observed_order_qty is None or observed_order_qty < order_qty):
                 self.logger.warning("auto_live_precheck_rejected asset=%s side=%s expected_qty=%s got=%s", snapshot.asset, var_side, order_qty, observed_order_qty)
                 return
+            entry_var_submit_started = time.monotonic()
             result = await self.send_variational_place_order(
                 side=var_side,
                 amount=decimal_to_str(order_qty) or str(order_qty),
                 expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
                 confirm=True,
             )
+            entry_var_submit_ms = elapsed_ms(entry_var_submit_started)
             if not result.get("ok"):
                 self.logger.warning("auto_live_var_submit_failed side=%s error=%s", var_side, result.get("error"))
                 return
 
             entry_eager_started = not self.auto_live_eager_hedge
             if self.auto_live_eager_hedge:
+                entry_lighter_submit_started = time.monotonic()
                 lighter_record, payload = await self.place_lighter_order_from_plan(
                     asset=snapshot.asset,
                     side=var_side,
@@ -3236,6 +3256,7 @@ class VariationalToLighterRuntime:
                     cycle_id=cycle_id,
                     role="entry",
                 )
+                entry_lighter_submit_ms = elapsed_ms(entry_lighter_submit_started)
                 entry_eager_started = self.auto_live_eager_hedge_started(lighter_record)
                 if lighter_record is not None and entry_eager_started:
                     self.pending_auto_live_matches.append(
@@ -3251,13 +3272,14 @@ class VariationalToLighterRuntime:
                     )
                     if payload is not None:
                         self.logger.info(
-                            "auto_live_eager_hedge_started cycle_id=%s role=entry asset=%s side=%s qty=%s stage=%s record_key=%s",
+                            "auto_live_eager_hedge_started cycle_id=%s role=entry asset=%s side=%s qty=%s stage=%s record_key=%s duration_ms=%s",
                             cycle_id,
                             snapshot.asset,
                             var_side,
                             order_qty,
                             payload.get("processing_stage"),
                             lighter_record.trade_key,
+                            entry_lighter_submit_ms,
                         )
                 elif lighter_record is not None:
                     self.logger.warning(
@@ -3309,12 +3331,17 @@ class VariationalToLighterRuntime:
                 }
             )
             self.logger.info(
-                "auto_live_entry_submitted cycle_id=%s asset=%s direction=%s qty=%s var_side=%s",
+                "auto_live_entry_submitted cycle_id=%s asset=%s direction=%s qty=%s var_side=%s entry_total_ms=%s entry_precheck_ms=%s var_preview_ms=%s var_submit_ms=%s lighter_submit_ms=%s",
                 cycle_id,
                 snapshot.asset,
                 direction,
                 order_qty,
                 var_side,
+                elapsed_ms(entry_signal_monotonic),
+                entry_precheck_ms,
+                entry_var_preview_ms,
+                entry_var_submit_ms,
+                entry_lighter_submit_ms,
             )
             return
 
@@ -3359,14 +3386,20 @@ class VariationalToLighterRuntime:
             return
 
         exit_side = self._opposite_var_side(self._auto_live_direction_to_var_side(position.direction))
+        exit_signal_monotonic = time.monotonic()
+        exit_precheck_ms = "-"
+        exit_var_submit_ms = "-"
+        exit_lighter_submit_ms = "-"
         if self.auto_live_eager_hedge:
             precheck_price = snapshot.var_sell_price if exit_side == "SELL" else snapshot.var_buy_price or snapshot.var_mid
+            exit_precheck_started = time.monotonic()
             precheck_ok, precheck_reason, precheck_edge_bps = await self.auto_live_lighter_precheck(
                 asset=snapshot.asset,
                 var_side=exit_side,
                 qty=position.planned_qty,
                 var_fill_price=precheck_price,
             )
+            exit_precheck_ms = elapsed_ms(exit_precheck_started)
             if not precheck_ok:
                 if self.should_log_auto_live_precheck_failure(
                     "exit",
@@ -3376,30 +3409,34 @@ class VariationalToLighterRuntime:
                     precheck_reason,
                 ):
                     self.logger.warning(
-                        "auto_live_exit_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s action=skip_var_exit",
+                        "auto_live_exit_precheck_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s edge_bps=%s duration_ms=%s action=skip_var_exit",
                         position.cycle_id,
                         snapshot.asset,
                         exit_side,
                         position.planned_qty,
                         precheck_reason,
                         decimal_to_str(precheck_edge_bps) or "-",
+                        exit_precheck_ms,
                     )
                 self.require_auto_live_manual_review(position, f"exit_precheck_failed:{precheck_reason}")
                 return
             self.logger.info(
-                "auto_live_exit_precheck_passed cycle_id=%s asset=%s side=%s qty=%s edge_bps=%s",
+                "auto_live_exit_precheck_passed cycle_id=%s asset=%s side=%s qty=%s edge_bps=%s duration_ms=%s",
                 position.cycle_id,
                 snapshot.asset,
                 exit_side,
                 position.planned_qty,
                 decimal_to_str(precheck_edge_bps) or "-",
+                exit_precheck_ms,
             )
+        exit_var_submit_started = time.monotonic()
         result = await self.send_variational_place_order(
             side=exit_side,
             amount=decimal_to_str(position.planned_qty) or str(position.planned_qty),
             expected_min_btc_qty=position.planned_qty if snapshot.asset.upper() == "BTC" else None,
             confirm=True,
         )
+        exit_var_submit_ms = elapsed_ms(exit_var_submit_started)
         if not result.get("ok"):
             self.logger.warning(
                 "auto_live_exit_submit_failed asset=%s side=%s reason=%s error=%s",
@@ -3415,6 +3452,7 @@ class VariationalToLighterRuntime:
         position.exit_reason = exit_reason
         exit_eager_started = not self.auto_live_eager_hedge
         if self.auto_live_eager_hedge:
+            exit_lighter_submit_started = time.monotonic()
             lighter_record, payload = await self.place_lighter_order_from_plan(
                 asset=snapshot.asset,
                 side=exit_side,
@@ -3423,6 +3461,7 @@ class VariationalToLighterRuntime:
                 cycle_id=position.cycle_id,
                 role="exit",
             )
+            exit_lighter_submit_ms = elapsed_ms(exit_lighter_submit_started)
             exit_eager_started = self.auto_live_eager_hedge_started(lighter_record)
             if lighter_record is not None and exit_eager_started:
                 self.pending_auto_live_matches.append(
@@ -3438,13 +3477,14 @@ class VariationalToLighterRuntime:
                 )
                 if payload is not None:
                     self.logger.info(
-                        "auto_live_eager_hedge_started cycle_id=%s role=exit asset=%s side=%s qty=%s stage=%s record_key=%s",
+                        "auto_live_eager_hedge_started cycle_id=%s role=exit asset=%s side=%s qty=%s stage=%s record_key=%s duration_ms=%s",
                         position.cycle_id,
                         snapshot.asset,
                         exit_side,
                         position.planned_qty,
                         payload.get("processing_stage"),
                         lighter_record.trade_key,
+                        exit_lighter_submit_ms,
                     )
             elif lighter_record is not None:
                 self.logger.warning(
@@ -3485,12 +3525,16 @@ class VariationalToLighterRuntime:
             self.require_auto_live_manual_review(position, "exit_eager_hedge_not_started")
             return
         self.logger.info(
-            "auto_live_exit_submitted cycle_id=%s asset=%s side=%s qty=%s reason=%s",
+            "auto_live_exit_submitted cycle_id=%s asset=%s side=%s qty=%s reason=%s exit_total_ms=%s exit_precheck_ms=%s var_submit_ms=%s lighter_submit_ms=%s",
             position.cycle_id,
             snapshot.asset,
             exit_side,
             position.planned_qty,
             exit_reason,
+            elapsed_ms(exit_signal_monotonic),
+            exit_precheck_ms,
+            exit_var_submit_ms,
+            exit_lighter_submit_ms,
         )
         self.auto_live_position = None
         self.auto_live_last_closed_monotonic = time.monotonic()
