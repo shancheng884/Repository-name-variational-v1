@@ -2365,6 +2365,11 @@ class VariationalToLighterRuntime:
                     ),
                     "reduce_only": False,
                     "trigger_price": 0,
+                    "order_expiry": (
+                        self.lighter_client.DEFAULT_IOC_EXPIRY
+                        if self.lighter_order_mode == LIGHTER_ORDER_MODE_MARKET_IOC
+                        else self.lighter_client.DEFAULT_28_DAY_ORDER_EXPIRY
+                    ),
                 }
                 if self.lighter_submit_transport == LIGHTER_SUBMIT_TRANSPORT_WS:
                     _, tx_hash, error = await self.create_lighter_order_ws(**order_kwargs)

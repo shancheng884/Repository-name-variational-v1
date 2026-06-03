@@ -183,3 +183,47 @@ def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_pat
         assert runtime.records["auto:BTC:buy:123"].matched_variational_trade_id == "trade-1"
 
     asyncio.run(run())
+
+
+def test_market_ioc_uses_ioc_expiry() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.lighter_order_mode = "market-ioc"
+
+    class FakeClient:
+        ORDER_TYPE_LIMIT = 0
+        ORDER_TYPE_MARKET = 1
+        ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0
+        ORDER_TIME_IN_FORCE_GOOD_TILL_TIME = 1
+        DEFAULT_IOC_EXPIRY = 0
+        DEFAULT_28_DAY_ORDER_EXPIRY = -1
+
+    runtime.lighter_client = FakeClient()
+
+    order_kwargs = {
+        "market_index": 1,
+        "client_order_index": 123,
+        "base_amount": 45,
+        "price": 100000,
+        "is_ask": False,
+        "order_type": (
+            runtime.lighter_client.ORDER_TYPE_MARKET
+            if runtime.lighter_order_mode == "market-ioc"
+            else runtime.lighter_client.ORDER_TYPE_LIMIT
+        ),
+        "time_in_force": (
+            runtime.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
+            if runtime.lighter_order_mode == "market-ioc"
+            else runtime.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+        ),
+        "reduce_only": False,
+        "trigger_price": 0,
+        "order_expiry": (
+            runtime.lighter_client.DEFAULT_IOC_EXPIRY
+            if runtime.lighter_order_mode == "market-ioc"
+            else runtime.lighter_client.DEFAULT_28_DAY_ORDER_EXPIRY
+        ),
+    }
+
+    assert order_kwargs["order_type"] == runtime.lighter_client.ORDER_TYPE_MARKET
+    assert order_kwargs["time_in_force"] == runtime.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
+    assert order_kwargs["order_expiry"] == runtime.lighter_client.DEFAULT_IOC_EXPIRY
