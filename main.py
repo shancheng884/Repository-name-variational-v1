@@ -3439,12 +3439,30 @@ class VariationalToLighterRuntime:
                     entry_precheck_ms,
                 )
             entry_var_preview_started = time.monotonic()
-            precheck = await self.send_variational_place_order(
-                side=var_side,
-                amount=decimal_to_str(order_qty) or str(order_qty),
-                expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
-                confirm=False,
-            )
+            try:
+                precheck = await self.send_variational_place_order(
+                    side=var_side,
+                    amount=decimal_to_str(order_qty) or str(order_qty),
+                    expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
+                    confirm=False,
+                )
+            except Exception as exc:
+                reason = f"entry_var_preview_exception:{exc}"
+                self.require_auto_live_manual_review_for_entry(
+                    cycle_id=cycle_id,
+                    asset=snapshot.asset,
+                    direction=direction,
+                    qty=order_qty,
+                    reason=reason,
+                )
+                self.logger.exception(
+                    "auto_live_entry_preview_exception cycle_id=%s asset=%s side=%s qty=%s",
+                    cycle_id,
+                    snapshot.asset,
+                    var_side,
+                    order_qty,
+                )
+                return
             entry_var_preview_ms = elapsed_ms_str(entry_var_preview_started)
             observed_order_qty = to_decimal((precheck.get("result") or {}).get("orderQuantityBtc"))
             if snapshot.asset.upper() == "BTC" and (observed_order_qty is None or observed_order_qty < order_qty):
