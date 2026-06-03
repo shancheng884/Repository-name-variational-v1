@@ -1,7 +1,10 @@
+import asyncio
 import logging
+from collections import deque
 from decimal import Decimal
+from pathlib import Path
 
-from main import AutoLivePositionState, VariationalToLighterRuntime
+from main import AutoLivePositionState, OrderLifecycle, PendingAutoLiveMatch, VariationalToLighterRuntime
 
 
 def _runtime_for_fuse_test() -> VariationalToLighterRuntime:
@@ -91,3 +94,92 @@ def test_auto_live_precheck_failure_logging_is_throttled() -> None:
         "hedge_price_deviation_exceeds_risk_limit",
         interval_seconds=10.0,
     ) is True
+
+
+def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_path) -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.mode = "live"
+        runtime.records = {}
+        runtime.record_order = deque()
+        runtime.records["auto:BTC:buy:123"] = OrderLifecycle(
+            trade_key="auto:BTC:buy:123",
+            trade_id="auto:BTC:buy:123",
+            side="buy",
+            qty=Decimal("0.00022"),
+            asset="BTC",
+            mode="live",
+            last_variational_status="submitted",
+            synthetic_eager_fill=True,
+            auto_live_cycle_id=1,
+            auto_live_role="entry",
+            auto_live_merge_path="synthetic_created",
+        )
+        runtime.record_order.append("auto:BTC:buy:123")
+        runtime.pending_auto_live_matches = [
+            PendingAutoLiveMatch(
+                record_key="auto:BTC:buy:123",
+                asset="BTC",
+                side="buy",
+                qty=Decimal("0.00022"),
+                cycle_id=1,
+                role="entry",
+                created_at_monotonic=asyncio.get_running_loop().time(),
+            )
+        ]
+        runtime.auto_live_match_window_seconds = 10.0
+        runtime.trade_event_min_timestamp = None
+        runtime.last_variational_trade_event_at = None
+        runtime.variational_ticker = "BTC"
+        runtime.accepted_assets = {"BTC"}
+        runtime._record_lock = asyncio.Lock()
+        runtime.logger = logging.getLogger("test_auto_live_fuse")
+        runtime.lighter_client_order_to_trade_key = {}
+        runtime.output_dir = Path(tmp_path)
+
+        hedge_calls: list[str] = []
+        append_calls: list[str] = []
+
+        async def fake_place_lighter_order(record) -> None:
+            hedge_calls.append(record.trade_key)
+
+        async def fake_append_order_log(event_type, payload) -> None:
+            append_calls.append(event_type)
+
+        runtime.place_lighter_order = fake_place_lighter_order
+        runtime.append_order_log = fake_append_order_log
+
+        submitted_event = {
+            "asset": "BTC",
+            "side": "buy",
+            "qty": "0.00022",
+            "status": "submitted",
+            "trade_id": "trade-1",
+            "timestamp": "2026-06-02T08:50:10Z",
+            "price": "100000",
+        }
+        filled_event = {
+            "asset": "BTC",
+            "side": "buy",
+            "qty": "0.00022",
+            "status": "filled",
+            "trade_id": "trade-1",
+            "timestamp": "2026-06-02T08:50:11Z",
+            "price": "100001",
+        }
+
+        await runtime.process_variational_trade_event(submitted_event)
+
+        assert len(runtime.pending_auto_live_matches) == 1
+        assert hedge_calls == []
+
+        await runtime.process_variational_trade_event(filled_event)
+
+        assert len(runtime.pending_auto_live_matches) == 0
+        assert hedge_calls == []
+        assert append_calls == ["variational_fill"]
+        assert "id:trade-1" in runtime.records
+        assert runtime.records["auto:BTC:buy:123"].auto_live_merge_path == "synthetic_matched_real_var_fill"
+        assert runtime.records["auto:BTC:buy:123"].matched_variational_trade_id == "trade-1"
+
+    asyncio.run(run())

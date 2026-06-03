@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_UP
 from pathlib import Path
+from types import SimpleNamespace
 from statistics import median
 from typing import Any
 
@@ -50,6 +51,12 @@ MODE_DRY_RUN = "dry-run"
 MODE_LIVE = "live"
 MODE_PAPER = "paper"
 MODE_CHOICES = (MODE_OBSERVE, MODE_DRY_RUN, MODE_LIVE, MODE_PAPER)
+LIGHTER_SUBMIT_TRANSPORT_HTTP = "http"
+LIGHTER_SUBMIT_TRANSPORT_WS = "ws"
+LIGHTER_SUBMIT_TRANSPORT_CHOICES = (LIGHTER_SUBMIT_TRANSPORT_HTTP, LIGHTER_SUBMIT_TRANSPORT_WS)
+LIGHTER_ORDER_MODE_LIMIT_GTT = "limit-gtt"
+LIGHTER_ORDER_MODE_MARKET_IOC = "market-ioc"
+LIGHTER_ORDER_MODE_CHOICES = (LIGHTER_ORDER_MODE_LIMIT_GTT, LIGHTER_ORDER_MODE_MARKET_IOC)
 
 STAGE_EVENT_RECEIVED = "event_received"
 STAGE_EVENT_FILTERED = "event_filtered"
@@ -404,6 +411,8 @@ class OrderLifecycle:
 
     lighter_side: str | None = None
     lighter_client_order_id: int | None = None
+    lighter_submit_transport: str | None = None
+    lighter_order_mode: str | None = None
     lighter_fill_price: Decimal | None = None
     lighter_fill_ts_iso: str | None = None
     lighter_tx_hash: str | None = None
@@ -451,6 +460,12 @@ class OrderLifecycle:
             "auto_live_merge_path": self.auto_live_merge_path,
             "lighter_order_side": self.lighter_side,
             "lighter_client_order_id": self.lighter_client_order_id,
+            "lighter_submit_transport": getattr(
+                self,
+                "lighter_submit_transport",
+                LIGHTER_SUBMIT_TRANSPORT_HTTP,
+            ),
+            "lighter_order_mode": getattr(self, "lighter_order_mode", LIGHTER_ORDER_MODE_LIMIT_GTT),
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
             "lighter_filled_at": self.lighter_fill_ts_iso,
             "mode": self.mode,
@@ -708,6 +723,8 @@ class VariationalToLighterRuntime:
             side.strip().lower() for side in str(args.live_allowed_sides).split(",") if side.strip()
         }
         self.live_submit_timeout_seconds = float(args.live_submit_timeout_seconds)
+        self.lighter_submit_transport = args.lighter_submit_transport
+        self.lighter_order_mode = args.lighter_order_mode
 
         self.stop_flag = False
         self.logger = logging.getLogger("var_lighter_runtime")
@@ -757,6 +774,10 @@ class VariationalToLighterRuntime:
         self.api_key_index: int | None = None
         self.lighter_client: Any | None = None
         self._lighter_signer_lock = asyncio.Lock()
+        self._lighter_submit_ws: Any | None = None
+        self._lighter_submit_ws_lock = asyncio.Lock()
+        self._var_command_ws: Any | None = None
+        self._var_command_ws_lock = asyncio.Lock()
 
         self.lighter_market_index = 0
         self.base_amount_multiplier = 0
@@ -1037,6 +1058,12 @@ class VariationalToLighterRuntime:
             "require_min_edge_bps": decimal_to_str(self.live_require_min_edge_bps),
             "cooldown_seconds": self.live_cooldown_seconds,
             "submit_timeout_seconds": self.live_submit_timeout_seconds,
+            "lighter_submit_transport": getattr(
+                self,
+                "lighter_submit_transport",
+                LIGHTER_SUBMIT_TRANSPORT_HTTP,
+            ),
+            "lighter_order_mode": getattr(self, "lighter_order_mode", LIGHTER_ORDER_MODE_LIMIT_GTT),
             "allowed_assets": sorted(self.live_allowed_assets),
             "allowed_sides": sorted(self.live_allowed_sides),
             "rollback_action": "manual_review_required",
@@ -1109,6 +1136,10 @@ class VariationalToLighterRuntime:
         passed.append(f"forwarder_command=ws://{FORWARDER_HOST}:{FORWARDER_COMMAND_PORT}")
         passed.append(f"risk_guard_max_base_amount={self.risk_guard_max_base_amount}")
         passed.append(f"risk_guard_max_price_deviation_bps={self.risk_guard_max_price_deviation_bps}")
+        passed.append(
+            f"lighter_submit_transport={getattr(self, 'lighter_submit_transport', LIGHTER_SUBMIT_TRANSPORT_HTTP)}"
+        )
+        passed.append(f"lighter_order_mode={getattr(self, 'lighter_order_mode', LIGHTER_ORDER_MODE_LIMIT_GTT)}")
         passed.append(f"live_config={json.dumps(self.live_config_snapshot(), ensure_ascii=True, sort_keys=True)}")
         passed.append(f"paper_config={json.dumps(self.paper_config_snapshot(), ensure_ascii=True, sort_keys=True)}")
 
@@ -1514,17 +1545,27 @@ class VariationalToLighterRuntime:
             "confirm": bool(confirm),
             "expectedMinBtcQty": decimal_to_str(expected_min_btc_qty) if expected_min_btc_qty is not None else "0",
         }
-        async with websockets.connect(
-            f"ws://{FORWARDER_HOST}:{FORWARDER_COMMAND_PORT}",
-            ping_interval=20,
-            ping_timeout=20,
-        ) as websocket:
-            await websocket.send(json.dumps(payload, ensure_ascii=True))
-            while True:
-                raw = await asyncio.wait_for(websocket.recv(), timeout=self.auto_live_command_timeout_seconds)
-                message = json.loads(raw)
-                if message.get("requestId") == request_id:
-                    return message
+        async with self._var_command_ws_lock:
+            websocket = self._var_command_ws
+            if websocket is None or getattr(websocket, "state", None) != 1:
+                websocket = await websockets.connect(
+                    f"ws://{FORWARDER_HOST}:{FORWARDER_COMMAND_PORT}",
+                    ping_interval=20,
+                    ping_timeout=20,
+                )
+                self._var_command_ws = websocket
+            try:
+                await websocket.send(json.dumps(payload, ensure_ascii=True))
+                while True:
+                    raw = await asyncio.wait_for(websocket.recv(), timeout=self.auto_live_command_timeout_seconds)
+                    message = json.loads(raw)
+                    if message.get("requestId") == request_id:
+                        return message
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await websocket.close()
+                self._var_command_ws = None
+                raise
 
     async def place_lighter_order_from_plan(
         self,
@@ -1553,6 +1594,8 @@ class VariationalToLighterRuntime:
             auto_live_cycle_id=cycle_id,
             auto_live_role=role,
             auto_live_merge_path="synthetic_created",
+            lighter_submit_transport=self.lighter_submit_transport,
+            lighter_order_mode=self.lighter_order_mode,
         )
         async with self._record_lock:
             self.set_record_stage(record, STAGE_RECORD_CREATED, clear_failure=True)
@@ -1611,6 +1654,113 @@ class VariationalToLighterRuntime:
         if env_flag("LIGHTER_WS_SERVER_PINGS"):
             return f"{LIGHTER_WS_URL}?server_pings=true"
         return LIGHTER_WS_URL
+
+    @staticmethod
+    def _is_lighter_ws_sendtx_response(message: dict[str, Any]) -> bool:
+        data = message.get("data")
+        if isinstance(data, dict) and "code" in data:
+            return True
+        return "code" in message and ("tx_hash" in message or "message" in message)
+
+    @staticmethod
+    def _normalize_lighter_ws_sendtx_response(message: dict[str, Any]) -> SimpleNamespace:
+        data = message.get("data")
+        payload = data if isinstance(data, dict) else message
+        return SimpleNamespace(
+            code=int(payload.get("code", 0) or 0),
+            message=payload.get("message"),
+            tx_hash=payload.get("tx_hash") or payload.get("hash") or "",
+            predicted_execution_time_ms=int(payload.get("predicted_execution_time_ms", 0) or 0),
+            volume_quota_remaining=int(payload.get("volume_quota_remaining", 0) or 0),
+            raw=message,
+        )
+
+    async def send_lighter_tx_ws(self, *, tx_type: int, tx_info: str) -> SimpleNamespace:
+        if not tx_info or tx_info[0] != "{":
+            raise ValueError(f"Invalid tx_info: {tx_info}")
+
+        payload = {
+            "type": "jsonapi/sendtx",
+            "data": {
+                "tx_type": int(tx_type),
+                "tx_info": tx_info,
+            },
+        }
+        async with self._lighter_submit_ws_lock:
+            websocket = self._lighter_submit_ws
+            if websocket is None or getattr(websocket, "state", None) != 1:
+                websocket = await websockets.connect(
+                    self.build_lighter_ws_url(),
+                    ping_interval=LIGHTER_WS_PING_INTERVAL_SECONDS,
+                    ping_timeout=LIGHTER_WS_PING_TIMEOUT_SECONDS,
+                )
+                self._lighter_submit_ws = websocket
+            try:
+                await websocket.send(json.dumps(payload, ensure_ascii=True))
+                while True:
+                    raw = await asyncio.wait_for(websocket.recv(), timeout=self.live_submit_timeout_seconds)
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", errors="replace")
+                    message = json.loads(raw)
+                    if message.get("type") == "ping":
+                        await websocket.send(json.dumps({"type": "pong"}))
+                        continue
+                    if self._is_lighter_ws_sendtx_response(message):
+                        return self._normalize_lighter_ws_sendtx_response(message)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await websocket.close()
+                self._lighter_submit_ws = None
+                raise
+
+    async def create_lighter_order_ws(
+        self,
+        *,
+        market_index: int,
+        client_order_index: int,
+        base_amount: int,
+        price: int,
+        is_ask: bool,
+        order_type: int,
+        time_in_force: int,
+        reduce_only: bool,
+        trigger_price: int,
+    ) -> tuple[Any | None, Any | None, str | None]:
+        from lighter.transactions import CreateOrder
+
+        if not self.lighter_client:
+            raise RuntimeError("Lighter client is not initialized")
+        api_key_index, nonce = self.lighter_client.nonce_manager.next_nonce()
+        sent_to_ws = False
+        try:
+            tx_type, tx_info, _tx_hash, error = self.lighter_client.sign_create_order(
+                market_index=market_index,
+                client_order_index=client_order_index,
+                base_amount=base_amount,
+                price=price,
+                is_ask=int(is_ask),
+                order_type=order_type,
+                time_in_force=time_in_force,
+                reduce_only=reduce_only,
+                trigger_price=trigger_price,
+                nonce=nonce,
+                api_key_index=api_key_index,
+            )
+            if error is not None:
+                self.lighter_client.nonce_manager.acknowledge_failure(api_key_index)
+                return None, None, error
+
+            sent_to_ws = True
+            api_response = await self.send_lighter_tx_ws(tx_type=tx_type, tx_info=tx_info)
+            if api_response is None or api_response.code != 200:
+                self.lighter_client.nonce_manager.acknowledge_failure(api_key_index)
+            return CreateOrder.from_json(tx_info), api_response, None
+        except Exception as exc:
+            if "invalid nonce" in str(exc):
+                self.lighter_client.nonce_manager.hard_refresh_nonce(api_key_index)
+            elif not sent_to_ws:
+                self.lighter_client.nonce_manager.acknowledge_failure(api_key_index)
+            return None, None, str(exc)
 
     async def handle_lighter_ws(self) -> None:
         while not self.stop_flag:
@@ -2197,17 +2347,29 @@ class VariationalToLighterRuntime:
             async with self._lighter_signer_lock:
                 if not self.lighter_client:
                     self.initialize_lighter_client()
-                _, tx_hash, error = await self.lighter_client.create_order(
-                    market_index=self.lighter_market_index,
-                    client_order_index=client_order_id,
-                    base_amount=base_amount,
-                    price=price_i,
-                    is_ask=is_ask,
-                    order_type=self.lighter_client.ORDER_TYPE_LIMIT,
-                    time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                    reduce_only=False,
-                    trigger_price=0,
-                )
+                order_kwargs = {
+                    "market_index": self.lighter_market_index,
+                    "client_order_index": client_order_id,
+                    "base_amount": base_amount,
+                    "price": price_i,
+                    "is_ask": is_ask,
+                    "order_type": (
+                        self.lighter_client.ORDER_TYPE_MARKET
+                        if self.lighter_order_mode == LIGHTER_ORDER_MODE_MARKET_IOC
+                        else self.lighter_client.ORDER_TYPE_LIMIT
+                    ),
+                    "time_in_force": (
+                        self.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
+                        if self.lighter_order_mode == LIGHTER_ORDER_MODE_MARKET_IOC
+                        else self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+                    ),
+                    "reduce_only": False,
+                    "trigger_price": 0,
+                }
+                if self.lighter_submit_transport == LIGHTER_SUBMIT_TRANSPORT_WS:
+                    _, tx_hash, error = await self.create_lighter_order_ws(**order_kwargs)
+                else:
+                    _, tx_hash, error = await self.lighter_client.create_order(**order_kwargs)
 
             submit_sent_iso = utc_now()
             submit_sent_monotonic = time.monotonic()
@@ -2220,6 +2382,8 @@ class VariationalToLighterRuntime:
                 record.dry_run_plan_base_amount = base_amount
                 record.lighter_side = side
                 record.lighter_client_order_id = client_order_id
+                record.lighter_submit_transport = self.lighter_submit_transport
+                record.lighter_order_mode = self.lighter_order_mode
                 record.lighter_tx_hash = tx_hash
                 record.live_submit_sent_at_iso = submit_sent_iso
                 record.live_submit_sent_monotonic = submit_sent_monotonic
@@ -2318,7 +2482,9 @@ class VariationalToLighterRuntime:
 
         created = False
         created_record: OrderLifecycle | None = None
-        matched_auto_live = self.consume_pending_auto_live_match(asset=asset, side=side, qty=qty)
+        matched_auto_live = None
+        if status == "filled":
+            matched_auto_live = self.consume_pending_auto_live_match(asset=asset, side=side, qty=qty)
         matched_trade_key = matched_auto_live.record_key if matched_auto_live is not None else None
 
         async with self._record_lock:
@@ -2394,7 +2560,7 @@ class VariationalToLighterRuntime:
             await self.record_dry_run_plan(created_record)
             return
 
-        if self.is_live_mode():
+        if self.is_live_mode() and status == "filled":
             await self.place_lighter_order(created_record)
 
     async def trade_loop(self) -> None:
@@ -3234,28 +3400,40 @@ class VariationalToLighterRuntime:
                 self.logger.warning("auto_live_precheck_rejected asset=%s side=%s expected_qty=%s got=%s", snapshot.asset, var_side, order_qty, observed_order_qty)
                 return
             entry_var_submit_started = time.monotonic()
-            result = await self.send_variational_place_order(
-                side=var_side,
-                amount=decimal_to_str(order_qty) or str(order_qty),
-                expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
-                confirm=True,
+            entry_var_task = asyncio.create_task(
+                self.send_variational_place_order(
+                    side=var_side,
+                    amount=decimal_to_str(order_qty) or str(order_qty),
+                    expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
+                    confirm=True,
+                )
             )
+            entry_lighter_task = None
+            if self.auto_live_eager_hedge:
+                entry_lighter_submit_started = time.monotonic()
+                entry_lighter_task = asyncio.create_task(
+                    self.place_lighter_order_from_plan(
+                        asset=snapshot.asset,
+                        side=var_side,
+                        qty=order_qty,
+                        var_fill_price=snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price or snapshot.var_mid,
+                        cycle_id=cycle_id,
+                        role="entry",
+                    )
+                )
+
+            result = await entry_var_task
             entry_var_submit_ms = elapsed_ms_str(entry_var_submit_started)
             if not result.get("ok"):
+                if entry_lighter_task is not None:
+                    with contextlib.suppress(Exception):
+                        await entry_lighter_task
                 self.logger.warning("auto_live_var_submit_failed side=%s error=%s", var_side, result.get("error"))
                 return
 
             entry_eager_started = not self.auto_live_eager_hedge
-            if self.auto_live_eager_hedge:
-                entry_lighter_submit_started = time.monotonic()
-                lighter_record, payload = await self.place_lighter_order_from_plan(
-                    asset=snapshot.asset,
-                    side=var_side,
-                    qty=order_qty,
-                    var_fill_price=snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price or snapshot.var_mid,
-                    cycle_id=cycle_id,
-                    role="entry",
-                )
+            if entry_lighter_task is not None:
+                lighter_record, payload = await entry_lighter_task
                 entry_lighter_submit_ms = elapsed_ms_str(entry_lighter_submit_started)
                 entry_eager_started = self.auto_live_eager_hedge_started(lighter_record)
                 if lighter_record is not None and entry_eager_started:
@@ -3430,14 +3608,34 @@ class VariationalToLighterRuntime:
                 exit_precheck_ms,
             )
         exit_var_submit_started = time.monotonic()
-        result = await self.send_variational_place_order(
-            side=exit_side,
-            amount=decimal_to_str(position.planned_qty) or str(position.planned_qty),
-            expected_min_btc_qty=position.planned_qty if snapshot.asset.upper() == "BTC" else None,
-            confirm=True,
+        exit_var_task = asyncio.create_task(
+            self.send_variational_place_order(
+                side=exit_side,
+                amount=decimal_to_str(position.planned_qty) or str(position.planned_qty),
+                expected_min_btc_qty=position.planned_qty if snapshot.asset.upper() == "BTC" else None,
+                confirm=True,
+            )
         )
+        exit_lighter_task = None
+        if self.auto_live_eager_hedge:
+            exit_lighter_submit_started = time.monotonic()
+            exit_lighter_task = asyncio.create_task(
+                self.place_lighter_order_from_plan(
+                    asset=snapshot.asset,
+                    side=exit_side,
+                    qty=position.planned_qty,
+                    var_fill_price=snapshot.var_sell_price if exit_side == "SELL" else snapshot.var_buy_price or snapshot.var_mid,
+                    cycle_id=position.cycle_id,
+                    role="exit",
+                )
+            )
+
+        result = await exit_var_task
         exit_var_submit_ms = elapsed_ms_str(exit_var_submit_started)
         if not result.get("ok"):
+            if exit_lighter_task is not None:
+                with contextlib.suppress(Exception):
+                    await exit_lighter_task
             self.logger.warning(
                 "auto_live_exit_submit_failed asset=%s side=%s reason=%s error=%s",
                 snapshot.asset,
@@ -3451,16 +3649,8 @@ class VariationalToLighterRuntime:
         position.exit_side = exit_side
         position.exit_reason = exit_reason
         exit_eager_started = not self.auto_live_eager_hedge
-        if self.auto_live_eager_hedge:
-            exit_lighter_submit_started = time.monotonic()
-            lighter_record, payload = await self.place_lighter_order_from_plan(
-                asset=snapshot.asset,
-                side=exit_side,
-                qty=position.planned_qty,
-                var_fill_price=snapshot.var_sell_price if exit_side == "SELL" else snapshot.var_buy_price or snapshot.var_mid,
-                cycle_id=position.cycle_id,
-                role="exit",
-            )
+        if exit_lighter_task is not None:
+            lighter_record, payload = await exit_lighter_task
             exit_lighter_submit_ms = elapsed_ms_str(exit_lighter_submit_started)
             exit_eager_started = self.auto_live_eager_hedge_started(lighter_record)
             if lighter_record is not None and exit_eager_started:
@@ -3835,9 +4025,11 @@ class VariationalToLighterRuntime:
                         "qty": decimal_to_str(record.qty),
                         "variational_filled_price": payload["variational_filled_price"],
                         "variational_filled_at": payload["variational_filled_at"],
-                        "lighter_order_side": payload["lighter_order_side"],
-                        "lighter_client_order_id": payload["lighter_client_order_id"],
-                        "lighter_filled_price": payload["lighter_filled_price"],
+                            "lighter_order_side": payload["lighter_order_side"],
+                            "lighter_client_order_id": payload["lighter_client_order_id"],
+                            "lighter_submit_transport": payload["lighter_submit_transport"],
+                            "lighter_order_mode": payload["lighter_order_mode"],
+                            "lighter_filled_price": payload["lighter_filled_price"],
                         "lighter_filled_at": payload["lighter_filled_at"],
                         "variational_notional": decimal_to_str(var_notional),
                         "lighter_notional": decimal_to_str(lighter_notional),
@@ -3905,6 +4097,8 @@ class VariationalToLighterRuntime:
             "variational_filled_at",
             "lighter_order_side",
             "lighter_client_order_id",
+            "lighter_submit_transport",
+            "lighter_order_mode",
             "lighter_filled_price",
             "lighter_filled_at",
             "variational_notional",
@@ -4066,6 +4260,16 @@ class VariationalToLighterRuntime:
                     if asyncio.iscoroutine(close_result):
                         await close_result
 
+        if self._lighter_submit_ws is not None:
+            with contextlib.suppress(Exception):
+                await self._lighter_submit_ws.close()
+            self._lighter_submit_ws = None
+
+        if self._var_command_ws is not None:
+            with contextlib.suppress(Exception):
+                await self._var_command_ws.close()
+            self._var_command_ws = None
+
         await self.runtime.stop()
 
 
@@ -4152,6 +4356,18 @@ def parse_args() -> argparse.Namespace:
             "Maximum time to wait for a live hedge to reach lighter_filled before marking it timed out. "
             f"Default: {DEFAULT_LIVE_SUBMIT_TIMEOUT_SECONDS}"
         ),
+    )
+    parser.add_argument(
+        "--lighter-submit-transport",
+        choices=LIGHTER_SUBMIT_TRANSPORT_CHOICES,
+        default=LIGHTER_SUBMIT_TRANSPORT_HTTP,
+        help="Transport for real Lighter order submission. Default: http; use ws to send signed tx via Lighter WebSocket.",
+    )
+    parser.add_argument(
+        "--lighter-order-mode",
+        choices=LIGHTER_ORDER_MODE_CHOICES,
+        default=LIGHTER_ORDER_MODE_LIMIT_GTT,
+        help="Lighter live order mode. Default: limit-gtt; use market-ioc for lower-latency taker execution.",
     )
     parser.add_argument(
         "--live-allowed-assets",
