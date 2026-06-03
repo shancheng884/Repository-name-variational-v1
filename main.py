@@ -1528,6 +1528,50 @@ class VariationalToLighterRuntime:
     def _opposite_var_side(side: str) -> str:
         return "SELL" if side.strip().upper() == "BUY" else "BUY"
 
+    def require_auto_live_manual_review_for_entry(
+        self,
+        *,
+        cycle_id: int,
+        asset: str,
+        direction: str,
+        qty: Decimal,
+        reason: str,
+    ) -> None:
+        self.auto_live_manual_review_required = True
+        self.auto_live_manual_review_reason = reason
+        self.write_auto_live_state(
+            {
+                "status": "manual_review_required",
+                "asset": asset,
+                "cycle_id": cycle_id,
+                "direction": direction,
+                "qty": decimal_to_str(qty),
+                "reason": reason,
+                "action": "stop_auto_live_until_restart",
+            }
+        )
+        self._last_auto_live_guard_log = None
+        self.maybe_log_auto_live_guard("manual_review_required")
+        try:
+            self.record_order_metric(
+                "auto_live_manual_review_required",
+                {
+                    "cycle_id": cycle_id,
+                    "asset": asset,
+                    "qty": decimal_to_str(qty),
+                    "reason": reason,
+                    "action": "stop_auto_live_until_restart",
+                },
+            )
+        except Exception:
+            self.logger.exception(
+                "auto_live_manual_review_metric_failed cycle_id=%s asset=%s qty=%s reason=%s",
+                cycle_id,
+                asset,
+                qty,
+                reason,
+            )
+
     async def send_variational_place_order(
         self,
         *,
@@ -3429,7 +3473,28 @@ class VariationalToLighterRuntime:
                     )
                 )
 
-            result = await entry_var_task
+            try:
+                result = await entry_var_task
+            except Exception as exc:
+                if entry_lighter_task is not None:
+                    with contextlib.suppress(Exception):
+                        await entry_lighter_task
+                reason = f"entry_var_submit_exception:{exc}"
+                self.require_auto_live_manual_review_for_entry(
+                    cycle_id=cycle_id,
+                    asset=snapshot.asset,
+                    direction=direction,
+                    qty=order_qty,
+                    reason=reason,
+                )
+                self.logger.exception(
+                    "auto_live_entry_submit_exception cycle_id=%s asset=%s side=%s qty=%s",
+                    cycle_id,
+                    snapshot.asset,
+                    var_side,
+                    order_qty,
+                )
+                return
             entry_var_submit_ms = elapsed_ms_str(entry_var_submit_started)
             if not result.get("ok"):
                 if entry_lighter_task is not None:
@@ -3440,7 +3505,25 @@ class VariationalToLighterRuntime:
 
             entry_eager_started = not self.auto_live_eager_hedge
             if entry_lighter_task is not None:
-                lighter_record, payload = await entry_lighter_task
+                try:
+                    lighter_record, payload = await entry_lighter_task
+                except Exception as exc:
+                    reason = f"entry_lighter_submit_exception:{exc}"
+                    self.require_auto_live_manual_review_for_entry(
+                        cycle_id=cycle_id,
+                        asset=snapshot.asset,
+                        direction=direction,
+                        qty=order_qty,
+                        reason=reason,
+                    )
+                    self.logger.exception(
+                        "auto_live_entry_lighter_submit_exception cycle_id=%s asset=%s side=%s qty=%s",
+                        cycle_id,
+                        snapshot.asset,
+                        var_side,
+                        order_qty,
+                    )
+                    return
                 entry_lighter_submit_ms = elapsed_ms_str(entry_lighter_submit_started)
                 entry_eager_started = self.auto_live_eager_hedge_started(lighter_record)
                 if lighter_record is not None and entry_eager_started:
@@ -3637,7 +3720,22 @@ class VariationalToLighterRuntime:
                 )
             )
 
-        result = await exit_var_task
+        try:
+            result = await exit_var_task
+        except Exception as exc:
+            if exit_lighter_task is not None:
+                with contextlib.suppress(Exception):
+                    await exit_lighter_task
+            reason = f"exit_var_submit_exception:{exc}"
+            self.require_auto_live_manual_review(position, reason)
+            self.logger.exception(
+                "auto_live_exit_submit_exception cycle_id=%s asset=%s side=%s qty=%s",
+                position.cycle_id,
+                snapshot.asset,
+                exit_side,
+                position.planned_qty,
+            )
+            return
         exit_var_submit_ms = elapsed_ms_str(exit_var_submit_started)
         if not result.get("ok"):
             if exit_lighter_task is not None:
@@ -3657,7 +3755,19 @@ class VariationalToLighterRuntime:
         position.exit_reason = exit_reason
         exit_eager_started = not self.auto_live_eager_hedge
         if exit_lighter_task is not None:
-            lighter_record, payload = await exit_lighter_task
+            try:
+                lighter_record, payload = await exit_lighter_task
+            except Exception as exc:
+                reason = f"exit_lighter_submit_exception:{exc}"
+                self.require_auto_live_manual_review(position, reason)
+                self.logger.exception(
+                    "auto_live_exit_lighter_submit_exception cycle_id=%s asset=%s side=%s qty=%s",
+                    position.cycle_id,
+                    snapshot.asset,
+                    exit_side,
+                    position.planned_qty,
+                )
+                return
             exit_lighter_submit_ms = elapsed_ms_str(exit_lighter_submit_started)
             exit_eager_started = self.auto_live_eager_hedge_started(lighter_record)
             if lighter_record is not None and exit_eager_started:
