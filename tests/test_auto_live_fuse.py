@@ -227,3 +227,57 @@ def test_market_ioc_uses_ioc_expiry() -> None:
     assert order_kwargs["order_type"] == runtime.lighter_client.ORDER_TYPE_MARKET
     assert order_kwargs["time_in_force"] == runtime.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
     assert order_kwargs["order_expiry"] == runtime.lighter_client.DEFAULT_IOC_EXPIRY
+
+
+def test_create_lighter_order_ws_accepts_order_expiry() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+
+        class FakeNonceManager:
+            def next_nonce(self):
+                return 1, 99
+
+            def acknowledge_failure(self, _api_key_index):
+                raise AssertionError("should not acknowledge failure")
+
+            def hard_refresh_nonce(self, _api_key_index):
+                raise AssertionError("should not refresh nonce")
+
+        class FakeClient:
+            nonce_manager = FakeNonceManager()
+
+            def sign_create_order(self, **kwargs):
+                assert kwargs["order_expiry"] == 0
+                return 1, "{}", "0xabc", None
+
+        runtime.lighter_client = FakeClient()
+
+        async def fake_send_lighter_tx_ws(*, tx_type, tx_info):
+            assert tx_type == 1
+            assert tx_info == "{}"
+
+            class Response:
+                code = 200
+                tx_hash = "0xabc"
+
+            return Response()
+
+        runtime.send_lighter_tx_ws = fake_send_lighter_tx_ws
+
+        _order, response, error = await runtime.create_lighter_order_ws(
+            market_index=1,
+            client_order_index=123,
+            base_amount=45,
+            price=100000,
+            is_ask=False,
+            order_type=1,
+            time_in_force=0,
+            reduce_only=False,
+            trigger_price=0,
+            order_expiry=0,
+        )
+
+        assert error is None
+        assert response.code == 200
+
+    asyncio.run(run())

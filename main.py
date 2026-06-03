@@ -1725,6 +1725,7 @@ class VariationalToLighterRuntime:
         time_in_force: int,
         reduce_only: bool,
         trigger_price: int,
+        order_expiry: int,
     ) -> tuple[Any | None, Any | None, str | None]:
         from lighter.transactions import CreateOrder
 
@@ -1743,6 +1744,7 @@ class VariationalToLighterRuntime:
                 time_in_force=time_in_force,
                 reduce_only=reduce_only,
                 trigger_price=trigger_price,
+                order_expiry=order_expiry,
                 nonce=nonce,
                 api_key_index=api_key_index,
             )
