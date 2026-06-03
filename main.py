@@ -1701,6 +1701,9 @@ class VariationalToLighterRuntime:
 
     @staticmethod
     def _is_lighter_ws_sendtx_response(message: dict[str, Any]) -> bool:
+        message_type = str(message.get("type") or "").strip().lower()
+        if "sendtx" in message_type:
+            return True
         data = message.get("data")
         if isinstance(data, dict) and "code" in data:
             return True
@@ -1738,9 +1741,7 @@ class VariationalToLighterRuntime:
                     ping_interval=LIGHTER_WS_PING_INTERVAL_SECONDS,
                     ping_timeout=LIGHTER_WS_PING_TIMEOUT_SECONDS,
                 )
-                self._lighter_submit_ws = websocket
-            try:
-                await websocket.send(json.dumps(payload, ensure_ascii=True))
+                connected = False
                 while True:
                     raw = await asyncio.wait_for(websocket.recv(), timeout=self.live_submit_timeout_seconds)
                     if isinstance(raw, bytes):
@@ -1749,8 +1750,31 @@ class VariationalToLighterRuntime:
                     if message.get("type") == "ping":
                         await websocket.send(json.dumps({"type": "pong"}))
                         continue
+                    if message.get("type") == "connected":
+                        connected = True
+                        break
+                if not connected:
+                    raise RuntimeError("Lighter WS submit handshake did not receive connected")
+                self._lighter_submit_ws = websocket
+            try:
+                await websocket.send(json.dumps(payload, ensure_ascii=True))
+                last_message: dict[str, Any] | None = None
+                while True:
+                    raw = await asyncio.wait_for(websocket.recv(), timeout=self.live_submit_timeout_seconds)
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", errors="replace")
+                    message = json.loads(raw)
+                    last_message = message
+                    if message.get("type") == "ping":
+                        await websocket.send(json.dumps({"type": "pong"}))
+                        continue
                     if self._is_lighter_ws_sendtx_response(message):
                         return self._normalize_lighter_ws_sendtx_response(message)
+            except asyncio.TimeoutError as exc:
+                last_type = (last_message or {}).get("type")
+                raise RuntimeError(
+                    f"Lighter WS sendtx timed out after {self.live_submit_timeout_seconds}s last_message_type={last_type}"
+                ) from exc
             except Exception:
                 with contextlib.suppress(Exception):
                     await websocket.close()
