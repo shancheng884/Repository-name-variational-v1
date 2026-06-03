@@ -220,6 +220,53 @@ def test_lighter_ws_sendtx_sends_tx_info_as_object() -> None:
     asyncio.run(run())
 
 
+def test_lighter_ws_prewarm_reuses_connection(monkeypatch) -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.live_submit_timeout_seconds = 1.0
+        runtime.lighter_submit_transport = "ws"
+        runtime._lighter_submit_ws_lock = asyncio.Lock()
+        runtime._lighter_submit_ws = None
+        runtime.logger = logging.getLogger("test_lighter_ws_prewarm")
+
+        class FakeWs:
+            state = 1
+
+            def __init__(self):
+                self.sent: list[str] = []
+                self.recv_messages = [
+                    json.dumps({"type": "connected"}),
+                    json.dumps({"type": "jsonapi/sendtx", "data": {"code": 200, "tx_hash": "0xabc"}}),
+                ]
+
+            async def send(self, message):
+                self.sent.append(message)
+
+            async def recv(self):
+                return self.recv_messages.pop(0)
+
+        fake_ws = FakeWs()
+        connect_calls = 0
+
+        async def fake_connect(*_args, **_kwargs):
+            nonlocal connect_calls
+            connect_calls += 1
+            return fake_ws
+
+        monkeypatch.setattr("main.websockets.connect", fake_connect)
+        monkeypatch.setattr("main.elapsed_ms_str", lambda *_args, **_kwargs: "0.001")
+
+        await runtime.prewarm_lighter_submit_ws()
+        response = await runtime.send_lighter_tx_ws(tx_type=14, tx_info='{"Nonce": 1}')
+
+        assert connect_calls == 1
+        assert response.code == 200
+        assert len(fake_ws.sent) == 1
+        assert json.loads(fake_ws.sent[0])["type"] == "jsonapi/sendtx"
+
+    asyncio.run(run())
+
+
 def test_market_ioc_uses_ioc_expiry() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.lighter_order_mode = "market-ioc"

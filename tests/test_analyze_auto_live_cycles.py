@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from tools.analyze_auto_live_cycles import parse_runtime_log
+from tools.analyze_auto_live_cycles import parse_runtime_log, print_summary
 
 
 def test_parse_auto_live_success_and_manual_review_cycles(tmp_path: Path) -> None:
@@ -59,3 +59,28 @@ def test_parse_auto_live_success_and_manual_review_cycles(tmp_path: Path) -> Non
     assert cycles[2].entry_precheck_status == "passed"
     assert cycles[2].last_entry_precheck_edge_bps is not None
     assert f"{cycles[2].last_entry_precheck_edge_bps:.3f}" == "85.713"
+
+
+def test_print_summary_includes_latency_percentiles(tmp_path: Path, capsys) -> None:
+    log_path = tmp_path / "runtime.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "2026-06-01 16:08:17,452 | INFO | auto_live_entry_submitted cycle_id=1 asset=BTC direction=long_var_short_lighter qty=0.00022 var_side=BUY entry_total_ms=900.1 entry_precheck_ms=12.3 var_preview_ms=200.4 var_submit_ms=300.5 lighter_submit_ms=386.9",
+                "2026-06-01 16:08:34,075 | INFO | auto_live_exit_submitted cycle_id=1 asset=BTC side=SELL qty=0.00022 reason=spread_reverted exit_total_ms=800.2 exit_precheck_ms=10.5 var_submit_ms=300.6 lighter_submit_ms=489.1",
+                "2026-06-01 16:17:08,463 | INFO | auto_live_entry_submitted cycle_id=2 asset=BTC direction=long_var_short_lighter qty=0.00022 var_side=BUY entry_total_ms=700.2 entry_precheck_ms=11.1 var_preview_ms=180.2 var_submit_ms=250.3 lighter_submit_ms=258.6",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cycles = parse_runtime_log(log_path, {"BTC"})
+
+    print_summary(cycles, log_path, limit=30)
+    captured = capsys.readouterr().out
+
+    assert "latency percentiles" in captured
+    assert "entry_total_ms 2 700.200 900.100" in captured
+    assert "entry_var_submit_ms 2 250.300 300.500" in captured
+    assert "exit_total_ms 1 800.200 800.200" in captured

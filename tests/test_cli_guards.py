@@ -134,3 +134,39 @@ def test_lighter_submit_transport_accepts_ws(monkeypatch) -> None:
 
     assert args.lighter_submit_transport == "ws"
     assert args.lighter_order_mode == "market-ioc"
+
+
+def test_low_latency_flags_are_explicit(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", ["main.py"])
+
+    args = parse_args()
+
+    assert args.lighter_prewarm_submit_ws is False
+    assert args.auto_live_skip_entry_preview is False
+
+
+def test_low_latency_flags_accept_opt_in(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--mode",
+            "live",
+            "--confirm-live",
+            "--live-max-notional-usd",
+            "25",
+            "--auto-live-entry",
+            "--auto-live-i-confirm-flat-start",
+            "--lighter-submit-transport",
+            "ws",
+            "--lighter-order-mode",
+            "market-ioc",
+            "--lighter-prewarm-submit-ws",
+            "--auto-live-skip-entry-preview",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.lighter_prewarm_submit_ws is True
+    assert args.auto_live_skip_entry_preview is True

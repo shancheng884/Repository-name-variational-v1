@@ -695,6 +695,7 @@ class VariationalToLighterRuntime:
         self.auto_live_entry = bool(args.auto_live_entry)
         self.auto_live_exit = bool(args.auto_live_exit)
         self.auto_live_eager_hedge = bool(args.auto_live_eager_hedge)
+        self.auto_live_skip_entry_preview = bool(args.auto_live_skip_entry_preview)
         self.auto_live_i_confirm_flat_start = bool(args.auto_live_i_confirm_flat_start)
         self.auto_live_reset_state_after_manual_flat = bool(args.auto_live_reset_state_after_manual_flat)
         self.auto_live_command_timeout_seconds = float(args.auto_live_command_timeout_seconds)
@@ -725,6 +726,7 @@ class VariationalToLighterRuntime:
         self.live_submit_timeout_seconds = float(args.live_submit_timeout_seconds)
         self.lighter_submit_transport = args.lighter_submit_transport
         self.lighter_order_mode = args.lighter_order_mode
+        self.lighter_prewarm_submit_ws = bool(args.lighter_prewarm_submit_ws)
 
         self.stop_flag = False
         self.logger = logging.getLogger("var_lighter_runtime")
@@ -1140,6 +1142,8 @@ class VariationalToLighterRuntime:
             f"lighter_submit_transport={getattr(self, 'lighter_submit_transport', LIGHTER_SUBMIT_TRANSPORT_HTTP)}"
         )
         passed.append(f"lighter_order_mode={getattr(self, 'lighter_order_mode', LIGHTER_ORDER_MODE_LIMIT_GTT)}")
+        passed.append(f"lighter_prewarm_submit_ws={getattr(self, 'lighter_prewarm_submit_ws', False)}")
+        passed.append(f"auto_live_skip_entry_preview={getattr(self, 'auto_live_skip_entry_preview', False)}")
         passed.append(f"live_config={json.dumps(self.live_config_snapshot(), ensure_ascii=True, sort_keys=True)}")
         passed.append(f"paper_config={json.dumps(self.paper_config_snapshot(), ensure_ascii=True, sort_keys=True)}")
 
@@ -1699,6 +1703,43 @@ class VariationalToLighterRuntime:
             return f"{LIGHTER_WS_URL}?server_pings=true"
         return LIGHTER_WS_URL
 
+    async def ensure_lighter_submit_ws(self) -> Any:
+        websocket = self._lighter_submit_ws
+        if websocket is not None and getattr(websocket, "state", None) == 1:
+            return websocket
+
+        websocket = await websockets.connect(
+            self.build_lighter_ws_url(),
+            ping_interval=LIGHTER_WS_PING_INTERVAL_SECONDS,
+            ping_timeout=LIGHTER_WS_PING_TIMEOUT_SECONDS,
+        )
+        try:
+            while True:
+                raw = await asyncio.wait_for(websocket.recv(), timeout=self.live_submit_timeout_seconds)
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                message = json.loads(raw)
+                if message.get("type") == "ping":
+                    await websocket.send(json.dumps({"type": "pong"}))
+                    continue
+                if message.get("type") == "connected":
+                    self._lighter_submit_ws = websocket
+                    return websocket
+        except Exception:
+            with contextlib.suppress(Exception):
+                await websocket.close()
+            if self._lighter_submit_ws is websocket:
+                self._lighter_submit_ws = None
+            raise
+
+    async def prewarm_lighter_submit_ws(self) -> None:
+        if self.lighter_submit_transport != LIGHTER_SUBMIT_TRANSPORT_WS:
+            return
+        started = time.monotonic()
+        async with self._lighter_submit_ws_lock:
+            await self.ensure_lighter_submit_ws()
+        self.logger.info("lighter_submit_ws_prewarmed duration_ms=%s", elapsed_ms_str(started))
+
     @staticmethod
     def _is_lighter_ws_sendtx_response(message: dict[str, Any]) -> bool:
         message_type = str(message.get("type") or "").strip().lower()
@@ -1735,28 +1776,7 @@ class VariationalToLighterRuntime:
             },
         }
         async with self._lighter_submit_ws_lock:
-            websocket = self._lighter_submit_ws
-            if websocket is None or getattr(websocket, "state", None) != 1:
-                websocket = await websockets.connect(
-                    self.build_lighter_ws_url(),
-                    ping_interval=LIGHTER_WS_PING_INTERVAL_SECONDS,
-                    ping_timeout=LIGHTER_WS_PING_TIMEOUT_SECONDS,
-                )
-                connected = False
-                while True:
-                    raw = await asyncio.wait_for(websocket.recv(), timeout=self.live_submit_timeout_seconds)
-                    if isinstance(raw, bytes):
-                        raw = raw.decode("utf-8", errors="replace")
-                    message = json.loads(raw)
-                    if message.get("type") == "ping":
-                        await websocket.send(json.dumps({"type": "pong"}))
-                        continue
-                    if message.get("type") == "connected":
-                        connected = True
-                        break
-                if not connected:
-                    raise RuntimeError("Lighter WS submit handshake did not receive connected")
-                self._lighter_submit_ws = websocket
+            websocket = await self.ensure_lighter_submit_ws()
             try:
                 await websocket.send(json.dumps(payload, ensure_ascii=True))
                 last_message: dict[str, Any] | None = None
@@ -3463,36 +3483,39 @@ class VariationalToLighterRuntime:
                     decimal_to_str(precheck_edge_bps) or "-",
                     entry_precheck_ms,
                 )
-            entry_var_preview_started = time.monotonic()
-            try:
-                precheck = await self.send_variational_place_order(
-                    side=var_side,
-                    amount=decimal_to_str(order_qty) or str(order_qty),
-                    expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
-                    confirm=False,
-                )
-            except Exception as exc:
-                reason = f"entry_var_preview_exception:{exc}"
-                self.require_auto_live_manual_review_for_entry(
-                    cycle_id=cycle_id,
-                    asset=snapshot.asset,
-                    direction=direction,
-                    qty=order_qty,
-                    reason=reason,
-                )
-                self.logger.exception(
-                    "auto_live_entry_preview_exception cycle_id=%s asset=%s side=%s qty=%s",
-                    cycle_id,
-                    snapshot.asset,
-                    var_side,
-                    order_qty,
-                )
-                return
-            entry_var_preview_ms = elapsed_ms_str(entry_var_preview_started)
-            observed_order_qty = to_decimal((precheck.get("result") or {}).get("orderQuantityBtc"))
-            if snapshot.asset.upper() == "BTC" and (observed_order_qty is None or observed_order_qty < order_qty):
-                self.logger.warning("auto_live_precheck_rejected asset=%s side=%s expected_qty=%s got=%s", snapshot.asset, var_side, order_qty, observed_order_qty)
-                return
+            if self.auto_live_skip_entry_preview:
+                entry_var_preview_ms = "skipped"
+            else:
+                entry_var_preview_started = time.monotonic()
+                try:
+                    precheck = await self.send_variational_place_order(
+                        side=var_side,
+                        amount=decimal_to_str(order_qty) or str(order_qty),
+                        expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
+                        confirm=False,
+                    )
+                except Exception as exc:
+                    reason = f"entry_var_preview_exception:{exc}"
+                    self.require_auto_live_manual_review_for_entry(
+                        cycle_id=cycle_id,
+                        asset=snapshot.asset,
+                        direction=direction,
+                        qty=order_qty,
+                        reason=reason,
+                    )
+                    self.logger.exception(
+                        "auto_live_entry_preview_exception cycle_id=%s asset=%s side=%s qty=%s",
+                        cycle_id,
+                        snapshot.asset,
+                        var_side,
+                        order_qty,
+                    )
+                    return
+                entry_var_preview_ms = elapsed_ms_str(entry_var_preview_started)
+                observed_order_qty = to_decimal((precheck.get("result") or {}).get("orderQuantityBtc"))
+                if snapshot.asset.upper() == "BTC" and (observed_order_qty is None or observed_order_qty < order_qty):
+                    self.logger.warning("auto_live_precheck_rejected asset=%s side=%s expected_qty=%s got=%s", snapshot.asset, var_side, order_qty, observed_order_qty)
+                    return
             entry_var_submit_started = time.monotonic()
             entry_var_task = asyncio.create_task(
                 self.send_variational_place_order(
@@ -4368,6 +4391,12 @@ class VariationalToLighterRuntime:
         if self.requires_lighter_market_data():
             initial_asset = await self.wait_for_ticker_resolution()
             await self.activate_asset(initial_asset, reason="startup")
+        if self.lighter_prewarm_submit_ws:
+            try:
+                await self.prewarm_lighter_submit_ws()
+            except Exception:
+                self.logger.exception("lighter_submit_ws_prewarm_failed")
+                raise
 
         self.trade_event_cursor = await self.runtime.monitor.get_latest_trade_event_seq()
         self.trade_event_min_timestamp = datetime.now(timezone.utc)
@@ -4530,6 +4559,11 @@ def parse_args() -> argparse.Namespace:
         help="Lighter live order mode. Default: limit-gtt; use market-ioc for lower-latency taker execution.",
     )
     parser.add_argument(
+        "--lighter-prewarm-submit-ws",
+        action="store_true",
+        help="Pre-connect the Lighter submit WebSocket at startup when using --lighter-submit-transport ws.",
+    )
+    parser.add_argument(
         "--live-allowed-assets",
         default="BTC,SOL,ETH",
         help="Comma-separated allowlist for live trading assets. Default: BTC,SOL,ETH",
@@ -4553,6 +4587,11 @@ def parse_args() -> argparse.Namespace:
         "--auto-live-eager-hedge",
         action="store_true",
         help="In live mode, after an auto-submitted Variational order, immediately start the matching Lighter hedge without waiting for the Variational fill event.",
+    )
+    parser.add_argument(
+        "--auto-live-skip-entry-preview",
+        action="store_true",
+        help="Skip the extra confirm=false Variational entry preview call. The confirm=true click still keeps expectedMinBtcQty protection.",
     )
     parser.add_argument(
         "--auto-live-command-timeout-seconds",

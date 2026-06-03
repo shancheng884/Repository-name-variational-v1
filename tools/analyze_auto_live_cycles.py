@@ -1,4 +1,5 @@
 import argparse
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -113,6 +114,19 @@ def fmt(value: Any, places: int = 3) -> str:
     if isinstance(value, Decimal):
         return f"{value:.{places}f}"
     return str(value)
+
+
+def percentile_nearest_rank(values: list[Decimal], percentile: int) -> Decimal | None:
+    if not values:
+        return None
+    if percentile <= 0:
+        return min(values)
+    if percentile >= 100:
+        return max(values)
+    ordered = sorted(values)
+    rank = math.ceil((Decimal(percentile) / Decimal("100")) * Decimal(len(ordered)))
+    index = max(0, min(len(ordered) - 1, int(rank) - 1))
+    return ordered[index]
 
 
 def cycle_sort_key(cycle: Cycle) -> tuple[str, datetime, int]:
@@ -274,6 +288,36 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
     else:
         for reason, count in sorted(manual_reasons.items(), key=lambda item: (-item[1], item[0])):
             print(f"{reason}: {count}")
+
+    metric_values: dict[str, list[Decimal]] = {
+        "entry_total_ms": [],
+        "entry_var_preview_ms": [],
+        "entry_var_submit_ms": [],
+        "entry_lighter_submit_ms": [],
+        "exit_total_ms": [],
+        "exit_var_submit_ms": [],
+        "exit_lighter_submit_ms": [],
+    }
+    for cycle in cycles:
+        for key in metric_values:
+            value = getattr(cycle, key)
+            if isinstance(value, Decimal):
+                metric_values[key].append(value)
+
+    print()
+    print("latency percentiles")
+    print("metric count p50_ms p90_ms min_ms max_ms")
+    for key, values in metric_values.items():
+        print(
+            "{metric} {count} {p50} {p90} {min_v} {max_v}".format(
+                metric=key,
+                count=len(values),
+                p50=fmt(percentile_nearest_rank(values, 50), 3),
+                p90=fmt(percentile_nearest_rank(values, 90), 3),
+                min_v=fmt(min(values) if values else None, 3),
+                max_v=fmt(max(values) if values else None, 3),
+            )
+        )
 
     selected = cycles[-limit:] if limit > 0 else cycles
     print()
