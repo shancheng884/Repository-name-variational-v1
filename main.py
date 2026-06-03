@@ -1725,12 +1725,13 @@ class VariationalToLighterRuntime:
     async def send_lighter_tx_ws(self, *, tx_type: int, tx_info: str) -> SimpleNamespace:
         if not tx_info or tx_info[0] != "{":
             raise ValueError(f"Invalid tx_info: {tx_info}")
+        tx_info_payload = json.loads(tx_info)
 
         payload = {
             "type": "jsonapi/sendtx",
             "data": {
                 "tx_type": int(tx_type),
-                "tx_info": tx_info,
+                "tx_info": tx_info_payload,
             },
         }
         async with self._lighter_submit_ws_lock:
@@ -1773,7 +1774,7 @@ class VariationalToLighterRuntime:
             except asyncio.TimeoutError as exc:
                 last_type = (last_message or {}).get("type")
                 raise RuntimeError(
-                    f"Lighter WS sendtx timed out after {self.live_submit_timeout_seconds}s last_message_type={last_type}"
+                    f"Lighter WS sendtx timed out after {self.live_submit_timeout_seconds}s last_message_type={last_type} tx_info_format=object"
                 ) from exc
             except Exception:
                 with contextlib.suppress(Exception):

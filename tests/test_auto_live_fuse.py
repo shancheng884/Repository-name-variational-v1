@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from collections import deque
 from decimal import Decimal
@@ -181,6 +182,40 @@ def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_pat
         assert "id:trade-1" in runtime.records
         assert runtime.records["auto:BTC:buy:123"].auto_live_merge_path == "synthetic_matched_real_var_fill"
         assert runtime.records["auto:BTC:buy:123"].matched_variational_trade_id == "trade-1"
+
+    asyncio.run(run())
+
+
+def test_lighter_ws_sendtx_sends_tx_info_as_object() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.live_submit_timeout_seconds = 1.0
+        runtime._lighter_submit_ws_lock = asyncio.Lock()
+
+        class FakeWs:
+            state = 1
+
+            def __init__(self):
+                self.sent: list[str] = []
+                self.recv_messages = [json.dumps({"type": "jsonapi/sendtx", "data": {"code": 200, "tx_hash": "0xabc"}})]
+
+            async def send(self, message):
+                self.sent.append(message)
+
+            async def recv(self):
+                return self.recv_messages.pop(0)
+
+        fake_ws = FakeWs()
+        runtime._lighter_submit_ws = fake_ws
+
+        response = await runtime.send_lighter_tx_ws(tx_type=14, tx_info='{"Nonce": 1}')
+
+        sent = json.loads(fake_ws.sent[0])
+        assert sent["type"] == "jsonapi/sendtx"
+        assert sent["data"]["tx_type"] == 14
+        assert sent["data"]["tx_info"] == {"Nonce": 1}
+        assert response.code == 200
+        assert response.tx_hash == "0xabc"
 
     asyncio.run(run())
 
