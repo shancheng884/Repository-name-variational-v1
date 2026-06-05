@@ -808,6 +808,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_next_lot_id = 1
         self.live_inventory_open_lots: list[dict[str, Any]] = []
         self.live_inventory_realized_pnl_usd = Decimal("0")
+        self.live_inventory_completed_cycles = 0
         self._order_write_lock = asyncio.Lock()
         self._opportunity_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
@@ -927,6 +928,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_open_lots = open_lots if isinstance(open_lots, list) else []
         self.live_inventory_next_lot_id = int(state.get("next_lot_id") or 1)
         self.live_inventory_realized_pnl_usd = to_decimal(state.get("realized_pnl_usd")) or Decimal("0")
+        self.live_inventory_completed_cycles = int(state.get("completed_cycles") or 0)
 
     async def persist_live_inventory_memory(self, *, reason: str) -> None:
         await self.write_live_inventory_state_async(
@@ -937,6 +939,7 @@ class VariationalToLighterRuntime:
                 "open_lots": self.live_inventory_open_lots,
                 "pending_actions": [],
                 "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
+                "completed_cycles": self.live_inventory_completed_cycles,
                 "reason": reason,
             }
         )
@@ -1370,6 +1373,7 @@ class VariationalToLighterRuntime:
                                 "open_lots": [],
                                 "pending_actions": [],
                                 "realized_pnl_usd": "0",
+                                "completed_cycles": 0,
                                 "reason": "manual_flat_start_reset",
                             }
                         )
@@ -3809,6 +3813,8 @@ class VariationalToLighterRuntime:
         self.live_inventory_sample_index += 1
         index = self.live_inventory_sample_index
         if not self.live_inventory_open_lots:
+            if self.live_inventory_completed_cycles >= self.live_inventory_max_cycles:
+                return
             directions = (
                 (
                     DIRECTION_LONG_VAR_SHORT_LIGHTER,
@@ -3855,6 +3861,7 @@ class VariationalToLighterRuntime:
                         "lighter_price": decimal_to_str(lighter_price),
                         "open_lots_total": len(self.live_inventory_open_lots),
                         "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
+                        "completed_cycles": self.live_inventory_completed_cycles,
                     },
                 )
                 return
@@ -3899,6 +3906,7 @@ class VariationalToLighterRuntime:
         pnl_bps = pnl / notional * Decimal("10000") if notional else None
         self.live_inventory_open_lots.pop(0)
         self.live_inventory_realized_pnl_usd += pnl
+        self.live_inventory_completed_cycles += 1
         await self.persist_live_inventory_memory(reason="dry_exit_decision")
         await self.append_live_inventory_log(
             "live_inventory_dry_exited",
@@ -3916,6 +3924,7 @@ class VariationalToLighterRuntime:
                 "exit_reason": "spread_reverted" if should_exit else "max_hold_samples",
                 "open_lots_total": len(self.live_inventory_open_lots),
                 "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
+                "completed_cycles": self.live_inventory_completed_cycles,
             },
         )
 
