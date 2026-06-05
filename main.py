@@ -1911,8 +1911,6 @@ class VariationalToLighterRuntime:
         trigger_price: int,
         order_expiry: int,
     ) -> tuple[Any | None, Any | None, str | None]:
-        from lighter.transactions import CreateOrder
-
         total_started = time.monotonic()
         if not self.lighter_client:
             raise RuntimeError("Lighter client is not initialized")
@@ -1960,7 +1958,7 @@ class VariationalToLighterRuntime:
             )
             if api_response is None or api_response.code != 200:
                 self.lighter_client.nonce_manager.acknowledge_failure(api_key_index)
-            return CreateOrder.from_json(tx_info), api_response, None
+            return None, api_response, None
         except Exception as exc:
             if "invalid nonce" in str(exc):
                 self.lighter_client.nonce_manager.hard_refresh_nonce(api_key_index)
