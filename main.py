@@ -1017,6 +1017,9 @@ class VariationalToLighterRuntime:
     def auto_live_eager_hedge_started(record: OrderLifecycle | None) -> bool:
         return record is not None and record.processing_stage in {STAGE_LIVE_SUBMIT_SENT, STAGE_LIGHTER_FILLED}
 
+    def timing_logger(self) -> logging.Logger:
+        return getattr(self, "logger", logging.getLogger(__name__))
+
     def log_auto_live_eager_hedge_timing(
         self,
         *,
@@ -1028,7 +1031,7 @@ class VariationalToLighterRuntime:
         task_created_monotonic: float | None,
         record: OrderLifecycle,
     ) -> None:
-        self.logger.info(
+        self.timing_logger().info(
             "auto_live_eager_hedge_timing cycle_id=%s role=%s asset=%s side=%s record_key=%s "
             "signal_to_task_create_ms=%s task_create_to_plan_start_ms=%s plan_ms=%s "
             "plan_ready_to_submit_start_ms=%s submit_call_ms=%s signal_to_submit_sent_ms=%s",
@@ -1829,9 +1832,12 @@ class VariationalToLighterRuntime:
         )
 
     async def send_lighter_tx_ws(self, *, tx_type: int, tx_info: str) -> SimpleNamespace:
+        total_started = time.monotonic()
         if not tx_info or tx_info[0] != "{":
             raise ValueError(f"Invalid tx_info: {tx_info}")
+        parse_started = time.monotonic()
         tx_info_payload = json.loads(tx_info)
+        parse_done = time.monotonic()
 
         payload = {
             "type": "jsonapi/sendtx",
@@ -1840,10 +1846,20 @@ class VariationalToLighterRuntime:
                 "tx_info": tx_info_payload,
             },
         }
+        lock_requested = time.monotonic()
         async with self._lighter_submit_ws_lock:
+            lock_acquired = time.monotonic()
+            ensure_started = time.monotonic()
             websocket = await self.ensure_lighter_submit_ws()
+            ensure_done = time.monotonic()
             try:
-                await websocket.send(json.dumps(payload, ensure_ascii=True))
+                serialize_started = time.monotonic()
+                payload_text = json.dumps(payload, ensure_ascii=True)
+                serialize_done = time.monotonic()
+                send_started = time.monotonic()
+                await websocket.send(payload_text)
+                send_done = time.monotonic()
+                response_started = time.monotonic()
                 last_message: dict[str, Any] | None = None
                 while True:
                     raw = await asyncio.wait_for(websocket.recv(), timeout=self.live_submit_timeout_seconds)
@@ -1855,6 +1871,20 @@ class VariationalToLighterRuntime:
                         await websocket.send(json.dumps({"type": "pong"}))
                         continue
                     if self._is_lighter_ws_sendtx_response(message):
+                        response_done = time.monotonic()
+                        self.timing_logger().info(
+                            "lighter_ws_sendtx_timing tx_type=%s parse_ms=%s ws_lock_wait_ms=%s ensure_ws_ms=%s "
+                            "serialize_ms=%s ws_send_ms=%s ws_response_wait_ms=%s ws_total_ms=%s total_ms=%s",
+                            tx_type,
+                            elapsed_ms_between_str(parse_started, parse_done),
+                            elapsed_ms_between_str(lock_requested, lock_acquired),
+                            elapsed_ms_between_str(ensure_started, ensure_done),
+                            elapsed_ms_between_str(serialize_started, serialize_done),
+                            elapsed_ms_between_str(send_started, send_done),
+                            elapsed_ms_between_str(response_started, response_done),
+                            elapsed_ms_between_str(lock_acquired, response_done),
+                            elapsed_ms_between_str(total_started, response_done),
+                        )
                         return self._normalize_lighter_ws_sendtx_response(message)
             except asyncio.TimeoutError as exc:
                 last_type = (last_message or {}).get("type")
@@ -1883,11 +1913,15 @@ class VariationalToLighterRuntime:
     ) -> tuple[Any | None, Any | None, str | None]:
         from lighter.transactions import CreateOrder
 
+        total_started = time.monotonic()
         if not self.lighter_client:
             raise RuntimeError("Lighter client is not initialized")
+        nonce_started = time.monotonic()
         api_key_index, nonce = self.lighter_client.nonce_manager.next_nonce()
+        nonce_done = time.monotonic()
         sent_to_ws = False
         try:
+            sign_started = time.monotonic()
             tx_type, tx_info, _tx_hash, error = self.lighter_client.sign_create_order(
                 market_index=market_index,
                 client_order_index=client_order_index,
@@ -1902,12 +1936,28 @@ class VariationalToLighterRuntime:
                 nonce=nonce,
                 api_key_index=api_key_index,
             )
+            sign_done = time.monotonic()
             if error is not None:
                 self.lighter_client.nonce_manager.acknowledge_failure(api_key_index)
                 return None, None, error
 
             sent_to_ws = True
+            ws_started = time.monotonic()
             api_response = await self.send_lighter_tx_ws(tx_type=tx_type, tx_info=tx_info)
+            ws_done = time.monotonic()
+            self.timing_logger().info(
+                "lighter_ws_create_order_timing market_index=%s client_order_index=%s side=%s base_amount=%s "
+                "nonce_ms=%s sign_ms=%s ws_submit_ms=%s total_ms=%s response_code=%s",
+                market_index,
+                client_order_index,
+                "SELL" if is_ask else "BUY",
+                base_amount,
+                elapsed_ms_between_str(nonce_started, nonce_done),
+                elapsed_ms_between_str(sign_started, sign_done),
+                elapsed_ms_between_str(ws_started, ws_done),
+                elapsed_ms_between_str(total_started, ws_done),
+                getattr(api_response, "code", "-"),
+            )
             if api_response is None or api_response.code != 200:
                 self.lighter_client.nonce_manager.acknowledge_failure(api_key_index)
             return CreateOrder.from_json(tx_info), api_response, None
@@ -2500,9 +2550,14 @@ class VariationalToLighterRuntime:
                 client_order_id += 1
 
         try:
+            submit_body_started = time.monotonic()
+            signer_lock_requested = time.monotonic()
             async with self._lighter_signer_lock:
+                signer_lock_acquired = time.monotonic()
+                init_started = time.monotonic()
                 if not self.lighter_client:
                     self.initialize_lighter_client()
+                init_done = time.monotonic()
                 order_kwargs = {
                     "market_index": self.lighter_market_index,
                     "client_order_index": client_order_id,
@@ -2531,6 +2586,19 @@ class VariationalToLighterRuntime:
                     _, tx_hash, error = await self.create_lighter_order_ws(**order_kwargs)
                 else:
                     _, tx_hash, error = await self.lighter_client.create_order(**order_kwargs)
+                submit_body_done = time.monotonic()
+                self.timing_logger().info(
+                    "lighter_submit_body_timing asset=%s side=%s client_order_id=%s transport=%s mode=%s "
+                    "signer_lock_wait_ms=%s init_ms=%s submit_body_ms=%s",
+                    record.asset,
+                    side,
+                    client_order_id,
+                    self.lighter_submit_transport,
+                    self.lighter_order_mode,
+                    elapsed_ms_between_str(signer_lock_requested, signer_lock_acquired),
+                    elapsed_ms_between_str(init_started, init_done),
+                    elapsed_ms_between_str(submit_body_started, submit_body_done),
+                )
 
             submit_sent_iso = utc_now()
             submit_sent_monotonic = time.monotonic()
