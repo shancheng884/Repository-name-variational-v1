@@ -3574,7 +3574,22 @@ class VariationalToLighterRuntime:
                 if entry_lighter_task is not None:
                     with contextlib.suppress(Exception):
                         await entry_lighter_task
-                self.logger.warning("auto_live_var_submit_failed side=%s error=%s", var_side, result.get("error"))
+                reason = f"entry_var_submit_failed:{result.get('error') or 'unknown'}"
+                self.require_auto_live_manual_review_for_entry(
+                    cycle_id=cycle_id,
+                    asset=snapshot.asset,
+                    direction=direction,
+                    qty=order_qty,
+                    reason=reason,
+                )
+                self.logger.warning(
+                    "auto_live_var_submit_failed cycle_id=%s asset=%s side=%s qty=%s error=%s action=manual_review_required",
+                    cycle_id,
+                    snapshot.asset,
+                    var_side,
+                    order_qty,
+                    result.get("error"),
+                )
                 return
 
             entry_eager_started = not self.auto_live_eager_hedge
@@ -3818,10 +3833,14 @@ class VariationalToLighterRuntime:
             if exit_lighter_task is not None:
                 with contextlib.suppress(Exception):
                     await exit_lighter_task
+            reason = f"exit_var_submit_failed:{result.get('error') or 'unknown'}"
+            self.require_auto_live_manual_review(position, reason)
             self.logger.warning(
-                "auto_live_exit_submit_failed asset=%s side=%s reason=%s error=%s",
+                "auto_live_exit_submit_failed cycle_id=%s asset=%s side=%s qty=%s reason=%s error=%s action=manual_review_required",
+                position.cycle_id,
                 snapshot.asset,
                 exit_side,
+                position.planned_qty,
                 exit_reason,
                 result.get("error"),
             )
