@@ -97,6 +97,31 @@ def test_auto_live_precheck_failure_logging_is_throttled() -> None:
     ) is True
 
 
+def test_auto_live_entry_actionable_edge_uses_taker_prices() -> None:
+    long_edge = VariationalToLighterRuntime.auto_live_entry_actionable_edge_bps(
+        "long_var_short_lighter",
+        Decimal("100000"),
+        Decimal("100080"),
+        Decimal("100100"),
+    )
+    short_edge = VariationalToLighterRuntime.auto_live_entry_actionable_edge_bps(
+        "short_var_long_lighter",
+        Decimal("100000"),
+        Decimal("99900"),
+        Decimal("99920"),
+    )
+    bad_short_edge = VariationalToLighterRuntime.auto_live_entry_actionable_edge_bps(
+        "short_var_long_lighter",
+        Decimal("100000"),
+        Decimal("100050"),
+        Decimal("100080"),
+    )
+
+    assert f"{long_edge:.3f}" == "8.000"
+    assert f"{short_edge:.3f}" == "8.000"
+    assert f"{bad_short_edge:.3f}" == "-8.000"
+
+
 def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_path) -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)

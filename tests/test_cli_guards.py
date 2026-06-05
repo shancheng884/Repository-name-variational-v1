@@ -104,6 +104,51 @@ def test_auto_live_entry_max_precheck_edge_accepts_positive_value(monkeypatch) -
     assert args.auto_live_entry_max_precheck_edge_bps == 80
 
 
+def test_auto_live_entry_min_actionable_edge_must_be_non_negative(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--mode",
+            "live",
+            "--confirm-live",
+            "--live-max-notional-usd",
+            "25",
+            "--auto-live-entry",
+            "--auto-live-i-confirm-flat-start",
+            "--auto-live-entry-min-actionable-edge-bps",
+            "-1",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_auto_live_entry_actionable_edge_flags_parse(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--mode",
+            "live",
+            "--confirm-live",
+            "--live-max-notional-usd",
+            "25",
+            "--auto-live-entry",
+            "--auto-live-i-confirm-flat-start",
+            "--auto-live-entry-min-actionable-edge-bps",
+            "8",
+            "--auto-live-disable-short-var-long-lighter",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.auto_live_entry_min_actionable_edge_bps == 8
+    assert args.auto_live_disable_short_var_long_lighter is True
+
+
 def test_lighter_submit_transport_defaults_to_http(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", ["main.py"])
 

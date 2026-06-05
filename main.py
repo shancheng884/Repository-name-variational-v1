@@ -713,6 +713,8 @@ class VariationalToLighterRuntime:
         self.auto_live_match_window_seconds = float(args.auto_live_match_window_seconds)
         self.auto_live_min_holding_seconds = float(args.auto_live_min_holding_seconds)
         self.auto_live_entry_max_precheck_edge_bps = Decimal(str(args.auto_live_entry_max_precheck_edge_bps))
+        self.auto_live_entry_min_actionable_edge_bps = Decimal(str(args.auto_live_entry_min_actionable_edge_bps))
+        self.auto_live_disable_short_var_long_lighter = bool(args.auto_live_disable_short_var_long_lighter)
         self.auto_live_cooldown_seconds = float(args.auto_live_cooldown_seconds)
         self.auto_live_max_cycles = int(args.auto_live_max_cycles)
         self.paper_notional_usd = Decimal(str(args.paper_notional_usd))
@@ -1583,6 +1585,25 @@ class VariationalToLighterRuntime:
             return "SELL"
         if direction == "short_var_long_lighter":
             return "BUY"
+        raise ValueError(f"Unsupported auto-live direction: {direction}")
+
+    @staticmethod
+    def auto_live_entry_actionable_edge_bps(
+        direction: str,
+        var_price: Decimal | None,
+        lighter_bid: Decimal | None,
+        lighter_ask: Decimal | None,
+    ) -> Decimal | None:
+        if var_price is None or var_price == 0:
+            return None
+        if direction == "long_var_short_lighter":
+            if lighter_bid is None:
+                return None
+            return ((lighter_bid - var_price) / var_price) * Decimal("10000")
+        if direction == "short_var_long_lighter":
+            if lighter_ask is None:
+                return None
+            return ((var_price - lighter_ask) / var_price) * Decimal("10000")
         raise ValueError(f"Unsupported auto-live direction: {direction}")
 
     @staticmethod
@@ -3536,6 +3557,14 @@ class VariationalToLighterRuntime:
                 return
             cycle_id = self.auto_live_next_cycle_id
             direction = candidate.direction
+            if self.auto_live_disable_short_var_long_lighter and direction == "short_var_long_lighter":
+                self.logger.info(
+                    "auto_live_entry_direction_disabled cycle_id=%s asset=%s direction=%s action=skip_var_entry",
+                    cycle_id,
+                    snapshot.asset,
+                    direction,
+                )
+                return
             current_pct = candidate.current_pct
             median_pct = candidate.median_pct
             deviation_bps = candidate.deviation_bps
@@ -3547,6 +3576,57 @@ class VariationalToLighterRuntime:
             if not depth_enough:
                 return
             var_side = self._auto_live_direction_to_var_side(direction)
+            actionable_var_price = (snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price) or snapshot.var_mid
+            lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
+            actionable_edge_bps = self.auto_live_entry_actionable_edge_bps(
+                direction,
+                actionable_var_price,
+                lighter_bid,
+                lighter_ask,
+            )
+            if self.auto_live_entry_min_actionable_edge_bps > 0:
+                if actionable_edge_bps is None:
+                    self.logger.info(
+                        "auto_live_entry_actionable_edge_checked cycle_id=%s asset=%s direction=%s var_side=%s "
+                        "var_price=%s lighter_bid=%s lighter_ask=%s edge_bps=- threshold_bps=%s action=skip_var_entry reason=edge_unavailable",
+                        cycle_id,
+                        snapshot.asset,
+                        direction,
+                        var_side,
+                        decimal_to_str(actionable_var_price) or "-",
+                        decimal_to_str(lighter_bid) or "-",
+                        decimal_to_str(lighter_ask) or "-",
+                        decimal_to_str(self.auto_live_entry_min_actionable_edge_bps),
+                    )
+                    return
+                if actionable_edge_bps < self.auto_live_entry_min_actionable_edge_bps:
+                    self.logger.info(
+                        "auto_live_entry_actionable_edge_checked cycle_id=%s asset=%s direction=%s var_side=%s "
+                        "var_price=%s lighter_bid=%s lighter_ask=%s edge_bps=%s threshold_bps=%s action=skip_var_entry reason=edge_below_threshold",
+                        cycle_id,
+                        snapshot.asset,
+                        direction,
+                        var_side,
+                        decimal_to_str(actionable_var_price) or "-",
+                        decimal_to_str(lighter_bid) or "-",
+                        decimal_to_str(lighter_ask) or "-",
+                        decimal_to_str(actionable_edge_bps) or "-",
+                        decimal_to_str(self.auto_live_entry_min_actionable_edge_bps),
+                    )
+                    return
+            self.logger.info(
+                "auto_live_entry_actionable_edge_checked cycle_id=%s asset=%s direction=%s var_side=%s "
+                "var_price=%s lighter_bid=%s lighter_ask=%s edge_bps=%s threshold_bps=%s action=pass",
+                cycle_id,
+                snapshot.asset,
+                direction,
+                var_side,
+                decimal_to_str(actionable_var_price) or "-",
+                decimal_to_str(lighter_bid) or "-",
+                decimal_to_str(lighter_ask) or "-",
+                decimal_to_str(actionable_edge_bps) or "-",
+                decimal_to_str(self.auto_live_entry_min_actionable_edge_bps),
+            )
             entry_signal_monotonic = time.monotonic()
             entry_precheck_ms = "-"
             entry_var_submit_ms = "-"
@@ -4809,6 +4889,17 @@ def parse_args() -> argparse.Namespace:
         help="Maximum Lighter hedge precheck edge bps allowed for auto-live entries. Set 0 to disable. Default: 0",
     )
     parser.add_argument(
+        "--auto-live-entry-min-actionable-edge-bps",
+        type=float,
+        default=0.0,
+        help="Minimum actionable entry edge bps from current Var execution price versus Lighter top of book. Set 0 to disable. Default: 0",
+    )
+    parser.add_argument(
+        "--auto-live-disable-short-var-long-lighter",
+        action="store_true",
+        help="Disable auto-live entries for short_var_long_lighter direction.",
+    )
+    parser.add_argument(
         "--auto-live-cooldown-seconds",
         type=float,
         default=DEFAULT_AUTO_LIVE_COOLDOWN_SECONDS,
@@ -4905,6 +4996,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--auto-live-min-holding-seconds must be >= 0")
     if args.auto_live_entry_max_precheck_edge_bps < 0:
         parser.error("--auto-live-entry-max-precheck-edge-bps must be >= 0")
+    if args.auto_live_entry_min_actionable_edge_bps < 0:
+        parser.error("--auto-live-entry-min-actionable-edge-bps must be >= 0")
     if args.auto_live_cooldown_seconds < 0:
         parser.error("--auto-live-cooldown-seconds must be >= 0")
     if args.auto_live_max_cycles < 0:
