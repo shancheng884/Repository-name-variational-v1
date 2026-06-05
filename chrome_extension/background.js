@@ -503,16 +503,17 @@ function buildVariationalOrderDomSnapshot(side, amount) {
   const mainInput = textInputs
     .map((el) => ({ el, rect: el.getBoundingClientRect() }))
     .sort((a, b) => (b.rect.width - a.rect.width) || (a.rect.y - b.rect.y))[0]?.el || null;
+  const panelLeft = Math.max(0, window.innerWidth - 560);
   const submitCandidates = buttons
     .map((el) => ({ el, rect: el.getBoundingClientRect(), item: describePanelNode(el) }))
-    .filter(({ rect, item }) => item && rect.x >= 1450 && rect.y >= 180 && rect.y <= 760)
+    .filter(({ rect, item }) => item && rect.x >= panelLeft && rect.y >= 180 && rect.y <= 760)
     .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x))
     .map(({ item }) => item)
     .slice(0, 30);
   const panelNodes = Array.from(document.querySelectorAll('button, input, textarea, [role="button"], [contenteditable="true"], [tabindex], div, span'))
     .filter(visible)
     .map(describePanelNode)
-    .filter((item) => item && item.rect.x >= 1450 && item.rect.y >= 140 && item.rect.y <= 760)
+    .filter((item) => item && item.rect.x >= panelLeft && item.rect.y >= 140 && item.rect.y <= 760)
     .filter((item) => item.text || item.ariaLabel || item.placeholder || item.name || item.id || item.value || ['INPUT', 'TEXTAREA'].includes(item.tag))
     .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x))
     .slice(0, 120);
@@ -757,9 +758,23 @@ async function handlePrepareOrderInputSweepDryRun(payload) {
 function findSubmitButton(snapshot, side) {
   const sideText = side.toLowerCase() === "buy" ? "buy" : "sell";
   const candidates = snapshot?.submitCandidates || [];
-  return candidates.find((item) => {
+  const exact = candidates.find((item) => {
     const text = String(item.text || "").toLowerCase();
     return !item.disabled && text.includes(sideText) && text.includes("btc") && item.rect;
+  });
+  if (exact) {
+    return exact;
+  }
+  const inputY = snapshot?.mainInput?.rect?.y ?? 0;
+  return candidates.find((item) => {
+    const text = String(item.text || "").trim().toLowerCase();
+    const rect = item.rect || null;
+    return !item.disabled
+      && rect
+      && text === sideText
+      && rect.width >= 180
+      && rect.height >= 32
+      && rect.y > inputY;
   }) || null;
 }
 
