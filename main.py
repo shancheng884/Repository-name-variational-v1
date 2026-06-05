@@ -739,6 +739,8 @@ class VariationalToLighterRuntime:
                 entry_bps=Decimal(str(args.paper_inventory_entry_bps)),
                 exit_bps=Decimal(str(args.paper_inventory_exit_bps)),
                 min_hold_samples=int(args.paper_inventory_min_hold_samples),
+                max_total_lots=int(args.paper_inventory_max_total_lots),
+                latency_samples=int(args.paper_inventory_latency_samples),
             )
             if self.paper_inventory
             else None
@@ -5155,9 +5157,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paper-inventory", action="store_true", help="Enable paper-only layered inventory simulation.")
     parser.add_argument("--paper-inventory-lot-notional-usd", type=float, default=50.0)
     parser.add_argument("--paper-inventory-max-lots", type=int, default=5)
+    parser.add_argument("--paper-inventory-max-total-lots", type=int, default=5)
     parser.add_argument("--paper-inventory-entry-bps", type=float, default=40.0)
     parser.add_argument("--paper-inventory-exit-bps", type=float, default=10.0)
     parser.add_argument("--paper-inventory-min-hold-samples", type=int, default=3)
+    parser.add_argument("--paper-inventory-latency-samples", type=int, default=0)
     args = parser.parse_args()
     if args.mode == MODE_LIVE and not args.confirm_live:
         parser.error("--mode live requires --confirm-live")
@@ -5183,8 +5187,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--paper-inventory-lot-notional-usd must be > 0")
     if args.paper_inventory_max_lots <= 0:
         parser.error("--paper-inventory-max-lots must be > 0")
+    if args.paper_inventory_max_total_lots <= 0:
+        parser.error("--paper-inventory-max-total-lots must be > 0")
     if args.paper_inventory_min_hold_samples < 0:
         parser.error("--paper-inventory-min-hold-samples must be >= 0")
+    if args.paper_inventory_latency_samples < 0:
+        parser.error("--paper-inventory-latency-samples must be >= 0")
     live_allowed_sides = {side.strip().lower() for side in str(args.live_allowed_sides).split(",") if side.strip()}
     invalid_live_allowed_sides = sorted(live_allowed_sides - {"buy", "sell"})
     if invalid_live_allowed_sides:

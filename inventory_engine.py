@@ -22,6 +22,16 @@ class InventoryLot:
 
 
 @dataclass(slots=True)
+class PendingInventoryAction:
+    action: str
+    direction: str
+    edge_bps: Decimal
+    logged_at: str
+    execute_sample_index: int
+    lot: InventoryLot | None = None
+
+
+@dataclass(slots=True)
 class InventoryEvent:
     event: str
     direction: str
@@ -44,21 +54,45 @@ class PaperInventoryEngine:
         entry_bps: Decimal,
         exit_bps: Decimal,
         min_hold_samples: int,
+        max_total_lots: int | None = None,
+        latency_samples: int = 0,
     ) -> None:
         if lot_notional_usd <= 0:
             raise ValueError("lot_notional_usd must be > 0")
         if max_lots <= 0:
             raise ValueError("max_lots must be > 0")
+        if max_total_lots is not None and max_total_lots <= 0:
+            raise ValueError("max_total_lots must be > 0")
         if min_hold_samples < 0:
             raise ValueError("min_hold_samples must be >= 0")
+        if latency_samples < 0:
+            raise ValueError("latency_samples must be >= 0")
         self.lot_notional_usd = lot_notional_usd
         self.max_lots = max_lots
+        self.max_total_lots = max_total_lots
         self.entry_bps = entry_bps
         self.exit_bps = exit_bps
         self.min_hold_samples = min_hold_samples
+        self.latency_samples = latency_samples
         self.lots: dict[str, list[InventoryLot]] = {direction: [] for direction in INVENTORY_DIRECTIONS}
+        self.pending_actions: dict[str, list[PendingInventoryAction]] = {direction: [] for direction in INVENTORY_DIRECTIONS}
         self.next_lot_id = 1
         self.realized_pnl_usd = Decimal("0")
+
+    def pending_entries(self) -> int:
+        return sum(1 for actions in self.pending_actions.values() for action in actions if action.action == "enter")
+
+    def pending_exits(self, direction: str) -> int:
+        return sum(1 for action in self.pending_actions[direction] if action.action == "exit")
+
+    def can_enter(self, direction: str) -> bool:
+        if len(self.lots[direction]) + sum(
+            1 for action in self.pending_actions[direction] if action.action == "enter"
+        ) >= self.max_lots:
+            return False
+        if self.max_total_lots is not None and self.open_lots() + self.pending_entries() >= self.max_total_lots:
+            return False
+        return True
 
     @staticmethod
     def close_lot(lot: InventoryLot, exit_var_price: Decimal, exit_lighter_price: Decimal) -> Decimal:
@@ -85,8 +119,87 @@ class PaperInventoryEngine:
 
         events: list[InventoryEvent] = []
         lots = self.lots[direction]
-        if lots and edge_bps <= self.exit_bps and sample_index - lots[0].entered_sample_index >= self.min_hold_samples:
-            lot = lots.pop(0)
+
+        pending = self.pending_actions[direction]
+        ready = [action for action in pending if sample_index >= action.execute_sample_index]
+        self.pending_actions[direction] = [action for action in pending if sample_index < action.execute_sample_index]
+        for action in ready:
+            if action.action == "exit":
+                if action.lot is None:
+                    raise ValueError("pending exit requires a lot")
+                lot = action.lot
+                if lot in lots:
+                    lots.remove(lot)
+                else:
+                    continue
+                pnl = self.close_lot(lot, var_exit_price, lighter_exit_price)
+                notional = lot.qty * lot.entry_var_price
+                pnl_bps = pnl / notional * Decimal("10000") if notional else None
+                self.realized_pnl_usd += pnl
+                events.append(
+                    InventoryEvent(
+                        event="inventory_paper_exited",
+                        direction=direction,
+                        lot_id=lot.lot_id,
+                        qty=lot.qty,
+                        edge_bps=action.edge_bps,
+                        var_price=var_exit_price,
+                        lighter_price=lighter_exit_price,
+                        pnl_usd=pnl,
+                        pnl_bps=pnl_bps,
+                        holding_samples=sample_index - lot.entered_sample_index,
+                    )
+                )
+                continue
+
+            qty = self.lot_notional_usd / var_entry_price
+            lot = InventoryLot(
+                lot_id=self.next_lot_id,
+                direction=direction,
+                qty=qty,
+                entry_var_price=var_entry_price,
+                entry_lighter_price=lighter_entry_price,
+                entry_edge_bps=action.edge_bps,
+                entered_at=action.logged_at,
+                entered_sample_index=sample_index,
+            )
+            self.next_lot_id += 1
+            lots.append(lot)
+            events.append(
+                InventoryEvent(
+                    event="inventory_paper_entered",
+                    direction=direction,
+                    lot_id=lot.lot_id,
+                    qty=qty,
+                    edge_bps=action.edge_bps,
+                    var_price=var_entry_price,
+                    lighter_price=lighter_entry_price,
+                )
+            )
+
+        if events:
+            return events
+
+        if (
+            lots
+            and edge_bps <= self.exit_bps
+            and sample_index - lots[0].entered_sample_index >= self.min_hold_samples
+            and self.pending_exits(direction) == 0
+        ):
+            lot = lots[0]
+            if self.latency_samples > 0:
+                self.pending_actions[direction].append(
+                    PendingInventoryAction(
+                        action="exit",
+                        direction=direction,
+                        edge_bps=edge_bps,
+                        logged_at=logged_at,
+                        execute_sample_index=sample_index + self.latency_samples,
+                        lot=lot,
+                    )
+                )
+                return events
+            lots.pop(0)
             pnl = self.close_lot(lot, var_exit_price, lighter_exit_price)
             notional = lot.qty * lot.entry_var_price
             pnl_bps = pnl / notional * Decimal("10000") if notional else None
@@ -107,7 +220,18 @@ class PaperInventoryEngine:
             )
             return events
 
-        if edge_bps >= self.entry_bps and len(lots) < self.max_lots:
+        if edge_bps >= self.entry_bps and self.can_enter(direction):
+            if self.latency_samples > 0:
+                self.pending_actions[direction].append(
+                    PendingInventoryAction(
+                        action="enter",
+                        direction=direction,
+                        edge_bps=edge_bps,
+                        logged_at=logged_at,
+                        execute_sample_index=sample_index + self.latency_samples,
+                    )
+                )
+                return events
             qty = self.lot_notional_usd / var_entry_price
             lot = InventoryLot(
                 lot_id=self.next_lot_id,
