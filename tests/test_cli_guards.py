@@ -215,3 +215,72 @@ def test_low_latency_flags_accept_opt_in(monkeypatch) -> None:
 
     assert args.lighter_prewarm_submit_ws is True
     assert args.auto_live_skip_entry_preview is True
+
+
+def live_inventory_safe_argv() -> list[str]:
+    return [
+        "main.py",
+        "--mode",
+        "live",
+        "--confirm-live",
+        "--live-max-notional-usd",
+        "10",
+        "--live-allowed-assets",
+        "BTC",
+        "--variational-submit-transport",
+        "api",
+        "--lighter-submit-transport",
+        "ws",
+        "--lighter-order-mode",
+        "market-ioc",
+        "--lighter-prewarm-submit-ws",
+        "--live-inventory",
+        "--live-inventory-i-confirm-flat-start",
+        "--live-inventory-dry-decisions",
+    ]
+
+
+def test_live_inventory_accepts_v1_safe_flags(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", live_inventory_safe_argv())
+
+    args = parse_args()
+
+    assert args.live_inventory is True
+    assert args.live_inventory_dry_decisions is True
+    assert args.live_inventory_i_confirm_flat_start is True
+    assert args.live_inventory_lot_notional_usd == 10.0
+    assert args.live_inventory_max_total_lots == 1
+    assert args.live_inventory_entry_bps == 50.0
+
+
+def test_live_inventory_requires_flat_start_confirmation(monkeypatch) -> None:
+    argv = live_inventory_safe_argv()
+    argv.remove("--live-inventory-i-confirm-flat-start")
+    monkeypatch.setattr("sys.argv", argv)
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_live_inventory_rejects_large_lot_notional(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-lot-notional-usd", "11"])
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_live_inventory_rejects_auto_live_combo(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--auto-live-entry", "--auto-live-i-confirm-flat-start"])
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_live_inventory_requires_low_latency_transports(monkeypatch) -> None:
+    argv = live_inventory_safe_argv()
+    argv.remove("api")
+    argv.insert(argv.index("--lighter-submit-transport"), "dom")
+    monkeypatch.setattr("sys.argv", argv)
+
+    with pytest.raises(SystemExit):
+        parse_args()
