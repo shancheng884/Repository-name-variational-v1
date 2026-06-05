@@ -284,3 +284,21 @@ def test_live_inventory_requires_low_latency_transports(monkeypatch) -> None:
 
     with pytest.raises(SystemExit):
         parse_args()
+
+
+def test_live_inventory_dry_decisions_allow_low_entry_threshold(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-entry-bps", "5"])
+
+    args = parse_args()
+
+    assert args.live_inventory_dry_decisions is True
+    assert args.live_inventory_entry_bps == 5.0
+
+
+def test_live_inventory_real_submit_rejects_low_entry_threshold(monkeypatch) -> None:
+    argv = live_inventory_safe_argv()
+    argv.remove("--live-inventory-dry-decisions")
+    monkeypatch.setattr("sys.argv", argv + ["--live-inventory-entry-bps", "5"])
+
+    with pytest.raises(SystemExit):
+        parse_args()
