@@ -765,12 +765,15 @@ function findSubmitButton(snapshot, side) {
 
 function parseBtcQuantityFromSnapshot(snapshot) {
   const text = (snapshot?.panelNodes || []).map((item) => item.text || "").join("\n");
-  const match = text.match(/Order Quantity\s+([0-9.]+)\s+BTC/i);
-  if (!match) {
-    return null;
-  }
-  const value = Number(match[1]);
-  return Number.isFinite(value) ? value : null;
+   const match =
+     text.match(/Order Quantity\s+([0-9.]+)\s+BTC/i) ||
+     text.match(/Order Size\s+([0-9.]+)\s+BTC/i) ||
+     text.match(/Size\s+([0-9.]+)\s+BTC/i);
+   if (!match) {
+     return null;
+   }
+   const value = Number(match[1]);
+   return Number.isFinite(value) ? value : null;
 }
 
 async function prepareOrderFormWithKeyboard(side, amount) {
