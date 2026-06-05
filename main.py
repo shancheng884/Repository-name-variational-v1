@@ -1740,6 +1740,11 @@ class VariationalToLighterRuntime:
             await self.ensure_lighter_submit_ws()
         self.logger.info("lighter_submit_ws_prewarmed duration_ms=%s", elapsed_ms_str(started))
 
+    async def _timed_submit(self, awaitable: Any) -> tuple[Any, str]:
+        started = time.monotonic()
+        result = await awaitable
+        return result, elapsed_ms_str(started)
+
     @staticmethod
     def _is_lighter_ws_sendtx_response(message: dict[str, Any]) -> bool:
         message_type = str(message.get("type") or "").strip().lower()
@@ -3518,29 +3523,33 @@ class VariationalToLighterRuntime:
                     return
             entry_var_submit_started = time.monotonic()
             entry_var_task = asyncio.create_task(
-                self.send_variational_place_order(
-                    side=var_side,
-                    amount=decimal_to_str(order_qty) or str(order_qty),
-                    expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
-                    confirm=True,
+                self._timed_submit(
+                    self.send_variational_place_order(
+                        side=var_side,
+                        amount=decimal_to_str(order_qty) or str(order_qty),
+                        expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
+                        confirm=True,
+                    )
                 )
             )
             entry_lighter_task = None
             if self.auto_live_eager_hedge:
                 entry_lighter_submit_started = time.monotonic()
                 entry_lighter_task = asyncio.create_task(
-                    self.place_lighter_order_from_plan(
-                        asset=snapshot.asset,
-                        side=var_side,
-                        qty=order_qty,
-                        var_fill_price=snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price or snapshot.var_mid,
-                        cycle_id=cycle_id,
-                        role="entry",
+                    self._timed_submit(
+                        self.place_lighter_order_from_plan(
+                            asset=snapshot.asset,
+                            side=var_side,
+                            qty=order_qty,
+                            var_fill_price=snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price or snapshot.var_mid,
+                            cycle_id=cycle_id,
+                            role="entry",
+                        )
                     )
                 )
 
             try:
-                result = await entry_var_task
+                result, entry_var_submit_ms = await entry_var_task
             except Exception as exc:
                 if entry_lighter_task is not None:
                     with contextlib.suppress(Exception):
@@ -3561,7 +3570,6 @@ class VariationalToLighterRuntime:
                     order_qty,
                 )
                 return
-            entry_var_submit_ms = elapsed_ms_str(entry_var_submit_started)
             if not result.get("ok"):
                 if entry_lighter_task is not None:
                     with contextlib.suppress(Exception):
@@ -3572,7 +3580,7 @@ class VariationalToLighterRuntime:
             entry_eager_started = not self.auto_live_eager_hedge
             if entry_lighter_task is not None:
                 try:
-                    lighter_record, payload = await entry_lighter_task
+                    lighter_result, entry_lighter_submit_ms = await entry_lighter_task
                 except Exception as exc:
                     reason = f"entry_lighter_submit_exception:{exc}"
                     self.require_auto_live_manual_review_for_entry(
@@ -3590,7 +3598,7 @@ class VariationalToLighterRuntime:
                         order_qty,
                     )
                     return
-                entry_lighter_submit_ms = elapsed_ms_str(entry_lighter_submit_started)
+                lighter_record, payload = lighter_result
                 entry_eager_started = self.auto_live_eager_hedge_started(lighter_record)
                 if lighter_record is not None and entry_eager_started:
                     self.pending_auto_live_matches.append(
@@ -3765,29 +3773,33 @@ class VariationalToLighterRuntime:
             )
         exit_var_submit_started = time.monotonic()
         exit_var_task = asyncio.create_task(
-            self.send_variational_place_order(
-                side=exit_side,
-                amount=decimal_to_str(position.planned_qty) or str(position.planned_qty),
-                expected_min_btc_qty=position.planned_qty if snapshot.asset.upper() == "BTC" else None,
-                confirm=True,
+            self._timed_submit(
+                self.send_variational_place_order(
+                    side=exit_side,
+                    amount=decimal_to_str(position.planned_qty) or str(position.planned_qty),
+                    expected_min_btc_qty=position.planned_qty if snapshot.asset.upper() == "BTC" else None,
+                    confirm=True,
+                )
             )
         )
         exit_lighter_task = None
         if self.auto_live_eager_hedge:
             exit_lighter_submit_started = time.monotonic()
             exit_lighter_task = asyncio.create_task(
-                self.place_lighter_order_from_plan(
-                    asset=snapshot.asset,
-                    side=exit_side,
-                    qty=position.planned_qty,
-                    var_fill_price=snapshot.var_sell_price if exit_side == "SELL" else snapshot.var_buy_price or snapshot.var_mid,
-                    cycle_id=position.cycle_id,
-                    role="exit",
+                self._timed_submit(
+                    self.place_lighter_order_from_plan(
+                        asset=snapshot.asset,
+                        side=exit_side,
+                        qty=position.planned_qty,
+                        var_fill_price=snapshot.var_sell_price if exit_side == "SELL" else snapshot.var_buy_price or snapshot.var_mid,
+                        cycle_id=position.cycle_id,
+                        role="exit",
+                    )
                 )
             )
 
         try:
-            result = await exit_var_task
+            result, exit_var_submit_ms = await exit_var_task
         except Exception as exc:
             if exit_lighter_task is not None:
                 with contextlib.suppress(Exception):
@@ -3802,7 +3814,6 @@ class VariationalToLighterRuntime:
                 position.planned_qty,
             )
             return
-        exit_var_submit_ms = elapsed_ms_str(exit_var_submit_started)
         if not result.get("ok"):
             if exit_lighter_task is not None:
                 with contextlib.suppress(Exception):
@@ -3822,7 +3833,7 @@ class VariationalToLighterRuntime:
         exit_eager_started = not self.auto_live_eager_hedge
         if exit_lighter_task is not None:
             try:
-                lighter_record, payload = await exit_lighter_task
+                lighter_result, exit_lighter_submit_ms = await exit_lighter_task
             except Exception as exc:
                 reason = f"exit_lighter_submit_exception:{exc}"
                 self.require_auto_live_manual_review(position, reason)
@@ -3834,7 +3845,7 @@ class VariationalToLighterRuntime:
                     position.planned_qty,
                 )
                 return
-            exit_lighter_submit_ms = elapsed_ms_str(exit_lighter_submit_started)
+            lighter_record, payload = lighter_result
             exit_eager_started = self.auto_live_eager_hedge_started(lighter_record)
             if lighter_record is not None and exit_eager_started:
                 self.pending_auto_live_matches.append(
