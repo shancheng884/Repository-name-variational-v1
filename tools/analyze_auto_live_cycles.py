@@ -80,8 +80,10 @@ class Cycle:
     exit_spread_usd: Decimal | None = None
     actual_entry_edge_bps: Decimal | None = None
     actual_exit_edge_bps: Decimal | None = None
-    entry_edge_slippage_bps: Decimal | None = None
-    exit_edge_slippage_bps: Decimal | None = None
+    actual_entry_abs_deviation_bps: Decimal | None = None
+    actual_exit_abs_deviation_bps: Decimal | None = None
+    entry_precheck_to_actual_abs_delta_bps: Decimal | None = None
+    exit_precheck_to_actual_abs_delta_bps: Decimal | None = None
     spread_capture_usd: Decimal | None = None
     spread_capture_bps: Decimal | None = None
     gross_pnl_usd: Decimal | None = None
@@ -194,14 +196,18 @@ def compute_spread_capture(
     return entry_spread, exit_spread, actual_entry_edge, actual_exit_edge, spread_capture, spread_capture_bps
 
 
-def compute_edge_slippage(cycle: Cycle) -> tuple[Decimal | None, Decimal | None]:
-    entry_slippage = None
-    exit_slippage = None
-    if cycle.last_entry_precheck_edge_bps is not None and cycle.actual_entry_edge_bps is not None:
-        entry_slippage = cycle.last_entry_precheck_edge_bps - cycle.actual_entry_edge_bps
-    if cycle.last_exit_precheck_edge_bps is not None and cycle.actual_exit_edge_bps is not None:
-        exit_slippage = cycle.last_exit_precheck_edge_bps - cycle.actual_exit_edge_bps
-    return entry_slippage, exit_slippage
+def compute_precheck_actual_abs_delta(cycle: Cycle) -> tuple[Decimal | None, Decimal | None]:
+    entry_delta = None
+    exit_delta = None
+    if cycle.actual_entry_edge_bps is not None:
+        cycle.actual_entry_abs_deviation_bps = abs(cycle.actual_entry_edge_bps)
+    if cycle.actual_exit_edge_bps is not None:
+        cycle.actual_exit_abs_deviation_bps = abs(cycle.actual_exit_edge_bps)
+    if cycle.last_entry_precheck_edge_bps is not None and cycle.actual_entry_abs_deviation_bps is not None:
+        entry_delta = cycle.last_entry_precheck_edge_bps - cycle.actual_entry_abs_deviation_bps
+    if cycle.last_exit_precheck_edge_bps is not None and cycle.actual_exit_abs_deviation_bps is not None:
+        exit_delta = cycle.last_exit_precheck_edge_bps - cycle.actual_exit_abs_deviation_bps
+    return entry_delta, exit_delta
 
 
 def compute_gross_pnl(cycle: Cycle) -> tuple[Decimal | None, Decimal | None]:
@@ -439,7 +445,10 @@ def enrich_cycles_with_order_metrics(cycles: list[Cycle], order_metrics_path: Pa
             cycle.spread_capture_usd,
             cycle.spread_capture_bps,
         ) = compute_spread_capture(cycle)
-        cycle.entry_edge_slippage_bps, cycle.exit_edge_slippage_bps = compute_edge_slippage(cycle)
+        (
+            cycle.entry_precheck_to_actual_abs_delta_bps,
+            cycle.exit_precheck_to_actual_abs_delta_bps,
+        ) = compute_precheck_actual_abs_delta(cycle)
         cycle.gross_pnl_usd, cycle.gross_pnl_bps = compute_gross_pnl(cycle)
 
 
@@ -541,7 +550,9 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
         "exit_lighter_fill_ms exit_signal_to_both_filled_ms "
         "entry_var_fill_price entry_lighter_fill_price exit_var_fill_price exit_lighter_fill_price "
         "entry_spread_usd exit_spread_usd actual_entry_edge_bps actual_exit_edge_bps "
-        "entry_edge_slippage_bps exit_edge_slippage_bps spread_capture_usd spread_capture_bps gross_pnl_usd gross_pnl_bps "
+        "actual_entry_abs_deviation_bps actual_exit_abs_deviation_bps "
+        "entry_precheck_to_actual_abs_delta_bps exit_precheck_to_actual_abs_delta_bps "
+        "spread_capture_usd spread_capture_bps gross_pnl_usd gross_pnl_bps "
         "manual_review_at manual_review_reason entry_precheck_failures"
     )
     for cycle in selected:
@@ -555,7 +566,9 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
             "{exit_lighter_fill_ms} {exit_signal_to_both_filled_ms} "
             "{entry_var_fill_price} {entry_lighter_fill_price} {exit_var_fill_price} {exit_lighter_fill_price} "
             "{entry_spread_usd} {exit_spread_usd} {actual_entry_edge_bps} {actual_exit_edge_bps} "
-            "{entry_edge_slippage_bps} {exit_edge_slippage_bps} {spread_capture_usd} {spread_capture_bps} "
+            "{actual_entry_abs_deviation_bps} {actual_exit_abs_deviation_bps} "
+            "{entry_precheck_to_actual_abs_delta_bps} {exit_precheck_to_actual_abs_delta_bps} "
+            "{spread_capture_usd} {spread_capture_bps} "
             "{gross_pnl_usd} {gross_pnl_bps} "
             "{manual_at} {manual_reason} {entry_precheck_failures}".format(
                 asset=cycle.asset,
@@ -597,8 +610,10 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
                 exit_spread_usd=fmt(cycle.exit_spread_usd, 2),
                 actual_entry_edge_bps=fmt(cycle.actual_entry_edge_bps, 3),
                 actual_exit_edge_bps=fmt(cycle.actual_exit_edge_bps, 3),
-                entry_edge_slippage_bps=fmt(cycle.entry_edge_slippage_bps, 3),
-                exit_edge_slippage_bps=fmt(cycle.exit_edge_slippage_bps, 3),
+                actual_entry_abs_deviation_bps=fmt(cycle.actual_entry_abs_deviation_bps, 3),
+                actual_exit_abs_deviation_bps=fmt(cycle.actual_exit_abs_deviation_bps, 3),
+                entry_precheck_to_actual_abs_delta_bps=fmt(cycle.entry_precheck_to_actual_abs_delta_bps, 3),
+                exit_precheck_to_actual_abs_delta_bps=fmt(cycle.exit_precheck_to_actual_abs_delta_bps, 3),
                 spread_capture_usd=fmt(cycle.spread_capture_usd, 2),
                 spread_capture_bps=fmt(cycle.spread_capture_bps, 3),
                 gross_pnl_usd=fmt(cycle.gross_pnl_usd, 6),

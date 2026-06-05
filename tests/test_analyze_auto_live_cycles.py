@@ -123,7 +123,9 @@ def test_order_metrics_enrich_fill_result_latency(tmp_path: Path, capsys) -> Non
     assert f"{cycles[0].exit_spread_usd:.2f}" == "-50.00"
     assert f"{cycles[0].actual_entry_edge_bps:.3f}" == "9.615"
     assert f"{cycles[0].actual_exit_edge_bps:.3f}" == "-4.817"
-    assert f"{cycles[0].exit_edge_slippage_bps:.3f}" == "9.817"
+    assert f"{cycles[0].actual_entry_abs_deviation_bps:.3f}" == "9.615"
+    assert f"{cycles[0].actual_exit_abs_deviation_bps:.3f}" == "4.817"
+    assert f"{cycles[0].exit_precheck_to_actual_abs_delta_bps:.3f}" == "0.183"
     assert f"{cycles[0].spread_capture_usd:.2f}" == "150.00"
     assert f"{cycles[0].spread_capture_bps:.3f}" == "14.423"
     assert f"{cycles[0].gross_pnl_usd:.6f}" == "0.073500"
@@ -135,7 +137,7 @@ def test_order_metrics_enrich_fill_result_latency(tmp_path: Path, capsys) -> Non
     assert "exit_signal_to_both_filled_ms" in captured
     assert "gross pnl summary (fees assumed zero)" in captured
     assert "actual_entry_edge_bps" in captured
-    assert "entry_edge_slippage_bps" in captured
+    assert "entry_precheck_to_actual_abs_delta_bps" in captured
     assert "spread_capture_usd" in captured
     assert "gross_pnl_usd" in captured
     assert "0.073500" in captured
