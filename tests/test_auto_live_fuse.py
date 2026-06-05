@@ -224,6 +224,57 @@ def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_pat
     asyncio.run(run())
 
 
+def test_live_inventory_blocks_trade_event_auto_hedge(tmp_path) -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.mode = "live"
+        runtime.live_inventory = True
+        runtime.records = {}
+        runtime.record_order = deque()
+        runtime.pending_auto_live_matches = []
+        runtime.auto_live_match_window_seconds = 10.0
+        runtime.trade_event_min_timestamp = None
+        runtime.last_variational_trade_event_at = None
+        runtime.variational_ticker = "BTC"
+        runtime.accepted_assets = {"BTC"}
+        runtime._record_lock = asyncio.Lock()
+        runtime.logger = logging.getLogger("test_auto_live_fuse")
+        runtime.lighter_client_order_to_trade_key = {}
+        runtime.output_dir = Path(tmp_path)
+
+        hedge_calls: list[str] = []
+        append_calls: list[str] = []
+
+        async def fake_place_lighter_order(record) -> None:
+            hedge_calls.append(record.trade_key)
+
+        async def fake_append_order_log(event_type, payload) -> None:
+            append_calls.append(event_type)
+
+        runtime.place_lighter_order = fake_place_lighter_order
+        runtime.append_order_log = fake_append_order_log
+
+        await runtime.process_variational_trade_event(
+            {
+                "asset": "BTC",
+                "side": "buy",
+                "qty": "0.00022",
+                "status": "filled",
+                "trade_id": "trade-live-inventory",
+                "timestamp": "2026-06-02T08:50:11Z",
+                "price": "100001",
+            }
+        )
+
+        assert hedge_calls == []
+        assert append_calls == ["variational_fill", "lighter_blocked"]
+        record = runtime.records["id:trade-live-inventory"]
+        assert record.processing_stage == "blocked_by_mode"
+        assert record.failure_reason == "live_inventory_blocks_trade_event_auto_hedge"
+
+    asyncio.run(run())
+
+
 def test_lighter_ws_sendtx_sends_tx_info_as_object() -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
@@ -399,5 +450,74 @@ def test_create_lighter_order_ws_accepts_order_expiry() -> None:
 
         assert error is None
         assert response.code == 200
+
+    asyncio.run(run())
+
+
+def test_place_lighter_order_from_plan_passes_reduce_only() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.mode = "live"
+        runtime.records = {}
+        runtime.record_order = deque()
+        runtime._record_lock = asyncio.Lock()
+        runtime._lighter_signer_lock = asyncio.Lock()
+        runtime.lighter_submit_transport = "http"
+        runtime.lighter_order_mode = "market-ioc"
+        runtime.lighter_market_index = 1
+        runtime.price_multiplier = Decimal("100")
+        runtime.base_amount_multiplier = Decimal("100000000")
+        runtime.risk_guard_max_base_amount = 1000000
+        runtime.risk_guard_max_price_deviation_bps = Decimal("1000")
+        runtime.lighter_min_base_amount = None
+        runtime.lighter_min_quote_amount = None
+        runtime.live_allowed_sides = {"buy", "sell"}
+        runtime.live_allowed_assets = {"BTC"}
+        runtime.live_max_qty = Decimal("0")
+        runtime.live_max_notional_usd = Decimal("100")
+        runtime.live_require_min_edge_bps = Decimal("0")
+        runtime.live_cooldown_seconds = 0.0
+        runtime.last_live_submit_monotonic_by_asset = {}
+        runtime.lighter_client_order_to_trade_key = {}
+        runtime.lighter_best_bid = Decimal("99990")
+        runtime.lighter_best_ask = Decimal("100010")
+        runtime.lighter_order_book_lock = asyncio.Lock()
+        runtime.last_lighter_order_book_update_at = "2999-06-02T08:50:11+00:00"
+        runtime.logger = logging.getLogger("test_auto_live_fuse")
+
+        captured_kwargs = {}
+
+        class FakeClient:
+            ORDER_TYPE_LIMIT = 0
+            ORDER_TYPE_MARKET = 1
+            ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0
+            ORDER_TIME_IN_FORCE_GOOD_TILL_TIME = 1
+            DEFAULT_IOC_EXPIRY = 0
+            DEFAULT_28_DAY_ORDER_EXPIRY = -1
+
+            async def create_order(self, **kwargs):
+                captured_kwargs.update(kwargs)
+                return None, "0xabc", None
+
+        runtime.lighter_client = FakeClient()
+
+        async def fake_append_order_log(_event_type, _payload) -> None:
+            return None
+
+        runtime.append_order_log = fake_append_order_log
+
+        record, payload = await runtime.place_lighter_order_from_plan(
+            asset="BTC",
+            side="SELL",
+            qty=Decimal("0.0001"),
+            var_fill_price=Decimal("100000"),
+            role="live_inventory_exit",
+            reduce_only=True,
+        )
+
+        assert captured_kwargs["reduce_only"] is True
+        assert record is not None
+        assert record.lighter_reduce_only is True
+        assert payload["lighter_reduce_only"] is True
 
     asyncio.run(run())

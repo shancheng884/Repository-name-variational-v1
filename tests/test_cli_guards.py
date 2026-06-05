@@ -253,6 +253,18 @@ def test_live_inventory_accepts_v1_safe_flags(monkeypatch) -> None:
     assert args.live_inventory_entry_bps == 50.0
 
 
+def test_live_inventory_real_submit_accepts_v1_safe_flags(monkeypatch) -> None:
+    argv = live_inventory_safe_argv()
+    argv.remove("--live-inventory-dry-decisions")
+    monkeypatch.setattr("sys.argv", argv)
+
+    args = parse_args()
+
+    assert args.live_inventory is True
+    assert args.live_inventory_dry_decisions is False
+    assert args.live_inventory_entry_bps == 50.0
+
+
 def test_live_inventory_requires_flat_start_confirmation(monkeypatch) -> None:
     argv = live_inventory_safe_argv()
     argv.remove("--live-inventory-i-confirm-flat-start")

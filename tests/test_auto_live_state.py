@@ -121,7 +121,7 @@ def test_live_inventory_state_reset_allows_startup_after_manual_flat(tmp_path, m
     assert state["open_lots"] == []
 
 
-def test_live_inventory_currently_blocks_until_submission_is_implemented(tmp_path, monkeypatch) -> None:
+def test_live_inventory_real_submit_allows_startup_when_state_flat(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("LIGHTER_ACCOUNT_INDEX", "1")
     monkeypatch.setenv("LIGHTER_API_KEY_INDEX", "1")
     monkeypatch.setenv("LIGHTER_PRIVATE_KEY", "secret")
@@ -133,7 +133,8 @@ def test_live_inventory_currently_blocks_until_submission_is_implemented(tmp_pat
 
     diagnostics = runtime.run_startup_diagnostics()
 
-    assert "live_inventory_order_submission_not_implemented_yet" in diagnostics.blocking_errors
+    assert diagnostics.blocking_errors == []
+    assert "live_inventory_real_submit_one_lot_enabled" in diagnostics.passed
 
 
 def test_live_inventory_dry_decisions_allow_startup_when_state_flat(tmp_path, monkeypatch) -> None:

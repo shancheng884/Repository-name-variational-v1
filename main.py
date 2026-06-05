@@ -428,6 +428,7 @@ class OrderLifecycle:
     lighter_client_order_id: int | None = None
     lighter_submit_transport: str | None = None
     lighter_order_mode: str | None = None
+    lighter_reduce_only: bool = False
     lighter_fill_price: Decimal | None = None
     lighter_fill_ts_iso: str | None = None
     lighter_tx_hash: str | None = None
@@ -481,6 +482,7 @@ class OrderLifecycle:
                 LIGHTER_SUBMIT_TRANSPORT_HTTP,
             ),
             "lighter_order_mode": getattr(self, "lighter_order_mode", LIGHTER_ORDER_MODE_LIMIT_GTT),
+            "lighter_reduce_only": self.lighter_reduce_only,
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
             "lighter_filled_at": self.lighter_fill_ts_iso,
             "mode": self.mode,
@@ -944,6 +946,47 @@ class VariationalToLighterRuntime:
             }
         )
 
+    async def require_live_inventory_manual_review(
+        self,
+        *,
+        asset: str,
+        reason: str,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        await self.write_live_inventory_state_async(
+            {
+                "status": "manual_review_required",
+                "asset": asset,
+                "next_lot_id": self.live_inventory_next_lot_id,
+                "open_lots": self.live_inventory_open_lots,
+                "pending_actions": [],
+                "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
+                "completed_cycles": self.live_inventory_completed_cycles,
+                "manual_review_reason": reason,
+                "manual_review_context": context or {},
+                "action": "stop_live_inventory_until_manual_flat_confirmed",
+            }
+        )
+        await self.append_live_inventory_log(
+            "live_inventory_manual_review_required",
+            {
+                "asset": asset,
+                "reason": reason,
+                "manual_review_context": context or {},
+                "open_lots_total": len(self.live_inventory_open_lots),
+                "completed_cycles": self.live_inventory_completed_cycles,
+                "action": "stop_live_inventory_until_manual_flat_confirmed",
+            },
+        )
+        self.logger.warning(
+            "live_inventory_manual_review_required asset=%s reason=%s open_lots=%s completed_cycles=%s action=stop_live_inventory_until_manual_flat_confirmed",
+            asset,
+            reason,
+            len(self.live_inventory_open_lots),
+            self.live_inventory_completed_cycles,
+        )
+        self.stop_flag = True
+
     def auto_live_guard_reason(self) -> str | None:
         if self.auto_live_manual_review_required:
             return "manual_review_required"
@@ -1359,7 +1402,7 @@ class VariationalToLighterRuntime:
                 if self.live_inventory_dry_decisions:
                     passed.append("live_inventory_dry_decisions_only_no_orders")
                 else:
-                    blocking_errors.append("live_inventory_order_submission_not_implemented_yet")
+                    passed.append("live_inventory_real_submit_one_lot_enabled")
                 if self.live_inventory_i_confirm_flat_start:
                     passed.append("live_inventory_flat_start_manually_confirmed")
                     state = self.load_live_inventory_state()
@@ -1851,6 +1894,7 @@ class VariationalToLighterRuntime:
         var_fill_price: Decimal,
         cycle_id: int | None = None,
         role: str | None = None,
+        reduce_only: bool = False,
     ) -> tuple[OrderLifecycle | None, dict[str, Any] | None]:
         synthetic_key = f"auto:{asset}:{side.lower()}:{int(time.time() * 1000)}"
         record = OrderLifecycle(
@@ -1871,6 +1915,7 @@ class VariationalToLighterRuntime:
             auto_live_merge_path="synthetic_created",
             lighter_submit_transport=self.lighter_submit_transport,
             lighter_order_mode=self.lighter_order_mode,
+            lighter_reduce_only=reduce_only,
         )
         async with self._record_lock:
             self.set_record_stage(record, STAGE_RECORD_CREATED, clear_failure=True)
@@ -2738,7 +2783,7 @@ class VariationalToLighterRuntime:
             await self.append_order_log("lighter_blocked", payload)
             return
 
-        if self.live_inventory and self.live_inventory_dry_decisions:
+        if getattr(self, "live_inventory", False) and self.live_inventory_dry_decisions:
             async with self._record_lock:
                 record.hedge_error = "Live inventory dry decision mode blocks real Lighter hedges"
                 self.set_record_stage(
@@ -2801,7 +2846,7 @@ class VariationalToLighterRuntime:
                         if self.lighter_order_mode == LIGHTER_ORDER_MODE_MARKET_IOC
                         else self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
                     ),
-                    "reduce_only": False,
+                    "reduce_only": bool(record.lighter_reduce_only),
                     "trigger_price": 0,
                     "order_expiry": (
                         self.lighter_client.DEFAULT_IOC_EXPIRY
@@ -2837,6 +2882,7 @@ class VariationalToLighterRuntime:
                 record.dry_run_plan_price = limit_price
                 record.dry_run_plan_base_amount = base_amount
                 record.lighter_side = side
+                record.lighter_reduce_only = bool(record.lighter_reduce_only)
                 record.lighter_client_order_id = client_order_id
                 record.lighter_submit_transport = self.lighter_submit_transport
                 record.lighter_order_mode = self.lighter_order_mode
@@ -3017,6 +3063,18 @@ class VariationalToLighterRuntime:
             return
 
         if self.is_live_mode() and status == "filled":
+            if getattr(self, "live_inventory", False):
+                async with self._record_lock:
+                    created_record.hedge_error = "Live inventory mode blocks trade-event auto hedges"
+                    self.set_record_stage(
+                        created_record,
+                        STAGE_BLOCKED_BY_MODE,
+                        failure_stage=FAILURE_STAGE_MODE_GUARD,
+                        failure_reason="live_inventory_blocks_trade_event_auto_hedge",
+                    )
+                    payload = created_record.to_payload()
+                await self.append_order_log("lighter_blocked", payload)
+                return
             await self.place_lighter_order(created_record)
 
     async def trade_loop(self) -> None:
@@ -3806,12 +3864,11 @@ class VariationalToLighterRuntime:
     async def maybe_run_live_inventory(self, snapshot: CrossSpreadSnapshot) -> None:
         if not self.is_live_inventory_enabled():
             return
-        if not self.live_inventory_dry_decisions:
-            return
         if snapshot.asset.upper() != "BTC":
             return
         self.live_inventory_sample_index += 1
         index = self.live_inventory_sample_index
+        event_prefix = "live_inventory_dry" if self.live_inventory_dry_decisions else "live_inventory"
         if not self.live_inventory_open_lots:
             if self.live_inventory_completed_cycles >= self.live_inventory_max_cycles:
                 return
@@ -3834,7 +3891,117 @@ class VariationalToLighterRuntime:
                     continue
                 if len(self.live_inventory_open_lots) >= self.live_inventory_max_total_lots:
                     return
-                qty = self.live_inventory_lot_notional_usd / var_price
+                notional_price = var_price * (Decimal("1") + Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000"))
+                qty = self.live_inventory_lot_notional_usd / notional_price
+                var_side = self._auto_live_direction_to_var_side(direction)
+                if not self.live_inventory_dry_decisions:
+                    try:
+                        var_task = asyncio.create_task(
+                            self._timed_submit(
+                                self.send_variational_place_order(
+                                    asset=snapshot.asset,
+                                    side=var_side,
+                                    amount=decimal_to_str(qty) or str(qty),
+                                    expected_min_btc_qty=qty if snapshot.asset.upper() == "BTC" else None,
+                                    confirm=True,
+                                    reduce_only=False,
+                                )
+                            )
+                        )
+                        lighter_task = asyncio.create_task(
+                            self._timed_submit(
+                                self.place_lighter_order_from_plan(
+                                    asset=snapshot.asset,
+                                    side=var_side,
+                                    qty=qty,
+                                    var_fill_price=var_price,
+                                    cycle_id=self.live_inventory_next_lot_id,
+                                    role="live_inventory_entry",
+                                )
+                            )
+                        )
+                        var_outcome, lighter_outcome = await asyncio.gather(
+                            var_task,
+                            lighter_task,
+                            return_exceptions=True,
+                        )
+                    except Exception as exc:
+                        await self.require_live_inventory_manual_review(
+                            asset=snapshot.asset,
+                            reason=f"entry_submit_exception:{exc}",
+                            context={
+                                "action": "entry",
+                                "direction": direction,
+                                "qty": decimal_to_str(qty),
+                                "var_side": var_side,
+                            },
+                        )
+                        return
+                    if isinstance(var_outcome, Exception):
+                        await self.require_live_inventory_manual_review(
+                            asset=snapshot.asset,
+                            reason=f"entry_var_submit_exception:{var_outcome}",
+                            context={
+                                "action": "entry",
+                                "direction": direction,
+                                "qty": decimal_to_str(qty),
+                                "var_side": var_side,
+                            },
+                        )
+                        return
+                    if isinstance(lighter_outcome, Exception):
+                        await self.require_live_inventory_manual_review(
+                            asset=snapshot.asset,
+                            reason=f"entry_lighter_submit_exception:{lighter_outcome}",
+                            context={
+                                "action": "entry",
+                                "direction": direction,
+                                "qty": decimal_to_str(qty),
+                                "var_side": var_side,
+                            },
+                        )
+                        return
+                    var_result, var_submit_ms = var_outcome
+                    lighter_result, lighter_submit_ms = lighter_outcome
+                    if not var_result.get("ok"):
+                        await self.require_live_inventory_manual_review(
+                            asset=snapshot.asset,
+                            reason=f"entry_var_submit_failed:{var_result.get('error') or 'unknown'}",
+                            context={
+                                "action": "entry",
+                                "direction": direction,
+                                "qty": decimal_to_str(qty),
+                                "var_side": var_side,
+                                "var_result": var_result,
+                            },
+                        )
+                        return
+                    lighter_record, lighter_payload = lighter_result
+                    lighter_started = self.auto_live_eager_hedge_started(lighter_record)
+                    if lighter_record is None or not lighter_started:
+                        reason = "entry_lighter_submit_failed:unknown"
+                        if lighter_record is not None:
+                            reason = "entry_lighter_submit_failed:" + (
+                                lighter_record.failure_reason or lighter_record.hedge_error or lighter_record.processing_stage or "unknown"
+                            )
+                        await self.require_live_inventory_manual_review(
+                            asset=snapshot.asset,
+                            reason=reason,
+                            context={
+                                "action": "entry",
+                                "direction": direction,
+                                "qty": decimal_to_str(qty),
+                                "var_side": var_side,
+                                "lighter_payload": lighter_payload,
+                            },
+                        )
+                        return
+                else:
+                    var_result = None
+                    lighter_record = None
+                    lighter_payload = None
+                    var_submit_ms = None
+                    lighter_submit_ms = None
                 lot = {
                     "lot_id": self.live_inventory_next_lot_id,
                     "direction": direction,
@@ -3844,13 +4011,26 @@ class VariationalToLighterRuntime:
                     "entry_edge_bps": decimal_to_str(edge_bps),
                     "entered_at": utc_now(),
                     "entered_sample_index": index,
-                    "status": "dry_open",
+                    "status": "dry_open" if self.live_inventory_dry_decisions else "open",
                 }
+                if not self.live_inventory_dry_decisions:
+                    lot.update(
+                        {
+                            "entry_var_side": var_side,
+                            "entry_var_submit_ms": var_submit_ms,
+                            "entry_lighter_submit_ms": lighter_submit_ms,
+                            "entry_var_result": var_result,
+                            "entry_lighter_record_key": lighter_record.trade_key if lighter_record is not None else None,
+                            "entry_lighter_payload": lighter_payload,
+                        }
+                    )
                 self.live_inventory_next_lot_id += 1
                 self.live_inventory_open_lots.append(lot)
-                await self.persist_live_inventory_memory(reason="dry_entry_decision")
+                await self.persist_live_inventory_memory(
+                    reason="dry_entry_decision" if self.live_inventory_dry_decisions else "entry_submitted"
+                )
                 await self.append_live_inventory_log(
-                    "live_inventory_dry_entered",
+                    f"{event_prefix}_entered",
                     {
                         "asset": snapshot.asset,
                         "lot_id": lot["lot_id"],
@@ -3862,6 +4042,8 @@ class VariationalToLighterRuntime:
                         "open_lots_total": len(self.live_inventory_open_lots),
                         "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
                         "completed_cycles": self.live_inventory_completed_cycles,
+                        "var_submit_ms": var_submit_ms,
+                        "lighter_submit_ms": lighter_submit_ms,
                     },
                 )
                 return
@@ -3879,15 +4061,10 @@ class VariationalToLighterRuntime:
             var_exit_price = snapshot.var_buy_price or snapshot.var_mid
             lighter_exit_price = snapshot.lighter_sell_fill_price
         else:
-            await self.write_live_inventory_state_async(
-                {
-                    "status": "manual_review_required",
-                    "asset": snapshot.asset,
-                    "open_lots": self.live_inventory_open_lots,
-                    "manual_review_reason": f"unknown_direction:{direction}",
-                }
+            await self.require_live_inventory_manual_review(
+                asset=snapshot.asset,
+                reason=f"unknown_direction:{direction}",
             )
-            self.stop_flag = True
             return
         entered_sample_index = int(lot.get("entered_sample_index") or index)
         holding_samples = index - entered_sample_index
@@ -3898,6 +4075,120 @@ class VariationalToLighterRuntime:
         entry_var_price = to_decimal(lot.get("entry_var_fill_price")) or var_exit_price
         entry_lighter_price = to_decimal(lot.get("entry_lighter_fill_price")) or lighter_exit_price
         qty = to_decimal(lot.get("qty")) or Decimal("0")
+        exit_reason = "spread_reverted" if should_exit else "max_hold_samples"
+        if not self.live_inventory_dry_decisions:
+            exit_side = self._opposite_var_side(str(lot.get("entry_var_side") or self._auto_live_direction_to_var_side(direction)))
+            try:
+                var_task = asyncio.create_task(
+                    self._timed_submit(
+                        self.send_variational_place_order(
+                            asset=snapshot.asset,
+                            side=exit_side,
+                            amount=decimal_to_str(qty) or str(qty),
+                            expected_min_btc_qty=qty if snapshot.asset.upper() == "BTC" else None,
+                            confirm=True,
+                            reduce_only=True,
+                        )
+                    )
+                )
+                lighter_task = asyncio.create_task(
+                    self._timed_submit(
+                        self.place_lighter_order_from_plan(
+                            asset=snapshot.asset,
+                            side=exit_side,
+                            qty=qty,
+                            var_fill_price=var_exit_price,
+                            cycle_id=int(lot.get("lot_id") or 0),
+                            role="live_inventory_exit",
+                            reduce_only=True,
+                        )
+                    )
+                )
+                var_outcome, lighter_outcome = await asyncio.gather(
+                    var_task,
+                    lighter_task,
+                    return_exceptions=True,
+                )
+            except Exception as exc:
+                await self.require_live_inventory_manual_review(
+                    asset=snapshot.asset,
+                    reason=f"exit_submit_exception:{exc}",
+                    context={
+                        "action": "exit",
+                        "lot_id": lot.get("lot_id"),
+                        "direction": direction,
+                        "qty": decimal_to_str(qty),
+                        "exit_side": exit_side,
+                    },
+                )
+                return
+            if isinstance(var_outcome, Exception):
+                await self.require_live_inventory_manual_review(
+                    asset=snapshot.asset,
+                    reason=f"exit_var_submit_exception:{var_outcome}",
+                    context={
+                        "action": "exit",
+                        "lot_id": lot.get("lot_id"),
+                        "direction": direction,
+                        "qty": decimal_to_str(qty),
+                        "exit_side": exit_side,
+                    },
+                )
+                return
+            if isinstance(lighter_outcome, Exception):
+                await self.require_live_inventory_manual_review(
+                    asset=snapshot.asset,
+                    reason=f"exit_lighter_submit_exception:{lighter_outcome}",
+                    context={
+                        "action": "exit",
+                        "lot_id": lot.get("lot_id"),
+                        "direction": direction,
+                        "qty": decimal_to_str(qty),
+                        "exit_side": exit_side,
+                    },
+                )
+                return
+            var_result, var_submit_ms = var_outcome
+            lighter_result, lighter_submit_ms = lighter_outcome
+            if not var_result.get("ok"):
+                await self.require_live_inventory_manual_review(
+                    asset=snapshot.asset,
+                    reason=f"exit_var_submit_failed:{var_result.get('error') or 'unknown'}",
+                    context={
+                        "action": "exit",
+                        "lot_id": lot.get("lot_id"),
+                        "direction": direction,
+                        "qty": decimal_to_str(qty),
+                        "exit_side": exit_side,
+                        "var_result": var_result,
+                    },
+                )
+                return
+            lighter_record, lighter_payload = lighter_result
+            lighter_started = self.auto_live_eager_hedge_started(lighter_record)
+            if lighter_record is None or not lighter_started:
+                reason = "exit_lighter_submit_failed:unknown"
+                if lighter_record is not None:
+                    reason = "exit_lighter_submit_failed:" + (
+                        lighter_record.failure_reason or lighter_record.hedge_error or lighter_record.processing_stage or "unknown"
+                    )
+                await self.require_live_inventory_manual_review(
+                    asset=snapshot.asset,
+                    reason=reason,
+                    context={
+                        "action": "exit",
+                        "lot_id": lot.get("lot_id"),
+                        "direction": direction,
+                        "qty": decimal_to_str(qty),
+                        "exit_side": exit_side,
+                        "lighter_payload": lighter_payload,
+                    },
+                )
+                return
+        else:
+            var_submit_ms = None
+            lighter_submit_ms = None
+            lighter_payload = None
         if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
             pnl = (var_exit_price - entry_var_price) * qty + (entry_lighter_price - lighter_exit_price) * qty
         else:
@@ -3907,9 +4198,11 @@ class VariationalToLighterRuntime:
         self.live_inventory_open_lots.pop(0)
         self.live_inventory_realized_pnl_usd += pnl
         self.live_inventory_completed_cycles += 1
-        await self.persist_live_inventory_memory(reason="dry_exit_decision")
+        await self.persist_live_inventory_memory(
+            reason="dry_exit_decision" if self.live_inventory_dry_decisions else "exit_submitted"
+        )
         await self.append_live_inventory_log(
-            "live_inventory_dry_exited",
+            f"{event_prefix}_exited",
             {
                 "asset": snapshot.asset,
                 "lot_id": lot.get("lot_id"),
@@ -3921,10 +4214,13 @@ class VariationalToLighterRuntime:
                 "pnl_usd": decimal_to_str(pnl),
                 "pnl_bps": decimal_to_str(pnl_bps),
                 "holding_samples": holding_samples,
-                "exit_reason": "spread_reverted" if should_exit else "max_hold_samples",
+                "exit_reason": exit_reason,
                 "open_lots_total": len(self.live_inventory_open_lots),
                 "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
                 "completed_cycles": self.live_inventory_completed_cycles,
+                "var_submit_ms": var_submit_ms,
+                "lighter_submit_ms": lighter_submit_ms,
+                "exit_lighter_payload": lighter_payload,
             },
         )
 
