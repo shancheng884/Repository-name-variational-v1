@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from tools.analyze_auto_live_cycles import enrich_cycles_with_order_metrics, parse_runtime_log, print_summary
+from tools.analyze_auto_live_cycles import enrich_cycles_with_order_metrics, filter_cycles, parse_runtime_log, print_summary
 
 
 def test_parse_auto_live_success_and_manual_review_cycles(tmp_path: Path) -> None:
@@ -118,6 +118,10 @@ def test_order_metrics_enrich_fill_result_latency(tmp_path: Path, capsys) -> Non
     assert f"{cycles[0].exit_lighter_fill_ms:.3f}" == "302.200"
     assert cycles[0].entry_signal_to_both_filled_ms is not None
     assert cycles[0].exit_signal_to_both_filled_ms is not None
+    assert f"{cycles[0].entry_spread_usd:.2f}" == "100.00"
+    assert f"{cycles[0].exit_spread_usd:.2f}" == "-50.00"
+    assert f"{cycles[0].spread_capture_usd:.2f}" == "150.00"
+    assert f"{cycles[0].spread_capture_bps:.3f}" == "14.423"
     assert f"{cycles[0].gross_pnl_usd:.6f}" == "0.073500"
     assert f"{cycles[0].gross_pnl_bps:.3f}" == "14.423"
 
@@ -126,5 +130,45 @@ def test_order_metrics_enrich_fill_result_latency(tmp_path: Path, capsys) -> Non
     assert "entry_signal_to_both_filled_ms" in captured
     assert "exit_signal_to_both_filled_ms" in captured
     assert "gross pnl summary (fees assumed zero)" in captured
+    assert "spread_capture_usd" in captured
     assert "gross_pnl_usd" in captured
     assert "0.073500" in captured
+
+
+def test_filter_cycles_can_keep_recent_completed_pnl_cycles(tmp_path: Path) -> None:
+    log_path = tmp_path / "runtime.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "2026-06-05 06:42:58,276 | INFO | auto_live_entry_submitted cycle_id=1 asset=BTC direction=short_var_long_lighter qty=0.00049 var_side=SELL entry_total_ms=162.366",
+                "2026-06-05 06:43:16,448 | INFO | auto_live_exit_submitted cycle_id=1 asset=BTC side=BUY qty=0.00049 reason=spread_reverted exit_total_ms=134.559",
+                "2026-06-05 07:33:45,259 | INFO | auto_live_entry_submitted cycle_id=1 asset=BTC direction=long_var_short_lighter qty=0.00049 var_side=BUY entry_total_ms=147.260",
+                "2026-06-05 07:34:00,427 | INFO | auto_live_exit_submitted cycle_id=1 asset=BTC side=SELL qty=0.00049 reason=spread_reverted exit_total_ms=143.062",
+                "2026-06-05 07:42:42,305 | INFO | auto_live_entry_submitted cycle_id=1 asset=BTC direction=long_var_short_lighter qty=0.00048 var_side=BUY entry_total_ms=134.843",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    metrics_path = tmp_path / "order_metrics.jsonl"
+    metrics_path.write_text(
+        "\n".join(
+            [
+                '{"event":"lighter_fill","logged_at":"2026-06-05T06:42:58.600000+00:00","asset":"BTC","auto_live_cycle_id":1,"auto_live_role":"entry","variational_filled_at":"2026-06-05T06:42:58.420000Z","lighter_filled_at":"2026-06-05T06:42:58.600000+00:00","variational_filled_price":"104000","lighter_filled_price":"103900"}',
+                '{"event":"lighter_fill","logged_at":"2026-06-05T06:43:16.760000+00:00","asset":"BTC","auto_live_cycle_id":1,"auto_live_role":"exit","variational_filled_at":"2026-06-05T06:43:16.590000Z","lighter_filled_at":"2026-06-05T06:43:16.760000+00:00","variational_filled_price":"103800","lighter_filled_price":"103850"}',
+                '{"event":"lighter_fill","logged_at":"2026-06-05T07:33:45.580000+00:00","asset":"BTC","auto_live_cycle_id":1,"auto_live_role":"entry","variational_filled_at":"2026-06-05T07:33:45.420000Z","lighter_filled_at":"2026-06-05T07:33:45.580000+00:00","variational_filled_price":"62410.70","lighter_filled_price":"62445.00"}',
+                '{"event":"lighter_fill","logged_at":"2026-06-05T07:34:00.780000+00:00","asset":"BTC","auto_live_cycle_id":1,"auto_live_role":"exit","variational_filled_at":"2026-06-05T07:34:00.590000Z","lighter_filled_at":"2026-06-05T07:34:00.780000+00:00","variational_filled_price":"62416.11","lighter_filled_price":"62457.28"}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cycles = parse_runtime_log(log_path, {"BTC"})
+    enrich_cycles_with_order_metrics(cycles, metrics_path, {"BTC"})
+    filtered = filter_cycles(cycles, min_occurrence=2, completed_only=True, pnl_only=True)
+
+    assert len(filtered) == 1
+    assert filtered[0].occurrence == 2
+    assert filtered[0].status == "flat"
+    assert filtered[0].gross_pnl_usd is not None

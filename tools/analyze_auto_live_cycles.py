@@ -76,6 +76,10 @@ class Cycle:
     entry_lighter_fill_price: Decimal | None = None
     exit_var_fill_price: Decimal | None = None
     exit_lighter_fill_price: Decimal | None = None
+    entry_spread_usd: Decimal | None = None
+    exit_spread_usd: Decimal | None = None
+    spread_capture_usd: Decimal | None = None
+    spread_capture_bps: Decimal | None = None
     gross_pnl_usd: Decimal | None = None
     gross_pnl_bps: Decimal | None = None
 
@@ -153,38 +157,45 @@ def percentile_nearest_rank(values: list[Decimal], percentile: int) -> Decimal |
     return ordered[index]
 
 
-def compute_gross_pnl(cycle: Cycle) -> tuple[Decimal | None, Decimal | None]:
+def compute_spread_capture(cycle: Cycle) -> tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None]:
     qty = parse_decimal(cycle.qty)
     if qty is None:
-        return None, None
+        return None, None, None, None
     if (
         cycle.entry_var_fill_price is None
         or cycle.entry_lighter_fill_price is None
         or cycle.exit_var_fill_price is None
         or cycle.exit_lighter_fill_price is None
     ):
-        return None, None
+        return None, None, None, None
     if cycle.entry_var_fill_price == 0:
-        return None, None
+        return None, None, None, None
 
     entry_side = cycle.entry_side.strip().upper()
     if entry_side == "BUY":
-        pnl = qty * (
-            (cycle.exit_var_fill_price - cycle.entry_var_fill_price)
-            + (cycle.entry_lighter_fill_price - cycle.exit_lighter_fill_price)
-        )
+        entry_spread = cycle.entry_lighter_fill_price - cycle.entry_var_fill_price
+        exit_spread = cycle.exit_lighter_fill_price - cycle.exit_var_fill_price
     elif entry_side == "SELL":
-        pnl = qty * (
-            (cycle.entry_var_fill_price - cycle.exit_var_fill_price)
-            + (cycle.exit_lighter_fill_price - cycle.entry_lighter_fill_price)
-        )
+        entry_spread = cycle.entry_var_fill_price - cycle.entry_lighter_fill_price
+        exit_spread = cycle.exit_var_fill_price - cycle.exit_lighter_fill_price
     else:
-        return None, None
+        return None, None, None, None
 
+    spread_capture = entry_spread - exit_spread
     notional = qty * cycle.entry_var_fill_price
     if notional == 0:
+        return entry_spread, exit_spread, spread_capture, None
+    return entry_spread, exit_spread, spread_capture, (spread_capture / cycle.entry_var_fill_price) * Decimal("10000")
+
+
+def compute_gross_pnl(cycle: Cycle) -> tuple[Decimal | None, Decimal | None]:
+    qty = parse_decimal(cycle.qty)
+    if qty is None or cycle.spread_capture_usd is None:
+        return None, None
+    pnl = qty * cycle.spread_capture_usd
+    if cycle.entry_var_fill_price is None or cycle.entry_var_fill_price == 0:
         return pnl, None
-    return pnl, (pnl / notional) * Decimal("10000")
+    return pnl, (pnl / (qty * cycle.entry_var_fill_price)) * Decimal("10000")
 
 
 def cycle_sort_key(cycle: Cycle) -> tuple[str, datetime, int]:
@@ -404,6 +415,12 @@ def enrich_cycles_with_order_metrics(cycles: list[Cycle], order_metrics_path: Pa
             cycle.exit_lighter_fill_price = parse_decimal(str(payload.get("lighter_filled_price") or ""))
 
     for cycle in cycles:
+        (
+            cycle.entry_spread_usd,
+            cycle.exit_spread_usd,
+            cycle.spread_capture_usd,
+            cycle.spread_capture_bps,
+        ) = compute_spread_capture(cycle)
         cycle.gross_pnl_usd, cycle.gross_pnl_bps = compute_gross_pnl(cycle)
 
 
@@ -503,7 +520,8 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
         "exit_at exit_side exit_reason exit_precheck_status exit_precheck_edge_bps exit_precheck_reason "
         "exit_precheck_ms exit_var_submit_ms exit_lighter_submit_ms exit_total_ms "
         "exit_lighter_fill_ms exit_signal_to_both_filled_ms "
-        "entry_var_fill_price entry_lighter_fill_price exit_var_fill_price exit_lighter_fill_price gross_pnl_usd gross_pnl_bps "
+        "entry_var_fill_price entry_lighter_fill_price exit_var_fill_price exit_lighter_fill_price "
+        "entry_spread_usd exit_spread_usd spread_capture_usd spread_capture_bps gross_pnl_usd gross_pnl_bps "
         "manual_review_at manual_review_reason entry_precheck_failures"
     )
     for cycle in selected:
@@ -516,6 +534,7 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
             "{exit_precheck_ms} {exit_var_submit_ms} {exit_lighter_submit_ms} {exit_total_ms} "
             "{exit_lighter_fill_ms} {exit_signal_to_both_filled_ms} "
             "{entry_var_fill_price} {entry_lighter_fill_price} {exit_var_fill_price} {exit_lighter_fill_price} "
+            "{entry_spread_usd} {exit_spread_usd} {spread_capture_usd} {spread_capture_bps} "
             "{gross_pnl_usd} {gross_pnl_bps} "
             "{manual_at} {manual_reason} {entry_precheck_failures}".format(
                 asset=cycle.asset,
@@ -553,6 +572,10 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
                 entry_lighter_fill_price=fmt(cycle.entry_lighter_fill_price, 2),
                 exit_var_fill_price=fmt(cycle.exit_var_fill_price, 2),
                 exit_lighter_fill_price=fmt(cycle.exit_lighter_fill_price, 2),
+                entry_spread_usd=fmt(cycle.entry_spread_usd, 2),
+                exit_spread_usd=fmt(cycle.exit_spread_usd, 2),
+                spread_capture_usd=fmt(cycle.spread_capture_usd, 2),
+                spread_capture_bps=fmt(cycle.spread_capture_bps, 3),
                 gross_pnl_usd=fmt(cycle.gross_pnl_usd, 6),
                 gross_pnl_bps=fmt(cycle.gross_pnl_bps, 3),
                 manual_at=cycle.manual_review_at.isoformat(sep=" ") if cycle.manual_review_at else "-",
@@ -562,12 +585,26 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
         )
 
 
+def filter_cycles(cycles: list[Cycle], min_occurrence: int, completed_only: bool, pnl_only: bool) -> list[Cycle]:
+    filtered = cycles
+    if min_occurrence > 0:
+        filtered = [cycle for cycle in filtered if cycle.occurrence >= min_occurrence]
+    if completed_only:
+        filtered = [cycle for cycle in filtered if cycle.status == "flat"]
+    if pnl_only:
+        filtered = [cycle for cycle in filtered if cycle.gross_pnl_usd is not None]
+    return filtered
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze auto-live cycles from runtime.log.")
     parser.add_argument("--runtime-log", default="log/runtime.log", help="Path to runtime.log. Default: log/runtime.log")
     parser.add_argument("--order-metrics", default="", help="Optional path to order_metrics.jsonl for fill-result latency metrics.")
     parser.add_argument("--assets", default="", help="Optional comma-separated asset filter, e.g. BTC,SOL")
     parser.add_argument("--limit", type=int, default=30, help="Number of latest cycle detail rows to print. Use 0 for all.")
+    parser.add_argument("--min-occurrence", type=int, default=0, help="Only include cycles with occurrence >= this value.")
+    parser.add_argument("--completed-only", action="store_true", help="Only include flat cycles.")
+    parser.add_argument("--pnl-only", action="store_true", help="Only include cycles with computed PnL.")
     args = parser.parse_args()
 
     runtime_log = Path(args.runtime_log)
@@ -580,6 +617,7 @@ def main() -> int:
         if not order_metrics.exists():
             raise SystemExit(f"order metrics log not found: {order_metrics}")
         enrich_cycles_with_order_metrics(cycles, order_metrics, asset_filter)
+    cycles = filter_cycles(cycles, args.min_occurrence, args.completed_only, args.pnl_only)
     print_summary(cycles, runtime_log, args.limit)
     return 0
 
