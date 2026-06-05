@@ -72,6 +72,12 @@ class Cycle:
     exit_lighter_fill_ms: Decimal | None = None
     exit_signal_to_both_filled_ms: Decimal | None = None
     exit_total_ms: Decimal | None = None
+    entry_var_fill_price: Decimal | None = None
+    entry_lighter_fill_price: Decimal | None = None
+    exit_var_fill_price: Decimal | None = None
+    exit_lighter_fill_price: Decimal | None = None
+    gross_pnl_usd: Decimal | None = None
+    gross_pnl_bps: Decimal | None = None
 
     @property
     def status(self) -> str:
@@ -145,6 +151,40 @@ def percentile_nearest_rank(values: list[Decimal], percentile: int) -> Decimal |
     rank = math.ceil((Decimal(percentile) / Decimal("100")) * Decimal(len(ordered)))
     index = max(0, min(len(ordered) - 1, int(rank) - 1))
     return ordered[index]
+
+
+def compute_gross_pnl(cycle: Cycle) -> tuple[Decimal | None, Decimal | None]:
+    qty = parse_decimal(cycle.qty)
+    if qty is None:
+        return None, None
+    if (
+        cycle.entry_var_fill_price is None
+        or cycle.entry_lighter_fill_price is None
+        or cycle.exit_var_fill_price is None
+        or cycle.exit_lighter_fill_price is None
+    ):
+        return None, None
+    if cycle.entry_var_fill_price == 0:
+        return None, None
+
+    entry_side = cycle.entry_side.strip().upper()
+    if entry_side == "BUY":
+        pnl = qty * (
+            (cycle.exit_var_fill_price - cycle.entry_var_fill_price)
+            + (cycle.entry_lighter_fill_price - cycle.exit_lighter_fill_price)
+        )
+    elif entry_side == "SELL":
+        pnl = qty * (
+            (cycle.entry_var_fill_price - cycle.exit_var_fill_price)
+            + (cycle.exit_lighter_fill_price - cycle.entry_lighter_fill_price)
+        )
+    else:
+        return None, None
+
+    notional = qty * cycle.entry_var_fill_price
+    if notional == 0:
+        return pnl, None
+    return pnl, (pnl / notional) * Decimal("10000")
 
 
 def cycle_sort_key(cycle: Cycle) -> tuple[str, datetime, int]:
@@ -355,9 +395,16 @@ def enrich_cycles_with_order_metrics(cycles: list[Cycle], order_metrics_path: Pa
         if role == "entry":
             cycle.entry_lighter_fill_ms = lighter_fill_ms
             cycle.entry_signal_to_both_filled_ms = signal_to_both_ms
+            cycle.entry_var_fill_price = parse_decimal(str(payload.get("variational_filled_price") or ""))
+            cycle.entry_lighter_fill_price = parse_decimal(str(payload.get("lighter_filled_price") or ""))
         else:
             cycle.exit_lighter_fill_ms = lighter_fill_ms
             cycle.exit_signal_to_both_filled_ms = signal_to_both_ms
+            cycle.exit_var_fill_price = parse_decimal(str(payload.get("variational_filled_price") or ""))
+            cycle.exit_lighter_fill_price = parse_decimal(str(payload.get("lighter_filled_price") or ""))
+
+    for cycle in cycles:
+        cycle.gross_pnl_usd, cycle.gross_pnl_bps = compute_gross_pnl(cycle)
 
 
 def timedelta_ms(value: Decimal):
@@ -424,6 +471,27 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
             )
         )
 
+    pnl_cycles = [cycle for cycle in cycles if cycle.gross_pnl_usd is not None]
+    print()
+    print("gross pnl summary (fees not included)")
+    if not pnl_cycles:
+        print("none")
+    else:
+        gross_values = [cycle.gross_pnl_usd for cycle in pnl_cycles if cycle.gross_pnl_usd is not None]
+        bps_values = [cycle.gross_pnl_bps for cycle in pnl_cycles if cycle.gross_pnl_bps is not None]
+        winners = [value for value in gross_values if value > 0]
+        losers = [value for value in gross_values if value < 0]
+        print(
+            "cycles={count} total_usd={total} avg_usd={avg} winners={winners} losers={losers} avg_bps={avg_bps}".format(
+                count=len(gross_values),
+                total=fmt(sum(gross_values), 6),
+                avg=fmt(sum(gross_values) / Decimal(len(gross_values)), 6),
+                winners=len(winners),
+                losers=len(losers),
+                avg_bps=fmt(sum(bps_values) / Decimal(len(bps_values)) if bps_values else None, 3),
+            )
+        )
+
     selected = cycles[-limit:] if limit > 0 else cycles
     print()
     print("cycle details")
@@ -435,6 +503,7 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
         "exit_at exit_side exit_reason exit_precheck_status exit_precheck_edge_bps exit_precheck_reason "
         "exit_precheck_ms exit_var_submit_ms exit_lighter_submit_ms exit_total_ms "
         "exit_lighter_fill_ms exit_signal_to_both_filled_ms "
+        "entry_var_fill_price entry_lighter_fill_price exit_var_fill_price exit_lighter_fill_price gross_pnl_usd gross_pnl_bps "
         "manual_review_at manual_review_reason entry_precheck_failures"
     )
     for cycle in selected:
@@ -446,6 +515,8 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
             "{exit_at} {exit_side} {exit_reason} {exit_precheck_status} {exit_edge} {exit_precheck_reason} "
             "{exit_precheck_ms} {exit_var_submit_ms} {exit_lighter_submit_ms} {exit_total_ms} "
             "{exit_lighter_fill_ms} {exit_signal_to_both_filled_ms} "
+            "{entry_var_fill_price} {entry_lighter_fill_price} {exit_var_fill_price} {exit_lighter_fill_price} "
+            "{gross_pnl_usd} {gross_pnl_bps} "
             "{manual_at} {manual_reason} {entry_precheck_failures}".format(
                 asset=cycle.asset,
                 cycle_id=cycle.cycle_id,
@@ -478,6 +549,12 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
                 exit_total_ms=fmt(cycle.exit_total_ms, 3),
                 exit_lighter_fill_ms=fmt(cycle.exit_lighter_fill_ms, 3),
                 exit_signal_to_both_filled_ms=fmt(cycle.exit_signal_to_both_filled_ms, 3),
+                entry_var_fill_price=fmt(cycle.entry_var_fill_price, 2),
+                entry_lighter_fill_price=fmt(cycle.entry_lighter_fill_price, 2),
+                exit_var_fill_price=fmt(cycle.exit_var_fill_price, 2),
+                exit_lighter_fill_price=fmt(cycle.exit_lighter_fill_price, 2),
+                gross_pnl_usd=fmt(cycle.gross_pnl_usd, 6),
+                gross_pnl_bps=fmt(cycle.gross_pnl_bps, 3),
                 manual_at=cycle.manual_review_at.isoformat(sep=" ") if cycle.manual_review_at else "-",
                 manual_reason=cycle.manual_review_reason or "-",
                 entry_precheck_failures=cycle.entry_precheck_failures,

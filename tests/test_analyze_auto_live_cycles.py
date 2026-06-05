@@ -102,8 +102,8 @@ def test_order_metrics_enrich_fill_result_latency(tmp_path: Path, capsys) -> Non
     metrics_path.write_text(
         "\n".join(
             [
-                '{"event":"lighter_fill","logged_at":"2026-06-05T06:42:58.600000+00:00","asset":"BTC","auto_live_cycle_id":1,"auto_live_role":"entry","synthetic_eager_fill":true,"variational_filled_at":"2026-06-05T06:42:58.420000Z","lighter_filled_at":"2026-06-05T06:42:58.600000+00:00","live_submit_sent_to_fill_ms":"305.1"}',
-                '{"event":"lighter_fill","logged_at":"2026-06-05T06:43:16.760000+00:00","asset":"BTC","auto_live_cycle_id":1,"auto_live_role":"exit","synthetic_eager_fill":true,"variational_filled_at":"2026-06-05T06:43:16.590000Z","lighter_filled_at":"2026-06-05T06:43:16.760000+00:00","live_submit_sent_to_fill_ms":"302.2"}',
+                '{"event":"lighter_fill","logged_at":"2026-06-05T06:42:58.600000+00:00","asset":"BTC","auto_live_cycle_id":1,"auto_live_role":"entry","synthetic_eager_fill":true,"variational_filled_at":"2026-06-05T06:42:58.420000Z","lighter_filled_at":"2026-06-05T06:42:58.600000+00:00","live_submit_sent_to_fill_ms":"305.1","variational_filled_price":"104000","lighter_filled_price":"103900"}',
+                '{"event":"lighter_fill","logged_at":"2026-06-05T06:43:16.760000+00:00","asset":"BTC","auto_live_cycle_id":1,"auto_live_role":"exit","synthetic_eager_fill":true,"variational_filled_at":"2026-06-05T06:43:16.590000Z","lighter_filled_at":"2026-06-05T06:43:16.760000+00:00","live_submit_sent_to_fill_ms":"302.2","variational_filled_price":"103800","lighter_filled_price":"103850"}',
             ]
         )
         + "\n",
@@ -118,8 +118,13 @@ def test_order_metrics_enrich_fill_result_latency(tmp_path: Path, capsys) -> Non
     assert f"{cycles[0].exit_lighter_fill_ms:.3f}" == "302.200"
     assert cycles[0].entry_signal_to_both_filled_ms is not None
     assert cycles[0].exit_signal_to_both_filled_ms is not None
+    assert f"{cycles[0].gross_pnl_usd:.6f}" == "0.073500"
+    assert f"{cycles[0].gross_pnl_bps:.3f}" == "14.423"
 
     print_summary(cycles, log_path, limit=30)
     captured = capsys.readouterr().out
     assert "entry_signal_to_both_filled_ms" in captured
     assert "exit_signal_to_both_filled_ms" in captured
+    assert "gross pnl summary (fees not included)" in captured
+    assert "gross_pnl_usd" in captured
+    assert "0.073500" in captured
