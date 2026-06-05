@@ -1,3 +1,5 @@
+import { buildVariationalApiScript } from "./var_api.js";
+
 const DEBUGGER_VERSION = "1.3";
 const MAX_QUEUE_SIZE = 1000;
 const AUTO_RELOAD_COOLDOWN_MS = 5000;
@@ -455,9 +457,54 @@ async function handleCommandSocketMessage(data) {
     await handlePrepareOrderInputSweepDryRun(payload);
     return;
   }
+  if (type === "VAR_API_POSITIONS") {
+    await handleVariationalApiCommand(payload, "POSITIONS", "VAR_API_POSITIONS_RESULT");
+    return;
+  }
+  if (type === "VAR_API_QUOTE") {
+    await handleVariationalApiCommand(payload, "QUOTE", "VAR_API_QUOTE_RESULT");
+    return;
+  }
+  if (type === "VAR_API_ORDER") {
+    await handleVariationalApiCommand(payload, "ORDER", "VAR_API_ORDER_RESULT");
+    return;
+  }
   if (type === "PLACE_ORDER") {
     await handlePlaceOrder(payload);
     return;
+  }
+}
+
+async function handleVariationalApiCommand(payload, action, resultType) {
+  const requestId = payload.requestId;
+  try {
+    if (state.attachedTabId == null) {
+      throw new Error("No attached tab.");
+    }
+    const result = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
+      expression: buildVariationalApiScript(action, payload),
+      returnByValue: true,
+      awaitPromise: true,
+      userGesture: true
+    });
+    const value = result.result?.value || null;
+    const exceptionText = result.exceptionDetails?.exception?.description || result.exceptionDetails?.text || "";
+    commandForwarder.send({
+      type: resultType,
+      requestId,
+      ok: Boolean(value?.ok) && !exceptionText,
+      result: value,
+      error: exceptionText || value?.error || "",
+      timestamp: nowIso()
+    });
+  } catch (error) {
+    commandForwarder.send({
+      type: resultType,
+      requestId,
+      ok: false,
+      error: error.message,
+      timestamp: nowIso()
+    });
   }
 }
 

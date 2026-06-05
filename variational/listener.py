@@ -867,6 +867,9 @@ class CommandBroker:
         if msg_type == "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN":
             await self._handle_prepare_order_input_sweep_dry_run(websocket, payload)
             return
+        if msg_type in {"VAR_API_POSITIONS", "VAR_API_QUOTE", "VAR_API_ORDER"}:
+            await self._handle_var_api_command(websocket, payload, msg_type, f"{msg_type}_RESULT")
+            return
         if msg_type == "PLACE_ORDER":
             await self._handle_place_order(websocket, payload)
             return
@@ -877,6 +880,9 @@ class CommandBroker:
             "PREPARE_ORDER_DRY_RUN_RESULT",
             "PREPARE_ORDER_KEYBOARD_DRY_RUN_RESULT",
             "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN_RESULT",
+            "VAR_API_POSITIONS_RESULT",
+            "VAR_API_QUOTE_RESULT",
+            "VAR_API_ORDER_RESULT",
         }:
             await self._handle_command_result(payload)
             return
@@ -970,6 +976,34 @@ class CommandBroker:
             "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN",
             "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN_RESULT",
         )
+
+    async def _handle_var_api_command(
+        self,
+        websocket: websockets.ServerConnection,
+        payload: dict[str, Any],
+        command_type: str,
+        result_type: str,
+    ) -> None:
+        request_id = str(payload.get("requestId") or uuid.uuid4())
+        async with self._lock:
+            extension = self._extension
+            if extension is None:
+                await self._send(
+                    websocket,
+                    {
+                        "type": result_type,
+                        "requestId": request_id,
+                        "ok": False,
+                        "error": "No extension command client connected.",
+                        "timestamp": utc_now(),
+                    },
+                )
+                return
+
+            self._pending_requests[request_id] = websocket
+            forward_payload = dict(payload)
+            forward_payload.update({"type": command_type, "requestId": request_id, "timestamp": utc_now()})
+            await self._send(extension, forward_payload)
 
     async def _forward_order_command(
         self,
