@@ -57,6 +57,9 @@ LIGHTER_SUBMIT_TRANSPORT_CHOICES = (LIGHTER_SUBMIT_TRANSPORT_HTTP, LIGHTER_SUBMI
 LIGHTER_ORDER_MODE_LIMIT_GTT = "limit-gtt"
 LIGHTER_ORDER_MODE_MARKET_IOC = "market-ioc"
 LIGHTER_ORDER_MODE_CHOICES = (LIGHTER_ORDER_MODE_LIMIT_GTT, LIGHTER_ORDER_MODE_MARKET_IOC)
+VARIATIONAL_SUBMIT_TRANSPORT_DOM = "dom"
+VARIATIONAL_SUBMIT_TRANSPORT_API = "api"
+VARIATIONAL_SUBMIT_TRANSPORT_CHOICES = (VARIATIONAL_SUBMIT_TRANSPORT_DOM, VARIATIONAL_SUBMIT_TRANSPORT_API)
 
 STAGE_EVENT_RECEIVED = "event_received"
 STAGE_EVENT_FILTERED = "event_filtered"
@@ -131,6 +134,7 @@ DEFAULT_AUTO_LIVE_MATCH_WINDOW_SECONDS = 10.0
 DEFAULT_AUTO_LIVE_MIN_HOLDING_SECONDS = 15.0
 DEFAULT_AUTO_LIVE_COOLDOWN_SECONDS = 60.0
 DEFAULT_AUTO_LIVE_MAX_CYCLES = 1
+DEFAULT_VARIATIONAL_API_MAX_SLIPPAGE = 0.005
 LIGHTER_INIT_RETRY_ATTEMPTS = 3
 LIGHTER_INIT_RETRY_DELAY_SECONDS = 1.0
 VAR_QUOTE_DIAGNOSTIC_INTERVAL_SECONDS = 30.0
@@ -724,6 +728,8 @@ class VariationalToLighterRuntime:
             side.strip().lower() for side in str(args.live_allowed_sides).split(",") if side.strip()
         }
         self.live_submit_timeout_seconds = float(args.live_submit_timeout_seconds)
+        self.variational_submit_transport = args.variational_submit_transport
+        self.variational_api_max_slippage = float(args.variational_api_max_slippage)
         self.lighter_submit_transport = args.lighter_submit_transport
         self.lighter_order_mode = args.lighter_order_mode
         self.lighter_prewarm_submit_ws = bool(args.lighter_prewarm_submit_ws)
@@ -1060,6 +1066,16 @@ class VariationalToLighterRuntime:
             "require_min_edge_bps": decimal_to_str(self.live_require_min_edge_bps),
             "cooldown_seconds": self.live_cooldown_seconds,
             "submit_timeout_seconds": self.live_submit_timeout_seconds,
+            "variational_submit_transport": getattr(
+                self,
+                "variational_submit_transport",
+                VARIATIONAL_SUBMIT_TRANSPORT_DOM,
+            ),
+            "variational_api_max_slippage": getattr(
+                self,
+                "variational_api_max_slippage",
+                DEFAULT_VARIATIONAL_API_MAX_SLIPPAGE,
+            ),
             "lighter_submit_transport": getattr(
                 self,
                 "lighter_submit_transport",
@@ -1140,6 +1156,9 @@ class VariationalToLighterRuntime:
         passed.append(f"risk_guard_max_price_deviation_bps={self.risk_guard_max_price_deviation_bps}")
         passed.append(
             f"lighter_submit_transport={getattr(self, 'lighter_submit_transport', LIGHTER_SUBMIT_TRANSPORT_HTTP)}"
+        )
+        passed.append(
+            f"variational_submit_transport={getattr(self, 'variational_submit_transport', VARIATIONAL_SUBMIT_TRANSPORT_DOM)}"
         )
         passed.append(f"lighter_order_mode={getattr(self, 'lighter_order_mode', LIGHTER_ORDER_MODE_LIMIT_GTT)}")
         passed.append(f"lighter_prewarm_submit_ws={getattr(self, 'lighter_prewarm_submit_ws', False)}")
@@ -1579,18 +1598,24 @@ class VariationalToLighterRuntime:
     async def send_variational_place_order(
         self,
         *,
+        asset: str,
         side: str,
         amount: str,
         expected_min_btc_qty: Decimal | None,
         confirm: bool,
+        reduce_only: bool = False,
     ) -> dict[str, Any]:
         request_id = str(int(time.time() * 1000))
+        use_api = self.variational_submit_transport == VARIATIONAL_SUBMIT_TRANSPORT_API
         payload = {
-            "type": "PLACE_ORDER",
+            "type": "VAR_API_ORDER" if use_api and confirm else "VAR_API_QUOTE" if use_api else "PLACE_ORDER",
             "requestId": request_id,
             "side": side.upper(),
+            "market": asset.upper(),
             "amount": amount,
             "confirm": bool(confirm),
+            "maxSlippage": self.variational_api_max_slippage,
+            "reduceOnly": bool(reduce_only),
             "expectedMinBtcQty": decimal_to_str(expected_min_btc_qty) if expected_min_btc_qty is not None else "0",
         }
         async with self._var_command_ws_lock:
@@ -3488,12 +3513,13 @@ class VariationalToLighterRuntime:
                     decimal_to_str(precheck_edge_bps) or "-",
                     entry_precheck_ms,
                 )
-            if self.auto_live_skip_entry_preview:
+            if self.auto_live_skip_entry_preview or self.variational_submit_transport == VARIATIONAL_SUBMIT_TRANSPORT_API:
                 entry_var_preview_ms = "skipped"
             else:
                 entry_var_preview_started = time.monotonic()
                 try:
                     precheck = await self.send_variational_place_order(
+                        asset=snapshot.asset,
                         side=var_side,
                         amount=decimal_to_str(order_qty) or str(order_qty),
                         expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
@@ -3525,10 +3551,12 @@ class VariationalToLighterRuntime:
             entry_var_task = asyncio.create_task(
                 self._timed_submit(
                     self.send_variational_place_order(
+                        asset=snapshot.asset,
                         side=var_side,
                         amount=decimal_to_str(order_qty) or str(order_qty),
                         expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
                         confirm=True,
+                        reduce_only=False,
                     )
                 )
             )
@@ -3790,10 +3818,12 @@ class VariationalToLighterRuntime:
         exit_var_task = asyncio.create_task(
             self._timed_submit(
                 self.send_variational_place_order(
+                    asset=snapshot.asset,
                     side=exit_side,
                     amount=decimal_to_str(position.planned_qty) or str(position.planned_qty),
                     expected_min_btc_qty=position.planned_qty if snapshot.asset.upper() == "BTC" else None,
                     confirm=True,
+                    reduce_only=True,
                 )
             )
         )
@@ -4575,6 +4605,18 @@ def parse_args() -> argparse.Namespace:
             "Maximum time to wait for a live hedge to reach lighter_filled before marking it timed out. "
             f"Default: {DEFAULT_LIVE_SUBMIT_TIMEOUT_SECONDS}"
         ),
+    )
+    parser.add_argument(
+        "--variational-submit-transport",
+        choices=VARIATIONAL_SUBMIT_TRANSPORT_CHOICES,
+        default=VARIATIONAL_SUBMIT_TRANSPORT_DOM,
+        help="Transport for auto-live Variational submits. Default: dom; use api to call the page API through the Chrome session.",
+    )
+    parser.add_argument(
+        "--variational-api-max-slippage",
+        type=float,
+        default=DEFAULT_VARIATIONAL_API_MAX_SLIPPAGE,
+        help=f"Max slippage sent to Variational page API market orders. Default: {DEFAULT_VARIATIONAL_API_MAX_SLIPPAGE}",
     )
     parser.add_argument(
         "--lighter-submit-transport",
