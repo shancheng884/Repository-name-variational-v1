@@ -45,6 +45,7 @@ from paper_engine import (
     paper_lighter_taker_cost_usd,
     paper_var_spread_cost_usd,
 )
+from inventory_engine import DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER, PaperInventoryEngine
 
 MODE_OBSERVE = "observe"
 MODE_DRY_RUN = "dry-run"
@@ -109,6 +110,7 @@ OUTPUT_DIR = LOG_DIR
 APP_LOG_FILE = LOG_DIR / "runtime.log"
 TRADE_RECORDS_CSV_FILE = LOG_DIR / "trade_records.csv"
 MARKET_SAMPLES_FILE = LOG_DIR / "market_samples.jsonl"
+INVENTORY_PAPER_FILE = LOG_DIR / "inventory_paper.jsonl"
 INSTANCE_LOCK_FILE = LOG_DIR / "main.instance.lock"
 AUTO_LIVE_STATE_FILE = LOG_DIR / "auto_live_state.json"
 READY_TIMEOUT_SECONDS = 60.0
@@ -728,6 +730,19 @@ class VariationalToLighterRuntime:
         self.paper_interval_seconds = float(args.paper_interval_seconds)
         self.paper_fee_bps_per_leg = Decimal(str(args.paper_fee_bps_per_leg))
         self.paper_latency_drift_bps = Decimal(str(args.paper_latency_drift_bps))
+        self.paper_inventory = bool(args.paper_inventory)
+        self.paper_inventory_sample_index = 0
+        self.paper_inventory_engine = (
+            PaperInventoryEngine(
+                lot_notional_usd=Decimal(str(args.paper_inventory_lot_notional_usd)),
+                max_lots=int(args.paper_inventory_max_lots),
+                entry_bps=Decimal(str(args.paper_inventory_entry_bps)),
+                exit_bps=Decimal(str(args.paper_inventory_exit_bps)),
+                min_hold_samples=int(args.paper_inventory_min_hold_samples),
+            )
+            if self.paper_inventory
+            else None
+        )
         self.ticker: str | None = None
         self.variational_ticker: str | None = None
         self.accepted_assets: set[str] = set()
@@ -769,6 +784,7 @@ class VariationalToLighterRuntime:
         self.orders_file = output_dir / "order_metrics.jsonl" if output_dir else None
         self.opportunities_file = output_dir / "opportunities.jsonl" if output_dir else None
         self.market_samples_file = output_dir / MARKET_SAMPLES_FILE.name if output_dir else None
+        self.inventory_paper_file = output_dir / INVENTORY_PAPER_FILE.name if output_dir else None
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
         self.auto_live_state_file = output_dir / AUTO_LIVE_STATE_FILE.name if output_dir else None
         self._order_write_lock = asyncio.Lock()
@@ -2338,6 +2354,14 @@ class VariationalToLighterRuntime:
             await asyncio.to_thread(self.market_samples_file.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(self._append_line, self.market_samples_file, line)
 
+    async def append_inventory_paper_log(self, payload: dict[str, Any]) -> None:
+        if self.inventory_paper_file is None:
+            return
+        line = json.dumps({"logged_at": utc_now(), **payload}, ensure_ascii=True) + "\n"
+        async with self._opportunity_write_lock:
+            await asyncio.to_thread(self.inventory_paper_file.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(self._append_line, self.inventory_paper_file, line)
+
     @staticmethod
     def _append_line(path: Path, line: str) -> None:
         with path.open("a", encoding="utf-8") as handle:
@@ -3582,6 +3606,63 @@ class VariationalToLighterRuntime:
             },
         )
 
+    async def maybe_run_paper_inventory(self, snapshot: CrossSpreadSnapshot) -> None:
+        engine = self.paper_inventory_engine
+        if engine is None:
+            return
+        self.paper_inventory_sample_index += 1
+        index = self.paper_inventory_sample_index
+        directions = (
+            (
+                DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                decimal_percent_to_bps(snapshot.long_var_short_lighter_pct),
+                snapshot.var_buy_price or snapshot.var_mid,
+                snapshot.lighter_sell_fill_price,
+                snapshot.var_sell_price or snapshot.var_mid,
+                snapshot.lighter_buy_fill_price,
+            ),
+            (
+                DIRECTION_SHORT_VAR_LONG_LIGHTER,
+                decimal_percent_to_bps(snapshot.short_var_long_lighter_pct),
+                snapshot.var_sell_price or snapshot.var_mid,
+                snapshot.lighter_buy_fill_price,
+                snapshot.var_buy_price or snapshot.var_mid,
+                snapshot.lighter_sell_fill_price,
+            ),
+        )
+        for direction, edge_bps, var_entry, lighter_entry, var_exit, lighter_exit in directions:
+            if edge_bps is None:
+                continue
+            events = engine.on_sample(
+                direction=direction,
+                edge_bps=edge_bps,
+                var_entry_price=var_entry,
+                lighter_entry_price=lighter_entry,
+                var_exit_price=var_exit,
+                lighter_exit_price=lighter_exit,
+                logged_at=utc_now(),
+                sample_index=index,
+            )
+            for event in events:
+                await self.append_inventory_paper_log(
+                    {
+                        "event": event.event,
+                        "asset": snapshot.asset,
+                        "direction": event.direction,
+                        "lot_id": event.lot_id,
+                        "qty": decimal_to_str(event.qty),
+                        "edge_bps": decimal_to_str(event.edge_bps),
+                        "var_price": decimal_to_str(event.var_price),
+                        "lighter_price": decimal_to_str(event.lighter_price),
+                        "pnl_usd": decimal_to_str(event.pnl_usd),
+                        "pnl_bps": decimal_to_str(event.pnl_bps),
+                        "holding_samples": event.holding_samples,
+                        "open_lots_total": engine.open_lots(),
+                        "open_lots_direction": engine.open_lots(event.direction),
+                        "realized_pnl_usd": decimal_to_str(engine.realized_pnl_usd),
+                    }
+                )
+
     async def maybe_run_auto_live(self, snapshot: CrossSpreadSnapshot) -> None:
         if not self.is_auto_live_enabled():
             return
@@ -4278,6 +4359,7 @@ class VariationalToLighterRuntime:
                 snapshot = await self.get_cross_spread_snapshot()
                 if snapshot is not None:
                     await self.append_market_sample(snapshot)
+                    await self.maybe_run_paper_inventory(snapshot)
                     await self.maybe_close_paper_position(snapshot)
                     await self.maybe_enter_paper_position(snapshot)
                     await self.maybe_run_auto_live(snapshot)
@@ -5070,6 +5152,12 @@ def parse_args() -> argparse.Namespace:
         default=float(DEFAULT_PAPER_LATENCY_DRIFT_BPS),
         help=f"Paper-mode extra latency drift penalty in bps per side. Default: {DEFAULT_PAPER_LATENCY_DRIFT_BPS}",
     )
+    parser.add_argument("--paper-inventory", action="store_true", help="Enable paper-only layered inventory simulation.")
+    parser.add_argument("--paper-inventory-lot-notional-usd", type=float, default=50.0)
+    parser.add_argument("--paper-inventory-max-lots", type=int, default=5)
+    parser.add_argument("--paper-inventory-entry-bps", type=float, default=40.0)
+    parser.add_argument("--paper-inventory-exit-bps", type=float, default=10.0)
+    parser.add_argument("--paper-inventory-min-hold-samples", type=int, default=3)
     args = parser.parse_args()
     if args.mode == MODE_LIVE and not args.confirm_live:
         parser.error("--mode live requires --confirm-live")
@@ -5091,6 +5179,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--auto-live-cooldown-seconds must be >= 0")
     if args.auto_live_max_cycles < 0:
         parser.error("--auto-live-max-cycles must be >= 0")
+    if args.paper_inventory_lot_notional_usd <= 0:
+        parser.error("--paper-inventory-lot-notional-usd must be > 0")
+    if args.paper_inventory_max_lots <= 0:
+        parser.error("--paper-inventory-max-lots must be > 0")
+    if args.paper_inventory_min_hold_samples < 0:
+        parser.error("--paper-inventory-min-hold-samples must be >= 0")
     live_allowed_sides = {side.strip().lower() for side in str(args.live_allowed_sides).split(",") if side.strip()}
     invalid_live_allowed_sides = sorted(live_allowed_sides - {"buy", "sell"})
     if invalid_live_allowed_sides:
