@@ -1607,6 +1607,14 @@ class VariationalToLighterRuntime:
         raise ValueError(f"Unsupported auto-live direction: {direction}")
 
     @staticmethod
+    def variational_api_quote_execution_price(side: str, quote_result: dict[str, Any]) -> Decimal | None:
+        bid = to_decimal(quote_result.get("bid"))
+        ask = to_decimal(quote_result.get("ask"))
+        if side.strip().upper() == "BUY":
+            return ask
+        return bid
+
+    @staticmethod
     def _opposite_var_side(side: str) -> str:
         return "SELL" if side.strip().upper() == "BUY" else "BUY"
 
@@ -3577,6 +3585,47 @@ class VariationalToLighterRuntime:
                 return
             var_side = self._auto_live_direction_to_var_side(direction)
             actionable_var_price = (snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price) or snapshot.var_mid
+            actionable_var_price_source = "snapshot"
+            if (
+                self.auto_live_entry_min_actionable_edge_bps > 0
+                and self.variational_submit_transport == VARIATIONAL_SUBMIT_TRANSPORT_API
+            ):
+                refresh_started = time.monotonic()
+                try:
+                    quote_result = await self.send_variational_place_order(
+                        asset=snapshot.asset,
+                        side=var_side,
+                        amount=decimal_to_str(order_qty) or str(order_qty),
+                        expected_min_btc_qty=order_qty if snapshot.asset.upper() == "BTC" else None,
+                        confirm=False,
+                    )
+                    refreshed_price = self.variational_api_quote_execution_price(var_side, quote_result)
+                    if quote_result.get("ok") and refreshed_price is not None:
+                        actionable_var_price = refreshed_price
+                        actionable_var_price_source = "variational_api_quote"
+                    else:
+                        self.logger.info(
+                            "auto_live_entry_actionable_quote_refresh_failed cycle_id=%s asset=%s direction=%s var_side=%s "
+                            "duration_ms=%s ok=%s error=%s action=use_snapshot_price",
+                            cycle_id,
+                            snapshot.asset,
+                            direction,
+                            var_side,
+                            elapsed_ms_str(refresh_started),
+                            quote_result.get("ok"),
+                            quote_result.get("error") or quote_result.get("step") or "missing_price",
+                        )
+                except Exception as exc:
+                    self.logger.info(
+                        "auto_live_entry_actionable_quote_refresh_failed cycle_id=%s asset=%s direction=%s var_side=%s "
+                        "duration_ms=%s error=%s action=use_snapshot_price",
+                        cycle_id,
+                        snapshot.asset,
+                        direction,
+                        var_side,
+                        elapsed_ms_str(refresh_started),
+                        exc,
+                    )
             lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
             actionable_edge_bps = self.auto_live_entry_actionable_edge_bps(
                 direction,
@@ -3588,12 +3637,13 @@ class VariationalToLighterRuntime:
                 if actionable_edge_bps is None:
                     self.logger.info(
                         "auto_live_entry_actionable_edge_checked cycle_id=%s asset=%s direction=%s var_side=%s "
-                        "var_price=%s lighter_bid=%s lighter_ask=%s edge_bps=- threshold_bps=%s action=skip_var_entry reason=edge_unavailable",
+                        "var_price=%s var_price_source=%s lighter_bid=%s lighter_ask=%s edge_bps=- threshold_bps=%s action=skip_var_entry reason=edge_unavailable",
                         cycle_id,
                         snapshot.asset,
                         direction,
                         var_side,
                         decimal_to_str(actionable_var_price) or "-",
+                        actionable_var_price_source,
                         decimal_to_str(lighter_bid) or "-",
                         decimal_to_str(lighter_ask) or "-",
                         decimal_to_str(self.auto_live_entry_min_actionable_edge_bps),
@@ -3602,12 +3652,13 @@ class VariationalToLighterRuntime:
                 if actionable_edge_bps < self.auto_live_entry_min_actionable_edge_bps:
                     self.logger.info(
                         "auto_live_entry_actionable_edge_checked cycle_id=%s asset=%s direction=%s var_side=%s "
-                        "var_price=%s lighter_bid=%s lighter_ask=%s edge_bps=%s threshold_bps=%s action=skip_var_entry reason=edge_below_threshold",
+                        "var_price=%s var_price_source=%s lighter_bid=%s lighter_ask=%s edge_bps=%s threshold_bps=%s action=skip_var_entry reason=edge_below_threshold",
                         cycle_id,
                         snapshot.asset,
                         direction,
                         var_side,
                         decimal_to_str(actionable_var_price) or "-",
+                        actionable_var_price_source,
                         decimal_to_str(lighter_bid) or "-",
                         decimal_to_str(lighter_ask) or "-",
                         decimal_to_str(actionable_edge_bps) or "-",
@@ -3616,12 +3667,13 @@ class VariationalToLighterRuntime:
                     return
             self.logger.info(
                 "auto_live_entry_actionable_edge_checked cycle_id=%s asset=%s direction=%s var_side=%s "
-                "var_price=%s lighter_bid=%s lighter_ask=%s edge_bps=%s threshold_bps=%s action=pass",
+                "var_price=%s var_price_source=%s lighter_bid=%s lighter_ask=%s edge_bps=%s threshold_bps=%s action=pass",
                 cycle_id,
                 snapshot.asset,
                 direction,
                 var_side,
                 decimal_to_str(actionable_var_price) or "-",
+                actionable_var_price_source,
                 decimal_to_str(lighter_bid) or "-",
                 decimal_to_str(lighter_ask) or "-",
                 decimal_to_str(actionable_edge_bps) or "-",
@@ -3632,7 +3684,7 @@ class VariationalToLighterRuntime:
             entry_var_submit_ms = "-"
             entry_lighter_submit_ms = "-"
             if self.auto_live_eager_hedge:
-                precheck_price = snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price or snapshot.var_mid
+                precheck_price = actionable_var_price
                 entry_precheck_started = time.monotonic()
                 precheck_ok, precheck_reason, precheck_edge_bps = await self.auto_live_lighter_precheck(
                     asset=snapshot.asset,
@@ -3750,7 +3802,7 @@ class VariationalToLighterRuntime:
                             asset=snapshot.asset,
                             side=var_side,
                             qty=order_qty,
-                            var_fill_price=snapshot.var_buy_price if var_side == "BUY" else snapshot.var_sell_price or snapshot.var_mid,
+                            var_fill_price=actionable_var_price,
                             cycle_id=cycle_id,
                             role="entry",
                         )

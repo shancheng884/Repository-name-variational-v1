@@ -122,6 +122,16 @@ def test_auto_live_entry_actionable_edge_uses_taker_prices() -> None:
     assert f"{bad_short_edge:.3f}" == "-8.000"
 
 
+def test_variational_api_quote_execution_price_uses_side() -> None:
+    quote = {"bid": "99990", "ask": "100010"}
+
+    buy_price = VariationalToLighterRuntime.variational_api_quote_execution_price("BUY", quote)
+    sell_price = VariationalToLighterRuntime.variational_api_quote_execution_price("SELL", quote)
+
+    assert buy_price == Decimal("100010")
+    assert sell_price == Decimal("99990")
+
+
 def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_path) -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
