@@ -108,6 +108,7 @@ LOG_DIR = Path("./log")
 OUTPUT_DIR = LOG_DIR
 APP_LOG_FILE = LOG_DIR / "runtime.log"
 TRADE_RECORDS_CSV_FILE = LOG_DIR / "trade_records.csv"
+MARKET_SAMPLES_FILE = LOG_DIR / "market_samples.jsonl"
 INSTANCE_LOCK_FILE = LOG_DIR / "main.instance.lock"
 AUTO_LIVE_STATE_FILE = LOG_DIR / "auto_live_state.json"
 READY_TIMEOUT_SECONDS = 60.0
@@ -767,6 +768,7 @@ class VariationalToLighterRuntime:
 
         self.orders_file = output_dir / "order_metrics.jsonl" if output_dir else None
         self.opportunities_file = output_dir / "opportunities.jsonl" if output_dir else None
+        self.market_samples_file = output_dir / MARKET_SAMPLES_FILE.name if output_dir else None
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
         self.auto_live_state_file = output_dir / AUTO_LIVE_STATE_FILE.name if output_dir else None
         self._order_write_lock = asyncio.Lock()
@@ -2302,6 +2304,39 @@ class VariationalToLighterRuntime:
         async with self._opportunity_write_lock:
             await asyncio.to_thread(self.opportunities_file.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(self._append_line, self.opportunities_file, line)
+
+    async def append_market_sample(self, snapshot: CrossSpreadSnapshot) -> None:
+        if self.market_samples_file is None:
+            return
+        row = {
+            "event": "market_sample",
+            "logged_at": utc_now(),
+            "asset": snapshot.asset,
+            "var_bid": decimal_to_str(snapshot.var_bid),
+            "var_ask": decimal_to_str(snapshot.var_ask),
+            "var_buy_price": decimal_to_str(snapshot.var_buy_price),
+            "var_sell_price": decimal_to_str(snapshot.var_sell_price),
+            "var_mid": decimal_to_str(snapshot.var_mid),
+            "var_full_spread_bps": decimal_to_str(snapshot.var_full_spread_bps),
+            "var_half_spread_bps": decimal_to_str(snapshot.var_half_spread_bps),
+            "var_spread_source": snapshot.var_spread_source,
+            "lighter_bid": decimal_to_str(snapshot.lighter_bid),
+            "lighter_ask": decimal_to_str(snapshot.lighter_ask),
+            "lighter_buy_fill_price": decimal_to_str(snapshot.lighter_buy_fill_price),
+            "lighter_sell_fill_price": decimal_to_str(snapshot.lighter_sell_fill_price),
+            "lighter_mid": decimal_to_str(snapshot.lighter_mid),
+            "lighter_half_spread_bps": decimal_to_str(snapshot.lighter_half_spread_bps),
+            "long_var_short_lighter_bps": decimal_to_str(decimal_percent_to_bps(snapshot.long_var_short_lighter_pct)),
+            "short_var_long_lighter_bps": decimal_to_str(decimal_percent_to_bps(snapshot.short_var_long_lighter_pct)),
+            "long_median_5m_bps": decimal_to_str(decimal_percent_to_bps(snapshot.long_median_5m_pct)),
+            "short_median_5m_bps": decimal_to_str(decimal_percent_to_bps(snapshot.short_median_5m_pct)),
+            "long_sample_count_5m": snapshot.long_sample_count_5m,
+            "short_sample_count_5m": snapshot.short_sample_count_5m,
+        }
+        line = json.dumps(row, ensure_ascii=True) + "\n"
+        async with self._opportunity_write_lock:
+            await asyncio.to_thread(self.market_samples_file.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(self._append_line, self.market_samples_file, line)
 
     @staticmethod
     def _append_line(path: Path, line: str) -> None:
@@ -4242,6 +4277,7 @@ class VariationalToLighterRuntime:
             while not self.stop_flag:
                 snapshot = await self.get_cross_spread_snapshot()
                 if snapshot is not None:
+                    await self.append_market_sample(snapshot)
                     await self.maybe_close_paper_position(snapshot)
                     await self.maybe_enter_paper_position(snapshot)
                     await self.maybe_run_auto_live(snapshot)
