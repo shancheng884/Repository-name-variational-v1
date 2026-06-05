@@ -75,3 +75,33 @@ def test_inventory_simulator_supports_short_var_long_lighter(tmp_path: Path) -> 
     assert result.forced_exits == 0
     assert result.max_open_lots == 2
     assert result.realized_pnl_usd > 0
+
+
+def test_inventory_simulator_applies_latency_and_min_hold(tmp_path: Path) -> None:
+    path = tmp_path / "market_samples.jsonl"
+    rows = [
+        _sample("t1", "100000", "99990", "100100", "100110"),
+        _sample("t2", "100020", "100010", "100090", "100100"),
+        _sample("t3", "100030", "100020", "100050", "100060"),
+        _sample("t4", "100040", "100030", "100040", "100050"),
+        _sample("t5", "100050", "100040", "100040", "100050"),
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    samples = read_samples(path, "BTC")
+    result = simulate_inventory(
+        samples,
+        direction="long_var_short_lighter",
+        lot_notional_usd=Decimal("100"),
+        max_lots=1,
+        entry_bps=Decimal("8"),
+        exit_bps=Decimal("4"),
+        latency_samples=1,
+        min_hold_samples=2,
+    )
+
+    assert result.entries == 1
+    assert result.exits == 1
+    assert result.forced_exits == 0
+    assert result.latency_samples == 1
+    assert result.min_hold_samples == 2

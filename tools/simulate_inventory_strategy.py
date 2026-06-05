@@ -43,6 +43,7 @@ class Lot:
     entry_lighter_price: Decimal
     entry_edge_bps: Decimal
     entered_at: str
+    entry_index: int
 
 
 @dataclass(slots=True)
@@ -55,6 +56,8 @@ class SimulationResult:
     realized_pnl_usd: Decimal
     avg_pnl_bps_per_closed_lot: Decimal | None
     open_lots: int
+    latency_samples: int
+    min_hold_samples: int
 
 
 def read_samples(path: Path, asset: str) -> list[Sample]:
@@ -131,6 +134,8 @@ def simulate_inventory(
     max_lots: int,
     entry_bps: Decimal,
     exit_bps: Decimal,
+    latency_samples: int = 0,
+    min_hold_samples: int = 0,
 ) -> SimulationResult:
     lots: list[Lot] = []
     realized = Decimal("0")
@@ -140,18 +145,22 @@ def simulate_inventory(
     max_open = 0
     pnl_bps_values: list[Decimal] = []
 
-    for sample in samples:
+    for index, sample in enumerate(samples):
+        execution_index = index + latency_samples
+        if execution_index >= len(samples):
+            break
+        execution_sample = samples[execution_index]
         edge_bps = sample_edge(sample, direction)
-        if lots and edge_bps <= exit_bps:
+        if lots and edge_bps <= exit_bps and index - lots[0].entry_index >= min_hold_samples:
             lot = lots.pop(0)
-            pnl = close_lot(lot, sample)
+            pnl = close_lot(lot, execution_sample)
             realized += pnl
             exits += 1
             pnl_bps_values.append(pnl / (lot.qty * lot.entry_var_price) * Decimal("10000"))
             continue
 
         if edge_bps >= entry_bps and len(lots) < max_lots:
-            entry_var_price, entry_lighter_price = entry_prices(sample, direction)
+            entry_var_price, entry_lighter_price = entry_prices(execution_sample, direction)
             qty = lot_notional_usd / entry_var_price
             lots.append(
                 Lot(
@@ -160,7 +169,8 @@ def simulate_inventory(
                     entry_var_price=entry_var_price,
                     entry_lighter_price=entry_lighter_price,
                     entry_edge_bps=edge_bps,
-                    entered_at=sample.logged_at,
+                    entered_at=execution_sample.logged_at,
+                    entry_index=execution_index,
                 )
             )
             entries += 1
@@ -185,6 +195,8 @@ def simulate_inventory(
         realized_pnl_usd=realized,
         avg_pnl_bps_per_closed_lot=avg_bps,
         open_lots=0,
+        latency_samples=latency_samples,
+        min_hold_samples=min_hold_samples,
     )
 
 
@@ -197,6 +209,8 @@ def main() -> int:
     parser.add_argument("--direction", choices=("long_var_short_lighter", "short_var_long_lighter"), default="long_var_short_lighter")
     parser.add_argument("--entry-bps", type=str, default="8")
     parser.add_argument("--exit-bps", type=str, default="4")
+    parser.add_argument("--latency-samples", type=int, default=0)
+    parser.add_argument("--min-hold-samples", type=int, default=0)
     args = parser.parse_args()
 
     path = Path(args.market_samples)
@@ -204,6 +218,10 @@ def main() -> int:
         raise SystemExit(f"market samples not found: {path}")
     if args.max_lots <= 0:
         raise SystemExit("--max-lots must be > 0")
+    if args.latency_samples < 0:
+        raise SystemExit("--latency-samples must be >= 0")
+    if args.min_hold_samples < 0:
+        raise SystemExit("--min-hold-samples must be >= 0")
 
     samples = read_samples(path, args.asset)
     result = simulate_inventory(
@@ -213,11 +231,14 @@ def main() -> int:
         max_lots=args.max_lots,
         entry_bps=Decimal(args.entry_bps),
         exit_bps=Decimal(args.exit_bps),
+        latency_samples=args.latency_samples,
+        min_hold_samples=args.min_hold_samples,
     )
 
     print(f"inventory simulation: {args.direction}")
     print(f"samples={result.samples}")
     print(f"entries={result.entries} exits={result.exits} forced_exits={result.forced_exits}")
+    print(f"latency_samples={result.latency_samples} min_hold_samples={result.min_hold_samples}")
     print(f"max_open_lots={result.max_open_lots}")
     print(f"realized_pnl_usd={fmt(result.realized_pnl_usd, 6)}")
     print(f"avg_pnl_bps_per_closed_lot={fmt(result.avg_pnl_bps_per_closed_lot, 3)}")
