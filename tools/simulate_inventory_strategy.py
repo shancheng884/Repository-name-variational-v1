@@ -32,10 +32,12 @@ class Sample:
     lighter_bid: Decimal
     lighter_ask: Decimal
     long_edge_bps: Decimal
+    short_edge_bps: Decimal
 
 
 @dataclass(slots=True)
 class Lot:
+    direction: str
     qty: Decimal
     entry_var_price: Decimal
     entry_lighter_price: Decimal
@@ -74,8 +76,9 @@ def read_samples(path: Path, asset: str) -> list[Sample]:
             var_sell = to_decimal(row.get("var_sell_price"))
             lighter_bid = to_decimal(row.get("lighter_bid"))
             lighter_ask = to_decimal(row.get("lighter_ask"))
-            edge = to_decimal(row.get("long_var_short_lighter_bps"))
-            if None in {var_buy, var_sell, lighter_bid, lighter_ask, edge}:
+            long_edge = to_decimal(row.get("long_var_short_lighter_bps"))
+            short_edge = to_decimal(row.get("short_var_long_lighter_bps"))
+            if None in {var_buy, var_sell, lighter_bid, lighter_ask, long_edge, short_edge}:
                 continue
             samples.append(
                 Sample(
@@ -85,21 +88,45 @@ def read_samples(path: Path, asset: str) -> list[Sample]:
                     var_sell_price=var_sell,
                     lighter_bid=lighter_bid,
                     lighter_ask=lighter_ask,
-                    long_edge_bps=edge,
+                    long_edge_bps=long_edge,
+                    short_edge_bps=short_edge,
                 )
             )
     return samples
 
 
 def close_lot(lot: Lot, sample: Sample) -> Decimal:
-    var_leg = (sample.var_sell_price - lot.entry_var_price) * lot.qty
-    lighter_leg = (lot.entry_lighter_price - sample.lighter_ask) * lot.qty
-    return var_leg + lighter_leg
+    if lot.direction == "long_var_short_lighter":
+        var_leg = (sample.var_sell_price - lot.entry_var_price) * lot.qty
+        lighter_leg = (lot.entry_lighter_price - sample.lighter_ask) * lot.qty
+        return var_leg + lighter_leg
+    if lot.direction == "short_var_long_lighter":
+        var_leg = (lot.entry_var_price - sample.var_buy_price) * lot.qty
+        lighter_leg = (sample.lighter_bid - lot.entry_lighter_price) * lot.qty
+        return var_leg + lighter_leg
+    raise ValueError(f"Unsupported direction: {lot.direction}")
 
 
-def simulate_long_inventory(
+def sample_edge(sample: Sample, direction: str) -> Decimal:
+    if direction == "long_var_short_lighter":
+        return sample.long_edge_bps
+    if direction == "short_var_long_lighter":
+        return sample.short_edge_bps
+    raise ValueError(f"Unsupported direction: {direction}")
+
+
+def entry_prices(sample: Sample, direction: str) -> tuple[Decimal, Decimal]:
+    if direction == "long_var_short_lighter":
+        return sample.var_buy_price, sample.lighter_bid
+    if direction == "short_var_long_lighter":
+        return sample.var_sell_price, sample.lighter_ask
+    raise ValueError(f"Unsupported direction: {direction}")
+
+
+def simulate_inventory(
     samples: list[Sample],
     *,
+    direction: str,
     lot_notional_usd: Decimal,
     max_lots: int,
     entry_bps: Decimal,
@@ -114,7 +141,8 @@ def simulate_long_inventory(
     pnl_bps_values: list[Decimal] = []
 
     for sample in samples:
-        if lots and sample.long_edge_bps <= exit_bps:
+        edge_bps = sample_edge(sample, direction)
+        if lots and edge_bps <= exit_bps:
             lot = lots.pop(0)
             pnl = close_lot(lot, sample)
             realized += pnl
@@ -122,14 +150,16 @@ def simulate_long_inventory(
             pnl_bps_values.append(pnl / (lot.qty * lot.entry_var_price) * Decimal("10000"))
             continue
 
-        if sample.long_edge_bps >= entry_bps and len(lots) < max_lots:
-            qty = lot_notional_usd / sample.var_buy_price
+        if edge_bps >= entry_bps and len(lots) < max_lots:
+            entry_var_price, entry_lighter_price = entry_prices(sample, direction)
+            qty = lot_notional_usd / entry_var_price
             lots.append(
                 Lot(
+                    direction=direction,
                     qty=qty,
-                    entry_var_price=sample.var_buy_price,
-                    entry_lighter_price=sample.lighter_bid,
-                    entry_edge_bps=sample.long_edge_bps,
+                    entry_var_price=entry_var_price,
+                    entry_lighter_price=entry_lighter_price,
+                    entry_edge_bps=edge_bps,
                     entered_at=sample.logged_at,
                 )
             )
@@ -164,6 +194,7 @@ def main() -> int:
     parser.add_argument("--asset", default="BTC")
     parser.add_argument("--lot-notional-usd", type=str, default="50")
     parser.add_argument("--max-lots", type=int, default=10)
+    parser.add_argument("--direction", choices=("long_var_short_lighter", "short_var_long_lighter"), default="long_var_short_lighter")
     parser.add_argument("--entry-bps", type=str, default="8")
     parser.add_argument("--exit-bps", type=str, default="4")
     args = parser.parse_args()
@@ -175,15 +206,16 @@ def main() -> int:
         raise SystemExit("--max-lots must be > 0")
 
     samples = read_samples(path, args.asset)
-    result = simulate_long_inventory(
+    result = simulate_inventory(
         samples,
+        direction=args.direction,
         lot_notional_usd=Decimal(args.lot_notional_usd),
         max_lots=args.max_lots,
         entry_bps=Decimal(args.entry_bps),
         exit_bps=Decimal(args.exit_bps),
     )
 
-    print("inventory simulation: long_var_short_lighter")
+    print(f"inventory simulation: {args.direction}")
     print(f"samples={result.samples}")
     print(f"entries={result.entries} exits={result.exits} forced_exits={result.forced_exits}")
     print(f"max_open_lots={result.max_open_lots}")
