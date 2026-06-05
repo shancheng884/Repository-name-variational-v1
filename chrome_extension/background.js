@@ -804,7 +804,23 @@ async function prepareOrderFormWithKeyboard(side, amount) {
     awaitPromise: false,
     userGesture: true
   });
-  const snapshotBefore = beforeResult.result?.value || null;
+  let snapshotBefore = beforeResult.result?.value || null;
+  if (snapshotBefore?.sideButton?.rect) {
+    const sideRect = snapshotBefore.sideButton.rect;
+    await clickPoint(
+      state.attachedTabId,
+      sideRect.x + Math.round(sideRect.width / 2),
+      sideRect.y + Math.round(sideRect.height / 2)
+    );
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const sideResult = await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
+      expression: snapshotExpression,
+      returnByValue: true,
+      awaitPromise: false,
+      userGesture: true
+    });
+    snapshotBefore = sideResult.result?.value || snapshotBefore;
+  }
   const candidates = (snapshotBefore?.inputs || [])
     .filter((item) => item.type !== "range" && item.rect && item.rect.width > 0 && item.rect.height > 0)
     .slice(0, 8);
