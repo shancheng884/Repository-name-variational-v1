@@ -184,6 +184,13 @@ def elapsed_ms_str(start_monotonic: float | None) -> str:
     return f"{(time.monotonic() - start_monotonic) * 1000:.3f}"
 
 
+def elapsed_ms_between_str(start_monotonic: float | None, end_monotonic: float | None) -> str:
+    value = elapsed_ms(start_monotonic, end_monotonic)
+    if value is None:
+        return "-"
+    return f"{value:.3f}"
+
+
 def clean_state_value(value: Any) -> str:
     if value is None:
         return ""
@@ -1009,6 +1016,34 @@ class VariationalToLighterRuntime:
     @staticmethod
     def auto_live_eager_hedge_started(record: OrderLifecycle | None) -> bool:
         return record is not None and record.processing_stage in {STAGE_LIVE_SUBMIT_SENT, STAGE_LIGHTER_FILLED}
+
+    def log_auto_live_eager_hedge_timing(
+        self,
+        *,
+        cycle_id: int,
+        role: str,
+        asset: str,
+        side: str,
+        signal_monotonic: float,
+        task_created_monotonic: float | None,
+        record: OrderLifecycle,
+    ) -> None:
+        self.logger.info(
+            "auto_live_eager_hedge_timing cycle_id=%s role=%s asset=%s side=%s record_key=%s "
+            "signal_to_task_create_ms=%s task_create_to_plan_start_ms=%s plan_ms=%s "
+            "plan_ready_to_submit_start_ms=%s submit_call_ms=%s signal_to_submit_sent_ms=%s",
+            cycle_id,
+            role,
+            asset,
+            side,
+            record.trade_key,
+            elapsed_ms_between_str(signal_monotonic, task_created_monotonic),
+            elapsed_ms_between_str(task_created_monotonic, record.live_plan_started_monotonic),
+            elapsed_ms_between_str(record.live_plan_started_monotonic, record.live_plan_ready_monotonic),
+            elapsed_ms_between_str(record.live_plan_ready_monotonic, record.live_submit_started_monotonic),
+            elapsed_ms_between_str(record.live_submit_started_monotonic, record.live_submit_sent_monotonic),
+            elapsed_ms_between_str(signal_monotonic, record.live_submit_sent_monotonic),
+        )
 
     async def auto_live_lighter_precheck(
         self,
@@ -3656,6 +3691,15 @@ class VariationalToLighterRuntime:
                         )
                     )
                     if payload is not None:
+                        self.log_auto_live_eager_hedge_timing(
+                            cycle_id=cycle_id,
+                            role="entry",
+                            asset=snapshot.asset,
+                            side=var_side,
+                            signal_monotonic=entry_signal_monotonic,
+                            task_created_monotonic=entry_lighter_submit_started,
+                            record=lighter_record,
+                        )
                         self.logger.info(
                             "auto_live_eager_hedge_started cycle_id=%s role=entry asset=%s side=%s qty=%s stage=%s record_key=%s duration_ms=%s",
                             cycle_id,
@@ -3909,6 +3953,15 @@ class VariationalToLighterRuntime:
                     )
                 )
                 if payload is not None:
+                    self.log_auto_live_eager_hedge_timing(
+                        cycle_id=position.cycle_id,
+                        role="exit",
+                        asset=snapshot.asset,
+                        side=exit_side,
+                        signal_monotonic=exit_signal_monotonic,
+                        task_created_monotonic=exit_lighter_submit_started,
+                        record=lighter_record,
+                    )
                     self.logger.info(
                         "auto_live_eager_hedge_started cycle_id=%s role=exit asset=%s side=%s qty=%s stage=%s record_key=%s duration_ms=%s",
                         position.cycle_id,
