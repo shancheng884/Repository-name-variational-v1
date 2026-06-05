@@ -1,8 +1,9 @@
 import argparse
+import json
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -62,10 +63,14 @@ class Cycle:
     entry_var_preview_ms: Decimal | None = None
     entry_var_submit_ms: Decimal | None = None
     entry_lighter_submit_ms: Decimal | None = None
+    entry_lighter_fill_ms: Decimal | None = None
+    entry_signal_to_both_filled_ms: Decimal | None = None
     entry_total_ms: Decimal | None = None
     exit_precheck_ms: Decimal | None = None
     exit_var_submit_ms: Decimal | None = None
     exit_lighter_submit_ms: Decimal | None = None
+    exit_lighter_fill_ms: Decimal | None = None
+    exit_signal_to_both_filled_ms: Decimal | None = None
     exit_total_ms: Decimal | None = None
 
     @property
@@ -102,6 +107,19 @@ def parse_log_ts(line: str) -> datetime | None:
         return datetime.strptime(line[:23], LOG_TS_FORMAT)
     except ValueError:
         return None
+
+
+def parse_iso_ts(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def parse_key_values(line: str) -> dict[str, str]:
@@ -263,6 +281,89 @@ def parse_runtime_log(path: Path, asset_filter: set[str]) -> list[Cycle]:
     return sorted(cycles, key=cycle_sort_key)
 
 
+def prefer_metric_record(existing: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, Any]:
+    if existing is None:
+        return incoming
+    existing_real = not bool(existing.get("synthetic_eager_fill"))
+    incoming_real = not bool(incoming.get("synthetic_eager_fill"))
+    if incoming_real and not existing_real:
+        return incoming
+    existing_logged = parse_iso_ts(existing.get("logged_at")) or datetime.min
+    incoming_logged = parse_iso_ts(incoming.get("logged_at")) or datetime.min
+    return incoming if incoming_logged >= existing_logged else existing
+
+
+def enrich_cycles_with_order_metrics(cycles: list[Cycle], order_metrics_path: Path, asset_filter: set[str]) -> None:
+    candidates: list[dict[str, Any]] = []
+
+    with order_metrics_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            asset = str(payload.get("asset") or "").upper()
+            if not asset or (asset_filter and asset not in asset_filter):
+                continue
+            cycle_id = payload.get("auto_live_cycle_id")
+            role = str(payload.get("auto_live_role") or "").lower()
+            if cycle_id is None or role not in {"entry", "exit"}:
+                continue
+            if not payload.get("lighter_filled_at") or not payload.get("variational_filled_at"):
+                continue
+            candidates.append(payload)
+
+    grouped: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+    for payload in candidates:
+        asset = str(payload.get("asset") or "").upper()
+        cycle_id = str(payload.get("auto_live_cycle_id"))
+        role = str(payload.get("auto_live_role") or "").lower()
+        logged_at = parse_iso_ts(payload.get("logged_at"))
+        matching_cycles = [cycle for cycle in cycles if cycle.asset == asset and str(cycle.cycle_id) == cycle_id]
+        if not matching_cycles:
+            continue
+        if logged_at is None:
+            cycle = matching_cycles[-1]
+        else:
+            cycle = min(
+                matching_cycles,
+                key=lambda item: abs((logged_at - ((item.entry_at if role == "entry" else item.exit_at) or datetime.min)).total_seconds()),
+            )
+        grouped_key = (asset, cycle_id, role, cycle.occurrence)
+        grouped[grouped_key] = prefer_metric_record(grouped.get(grouped_key), payload)
+
+    for (_asset, _cycle_id, role, occurrence), payload in grouped.items():
+        asset = str(payload.get("asset") or "").upper()
+        cycle_id = str(payload.get("auto_live_cycle_id"))
+        cycle = next(
+            (item for item in cycles if item.asset == asset and str(item.cycle_id) == cycle_id and item.occurrence == occurrence),
+            None,
+        )
+        if cycle is None:
+            continue
+        signal_at = cycle.entry_at if role == "entry" else cycle.exit_at
+        total_ms = cycle.entry_total_ms if role == "entry" else cycle.exit_total_ms
+        if signal_at is not None and total_ms is not None:
+            signal_at = signal_at - timedelta_ms(total_ms)
+        var_filled_at = parse_iso_ts(payload.get("variational_filled_at"))
+        lighter_filled_at = parse_iso_ts(payload.get("lighter_filled_at"))
+        both_filled_at = max([ts for ts in (var_filled_at, lighter_filled_at) if ts is not None], default=None)
+        lighter_fill_ms = parse_decimal(str(payload.get("live_submit_sent_to_fill_ms") or ""))
+        signal_to_both_ms = None
+        if signal_at is not None and both_filled_at is not None:
+            signal_to_both_ms = Decimal(str((both_filled_at - signal_at).total_seconds() * 1000))
+        if role == "entry":
+            cycle.entry_lighter_fill_ms = lighter_fill_ms
+            cycle.entry_signal_to_both_filled_ms = signal_to_both_ms
+        else:
+            cycle.exit_lighter_fill_ms = lighter_fill_ms
+            cycle.exit_signal_to_both_filled_ms = signal_to_both_ms
+
+
+def timedelta_ms(value: Decimal):
+    return timedelta(milliseconds=float(value))
+
+
 def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
     print(f"Source: {source}")
     print()
@@ -294,9 +395,13 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
         "entry_var_preview_ms": [],
         "entry_var_submit_ms": [],
         "entry_lighter_submit_ms": [],
+        "entry_lighter_fill_ms": [],
+        "entry_signal_to_both_filled_ms": [],
         "exit_total_ms": [],
         "exit_var_submit_ms": [],
         "exit_lighter_submit_ms": [],
+        "exit_lighter_fill_ms": [],
+        "exit_signal_to_both_filled_ms": [],
     }
     for cycle in cycles:
         for key in metric_values:
@@ -326,8 +431,10 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
         "asset cycle_id occurrence status entry_at entry_side direction qty holding_seconds "
         "entry_precheck_status entry_precheck_edge_bps entry_precheck_reason "
         "entry_precheck_ms entry_var_preview_ms entry_var_submit_ms entry_lighter_submit_ms entry_total_ms "
+        "entry_lighter_fill_ms entry_signal_to_both_filled_ms "
         "exit_at exit_side exit_reason exit_precheck_status exit_precheck_edge_bps exit_precheck_reason "
         "exit_precheck_ms exit_var_submit_ms exit_lighter_submit_ms exit_total_ms "
+        "exit_lighter_fill_ms exit_signal_to_both_filled_ms "
         "manual_review_at manual_review_reason entry_precheck_failures"
     )
     for cycle in selected:
@@ -335,8 +442,10 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
             "{asset} {cycle_id} {occurrence} {status} {entry_at} {entry_side} {direction} {qty} {holding} "
             "{entry_precheck_status} {entry_edge} {entry_precheck_reason} "
             "{entry_precheck_ms} {entry_var_preview_ms} {entry_var_submit_ms} {entry_lighter_submit_ms} {entry_total_ms} "
+            "{entry_lighter_fill_ms} {entry_signal_to_both_filled_ms} "
             "{exit_at} {exit_side} {exit_reason} {exit_precheck_status} {exit_edge} {exit_precheck_reason} "
             "{exit_precheck_ms} {exit_var_submit_ms} {exit_lighter_submit_ms} {exit_total_ms} "
+            "{exit_lighter_fill_ms} {exit_signal_to_both_filled_ms} "
             "{manual_at} {manual_reason} {entry_precheck_failures}".format(
                 asset=cycle.asset,
                 cycle_id=cycle.cycle_id,
@@ -355,6 +464,8 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
                 entry_var_submit_ms=fmt(cycle.entry_var_submit_ms, 3),
                 entry_lighter_submit_ms=fmt(cycle.entry_lighter_submit_ms, 3),
                 entry_total_ms=fmt(cycle.entry_total_ms, 3),
+                entry_lighter_fill_ms=fmt(cycle.entry_lighter_fill_ms, 3),
+                entry_signal_to_both_filled_ms=fmt(cycle.entry_signal_to_both_filled_ms, 3),
                 exit_at=cycle.exit_at.isoformat(sep=" ") if cycle.exit_at else "-",
                 exit_side=cycle.exit_side or "-",
                 exit_reason=cycle.exit_reason or "-",
@@ -365,6 +476,8 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
                 exit_var_submit_ms=fmt(cycle.exit_var_submit_ms, 3),
                 exit_lighter_submit_ms=fmt(cycle.exit_lighter_submit_ms, 3),
                 exit_total_ms=fmt(cycle.exit_total_ms, 3),
+                exit_lighter_fill_ms=fmt(cycle.exit_lighter_fill_ms, 3),
+                exit_signal_to_both_filled_ms=fmt(cycle.exit_signal_to_both_filled_ms, 3),
                 manual_at=cycle.manual_review_at.isoformat(sep=" ") if cycle.manual_review_at else "-",
                 manual_reason=cycle.manual_review_reason or "-",
                 entry_precheck_failures=cycle.entry_precheck_failures,
@@ -375,6 +488,7 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze auto-live cycles from runtime.log.")
     parser.add_argument("--runtime-log", default="log/runtime.log", help="Path to runtime.log. Default: log/runtime.log")
+    parser.add_argument("--order-metrics", default="", help="Optional path to order_metrics.jsonl for fill-result latency metrics.")
     parser.add_argument("--assets", default="", help="Optional comma-separated asset filter, e.g. BTC,SOL")
     parser.add_argument("--limit", type=int, default=30, help="Number of latest cycle detail rows to print. Use 0 for all.")
     args = parser.parse_args()
@@ -384,6 +498,11 @@ def main() -> int:
         raise SystemExit(f"runtime log not found: {runtime_log}")
     asset_filter = {asset.strip().upper() for asset in args.assets.split(",") if asset.strip()}
     cycles = parse_runtime_log(runtime_log, asset_filter)
+    if args.order_metrics:
+        order_metrics = Path(args.order_metrics)
+        if not order_metrics.exists():
+            raise SystemExit(f"order metrics log not found: {order_metrics}")
+        enrich_cycles_with_order_metrics(cycles, order_metrics, asset_filter)
     print_summary(cycles, runtime_log, args.limit)
     return 0
 

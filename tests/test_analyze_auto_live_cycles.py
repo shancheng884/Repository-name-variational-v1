@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from tools.analyze_auto_live_cycles import parse_runtime_log, print_summary
+from tools.analyze_auto_live_cycles import enrich_cycles_with_order_metrics, parse_runtime_log, print_summary
 
 
 def test_parse_auto_live_success_and_manual_review_cycles(tmp_path: Path) -> None:
@@ -84,3 +84,42 @@ def test_print_summary_includes_latency_percentiles(tmp_path: Path, capsys) -> N
     assert "entry_total_ms 2 700.200 900.100" in captured
     assert "entry_var_submit_ms 2 250.300 300.500" in captured
     assert "exit_total_ms 1 800.200 800.200" in captured
+
+
+def test_order_metrics_enrich_fill_result_latency(tmp_path: Path, capsys) -> None:
+    log_path = tmp_path / "runtime.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "2026-06-05 06:42:58,276 | INFO | auto_live_entry_submitted cycle_id=1 asset=BTC direction=short_var_long_lighter qty=0.00049 var_side=SELL entry_total_ms=162.366 entry_precheck_ms=0.061 var_preview_ms=skipped var_submit_ms=161.124 lighter_submit_ms=19.205",
+                "2026-06-05 06:43:16,448 | INFO | auto_live_exit_submitted cycle_id=1 asset=BTC side=BUY qty=0.00049 reason=spread_reverted exit_total_ms=134.559 exit_precheck_ms=0.072 var_submit_ms=134.036 lighter_submit_ms=16.639",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    metrics_path = tmp_path / "order_metrics.jsonl"
+    metrics_path.write_text(
+        "\n".join(
+            [
+                '{"event":"lighter_fill","logged_at":"2026-06-05T06:42:58.600000+00:00","asset":"BTC","auto_live_cycle_id":1,"auto_live_role":"entry","synthetic_eager_fill":true,"variational_filled_at":"2026-06-05T06:42:58.420000Z","lighter_filled_at":"2026-06-05T06:42:58.600000+00:00","live_submit_sent_to_fill_ms":"305.1"}',
+                '{"event":"lighter_fill","logged_at":"2026-06-05T06:43:16.760000+00:00","asset":"BTC","auto_live_cycle_id":1,"auto_live_role":"exit","synthetic_eager_fill":true,"variational_filled_at":"2026-06-05T06:43:16.590000Z","lighter_filled_at":"2026-06-05T06:43:16.760000+00:00","live_submit_sent_to_fill_ms":"302.2"}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cycles = parse_runtime_log(log_path, {"BTC"})
+    enrich_cycles_with_order_metrics(cycles, metrics_path, {"BTC"})
+
+    assert len(cycles) == 1
+    assert f"{cycles[0].entry_lighter_fill_ms:.3f}" == "305.100"
+    assert f"{cycles[0].exit_lighter_fill_ms:.3f}" == "302.200"
+    assert cycles[0].entry_signal_to_both_filled_ms is not None
+    assert cycles[0].exit_signal_to_both_filled_ms is not None
+
+    print_summary(cycles, log_path, limit=30)
+    captured = capsys.readouterr().out
+    assert "entry_signal_to_both_filled_ms" in captured
+    assert "exit_signal_to_both_filled_ms" in captured
