@@ -125,6 +125,6 @@ def test_order_metrics_enrich_fill_result_latency(tmp_path: Path, capsys) -> Non
     captured = capsys.readouterr().out
     assert "entry_signal_to_both_filled_ms" in captured
     assert "exit_signal_to_both_filled_ms" in captured
-    assert "gross pnl summary (fees not included)" in captured
+    assert "gross pnl summary (fees assumed zero)" in captured
     assert "gross_pnl_usd" in captured
     assert "0.073500" in captured

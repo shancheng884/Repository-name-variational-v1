@@ -473,7 +473,7 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
 
     pnl_cycles = [cycle for cycle in cycles if cycle.gross_pnl_usd is not None]
     print()
-    print("gross pnl summary (fees not included)")
+    print("gross pnl summary (fees assumed zero)")
     if not pnl_cycles:
         print("none")
     else:
