@@ -78,6 +78,10 @@ class Cycle:
     exit_lighter_fill_price: Decimal | None = None
     entry_spread_usd: Decimal | None = None
     exit_spread_usd: Decimal | None = None
+    actual_entry_edge_bps: Decimal | None = None
+    actual_exit_edge_bps: Decimal | None = None
+    entry_edge_slippage_bps: Decimal | None = None
+    exit_edge_slippage_bps: Decimal | None = None
     spread_capture_usd: Decimal | None = None
     spread_capture_bps: Decimal | None = None
     gross_pnl_usd: Decimal | None = None
@@ -157,19 +161,21 @@ def percentile_nearest_rank(values: list[Decimal], percentile: int) -> Decimal |
     return ordered[index]
 
 
-def compute_spread_capture(cycle: Cycle) -> tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None]:
+def compute_spread_capture(
+    cycle: Cycle,
+) -> tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None, Decimal | None, Decimal | None]:
     qty = parse_decimal(cycle.qty)
     if qty is None:
-        return None, None, None, None
+        return None, None, None, None, None, None
     if (
         cycle.entry_var_fill_price is None
         or cycle.entry_lighter_fill_price is None
         or cycle.exit_var_fill_price is None
         or cycle.exit_lighter_fill_price is None
     ):
-        return None, None, None, None
+        return None, None, None, None, None, None
     if cycle.entry_var_fill_price == 0:
-        return None, None, None, None
+        return None, None, None, None, None, None
 
     entry_side = cycle.entry_side.strip().upper()
     if entry_side == "BUY":
@@ -179,13 +185,23 @@ def compute_spread_capture(cycle: Cycle) -> tuple[Decimal | None, Decimal | None
         entry_spread = cycle.entry_var_fill_price - cycle.entry_lighter_fill_price
         exit_spread = cycle.exit_var_fill_price - cycle.exit_lighter_fill_price
     else:
-        return None, None, None, None
+        return None, None, None, None, None, None
 
     spread_capture = entry_spread - exit_spread
-    notional = qty * cycle.entry_var_fill_price
-    if notional == 0:
-        return entry_spread, exit_spread, spread_capture, None
-    return entry_spread, exit_spread, spread_capture, (spread_capture / cycle.entry_var_fill_price) * Decimal("10000")
+    actual_entry_edge = (entry_spread / cycle.entry_var_fill_price) * Decimal("10000")
+    actual_exit_edge = (exit_spread / cycle.exit_var_fill_price) * Decimal("10000") if cycle.exit_var_fill_price else None
+    spread_capture_bps = (spread_capture / cycle.entry_var_fill_price) * Decimal("10000")
+    return entry_spread, exit_spread, actual_entry_edge, actual_exit_edge, spread_capture, spread_capture_bps
+
+
+def compute_edge_slippage(cycle: Cycle) -> tuple[Decimal | None, Decimal | None]:
+    entry_slippage = None
+    exit_slippage = None
+    if cycle.last_entry_precheck_edge_bps is not None and cycle.actual_entry_edge_bps is not None:
+        entry_slippage = cycle.last_entry_precheck_edge_bps - cycle.actual_entry_edge_bps
+    if cycle.last_exit_precheck_edge_bps is not None and cycle.actual_exit_edge_bps is not None:
+        exit_slippage = cycle.last_exit_precheck_edge_bps - cycle.actual_exit_edge_bps
+    return entry_slippage, exit_slippage
 
 
 def compute_gross_pnl(cycle: Cycle) -> tuple[Decimal | None, Decimal | None]:
@@ -418,9 +434,12 @@ def enrich_cycles_with_order_metrics(cycles: list[Cycle], order_metrics_path: Pa
         (
             cycle.entry_spread_usd,
             cycle.exit_spread_usd,
+            cycle.actual_entry_edge_bps,
+            cycle.actual_exit_edge_bps,
             cycle.spread_capture_usd,
             cycle.spread_capture_bps,
         ) = compute_spread_capture(cycle)
+        cycle.entry_edge_slippage_bps, cycle.exit_edge_slippage_bps = compute_edge_slippage(cycle)
         cycle.gross_pnl_usd, cycle.gross_pnl_bps = compute_gross_pnl(cycle)
 
 
@@ -521,7 +540,8 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
         "exit_precheck_ms exit_var_submit_ms exit_lighter_submit_ms exit_total_ms "
         "exit_lighter_fill_ms exit_signal_to_both_filled_ms "
         "entry_var_fill_price entry_lighter_fill_price exit_var_fill_price exit_lighter_fill_price "
-        "entry_spread_usd exit_spread_usd spread_capture_usd spread_capture_bps gross_pnl_usd gross_pnl_bps "
+        "entry_spread_usd exit_spread_usd actual_entry_edge_bps actual_exit_edge_bps "
+        "entry_edge_slippage_bps exit_edge_slippage_bps spread_capture_usd spread_capture_bps gross_pnl_usd gross_pnl_bps "
         "manual_review_at manual_review_reason entry_precheck_failures"
     )
     for cycle in selected:
@@ -534,7 +554,8 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
             "{exit_precheck_ms} {exit_var_submit_ms} {exit_lighter_submit_ms} {exit_total_ms} "
             "{exit_lighter_fill_ms} {exit_signal_to_both_filled_ms} "
             "{entry_var_fill_price} {entry_lighter_fill_price} {exit_var_fill_price} {exit_lighter_fill_price} "
-            "{entry_spread_usd} {exit_spread_usd} {spread_capture_usd} {spread_capture_bps} "
+            "{entry_spread_usd} {exit_spread_usd} {actual_entry_edge_bps} {actual_exit_edge_bps} "
+            "{entry_edge_slippage_bps} {exit_edge_slippage_bps} {spread_capture_usd} {spread_capture_bps} "
             "{gross_pnl_usd} {gross_pnl_bps} "
             "{manual_at} {manual_reason} {entry_precheck_failures}".format(
                 asset=cycle.asset,
@@ -574,6 +595,10 @@ def print_summary(cycles: list[Cycle], source: Path, limit: int) -> None:
                 exit_lighter_fill_price=fmt(cycle.exit_lighter_fill_price, 2),
                 entry_spread_usd=fmt(cycle.entry_spread_usd, 2),
                 exit_spread_usd=fmt(cycle.exit_spread_usd, 2),
+                actual_entry_edge_bps=fmt(cycle.actual_entry_edge_bps, 3),
+                actual_exit_edge_bps=fmt(cycle.actual_exit_edge_bps, 3),
+                entry_edge_slippage_bps=fmt(cycle.entry_edge_slippage_bps, 3),
+                exit_edge_slippage_bps=fmt(cycle.exit_edge_slippage_bps, 3),
                 spread_capture_usd=fmt(cycle.spread_capture_usd, 2),
                 spread_capture_bps=fmt(cycle.spread_capture_bps, 3),
                 gross_pnl_usd=fmt(cycle.gross_pnl_usd, 6),

@@ -92,6 +92,7 @@ def test_order_metrics_enrich_fill_result_latency(tmp_path: Path, capsys) -> Non
         "\n".join(
             [
                 "2026-06-05 06:42:58,276 | INFO | auto_live_entry_submitted cycle_id=1 asset=BTC direction=short_var_long_lighter qty=0.00049 var_side=SELL entry_total_ms=162.366 entry_precheck_ms=0.061 var_preview_ms=skipped var_submit_ms=161.124 lighter_submit_ms=19.205",
+                "2026-06-05 06:43:10,000 | INFO | auto_live_exit_precheck_passed cycle_id=1 asset=BTC side=BUY qty=0.00049 edge_bps=5.000 duration_ms=0.1",
                 "2026-06-05 06:43:16,448 | INFO | auto_live_exit_submitted cycle_id=1 asset=BTC side=BUY qty=0.00049 reason=spread_reverted exit_total_ms=134.559 exit_precheck_ms=0.072 var_submit_ms=134.036 lighter_submit_ms=16.639",
             ]
         )
@@ -120,6 +121,9 @@ def test_order_metrics_enrich_fill_result_latency(tmp_path: Path, capsys) -> Non
     assert cycles[0].exit_signal_to_both_filled_ms is not None
     assert f"{cycles[0].entry_spread_usd:.2f}" == "100.00"
     assert f"{cycles[0].exit_spread_usd:.2f}" == "-50.00"
+    assert f"{cycles[0].actual_entry_edge_bps:.3f}" == "9.615"
+    assert f"{cycles[0].actual_exit_edge_bps:.3f}" == "-4.817"
+    assert f"{cycles[0].exit_edge_slippage_bps:.3f}" == "9.817"
     assert f"{cycles[0].spread_capture_usd:.2f}" == "150.00"
     assert f"{cycles[0].spread_capture_bps:.3f}" == "14.423"
     assert f"{cycles[0].gross_pnl_usd:.6f}" == "0.073500"
@@ -130,6 +134,8 @@ def test_order_metrics_enrich_fill_result_latency(tmp_path: Path, capsys) -> Non
     assert "entry_signal_to_both_filled_ms" in captured
     assert "exit_signal_to_both_filled_ms" in captured
     assert "gross pnl summary (fees assumed zero)" in captured
+    assert "actual_entry_edge_bps" in captured
+    assert "entry_edge_slippage_bps" in captured
     assert "spread_capture_usd" in captured
     assert "gross_pnl_usd" in captured
     assert "0.073500" in captured
