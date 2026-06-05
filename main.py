@@ -1608,8 +1608,9 @@ class VariationalToLighterRuntime:
 
     @staticmethod
     def variational_api_quote_execution_price(side: str, quote_result: dict[str, Any]) -> Decimal | None:
-        bid = to_decimal(quote_result.get("bid"))
-        ask = to_decimal(quote_result.get("ask"))
+        payload = quote_result.get("result") if isinstance(quote_result.get("result"), dict) else quote_result
+        bid = to_decimal(payload.get("bid"))
+        ask = to_decimal(payload.get("ask"))
         if side.strip().upper() == "BUY":
             return ask
         return bid

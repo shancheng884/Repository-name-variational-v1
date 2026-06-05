@@ -124,12 +124,15 @@ def test_auto_live_entry_actionable_edge_uses_taker_prices() -> None:
 
 def test_variational_api_quote_execution_price_uses_side() -> None:
     quote = {"bid": "99990", "ask": "100010"}
+    nested_quote = {"result": {"bid": "99980", "ask": "100020"}}
 
     buy_price = VariationalToLighterRuntime.variational_api_quote_execution_price("BUY", quote)
     sell_price = VariationalToLighterRuntime.variational_api_quote_execution_price("SELL", quote)
+    nested_buy_price = VariationalToLighterRuntime.variational_api_quote_execution_price("BUY", nested_quote)
 
     assert buy_price == Decimal("100010")
     assert sell_price == Decimal("99990")
+    assert nested_buy_price == Decimal("100020")
 
 
 def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_path) -> None:
