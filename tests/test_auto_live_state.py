@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import json
 from decimal import Decimal
 
@@ -151,3 +152,49 @@ def test_live_inventory_dry_decisions_allow_startup_when_state_flat(tmp_path, mo
 
     assert diagnostics.blocking_errors == []
     assert "live_inventory_dry_decisions_only_no_orders" in diagnostics.passed
+
+
+def test_variational_api_command_preflight_fails_when_extension_disconnected(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _runtime(tmp_path)
+
+        async def fake_send_variational_place_order(**_kwargs):
+            return {"ok": False, "error": "No extension command client connected."}
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+
+        try:
+            await runtime.preflight_variational_api_command_client("BTC")
+        except RuntimeError as exc:
+            assert "No extension command client connected" in str(exc)
+        else:
+            raise AssertionError("preflight should fail")
+
+    asyncio.run(run())
+
+
+def test_variational_api_command_preflight_passes_when_extension_connected(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _runtime(tmp_path)
+        calls = []
+
+        async def fake_send_variational_place_order(**kwargs):
+            calls.append(kwargs)
+            return {"ok": True}
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+
+        await runtime.preflight_variational_api_command_client("BTC")
+
+        assert calls == [
+            {
+                "asset": "BTC",
+                "side": "BUY",
+                "amount": "0.00000001",
+                "expected_min_btc_qty": None,
+                "confirm": False,
+                "reduce_only": False,
+            }
+        ]
+
+    asyncio.run(run())

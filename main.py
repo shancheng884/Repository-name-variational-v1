@@ -2085,6 +2085,18 @@ class VariationalToLighterRuntime:
         result = await awaitable
         return result, elapsed_ms_str(started)
 
+    async def preflight_variational_api_command_client(self, asset: str) -> None:
+        result = await self.send_variational_place_order(
+            asset=asset,
+            side="BUY",
+            amount="0.00000001",
+            expected_min_btc_qty=None,
+            confirm=False,
+            reduce_only=False,
+        )
+        if not result.get("ok"):
+            raise RuntimeError(f"Variational API command preflight failed: {result.get('error') or result}")
+
     @staticmethod
     def _is_lighter_ws_sendtx_response(message: dict[str, Any]) -> bool:
         message_type = str(message.get("type") or "").strip().lower()
@@ -5486,6 +5498,13 @@ class VariationalToLighterRuntime:
                 await self.prewarm_lighter_submit_ws()
             except Exception:
                 self.logger.exception("lighter_submit_ws_prewarm_failed")
+                raise
+        if self.is_live_inventory_enabled() and not self.live_inventory_dry_decisions:
+            try:
+                await self.preflight_variational_api_command_client(initial_asset)
+                self.logger.info("variational_api_command_client_preflight_passed asset=%s", initial_asset)
+            except Exception:
+                self.logger.exception("variational_api_command_client_preflight_failed asset=%s", initial_asset)
                 raise
         if self.is_live_inventory_enabled():
             self.sync_live_inventory_memory_from_state()
