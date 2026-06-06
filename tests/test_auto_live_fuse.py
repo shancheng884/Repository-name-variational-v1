@@ -5,7 +5,13 @@ from collections import deque
 from decimal import Decimal
 from pathlib import Path
 
-from main import AutoLivePositionState, OrderLifecycle, PendingAutoLiveMatch, VariationalToLighterRuntime
+from main import (
+    AutoLivePositionState,
+    CrossSpreadSnapshot,
+    OrderLifecycle,
+    PendingAutoLiveMatch,
+    VariationalToLighterRuntime,
+)
 
 
 def _runtime_for_fuse_test() -> VariationalToLighterRuntime:
@@ -519,5 +525,132 @@ def test_place_lighter_order_from_plan_passes_reduce_only() -> None:
         assert record is not None
         assert record.lighter_reduce_only is True
         assert payload["lighter_reduce_only"] is True
+
+    asyncio.run(run())
+
+
+def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.mode = "live"
+    runtime.live_inventory = True
+    runtime.live_inventory_dry_decisions = False
+    runtime.live_inventory_sample_index = 0
+    runtime.live_inventory_completed_cycles = 0
+    runtime.live_inventory_max_cycles = 1
+    runtime.live_inventory_next_lot_id = 1
+    runtime.live_inventory_open_lots = []
+    runtime.live_inventory_realized_pnl_usd = Decimal("0")
+    runtime.live_inventory_entry_bps = Decimal("50")
+    runtime.live_inventory_exit_bps = Decimal("10")
+    runtime.live_inventory_lot_notional_usd = Decimal("10")
+    runtime.live_inventory_max_total_lots = 1
+    runtime.live_inventory_state_file = Path(tmp_path) / "live_inventory_state.json"
+    runtime.orders_file = Path(tmp_path) / "order_metrics.jsonl"
+    runtime._order_write_lock = asyncio.Lock()
+    runtime.lighter_order_book_lock = asyncio.Lock()
+    runtime.lighter_best_bid = Decimal("59990")
+    runtime.lighter_best_ask = Decimal("60010")
+    runtime.last_lighter_order_book_update_at = "2999-06-02T08:50:11+00:00"
+    runtime.base_amount_multiplier = Decimal("100000000")
+    runtime.risk_guard_max_base_amount = 1000000
+    runtime.risk_guard_max_price_deviation_bps = Decimal("1000")
+    runtime.lighter_min_quote_amount = None
+    runtime.live_allowed_sides = {"buy", "sell"}
+    runtime.live_allowed_assets = {"BTC"}
+    runtime.live_max_qty = Decimal("0")
+    runtime.live_max_notional_usd = Decimal("20")
+    runtime.live_require_min_edge_bps = Decimal("0")
+    runtime.live_cooldown_seconds = 0.0
+    runtime.logger = logging.getLogger("test_auto_live_fuse")
+    return runtime
+
+
+def _inventory_entry_snapshot() -> CrossSpreadSnapshot:
+    return CrossSpreadSnapshot(
+        asset="BTC",
+        var_bid=Decimal("59990"),
+        var_ask=Decimal("60000"),
+        var_mid=Decimal("59995"),
+        var_half_spread_bps=Decimal("1"),
+        var_buy_price=Decimal("60000"),
+        var_sell_price=Decimal("59990"),
+        var_full_spread_bps=Decimal("2"),
+        var_spread_source="test",
+        lighter_bid=Decimal("60400"),
+        lighter_ask=Decimal("60420"),
+        lighter_mid=Decimal("60410"),
+        lighter_buy_price=Decimal("60420"),
+        lighter_sell_price=Decimal("60400"),
+        lighter_half_spread_bps=Decimal("1"),
+        lighter_buy_fill_price=Decimal("60420"),
+        lighter_sell_fill_price=Decimal("60400"),
+        long_var_short_lighter_pct=Decimal("0.66666667"),
+        short_var_long_lighter_pct=Decimal("-0.006"),
+        long_median_5m_pct=None,
+        short_median_5m_pct=None,
+        long_sample_count_5m=1,
+        short_sample_count_5m=1,
+    )
+
+
+def test_live_inventory_entry_blocks_below_lighter_min_base_before_submit(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.lighter_min_base_amount = Decimal("0.00020")
+        submit_calls: list[str] = []
+
+        async def fake_send_variational_place_order(**_kwargs):
+            submit_calls.append("var")
+            return {"ok": True}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            submit_calls.append("lighter")
+            return None, None
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        await runtime.maybe_run_live_inventory(_inventory_entry_snapshot())
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        log_line = runtime.orders_file.read_text(encoding="utf-8").strip()
+
+        assert submit_calls == []
+        assert runtime.live_inventory_open_lots == []
+        assert runtime.live_inventory_completed_cycles == 0
+        assert state["status"] == "flat"
+        assert state["last_blocked_reason"] == "hedge_below_lighter_min_base_amount"
+        assert "live_inventory_entry_blocked" in log_line
+
+    asyncio.run(run())
+
+
+def test_live_inventory_entry_blocks_below_lighter_min_quote_before_submit(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.lighter_min_base_amount = None
+        runtime.lighter_min_quote_amount = Decimal("15")
+        submit_calls: list[str] = []
+
+        async def fake_send_variational_place_order(**_kwargs):
+            submit_calls.append("var")
+            return {"ok": True}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            submit_calls.append("lighter")
+            return None, None
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        await runtime.maybe_run_live_inventory(_inventory_entry_snapshot())
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+
+        assert submit_calls == []
+        assert runtime.live_inventory_open_lots == []
+        assert runtime.live_inventory_completed_cycles == 0
+        assert state["status"] == "flat"
+        assert state["last_blocked_reason"] == "hedge_below_lighter_min_quote_amount"
 
     asyncio.run(run())

@@ -987,6 +987,67 @@ class VariationalToLighterRuntime:
         )
         self.stop_flag = True
 
+    async def block_live_inventory_entry(self, *, asset: str, reason: str, context: dict[str, Any]) -> None:
+        await self.write_live_inventory_state_async(
+            {
+                "status": "flat",
+                "asset": asset,
+                "next_lot_id": self.live_inventory_next_lot_id,
+                "open_lots": self.live_inventory_open_lots,
+                "pending_actions": [],
+                "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
+                "completed_cycles": self.live_inventory_completed_cycles,
+                "last_blocked_reason": reason,
+                "last_blocked_context": context,
+            }
+        )
+        await self.append_live_inventory_log(
+            "live_inventory_entry_blocked",
+            {
+                "asset": asset,
+                "reason": reason,
+                "blocked_context": context,
+                "open_lots_total": len(self.live_inventory_open_lots),
+                "completed_cycles": self.live_inventory_completed_cycles,
+            },
+        )
+
+    async def live_inventory_entry_preflight(
+        self,
+        *,
+        asset: str,
+        direction: str,
+        var_side: str,
+        qty: Decimal,
+        var_price: Decimal,
+        lighter_price: Decimal,
+        edge_bps: Decimal | None,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        ok, reason, precheck_edge_bps = await self.auto_live_lighter_precheck(
+            asset=asset,
+            var_side=var_side,
+            qty=qty,
+            var_fill_price=var_price,
+        )
+        notional = qty * lighter_price
+        context = {
+            "action": "entry",
+            "direction": direction,
+            "var_side": var_side,
+            "qty": decimal_to_str(qty),
+            "var_price": decimal_to_str(var_price),
+            "lighter_price": decimal_to_str(lighter_price),
+            "lighter_notional_usd": decimal_to_str(notional),
+            "entry_edge_bps": decimal_to_str(edge_bps),
+            "precheck_edge_bps": decimal_to_str(precheck_edge_bps),
+            "lighter_min_base_amount": decimal_to_str(self.lighter_min_base_amount),
+            "lighter_min_quote_amount": decimal_to_str(self.lighter_min_quote_amount),
+            "live_max_notional_usd": decimal_to_str(self.live_max_notional_usd),
+        }
+        if ok:
+            return True, "ok", context
+        return False, reason, context
+
     def auto_live_guard_reason(self) -> str | None:
         if self.auto_live_manual_review_required:
             return "manual_review_required"
@@ -3895,6 +3956,22 @@ class VariationalToLighterRuntime:
                 qty = self.live_inventory_lot_notional_usd / notional_price
                 var_side = self._auto_live_direction_to_var_side(direction)
                 if not self.live_inventory_dry_decisions:
+                    preflight_ok, preflight_reason, preflight_context = await self.live_inventory_entry_preflight(
+                        asset=snapshot.asset,
+                        direction=direction,
+                        var_side=var_side,
+                        qty=qty,
+                        var_price=var_price,
+                        lighter_price=lighter_price,
+                        edge_bps=edge_bps,
+                    )
+                    if not preflight_ok:
+                        await self.block_live_inventory_entry(
+                            asset=snapshot.asset,
+                            reason=preflight_reason,
+                            context=preflight_context,
+                        )
+                        return
                     try:
                         var_task = asyncio.create_task(
                             self._timed_submit(
