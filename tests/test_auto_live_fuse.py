@@ -11,6 +11,7 @@ from main import (
     OrderLifecycle,
     PendingAutoLiveMatch,
     VariationalToLighterRuntime,
+    variational_api_amount_to_str,
 )
 
 
@@ -652,5 +653,44 @@ def test_live_inventory_entry_blocks_below_lighter_min_quote_before_submit(tmp_p
         assert runtime.live_inventory_completed_cycles == 0
         assert state["status"] == "flat"
         assert state["last_blocked_reason"] == "hedge_below_lighter_min_quote_amount"
+
+    asyncio.run(run())
+
+
+def test_variational_api_amount_to_str_truncates_to_8_decimals() -> None:
+    assert variational_api_amount_to_str(Decimal("0.0002432227102505721546713663434")) == "0.00024322"
+
+
+def test_live_inventory_var_failure_does_not_submit_lighter(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_lot_notional_usd = Decimal("15")
+        runtime.lighter_min_base_amount = Decimal("0.00020")
+        submit_calls: list[str] = []
+        var_amounts: list[str] = []
+
+        async def fake_send_variational_place_order(**kwargs):
+            submit_calls.append("var")
+            var_amounts.append(kwargs["amount"])
+            return {"ok": False, "error": "quote_qty_precision"}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            submit_calls.append("lighter")
+            return None, None
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        await runtime.maybe_run_live_inventory(_inventory_entry_snapshot())
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+
+        assert submit_calls == ["var"]
+        assert var_amounts == ["0.00024752"]
+        assert state["status"] == "manual_review_required"
+        assert state["manual_review_context"]["lighter_submitted"] is False
+        assert state["manual_review_context"]["var_amount"] == "0.00024752"
+        assert runtime.live_inventory_open_lots == []
+        assert runtime.live_inventory_completed_cycles == 0
 
     asyncio.run(run())

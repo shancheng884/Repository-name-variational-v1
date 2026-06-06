@@ -10,7 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from types import SimpleNamespace
 from statistics import median
@@ -180,6 +180,13 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return format(value, "f")
+
+
+VARIATIONAL_API_AMOUNT_QUANTUM = Decimal("0.00000001")
+
+
+def variational_api_amount_to_str(value: Decimal) -> str:
+    return decimal_to_str(value.quantize(VARIATIONAL_API_AMOUNT_QUANTUM, rounding=ROUND_DOWN)) or "0"
 
 
 def elapsed_ms_str(start_monotonic: float | None) -> str:
@@ -3972,74 +3979,32 @@ class VariationalToLighterRuntime:
                             context=preflight_context,
                         )
                         return
+                    var_amount = variational_api_amount_to_str(qty)
                     try:
-                        var_task = asyncio.create_task(
-                            self._timed_submit(
-                                self.send_variational_place_order(
-                                    asset=snapshot.asset,
-                                    side=var_side,
-                                    amount=decimal_to_str(qty) or str(qty),
-                                    expected_min_btc_qty=qty if snapshot.asset.upper() == "BTC" else None,
-                                    confirm=True,
-                                    reduce_only=False,
-                                )
+                        var_outcome = await self._timed_submit(
+                            self.send_variational_place_order(
+                                asset=snapshot.asset,
+                                side=var_side,
+                                amount=var_amount,
+                                expected_min_btc_qty=Decimal(var_amount) if snapshot.asset.upper() == "BTC" else None,
+                                confirm=True,
+                                reduce_only=False,
                             )
-                        )
-                        lighter_task = asyncio.create_task(
-                            self._timed_submit(
-                                self.place_lighter_order_from_plan(
-                                    asset=snapshot.asset,
-                                    side=var_side,
-                                    qty=qty,
-                                    var_fill_price=var_price,
-                                    cycle_id=self.live_inventory_next_lot_id,
-                                    role="live_inventory_entry",
-                                )
-                            )
-                        )
-                        var_outcome, lighter_outcome = await asyncio.gather(
-                            var_task,
-                            lighter_task,
-                            return_exceptions=True,
                         )
                     except Exception as exc:
                         await self.require_live_inventory_manual_review(
                             asset=snapshot.asset,
-                            reason=f"entry_submit_exception:{exc}",
+                            reason=f"entry_var_submit_exception:{exc}",
                             context={
                                 "action": "entry",
                                 "direction": direction,
                                 "qty": decimal_to_str(qty),
-                                "var_side": var_side,
-                            },
-                        )
-                        return
-                    if isinstance(var_outcome, Exception):
-                        await self.require_live_inventory_manual_review(
-                            asset=snapshot.asset,
-                            reason=f"entry_var_submit_exception:{var_outcome}",
-                            context={
-                                "action": "entry",
-                                "direction": direction,
-                                "qty": decimal_to_str(qty),
-                                "var_side": var_side,
-                            },
-                        )
-                        return
-                    if isinstance(lighter_outcome, Exception):
-                        await self.require_live_inventory_manual_review(
-                            asset=snapshot.asset,
-                            reason=f"entry_lighter_submit_exception:{lighter_outcome}",
-                            context={
-                                "action": "entry",
-                                "direction": direction,
-                                "qty": decimal_to_str(qty),
+                                "var_amount": var_amount,
                                 "var_side": var_side,
                             },
                         )
                         return
                     var_result, var_submit_ms = var_outcome
-                    lighter_result, lighter_submit_ms = lighter_outcome
                     if not var_result.get("ok"):
                         await self.require_live_inventory_manual_review(
                             asset=snapshot.asset,
@@ -4048,11 +4013,39 @@ class VariationalToLighterRuntime:
                                 "action": "entry",
                                 "direction": direction,
                                 "qty": decimal_to_str(qty),
+                                "var_amount": var_amount,
+                                "var_side": var_side,
+                                "var_result": var_result,
+                                "lighter_submitted": False,
+                            },
+                        )
+                        return
+                    try:
+                        lighter_outcome = await self._timed_submit(
+                            self.place_lighter_order_from_plan(
+                                asset=snapshot.asset,
+                                side=var_side,
+                                qty=qty,
+                                var_fill_price=var_price,
+                                cycle_id=self.live_inventory_next_lot_id,
+                                role="live_inventory_entry",
+                            )
+                        )
+                    except Exception as exc:
+                        await self.require_live_inventory_manual_review(
+                            asset=snapshot.asset,
+                            reason=f"entry_lighter_submit_exception:{exc}",
+                            context={
+                                "action": "entry",
+                                "direction": direction,
+                                "qty": decimal_to_str(qty),
+                                "var_amount": var_amount,
                                 "var_side": var_side,
                                 "var_result": var_result,
                             },
                         )
                         return
+                    lighter_result, lighter_submit_ms = lighter_outcome
                     lighter_record, lighter_payload = lighter_result
                     lighter_started = self.auto_live_eager_hedge_started(lighter_record)
                     if lighter_record is None or not lighter_started:
