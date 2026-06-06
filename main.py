@@ -5855,8 +5855,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory V1 requires --lighter-order-mode market-ioc")
         if not args.lighter_prewarm_submit_ws:
             parser.error("--live-inventory V1 requires --lighter-prewarm-submit-ws")
-        if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > 10:
-            parser.error("--live-inventory-lot-notional-usd must be > 0 and <= 10 in V1")
+        if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > 15:
+            parser.error("--live-inventory-lot-notional-usd must be > 0 and <= 15 in V1")
         if args.live_inventory_max_lots <= 0 or args.live_inventory_max_lots > 3:
             parser.error("--live-inventory-max-lots must be > 0 and <= 3 in V1")
         if args.live_inventory_max_total_lots <= 0 or args.live_inventory_max_total_lots > 3:

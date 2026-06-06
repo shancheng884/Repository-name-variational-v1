@@ -265,6 +265,27 @@ def test_live_inventory_real_submit_accepts_v1_safe_flags(monkeypatch) -> None:
     assert args.live_inventory_entry_bps == 50.0
 
 
+def test_live_inventory_real_submit_accepts_15u_lot_notional(monkeypatch) -> None:
+    argv = live_inventory_safe_argv()
+    argv.remove("--live-inventory-dry-decisions")
+    monkeypatch.setattr(
+        "sys.argv",
+        argv
+        + [
+            "--live-max-notional-usd",
+            "15",
+            "--live-inventory-lot-notional-usd",
+            "15",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.live_inventory is True
+    assert args.live_inventory_dry_decisions is False
+    assert args.live_inventory_lot_notional_usd == 15.0
+
+
 def test_live_inventory_requires_flat_start_confirmation(monkeypatch) -> None:
     argv = live_inventory_safe_argv()
     argv.remove("--live-inventory-i-confirm-flat-start")
@@ -275,7 +296,7 @@ def test_live_inventory_requires_flat_start_confirmation(monkeypatch) -> None:
 
 
 def test_live_inventory_rejects_large_lot_notional(monkeypatch) -> None:
-    monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-lot-notional-usd", "11"])
+    monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-lot-notional-usd", "16"])
 
     with pytest.raises(SystemExit):
         parse_args()
