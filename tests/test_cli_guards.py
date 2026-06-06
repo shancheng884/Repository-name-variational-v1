@@ -286,15 +286,15 @@ def test_live_inventory_real_submit_accepts_15u_lot_notional(monkeypatch) -> Non
     assert args.live_inventory_lot_notional_usd == 15.0
 
 
-def test_live_inventory_real_submit_accepts_40bps_entry_threshold(monkeypatch) -> None:
+def test_live_inventory_real_submit_accepts_10bps_entry_threshold(monkeypatch) -> None:
     argv = live_inventory_safe_argv()
     argv.remove("--live-inventory-dry-decisions")
-    monkeypatch.setattr("sys.argv", argv + ["--live-inventory-entry-bps", "40"])
+    monkeypatch.setattr("sys.argv", argv + ["--live-inventory-entry-bps", "10"])
 
     args = parse_args()
 
     assert args.live_inventory_dry_decisions is False
-    assert args.live_inventory_entry_bps == 40.0
+    assert args.live_inventory_entry_bps == 10.0
 
 
 def test_live_inventory_requires_flat_start_confirmation(monkeypatch) -> None:
@@ -339,10 +339,10 @@ def test_live_inventory_dry_decisions_allow_low_entry_threshold(monkeypatch) -> 
     assert args.live_inventory_entry_bps == 5.0
 
 
-def test_live_inventory_real_submit_rejects_below_40bps_entry_threshold(monkeypatch) -> None:
+def test_live_inventory_real_submit_rejects_below_10bps_entry_threshold(monkeypatch) -> None:
     argv = live_inventory_safe_argv()
     argv.remove("--live-inventory-dry-decisions")
-    monkeypatch.setattr("sys.argv", argv + ["--live-inventory-entry-bps", "39.99"])
+    monkeypatch.setattr("sys.argv", argv + ["--live-inventory-entry-bps", "9.99"])
 
     with pytest.raises(SystemExit):
         parse_args()
