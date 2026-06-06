@@ -251,6 +251,7 @@ def test_live_inventory_accepts_v1_safe_flags(monkeypatch) -> None:
     assert args.live_inventory_lot_notional_usd == 20.0
     assert args.live_inventory_max_total_lots == 1
     assert args.live_inventory_entry_bps == 50.0
+    assert args.live_inventory_max_var_spread_bps == 5.0
 
 
 def test_live_inventory_real_submit_accepts_v1_safe_flags(monkeypatch) -> None:
@@ -308,6 +309,13 @@ def test_live_inventory_requires_flat_start_confirmation(monkeypatch) -> None:
 
 def test_live_inventory_rejects_large_lot_notional(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-lot-notional-usd", "21"])
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_live_inventory_rejects_non_positive_var_spread_limit(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-max-var-spread-bps", "0"])
 
     with pytest.raises(SystemExit):
         parse_args()

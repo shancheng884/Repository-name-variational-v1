@@ -616,8 +616,10 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_next_lot_id = 1
     runtime.live_inventory_open_lots = []
     runtime.live_inventory_realized_pnl_usd = Decimal("0")
+    runtime.pending_live_inventory_actual_pnl = {}
     runtime.live_inventory_entry_bps = Decimal("50")
     runtime.live_inventory_exit_bps = Decimal("10")
+    runtime.live_inventory_max_var_spread_bps = Decimal("5")
     runtime.live_inventory_lot_notional_usd = Decimal("10")
     runtime.live_inventory_max_total_lots = 1
     runtime.live_inventory_state_file = Path(tmp_path) / "live_inventory_state.json"
@@ -630,6 +632,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.base_amount_multiplier = Decimal("100000000")
     runtime.risk_guard_max_base_amount = 1000000
     runtime.risk_guard_max_price_deviation_bps = Decimal("1000")
+    runtime.lighter_min_base_amount = None
     runtime.lighter_min_quote_amount = None
     runtime.live_allowed_sides = {"buy", "sell"}
     runtime.live_allowed_assets = {"BTC"}
@@ -732,6 +735,35 @@ def test_live_inventory_entry_blocks_below_lighter_min_quote_before_submit(tmp_p
     asyncio.run(run())
 
 
+def test_live_inventory_entry_blocks_high_var_spread_before_submit(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_max_var_spread_bps = Decimal("1")
+        submit_calls: list[str] = []
+
+        async def fake_send_variational_place_order(**_kwargs):
+            submit_calls.append("var")
+            return {"ok": True}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            submit_calls.append("lighter")
+            return None, None
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        await runtime.maybe_run_live_inventory(_inventory_entry_snapshot())
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+
+        assert submit_calls == []
+        assert state["status"] == "flat"
+        assert state["last_blocked_reason"] == "var_spread_exceeds_live_inventory_limit"
+        assert state["last_blocked_context"]["var_spread_bps"] == "2"
+
+    asyncio.run(run())
+
+
 def test_variational_api_amount_to_str_truncates_to_min_qty_tick() -> None:
     assert variational_api_amount_to_str(Decimal("0.0002432227102505721546713663434")) == "0.000243"
 
@@ -812,5 +844,39 @@ def test_live_inventory_exit_concurrent_submit_uses_formatted_var_amount(tmp_pat
         assert state["manual_review_context"]["var_amount"] == "0.000243"
         assert runtime.live_inventory_open_lots[0]["status"] == "open"
         assert runtime.live_inventory_completed_cycles == 0
+
+    asyncio.run(run())
+
+
+def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.pending_live_inventory_actual_pnl["exit-1"] = {
+            "asset": "BTC",
+            "lot_id": 1,
+            "direction": "short_var_long_lighter",
+            "qty": "0.000326",
+            "entry_var_price": "60679.56",
+            "entry_lighter_price": "60600.4",
+            "exit_var_price": "60607.99",
+            "exit_lighter_estimated_price": "60605.9",
+            "estimated_pnl_usd": "0.02478067523956343718372446020",
+            "estimated_pnl_bps": "12.51424099597953577778085240",
+        }
+
+        await runtime.maybe_append_live_inventory_actual_pnl(
+            {
+                "trade_key": "exit-1",
+                "lighter_filled_price": "60605.8",
+            }
+        )
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+
+        assert rows[-1]["event"] == "live_inventory_actual_pnl"
+        assert rows[-1]["actual_pnl_status"] == "lighter_final_fill_confirmed"
+        assert rows[-1]["exit_lighter_final_fill_price"] == "60605.8"
+        assert rows[-1]["actual_pnl_usd"] == "0.02509222"
+        assert "exit-1" not in runtime.pending_live_inventory_actual_pnl
 
     asyncio.run(run())

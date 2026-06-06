@@ -739,6 +739,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_max_total_lots = int(args.live_inventory_max_total_lots)
         self.live_inventory_entry_bps = Decimal(str(args.live_inventory_entry_bps))
         self.live_inventory_exit_bps = Decimal(str(args.live_inventory_exit_bps))
+        self.live_inventory_max_var_spread_bps = Decimal(str(args.live_inventory_max_var_spread_bps))
         self.live_inventory_min_hold_samples = int(args.live_inventory_min_hold_samples)
         self.live_inventory_max_hold_samples = int(args.live_inventory_max_hold_samples)
         self.live_inventory_max_unrealized_loss_bps = Decimal(str(args.live_inventory_max_unrealized_loss_bps))
@@ -818,6 +819,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_open_lots: list[dict[str, Any]] = []
         self.live_inventory_realized_pnl_usd = Decimal("0")
         self.live_inventory_completed_cycles = 0
+        self.pending_live_inventory_actual_pnl: dict[str, dict[str, Any]] = {}
         self._order_write_lock = asyncio.Lock()
         self._opportunity_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
@@ -1019,6 +1021,69 @@ class VariationalToLighterRuntime:
             },
         )
 
+    @staticmethod
+    def live_inventory_pair_pnl(
+        *,
+        direction: str,
+        qty: Decimal,
+        entry_var_price: Decimal,
+        entry_lighter_price: Decimal,
+        exit_var_price: Decimal,
+        exit_lighter_price: Decimal,
+    ) -> tuple[Decimal, Decimal, Decimal]:
+        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+            var_leg_pnl = (exit_var_price - entry_var_price) * qty
+            lighter_leg_pnl = (entry_lighter_price - exit_lighter_price) * qty
+        else:
+            var_leg_pnl = (entry_var_price - exit_var_price) * qty
+            lighter_leg_pnl = (exit_lighter_price - entry_lighter_price) * qty
+        return var_leg_pnl, lighter_leg_pnl, var_leg_pnl + lighter_leg_pnl
+
+    async def maybe_append_live_inventory_actual_pnl(self, payload: dict[str, Any]) -> None:
+        trade_key = str(payload.get("trade_key") or "")
+        pending = self.pending_live_inventory_actual_pnl.pop(trade_key, None)
+        if not pending:
+            return
+
+        qty = to_decimal(pending.get("qty")) or Decimal("0")
+        entry_var_price = to_decimal(pending.get("entry_var_price"))
+        entry_lighter_price = to_decimal(pending.get("entry_lighter_price"))
+        exit_var_price = to_decimal(pending.get("exit_var_price"))
+        exit_lighter_price = to_decimal(payload.get("lighter_filled_price"))
+        if None in {entry_var_price, entry_lighter_price, exit_var_price, exit_lighter_price}:
+            await self.append_live_inventory_log(
+                "live_inventory_actual_pnl_pending",
+                {
+                    **pending,
+                    "exit_lighter_payload": payload,
+                    "actual_pnl_status": "missing_final_fill_price",
+                },
+            )
+            return
+
+        var_leg_pnl, lighter_leg_pnl, actual_pnl = self.live_inventory_pair_pnl(
+            direction=str(pending.get("direction") or ""),
+            qty=qty,
+            entry_var_price=entry_var_price,
+            entry_lighter_price=entry_lighter_price,
+            exit_var_price=exit_var_price,
+            exit_lighter_price=exit_lighter_price,
+        )
+        notional = qty * entry_var_price
+        actual_pnl_bps = actual_pnl / notional * Decimal("10000") if notional else None
+        await self.append_live_inventory_log(
+            "live_inventory_actual_pnl",
+            {
+                **pending,
+                "actual_pnl_status": "lighter_final_fill_confirmed",
+                "exit_lighter_final_fill_price": decimal_to_str(exit_lighter_price),
+                "actual_var_leg_pnl_usd": decimal_to_str(var_leg_pnl),
+                "actual_lighter_leg_pnl_usd": decimal_to_str(lighter_leg_pnl),
+                "actual_pnl_usd": decimal_to_str(actual_pnl),
+                "actual_pnl_bps": decimal_to_str(actual_pnl_bps),
+                "exit_lighter_payload": payload,
+            },
+        )
     async def live_inventory_entry_preflight(
         self,
         *,
@@ -1029,13 +1094,8 @@ class VariationalToLighterRuntime:
         var_price: Decimal,
         lighter_price: Decimal,
         edge_bps: Decimal | None,
+        var_spread_bps: Decimal | None = None,
     ) -> tuple[bool, str, dict[str, Any]]:
-        ok, reason, precheck_edge_bps = await self.auto_live_lighter_precheck(
-            asset=asset,
-            var_side=var_side,
-            qty=qty,
-            var_fill_price=var_price,
-        )
         notional = qty * lighter_price
         context = {
             "action": "entry",
@@ -1046,11 +1106,22 @@ class VariationalToLighterRuntime:
             "lighter_price": decimal_to_str(lighter_price),
             "lighter_notional_usd": decimal_to_str(notional),
             "entry_edge_bps": decimal_to_str(edge_bps),
-            "precheck_edge_bps": decimal_to_str(precheck_edge_bps),
+            "var_spread_bps": decimal_to_str(var_spread_bps),
+            "live_inventory_max_var_spread_bps": decimal_to_str(self.live_inventory_max_var_spread_bps),
+            "precheck_edge_bps": None,
             "lighter_min_base_amount": decimal_to_str(self.lighter_min_base_amount),
             "lighter_min_quote_amount": decimal_to_str(self.lighter_min_quote_amount),
             "live_max_notional_usd": decimal_to_str(self.live_max_notional_usd),
         }
+        if var_spread_bps is not None and var_spread_bps > self.live_inventory_max_var_spread_bps:
+            return False, "var_spread_exceeds_live_inventory_limit", context
+        ok, reason, precheck_edge_bps = await self.auto_live_lighter_precheck(
+            asset=asset,
+            var_side=var_side,
+            qty=qty,
+            var_fill_price=var_price,
+        )
+        context["precheck_edge_bps"] = decimal_to_str(precheck_edge_bps)
         if ok:
             return True, "ok", context
         return False, reason, context
@@ -1815,6 +1886,7 @@ class VariationalToLighterRuntime:
             payload = record.to_payload()
 
         await self.append_order_log("lighter_fill", payload)
+        await self.maybe_append_live_inventory_actual_pnl(payload)
 
     @staticmethod
     def _auto_live_direction_to_var_side(direction: str) -> str:
@@ -3987,6 +4059,7 @@ class VariationalToLighterRuntime:
                         var_price=var_price,
                         lighter_price=lighter_price,
                         edge_bps=edge_bps,
+                        var_spread_bps=snapshot.var_full_spread_bps or snapshot.var_half_spread_bps * Decimal("2"),
                     )
                     if not preflight_ok:
                         await self.block_live_inventory_entry(
@@ -4299,10 +4372,14 @@ class VariationalToLighterRuntime:
             var_submit_ms = None
             lighter_submit_ms = None
             lighter_payload = None
-        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
-            pnl = (var_exit_price - entry_var_price) * qty + (entry_lighter_price - lighter_exit_price) * qty
-        else:
-            pnl = (entry_var_price - var_exit_price) * qty + (lighter_exit_price - entry_lighter_price) * qty
+        estimated_var_leg_pnl, estimated_lighter_leg_pnl, pnl = self.live_inventory_pair_pnl(
+            direction=direction,
+            qty=qty,
+            entry_var_price=entry_var_price,
+            entry_lighter_price=entry_lighter_price,
+            exit_var_price=var_exit_price,
+            exit_lighter_price=lighter_exit_price,
+        )
         notional = qty * entry_var_price
         pnl_bps = pnl / notional * Decimal("10000") if notional else None
         self.live_inventory_open_lots.pop(0)
@@ -4311,6 +4388,26 @@ class VariationalToLighterRuntime:
         await self.persist_live_inventory_memory(
             reason="dry_exit_decision" if self.live_inventory_dry_decisions else "exit_submitted"
         )
+        actual_pnl_status = "dry_decision" if self.live_inventory_dry_decisions else "pending_lighter_final_fill"
+        if not self.live_inventory_dry_decisions and isinstance(lighter_payload, dict):
+            exit_trade_key = str(lighter_payload.get("trade_key") or "")
+            if exit_trade_key:
+                self.pending_live_inventory_actual_pnl[exit_trade_key] = {
+                    "asset": snapshot.asset,
+                    "lot_id": lot.get("lot_id"),
+                    "direction": direction,
+                    "qty": decimal_to_str(qty),
+                    "entry_var_price": decimal_to_str(entry_var_price),
+                    "entry_lighter_price": decimal_to_str(entry_lighter_price),
+                    "exit_var_price": decimal_to_str(var_exit_price),
+                    "exit_lighter_estimated_price": decimal_to_str(lighter_exit_price),
+                    "estimated_pnl_usd": decimal_to_str(pnl),
+                    "estimated_pnl_bps": decimal_to_str(pnl_bps),
+                    "estimated_var_leg_pnl_usd": decimal_to_str(estimated_var_leg_pnl),
+                    "estimated_lighter_leg_pnl_usd": decimal_to_str(estimated_lighter_leg_pnl),
+                    "holding_samples": holding_samples,
+                    "exit_reason": exit_reason,
+                }
         await self.append_live_inventory_log(
             f"{event_prefix}_exited",
             {
@@ -4323,6 +4420,11 @@ class VariationalToLighterRuntime:
                 "lighter_price": decimal_to_str(lighter_exit_price),
                 "pnl_usd": decimal_to_str(pnl),
                 "pnl_bps": decimal_to_str(pnl_bps),
+                "estimated_pnl_usd": decimal_to_str(pnl),
+                "estimated_pnl_bps": decimal_to_str(pnl_bps),
+                "estimated_var_leg_pnl_usd": decimal_to_str(estimated_var_leg_pnl),
+                "estimated_lighter_leg_pnl_usd": decimal_to_str(estimated_lighter_leg_pnl),
+                "actual_pnl_status": actual_pnl_status,
                 "holding_samples": holding_samples,
                 "exit_reason": exit_reason,
                 "open_lots_total": len(self.live_inventory_open_lots),
@@ -5794,6 +5896,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-max-total-lots", type=int, default=1)
     parser.add_argument("--live-inventory-entry-bps", type=float, default=50.0)
     parser.add_argument("--live-inventory-exit-bps", type=float, default=10.0)
+    parser.add_argument("--live-inventory-max-var-spread-bps", type=float, default=5.0)
     parser.add_argument("--live-inventory-min-hold-samples", type=int, default=3)
     parser.add_argument("--live-inventory-max-hold-samples", type=int, default=300)
     parser.add_argument("--live-inventory-max-unrealized-loss-bps", type=float, default=25.0)
@@ -5907,6 +6010,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-entry-bps must be >= 10 in V1 real-submit mode")
         if args.live_inventory_exit_bps < 0:
             parser.error("--live-inventory-exit-bps must be >= 0")
+        if args.live_inventory_max_var_spread_bps <= 0:
+            parser.error("--live-inventory-max-var-spread-bps must be > 0")
         if args.live_inventory_min_hold_samples < 0:
             parser.error("--live-inventory-min-hold-samples must be >= 0")
         if args.live_inventory_max_hold_samples <= 0:
