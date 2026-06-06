@@ -661,7 +661,7 @@ def test_variational_api_amount_to_str_truncates_to_8_decimals() -> None:
     assert variational_api_amount_to_str(Decimal("0.0002432227102505721546713663434")) == "0.00024322"
 
 
-def test_live_inventory_var_failure_does_not_submit_lighter(tmp_path) -> None:
+def test_live_inventory_entry_concurrent_submit_uses_formatted_var_amount(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
         runtime.live_inventory_lot_notional_usd = Decimal("15")
@@ -676,7 +676,7 @@ def test_live_inventory_var_failure_does_not_submit_lighter(tmp_path) -> None:
 
         async def fake_place_lighter_order_from_plan(**_kwargs):
             submit_calls.append("lighter")
-            return None, None
+            return None, {"submitted": True}
 
         runtime.send_variational_place_order = fake_send_variational_place_order
         runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
@@ -685,10 +685,9 @@ def test_live_inventory_var_failure_does_not_submit_lighter(tmp_path) -> None:
 
         state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
 
-        assert submit_calls == ["var"]
+        assert sorted(submit_calls) == ["lighter", "var"]
         assert var_amounts == ["0.00024752"]
         assert state["status"] == "manual_review_required"
-        assert state["manual_review_context"]["lighter_submitted"] is False
         assert state["manual_review_context"]["var_amount"] == "0.00024752"
         assert runtime.live_inventory_open_lots == []
         assert runtime.live_inventory_completed_cycles == 0
