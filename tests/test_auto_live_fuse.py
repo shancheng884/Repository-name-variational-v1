@@ -530,6 +530,75 @@ def test_place_lighter_order_from_plan_passes_reduce_only() -> None:
     asyncio.run(run())
 
 
+def test_reduce_only_lighter_order_bypasses_live_cooldown() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.mode = "live"
+        runtime.records = {}
+        runtime.record_order = deque()
+        runtime._record_lock = asyncio.Lock()
+        runtime._lighter_signer_lock = asyncio.Lock()
+        runtime.lighter_submit_transport = "http"
+        runtime.lighter_order_mode = "market-ioc"
+        runtime.lighter_market_index = 1
+        runtime.price_multiplier = Decimal("100")
+        runtime.base_amount_multiplier = Decimal("100000000")
+        runtime.risk_guard_max_base_amount = 1000000
+        runtime.risk_guard_max_price_deviation_bps = Decimal("1000")
+        runtime.lighter_min_base_amount = None
+        runtime.lighter_min_quote_amount = None
+        runtime.live_allowed_sides = {"buy", "sell"}
+        runtime.live_allowed_assets = {"BTC"}
+        runtime.live_max_qty = Decimal("0")
+        runtime.live_max_notional_usd = Decimal("100")
+        runtime.live_require_min_edge_bps = Decimal("0")
+        runtime.live_cooldown_seconds = 999999.0
+        runtime.last_live_submit_monotonic_by_asset = {"BTC": 999999999999.0}
+        runtime.lighter_client_order_to_trade_key = {}
+        runtime.lighter_best_bid = Decimal("99990")
+        runtime.lighter_best_ask = Decimal("100010")
+        runtime.lighter_order_book_lock = asyncio.Lock()
+        runtime.last_lighter_order_book_update_at = "2999-06-02T08:50:11+00:00"
+        runtime.logger = logging.getLogger("test_auto_live_fuse")
+
+        captured_kwargs = {}
+
+        class FakeClient:
+            ORDER_TYPE_LIMIT = 0
+            ORDER_TYPE_MARKET = 1
+            ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0
+            ORDER_TIME_IN_FORCE_GOOD_TILL_TIME = 1
+            DEFAULT_IOC_EXPIRY = 0
+            DEFAULT_28_DAY_ORDER_EXPIRY = -1
+
+            async def create_order(self, **kwargs):
+                captured_kwargs.update(kwargs)
+                return None, "0xabc", None
+
+        runtime.lighter_client = FakeClient()
+
+        async def fake_append_order_log(_event_type, _payload) -> None:
+            return None
+
+        runtime.append_order_log = fake_append_order_log
+
+        record, payload = await runtime.place_lighter_order_from_plan(
+            asset="BTC",
+            side="BUY",
+            qty=Decimal("0.000243"),
+            var_fill_price=Decimal("98990"),
+            role="live_inventory_exit",
+            reduce_only=True,
+        )
+
+        assert captured_kwargs["reduce_only"] is True
+        assert record is not None
+        assert record.failure_reason is None
+        assert payload["processing_stage"] == "live_submit_sent"
+
+    asyncio.run(run())
+
+
 def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.mode = "live"
@@ -690,6 +759,52 @@ def test_live_inventory_entry_concurrent_submit_uses_formatted_var_amount(tmp_pa
         assert state["status"] == "manual_review_required"
         assert state["manual_review_context"]["var_amount"] == "0.00024752"
         assert runtime.live_inventory_open_lots == []
+        assert runtime.live_inventory_completed_cycles == 0
+
+    asyncio.run(run())
+
+
+def test_live_inventory_exit_concurrent_submit_uses_formatted_var_amount(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.lighter_min_base_amount = Decimal("0.00020")
+        runtime.live_inventory_max_hold_samples = 300
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 1,
+                "direction": "short_var_long_lighter",
+                "qty": "0.0002430031523195129605107581521",
+                "entry_var_side": "SELL",
+                "entry_var_fill_price": "61116.43",
+                "entry_lighter_fill_price": "61054.70",
+                "entered_sample_index": 0,
+                "status": "open",
+            }
+        ]
+        submit_calls: list[str] = []
+        var_amounts: list[str] = []
+
+        async def fake_send_variational_place_order(**kwargs):
+            submit_calls.append("var")
+            var_amounts.append(kwargs["amount"])
+            return {"ok": False, "error": "quote_qty_precision"}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            submit_calls.append("lighter")
+            return None, {"submitted": True}
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        await runtime.maybe_run_live_inventory(_inventory_entry_snapshot())
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+
+        assert sorted(submit_calls) == ["lighter", "var"]
+        assert var_amounts == ["0.00024300"]
+        assert state["status"] == "manual_review_required"
+        assert state["manual_review_context"]["var_amount"] == "0.00024300"
+        assert runtime.live_inventory_open_lots[0]["status"] == "open"
         assert runtime.live_inventory_completed_cycles == 0
 
     asyncio.run(run())

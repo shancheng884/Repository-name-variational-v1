@@ -2806,7 +2806,11 @@ class VariationalToLighterRuntime:
             now_monotonic = time.monotonic()
             asset_key = record.asset.upper()
             last_submit_monotonic = self.last_live_submit_monotonic_by_asset.get(asset_key)
-            if last_submit_monotonic is not None and now_monotonic - last_submit_monotonic < self.live_cooldown_seconds:
+            if (
+                not record.lighter_reduce_only
+                and last_submit_monotonic is not None
+                and now_monotonic - last_submit_monotonic < self.live_cooldown_seconds
+            ):
                 remaining = self.live_cooldown_seconds - (now_monotonic - last_submit_monotonic)
                 async with self._record_lock:
                     record.hedge_error = f"Live cooldown active, wait {remaining:.2f}s"
@@ -4167,14 +4171,15 @@ class VariationalToLighterRuntime:
         exit_reason = "spread_reverted" if should_exit else "max_hold_samples"
         if not self.live_inventory_dry_decisions:
             exit_side = self._opposite_var_side(str(lot.get("entry_var_side") or self._auto_live_direction_to_var_side(direction)))
+            var_amount = variational_api_amount_to_str(qty)
             try:
                 var_task = asyncio.create_task(
                     self._timed_submit(
                         self.send_variational_place_order(
                             asset=snapshot.asset,
                             side=exit_side,
-                            amount=decimal_to_str(qty) or str(qty),
-                            expected_min_btc_qty=qty if snapshot.asset.upper() == "BTC" else None,
+                            amount=var_amount,
+                            expected_min_btc_qty=Decimal(var_amount) if snapshot.asset.upper() == "BTC" else None,
                             confirm=True,
                             reduce_only=True,
                         )
@@ -4207,6 +4212,7 @@ class VariationalToLighterRuntime:
                         "lot_id": lot.get("lot_id"),
                         "direction": direction,
                         "qty": decimal_to_str(qty),
+                        "var_amount": var_amount,
                         "exit_side": exit_side,
                     },
                 )
@@ -4220,6 +4226,7 @@ class VariationalToLighterRuntime:
                         "lot_id": lot.get("lot_id"),
                         "direction": direction,
                         "qty": decimal_to_str(qty),
+                        "var_amount": var_amount,
                         "exit_side": exit_side,
                     },
                 )
@@ -4233,6 +4240,7 @@ class VariationalToLighterRuntime:
                         "lot_id": lot.get("lot_id"),
                         "direction": direction,
                         "qty": decimal_to_str(qty),
+                        "var_amount": var_amount,
                         "exit_side": exit_side,
                     },
                 )
@@ -4248,6 +4256,7 @@ class VariationalToLighterRuntime:
                         "lot_id": lot.get("lot_id"),
                         "direction": direction,
                         "qty": decimal_to_str(qty),
+                        "var_amount": var_amount,
                         "exit_side": exit_side,
                         "var_result": var_result,
                     },
