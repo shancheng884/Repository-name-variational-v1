@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -62,6 +63,16 @@ class LiveInventoryEdgeSummary:
     lighter_min_quote_amount: Decimal | None
     thresholds: tuple[Decimal, ...]
     by_direction: dict[str, DirectionEdgeSummary]
+
+
+@dataclass(slots=True)
+class WatchSignal:
+    triggered: bool
+    direction: str | None
+    edge_bps: Decimal | None
+    threshold_bps: Decimal
+    executable: bool
+    logged_at: str | None
 
 
 def load_samples(path: Path, *, asset: str, latest: int | None = None) -> list[MarketSample]:
@@ -246,6 +257,48 @@ def print_summary(summary: LiveInventoryEdgeSummary) -> None:
         print()
 
 
+def latest_watch_signal(
+    samples: list[MarketSample],
+    *,
+    threshold_bps: Decimal,
+    lot_notional_usd: Decimal,
+    lighter_min_base_amount: Decimal | None,
+    lighter_min_quote_amount: Decimal | None,
+) -> WatchSignal:
+    if not samples:
+        return WatchSignal(False, None, None, threshold_bps, False, None)
+    latest = samples[-1]
+    candidates = []
+    for direction in (DIRECTION_LONG, DIRECTION_SHORT):
+        edge = edge_for(latest, direction)
+        executable = executable_for_live_inventory(
+            latest,
+            direction=direction,
+            lot_notional_usd=lot_notional_usd,
+            lighter_min_base_amount=lighter_min_base_amount,
+            lighter_min_quote_amount=lighter_min_quote_amount,
+        )
+        candidates.append((edge, direction, executable))
+    edge, direction, executable = max(candidates, key=lambda item: item[0])
+    return WatchSignal(
+        triggered=edge >= threshold_bps and executable,
+        direction=direction,
+        edge_bps=edge,
+        threshold_bps=threshold_bps,
+        executable=executable,
+        logged_at=latest.logged_at,
+    )
+
+
+def print_watch_line(signal: WatchSignal) -> None:
+    prefix = "WATCH_ALERT" if signal.triggered else "WATCH_WAIT"
+    print(
+        f"{prefix} logged_at={signal.logged_at or '-'} direction={signal.direction or '-'} "
+        f"edge_bps={fmt(signal.edge_bps)} threshold_bps={signal.threshold_bps} executable={signal.executable}",
+        flush=True,
+    )
+
+
 def parse_thresholds(raw: str) -> tuple[Decimal, ...]:
     values = tuple(to_decimal(item.strip()) for item in raw.split(",") if item.strip())
     if any(value is None for value in values) or not values:
@@ -262,6 +315,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lighter-min-base-amount", type=str, default="0.00020")
     parser.add_argument("--lighter-min-quote-amount", type=str, default="10")
     parser.add_argument("--thresholds", type=parse_thresholds, default=DEFAULT_THRESHOLDS)
+    parser.add_argument("--watch", action="store_true", help="Continuously refresh and print WATCH_ALERT when latest edge is executable and above threshold.")
+    parser.add_argument("--watch-threshold-bps", type=str, default="40")
+    parser.add_argument("--interval-seconds", type=float, default=5.0)
     return parser.parse_args()
 
 
@@ -274,9 +330,15 @@ def main() -> None:
         raise SystemExit("--lot-notional-usd must be > 0")
     min_base = to_decimal(args.lighter_min_base_amount)
     min_quote = to_decimal(args.lighter_min_quote_amount)
-    samples = load_samples(args.market_samples, asset=args.asset, latest=args.latest)
-    print_summary(
-        summarize_edges(
+    watch_threshold = to_decimal(args.watch_threshold_bps)
+    if watch_threshold is None:
+        raise SystemExit("--watch-threshold-bps must be a decimal")
+    if args.watch and args.interval_seconds <= 0:
+        raise SystemExit("--interval-seconds must be > 0")
+
+    while True:
+        samples = load_samples(args.market_samples, asset=args.asset, latest=args.latest)
+        summary = summarize_edges(
             samples,
             file=args.market_samples,
             asset=args.asset,
@@ -285,7 +347,20 @@ def main() -> None:
             lighter_min_quote_amount=min_quote,
             thresholds=args.thresholds,
         )
-    )
+        print_summary(summary)
+        if args.watch:
+            print_watch_line(
+                latest_watch_signal(
+                    samples,
+                    threshold_bps=watch_threshold,
+                    lot_notional_usd=lot_notional,
+                    lighter_min_base_amount=min_base,
+                    lighter_min_quote_amount=min_quote,
+                )
+            )
+            time.sleep(args.interval_seconds)
+            continue
+        break
 
 
 if __name__ == "__main__":

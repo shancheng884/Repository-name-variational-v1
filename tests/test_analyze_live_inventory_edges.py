@@ -2,7 +2,7 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
-from tools.analyze_live_inventory_edges import load_samples, summarize_edges
+from tools.analyze_live_inventory_edges import latest_watch_signal, load_samples, summarize_edges
 
 
 def _sample(ts: str, var_buy: str, var_sell: str, lighter_bid: str, lighter_ask: str) -> dict:
@@ -81,3 +81,46 @@ def test_live_inventory_edge_summary_applies_min_base(tmp_path: Path) -> None:
     assert too_small.by_direction["long_var_short_lighter"].executable_threshold_counts[Decimal("50")] == 0
     assert large_enough.by_direction["long_var_short_lighter"].executable_count == 1
     assert large_enough.by_direction["long_var_short_lighter"].executable_threshold_counts[Decimal("50")] == 1
+
+
+def test_live_inventory_watch_signal_alerts_on_latest_executable_edge(tmp_path: Path) -> None:
+    path = tmp_path / "market_samples.jsonl"
+    rows = [
+        _sample("t1", "60000", "59990", "60100", "60120"),
+        _sample("t2", "60000", "59990", "60350", "60370"),
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    samples = load_samples(path, asset="BTC")
+
+    signal = latest_watch_signal(
+        samples,
+        threshold_bps=Decimal("40"),
+        lot_notional_usd=Decimal("15"),
+        lighter_min_base_amount=Decimal("0.00020"),
+        lighter_min_quote_amount=Decimal("10"),
+    )
+
+    assert signal.triggered is True
+    assert signal.direction == "long_var_short_lighter"
+    assert signal.edge_bps == Decimal("58.33333333333333333333333333")
+    assert signal.executable is True
+    assert signal.logged_at == "t2"
+
+
+def test_live_inventory_watch_signal_waits_when_latest_edge_is_not_executable(tmp_path: Path) -> None:
+    path = tmp_path / "market_samples.jsonl"
+    path.write_text(json.dumps(_sample("t1", "60000", "59990", "60350", "60370")) + "\n", encoding="utf-8")
+    samples = load_samples(path, asset="BTC")
+
+    signal = latest_watch_signal(
+        samples,
+        threshold_bps=Decimal("40"),
+        lot_notional_usd=Decimal("10"),
+        lighter_min_base_amount=Decimal("0.00020"),
+        lighter_min_quote_amount=Decimal("10"),
+    )
+
+    assert signal.triggered is False
+    assert signal.direction == "long_var_short_lighter"
+    assert signal.edge_bps == Decimal("58.33333333333333333333333333")
+    assert signal.executable is False
