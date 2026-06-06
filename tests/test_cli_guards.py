@@ -248,7 +248,7 @@ def test_live_inventory_accepts_v1_safe_flags(monkeypatch) -> None:
     assert args.live_inventory is True
     assert args.live_inventory_dry_decisions is True
     assert args.live_inventory_i_confirm_flat_start is True
-    assert args.live_inventory_lot_notional_usd == 10.0
+    assert args.live_inventory_lot_notional_usd == 20.0
     assert args.live_inventory_max_total_lots == 1
     assert args.live_inventory_entry_bps == 50.0
 
@@ -265,7 +265,7 @@ def test_live_inventory_real_submit_accepts_v1_safe_flags(monkeypatch) -> None:
     assert args.live_inventory_entry_bps == 50.0
 
 
-def test_live_inventory_real_submit_accepts_15u_lot_notional(monkeypatch) -> None:
+def test_live_inventory_real_submit_accepts_20u_lot_notional(monkeypatch) -> None:
     argv = live_inventory_safe_argv()
     argv.remove("--live-inventory-dry-decisions")
     monkeypatch.setattr(
@@ -273,9 +273,9 @@ def test_live_inventory_real_submit_accepts_15u_lot_notional(monkeypatch) -> Non
         argv
         + [
             "--live-max-notional-usd",
-            "15",
+            "20",
             "--live-inventory-lot-notional-usd",
-            "15",
+            "20",
         ],
     )
 
@@ -283,7 +283,7 @@ def test_live_inventory_real_submit_accepts_15u_lot_notional(monkeypatch) -> Non
 
     assert args.live_inventory is True
     assert args.live_inventory_dry_decisions is False
-    assert args.live_inventory_lot_notional_usd == 15.0
+    assert args.live_inventory_lot_notional_usd == 20.0
 
 
 def test_live_inventory_real_submit_accepts_10bps_entry_threshold(monkeypatch) -> None:
@@ -307,7 +307,7 @@ def test_live_inventory_requires_flat_start_confirmation(monkeypatch) -> None:
 
 
 def test_live_inventory_rejects_large_lot_notional(monkeypatch) -> None:
-    monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-lot-notional-usd", "16"])
+    monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-lot-notional-usd", "21"])
 
     with pytest.raises(SystemExit):
         parse_args()

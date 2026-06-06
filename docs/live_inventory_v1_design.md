@@ -59,7 +59,7 @@ Suggested CLI flags:
 - `--live-inventory`
 - `--live-inventory-i-confirm-flat-start`
 - `--live-inventory-reset-state-after-manual-flat`
-- `--live-inventory-lot-notional-usd`, default disabled or `10`
+- `--live-inventory-lot-notional-usd`, default disabled or `20`
 - `--live-inventory-max-lots`, default `2`
 - `--live-inventory-max-total-lots`, default `2`
 - `--live-inventory-entry-bps`, default `45`
@@ -71,7 +71,7 @@ Suggested CLI flags:
 
 Hard V1 caps:
 
-- `lot_notional_usd <= 10` unless code is changed deliberately later.
+- `lot_notional_usd <= 20` unless code is changed deliberately later.
 - `max_total_lots <= 3`.
 - `asset == BTC` only.
 - `Lighter` order mode must be `market-ioc`.

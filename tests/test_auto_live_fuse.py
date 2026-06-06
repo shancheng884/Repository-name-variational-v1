@@ -142,6 +142,12 @@ def test_variational_api_quote_execution_price_uses_side() -> None:
     assert nested_buy_price == Decimal("100020")
 
 
+def test_variational_api_amount_is_quantized_to_min_qty_tick() -> None:
+    assert variational_api_amount_to_str(Decimal("0.0002443343566137633103278690968")) == "0.000244"
+    assert variational_api_amount_to_str(Decimal("0.0000019")) == "0.000001"
+    assert variational_api_amount_to_str(Decimal("0.0000009")) == "0.000000"
+
+
 def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_path) -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
@@ -726,14 +732,14 @@ def test_live_inventory_entry_blocks_below_lighter_min_quote_before_submit(tmp_p
     asyncio.run(run())
 
 
-def test_variational_api_amount_to_str_truncates_to_8_decimals() -> None:
-    assert variational_api_amount_to_str(Decimal("0.0002432227102505721546713663434")) == "0.00024322"
+def test_variational_api_amount_to_str_truncates_to_min_qty_tick() -> None:
+    assert variational_api_amount_to_str(Decimal("0.0002432227102505721546713663434")) == "0.000243"
 
 
 def test_live_inventory_entry_concurrent_submit_uses_formatted_var_amount(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
-        runtime.live_inventory_lot_notional_usd = Decimal("15")
+        runtime.live_inventory_lot_notional_usd = Decimal("20")
         runtime.lighter_min_base_amount = Decimal("0.00020")
         submit_calls: list[str] = []
         var_amounts: list[str] = []
@@ -755,9 +761,9 @@ def test_live_inventory_entry_concurrent_submit_uses_formatted_var_amount(tmp_pa
         state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
 
         assert sorted(submit_calls) == ["lighter", "var"]
-        assert var_amounts == ["0.00024752"]
+        assert var_amounts == ["0.000330"]
         assert state["status"] == "manual_review_required"
-        assert state["manual_review_context"]["var_amount"] == "0.00024752"
+        assert state["manual_review_context"]["var_amount"] == "0.000330"
         assert runtime.live_inventory_open_lots == []
         assert runtime.live_inventory_completed_cycles == 0
 
@@ -801,9 +807,9 @@ def test_live_inventory_exit_concurrent_submit_uses_formatted_var_amount(tmp_pat
         state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
 
         assert sorted(submit_calls) == ["lighter", "var"]
-        assert var_amounts == ["0.00024300"]
+        assert var_amounts == ["0.000243"]
         assert state["status"] == "manual_review_required"
-        assert state["manual_review_context"]["var_amount"] == "0.00024300"
+        assert state["manual_review_context"]["var_amount"] == "0.000243"
         assert runtime.live_inventory_open_lots[0]["status"] == "open"
         assert runtime.live_inventory_completed_cycles == 0
 

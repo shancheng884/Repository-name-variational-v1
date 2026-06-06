@@ -182,7 +182,7 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     return format(value, "f")
 
 
-VARIATIONAL_API_AMOUNT_QUANTUM = Decimal("0.00000001")
+VARIATIONAL_API_AMOUNT_QUANTUM = Decimal("0.000001")
 
 
 def variational_api_amount_to_str(value: Decimal) -> str:
@@ -5789,7 +5789,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="After manually confirming Var and Lighter are flat, reset log/live_inventory_state.json to flat during startup.",
     )
-    parser.add_argument("--live-inventory-lot-notional-usd", type=float, default=10.0)
+    parser.add_argument("--live-inventory-lot-notional-usd", type=float, default=20.0)
     parser.add_argument("--live-inventory-max-lots", type=int, default=1)
     parser.add_argument("--live-inventory-max-total-lots", type=int, default=1)
     parser.add_argument("--live-inventory-entry-bps", type=float, default=50.0)
@@ -5895,8 +5895,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory V1 requires --lighter-order-mode market-ioc")
         if not args.lighter_prewarm_submit_ws:
             parser.error("--live-inventory V1 requires --lighter-prewarm-submit-ws")
-        if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > 15:
-            parser.error("--live-inventory-lot-notional-usd must be > 0 and <= 15 in V1")
+        if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > 20:
+            parser.error("--live-inventory-lot-notional-usd must be > 0 and <= 20 in V1")
         if args.live_inventory_max_lots <= 0 or args.live_inventory_max_lots > 3:
             parser.error("--live-inventory-max-lots must be > 0 and <= 3 in V1")
         if args.live_inventory_max_total_lots <= 0 or args.live_inventory_max_total_lots > 3:
