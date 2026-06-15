@@ -215,6 +215,7 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
                 "qty": "0.0003",
                 "entry_var_fill_price": "100",
                 "entry_lighter_fill_price": "110",
+                "entry_edge_bps": "1000",
                 "entered_at": "2026-06-15T00:00:00Z",
             },
         )
@@ -285,6 +286,10 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
         assert final_rows[0]["final_pnl_usd"] == "-0.0063"
         assert Decimal(final_rows[0]["entry_var_fill_drift_bps"]) == Decimal("3000")
         assert Decimal(final_rows[0]["exit_var_fill_drift_bps"]) == Decimal("0")
+        assert Decimal(final_rows[0]["entry_estimated_edge_bps"]) == Decimal("1000")
+        assert Decimal(final_rows[0]["entry_final_edge_bps"]) < Decimal("0")
+        assert Decimal(final_rows[0]["entry_edge_capture_loss_bps"]) > Decimal("2500")
+        assert runtime.live_inventory_execution_loss_bps_samples
 
     asyncio.run(run())
 
@@ -800,6 +805,8 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_open_lots = []
     runtime.live_inventory_realized_pnl_usd = Decimal("0")
     runtime.pending_live_inventory_actual_pnl = {}
+    runtime.pending_live_inventory_final_pnl = {}
+    runtime.live_inventory_execution_loss_bps_samples = deque(maxlen=20)
     runtime.live_inventory_entry_bps = Decimal("50")
     runtime.live_inventory_exit_bps = Decimal("10")
     runtime.live_inventory_max_var_spread_bps = Decimal("5")
@@ -981,6 +988,40 @@ def test_live_inventory_entry_blocks_dynamic_threshold_before_submit(tmp_path) -
         assert submit_calls == []
         assert state["status"] == "flat"
         assert state["last_blocked_reason"] == "edge_bps_below_dynamic_live_inventory_entry"
+        assert Decimal(state["last_blocked_context"]["live_inventory_required_entry_bps"]) == Decimal("72")
+
+    asyncio.run(run())
+
+
+def test_live_inventory_entry_uses_recent_execution_loss_buffer_before_submit(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_entry_bps = Decimal("10")
+        runtime.live_inventory_dynamic_entry_buffer_bps = Decimal("0")
+        runtime.live_inventory_execution_loss_bps_samples.extend(
+            [Decimal("50"), Decimal("60"), Decimal("65"), Decimal("70")]
+        )
+        submit_calls: list[str] = []
+
+        async def fake_send_variational_place_order(**_kwargs):
+            submit_calls.append("var")
+            return {"ok": True}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            submit_calls.append("lighter")
+            return None, None
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        await runtime.maybe_run_live_inventory(_inventory_entry_snapshot())
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+
+        assert submit_calls == []
+        assert state["status"] == "flat"
+        assert state["last_blocked_reason"] == "edge_bps_below_dynamic_live_inventory_entry"
+        assert Decimal(state["last_blocked_context"]["live_inventory_recent_execution_loss_buffer_bps"]) == Decimal("70")
         assert Decimal(state["last_blocked_context"]["live_inventory_required_entry_bps"]) == Decimal("72")
 
     asyncio.run(run())

@@ -14,7 +14,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from types import SimpleNamespace
 from statistics import median
-from typing import Any
+from typing import Any, Iterable
 
 import requests
 import websockets
@@ -833,6 +833,8 @@ class VariationalToLighterRuntime:
         self.live_inventory_completed_cycles = 0
         self.pending_live_inventory_actual_pnl: dict[str, dict[str, Any]] = {}
         self.pending_live_inventory_final_pnl: dict[str, dict[str, Any]] = {}
+        self.live_inventory_execution_loss_bps_samples: deque[Decimal] = deque(maxlen=20)
+        self.load_recent_live_inventory_execution_loss_bps()
         self.pending_live_inventory_var_fill_matches: list[PendingLiveInventoryVarFillMatch] = []
         self._order_write_lock = asyncio.Lock()
         self._opportunity_write_lock = asyncio.Lock()
@@ -907,6 +909,40 @@ class VariationalToLighterRuntime:
     @staticmethod
     def now_iso() -> str:
         return utc_now()
+
+    def load_recent_live_inventory_execution_loss_bps(self) -> None:
+        orders_file = getattr(self, "orders_file", None)
+        if orders_file is None or not orders_file.exists():
+            return
+        samples: deque[Decimal] = deque(maxlen=self.live_inventory_execution_loss_bps_samples.maxlen)
+        try:
+            with orders_file.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if '"event": "live_inventory_final_pnl"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    loss_bps = to_decimal(row.get("entry_edge_capture_loss_bps"))
+                    if loss_bps is not None and loss_bps > 0:
+                        samples.append(loss_bps)
+        except OSError as exc:
+            self.logger.warning("Could not load recent live inventory execution loss samples: %s", exc)
+            return
+        self.live_inventory_execution_loss_bps_samples.extend(samples)
+
+    @staticmethod
+    def percentile_decimal(values: Iterable[Decimal], percentile: int) -> Decimal | None:
+        ordered = sorted(value for value in values if value is not None)
+        if not ordered:
+            return None
+        rank = ((len(ordered) * percentile) + 99) // 100
+        index = max(0, min(len(ordered) - 1, rank - 1))
+        return ordered[index]
+
+    def live_inventory_recent_execution_loss_buffer_bps(self) -> Decimal:
+        return self.percentile_decimal(getattr(self, "live_inventory_execution_loss_bps_samples", []), 80) or Decimal("0")
 
     @staticmethod
     def set_record_stage(
@@ -1059,6 +1095,21 @@ class VariationalToLighterRuntime:
             return None
         return ((actual - estimated) / estimated) * Decimal("10000")
 
+    @staticmethod
+    def live_inventory_pair_edge_bps(
+        *,
+        direction: str,
+        var_price: Decimal | None,
+        lighter_price: Decimal | None,
+    ) -> Decimal | None:
+        if var_price is None or lighter_price is None or var_price == 0:
+            return None
+        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+            return ((lighter_price - var_price) / var_price) * Decimal("10000")
+        if direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
+            return ((var_price - lighter_price) / var_price) * Decimal("10000")
+        return None
+
     async def live_inventory_lighter_slippage_bps(self, *, lighter_side: str, qty: Decimal) -> tuple[Decimal | None, Decimal | None]:
         best_bid, best_ask = await self.get_lighter_best_bid_ask()
         estimated_fill = await self.estimate_lighter_fill_price(lighter_side, qty)
@@ -1138,6 +1189,7 @@ class VariationalToLighterRuntime:
                 "qty": lot.get("qty"),
                 "entry_estimated_var_price": lot.get("entry_var_fill_price"),
                 "entry_estimated_lighter_price": lot.get("entry_lighter_fill_price"),
+                "entry_signal_edge_bps": lot.get("entry_edge_bps"),
                 "entered_at": lot.get("entered_at"),
             }
         )
@@ -1229,6 +1281,33 @@ class VariationalToLighterRuntime:
         entry_estimated_lighter_price = to_decimal(pending.get("entry_estimated_lighter_price"))
         exit_estimated_var_price = to_decimal(pending.get("exit_estimated_var_price"))
         exit_estimated_lighter_price = to_decimal(pending.get("exit_estimated_lighter_price"))
+        entry_signal_edge_bps = to_decimal(pending.get("entry_signal_edge_bps"))
+        entry_estimated_edge_bps = self.live_inventory_pair_edge_bps(
+            direction=direction,
+            var_price=entry_estimated_var_price,
+            lighter_price=entry_estimated_lighter_price,
+        )
+        entry_final_edge_bps = self.live_inventory_pair_edge_bps(
+            direction=direction,
+            var_price=entry_var_price,
+            lighter_price=entry_lighter_price,
+        )
+        exit_estimated_edge_bps = self.live_inventory_pair_edge_bps(
+            direction=direction,
+            var_price=exit_estimated_var_price,
+            lighter_price=exit_estimated_lighter_price,
+        )
+        exit_final_edge_bps = self.live_inventory_pair_edge_bps(
+            direction=direction,
+            var_price=exit_var_price,
+            lighter_price=exit_lighter_price,
+        )
+        entry_edge_capture_loss_bps = None
+        if entry_signal_edge_bps is not None and entry_final_edge_bps is not None:
+            entry_edge_capture_loss_bps = entry_signal_edge_bps - entry_final_edge_bps
+        final_spread_capture_bps = None
+        if entry_final_edge_bps is not None and exit_final_edge_bps is not None:
+            final_spread_capture_bps = entry_final_edge_bps - exit_final_edge_bps
 
         var_leg_pnl, lighter_leg_pnl, final_pnl = self.live_inventory_pair_pnl(
             direction=direction,
@@ -1240,6 +1319,10 @@ class VariationalToLighterRuntime:
         )
         notional = (qty or Decimal("0")) * (entry_var_price or Decimal("0"))
         final_pnl_bps = final_pnl / notional * Decimal("10000") if notional else None
+        if not hasattr(self, "live_inventory_execution_loss_bps_samples"):
+            self.live_inventory_execution_loss_bps_samples = deque(maxlen=20)
+        if entry_edge_capture_loss_bps is not None and entry_edge_capture_loss_bps > 0:
+            self.live_inventory_execution_loss_bps_samples.append(entry_edge_capture_loss_bps)
         pending["final_pnl_emitted"] = True
         await self.append_live_inventory_log(
             "live_inventory_final_pnl",
@@ -1250,6 +1333,15 @@ class VariationalToLighterRuntime:
                 "final_lighter_leg_pnl_usd": decimal_to_str(lighter_leg_pnl),
                 "final_pnl_usd": decimal_to_str(final_pnl),
                 "final_pnl_bps": decimal_to_str(final_pnl_bps),
+                "entry_estimated_edge_bps": decimal_to_str(entry_estimated_edge_bps),
+                "entry_final_edge_bps": decimal_to_str(entry_final_edge_bps),
+                "exit_estimated_edge_bps": decimal_to_str(exit_estimated_edge_bps),
+                "exit_final_edge_bps": decimal_to_str(exit_final_edge_bps),
+                "entry_edge_capture_loss_bps": decimal_to_str(entry_edge_capture_loss_bps),
+                "final_spread_capture_bps": decimal_to_str(final_spread_capture_bps),
+                "recent_execution_loss_buffer_bps": decimal_to_str(
+                    self.live_inventory_recent_execution_loss_buffer_bps()
+                ),
                 "entry_var_fill_drift_bps": decimal_to_str(
                     self.live_inventory_price_drift_bps(entry_var_price, entry_estimated_var_price)
                 ),
@@ -1291,6 +1383,9 @@ class VariationalToLighterRuntime:
             "live_inventory_entry_bps": decimal_to_str(self.live_inventory_entry_bps),
             "live_inventory_dynamic_entry_buffer_bps": decimal_to_str(self.live_inventory_dynamic_entry_buffer_bps),
             "live_inventory_max_lighter_slippage_bps": decimal_to_str(self.live_inventory_max_lighter_slippage_bps),
+            "live_inventory_recent_execution_loss_buffer_bps": decimal_to_str(
+                self.live_inventory_recent_execution_loss_buffer_bps()
+            ),
             "live_inventory_required_entry_bps": None,
             "lighter_side": None,
             "lighter_estimated_fill_price": None,
@@ -1337,6 +1432,7 @@ class VariationalToLighterRuntime:
         dynamic_required_entry_bps = (
             (var_spread_bps or Decimal("0"))
             + lighter_slippage_bps
+            + self.live_inventory_recent_execution_loss_buffer_bps()
             + self.live_inventory_dynamic_entry_buffer_bps
         )
         if dynamic_required_entry_bps > required_entry_bps:
