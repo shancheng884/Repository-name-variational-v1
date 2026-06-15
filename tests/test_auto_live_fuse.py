@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from collections import deque
 from decimal import Decimal
 from pathlib import Path
@@ -641,6 +642,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_max_notional_usd = Decimal("20")
     runtime.live_require_min_edge_bps = Decimal("0")
     runtime.live_cooldown_seconds = 0.0
+    runtime.last_live_submit_monotonic_by_asset = {}
     runtime.logger = logging.getLogger("test_auto_live_fuse")
     return runtime
 
@@ -761,6 +763,38 @@ def test_live_inventory_entry_blocks_high_var_spread_before_submit(tmp_path) -> 
         assert state["status"] == "flat"
         assert state["last_blocked_reason"] == "var_spread_exceeds_live_inventory_limit"
         assert state["last_blocked_context"]["var_spread_bps"] == "2"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_entry_blocks_live_cooldown_before_submit(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_cooldown_seconds = 3.0
+        runtime.last_live_submit_monotonic_by_asset = {"BTC": time.monotonic()}
+        submit_calls: list[str] = []
+
+        async def fake_send_variational_place_order(**_kwargs):
+            submit_calls.append("var")
+            return {"ok": True}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            submit_calls.append("lighter")
+            return None, {"submitted": True}
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        await runtime.maybe_run_live_inventory(_inventory_entry_snapshot())
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+
+        assert submit_calls == []
+        assert runtime.live_inventory_open_lots == []
+        assert runtime.live_inventory_completed_cycles == 0
+        assert state["status"] == "flat"
+        assert state["last_blocked_reason"] == "live_cooldown_active"
+        assert state["last_blocked_context"]["live_cooldown_remaining_seconds"] is not None
 
     asyncio.run(run())
 

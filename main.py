@@ -1112,9 +1112,17 @@ class VariationalToLighterRuntime:
             "lighter_min_base_amount": decimal_to_str(self.lighter_min_base_amount),
             "lighter_min_quote_amount": decimal_to_str(self.lighter_min_quote_amount),
             "live_max_notional_usd": decimal_to_str(self.live_max_notional_usd),
+            "live_cooldown_remaining_seconds": None,
         }
         if var_spread_bps is not None and var_spread_bps > self.live_inventory_max_var_spread_bps:
             return False, "var_spread_exceeds_live_inventory_limit", context
+        last_submit_monotonic = self.last_live_submit_monotonic_by_asset.get(asset.upper())
+        if last_submit_monotonic is not None:
+            cooldown_elapsed = time.monotonic() - last_submit_monotonic
+            if cooldown_elapsed < self.live_cooldown_seconds:
+                remaining = self.live_cooldown_seconds - cooldown_elapsed
+                context["live_cooldown_remaining_seconds"] = f"{remaining:.3f}"
+                return False, "live_cooldown_active", context
         ok, reason, precheck_edge_bps = await self.auto_live_lighter_precheck(
             asset=asset,
             var_side=var_side,
