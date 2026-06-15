@@ -656,6 +656,16 @@ class PendingAutoLiveMatch:
 
 
 @dataclass(slots=True)
+class PendingLiveInventoryVarFillMatch:
+    asset: str
+    side: str
+    qty: Decimal
+    lot_id: int
+    role: str
+    created_at_monotonic: float
+
+
+@dataclass(slots=True)
 class StartupDiagnostics:
     passed: list[str]
     warnings: list[str]
@@ -820,6 +830,8 @@ class VariationalToLighterRuntime:
         self.live_inventory_realized_pnl_usd = Decimal("0")
         self.live_inventory_completed_cycles = 0
         self.pending_live_inventory_actual_pnl: dict[str, dict[str, Any]] = {}
+        self.pending_live_inventory_final_pnl: dict[str, dict[str, Any]] = {}
+        self.pending_live_inventory_var_fill_matches: list[PendingLiveInventoryVarFillMatch] = []
         self._order_write_lock = asyncio.Lock()
         self._opportunity_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
@@ -1082,6 +1094,94 @@ class VariationalToLighterRuntime:
                 "actual_pnl_usd": decimal_to_str(actual_pnl),
                 "actual_pnl_bps": decimal_to_str(actual_pnl_bps),
                 "exit_lighter_payload": payload,
+            },
+        )
+
+    @staticmethod
+    def live_inventory_final_pnl_key(asset: str, lot_id: Any) -> str:
+        return f"{str(asset).upper()}:{lot_id}"
+
+    def remember_live_inventory_final_pnl_lot(self, *, asset: str, lot: dict[str, Any]) -> None:
+        lot_id = lot.get("lot_id")
+        if lot_id is None:
+            return
+        key = self.live_inventory_final_pnl_key(asset, lot_id)
+        pending = self.pending_live_inventory_final_pnl.setdefault(key, {})
+        pending.update(
+            {
+                "asset": asset,
+                "lot_id": lot_id,
+                "direction": lot.get("direction"),
+                "qty": lot.get("qty"),
+                "entry_estimated_var_price": lot.get("entry_var_fill_price"),
+                "entry_estimated_lighter_price": lot.get("entry_lighter_fill_price"),
+                "entered_at": lot.get("entered_at"),
+            }
+        )
+
+    async def maybe_append_live_inventory_final_pnl_from_fill(self, payload: dict[str, Any]) -> None:
+        role = str(payload.get("auto_live_role") or "")
+        if role not in {"live_inventory_entry", "live_inventory_exit"}:
+            return
+        lot_id = payload.get("auto_live_cycle_id")
+        asset = str(payload.get("asset") or "")
+        if lot_id is None or not asset:
+            return
+
+        key = self.live_inventory_final_pnl_key(asset, lot_id)
+        pending = self.pending_live_inventory_final_pnl.setdefault(key, {"asset": asset, "lot_id": lot_id})
+        pending.setdefault("qty", payload.get("qty"))
+        if role == "live_inventory_entry":
+            if payload.get("variational_filled_price") is not None and payload.get("synthetic_eager_fill") is False:
+                pending["entry_var_final_fill_price"] = payload.get("variational_filled_price")
+                pending["entry_var_final_fill_at"] = payload.get("variational_filled_at")
+            if payload.get("lighter_filled_price") is not None:
+                pending["entry_lighter_final_fill_price"] = payload.get("lighter_filled_price")
+                pending["entry_lighter_final_fill_at"] = payload.get("lighter_filled_at")
+        else:
+            if payload.get("variational_filled_price") is not None and payload.get("synthetic_eager_fill") is False:
+                pending["exit_var_final_fill_price"] = payload.get("variational_filled_price")
+                pending["exit_var_final_fill_at"] = payload.get("variational_filled_at")
+            if payload.get("lighter_filled_price") is not None:
+                pending["exit_lighter_final_fill_price"] = payload.get("lighter_filled_price")
+                pending["exit_lighter_final_fill_at"] = payload.get("lighter_filled_at")
+
+        await self.maybe_append_live_inventory_final_pnl(key)
+
+    async def maybe_append_live_inventory_final_pnl(self, key: str) -> None:
+        pending = self.pending_live_inventory_final_pnl.get(key)
+        if not pending or pending.get("final_pnl_emitted"):
+            return
+
+        qty = to_decimal(pending.get("qty"))
+        direction = str(pending.get("direction") or "")
+        entry_var_price = to_decimal(pending.get("entry_var_final_fill_price"))
+        entry_lighter_price = to_decimal(pending.get("entry_lighter_final_fill_price"))
+        exit_var_price = to_decimal(pending.get("exit_var_final_fill_price"))
+        exit_lighter_price = to_decimal(pending.get("exit_lighter_final_fill_price"))
+        if None in {qty, entry_var_price, entry_lighter_price, exit_var_price, exit_lighter_price} or not direction:
+            return
+
+        var_leg_pnl, lighter_leg_pnl, final_pnl = self.live_inventory_pair_pnl(
+            direction=direction,
+            qty=qty or Decimal("0"),
+            entry_var_price=entry_var_price or Decimal("0"),
+            entry_lighter_price=entry_lighter_price or Decimal("0"),
+            exit_var_price=exit_var_price or Decimal("0"),
+            exit_lighter_price=exit_lighter_price or Decimal("0"),
+        )
+        notional = (qty or Decimal("0")) * (entry_var_price or Decimal("0"))
+        final_pnl_bps = final_pnl / notional * Decimal("10000") if notional else None
+        pending["final_pnl_emitted"] = True
+        await self.append_live_inventory_log(
+            "live_inventory_final_pnl",
+            {
+                **pending,
+                "final_pnl_status": "var_and_lighter_final_fills_confirmed",
+                "final_var_leg_pnl_usd": decimal_to_str(var_leg_pnl),
+                "final_lighter_leg_pnl_usd": decimal_to_str(lighter_leg_pnl),
+                "final_pnl_usd": decimal_to_str(final_pnl),
+                "final_pnl_bps": decimal_to_str(final_pnl_bps),
             },
         )
     async def live_inventory_entry_preflight(
@@ -1895,6 +1995,7 @@ class VariationalToLighterRuntime:
 
         await self.append_order_log("lighter_fill", payload)
         await self.maybe_append_live_inventory_actual_pnl(payload)
+        await self.maybe_append_live_inventory_final_pnl_from_fill(payload)
 
     @staticmethod
     def _auto_live_direction_to_var_side(direction: str) -> str:
@@ -2094,6 +2195,45 @@ class VariationalToLighterRuntime:
             match = self.pending_auto_live_matches.pop(idx)
             return match
         return None
+
+    def prune_pending_live_inventory_var_fill_matches(self) -> None:
+        now_monotonic = time.monotonic()
+        pending_matches = getattr(self, "pending_live_inventory_var_fill_matches", [])
+        self.pending_live_inventory_var_fill_matches = [
+            item
+            for item in pending_matches
+            if now_monotonic - item.created_at_monotonic <= self.auto_live_match_window_seconds
+        ]
+
+    def consume_pending_live_inventory_var_fill_match(
+        self,
+        *,
+        asset: str,
+        side: str,
+        qty: Decimal,
+    ) -> PendingLiveInventoryVarFillMatch | None:
+        self.prune_pending_live_inventory_var_fill_matches()
+        side_lower = side.strip().lower()
+        for idx, item in enumerate(self.pending_live_inventory_var_fill_matches):
+            if item.asset != asset or item.side != side_lower:
+                continue
+            if abs(item.qty - qty) > Decimal("0.000002"):
+                continue
+            return self.pending_live_inventory_var_fill_matches.pop(idx)
+        return None
+
+    def add_pending_live_inventory_var_fill_match(self, match: PendingLiveInventoryVarFillMatch) -> None:
+        if not hasattr(self, "pending_live_inventory_var_fill_matches"):
+            self.pending_live_inventory_var_fill_matches = []
+        self.pending_live_inventory_var_fill_matches.append(match)
+
+    def remove_pending_live_inventory_var_fill_match(self, *, asset: str, lot_id: Any, role: str) -> None:
+        pending_matches = getattr(self, "pending_live_inventory_var_fill_matches", [])
+        self.pending_live_inventory_var_fill_matches = [
+            item
+            for item in pending_matches
+            if not (item.asset == asset and item.lot_id == lot_id and item.role == role)
+        ]
 
     def _rekey_record_locked(self, record: OrderLifecycle, new_trade_key: str) -> None:
         old_trade_key = record.trade_key
@@ -3149,8 +3289,14 @@ class VariationalToLighterRuntime:
         created = False
         created_record: OrderLifecycle | None = None
         matched_auto_live = None
+        matched_live_inventory_var_fill = None
         if status == "filled":
             matched_auto_live = self.consume_pending_auto_live_match(asset=asset, side=side, qty=qty)
+            matched_live_inventory_var_fill = self.consume_pending_live_inventory_var_fill_match(
+                asset=asset,
+                side=side,
+                qty=qty,
+            )
         matched_trade_key = matched_auto_live.record_key if matched_auto_live is not None else None
 
         async with self._record_lock:
@@ -3164,8 +3310,20 @@ class VariationalToLighterRuntime:
                     asset=asset if asset else "UNKNOWN",
                     mode=self.mode,
                     last_variational_status=status,
-                    auto_live_cycle_id=matched_auto_live.cycle_id if matched_auto_live is not None else None,
-                    auto_live_role=matched_auto_live.role if matched_auto_live is not None else None,
+                    auto_live_cycle_id=(
+                        matched_auto_live.cycle_id
+                        if matched_auto_live is not None
+                        else matched_live_inventory_var_fill.lot_id
+                        if matched_live_inventory_var_fill is not None
+                        else None
+                    ),
+                    auto_live_role=(
+                        matched_auto_live.role
+                        if matched_auto_live is not None
+                        else matched_live_inventory_var_fill.role
+                        if matched_live_inventory_var_fill is not None
+                        else None
+                    ),
                 )
                 self.set_record_stage(record, STAGE_RECORD_CREATED, clear_failure=True)
                 self.records[record.trade_key] = record
@@ -3179,6 +3337,9 @@ class VariationalToLighterRuntime:
                 if matched_auto_live is not None:
                     record.auto_live_cycle_id = matched_auto_live.cycle_id
                     record.auto_live_role = matched_auto_live.role
+                elif matched_live_inventory_var_fill is not None:
+                    record.auto_live_cycle_id = matched_live_inventory_var_fill.lot_id
+                    record.auto_live_role = matched_live_inventory_var_fill.role
                 self.set_record_stage(record, STAGE_EVENT_FILTERED)
 
             if created:
@@ -3211,6 +3372,7 @@ class VariationalToLighterRuntime:
 
         if filled_payload is not None:
             await self.append_order_log("variational_fill", filled_payload)
+            await self.maybe_append_live_inventory_final_pnl_from_fill(filled_payload)
 
         if not created or created_record is None:
             return
@@ -3227,7 +3389,7 @@ class VariationalToLighterRuntime:
             return
 
         if self.is_live_mode() and status == "filled":
-            if getattr(self, "live_inventory", False):
+            if getattr(self, "live_inventory", False) or str(getattr(created_record, "auto_live_role", "") or "").startswith("live_inventory_"):
                 async with self._record_lock:
                     created_record.hedge_error = "Live inventory mode blocks trade-event auto hedges"
                     self.set_record_stage(
@@ -4057,6 +4219,7 @@ class VariationalToLighterRuntime:
                     return
                 notional_price = var_price * (Decimal("1") + Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000"))
                 qty = self.live_inventory_lot_notional_usd / notional_price
+                lot_id = self.live_inventory_next_lot_id
                 var_side = self._auto_live_direction_to_var_side(direction)
                 if not self.live_inventory_dry_decisions:
                     preflight_ok, preflight_reason, preflight_context = await self.live_inventory_entry_preflight(
@@ -4077,6 +4240,16 @@ class VariationalToLighterRuntime:
                         )
                         return
                     var_amount = variational_api_amount_to_str(qty)
+                    self.add_pending_live_inventory_var_fill_match(
+                        PendingLiveInventoryVarFillMatch(
+                            asset=snapshot.asset,
+                            side=var_side.lower(),
+                            qty=Decimal(var_amount),
+                            lot_id=lot_id,
+                            role="live_inventory_entry",
+                            created_at_monotonic=time.monotonic(),
+                        )
+                    )
                     try:
                         var_task = asyncio.create_task(
                             self._timed_submit(
@@ -4121,6 +4294,11 @@ class VariationalToLighterRuntime:
                         )
                         return
                     if isinstance(var_outcome, Exception):
+                        self.remove_pending_live_inventory_var_fill_match(
+                            asset=snapshot.asset,
+                            lot_id=lot_id,
+                            role="live_inventory_entry",
+                        )
                         await self.require_live_inventory_manual_review(
                             asset=snapshot.asset,
                             reason=f"entry_var_submit_exception:{var_outcome}",
@@ -4149,6 +4327,11 @@ class VariationalToLighterRuntime:
                     var_result, var_submit_ms = var_outcome
                     lighter_result, lighter_submit_ms = lighter_outcome
                     if not var_result.get("ok"):
+                        self.remove_pending_live_inventory_var_fill_match(
+                            asset=snapshot.asset,
+                            lot_id=lot_id,
+                            role="live_inventory_entry",
+                        )
                         await self.require_live_inventory_manual_review(
                             asset=snapshot.asset,
                             reason=f"entry_var_submit_failed:{var_result.get('error') or 'unknown'}",
@@ -4189,7 +4372,7 @@ class VariationalToLighterRuntime:
                     var_submit_ms = None
                     lighter_submit_ms = None
                 lot = {
-                    "lot_id": self.live_inventory_next_lot_id,
+                    "lot_id": lot_id,
                     "direction": direction,
                     "qty": decimal_to_str(qty),
                     "entry_var_fill_price": decimal_to_str(var_price),
@@ -4210,6 +4393,7 @@ class VariationalToLighterRuntime:
                             "entry_lighter_payload": lighter_payload,
                         }
                     )
+                    self.remember_live_inventory_final_pnl_lot(asset=snapshot.asset, lot=lot)
                 self.live_inventory_next_lot_id += 1
                 self.live_inventory_open_lots.append(lot)
                 await self.persist_live_inventory_memory(
@@ -4266,6 +4450,16 @@ class VariationalToLighterRuntime:
         if not self.live_inventory_dry_decisions:
             exit_side = self._opposite_var_side(str(lot.get("entry_var_side") or self._auto_live_direction_to_var_side(direction)))
             var_amount = variational_api_amount_to_str(qty)
+            self.add_pending_live_inventory_var_fill_match(
+                PendingLiveInventoryVarFillMatch(
+                    asset=snapshot.asset,
+                    side=exit_side.lower(),
+                    qty=Decimal(var_amount),
+                    lot_id=int(lot.get("lot_id") or 0),
+                    role="live_inventory_exit",
+                    created_at_monotonic=time.monotonic(),
+                )
+            )
             try:
                 var_task = asyncio.create_task(
                     self._timed_submit(
@@ -4312,6 +4506,11 @@ class VariationalToLighterRuntime:
                 )
                 return
             if isinstance(var_outcome, Exception):
+                self.remove_pending_live_inventory_var_fill_match(
+                    asset=snapshot.asset,
+                    lot_id=lot.get("lot_id"),
+                    role="live_inventory_exit",
+                )
                 await self.require_live_inventory_manual_review(
                     asset=snapshot.asset,
                     reason=f"exit_var_submit_exception:{var_outcome}",
@@ -4342,6 +4541,11 @@ class VariationalToLighterRuntime:
             var_result, var_submit_ms = var_outcome
             lighter_result, lighter_submit_ms = lighter_outcome
             if not var_result.get("ok"):
+                self.remove_pending_live_inventory_var_fill_match(
+                    asset=snapshot.asset,
+                    lot_id=lot.get("lot_id"),
+                    role="live_inventory_exit",
+                )
                 await self.require_live_inventory_manual_review(
                     asset=snapshot.asset,
                     reason=f"exit_var_submit_failed:{var_result.get('error') or 'unknown'}",
@@ -4401,7 +4605,7 @@ class VariationalToLighterRuntime:
         if not self.live_inventory_dry_decisions and isinstance(lighter_payload, dict):
             exit_trade_key = str(lighter_payload.get("trade_key") or "")
             if exit_trade_key:
-                self.pending_live_inventory_actual_pnl[exit_trade_key] = {
+                pending_pnl = {
                     "asset": snapshot.asset,
                     "lot_id": lot.get("lot_id"),
                     "direction": direction,
@@ -4417,6 +4621,17 @@ class VariationalToLighterRuntime:
                     "holding_samples": holding_samples,
                     "exit_reason": exit_reason,
                 }
+                self.pending_live_inventory_actual_pnl[exit_trade_key] = pending_pnl
+                final_key = self.live_inventory_final_pnl_key(snapshot.asset, lot.get("lot_id"))
+                final_pending = self.pending_live_inventory_final_pnl.setdefault(final_key, {})
+                final_pending.update(
+                    {
+                        **pending_pnl,
+                        "exit_estimated_var_price": decimal_to_str(var_exit_price),
+                        "exit_estimated_lighter_price": decimal_to_str(lighter_exit_price),
+                        "exited_at": utc_now(),
+                    }
+                )
         await self.append_live_inventory_log(
             f"{event_prefix}_exited",
             {

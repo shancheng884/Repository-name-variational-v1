@@ -11,6 +11,7 @@ from main import (
     CrossSpreadSnapshot,
     OrderLifecycle,
     PendingAutoLiveMatch,
+    PendingLiveInventoryVarFillMatch,
     VariationalToLighterRuntime,
     variational_api_amount_to_str,
 )
@@ -147,6 +148,118 @@ def test_variational_api_amount_is_quantized_to_min_qty_tick() -> None:
     assert variational_api_amount_to_str(Decimal("0.0002443343566137633103278690968")) == "0.000244"
     assert variational_api_amount_to_str(Decimal("0.0000019")) == "0.000001"
     assert variational_api_amount_to_str(Decimal("0.0000009")) == "0.000000"
+
+
+def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path) -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.mode = "live"
+        runtime.live_inventory_dry_decisions = False
+        runtime.records = {}
+        runtime.record_order = deque()
+        runtime.pending_auto_live_matches = []
+        runtime.pending_live_inventory_var_fill_matches = [
+            PendingLiveInventoryVarFillMatch(
+                asset="BTC",
+                side="buy",
+                qty=Decimal("0.0003"),
+                lot_id=1,
+                role="live_inventory_entry",
+                created_at_monotonic=time.monotonic(),
+            ),
+            PendingLiveInventoryVarFillMatch(
+                asset="BTC",
+                side="sell",
+                qty=Decimal("0.0003"),
+                lot_id=1,
+                role="live_inventory_exit",
+                created_at_monotonic=time.monotonic(),
+            ),
+        ]
+        runtime.pending_live_inventory_actual_pnl = {}
+        runtime.pending_live_inventory_final_pnl = {}
+        runtime.auto_live_match_window_seconds = 10.0
+        runtime.trade_event_min_timestamp = None
+        runtime.last_variational_trade_event_at = None
+        runtime.variational_ticker = "BTC"
+        runtime.accepted_assets = {"BTC"}
+        runtime._record_lock = asyncio.Lock()
+        runtime.logger = logging.getLogger("test_auto_live_fuse")
+        runtime.lighter_client_order_to_trade_key = {}
+        runtime.orders_file = tmp_path / "order_metrics.jsonl"
+        runtime._order_write_lock = asyncio.Lock()
+
+        runtime.remember_live_inventory_final_pnl_lot(
+            asset="BTC",
+            lot={
+                "lot_id": 1,
+                "direction": "long_var_short_lighter",
+                "qty": "0.0003",
+                "entry_var_fill_price": "100",
+                "entry_lighter_fill_price": "110",
+                "entered_at": "2026-06-15T00:00:00Z",
+            },
+        )
+        key = runtime.live_inventory_final_pnl_key("BTC", 1)
+        runtime.pending_live_inventory_final_pnl[key].update(
+            {
+                "exit_var_price": "111",
+                "exit_lighter_estimated_price": "112",
+                "estimated_pnl_usd": "0.003",
+            }
+        )
+
+        await runtime.maybe_append_live_inventory_final_pnl_from_fill(
+            {
+                "asset": "BTC",
+                "qty": "0.0003",
+                "auto_live_cycle_id": 1,
+                "auto_live_role": "live_inventory_entry",
+                "lighter_filled_price": "110",
+                "lighter_filled_at": "2026-06-15T00:00:00.100000Z",
+            }
+        )
+        await runtime.process_variational_trade_event(
+            {
+                "asset": "BTC",
+                "side": "buy",
+                "qty": "0.0003",
+                "status": "filled",
+                "trade_id": "entry-var",
+                "timestamp": "2026-06-15T00:00:00.200000Z",
+                "price": "130",
+            }
+        )
+        await runtime.maybe_append_live_inventory_final_pnl_from_fill(
+            {
+                "asset": "BTC",
+                "qty": "0.0003",
+                "auto_live_cycle_id": 1,
+                "auto_live_role": "live_inventory_exit",
+                "lighter_filled_price": "112",
+                "lighter_filled_at": "2026-06-15T00:00:10.100000Z",
+            }
+        )
+        await runtime.process_variational_trade_event(
+            {
+                "asset": "BTC",
+                "side": "sell",
+                "qty": "0.0003",
+                "status": "filled",
+                "trade_id": "exit-var",
+                "timestamp": "2026-06-15T00:00:10.200000Z",
+                "price": "111",
+            }
+        )
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        final_rows = [row for row in rows if row["event"] == "live_inventory_final_pnl"]
+        assert len(final_rows) == 1
+        assert final_rows[0]["final_var_leg_pnl_usd"] == "-0.0057"
+        assert final_rows[0]["final_lighter_leg_pnl_usd"] == "-0.0006"
+        assert final_rows[0]["final_pnl_usd"] == "-0.0063"
+
+    asyncio.run(run())
 
 
 def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_path) -> None:
