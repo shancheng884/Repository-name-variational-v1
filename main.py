@@ -6015,8 +6015,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-max-total-lots must be > 0 and <= 3 in V1")
         if args.live_inventory_entry_bps < 0:
             parser.error("--live-inventory-entry-bps must be >= 0")
-        if not args.live_inventory_dry_decisions and args.live_inventory_entry_bps < 5:
-            parser.error("--live-inventory-entry-bps must be >= 5 in V1 real-submit mode")
+        if not args.live_inventory_dry_decisions and args.live_inventory_entry_bps < 30:
+            parser.error("--live-inventory-entry-bps must be >= 30 in V1 real-submit mode")
         if args.live_inventory_exit_bps < 0:
             parser.error("--live-inventory-exit-bps must be >= 0")
         if args.live_inventory_max_var_spread_bps <= 0:

@@ -287,15 +287,15 @@ def test_live_inventory_real_submit_accepts_20u_lot_notional(monkeypatch) -> Non
     assert args.live_inventory_lot_notional_usd == 20.0
 
 
-def test_live_inventory_real_submit_accepts_10bps_entry_threshold(monkeypatch) -> None:
+def test_live_inventory_real_submit_accepts_30bps_entry_threshold(monkeypatch) -> None:
     argv = live_inventory_safe_argv()
     argv.remove("--live-inventory-dry-decisions")
-    monkeypatch.setattr("sys.argv", argv + ["--live-inventory-entry-bps", "10"])
+    monkeypatch.setattr("sys.argv", argv + ["--live-inventory-entry-bps", "30"])
 
     args = parse_args()
 
     assert args.live_inventory_dry_decisions is False
-    assert args.live_inventory_entry_bps == 10.0
+    assert args.live_inventory_entry_bps == 30.0
 
 
 def test_live_inventory_requires_flat_start_confirmation(monkeypatch) -> None:
@@ -347,21 +347,19 @@ def test_live_inventory_dry_decisions_allow_low_entry_threshold(monkeypatch) -> 
     assert args.live_inventory_entry_bps == 5.0
 
 
-def test_live_inventory_real_submit_rejects_below_5bps_entry_threshold(monkeypatch) -> None:
+def test_live_inventory_real_submit_rejects_below_30bps_entry_threshold(monkeypatch) -> None:
     argv = live_inventory_safe_argv()
     argv.remove("--live-inventory-dry-decisions")
-    monkeypatch.setattr("sys.argv", argv + ["--live-inventory-entry-bps", "4.99"])
+    monkeypatch.setattr("sys.argv", argv + ["--live-inventory-entry-bps", "29.99"])
 
     with pytest.raises(SystemExit):
         parse_args()
 
 
-def test_live_inventory_real_submit_accepts_5bps_entry_threshold(monkeypatch) -> None:
+def test_live_inventory_real_submit_rejects_5bps_entry_threshold(monkeypatch) -> None:
     argv = live_inventory_safe_argv()
     argv.remove("--live-inventory-dry-decisions")
     monkeypatch.setattr("sys.argv", argv + ["--live-inventory-entry-bps", "5"])
 
-    args = parse_args()
-
-    assert args.live_inventory_dry_decisions is False
-    assert args.live_inventory_entry_bps == 5.0
+    with pytest.raises(SystemExit):
+        parse_args()
