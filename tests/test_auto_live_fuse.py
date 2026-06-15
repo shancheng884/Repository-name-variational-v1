@@ -216,6 +216,13 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
                 "entry_var_fill_price": "100",
                 "entry_lighter_fill_price": "110",
                 "entry_edge_bps": "1000",
+                "entry_snapshot_var_bid": "99",
+                "entry_snapshot_var_ask": "101",
+                "entry_snapshot_var_mid": "100",
+                "entry_snapshot_var_buy_price": "100",
+                "entry_snapshot_var_sell_price": "99",
+                "entry_snapshot_var_full_spread_bps": "200",
+                "entry_snapshot_var_spread_source": "test",
                 "entered_at": "2026-06-15T00:00:00Z",
             },
         )
@@ -289,6 +296,8 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
         assert Decimal(final_rows[0]["entry_estimated_edge_bps"]) == Decimal("1000")
         assert Decimal(final_rows[0]["entry_final_edge_bps"]) < Decimal("0")
         assert Decimal(final_rows[0]["entry_edge_capture_loss_bps"]) > Decimal("2500")
+        assert Decimal(final_rows[0]["entry_var_final_vs_snapshot_buy_bps"]) == Decimal("3000")
+        assert Decimal(final_rows[0]["entry_var_final_vs_snapshot_ask_bps"]) > Decimal("2800")
         assert runtime.live_inventory_execution_loss_bps_samples
 
     asyncio.run(run())

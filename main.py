@@ -1190,6 +1190,13 @@ class VariationalToLighterRuntime:
                 "entry_estimated_var_price": lot.get("entry_var_fill_price"),
                 "entry_estimated_lighter_price": lot.get("entry_lighter_fill_price"),
                 "entry_signal_edge_bps": lot.get("entry_edge_bps"),
+                "entry_snapshot_var_bid": lot.get("entry_snapshot_var_bid"),
+                "entry_snapshot_var_ask": lot.get("entry_snapshot_var_ask"),
+                "entry_snapshot_var_mid": lot.get("entry_snapshot_var_mid"),
+                "entry_snapshot_var_buy_price": lot.get("entry_snapshot_var_buy_price"),
+                "entry_snapshot_var_sell_price": lot.get("entry_snapshot_var_sell_price"),
+                "entry_snapshot_var_full_spread_bps": lot.get("entry_snapshot_var_full_spread_bps"),
+                "entry_snapshot_var_spread_source": lot.get("entry_snapshot_var_spread_source"),
                 "entered_at": lot.get("entered_at"),
             }
         )
@@ -1281,6 +1288,11 @@ class VariationalToLighterRuntime:
         entry_estimated_lighter_price = to_decimal(pending.get("entry_estimated_lighter_price"))
         exit_estimated_var_price = to_decimal(pending.get("exit_estimated_var_price"))
         exit_estimated_lighter_price = to_decimal(pending.get("exit_estimated_lighter_price"))
+        entry_snapshot_var_bid = to_decimal(pending.get("entry_snapshot_var_bid"))
+        entry_snapshot_var_ask = to_decimal(pending.get("entry_snapshot_var_ask"))
+        entry_snapshot_var_mid = to_decimal(pending.get("entry_snapshot_var_mid"))
+        entry_snapshot_var_buy_price = to_decimal(pending.get("entry_snapshot_var_buy_price"))
+        entry_snapshot_var_sell_price = to_decimal(pending.get("entry_snapshot_var_sell_price"))
         entry_signal_edge_bps = to_decimal(pending.get("entry_signal_edge_bps"))
         entry_estimated_edge_bps = self.live_inventory_pair_edge_bps(
             direction=direction,
@@ -1341,6 +1353,21 @@ class VariationalToLighterRuntime:
                 "final_spread_capture_bps": decimal_to_str(final_spread_capture_bps),
                 "recent_execution_loss_buffer_bps": decimal_to_str(
                     self.live_inventory_recent_execution_loss_buffer_bps()
+                ),
+                "entry_var_final_vs_snapshot_bid_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(entry_var_price, entry_snapshot_var_bid)
+                ),
+                "entry_var_final_vs_snapshot_ask_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(entry_var_price, entry_snapshot_var_ask)
+                ),
+                "entry_var_final_vs_snapshot_mid_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(entry_var_price, entry_snapshot_var_mid)
+                ),
+                "entry_var_final_vs_snapshot_buy_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(entry_var_price, entry_snapshot_var_buy_price)
+                ),
+                "entry_var_final_vs_snapshot_sell_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(entry_var_price, entry_snapshot_var_sell_price)
                 ),
                 "entry_var_fill_drift_bps": decimal_to_str(
                     self.live_inventory_price_drift_bps(entry_var_price, entry_estimated_var_price)
@@ -4588,6 +4615,13 @@ class VariationalToLighterRuntime:
                     "entry_var_price_source": "estimated_snapshot",
                     "entry_lighter_price_source": "estimated_snapshot",
                     "entry_cost_status": "dry_decision" if self.live_inventory_dry_decisions else "final_fills_pending",
+                    "entry_snapshot_var_bid": decimal_to_str(snapshot.var_bid),
+                    "entry_snapshot_var_ask": decimal_to_str(snapshot.var_ask),
+                    "entry_snapshot_var_mid": decimal_to_str(snapshot.var_mid),
+                    "entry_snapshot_var_buy_price": decimal_to_str(snapshot.var_buy_price),
+                    "entry_snapshot_var_sell_price": decimal_to_str(snapshot.var_sell_price),
+                    "entry_snapshot_var_full_spread_bps": decimal_to_str(snapshot.var_full_spread_bps),
+                    "entry_snapshot_var_spread_source": snapshot.var_spread_source,
                     "entry_edge_bps": decimal_to_str(edge_bps),
                     "entered_at": utc_now(),
                     "entered_sample_index": index,
@@ -4622,6 +4656,13 @@ class VariationalToLighterRuntime:
                         "edge_bps": decimal_to_str(edge_bps),
                         "var_price": decimal_to_str(var_price),
                         "lighter_price": decimal_to_str(lighter_price),
+                        "var_bid": decimal_to_str(snapshot.var_bid),
+                        "var_ask": decimal_to_str(snapshot.var_ask),
+                        "var_mid": decimal_to_str(snapshot.var_mid),
+                        "var_buy_price": decimal_to_str(snapshot.var_buy_price),
+                        "var_sell_price": decimal_to_str(snapshot.var_sell_price),
+                        "var_full_spread_bps": decimal_to_str(snapshot.var_full_spread_bps),
+                        "var_spread_source": snapshot.var_spread_source,
                         "open_lots_total": len(self.live_inventory_open_lots),
                         "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
                         "completed_cycles": self.live_inventory_completed_cycles,
