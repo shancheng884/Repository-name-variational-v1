@@ -4246,7 +4246,8 @@ class VariationalToLighterRuntime:
             return
         entered_sample_index = int(lot.get("entered_sample_index") or index)
         holding_samples = index - entered_sample_index
-        should_exit = edge_bps is not None and edge_bps <= self.live_inventory_exit_bps
+        can_exit_on_reversion = holding_samples >= self.live_inventory_min_hold_samples
+        should_exit = can_exit_on_reversion and edge_bps is not None and edge_bps <= self.live_inventory_exit_bps
         should_timeout = holding_samples >= self.live_inventory_max_hold_samples
         if not should_exit and not should_timeout:
             return

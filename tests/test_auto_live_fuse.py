@@ -622,6 +622,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_max_var_spread_bps = Decimal("5")
     runtime.live_inventory_lot_notional_usd = Decimal("10")
     runtime.live_inventory_max_total_lots = 1
+    runtime.live_inventory_min_hold_samples = 0
     runtime.live_inventory_state_file = Path(tmp_path) / "live_inventory_state.json"
     runtime.orders_file = Path(tmp_path) / "order_metrics.jsonl"
     runtime._order_write_lock = asyncio.Lock()
@@ -842,6 +843,45 @@ def test_live_inventory_exit_concurrent_submit_uses_formatted_var_amount(tmp_pat
         assert var_amounts == ["0.000243"]
         assert state["status"] == "manual_review_required"
         assert state["manual_review_context"]["var_amount"] == "0.000243"
+        assert runtime.live_inventory_open_lots[0]["status"] == "open"
+        assert runtime.live_inventory_completed_cycles == 0
+
+    asyncio.run(run())
+
+
+def test_live_inventory_exit_waits_for_min_hold_samples(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_min_hold_samples = 10
+        runtime.live_inventory_max_hold_samples = 300
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 1,
+                "direction": "long_var_short_lighter",
+                "qty": "0.000301",
+                "entry_var_side": "BUY",
+                "entry_var_fill_price": "65636.88",
+                "entry_lighter_fill_price": "65670.40",
+                "entered_sample_index": 0,
+                "status": "open",
+            }
+        ]
+        submit_calls: list[str] = []
+
+        async def fake_send_variational_place_order(**_kwargs):
+            submit_calls.append("var")
+            return {"ok": True}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            submit_calls.append("lighter")
+            return None, {"submitted": True}
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        await runtime.maybe_run_live_inventory(_inventory_entry_snapshot())
+
+        assert submit_calls == []
         assert runtime.live_inventory_open_lots[0]["status"] == "open"
         assert runtime.live_inventory_completed_cycles == 0
 
