@@ -750,6 +750,8 @@ class VariationalToLighterRuntime:
         self.live_inventory_entry_bps = Decimal(str(args.live_inventory_entry_bps))
         self.live_inventory_exit_bps = Decimal(str(args.live_inventory_exit_bps))
         self.live_inventory_max_var_spread_bps = Decimal(str(args.live_inventory_max_var_spread_bps))
+        self.live_inventory_dynamic_entry_buffer_bps = Decimal(str(args.live_inventory_dynamic_entry_buffer_bps))
+        self.live_inventory_max_lighter_slippage_bps = Decimal(str(args.live_inventory_max_lighter_slippage_bps))
         self.live_inventory_min_hold_samples = int(args.live_inventory_min_hold_samples)
         self.live_inventory_max_hold_samples = int(args.live_inventory_max_hold_samples)
         self.live_inventory_max_unrealized_loss_bps = Decimal(str(args.live_inventory_max_unrealized_loss_bps))
@@ -1051,6 +1053,27 @@ class VariationalToLighterRuntime:
             lighter_leg_pnl = (exit_lighter_price - entry_lighter_price) * qty
         return var_leg_pnl, lighter_leg_pnl, var_leg_pnl + lighter_leg_pnl
 
+    @staticmethod
+    def live_inventory_price_drift_bps(actual: Decimal | None, estimated: Decimal | None) -> Decimal | None:
+        if actual is None or estimated is None or estimated == 0:
+            return None
+        return ((actual - estimated) / estimated) * Decimal("10000")
+
+    async def live_inventory_lighter_slippage_bps(self, *, lighter_side: str, qty: Decimal) -> tuple[Decimal | None, Decimal | None]:
+        best_bid, best_ask = await self.get_lighter_best_bid_ask()
+        estimated_fill = await self.estimate_lighter_fill_price(lighter_side, qty)
+        if estimated_fill is None:
+            return None, None
+        if lighter_side.strip().upper() == "BUY":
+            reference = best_ask
+            slippage_bps = ((estimated_fill - reference) / reference) * Decimal("10000") if reference else None
+        else:
+            reference = best_bid
+            slippage_bps = ((reference - estimated_fill) / reference) * Decimal("10000") if reference else None
+        if slippage_bps is not None and slippage_bps < 0:
+            slippage_bps = Decimal("0")
+        return estimated_fill, slippage_bps
+
     async def maybe_append_live_inventory_actual_pnl(self, payload: dict[str, Any]) -> None:
         trade_key = str(payload.get("trade_key") or "")
         pending = self.pending_live_inventory_actual_pnl.pop(trade_key, None)
@@ -1161,6 +1184,10 @@ class VariationalToLighterRuntime:
         exit_lighter_price = to_decimal(pending.get("exit_lighter_final_fill_price"))
         if None in {qty, entry_var_price, entry_lighter_price, exit_var_price, exit_lighter_price} or not direction:
             return
+        entry_estimated_var_price = to_decimal(pending.get("entry_estimated_var_price"))
+        entry_estimated_lighter_price = to_decimal(pending.get("entry_estimated_lighter_price"))
+        exit_estimated_var_price = to_decimal(pending.get("exit_estimated_var_price"))
+        exit_estimated_lighter_price = to_decimal(pending.get("exit_estimated_lighter_price"))
 
         var_leg_pnl, lighter_leg_pnl, final_pnl = self.live_inventory_pair_pnl(
             direction=direction,
@@ -1182,6 +1209,18 @@ class VariationalToLighterRuntime:
                 "final_lighter_leg_pnl_usd": decimal_to_str(lighter_leg_pnl),
                 "final_pnl_usd": decimal_to_str(final_pnl),
                 "final_pnl_bps": decimal_to_str(final_pnl_bps),
+                "entry_var_fill_drift_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(entry_var_price, entry_estimated_var_price)
+                ),
+                "entry_lighter_fill_drift_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(entry_lighter_price, entry_estimated_lighter_price)
+                ),
+                "exit_var_fill_drift_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(exit_var_price, exit_estimated_var_price)
+                ),
+                "exit_lighter_fill_drift_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(exit_lighter_price, exit_estimated_lighter_price)
+                ),
             },
         )
     async def live_inventory_entry_preflight(
@@ -1208,6 +1247,13 @@ class VariationalToLighterRuntime:
             "entry_edge_bps": decimal_to_str(edge_bps),
             "var_spread_bps": decimal_to_str(var_spread_bps),
             "live_inventory_max_var_spread_bps": decimal_to_str(self.live_inventory_max_var_spread_bps),
+            "live_inventory_entry_bps": decimal_to_str(self.live_inventory_entry_bps),
+            "live_inventory_dynamic_entry_buffer_bps": decimal_to_str(self.live_inventory_dynamic_entry_buffer_bps),
+            "live_inventory_max_lighter_slippage_bps": decimal_to_str(self.live_inventory_max_lighter_slippage_bps),
+            "live_inventory_required_entry_bps": None,
+            "lighter_side": None,
+            "lighter_estimated_fill_price": None,
+            "lighter_order_book_slippage_bps": None,
             "precheck_edge_bps": None,
             "lighter_min_base_amount": decimal_to_str(self.lighter_min_base_amount),
             "lighter_min_quote_amount": decimal_to_str(self.lighter_min_quote_amount),
@@ -1230,9 +1276,34 @@ class VariationalToLighterRuntime:
             var_fill_price=var_price,
         )
         context["precheck_edge_bps"] = decimal_to_str(precheck_edge_bps)
-        if ok:
-            return True, "ok", context
-        return False, reason, context
+        if not ok:
+            return False, reason, context
+
+        lighter_side = "SELL" if var_side.strip().upper() == "BUY" else "BUY"
+        lighter_estimated_fill_price, lighter_slippage_bps = await self.live_inventory_lighter_slippage_bps(
+            lighter_side=lighter_side,
+            qty=qty,
+        )
+        context["lighter_side"] = lighter_side
+        context["lighter_estimated_fill_price"] = decimal_to_str(lighter_estimated_fill_price)
+        context["lighter_order_book_slippage_bps"] = decimal_to_str(lighter_slippage_bps)
+        if lighter_estimated_fill_price is None or lighter_slippage_bps is None:
+            return False, "lighter_order_book_depth_insufficient", context
+        if lighter_slippage_bps > self.live_inventory_max_lighter_slippage_bps:
+            return False, "lighter_slippage_exceeds_live_inventory_limit", context
+
+        required_entry_bps = self.live_inventory_entry_bps
+        dynamic_required_entry_bps = (
+            (var_spread_bps or Decimal("0"))
+            + lighter_slippage_bps
+            + self.live_inventory_dynamic_entry_buffer_bps
+        )
+        if dynamic_required_entry_bps > required_entry_bps:
+            required_entry_bps = dynamic_required_entry_bps
+        context["live_inventory_required_entry_bps"] = decimal_to_str(required_entry_bps)
+        if edge_bps is None or edge_bps < required_entry_bps:
+            return False, "edge_bps_below_dynamic_live_inventory_entry", context
+        return True, "ok", context
 
     def auto_live_guard_reason(self) -> str | None:
         if self.auto_live_manual_review_required:
@@ -6121,6 +6192,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-entry-bps", type=float, default=50.0)
     parser.add_argument("--live-inventory-exit-bps", type=float, default=10.0)
     parser.add_argument("--live-inventory-max-var-spread-bps", type=float, default=5.0)
+    parser.add_argument(
+        "--live-inventory-dynamic-entry-buffer-bps",
+        type=float,
+        default=5.0,
+        help="Extra live inventory entry cushion added on top of Var spread and Lighter depth slippage. Default: 5.0",
+    )
+    parser.add_argument(
+        "--live-inventory-max-lighter-slippage-bps",
+        type=float,
+        default=3.0,
+        help="Maximum estimated Lighter order-book slippage allowed for live inventory entry. Default: 3.0",
+    )
     parser.add_argument("--live-inventory-min-hold-samples", type=int, default=3)
     parser.add_argument("--live-inventory-max-hold-samples", type=int, default=300)
     parser.add_argument("--live-inventory-max-unrealized-loss-bps", type=float, default=25.0)
@@ -6236,6 +6319,10 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-exit-bps must be >= 0")
         if args.live_inventory_max_var_spread_bps <= 0:
             parser.error("--live-inventory-max-var-spread-bps must be > 0")
+        if args.live_inventory_dynamic_entry_buffer_bps < 0:
+            parser.error("--live-inventory-dynamic-entry-buffer-bps must be >= 0")
+        if args.live_inventory_max_lighter_slippage_bps < 0:
+            parser.error("--live-inventory-max-lighter-slippage-bps must be >= 0")
         if args.live_inventory_min_hold_samples < 0:
             parser.error("--live-inventory-min-hold-samples must be >= 0")
         if args.live_inventory_max_hold_samples <= 0:

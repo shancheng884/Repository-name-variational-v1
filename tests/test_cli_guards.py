@@ -252,6 +252,8 @@ def test_live_inventory_accepts_v1_safe_flags(monkeypatch) -> None:
     assert args.live_inventory_max_total_lots == 1
     assert args.live_inventory_entry_bps == 50.0
     assert args.live_inventory_max_var_spread_bps == 5.0
+    assert args.live_inventory_dynamic_entry_buffer_bps == 5.0
+    assert args.live_inventory_max_lighter_slippage_bps == 3.0
 
 
 def test_live_inventory_real_submit_accepts_v1_safe_flags(monkeypatch) -> None:
@@ -316,6 +318,20 @@ def test_live_inventory_rejects_large_lot_notional(monkeypatch) -> None:
 
 def test_live_inventory_rejects_non_positive_var_spread_limit(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-max-var-spread-bps", "0"])
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_live_inventory_rejects_negative_dynamic_entry_buffer(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-dynamic-entry-buffer-bps", "-1"])
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_live_inventory_rejects_negative_lighter_slippage_limit(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-max-lighter-slippage-bps", "-1"])
 
     with pytest.raises(SystemExit):
         parse_args()
