@@ -188,6 +188,24 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
         runtime.lighter_client_order_to_trade_key = {}
         runtime.orders_file = tmp_path / "order_metrics.jsonl"
         runtime._order_write_lock = asyncio.Lock()
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 1,
+                "direction": "long_var_short_lighter",
+                "qty": "0.0003",
+                "entry_var_fill_price": "100",
+                "entry_lighter_fill_price": "110",
+                "entry_var_price_source": "estimated_snapshot",
+                "entry_lighter_price_source": "estimated_snapshot",
+                "entry_cost_status": "final_fills_pending",
+            }
+        ]
+        persist_reasons: list[str] = []
+
+        async def fake_persist_live_inventory_memory(*, reason: str) -> None:
+            persist_reasons.append(reason)
+
+        runtime.persist_live_inventory_memory = fake_persist_live_inventory_memory
 
         runtime.remember_live_inventory_final_pnl_lot(
             asset="BTC",
@@ -231,6 +249,12 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
                 "price": "130",
             }
         )
+        assert runtime.live_inventory_open_lots[0]["entry_var_fill_price"] == "130"
+        assert runtime.live_inventory_open_lots[0]["entry_lighter_fill_price"] == "110"
+        assert runtime.live_inventory_open_lots[0]["entry_cost_status"] == "final_fills_confirmed"
+        assert runtime.live_inventory_open_lots[0]["entry_var_price_source"] == "final_fill"
+        assert runtime.live_inventory_open_lots[0]["entry_lighter_price_source"] == "final_fill"
+        assert "entry_final_fill_cost_update" in persist_reasons
         await runtime.maybe_append_live_inventory_final_pnl_from_fill(
             {
                 "asset": "BTC",
@@ -261,6 +285,48 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
         assert final_rows[0]["final_pnl_usd"] == "-0.0063"
         assert Decimal(final_rows[0]["entry_var_fill_drift_bps"]) == Decimal("3000")
         assert Decimal(final_rows[0]["exit_var_fill_drift_bps"]) == Decimal("0")
+
+    asyncio.run(run())
+
+
+def test_live_inventory_blocks_spread_reverted_exit_until_entry_cost_confirmed(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 1,
+                "direction": "long_var_short_lighter",
+                "qty": "0.0003",
+                "entry_var_fill_price": "60000",
+                "entry_lighter_fill_price": "60400",
+                "entry_var_side": "BUY",
+                "entry_cost_status": "final_fills_pending",
+                "entered_sample_index": 0,
+            }
+        ]
+        submit_calls: list[str] = []
+
+        async def fake_send_variational_place_order(**_kwargs):
+            submit_calls.append("var")
+            return {"ok": True}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            submit_calls.append("lighter")
+            return None, {"submitted": True}
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+        snapshot = _inventory_entry_snapshot()
+        snapshot.long_var_short_lighter_pct = Decimal("0.0001")
+
+        await runtime.maybe_run_live_inventory(snapshot)
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+
+        assert submit_calls == []
+        assert runtime.live_inventory_open_lots
+        assert rows[-1]["event"] == "live_inventory_exit_blocked"
+        assert rows[-1]["reason"] == "entry_final_fill_cost_pending"
 
     asyncio.run(run())
 
@@ -742,6 +808,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_lot_notional_usd = Decimal("10")
     runtime.live_inventory_max_total_lots = 1
     runtime.live_inventory_min_hold_samples = 0
+    runtime.live_inventory_max_hold_samples = 300
     runtime.live_inventory_state_file = Path(tmp_path) / "live_inventory_state.json"
     runtime.orders_file = Path(tmp_path) / "order_metrics.jsonl"
     runtime._order_write_lock = asyncio.Lock()
@@ -1039,6 +1106,7 @@ def test_live_inventory_exit_concurrent_submit_uses_formatted_var_amount(tmp_pat
                 "entry_var_side": "SELL",
                 "entry_var_fill_price": "61116.43",
                 "entry_lighter_fill_price": "61054.70",
+                "entry_cost_status": "final_fills_confirmed",
                 "entered_sample_index": 0,
                 "status": "open",
             }

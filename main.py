@@ -1142,6 +1142,45 @@ class VariationalToLighterRuntime:
             }
         )
 
+    def sync_live_inventory_open_lot_entry_cost(self, *, asset: str, lot_id: Any) -> bool:
+        open_lots = getattr(self, "live_inventory_open_lots", [])
+        if lot_id is None or not open_lots:
+            return False
+        key = self.live_inventory_final_pnl_key(asset, lot_id)
+        pending = self.pending_live_inventory_final_pnl.get(key) or {}
+        entry_var_price = pending.get("entry_var_final_fill_price")
+        entry_lighter_price = pending.get("entry_lighter_final_fill_price")
+        updated = False
+        for lot in open_lots:
+            if str(lot.get("lot_id")) != str(lot_id):
+                continue
+            if entry_var_price is not None and lot.get("entry_var_fill_price") != entry_var_price:
+                lot["entry_var_fill_price"] = entry_var_price
+                lot["entry_var_final_fill_at"] = pending.get("entry_var_final_fill_at")
+                updated = True
+            if entry_var_price is not None and lot.get("entry_var_price_source") != "final_fill":
+                lot["entry_var_price_source"] = "final_fill"
+                lot["entry_var_final_fill_at"] = pending.get("entry_var_final_fill_at")
+                updated = True
+            if entry_lighter_price is not None and lot.get("entry_lighter_fill_price") != entry_lighter_price:
+                lot["entry_lighter_fill_price"] = entry_lighter_price
+                lot["entry_lighter_final_fill_at"] = pending.get("entry_lighter_final_fill_at")
+                updated = True
+            if entry_lighter_price is not None and lot.get("entry_lighter_price_source") != "final_fill":
+                lot["entry_lighter_price_source"] = "final_fill"
+                lot["entry_lighter_final_fill_at"] = pending.get("entry_lighter_final_fill_at")
+                updated = True
+            cost_status = "final_fills_confirmed" if entry_var_price is not None and entry_lighter_price is not None else "final_fills_pending"
+            if lot.get("entry_cost_status") != cost_status:
+                lot["entry_cost_status"] = cost_status
+                updated = True
+            break
+        return updated
+
+    @staticmethod
+    def live_inventory_entry_cost_confirmed(lot: dict[str, Any]) -> bool:
+        return lot.get("entry_cost_status") == "final_fills_confirmed"
+
     async def maybe_append_live_inventory_final_pnl_from_fill(self, payload: dict[str, Any]) -> None:
         role = str(payload.get("auto_live_role") or "")
         if role not in {"live_inventory_entry", "live_inventory_exit"}:
@@ -1161,6 +1200,8 @@ class VariationalToLighterRuntime:
             if payload.get("lighter_filled_price") is not None:
                 pending["entry_lighter_final_fill_price"] = payload.get("lighter_filled_price")
                 pending["entry_lighter_final_fill_at"] = payload.get("lighter_filled_at")
+            if self.sync_live_inventory_open_lot_entry_cost(asset=asset, lot_id=lot_id):
+                await self.persist_live_inventory_memory(reason="entry_final_fill_cost_update")
         else:
             if payload.get("variational_filled_price") is not None and payload.get("synthetic_eager_fill") is False:
                 pending["exit_var_final_fill_price"] = payload.get("variational_filled_price")
@@ -4448,6 +4489,9 @@ class VariationalToLighterRuntime:
                     "qty": decimal_to_str(qty),
                     "entry_var_fill_price": decimal_to_str(var_price),
                     "entry_lighter_fill_price": decimal_to_str(lighter_price),
+                    "entry_var_price_source": "estimated_snapshot",
+                    "entry_lighter_price_source": "estimated_snapshot",
+                    "entry_cost_status": "dry_decision" if self.live_inventory_dry_decisions else "final_fills_pending",
                     "entry_edge_bps": decimal_to_str(edge_bps),
                     "entered_at": utc_now(),
                     "entered_sample_index": index,
@@ -4467,6 +4511,8 @@ class VariationalToLighterRuntime:
                     self.remember_live_inventory_final_pnl_lot(asset=snapshot.asset, lot=lot)
                 self.live_inventory_next_lot_id += 1
                 self.live_inventory_open_lots.append(lot)
+                if not self.live_inventory_dry_decisions:
+                    self.sync_live_inventory_open_lot_entry_cost(asset=snapshot.asset, lot_id=lot_id)
                 await self.persist_live_inventory_memory(
                     reason="dry_entry_decision" if self.live_inventory_dry_decisions else "entry_submitted"
                 )
@@ -4512,6 +4558,21 @@ class VariationalToLighterRuntime:
         can_exit_on_reversion = holding_samples >= self.live_inventory_min_hold_samples
         should_exit = can_exit_on_reversion and edge_bps is not None and edge_bps <= self.live_inventory_exit_bps
         should_timeout = holding_samples >= self.live_inventory_max_hold_samples
+        entry_cost_status = str(lot.get("entry_cost_status") or "unknown")
+        if should_exit and not should_timeout and not self.live_inventory_dry_decisions and not self.live_inventory_entry_cost_confirmed(lot):
+            await self.append_live_inventory_log(
+                f"{event_prefix}_exit_blocked",
+                {
+                    "asset": snapshot.asset,
+                    "lot_id": lot.get("lot_id"),
+                    "direction": direction,
+                    "reason": "entry_final_fill_cost_pending",
+                    "entry_cost_status": entry_cost_status,
+                    "edge_bps": decimal_to_str(edge_bps),
+                    "holding_samples": holding_samples,
+                },
+            )
+            return
         if not should_exit and not should_timeout:
             return
         entry_var_price = to_decimal(lot.get("entry_var_fill_price")) or var_exit_price
@@ -4683,6 +4744,9 @@ class VariationalToLighterRuntime:
                     "qty": decimal_to_str(qty),
                     "entry_var_price": decimal_to_str(entry_var_price),
                     "entry_lighter_price": decimal_to_str(entry_lighter_price),
+                    "entry_cost_status": entry_cost_status,
+                    "entry_var_price_source": lot.get("entry_var_price_source"),
+                    "entry_lighter_price_source": lot.get("entry_lighter_price_source"),
                     "exit_var_price": decimal_to_str(var_exit_price),
                     "exit_lighter_estimated_price": decimal_to_str(lighter_exit_price),
                     "estimated_pnl_usd": decimal_to_str(pnl),
@@ -4720,6 +4784,9 @@ class VariationalToLighterRuntime:
                 "estimated_var_leg_pnl_usd": decimal_to_str(estimated_var_leg_pnl),
                 "estimated_lighter_leg_pnl_usd": decimal_to_str(estimated_lighter_leg_pnl),
                 "actual_pnl_status": actual_pnl_status,
+                "entry_cost_status": entry_cost_status,
+                "entry_var_price_source": lot.get("entry_var_price_source"),
+                "entry_lighter_price_source": lot.get("entry_lighter_price_source"),
                 "holding_samples": holding_samples,
                 "exit_reason": exit_reason,
                 "open_lots_total": len(self.live_inventory_open_lots),
