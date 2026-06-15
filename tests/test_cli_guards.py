@@ -379,3 +379,33 @@ def test_live_inventory_real_submit_rejects_5bps_entry_threshold(monkeypatch) ->
 
     with pytest.raises(SystemExit):
         parse_args()
+
+
+def test_live_inventory_real_submit_accepts_low_entry_threshold_with_diagnostic_ack(monkeypatch) -> None:
+    argv = live_inventory_safe_argv()
+    argv.remove("--live-inventory-dry-decisions")
+    monkeypatch.setattr(
+        "sys.argv",
+        argv
+        + [
+            "--live-inventory-entry-bps",
+            "15",
+            "--live-inventory-i-accept-diagnostic-low-entry-bps",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.live_inventory_dry_decisions is False
+    assert args.live_inventory_entry_bps == 15.0
+    assert args.live_inventory_i_accept_diagnostic_low_entry_bps is True
+
+
+def test_live_inventory_dry_decisions_rejects_diagnostic_low_entry_ack(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        live_inventory_safe_argv() + ["--live-inventory-i-accept-diagnostic-low-entry-bps"],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()

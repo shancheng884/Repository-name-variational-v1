@@ -6190,6 +6190,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-max-lots", type=int, default=1)
     parser.add_argument("--live-inventory-max-total-lots", type=int, default=1)
     parser.add_argument("--live-inventory-entry-bps", type=float, default=50.0)
+    parser.add_argument(
+        "--live-inventory-i-accept-diagnostic-low-entry-bps",
+        action="store_true",
+        help="Allow real-submit live inventory entry below 30bps for one-lot diagnostic data collection only.",
+    )
     parser.add_argument("--live-inventory-exit-bps", type=float, default=10.0)
     parser.add_argument("--live-inventory-max-var-spread-bps", type=float, default=5.0)
     parser.add_argument(
@@ -6313,8 +6318,14 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-max-total-lots must be > 0 and <= 3 in V1")
         if args.live_inventory_entry_bps < 0:
             parser.error("--live-inventory-entry-bps must be >= 0")
-        if not args.live_inventory_dry_decisions and args.live_inventory_entry_bps < 30:
+        if (
+            not args.live_inventory_dry_decisions
+            and args.live_inventory_entry_bps < 30
+            and not args.live_inventory_i_accept_diagnostic_low_entry_bps
+        ):
             parser.error("--live-inventory-entry-bps must be >= 30 in V1 real-submit mode")
+        if args.live_inventory_i_accept_diagnostic_low_entry_bps and args.live_inventory_dry_decisions:
+            parser.error("--live-inventory-i-accept-diagnostic-low-entry-bps is only for real-submit diagnostic runs")
         if args.live_inventory_exit_bps < 0:
             parser.error("--live-inventory-exit-bps must be >= 0")
         if args.live_inventory_max_var_spread_bps <= 0:
