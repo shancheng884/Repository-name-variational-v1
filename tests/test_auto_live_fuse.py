@@ -223,6 +223,11 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
                 "entry_snapshot_var_sell_price": "99",
                 "entry_snapshot_var_full_spread_bps": "200",
                 "entry_snapshot_var_spread_source": "test",
+                "entry_var_order_quote_id": "entry-quote",
+                "entry_var_order_quote_bid": "119",
+                "entry_var_order_quote_ask": "120",
+                "entry_var_order_quote_timestamp": "2026-06-15T00:00:00.050000Z",
+                "entry_var_order_quote_execution_price": "120",
                 "entered_at": "2026-06-15T00:00:00Z",
             },
         )
@@ -232,6 +237,7 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
                 "exit_var_price": "111",
                 "exit_estimated_var_price": "111",
                 "exit_lighter_estimated_price": "112",
+                "exit_var_order_quote_execution_price": "111",
                 "estimated_pnl_usd": "0.003",
             }
         )
@@ -298,9 +304,38 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
         assert Decimal(final_rows[0]["entry_edge_capture_loss_bps"]) > Decimal("2500")
         assert Decimal(final_rows[0]["entry_var_final_vs_snapshot_buy_bps"]) == Decimal("3000")
         assert Decimal(final_rows[0]["entry_var_final_vs_snapshot_ask_bps"]) > Decimal("2800")
+        assert final_rows[0]["entry_var_order_quote_id"] == "entry-quote"
+        assert Decimal(final_rows[0]["entry_var_order_quote_vs_snapshot_buy_bps"]) == Decimal("2000")
+        assert Decimal(final_rows[0]["entry_var_final_vs_order_quote_bps"]) == Decimal("833.3333333333333333333333333")
+        assert Decimal(final_rows[0]["exit_var_final_vs_order_quote_bps"]) == Decimal("0")
         assert runtime.live_inventory_execution_loss_bps_samples
 
     asyncio.run(run())
+
+
+def test_variational_api_order_quote_fields_uses_side_execution_price() -> None:
+    buy_fields = VariationalToLighterRuntime.variational_api_order_quote_fields(
+        "BUY",
+        {
+            "result": {
+                "quoteId": "q1",
+                "bid": "99",
+                "ask": "101",
+                "markPrice": "100",
+                "quoteTimestamp": "2026-06-15T00:00:00Z",
+            }
+        },
+    )
+    sell_fields = VariationalToLighterRuntime.variational_api_order_quote_fields(
+        "SELL",
+        {"result": {"quote_id": "q2", "bid": "98", "ask": "102"}},
+    )
+
+    assert buy_fields["quote_id"] == "q1"
+    assert buy_fields["quote_execution_price"] == "101"
+    assert buy_fields["quote_mark_price"] == "100"
+    assert sell_fields["quote_id"] == "q2"
+    assert sell_fields["quote_execution_price"] == "98"
 
 
 def test_live_inventory_blocks_spread_reverted_exit_until_entry_cost_confirmed(tmp_path) -> None:

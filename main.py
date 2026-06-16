@@ -1096,6 +1096,24 @@ class VariationalToLighterRuntime:
         return ((actual - estimated) / estimated) * Decimal("10000")
 
     @staticmethod
+    def variational_api_order_quote_fields(side: str, result: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            return {}
+        payload = result.get("result") if isinstance(result.get("result"), dict) else result
+        bid = to_decimal(payload.get("bid"))
+        ask = to_decimal(payload.get("ask"))
+        side_upper = side.strip().upper()
+        execution_price = ask if side_upper == "BUY" else bid
+        return {
+            "quote_id": payload.get("quoteId") or payload.get("quote_id"),
+            "quote_bid": decimal_to_str(bid),
+            "quote_ask": decimal_to_str(ask),
+            "quote_mark_price": payload.get("markPrice") or payload.get("mark_price"),
+            "quote_timestamp": payload.get("quoteTimestamp") or payload.get("timestamp"),
+            "quote_execution_price": decimal_to_str(execution_price),
+        }
+
+    @staticmethod
     def live_inventory_pair_edge_bps(
         *,
         direction: str,
@@ -1197,6 +1215,12 @@ class VariationalToLighterRuntime:
                 "entry_snapshot_var_sell_price": lot.get("entry_snapshot_var_sell_price"),
                 "entry_snapshot_var_full_spread_bps": lot.get("entry_snapshot_var_full_spread_bps"),
                 "entry_snapshot_var_spread_source": lot.get("entry_snapshot_var_spread_source"),
+                "entry_var_order_quote_id": lot.get("entry_var_order_quote_id"),
+                "entry_var_order_quote_bid": lot.get("entry_var_order_quote_bid"),
+                "entry_var_order_quote_ask": lot.get("entry_var_order_quote_ask"),
+                "entry_var_order_quote_mark_price": lot.get("entry_var_order_quote_mark_price"),
+                "entry_var_order_quote_timestamp": lot.get("entry_var_order_quote_timestamp"),
+                "entry_var_order_quote_execution_price": lot.get("entry_var_order_quote_execution_price"),
                 "entered_at": lot.get("entered_at"),
             }
         )
@@ -1293,6 +1317,8 @@ class VariationalToLighterRuntime:
         entry_snapshot_var_mid = to_decimal(pending.get("entry_snapshot_var_mid"))
         entry_snapshot_var_buy_price = to_decimal(pending.get("entry_snapshot_var_buy_price"))
         entry_snapshot_var_sell_price = to_decimal(pending.get("entry_snapshot_var_sell_price"))
+        entry_var_order_quote_execution_price = to_decimal(pending.get("entry_var_order_quote_execution_price"))
+        exit_var_order_quote_execution_price = to_decimal(pending.get("exit_var_order_quote_execution_price"))
         entry_signal_edge_bps = to_decimal(pending.get("entry_signal_edge_bps"))
         entry_estimated_edge_bps = self.live_inventory_pair_edge_bps(
             direction=direction,
@@ -1369,6 +1395,15 @@ class VariationalToLighterRuntime:
                 "entry_var_final_vs_snapshot_sell_bps": decimal_to_str(
                     self.live_inventory_price_drift_bps(entry_var_price, entry_snapshot_var_sell_price)
                 ),
+                "entry_var_order_quote_vs_snapshot_buy_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(entry_var_order_quote_execution_price, entry_snapshot_var_buy_price)
+                ),
+                "entry_var_order_quote_vs_snapshot_sell_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(entry_var_order_quote_execution_price, entry_snapshot_var_sell_price)
+                ),
+                "entry_var_final_vs_order_quote_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(entry_var_price, entry_var_order_quote_execution_price)
+                ),
                 "entry_var_fill_drift_bps": decimal_to_str(
                     self.live_inventory_price_drift_bps(entry_var_price, entry_estimated_var_price)
                 ),
@@ -1377,6 +1412,9 @@ class VariationalToLighterRuntime:
                 ),
                 "exit_var_fill_drift_bps": decimal_to_str(
                     self.live_inventory_price_drift_bps(exit_var_price, exit_estimated_var_price)
+                ),
+                "exit_var_final_vs_order_quote_bps": decimal_to_str(
+                    self.live_inventory_price_drift_bps(exit_var_price, exit_var_order_quote_execution_price)
                 ),
                 "exit_lighter_fill_drift_bps": decimal_to_str(
                     self.live_inventory_price_drift_bps(exit_lighter_price, exit_estimated_lighter_price)
@@ -4580,6 +4618,7 @@ class VariationalToLighterRuntime:
                             },
                         )
                         return
+                    entry_var_order_quote = self.variational_api_order_quote_fields(var_side, var_result)
                     lighter_record, lighter_payload = lighter_result
                     lighter_started = self.auto_live_eager_hedge_started(lighter_record)
                     if lighter_record is None or not lighter_started:
@@ -4606,6 +4645,7 @@ class VariationalToLighterRuntime:
                     lighter_payload = None
                     var_submit_ms = None
                     lighter_submit_ms = None
+                    entry_var_order_quote = {}
                 lot = {
                     "lot_id": lot_id,
                     "direction": direction,
@@ -4622,6 +4662,12 @@ class VariationalToLighterRuntime:
                     "entry_snapshot_var_sell_price": decimal_to_str(snapshot.var_sell_price),
                     "entry_snapshot_var_full_spread_bps": decimal_to_str(snapshot.var_full_spread_bps),
                     "entry_snapshot_var_spread_source": snapshot.var_spread_source,
+                    "entry_var_order_quote_id": entry_var_order_quote.get("quote_id"),
+                    "entry_var_order_quote_bid": entry_var_order_quote.get("quote_bid"),
+                    "entry_var_order_quote_ask": entry_var_order_quote.get("quote_ask"),
+                    "entry_var_order_quote_mark_price": entry_var_order_quote.get("quote_mark_price"),
+                    "entry_var_order_quote_timestamp": entry_var_order_quote.get("quote_timestamp"),
+                    "entry_var_order_quote_execution_price": entry_var_order_quote.get("quote_execution_price"),
                     "entry_edge_bps": decimal_to_str(edge_bps),
                     "entered_at": utc_now(),
                     "entered_sample_index": index,
@@ -4663,6 +4709,12 @@ class VariationalToLighterRuntime:
                         "var_sell_price": decimal_to_str(snapshot.var_sell_price),
                         "var_full_spread_bps": decimal_to_str(snapshot.var_full_spread_bps),
                         "var_spread_source": snapshot.var_spread_source,
+                        "var_order_quote_id": entry_var_order_quote.get("quote_id"),
+                        "var_order_quote_bid": entry_var_order_quote.get("quote_bid"),
+                        "var_order_quote_ask": entry_var_order_quote.get("quote_ask"),
+                        "var_order_quote_mark_price": entry_var_order_quote.get("quote_mark_price"),
+                        "var_order_quote_timestamp": entry_var_order_quote.get("quote_timestamp"),
+                        "var_order_quote_execution_price": entry_var_order_quote.get("quote_execution_price"),
                         "open_lots_total": len(self.live_inventory_open_lots),
                         "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
                         "completed_cycles": self.live_inventory_completed_cycles,
@@ -4829,6 +4881,7 @@ class VariationalToLighterRuntime:
                     },
                 )
                 return
+            exit_var_order_quote = self.variational_api_order_quote_fields(exit_side, var_result)
             lighter_record, lighter_payload = lighter_result
             lighter_started = self.auto_live_eager_hedge_started(lighter_record)
             if lighter_record is None or not lighter_started:
@@ -4854,6 +4907,7 @@ class VariationalToLighterRuntime:
             var_submit_ms = None
             lighter_submit_ms = None
             lighter_payload = None
+            exit_var_order_quote = {}
         estimated_var_leg_pnl, estimated_lighter_leg_pnl, pnl = self.live_inventory_pair_pnl(
             direction=direction,
             qty=qty,
@@ -4901,6 +4955,12 @@ class VariationalToLighterRuntime:
                         **pending_pnl,
                         "exit_estimated_var_price": decimal_to_str(var_exit_price),
                         "exit_estimated_lighter_price": decimal_to_str(lighter_exit_price),
+                        "exit_var_order_quote_id": exit_var_order_quote.get("quote_id"),
+                        "exit_var_order_quote_bid": exit_var_order_quote.get("quote_bid"),
+                        "exit_var_order_quote_ask": exit_var_order_quote.get("quote_ask"),
+                        "exit_var_order_quote_mark_price": exit_var_order_quote.get("quote_mark_price"),
+                        "exit_var_order_quote_timestamp": exit_var_order_quote.get("quote_timestamp"),
+                        "exit_var_order_quote_execution_price": exit_var_order_quote.get("quote_execution_price"),
                         "exited_at": utc_now(),
                     }
                 )
@@ -4931,6 +4991,12 @@ class VariationalToLighterRuntime:
                 "completed_cycles": self.live_inventory_completed_cycles,
                 "var_submit_ms": var_submit_ms,
                 "lighter_submit_ms": lighter_submit_ms,
+                "var_order_quote_id": exit_var_order_quote.get("quote_id"),
+                "var_order_quote_bid": exit_var_order_quote.get("quote_bid"),
+                "var_order_quote_ask": exit_var_order_quote.get("quote_ask"),
+                "var_order_quote_mark_price": exit_var_order_quote.get("quote_mark_price"),
+                "var_order_quote_timestamp": exit_var_order_quote.get("quote_timestamp"),
+                "var_order_quote_execution_price": exit_var_order_quote.get("quote_execution_price"),
                 "exit_lighter_payload": lighter_payload,
             },
         )
