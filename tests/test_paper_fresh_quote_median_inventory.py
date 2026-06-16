@@ -3,9 +3,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from inventory_engine import DIRECTION_LONG_VAR_SHORT_LIGHTER
+from inventory_engine import DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER, INVENTORY_DIRECTIONS, PaperInventoryEngine
 from tools.paper_fresh_quote_inventory import FreshInventorySample
-from tools.paper_fresh_quote_median_inventory import MedianState, RollingMedian, median_signal, parse_windows, state_row
+from tools.paper_fresh_quote_median_inventory import MedianState, RollingMedian, median_signal, parse_windows, state_row, tradable_directions
 
 
 def _sample(*, ask: str, lighter_bid: str):
@@ -93,3 +93,33 @@ def test_state_row_serializes_median_fields() -> None:
     assert row["event"] == "fresh_quote_median_inventory_paper_state"
     assert Decimal(row["long_deviation_bps"]) == Decimal("0")
     assert row["long_counts"] == {"base": 1}
+
+
+def test_tradable_directions_prevents_mixed_inventory() -> None:
+    engine = PaperInventoryEngine(
+        lot_notional_usd=Decimal("20"),
+        max_lots=3,
+        max_total_lots=3,
+        entry_bps=Decimal("2"),
+        exit_bps=Decimal("0.5"),
+        min_hold_samples=1,
+    )
+
+    assert tradable_directions(engine) == INVENTORY_DIRECTIONS
+
+    engine.on_sample(
+        direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+        edge_bps=Decimal("2.1"),
+        var_entry_price=Decimal("100"),
+        lighter_entry_price=Decimal("101"),
+        var_exit_price=Decimal("99"),
+        lighter_exit_price=Decimal("102"),
+        logged_at="now",
+        sample_index=0,
+    )
+
+    assert tradable_directions(engine) == (DIRECTION_LONG_VAR_SHORT_LIGHTER,)
+
+    engine.lots[DIRECTION_SHORT_VAR_LONG_LIGHTER].append(engine.lots[DIRECTION_LONG_VAR_SHORT_LIGHTER][0])
+    with pytest.raises(RuntimeError):
+        tradable_directions(engine)

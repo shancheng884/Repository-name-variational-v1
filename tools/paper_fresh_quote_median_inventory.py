@@ -107,6 +107,25 @@ def median_signal(
     return deviation, baseline, medians, counts
 
 
+def active_direction(engine: PaperInventoryEngine) -> str | None:
+    long_lots = engine.open_lots(DIRECTION_LONG_VAR_SHORT_LIGHTER)
+    short_lots = engine.open_lots(DIRECTION_SHORT_VAR_LONG_LIGHTER)
+    if long_lots and short_lots:
+        raise RuntimeError("median inventory paper has mixed long and short lots")
+    if long_lots:
+        return DIRECTION_LONG_VAR_SHORT_LIGHTER
+    if short_lots:
+        return DIRECTION_SHORT_VAR_LONG_LIGHTER
+    return None
+
+
+def tradable_directions(engine: PaperInventoryEngine) -> tuple[str, ...]:
+    active = active_direction(engine)
+    if active is not None:
+        return (active,)
+    return INVENTORY_DIRECTIONS
+
+
 def event_to_json(event: Any) -> dict[str, Any]:
     row = asdict(event)
     for key, value in list(row.items()):
@@ -210,7 +229,7 @@ async def run(args: argparse.Namespace) -> None:
 
         median_state.add(sample)
         events = []
-        for direction in INVENTORY_DIRECTIONS:
+        for direction in tradable_directions(engine):
             deviation, _, _, _ = median_signal(
                 sample=sample,
                 median_state=median_state,
