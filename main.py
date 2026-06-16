@@ -751,6 +751,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_exit_bps = Decimal(str(args.live_inventory_exit_bps))
         self.live_inventory_max_var_spread_bps = Decimal(str(args.live_inventory_max_var_spread_bps))
         self.live_inventory_dynamic_entry_buffer_bps = Decimal(str(args.live_inventory_dynamic_entry_buffer_bps))
+        self.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics = bool(
+            args.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics
+        )
         self.live_inventory_max_lighter_slippage_bps = Decimal(str(args.live_inventory_max_lighter_slippage_bps))
         self.live_inventory_min_hold_samples = int(args.live_inventory_min_hold_samples)
         self.live_inventory_max_hold_samples = int(args.live_inventory_max_hold_samples)
@@ -1494,11 +1497,18 @@ class VariationalToLighterRuntime:
             return False, "lighter_slippage_exceeds_live_inventory_limit", context
 
         required_entry_bps = self.live_inventory_entry_bps
+        recent_execution_loss_buffer_bps = Decimal("0")
+        if not self.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics:
+            recent_execution_loss_buffer_bps = self.live_inventory_recent_execution_loss_buffer_bps()
         dynamic_required_entry_bps = (
             (var_spread_bps or Decimal("0"))
             + lighter_slippage_bps
-            + self.live_inventory_recent_execution_loss_buffer_bps()
+            + recent_execution_loss_buffer_bps
             + self.live_inventory_dynamic_entry_buffer_bps
+        )
+        context["live_inventory_recent_execution_loss_buffer_bps"] = decimal_to_str(recent_execution_loss_buffer_bps)
+        context["live_inventory_ignored_recent_execution_loss_buffer_for_diagnostics"] = (
+            self.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics
         )
         if dynamic_required_entry_bps > required_entry_bps:
             required_entry_bps = dynamic_required_entry_bps
@@ -6474,6 +6484,11 @@ def parse_args() -> argparse.Namespace:
         help="Extra live inventory entry cushion added on top of Var spread and Lighter depth slippage. Default: 5.0",
     )
     parser.add_argument(
+        "--live-inventory-ignore-recent-execution-loss-buffer-for-diagnostics",
+        action="store_true",
+        help="Diagnostic real-submit only: ignore historical execution-loss buffer in the dynamic entry threshold without disabling other live inventory guards.",
+    )
+    parser.add_argument(
         "--live-inventory-max-lighter-slippage-bps",
         type=float,
         default=3.0,
@@ -6596,6 +6611,13 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-entry-bps must be >= 30 in V1 real-submit mode")
         if args.live_inventory_i_accept_diagnostic_low_entry_bps and args.live_inventory_dry_decisions:
             parser.error("--live-inventory-i-accept-diagnostic-low-entry-bps is only for real-submit diagnostic runs")
+        if (
+            args.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics
+            and (args.live_inventory_dry_decisions or not args.live_inventory_i_accept_diagnostic_low_entry_bps)
+        ):
+            parser.error(
+                "--live-inventory-ignore-recent-execution-loss-buffer-for-diagnostics requires real-submit diagnostic acknowledgement"
+            )
         if args.live_inventory_exit_bps < 0:
             parser.error("--live-inventory-exit-bps must be >= 0")
         if args.live_inventory_max_var_spread_bps <= 0:
@@ -6616,6 +6638,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--live-inventory-reset-state-after-manual-flat requires --live-inventory")
     elif args.live_inventory_dry_decisions:
         parser.error("--live-inventory-dry-decisions requires --live-inventory")
+    elif args.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics:
+        parser.error("--live-inventory-ignore-recent-execution-loss-buffer-for-diagnostics requires --live-inventory")
     if args.auto_live_min_holding_seconds < 0:
         parser.error("--auto-live-min-holding-seconds must be >= 0")
     if args.auto_live_entry_max_precheck_edge_bps < 0:
