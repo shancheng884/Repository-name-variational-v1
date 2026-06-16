@@ -43,6 +43,7 @@ class InventoryEvent:
     pnl_usd: Decimal | None = None
     pnl_bps: Decimal | None = None
     holding_samples: int | None = None
+    exit_reason: str | None = None
 
 
 class PaperInventoryEngine:
@@ -118,6 +119,26 @@ class PaperInventoryEngine:
         notional = lot.qty * lot.entry_var_price
         return pnl / notional * Decimal("10000") if notional else None
 
+    def exit_reason(
+        self,
+        *,
+        lot: InventoryLot,
+        edge_bps: Decimal,
+        pnl_bps: Decimal | None,
+        holding_samples: int,
+    ) -> str | None:
+        if holding_samples < self.min_hold_samples:
+            return None
+        if self.max_hold_samples is not None and holding_samples >= self.max_hold_samples:
+            return "max_hold_samples"
+        if self.max_unrealized_loss_bps is not None and pnl_bps is not None and pnl_bps <= -self.max_unrealized_loss_bps:
+            return "max_unrealized_loss_bps"
+        if edge_bps > self.exit_bps:
+            return None
+        if self.min_exit_pnl_bps is not None and (pnl_bps is None or pnl_bps < self.min_exit_pnl_bps):
+            return None
+        return "signal_reverted"
+
     def should_exit(
         self,
         *,
@@ -126,17 +147,7 @@ class PaperInventoryEngine:
         pnl_bps: Decimal | None,
         holding_samples: int,
     ) -> bool:
-        if holding_samples < self.min_hold_samples:
-            return False
-        if self.max_hold_samples is not None and holding_samples >= self.max_hold_samples:
-            return True
-        if self.max_unrealized_loss_bps is not None and pnl_bps is not None and pnl_bps <= -self.max_unrealized_loss_bps:
-            return True
-        if edge_bps > self.exit_bps:
-            return False
-        if self.min_exit_pnl_bps is not None and (pnl_bps is None or pnl_bps < self.min_exit_pnl_bps):
-            return False
-        return True
+        return self.exit_reason(lot=lot, edge_bps=edge_bps, pnl_bps=pnl_bps, holding_samples=holding_samples) is not None
 
     def on_sample(
         self,
@@ -220,7 +231,8 @@ class PaperInventoryEngine:
             lot = lots[0]
             holding_samples = sample_index - lot.entered_sample_index
             pnl_bps = self.lot_pnl_bps(lot, var_exit_price, lighter_exit_price)
-            if not self.should_exit(lot=lot, edge_bps=edge_bps, pnl_bps=pnl_bps, holding_samples=holding_samples):
+            exit_reason = self.exit_reason(lot=lot, edge_bps=edge_bps, pnl_bps=pnl_bps, holding_samples=holding_samples)
+            if exit_reason is None:
                 return events
             if self.latency_samples > 0:
                 self.pending_actions[direction].append(
@@ -248,11 +260,12 @@ class PaperInventoryEngine:
                     edge_bps=edge_bps,
                     var_price=var_exit_price,
                     lighter_price=lighter_exit_price,
-                    pnl_usd=pnl,
-                    pnl_bps=pnl_bps,
-                    holding_samples=sample_index - lot.entered_sample_index,
+                        pnl_usd=pnl,
+                        pnl_bps=pnl_bps,
+                        holding_samples=sample_index - lot.entered_sample_index,
+                        exit_reason=exit_reason,
+                    )
                 )
-            )
             return events
 
         if edge_bps >= self.entry_bps and self.can_enter(direction):

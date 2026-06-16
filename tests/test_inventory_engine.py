@@ -263,6 +263,7 @@ def test_paper_inventory_min_exit_pnl_blocks_losing_reversion_exit() -> None:
     assert engine.open_lots() == 0
     assert exited[0].event == "inventory_paper_exited"
     assert exited[0].pnl_bps is not None and exited[0].pnl_bps >= Decimal("0.5")
+    assert exited[0].exit_reason == "signal_reverted"
 
 
 def test_paper_inventory_stop_loss_forces_exit_before_signal_exit() -> None:
@@ -299,3 +300,40 @@ def test_paper_inventory_stop_loss_forces_exit_before_signal_exit() -> None:
 
     assert exited[0].event == "inventory_paper_exited"
     assert exited[0].pnl_bps is not None and exited[0].pnl_bps <= Decimal("-1")
+    assert exited[0].exit_reason == "max_unrealized_loss_bps"
+
+
+def test_paper_inventory_max_hold_sets_exit_reason() -> None:
+    engine = PaperInventoryEngine(
+        lot_notional_usd=Decimal("100"),
+        max_lots=1,
+        entry_bps=Decimal("8"),
+        exit_bps=Decimal("0"),
+        min_hold_samples=0,
+        min_exit_pnl_bps=Decimal("0.5"),
+        max_hold_samples=2,
+    )
+
+    engine.on_sample(
+        direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+        edge_bps=Decimal("10"),
+        var_entry_price=Decimal("100000"),
+        lighter_entry_price=Decimal("100100"),
+        var_exit_price=Decimal("99990"),
+        lighter_exit_price=Decimal("100110"),
+        logged_at="t1",
+        sample_index=1,
+    )
+    exited = engine.on_sample(
+        direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+        edge_bps=Decimal("5"),
+        var_entry_price=Decimal("100000"),
+        lighter_entry_price=Decimal("100100"),
+        var_exit_price=Decimal("100000"),
+        lighter_exit_price=Decimal("100110"),
+        logged_at="t3",
+        sample_index=3,
+    )
+
+    assert exited[0].event == "inventory_paper_exited"
+    assert exited[0].exit_reason == "max_hold_samples"
