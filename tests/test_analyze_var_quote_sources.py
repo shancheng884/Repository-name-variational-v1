@@ -1,9 +1,8 @@
+import asyncio
 import json
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-
-import pytest
 
 from tools import analyze_var_quote_sources
 from tools.analyze_var_quote_sources import analyze_candidate, latest_candidate
@@ -90,8 +89,7 @@ def test_analyze_candidate_computes_fresh_edge_loss(tmp_path: Path) -> None:
     assert result["fresh_quote_ms"] == "12.3"
 
 
-@pytest.mark.asyncio
-async def test_run_once_requests_var_quote_with_notional_amount(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_run_once_requests_var_quote_with_notional_amount(monkeypatch, tmp_path: Path) -> None:
     path = tmp_path / "market_samples.jsonl"
     _write_jsonl(
         path,
@@ -117,15 +115,17 @@ async def test_run_once_requests_var_quote_with_notional_amount(monkeypatch: pyt
 
     monkeypatch.setattr(analyze_var_quote_sources, "request_var_quote", fake_request_var_quote)
 
-    await analyze_var_quote_sources.run_once(
-        SimpleNamespace(
-            file=path,
-            asset="BTC",
-            threshold_bps=10,
-            lot_notional_usd=20,
-            latest=10,
-            endpoint="ws://example",
-            timeout_seconds=5,
+    asyncio.run(
+        analyze_var_quote_sources.run_once(
+            SimpleNamespace(
+                file=path,
+                asset="BTC",
+                threshold_bps=10,
+                lot_notional_usd=20,
+                latest=10,
+                endpoint="ws://example",
+                timeout_seconds=5,
+            )
         )
     )
 
