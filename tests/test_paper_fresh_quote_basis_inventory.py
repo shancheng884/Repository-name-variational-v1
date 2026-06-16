@@ -2,7 +2,15 @@ from decimal import Decimal
 
 from inventory_engine import DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER, PaperInventoryEngine
 from tests.test_paper_fresh_quote_median_inventory import _sample
-from tools.paper_fresh_quote_basis_inventory import EwmaBasisState, basis_bps, direction_signal, entry_direction, state_row
+from tools.paper_fresh_quote_basis_inventory import (
+    EwmaBasisState,
+    basis_bps,
+    direction_signal,
+    entry_direction,
+    entry_roundtrip_cost_allowed,
+    roundtrip_pnl_bps,
+    state_row,
+)
 
 
 def test_basis_bps_uses_mid_prices() -> None:
@@ -45,6 +53,40 @@ def test_direction_signal_is_positive_for_active_direction() -> None:
     assert direction_signal(DIRECTION_LONG_VAR_SHORT_LIGHTER, -3.5) == Decimal("3.5")
 
 
+def test_roundtrip_pnl_bps_measures_immediate_exit_cost() -> None:
+    result = roundtrip_pnl_bps(
+        direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+        var_entry_price=Decimal("100"),
+        lighter_entry_price=Decimal("101"),
+        var_exit_price=Decimal("99"),
+        lighter_exit_price=Decimal("102"),
+    )
+
+    assert result == Decimal("-200")
+
+
+def test_entry_roundtrip_cost_gate_blocks_expensive_new_entries() -> None:
+    allowed = entry_roundtrip_cost_allowed(
+        direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+        var_entry_price=Decimal("100"),
+        lighter_entry_price=Decimal("101"),
+        var_exit_price=Decimal("99.98"),
+        lighter_exit_price=Decimal("101"),
+        max_entry_roundtrip_cost_bps=Decimal("3"),
+    )
+    blocked = entry_roundtrip_cost_allowed(
+        direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+        var_entry_price=Decimal("100"),
+        lighter_entry_price=Decimal("101"),
+        var_exit_price=Decimal("99.94"),
+        lighter_exit_price=Decimal("101.01"),
+        max_entry_roundtrip_cost_bps=Decimal("3"),
+    )
+
+    assert allowed is True
+    assert blocked is False
+
+
 def test_state_row_serializes_basis_fields() -> None:
     sample = _sample(ask="100", lighter_bid="101")
     state = EwmaBasisState(
@@ -78,4 +120,6 @@ def test_state_row_serializes_basis_fields() -> None:
 
     assert row["event"] == "fresh_quote_basis_inventory_paper_state"
     assert row["basis_bps"] is not None
+    assert row["long_roundtrip_pnl_bps"] is not None
+    assert row["short_roundtrip_pnl_bps"] is not None
     assert row["open_lot_details"] == []

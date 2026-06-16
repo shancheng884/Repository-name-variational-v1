@@ -109,6 +109,46 @@ def direction_signal(direction: str, z: float) -> Decimal:
     raise ValueError(f"Unsupported direction: {direction}")
 
 
+def roundtrip_pnl_bps(
+    *,
+    direction: str,
+    var_entry_price: Decimal,
+    lighter_entry_price: Decimal,
+    var_exit_price: Decimal,
+    lighter_exit_price: Decimal,
+) -> Decimal:
+    if var_entry_price <= 0:
+        raise ValueError("var_entry_price must be > 0")
+    if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+        pnl_per_unit = (var_exit_price - var_entry_price) + (lighter_entry_price - lighter_exit_price)
+    elif direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
+        pnl_per_unit = (var_entry_price - var_exit_price) + (lighter_exit_price - lighter_entry_price)
+    else:
+        raise ValueError(f"Unsupported direction: {direction}")
+    return pnl_per_unit / var_entry_price * Decimal("10000")
+
+
+def entry_roundtrip_cost_allowed(
+    *,
+    direction: str,
+    var_entry_price: Decimal,
+    lighter_entry_price: Decimal,
+    var_exit_price: Decimal,
+    lighter_exit_price: Decimal,
+    max_entry_roundtrip_cost_bps: Decimal,
+) -> bool:
+    if max_entry_roundtrip_cost_bps <= 0:
+        return True
+    pnl_bps = roundtrip_pnl_bps(
+        direction=direction,
+        var_entry_price=var_entry_price,
+        lighter_entry_price=lighter_entry_price,
+        var_exit_price=var_exit_price,
+        lighter_exit_price=lighter_exit_price,
+    )
+    return pnl_bps >= -max_entry_roundtrip_cost_bps
+
+
 def event_to_json(event: Any) -> dict[str, Any]:
     row = asdict(event)
     for key, value in list(row.items()):
@@ -129,6 +169,8 @@ def state_row(
     state: EwmaBasisState,
     signal_direction: str | None,
 ) -> dict[str, Any]:
+    _, long_var_entry, long_lighter_entry, long_var_exit, long_lighter_exit = sample_prices(sample, DIRECTION_LONG_VAR_SHORT_LIGHTER)
+    _, short_var_entry, short_lighter_entry, short_var_exit, short_lighter_exit = sample_prices(sample, DIRECTION_SHORT_VAR_LONG_LIGHTER)
     return {
         "event": "fresh_quote_basis_inventory_paper_state",
         "sample_index": sample_index,
@@ -143,6 +185,24 @@ def state_row(
         "lighter_ask": decimal_to_str(sample.lighter_ask),
         "long_edge_bps": decimal_to_str(sample.long_edge_bps),
         "short_edge_bps": decimal_to_str(sample.short_edge_bps),
+        "long_roundtrip_pnl_bps": decimal_to_str(
+            roundtrip_pnl_bps(
+                direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                var_entry_price=long_var_entry,
+                lighter_entry_price=long_lighter_entry,
+                var_exit_price=long_var_exit,
+                lighter_exit_price=long_lighter_exit,
+            )
+        ),
+        "short_roundtrip_pnl_bps": decimal_to_str(
+            roundtrip_pnl_bps(
+                direction=DIRECTION_SHORT_VAR_LONG_LIGHTER,
+                var_entry_price=short_var_entry,
+                lighter_entry_price=short_lighter_entry,
+                var_exit_price=short_var_exit,
+                lighter_exit_price=short_lighter_exit,
+            )
+        ),
         "basis_bps": decimal_to_str(basis),
         "basis_mean_bps": None if state.signal_mean is None else str(state.signal_mean),
         "basis_sigma_bps": None if state.signal_sigma is None else str(state.signal_sigma),
@@ -217,6 +277,15 @@ async def run(args: argparse.Namespace) -> None:
                     if edge < Decimal(str(args.min_entry_edge_bps)):
                         continue
                 _, var_entry, lighter_entry, var_exit, lighter_exit = sample_prices(sample, direction)
+                if not active and not entry_roundtrip_cost_allowed(
+                    direction=direction,
+                    var_entry_price=var_entry,
+                    lighter_entry_price=lighter_entry,
+                    var_exit_price=var_exit,
+                    lighter_exit_price=lighter_exit,
+                    max_entry_roundtrip_cost_bps=Decimal(str(args.max_entry_roundtrip_cost_bps)),
+                ):
+                    continue
                 events.extend(
                     engine.on_sample(
                         direction=direction,
@@ -263,6 +332,7 @@ def main() -> int:
     parser.add_argument("--z-entry", type=float, default=4.0)
     parser.add_argument("--z-exit", type=float, default=0.0)
     parser.add_argument("--min-entry-edge-bps", type=float, default=0.0)
+    parser.add_argument("--max-entry-roundtrip-cost-bps", type=float, default=0.0, help="Skip new entries whose immediate round-trip loss is worse than this many bps; 0 disables the gate.")
     parser.add_argument("--max-lots", type=int, default=2)
     parser.add_argument("--max-total-lots", type=int, default=2)
     parser.add_argument("--min-hold-samples", type=int, default=20)
@@ -286,6 +356,8 @@ def main() -> int:
         parser.error("--z-exit must be >= 0")
     if args.min_entry_edge_bps < 0:
         parser.error("--min-entry-edge-bps must be >= 0")
+    if args.max_entry_roundtrip_cost_bps < 0:
+        parser.error("--max-entry-roundtrip-cost-bps must be >= 0")
     if args.max_lots <= 0:
         parser.error("--max-lots must be > 0")
     if args.max_total_lots <= 0:
