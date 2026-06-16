@@ -1,7 +1,11 @@
 import json
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+
+from tools import analyze_var_quote_sources
 from tools.analyze_var_quote_sources import analyze_candidate, latest_candidate
 
 
@@ -49,6 +53,7 @@ def test_latest_candidate_picks_highest_threshold_direction(tmp_path: Path) -> N
     assert candidate.snapshot_edge_bps == Decimal("30")
     assert candidate.snapshot_var_price == Decimal("99")
     assert candidate.lighter_price == Decimal("98.7")
+    assert candidate.lot_notional_usd == Decimal("20")
     assert candidate.snapshot_var_timestamp == "2026-06-16T00:00:01Z"
 
 
@@ -83,3 +88,45 @@ def test_analyze_candidate_computes_fresh_edge_loss(tmp_path: Path) -> None:
     assert Decimal(result["fresh_edge_bps"]) < Decimal("100")
     assert Decimal(result["edge_loss_bps"]) > Decimal("0")
     assert result["fresh_quote_ms"] == "12.3"
+
+
+@pytest.mark.asyncio
+async def test_run_once_requests_var_quote_with_notional_amount(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "market_samples.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "event": "market_sample",
+                "logged_at": "2026-06-16T00:00:01Z",
+                "asset": "BTC",
+                "var_buy_price": "100",
+                "var_sell_price": "99",
+                "lighter_bid": "101",
+                "lighter_ask": "102",
+                "long_var_short_lighter_bps": "100",
+                "short_var_long_lighter_bps": "-303.030303",
+            },
+        ],
+    )
+    requested: dict[str, object] = {}
+
+    async def fake_request_var_quote(endpoint: str, *, asset: str, amount: Decimal, timeout_seconds: float) -> dict:
+        requested.update({"endpoint": endpoint, "asset": asset, "amount": amount, "timeout_seconds": timeout_seconds})
+        return {"ok": True, "result": {"quoteId": "q1", "bid": "100.5", "ask": "100.8", "quoteTimestamp": "now"}}
+
+    monkeypatch.setattr(analyze_var_quote_sources, "request_var_quote", fake_request_var_quote)
+
+    await analyze_var_quote_sources.run_once(
+        SimpleNamespace(
+            file=path,
+            asset="BTC",
+            threshold_bps=10,
+            lot_notional_usd=20,
+            latest=10,
+            endpoint="ws://example",
+            timeout_seconds=5,
+        )
+    )
+
+    assert requested["amount"] == Decimal("20")

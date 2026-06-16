@@ -51,6 +51,7 @@ class Candidate:
     snapshot_var_price: Decimal
     lighter_price: Decimal
     qty: Decimal
+    lot_notional_usd: Decimal
     snapshot_var_timestamp: str | None
     snapshot_var_source_url: str | None
     snapshot_var_source_stream: str | None
@@ -81,6 +82,7 @@ def candidate_from_row(row: dict[str, Any], *, direction: str, lot_notional_usd:
         snapshot_var_price=var_price,
         lighter_price=lighter_price,
         qty=lot_notional_usd / notional_price,
+        lot_notional_usd=lot_notional_usd,
         snapshot_var_timestamp=str(row.get("var_timestamp") or row.get("entry_snapshot_var_timestamp") or "") or None,
         snapshot_var_source_url=str(row.get("var_source_url") or "") or None,
         snapshot_var_source_stream=str(row.get("var_source_stream") or "") or None,
@@ -183,7 +185,7 @@ async def run_once(args: argparse.Namespace) -> dict[str, Any] | None:
     quote = await request_var_quote(
         args.endpoint,
         asset=candidate.asset,
-        amount=candidate.qty,
+        amount=candidate.lot_notional_usd,
         timeout_seconds=args.timeout_seconds,
     )
     quote_ms = Decimal(str((time.perf_counter() - started) * 1000))
@@ -209,7 +211,7 @@ async def run_watch(args: argparse.Namespace) -> None:
             quote = await request_var_quote(
                 args.endpoint,
                 asset=candidate.asset,
-                amount=candidate.qty,
+                amount=candidate.lot_notional_usd,
                 timeout_seconds=args.timeout_seconds,
             )
             quote_ms = Decimal(str((time.perf_counter() - started) * 1000))
