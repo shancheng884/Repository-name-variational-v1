@@ -40,6 +40,8 @@ def test_load_rows_finds_closest_snapshot_price(tmp_path: Path) -> None:
     rows = load_rows(path)
 
     assert len(rows) == 1
+    assert rows[0].expected_entry_snapshot_price == "buy"
+    assert rows[0].expected_entry_snapshot_drift_bps == Decimal("13.4")
     assert rows[0].closest_snapshot_price == "sell"
     assert rows[0].closest_snapshot_drift_bps == Decimal("0.1")
     assert rows[0].entry_edge_capture_loss_bps == Decimal("13.6")

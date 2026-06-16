@@ -70,6 +70,21 @@ class VarDiagnosticRow:
             return None
         return self.drift_by_price[closest]
 
+    @property
+    def expected_entry_snapshot_price(self) -> str | None:
+        if self.direction == "long_var_short_lighter":
+            return "buy"
+        if self.direction == "short_var_long_lighter":
+            return "sell"
+        return None
+
+    @property
+    def expected_entry_snapshot_drift_bps(self) -> Decimal | None:
+        expected = self.expected_entry_snapshot_price
+        if expected is None:
+            return None
+        return self.drift_by_price.get(expected)
+
 
 def load_rows(path: Path, *, latest: int | None = None) -> list[VarDiagnosticRow]:
     rows: list[VarDiagnosticRow] = []
@@ -142,6 +157,8 @@ def print_summary(rows: list[VarDiagnosticRow]) -> None:
             f"capture_loss_bps={fmt(row.entry_edge_capture_loss_bps)} "
             f"var_drift_bps={fmt(row.entry_var_fill_drift_bps)} "
             f"lighter_drift_bps={fmt(row.entry_lighter_fill_drift_bps)} "
+            f"expected={row.expected_entry_snapshot_price or '-'} "
+            f"expected_drift_bps={fmt(row.expected_entry_snapshot_drift_bps)} "
             f"closest={row.closest_snapshot_price or '-'} "
             f"closest_drift_bps={fmt(row.closest_snapshot_drift_bps)} "
             f"var_full_spread_bps={fmt(row.var_full_spread_bps)} "
