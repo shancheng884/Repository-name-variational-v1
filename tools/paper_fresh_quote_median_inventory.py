@@ -134,6 +134,30 @@ def event_to_json(event: Any) -> dict[str, Any]:
     return row
 
 
+def open_lot_details(*, engine: PaperInventoryEngine, sample: FreshInventorySample, sample_index: int) -> list[dict[str, Any]]:
+    details = []
+    for direction in INVENTORY_DIRECTIONS:
+        _, _, _, var_exit, lighter_exit = sample_prices(sample, direction)
+        for lot in engine.lots[direction]:
+            pnl_usd = engine.close_lot(lot, var_exit, lighter_exit)
+            pnl_bps = engine.lot_pnl_bps(lot, var_exit, lighter_exit)
+            details.append(
+                {
+                    "lot_id": lot.lot_id,
+                    "direction": lot.direction,
+                    "holding_samples": sample_index - lot.entered_sample_index,
+                    "entry_edge_bps": decimal_to_str(lot.entry_edge_bps),
+                    "entry_var_price": decimal_to_str(lot.entry_var_price),
+                    "entry_lighter_price": decimal_to_str(lot.entry_lighter_price),
+                    "exit_var_price": decimal_to_str(var_exit),
+                    "exit_lighter_price": decimal_to_str(lighter_exit),
+                    "unrealized_pnl_bps": decimal_to_str(pnl_bps),
+                    "unrealized_pnl_usd": decimal_to_str(pnl_usd),
+                }
+            )
+    return details
+
+
 def state_row(
     *,
     sample: FreshInventorySample,
@@ -189,6 +213,7 @@ def state_row(
         "open_lots": engine.open_lots(),
         "open_long_lots": engine.open_lots(DIRECTION_LONG_VAR_SHORT_LIGHTER),
         "open_short_lots": engine.open_lots(DIRECTION_SHORT_VAR_LONG_LIGHTER),
+        "open_lot_details": open_lot_details(engine=engine, sample=sample, sample_index=sample_index),
         "realized_pnl_usd": decimal_to_str(engine.realized_pnl_usd),
         "actions": [event_to_json(event) for event in events],
     }

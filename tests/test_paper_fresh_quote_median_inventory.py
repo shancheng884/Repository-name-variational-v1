@@ -1,11 +1,10 @@
 from decimal import Decimal
-from types import SimpleNamespace
 
 import pytest
 
 from inventory_engine import DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER, INVENTORY_DIRECTIONS, PaperInventoryEngine
 from tools.paper_fresh_quote_inventory import FreshInventorySample
-from tools.paper_fresh_quote_median_inventory import MedianState, RollingMedian, median_signal, parse_windows, state_row, tradable_directions
+from tools.paper_fresh_quote_median_inventory import MedianState, RollingMedian, median_signal, open_lot_details, parse_windows, state_row, tradable_directions
 
 
 def _sample(*, ask: str, lighter_bid: str):
@@ -78,11 +77,19 @@ def test_median_signal_waits_for_baseline_then_returns_deviation() -> None:
 def test_state_row_serializes_median_fields() -> None:
     state = MedianState({"base": 10})
     sample = _sample(ask="100", lighter_bid="101")
+    engine = PaperInventoryEngine(
+        lot_notional_usd=Decimal("20"),
+        max_lots=3,
+        max_total_lots=3,
+        entry_bps=Decimal("2"),
+        exit_bps=Decimal("0.5"),
+        min_hold_samples=1,
+    )
     state.add(sample)
 
     row = state_row(
         sample=sample,
-        engine=SimpleNamespace(open_lots=lambda direction=None: 0, realized_pnl_usd=Decimal("0")),
+        engine=engine,
         median_state=state,
         sample_index=0,
         events=[],
@@ -123,3 +130,31 @@ def test_tradable_directions_prevents_mixed_inventory() -> None:
     engine.lots[DIRECTION_SHORT_VAR_LONG_LIGHTER].append(engine.lots[DIRECTION_LONG_VAR_SHORT_LIGHTER][0])
     with pytest.raises(RuntimeError):
         tradable_directions(engine)
+
+
+def test_open_lot_details_reports_unrealized_pnl() -> None:
+    engine = PaperInventoryEngine(
+        lot_notional_usd=Decimal("20"),
+        max_lots=3,
+        max_total_lots=3,
+        entry_bps=Decimal("2"),
+        exit_bps=Decimal("0.5"),
+        min_hold_samples=1,
+    )
+    sample = _sample(ask="100", lighter_bid="101")
+    engine.on_sample(
+        direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+        edge_bps=sample.long_edge_bps,
+        var_entry_price=sample.var_ask,
+        lighter_entry_price=sample.lighter_sell_price,
+        var_exit_price=sample.var_bid,
+        lighter_exit_price=sample.lighter_buy_price,
+        logged_at="now",
+        sample_index=0,
+    )
+
+    details = open_lot_details(engine=engine, sample=sample, sample_index=2)
+
+    assert details[0]["lot_id"] == 1
+    assert details[0]["holding_samples"] == 2
+    assert Decimal(details[0]["unrealized_pnl_bps"]) < Decimal("0")
