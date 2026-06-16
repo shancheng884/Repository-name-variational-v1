@@ -28,6 +28,8 @@ def test_load_rows_finds_closest_snapshot_price(tmp_path: Path) -> None:
                 "entry_var_fill_drift_bps": "13.4",
                 "entry_lighter_fill_drift_bps": "-0.1",
                 "var_full_spread_bps": "8.0",
+                "entry_snapshot_var_timestamp": "2026-06-15T00:00:00.000Z",
+                "entry_var_order_quote_timestamp": "2026-06-15T00:00:00.050Z",
                 "entry_var_final_vs_snapshot_bid_bps": "14.0",
                 "entry_var_final_vs_snapshot_ask_bps": "0.2",
                 "entry_var_final_vs_snapshot_mid_bps": "7.0",
@@ -45,6 +47,8 @@ def test_load_rows_finds_closest_snapshot_price(tmp_path: Path) -> None:
     assert rows[0].closest_snapshot_price == "sell"
     assert rows[0].closest_snapshot_drift_bps == Decimal("0.1")
     assert rows[0].entry_edge_capture_loss_bps == Decimal("13.6")
+    assert rows[0].snapshot_var_timestamp == "2026-06-15T00:00:00.000Z"
+    assert rows[0].order_quote_timestamp == "2026-06-15T00:00:00.050Z"
 
 
 def test_latest_limits_rows(tmp_path: Path) -> None:

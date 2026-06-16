@@ -603,6 +603,9 @@ class CrossSpreadSnapshot:
     var_sell_price: Decimal | None
     var_full_spread_bps: Decimal | None
     var_spread_source: str
+    var_timestamp: str | None
+    var_source_url: str | None
+    var_source_stream: str | None
     lighter_bid: Decimal
     lighter_ask: Decimal
     lighter_mid: Decimal
@@ -1218,6 +1221,9 @@ class VariationalToLighterRuntime:
                 "entry_snapshot_var_sell_price": lot.get("entry_snapshot_var_sell_price"),
                 "entry_snapshot_var_full_spread_bps": lot.get("entry_snapshot_var_full_spread_bps"),
                 "entry_snapshot_var_spread_source": lot.get("entry_snapshot_var_spread_source"),
+                "entry_snapshot_var_timestamp": lot.get("entry_snapshot_var_timestamp"),
+                "entry_snapshot_var_source_url": lot.get("entry_snapshot_var_source_url"),
+                "entry_snapshot_var_source_stream": lot.get("entry_snapshot_var_source_stream"),
                 "entry_var_order_quote_id": lot.get("entry_var_order_quote_id"),
                 "entry_var_order_quote_bid": lot.get("entry_var_order_quote_bid"),
                 "entry_var_order_quote_ask": lot.get("entry_var_order_quote_ask"),
@@ -4143,6 +4149,8 @@ class VariationalToLighterRuntime:
                 var_spread_source=var_spread_source,
             )
 
+        raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
+
         return CrossSpreadSnapshot(
             asset=asset,
             var_bid=var_bid,
@@ -4153,6 +4161,9 @@ class VariationalToLighterRuntime:
             var_sell_price=var_sell_price,
             var_full_spread_bps=var_full_spread_bps,
             var_spread_source=var_spread_source,
+            var_timestamp=str(quote.get("timestamp") or raw.get("timestamp") or "") or None,
+            var_source_url=str(raw.get("__source_url") or "") or None,
+            var_source_stream=str(raw.get("__source_stream") or raw.get("channel") or "") or None,
             lighter_bid=lighter_bid,
             lighter_ask=lighter_ask,
             lighter_mid=lighter_mid,
@@ -4672,6 +4683,9 @@ class VariationalToLighterRuntime:
                     "entry_snapshot_var_sell_price": decimal_to_str(snapshot.var_sell_price),
                     "entry_snapshot_var_full_spread_bps": decimal_to_str(snapshot.var_full_spread_bps),
                     "entry_snapshot_var_spread_source": snapshot.var_spread_source,
+                    "entry_snapshot_var_timestamp": snapshot.var_timestamp,
+                    "entry_snapshot_var_source_url": snapshot.var_source_url,
+                    "entry_snapshot_var_source_stream": snapshot.var_source_stream,
                     "entry_var_order_quote_id": entry_var_order_quote.get("quote_id"),
                     "entry_var_order_quote_bid": entry_var_order_quote.get("quote_bid"),
                     "entry_var_order_quote_ask": entry_var_order_quote.get("quote_ask"),
@@ -4719,6 +4733,9 @@ class VariationalToLighterRuntime:
                         "var_sell_price": decimal_to_str(snapshot.var_sell_price),
                         "var_full_spread_bps": decimal_to_str(snapshot.var_full_spread_bps),
                         "var_spread_source": snapshot.var_spread_source,
+                        "var_timestamp": snapshot.var_timestamp,
+                        "var_source_url": snapshot.var_source_url,
+                        "var_source_stream": snapshot.var_source_stream,
                         "var_order_quote_id": entry_var_order_quote.get("quote_id"),
                         "var_order_quote_bid": entry_var_order_quote.get("quote_bid"),
                         "var_order_quote_ask": entry_var_order_quote.get("quote_ask"),

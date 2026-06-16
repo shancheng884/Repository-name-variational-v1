@@ -55,6 +55,8 @@ class VarDiagnosticRow:
     entry_var_fill_drift_bps: Decimal | None
     entry_lighter_fill_drift_bps: Decimal | None
     var_full_spread_bps: Decimal | None
+    snapshot_var_timestamp: str
+    order_quote_timestamp: str
     drift_by_price: dict[str, Decimal]
 
     @property
@@ -114,6 +116,8 @@ def load_rows(path: Path, *, latest: int | None = None) -> list[VarDiagnosticRow
                     entry_var_fill_drift_bps=to_decimal(row.get("entry_var_fill_drift_bps")),
                     entry_lighter_fill_drift_bps=to_decimal(row.get("entry_lighter_fill_drift_bps")),
                     var_full_spread_bps=to_decimal(row.get("var_full_spread_bps")),
+                    snapshot_var_timestamp=str(row.get("entry_snapshot_var_timestamp") or ""),
+                    order_quote_timestamp=str(row.get("entry_var_order_quote_timestamp") or ""),
                     drift_by_price=drift_by_price,
                 )
             )
@@ -162,6 +166,8 @@ def print_summary(rows: list[VarDiagnosticRow]) -> None:
             f"closest={row.closest_snapshot_price or '-'} "
             f"closest_drift_bps={fmt(row.closest_snapshot_drift_bps)} "
             f"var_full_spread_bps={fmt(row.var_full_spread_bps)} "
+            f"snapshot_ts={row.snapshot_var_timestamp or '-'} "
+            f"order_quote_ts={row.order_quote_timestamp or '-'} "
             f"{drift_parts}"
         )
 
