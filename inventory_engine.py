@@ -56,6 +56,9 @@ class PaperInventoryEngine:
         min_hold_samples: int,
         max_total_lots: int | None = None,
         latency_samples: int = 0,
+        min_exit_pnl_bps: Decimal | None = None,
+        max_hold_samples: int | None = None,
+        max_unrealized_loss_bps: Decimal | None = None,
     ) -> None:
         if lot_notional_usd <= 0:
             raise ValueError("lot_notional_usd must be > 0")
@@ -67,6 +70,10 @@ class PaperInventoryEngine:
             raise ValueError("min_hold_samples must be >= 0")
         if latency_samples < 0:
             raise ValueError("latency_samples must be >= 0")
+        if max_hold_samples is not None and max_hold_samples < 0:
+            raise ValueError("max_hold_samples must be >= 0")
+        if max_unrealized_loss_bps is not None and max_unrealized_loss_bps < 0:
+            raise ValueError("max_unrealized_loss_bps must be >= 0")
         self.lot_notional_usd = lot_notional_usd
         self.max_lots = max_lots
         self.max_total_lots = max_total_lots
@@ -74,6 +81,9 @@ class PaperInventoryEngine:
         self.exit_bps = exit_bps
         self.min_hold_samples = min_hold_samples
         self.latency_samples = latency_samples
+        self.min_exit_pnl_bps = min_exit_pnl_bps
+        self.max_hold_samples = max_hold_samples
+        self.max_unrealized_loss_bps = max_unrealized_loss_bps
         self.lots: dict[str, list[InventoryLot]] = {direction: [] for direction in INVENTORY_DIRECTIONS}
         self.pending_actions: dict[str, list[PendingInventoryAction]] = {direction: [] for direction in INVENTORY_DIRECTIONS}
         self.next_lot_id = 1
@@ -101,6 +111,32 @@ class PaperInventoryEngine:
         if lot.direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
             return (lot.entry_var_price - exit_var_price) * lot.qty + (exit_lighter_price - lot.entry_lighter_price) * lot.qty
         raise ValueError(f"Unsupported direction: {lot.direction}")
+
+    @staticmethod
+    def lot_pnl_bps(lot: InventoryLot, exit_var_price: Decimal, exit_lighter_price: Decimal) -> Decimal | None:
+        pnl = PaperInventoryEngine.close_lot(lot, exit_var_price, exit_lighter_price)
+        notional = lot.qty * lot.entry_var_price
+        return pnl / notional * Decimal("10000") if notional else None
+
+    def should_exit(
+        self,
+        *,
+        lot: InventoryLot,
+        edge_bps: Decimal,
+        pnl_bps: Decimal | None,
+        holding_samples: int,
+    ) -> bool:
+        if holding_samples < self.min_hold_samples:
+            return False
+        if self.max_hold_samples is not None and holding_samples >= self.max_hold_samples:
+            return True
+        if self.max_unrealized_loss_bps is not None and pnl_bps is not None and pnl_bps <= -self.max_unrealized_loss_bps:
+            return True
+        if edge_bps > self.exit_bps:
+            return False
+        if self.min_exit_pnl_bps is not None and (pnl_bps is None or pnl_bps < self.min_exit_pnl_bps):
+            return False
+        return True
 
     def on_sample(
         self,
@@ -180,13 +216,12 @@ class PaperInventoryEngine:
         if events:
             return events
 
-        if (
-            lots
-            and edge_bps <= self.exit_bps
-            and sample_index - lots[0].entered_sample_index >= self.min_hold_samples
-            and self.pending_exits(direction) == 0
-        ):
+        if lots and self.pending_exits(direction) == 0:
             lot = lots[0]
+            holding_samples = sample_index - lot.entered_sample_index
+            pnl_bps = self.lot_pnl_bps(lot, var_exit_price, lighter_exit_price)
+            if not self.should_exit(lot=lot, edge_bps=edge_bps, pnl_bps=pnl_bps, holding_samples=holding_samples):
+                return events
             if self.latency_samples > 0:
                 self.pending_actions[direction].append(
                     PendingInventoryAction(

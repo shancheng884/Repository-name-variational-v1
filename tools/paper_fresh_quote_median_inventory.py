@@ -205,6 +205,9 @@ async def run(args: argparse.Namespace) -> None:
         exit_bps=Decimal(str(args.exit_deviation_bps)),
         min_hold_samples=args.min_hold_samples,
         latency_samples=0,
+        min_exit_pnl_bps=Decimal(str(args.min_exit_pnl_bps)),
+        max_hold_samples=args.max_hold_samples,
+        max_unrealized_loss_bps=Decimal(str(args.max_unrealized_loss_bps)),
     )
     sample_index = 0
     while True:
@@ -285,6 +288,9 @@ def main() -> int:
     parser.add_argument("--max-lots", type=int, default=3)
     parser.add_argument("--max-total-lots", type=int, default=3)
     parser.add_argument("--min-hold-samples", type=int, default=10)
+    parser.add_argument("--min-exit-pnl-bps", type=float, default=0.5, help="Only exit on signal reversion when lot PnL is at least this many bps.")
+    parser.add_argument("--max-hold-samples", type=int, default=300, help="Force exit after this many samples; 0 disables forced time exit.")
+    parser.add_argument("--max-unrealized-loss-bps", type=float, default=5.0, help="Force stop loss when lot PnL is below negative this many bps.")
     parser.add_argument("--windows", default="5m:300,30m:1800,1h:3600")
     parser.add_argument("--baseline-window", default="5m")
     parser.add_argument("--min-baseline-samples", type=int, default=30)
@@ -307,6 +313,14 @@ def main() -> int:
         parser.error("--max-total-lots must be > 0")
     if args.min_hold_samples < 0:
         parser.error("--min-hold-samples must be >= 0")
+    if args.min_exit_pnl_bps < 0:
+        parser.error("--min-exit-pnl-bps must be >= 0")
+    if args.max_hold_samples < 0:
+        parser.error("--max-hold-samples must be >= 0")
+    if args.max_hold_samples == 0:
+        args.max_hold_samples = None
+    if args.max_unrealized_loss_bps < 0:
+        parser.error("--max-unrealized-loss-bps must be >= 0")
     if args.min_baseline_samples <= 0:
         parser.error("--min-baseline-samples must be > 0")
     if args.latest <= 0:
