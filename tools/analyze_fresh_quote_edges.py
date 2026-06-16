@@ -4,13 +4,16 @@ import argparse
 import asyncio
 import json
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from tools.analyze_var_quote_sources import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools.analyze_var_quote_sources import (  # noqa: E402
     DEFAULT_ENDPOINT,
     DIRECTION_LONG,
     DIRECTION_SHORT,
