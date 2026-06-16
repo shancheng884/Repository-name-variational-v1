@@ -753,6 +753,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_entry_bps = Decimal(str(args.live_inventory_entry_bps))
         self.live_inventory_exit_bps = Decimal(str(args.live_inventory_exit_bps))
         self.live_inventory_max_var_spread_bps = Decimal(str(args.live_inventory_max_var_spread_bps))
+        self.live_inventory_max_var_snapshot_age_seconds = float(args.live_inventory_max_var_snapshot_age_seconds)
         self.live_inventory_dynamic_entry_buffer_bps = Decimal(str(args.live_inventory_dynamic_entry_buffer_bps))
         self.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics = bool(
             args.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics
@@ -1441,7 +1442,9 @@ class VariationalToLighterRuntime:
         lighter_price: Decimal,
         edge_bps: Decimal | None,
         var_spread_bps: Decimal | None = None,
+        var_snapshot_timestamp: str | None = None,
     ) -> tuple[bool, str, dict[str, Any]]:
+        var_snapshot_age_seconds = self._age_seconds_from_iso(var_snapshot_timestamp)
         notional = qty * lighter_price
         context = {
             "action": "entry",
@@ -1453,6 +1456,9 @@ class VariationalToLighterRuntime:
             "lighter_notional_usd": decimal_to_str(notional),
             "entry_edge_bps": decimal_to_str(edge_bps),
             "var_spread_bps": decimal_to_str(var_spread_bps),
+            "var_snapshot_timestamp": var_snapshot_timestamp,
+            "var_snapshot_age_seconds": f"{var_snapshot_age_seconds:.3f}" if var_snapshot_age_seconds is not None else None,
+            "live_inventory_max_var_snapshot_age_seconds": f"{self.live_inventory_max_var_snapshot_age_seconds:.3f}",
             "live_inventory_max_var_spread_bps": decimal_to_str(self.live_inventory_max_var_spread_bps),
             "live_inventory_entry_bps": decimal_to_str(self.live_inventory_entry_bps),
             "live_inventory_dynamic_entry_buffer_bps": decimal_to_str(self.live_inventory_dynamic_entry_buffer_bps),
@@ -1472,6 +1478,8 @@ class VariationalToLighterRuntime:
         }
         if var_spread_bps is not None and var_spread_bps > self.live_inventory_max_var_spread_bps:
             return False, "var_spread_exceeds_live_inventory_limit", context
+        if var_snapshot_age_seconds is None or var_snapshot_age_seconds > self.live_inventory_max_var_snapshot_age_seconds:
+            return False, "variational_quote_snapshot_stale", context
         last_submit_monotonic = self.last_live_submit_monotonic_by_asset.get(asset.upper())
         if last_submit_monotonic is not None:
             cooldown_elapsed = time.monotonic() - last_submit_monotonic
@@ -4525,6 +4533,7 @@ class VariationalToLighterRuntime:
                         lighter_price=lighter_price,
                         edge_bps=edge_bps,
                         var_spread_bps=snapshot.var_full_spread_bps or snapshot.var_half_spread_bps * Decimal("2"),
+                        var_snapshot_timestamp=snapshot.var_timestamp,
                     )
                     if not preflight_ok:
                         await self.block_live_inventory_entry(
@@ -6495,6 +6504,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-exit-bps", type=float, default=10.0)
     parser.add_argument("--live-inventory-max-var-spread-bps", type=float, default=5.0)
     parser.add_argument(
+        "--live-inventory-max-var-snapshot-age-seconds",
+        type=float,
+        default=5.0,
+        help="Maximum age of the Variational quote snapshot allowed for live inventory entry. Default: 5.0",
+    )
+    parser.add_argument(
         "--live-inventory-dynamic-entry-buffer-bps",
         type=float,
         default=5.0,
@@ -6639,6 +6654,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-exit-bps must be >= 0")
         if args.live_inventory_max_var_spread_bps <= 0:
             parser.error("--live-inventory-max-var-spread-bps must be > 0")
+        if args.live_inventory_max_var_snapshot_age_seconds <= 0:
+            parser.error("--live-inventory-max-var-snapshot-age-seconds must be > 0")
         if args.live_inventory_dynamic_entry_buffer_bps < 0:
             parser.error("--live-inventory-dynamic-entry-buffer-bps must be >= 0")
         if args.live_inventory_max_lighter_slippage_bps < 0:

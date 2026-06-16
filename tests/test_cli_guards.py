@@ -354,6 +354,16 @@ def test_live_inventory_requires_low_latency_transports(monkeypatch) -> None:
         parse_args()
 
 
+def test_live_inventory_rejects_non_positive_var_snapshot_age(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        live_inventory_safe_argv() + ["--live-inventory-max-var-snapshot-age-seconds", "0"],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
 def test_live_inventory_dry_decisions_allow_low_entry_threshold(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-entry-bps", "5"])
 

@@ -854,6 +854,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_entry_bps = Decimal("50")
     runtime.live_inventory_exit_bps = Decimal("10")
     runtime.live_inventory_max_var_spread_bps = Decimal("5")
+    runtime.live_inventory_max_var_snapshot_age_seconds = 5.0
     runtime.live_inventory_dynamic_entry_buffer_bps = Decimal("5")
     runtime.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics = False
     runtime.live_inventory_max_lighter_slippage_bps = Decimal("3")
@@ -899,7 +900,7 @@ def _inventory_entry_snapshot() -> CrossSpreadSnapshot:
         var_sell_price=Decimal("59990"),
         var_full_spread_bps=Decimal("2"),
         var_spread_source="test",
-        var_timestamp="2026-06-16T03:25:20.000Z",
+        var_timestamp="2999-06-16T03:25:20.000Z",
         var_source_url="wss://example.test/prices",
         var_source_stream="instrument_price:BTC",
         lighter_bid=Decimal("60400"),
@@ -1007,6 +1008,37 @@ def test_live_inventory_entry_blocks_high_var_spread_before_submit(tmp_path) -> 
         assert state["status"] == "flat"
         assert state["last_blocked_reason"] == "var_spread_exceeds_live_inventory_limit"
         assert state["last_blocked_context"]["var_spread_bps"] == "2"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_entry_blocks_stale_var_snapshot_before_submit(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_max_var_snapshot_age_seconds = 5.0
+        snapshot = _inventory_entry_snapshot()
+        snapshot.var_timestamp = "2026-06-16T03:25:20.000Z"
+        submit_calls: list[str] = []
+
+        async def fake_send_variational_place_order(**_kwargs):
+            submit_calls.append("var")
+            return {"ok": True}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            submit_calls.append("lighter")
+            return None, None
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        await runtime.maybe_run_live_inventory(snapshot)
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+
+        assert submit_calls == []
+        assert state["status"] == "flat"
+        assert state["last_blocked_reason"] == "variational_quote_snapshot_stale"
+        assert state["last_blocked_context"]["var_snapshot_timestamp"] == "2026-06-16T03:25:20.000Z"
 
     asyncio.run(run())
 
