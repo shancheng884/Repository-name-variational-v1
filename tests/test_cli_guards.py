@@ -364,6 +364,17 @@ def test_live_inventory_rejects_non_positive_var_snapshot_age(monkeypatch) -> No
         parse_args()
 
 
+def test_live_inventory_refresh_var_quote_before_entry_flag_parses(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        live_inventory_safe_argv() + ["--live-inventory-refresh-var-quote-before-entry"],
+    )
+
+    args = parse_args()
+
+    assert args.live_inventory_refresh_var_quote_before_entry is True
+
+
 def test_live_inventory_dry_decisions_allow_low_entry_threshold(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", live_inventory_safe_argv() + ["--live-inventory-entry-bps", "5"])
 

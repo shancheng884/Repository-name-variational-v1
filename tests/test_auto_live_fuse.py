@@ -855,6 +855,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_exit_bps = Decimal("10")
     runtime.live_inventory_max_var_spread_bps = Decimal("5")
     runtime.live_inventory_max_var_snapshot_age_seconds = 5.0
+    runtime.live_inventory_refresh_var_quote_before_entry = False
     runtime.live_inventory_dynamic_entry_buffer_bps = Decimal("5")
     runtime.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics = False
     runtime.live_inventory_max_lighter_slippage_bps = Decimal("3")
@@ -1039,6 +1040,62 @@ def test_live_inventory_entry_blocks_stale_var_snapshot_before_submit(tmp_path) 
         assert state["status"] == "flat"
         assert state["last_blocked_reason"] == "variational_quote_snapshot_stale"
         assert state["last_blocked_context"]["var_snapshot_timestamp"] == "2026-06-16T03:25:20.000Z"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_refreshes_var_quote_before_entry_and_reuses_quote_id(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_lot_notional_usd = Decimal("20")
+        runtime.live_inventory_entry_bps = Decimal("10")
+        runtime.live_inventory_dynamic_entry_buffer_bps = Decimal("0")
+        runtime.live_inventory_refresh_var_quote_before_entry = True
+        runtime.lighter_min_base_amount = Decimal("0.00020")
+        snapshot = _inventory_entry_snapshot()
+        snapshot.var_timestamp = "2026-06-16T03:25:20.000Z"
+        calls: list[dict] = []
+
+        async def fake_send_variational_place_order(**kwargs):
+            calls.append(kwargs)
+            if not kwargs["confirm"]:
+                return {
+                    "ok": True,
+                    "result": {
+                        "quoteId": "fresh-entry-quote",
+                        "bid": "60095",
+                        "ask": "60100",
+                        "quoteTimestamp": "2999-06-16T03:25:21.000Z",
+                    },
+                }
+            return {"ok": True}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            record = OrderLifecycle(
+                trade_key="entry-1",
+                trade_id="",
+                side="sell",
+                qty=Decimal("0.000330"),
+                asset="BTC",
+                mode="live",
+                last_variational_status="",
+            )
+            record.processing_stage = "live_submit_sent"
+            return record, {"trade_key": "entry-1"}
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        await runtime.maybe_run_live_inventory(snapshot)
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        entered = next(row for row in rows if row["event"] == "live_inventory_entered")
+
+        assert [call["confirm"] for call in calls] == [False, True]
+        assert calls[1]["reuse_quote_id"] == "fresh-entry-quote"
+        assert entered["var_order_quote_id"] == "fresh-entry-quote"
+        assert entered["var_order_quote_execution_price"] == "60100"
+        assert entered["initial_snapshot_var_price"] == "60000"
 
     asyncio.run(run())
 

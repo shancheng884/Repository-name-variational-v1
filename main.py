@@ -754,6 +754,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_exit_bps = Decimal(str(args.live_inventory_exit_bps))
         self.live_inventory_max_var_spread_bps = Decimal(str(args.live_inventory_max_var_spread_bps))
         self.live_inventory_max_var_snapshot_age_seconds = float(args.live_inventory_max_var_snapshot_age_seconds)
+        self.live_inventory_refresh_var_quote_before_entry = bool(args.live_inventory_refresh_var_quote_before_entry)
         self.live_inventory_dynamic_entry_buffer_bps = Decimal(str(args.live_inventory_dynamic_entry_buffer_bps))
         self.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics = bool(
             args.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics
@@ -1225,6 +1226,9 @@ class VariationalToLighterRuntime:
                 "entry_snapshot_var_timestamp": lot.get("entry_snapshot_var_timestamp"),
                 "entry_snapshot_var_source_url": lot.get("entry_snapshot_var_source_url"),
                 "entry_snapshot_var_source_stream": lot.get("entry_snapshot_var_source_stream"),
+                "entry_initial_signal_edge_bps": lot.get("entry_initial_signal_edge_bps"),
+                "entry_initial_snapshot_var_price": lot.get("entry_initial_snapshot_var_price"),
+                "entry_refreshed_var_quote_ms": lot.get("entry_refreshed_var_quote_ms"),
                 "entry_var_order_quote_id": lot.get("entry_var_order_quote_id"),
                 "entry_var_order_quote_bid": lot.get("entry_var_order_quote_bid"),
                 "entry_var_order_quote_ask": lot.get("entry_var_order_quote_ask"),
@@ -2395,6 +2399,7 @@ class VariationalToLighterRuntime:
         expected_min_btc_qty: Decimal | None,
         confirm: bool,
         reduce_only: bool = False,
+        reuse_quote_id: str | None = None,
     ) -> dict[str, Any]:
         request_id = str(int(time.time() * 1000))
         use_api = self.variational_submit_transport == VARIATIONAL_SUBMIT_TRANSPORT_API
@@ -2407,6 +2412,7 @@ class VariationalToLighterRuntime:
             "confirm": bool(confirm),
             "maxSlippage": self.variational_api_max_slippage,
             "reduceOnly": bool(reduce_only),
+            "reuseQuoteId": reuse_quote_id,
             "expectedMinBtcQty": decimal_to_str(expected_min_btc_qty) if expected_min_btc_qty is not None else "0",
         }
         async with self._var_command_ws_lock:
@@ -4523,7 +4529,47 @@ class VariationalToLighterRuntime:
                 qty = self.live_inventory_lot_notional_usd / notional_price
                 lot_id = self.live_inventory_next_lot_id
                 var_side = self._auto_live_direction_to_var_side(direction)
+                initial_signal_edge_bps = edge_bps
+                initial_snapshot_var_price = var_price
+                refreshed_var_quote: dict[str, Any] = {}
+                refreshed_var_quote_ms: str | None = None
                 if not self.live_inventory_dry_decisions:
+                    if self.live_inventory_refresh_var_quote_before_entry:
+                        var_amount_for_quote = variational_api_amount_to_str(qty)
+                        quote_result, refreshed_var_quote_ms = await self._timed_submit(
+                            self.send_variational_place_order(
+                                asset=snapshot.asset,
+                                side=var_side,
+                                amount=var_amount_for_quote,
+                                expected_min_btc_qty=Decimal(var_amount_for_quote)
+                                if snapshot.asset.upper() == "BTC"
+                                else None,
+                                confirm=False,
+                                reduce_only=False,
+                            )
+                        )
+                        if not quote_result.get("ok"):
+                            await self.block_live_inventory_entry(
+                                asset=snapshot.asset,
+                                reason=f"variational_fresh_quote_failed:{quote_result.get('error') or 'unknown'}",
+                                context={"direction": direction, "var_side": var_side, "qty": decimal_to_str(qty)},
+                            )
+                            return
+                        refreshed_var_quote = self.variational_api_order_quote_fields(var_side, quote_result)
+                        refreshed_var_price = to_decimal(refreshed_var_quote.get("quote_execution_price"))
+                        if refreshed_var_price is None:
+                            await self.block_live_inventory_entry(
+                                asset=snapshot.asset,
+                                reason="variational_fresh_quote_missing_execution_price",
+                                context={"direction": direction, "var_side": var_side, "qty": decimal_to_str(qty)},
+                            )
+                            return
+                        var_price = refreshed_var_price
+                        edge_bps = self.live_inventory_pair_edge_bps(
+                            direction=direction,
+                            var_price=var_price,
+                            lighter_price=lighter_price,
+                        )
                     preflight_ok, preflight_reason, preflight_context = await self.live_inventory_entry_preflight(
                         asset=snapshot.asset,
                         direction=direction,
@@ -4533,7 +4579,7 @@ class VariationalToLighterRuntime:
                         lighter_price=lighter_price,
                         edge_bps=edge_bps,
                         var_spread_bps=snapshot.var_full_spread_bps or snapshot.var_half_spread_bps * Decimal("2"),
-                        var_snapshot_timestamp=snapshot.var_timestamp,
+                        var_snapshot_timestamp=refreshed_var_quote.get("quote_timestamp") or snapshot.var_timestamp,
                     )
                     if not preflight_ok:
                         await self.block_live_inventory_entry(
@@ -4563,6 +4609,7 @@ class VariationalToLighterRuntime:
                                     expected_min_btc_qty=Decimal(var_amount) if snapshot.asset.upper() == "BTC" else None,
                                     confirm=True,
                                     reduce_only=False,
+                                    reuse_quote_id=refreshed_var_quote.get("quote_id"),
                                 )
                             )
                         )
@@ -4648,7 +4695,7 @@ class VariationalToLighterRuntime:
                             },
                         )
                         return
-                    entry_var_order_quote = self.variational_api_order_quote_fields(var_side, var_result)
+                    entry_var_order_quote = refreshed_var_quote or self.variational_api_order_quote_fields(var_side, var_result)
                     lighter_record, lighter_payload = lighter_result
                     lighter_started = self.auto_live_eager_hedge_started(lighter_record)
                     if lighter_record is None or not lighter_started:
@@ -4695,6 +4742,9 @@ class VariationalToLighterRuntime:
                     "entry_snapshot_var_timestamp": snapshot.var_timestamp,
                     "entry_snapshot_var_source_url": snapshot.var_source_url,
                     "entry_snapshot_var_source_stream": snapshot.var_source_stream,
+                    "entry_initial_signal_edge_bps": decimal_to_str(initial_signal_edge_bps),
+                    "entry_initial_snapshot_var_price": decimal_to_str(initial_snapshot_var_price),
+                    "entry_refreshed_var_quote_ms": refreshed_var_quote_ms,
                     "entry_var_order_quote_id": entry_var_order_quote.get("quote_id"),
                     "entry_var_order_quote_bid": entry_var_order_quote.get("quote_bid"),
                     "entry_var_order_quote_ask": entry_var_order_quote.get("quote_ask"),
@@ -4733,6 +4783,9 @@ class VariationalToLighterRuntime:
                         "direction": direction,
                         "qty": lot["qty"],
                         "edge_bps": decimal_to_str(edge_bps),
+                        "initial_signal_edge_bps": decimal_to_str(initial_signal_edge_bps),
+                        "initial_snapshot_var_price": decimal_to_str(initial_snapshot_var_price),
+                        "refreshed_var_quote_ms": refreshed_var_quote_ms,
                         "var_price": decimal_to_str(var_price),
                         "lighter_price": decimal_to_str(lighter_price),
                         "var_bid": decimal_to_str(snapshot.var_bid),
@@ -6508,6 +6561,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=5.0,
         help="Maximum age of the Variational quote snapshot allowed for live inventory entry. Default: 5.0",
+    )
+    parser.add_argument(
+        "--live-inventory-refresh-var-quote-before-entry",
+        action="store_true",
+        help="After a live inventory entry candidate is found, fetch a fresh Variational indicative quote, recompute edge, and reuse its quoteId for the entry order.",
     )
     parser.add_argument(
         "--live-inventory-dynamic-entry-buffer-bps",
