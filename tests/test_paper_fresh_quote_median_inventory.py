@@ -4,21 +4,26 @@ from types import SimpleNamespace
 import pytest
 
 from inventory_engine import DIRECTION_LONG_VAR_SHORT_LIGHTER
-from tools.paper_fresh_quote_inventory import make_sample
+from tools.paper_fresh_quote_inventory import FreshInventorySample
 from tools.paper_fresh_quote_median_inventory import MedianState, RollingMedian, median_signal, parse_windows, state_row
 
 
 def _sample(*, ask: str, lighter_bid: str):
-    return make_sample(
-        snapshot=SimpleNamespace(
-            logged_at="now",
-            asset="BTC",
-            bid=Decimal(lighter_bid),
-            ask=Decimal("102"),
-            buy_fill_price=Decimal("102"),
-            sell_fill_price=Decimal(lighter_bid),
-        ),
-        quote_message={"ok": True, "result": {"quoteId": "q1", "bid": "100", "ask": ask, "quoteTimestamp": "ts"}},
+    long_edge = (Decimal(lighter_bid) - Decimal(ask)) / Decimal(ask) * Decimal("10000")
+    short_edge = (Decimal("100") - Decimal("102")) / Decimal("102") * Decimal("10000")
+    return FreshInventorySample(
+        logged_at="now",
+        asset="BTC",
+        var_bid=Decimal("100"),
+        var_ask=Decimal(ask),
+        lighter_bid=Decimal(lighter_bid),
+        lighter_ask=Decimal("102"),
+        lighter_buy_price=Decimal("102"),
+        lighter_sell_price=Decimal(lighter_bid),
+        long_edge_bps=long_edge,
+        short_edge_bps=short_edge,
+        quote_id="q1",
+        quote_timestamp="ts",
         quote_ms=Decimal("12.5"),
     )
 
@@ -86,5 +91,5 @@ def test_state_row_serializes_median_fields() -> None:
     )
 
     assert row["event"] == "fresh_quote_median_inventory_paper_state"
-    assert row["long_deviation_bps"] == "0"
+    assert Decimal(row["long_deviation_bps"]) == Decimal("0")
     assert row["long_counts"] == {"base": 1}

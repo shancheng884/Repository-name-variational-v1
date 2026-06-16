@@ -10,8 +10,6 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-import websockets
-
 
 DIRECTION_LONG = "long_var_short_lighter"
 DIRECTION_SHORT = "short_var_long_lighter"
@@ -123,6 +121,8 @@ def latest_candidate(
 
 
 async def request_var_quote(endpoint: str, *, asset: str, amount: Decimal, timeout_seconds: float) -> dict[str, Any]:
+    import websockets
+
     request_id = str(uuid.uuid4())
     payload = {
         "type": "VAR_API_QUOTE",
