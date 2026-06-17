@@ -182,19 +182,25 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n")
 
 
-async def run(args: argparse.Namespace) -> None:
+async def collect_market(
+    *,
+    book: MarketBook,
+    output: Path,
+    notional_usd: Decimal,
+    interval_seconds: float,
+    url: str,
+    write_lock: asyncio.Lock,
+    stop_event: asyncio.Event,
+    write_state: dict[str, int],
+    max_samples: int,
+) -> None:
     import websockets
 
-    assets = [asset.strip().upper() for asset in args.assets.split(",") if asset.strip()]
-    books_by_id = load_lighter_markets(assets)
-    last_written: dict[int, float] = {}
-    url = f"{LIGHTER_WS_URL}?server_pings=true" if os.getenv("LIGHTER_WS_SERVER_PINGS", "").lower() in {"1", "true", "yes", "on"} else LIGHTER_WS_URL
-    written = 0
-    while True:
+    last_written = 0.0
+    while not stop_event.is_set():
         try:
             async with websockets.connect(url, ping_interval=30, ping_timeout=30) as websocket:
-                for market_id in books_by_id:
-                    await websocket.send(json.dumps({"type": "subscribe", "channel": f"order_book/{market_id}"}))
+                await websocket.send(json.dumps({"type": "subscribe", "channel": f"order_book/{book.market_id}"}))
                 while True:
                     raw = await websocket.recv()
                     if isinstance(raw, bytes):
@@ -203,27 +209,69 @@ async def run(args: argparse.Namespace) -> None:
                     if message.get("type") == "ping":
                         await websocket.send(json.dumps({"type": "pong"}))
                         continue
-                    apply_order_book_message(books_by_id, message)
+                    apply_order_book_message({book.market_id: book}, message)
                     now = time.monotonic()
-                    for market_id, book in books_by_id.items():
-                        if not book.ready:
-                            continue
-                        if now - last_written.get(market_id, 0.0) < args.interval_seconds:
-                            continue
-                        row = market_sample_row(book, notional_usd=Decimal(str(args.notional_usd)))
-                        if row is None:
-                            continue
-                        append_jsonl(args.output, row)
-                        print(json.dumps(row, ensure_ascii=False, sort_keys=True), flush=True)
-                        last_written[market_id] = now
-                        written += 1
-                        if args.max_samples > 0 and written >= args.max_samples:
+                    if not book.ready or now - last_written < interval_seconds:
+                        continue
+                    row = market_sample_row(book, notional_usd=notional_usd)
+                    if row is None:
+                        continue
+                    async with write_lock:
+                        if max_samples > 0 and write_state["written"] >= max_samples:
+                            stop_event.set()
                             return
+                        append_jsonl(output, row)
+                        write_state["written"] += 1
+                        if max_samples > 0 and write_state["written"] >= max_samples:
+                            stop_event.set()
+                    print(json.dumps(row, ensure_ascii=False, sort_keys=True), flush=True)
+                    last_written = now
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(json.dumps({"event": "lighter_multi_asset_collector_reconnect", "error": str(exc)}, ensure_ascii=False, sort_keys=True), flush=True)
+            print(
+                json.dumps(
+                    {"asset": book.asset, "event": "lighter_multi_asset_collector_reconnect", "error": str(exc)},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
             await asyncio.sleep(1)
+
+
+async def run(args: argparse.Namespace) -> None:
+    assets = [asset.strip().upper() for asset in args.assets.split(",") if asset.strip()]
+    books_by_id = load_lighter_markets(assets)
+    url = f"{LIGHTER_WS_URL}?server_pings=true" if os.getenv("LIGHTER_WS_SERVER_PINGS", "").lower() in {"1", "true", "yes", "on"} else LIGHTER_WS_URL
+    write_lock = asyncio.Lock()
+    stop_event = asyncio.Event()
+    write_state = {"written": 0}
+    tasks = [
+        asyncio.create_task(
+            collect_market(
+                book=book,
+                output=args.output,
+                notional_usd=Decimal(str(args.notional_usd)),
+                interval_seconds=args.interval_seconds,
+                url=url,
+                write_lock=write_lock,
+                stop_event=stop_event,
+                write_state=write_state,
+                max_samples=args.max_samples,
+            )
+        )
+        for book in books_by_id.values()
+    ]
+    try:
+        if args.max_samples > 0:
+            await stop_event.wait()
+            return
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def main() -> int:
