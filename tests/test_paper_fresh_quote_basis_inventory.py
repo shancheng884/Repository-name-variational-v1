@@ -3,6 +3,7 @@ from decimal import Decimal
 from inventory_engine import DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER, PaperInventoryEngine
 from tests.test_paper_fresh_quote_median_inventory import _sample
 from tools.paper_fresh_quote_basis_inventory import (
+    EntryConfirmationState,
     EwmaBasisState,
     basis_bps,
     direction_signal,
@@ -51,6 +52,23 @@ def test_entry_direction_maps_z_to_inventory_direction() -> None:
 def test_direction_signal_is_positive_for_active_direction() -> None:
     assert direction_signal(DIRECTION_SHORT_VAR_LONG_LIGHTER, 3.5) == Decimal("3.5")
     assert direction_signal(DIRECTION_LONG_VAR_SHORT_LIGHTER, -3.5) == Decimal("3.5")
+
+
+def test_entry_confirmation_waits_for_reversion() -> None:
+    state = EntryConfirmationState(confirm_samples=2, min_z_improvement=Decimal("0.5"))
+
+    assert state.allowed(direction=DIRECTION_LONG_VAR_SHORT_LIGHTER, signal=5.0) is False
+    assert state.allowed(direction=DIRECTION_LONG_VAR_SHORT_LIGHTER, signal=5.2) is False
+    assert state.allowed(direction=DIRECTION_LONG_VAR_SHORT_LIGHTER, signal=4.9) is False
+    assert state.allowed(direction=DIRECTION_LONG_VAR_SHORT_LIGHTER, signal=4.6) is True
+
+
+def test_entry_confirmation_expires_after_window() -> None:
+    state = EntryConfirmationState(confirm_samples=1, min_z_improvement=Decimal("0.5"))
+
+    assert state.allowed(direction=DIRECTION_LONG_VAR_SHORT_LIGHTER, signal=5.0) is False
+    assert state.allowed(direction=DIRECTION_LONG_VAR_SHORT_LIGHTER, signal=4.9) is False
+    assert state.allowed(direction=DIRECTION_LONG_VAR_SHORT_LIGHTER, signal=4.4) is False
 
 
 def test_roundtrip_pnl_bps_measures_immediate_exit_cost() -> None:

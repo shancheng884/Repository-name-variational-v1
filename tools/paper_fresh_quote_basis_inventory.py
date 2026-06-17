@@ -87,6 +87,43 @@ class EwmaBasisState:
         return z, warm
 
 
+class EntryConfirmationState:
+    def __init__(self, *, confirm_samples: int, min_z_improvement: float) -> None:
+        if confirm_samples < 0:
+            raise ValueError("confirm_samples must be >= 0")
+        if min_z_improvement < 0:
+            raise ValueError("min_z_improvement must be >= 0")
+        self.confirm_samples = confirm_samples
+        self.min_z_improvement = float(min_z_improvement)
+        self.direction: str | None = None
+        self.peak_signal = 0.0
+        self.samples_since_peak = 0
+
+    def allowed(self, *, direction: str | None, signal: float) -> bool:
+        if self.confirm_samples == 0 or self.min_z_improvement == 0:
+            return True
+        if direction is None:
+            self.direction = None
+            self.peak_signal = 0.0
+            self.samples_since_peak = 0
+            return False
+        if self.direction != direction:
+            self.direction = direction
+            self.peak_signal = signal
+            self.samples_since_peak = 0
+            return False
+        if signal >= self.peak_signal:
+            self.peak_signal = signal
+            self.samples_since_peak = 0
+            return False
+        self.samples_since_peak += 1
+        if self.samples_since_peak > self.confirm_samples:
+            self.peak_signal = signal
+            self.samples_since_peak = 0
+            return False
+        return self.peak_signal - signal >= self.min_z_improvement
+
+
 def basis_bps(sample: FreshInventorySample) -> Decimal | None:
     var_mid = (sample.var_bid + sample.var_ask) / Decimal("2")
     lighter_mid = (sample.lighter_bid + sample.lighter_ask) / Decimal("2")
@@ -226,6 +263,10 @@ async def run(args: argparse.Namespace) -> None:
         gap_reset_seconds=args.basis_gap_reset_seconds,
         sigma_floor_bps=args.basis_sigma_floor_bps,
     )
+    entry_confirmation = EntryConfirmationState(
+        confirm_samples=args.entry_confirm_samples,
+        min_z_improvement=args.entry_confirm_min_z_improvement,
+    )
     engine = PaperInventoryEngine(
         lot_notional_usd=Decimal(str(args.lot_notional_usd)),
         max_lots=args.max_lots,
@@ -267,9 +308,16 @@ async def run(args: argparse.Namespace) -> None:
         if basis is not None:
             z, warm = state.update(time.time(), float(basis))
             signal_direction = entry_direction(z, warm=warm, z_entry=args.z_entry)
+            confirmed_entry_direction = signal_direction
+            if signal_direction is not None:
+                signal_value = float(direction_signal(signal_direction, z))
+                if not entry_confirmation.allowed(direction=signal_direction, signal=signal_value):
+                    confirmed_entry_direction = None
+            else:
+                entry_confirmation.allowed(direction=None, signal=0.0)
             for direction in tradable_directions(engine):
                 active = engine.open_lots(direction) > 0
-                if not active and direction != signal_direction:
+                if not active and direction != confirmed_entry_direction:
                     continue
                 signal = direction_signal(direction, z)
                 if not active and args.min_entry_edge_bps > 0:
@@ -333,6 +381,8 @@ def main() -> int:
     parser.add_argument("--z-exit", type=float, default=0.0)
     parser.add_argument("--min-entry-edge-bps", type=float, default=0.0)
     parser.add_argument("--max-entry-roundtrip-cost-bps", type=float, default=0.0, help="Skip new entries whose immediate round-trip loss is worse than this many bps; 0 disables the gate.")
+    parser.add_argument("--entry-confirm-samples", type=int, default=0, help="Require z-score to begin reverting within this many samples before opening a new lot; 0 disables confirmation.")
+    parser.add_argument("--entry-confirm-min-z-improvement", type=float, default=0.0, help="Minimum z-score improvement from the local extreme required by --entry-confirm-samples.")
     parser.add_argument("--max-lots", type=int, default=2)
     parser.add_argument("--max-total-lots", type=int, default=2)
     parser.add_argument("--min-hold-samples", type=int, default=20)
@@ -358,6 +408,10 @@ def main() -> int:
         parser.error("--min-entry-edge-bps must be >= 0")
     if args.max_entry_roundtrip_cost_bps < 0:
         parser.error("--max-entry-roundtrip-cost-bps must be >= 0")
+    if args.entry_confirm_samples < 0:
+        parser.error("--entry-confirm-samples must be >= 0")
+    if args.entry_confirm_min_z_improvement < 0:
+        parser.error("--entry-confirm-min-z-improvement must be >= 0")
     if args.max_lots <= 0:
         parser.error("--max-lots must be > 0")
     if args.max_total_lots <= 0:
