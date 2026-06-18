@@ -284,6 +284,47 @@ def test_live_inventory_basis_rejects_real_submit(monkeypatch) -> None:
         parse_args()
 
 
+def test_live_inventory_basis_real_submit_accepts_one_cycle_diagnostic(monkeypatch) -> None:
+    argv = live_inventory_basis_safe_argv()
+    argv.remove("--live-inventory-dry-decisions")
+    monkeypatch.setattr(
+        "sys.argv",
+        argv
+        + [
+            "--live-inventory-max-cycles",
+            "1",
+            "--live-inventory-i-accept-basis-real-diagnostic",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.live_inventory_signal_mode == "basis"
+    assert args.live_inventory_dry_decisions is False
+    assert args.live_inventory_i_accept_basis_real_diagnostic is True
+    assert args.live_inventory_lot_notional_usd == 20.0
+    assert args.live_inventory_max_lots == 1
+    assert args.live_inventory_max_total_lots == 1
+    assert args.live_inventory_max_cycles == 1
+
+
+def test_live_inventory_basis_real_submit_rejects_multiple_cycles(monkeypatch) -> None:
+    argv = live_inventory_basis_safe_argv()
+    argv.remove("--live-inventory-dry-decisions")
+    monkeypatch.setattr(
+        "sys.argv",
+        argv
+        + [
+            "--live-inventory-max-cycles",
+            "2",
+            "--live-inventory-i-accept-basis-real-diagnostic",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
 def test_live_inventory_basis_rejects_non_eth(monkeypatch) -> None:
     argv = live_inventory_basis_safe_argv()
     argv[argv.index("ETH")] = "BTC"
