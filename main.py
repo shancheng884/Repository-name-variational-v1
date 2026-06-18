@@ -1099,6 +1099,35 @@ class VariationalToLighterRuntime:
             },
         )
 
+    async def maybe_timeout_pending_live_inventory_var_entry(self, *, asset: str) -> bool:
+        now_monotonic = time.monotonic()
+        for item in list(getattr(self, "pending_live_inventory_var_fill_matches", [])):
+            if item.asset.upper() != asset.upper() or item.role != "live_inventory_entry_pending_lighter":
+                continue
+            age_seconds = now_monotonic - item.created_at_monotonic
+            if age_seconds < self.auto_live_match_window_seconds:
+                continue
+            self.remove_pending_live_inventory_var_fill_match(
+                asset=item.asset,
+                lot_id=item.lot_id,
+                role=item.role,
+            )
+            await self.require_live_inventory_manual_review(
+                asset=item.asset,
+                reason="basis_entry_var_fill_timeout",
+                context={
+                    "lot_id": item.lot_id,
+                    "side": item.side,
+                    "qty": decimal_to_str(item.qty),
+                    "age_seconds": age_seconds,
+                    "timeout_seconds": self.auto_live_match_window_seconds,
+                    "pending_context": item.context or {},
+                    "action": "confirm_variational_order_status_and_position_manually",
+                },
+            )
+            return True
+        return False
+
     @staticmethod
     def live_inventory_pair_pnl(
         *,
@@ -4824,6 +4853,8 @@ class VariationalToLighterRuntime:
         await self.append_live_inventory_log("live_inventory_basis_state", state_payload)
         if not self.live_inventory_open_lots:
             if self.has_pending_live_inventory_var_fill_match(asset=asset, roles={"live_inventory_entry_pending_lighter"}):
+                if await self.maybe_timeout_pending_live_inventory_var_entry(asset=asset):
+                    return
                 await self.append_live_inventory_log(
                     "live_inventory_entry_blocked",
                     {**state_payload, "reason": "basis_var_entry_pending_fill"},

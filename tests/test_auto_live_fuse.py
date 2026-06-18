@@ -1156,6 +1156,65 @@ def test_live_inventory_basis_pending_entry_survives_match_window(tmp_path) -> N
     assert runtime.pending_live_inventory_var_fill_matches[0].role == "live_inventory_entry_pending_lighter"
 
 
+def test_live_inventory_basis_pending_entry_timeout_requires_manual_review(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.stop_flag = False
+        runtime.auto_live_match_window_seconds = 30
+        runtime.pending_live_inventory_var_fill_matches = [
+            PendingLiveInventoryVarFillMatch(
+                asset="ETH",
+                side="buy",
+                qty=Decimal("0.011535"),
+                lot_id=1,
+                role="live_inventory_entry_pending_lighter",
+                created_at_monotonic=time.monotonic() - 31,
+                context={"direction": "long_var_short_lighter", "quote_id": "quote-1"},
+            )
+        ]
+
+        timed_out = await runtime.maybe_timeout_pending_live_inventory_var_entry(asset="ETH")
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert timed_out is True
+        assert runtime.pending_live_inventory_var_fill_matches == []
+        assert runtime.stop_flag is True
+        assert state["status"] == "manual_review_required"
+        assert state["manual_review_reason"] == "basis_entry_var_fill_timeout"
+        assert state["manual_review_context"]["lot_id"] == 1
+        assert rows[-1]["event"] == "live_inventory_manual_review_required"
+        assert rows[-1]["reason"] == "basis_entry_var_fill_timeout"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_basis_pending_entry_before_timeout_does_not_stop(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.stop_flag = False
+        runtime.auto_live_match_window_seconds = 30
+        runtime.pending_live_inventory_var_fill_matches = [
+            PendingLiveInventoryVarFillMatch(
+                asset="ETH",
+                side="buy",
+                qty=Decimal("0.011535"),
+                lot_id=1,
+                role="live_inventory_entry_pending_lighter",
+                created_at_monotonic=time.monotonic() - 29,
+            )
+        ]
+
+        timed_out = await runtime.maybe_timeout_pending_live_inventory_var_entry(asset="ETH")
+
+        assert timed_out is False
+        assert len(runtime.pending_live_inventory_var_fill_matches) == 1
+        assert runtime.stop_flag is False
+        assert not runtime.live_inventory_state_file.exists()
+
+    asyncio.run(run())
+
+
 def test_live_inventory_entry_blocks_below_lighter_min_base_before_submit(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
