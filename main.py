@@ -1213,15 +1213,16 @@ class VariationalToLighterRuntime:
                 {"asset": asset, "error": result.get("error") or result.get("step") or "unknown", "result": result},
             )
             return None, None
-        bid = to_decimal(result.get("bid"))
-        ask = to_decimal(result.get("ask"))
+        payload = result.get("result") if isinstance(result.get("result"), dict) else result
+        bid = to_decimal(payload.get("bid"))
+        ask = to_decimal(payload.get("ask"))
         if bid is None or ask is None or bid <= 0 or ask <= 0:
             await self.append_live_inventory_log(
                 "live_inventory_basis_quote_failed",
                 {"asset": asset, "error": "missing_or_invalid_bid_ask", "result": result},
             )
             return None, None
-        return result, Decimal(str(elapsed_ms))
+        return payload, Decimal(str(elapsed_ms))
 
     async def maybe_append_live_inventory_actual_pnl(self, payload: dict[str, Any]) -> None:
         trade_key = str(payload.get("trade_key") or "")
