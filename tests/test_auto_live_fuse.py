@@ -941,11 +941,19 @@ def _eth_inventory_snapshot() -> CrossSpreadSnapshot:
     return snapshot
 
 
-def test_live_inventory_basis_real_entry_submits_both_legs(tmp_path) -> None:
+def test_live_inventory_basis_real_entry_waits_for_var_fill_before_lighter(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
         runtime.live_inventory_signal_mode = "basis"
         runtime.live_allowed_assets = {"ETH"}
+        runtime.accepted_assets = {"ETH"}
+        runtime.trade_event_min_timestamp = None
+        runtime.pending_auto_live_matches = []
+        runtime.auto_live_match_window_seconds = 60
+        runtime._record_lock = asyncio.Lock()
+        runtime.records = {}
+        runtime.record_order = deque(maxlen=1000)
+        runtime.lighter_client_order_to_trade_key = {}
         runtime.live_inventory_lot_notional_usd = Decimal("20")
         runtime.live_max_notional_usd = Decimal("25")
         runtime.risk_guard_max_base_amount = 10_000_000
@@ -1007,13 +1015,145 @@ def test_live_inventory_basis_real_entry_submits_both_legs(tmp_path) -> None:
 
         rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
 
-        assert {call["venue"] for call in calls} == {"var", "lighter"}
-        assert calls[0]["confirm"] is True or calls[1]["confirm"] is True
+        assert [call["venue"] for call in calls] == ["var"]
+        assert calls[0]["confirm"] is True
+        assert runtime.live_inventory_open_lots == []
+        assert len(runtime.pending_live_inventory_var_fill_matches) == 1
+        assert runtime.pending_live_inventory_var_fill_matches[0].role == "live_inventory_entry_pending_lighter"
+        assert rows[-1]["event"] == "live_inventory_var_entry_submitted"
+
+        await runtime.process_variational_trade_event(
+            {
+                "asset": "ETH",
+                "side": "buy",
+                "qty": calls[0]["amount"],
+                "price": "1753.30",
+                "status": "filled",
+                "trade_id": "var-fill-1",
+                "timestamp": "2999-06-16T03:25:21.000Z",
+            }
+        )
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert [call["venue"] for call in calls] == ["var", "lighter"]
+        assert runtime.pending_live_inventory_var_fill_matches == []
         assert runtime.live_inventory_open_lots
         assert runtime.live_inventory_open_lots[0]["status"] == "open"
+        assert runtime.live_inventory_open_lots[0]["entry_var_price_source"] == "final_fill"
         assert rows[-1]["event"] == "live_inventory_entered"
+        assert rows[-1]["entry_confirmation_mode"] == "var_fill_then_lighter"
 
     asyncio.run(run())
+
+
+def test_live_inventory_basis_real_entry_rejected_does_not_submit_lighter(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_signal_mode = "basis"
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.accepted_assets = {"ETH"}
+        runtime.trade_event_min_timestamp = None
+        runtime.pending_auto_live_matches = []
+        runtime.auto_live_match_window_seconds = 60
+        runtime._record_lock = asyncio.Lock()
+        runtime.records = {}
+        runtime.record_order = deque(maxlen=1000)
+        runtime.lighter_client_order_to_trade_key = {}
+        runtime.live_inventory_lot_notional_usd = Decimal("20")
+        runtime.live_max_notional_usd = Decimal("25")
+        runtime.risk_guard_max_base_amount = 10_000_000
+        runtime.lighter_order_book = {
+            "bids": {Decimal("1755.00"): Decimal("1")},
+            "asks": {Decimal("1755.10"): Decimal("1")},
+        }
+        runtime.lighter_best_bid = Decimal("1755.00")
+        runtime.lighter_best_ask = Decimal("1755.10")
+        runtime.live_inventory_basis_state = LiveInventoryBasisState(
+            half_life_seconds=300,
+            warmup_samples=1,
+            gap_reset_seconds=30,
+            sigma_floor_bps=0,
+        )
+        runtime.live_inventory_basis_state.mean = -7.0
+        runtime.live_inventory_basis_state.var = 0.1
+        runtime.live_inventory_basis_state.seen = 10
+        runtime.live_inventory_basis_state.last_ts = time.monotonic()
+        runtime.live_inventory_basis_z_entry = Decimal("4")
+        runtime.live_inventory_basis_min_entry_edge_bps = Decimal("7")
+        runtime.live_inventory_basis_max_entry_roundtrip_cost_bps = Decimal("4")
+        runtime.pending_live_inventory_var_fill_matches = []
+        calls: list[dict] = []
+
+        async def fake_fetch_live_inventory_basis_quote(**_kwargs):
+            return {
+                "quoteId": "entry-quote",
+                "bid": "1753.00",
+                "ask": "1753.25",
+                "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+            }, Decimal("10")
+
+        async def fake_send_variational_place_order(**kwargs):
+            calls.append({"venue": "var", **kwargs})
+            return {"ok": True}
+
+        async def fake_place_lighter_order_from_plan(**kwargs):
+            calls.append({"venue": "lighter", **kwargs})
+            return None, None
+
+        runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        await runtime.maybe_run_live_inventory_basis(_eth_inventory_snapshot())
+        await runtime.process_variational_trade_event(
+            {
+                "asset": "ETH",
+                "side": "buy",
+                "qty": calls[0]["amount"],
+                "price": "1753.30",
+                "status": "rejected",
+                "trade_id": "var-reject-1",
+                "timestamp": "2999-06-16T03:25:21.000Z",
+            }
+        )
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        assert [call["venue"] for call in calls] == ["var"]
+        assert runtime.pending_live_inventory_var_fill_matches == []
+        assert runtime.live_inventory_open_lots == []
+        assert runtime.stop_flag is True
+        assert state["status"] == "manual_review_required"
+        assert state["manual_review_reason"] == "variational_rejected:pending_live_inventory_entry_pending_lighter"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_basis_pending_entry_survives_match_window(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.auto_live_match_window_seconds = 0
+    runtime.pending_live_inventory_var_fill_matches = [
+        PendingLiveInventoryVarFillMatch(
+            asset="ETH",
+            side="buy",
+            qty=Decimal("0.01"),
+            lot_id=1,
+            role="live_inventory_entry_pending_lighter",
+            created_at_monotonic=time.monotonic() - 3600,
+        ),
+        PendingLiveInventoryVarFillMatch(
+            asset="ETH",
+            side="sell",
+            qty=Decimal("0.01"),
+            lot_id=2,
+            role="live_inventory_exit",
+            created_at_monotonic=time.monotonic() - 3600,
+        ),
+    ]
+
+    runtime.prune_pending_live_inventory_var_fill_matches()
+
+    assert len(runtime.pending_live_inventory_var_fill_matches) == 1
+    assert runtime.pending_live_inventory_var_fill_matches[0].role == "live_inventory_entry_pending_lighter"
 
 
 def test_live_inventory_entry_blocks_below_lighter_min_base_before_submit(tmp_path) -> None:
