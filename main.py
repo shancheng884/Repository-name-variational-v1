@@ -4,6 +4,7 @@ import contextlib
 import csv
 import json
 import logging
+import math
 import os
 import signal
 import time
@@ -61,6 +62,9 @@ LIGHTER_ORDER_MODE_CHOICES = (LIGHTER_ORDER_MODE_LIMIT_GTT, LIGHTER_ORDER_MODE_M
 VARIATIONAL_SUBMIT_TRANSPORT_DOM = "dom"
 VARIATIONAL_SUBMIT_TRANSPORT_API = "api"
 VARIATIONAL_SUBMIT_TRANSPORT_CHOICES = (VARIATIONAL_SUBMIT_TRANSPORT_DOM, VARIATIONAL_SUBMIT_TRANSPORT_API)
+LIVE_INVENTORY_SIGNAL_SNAPSHOT = "snapshot"
+LIVE_INVENTORY_SIGNAL_BASIS = "basis"
+LIVE_INVENTORY_SIGNAL_CHOICES = (LIVE_INVENTORY_SIGNAL_SNAPSHOT, LIVE_INVENTORY_SIGNAL_BASIS)
 
 STAGE_EVENT_RECEIVED = "event_received"
 STAGE_EVENT_FILTERED = "event_filtered"
@@ -745,6 +749,7 @@ class VariationalToLighterRuntime:
         self.auto_live_max_cycles = int(args.auto_live_max_cycles)
         self.live_inventory = bool(args.live_inventory)
         self.live_inventory_dry_decisions = bool(args.live_inventory_dry_decisions)
+        self.live_inventory_signal_mode = args.live_inventory_signal_mode
         self.live_inventory_i_confirm_flat_start = bool(args.live_inventory_i_confirm_flat_start)
         self.live_inventory_reset_state_after_manual_flat = bool(args.live_inventory_reset_state_after_manual_flat)
         self.live_inventory_lot_notional_usd = Decimal(str(args.live_inventory_lot_notional_usd))
@@ -764,6 +769,13 @@ class VariationalToLighterRuntime:
         self.live_inventory_max_hold_samples = int(args.live_inventory_max_hold_samples)
         self.live_inventory_max_unrealized_loss_bps = Decimal(str(args.live_inventory_max_unrealized_loss_bps))
         self.live_inventory_max_cycles = int(args.live_inventory_max_cycles)
+        self.live_inventory_basis_z_entry = Decimal(str(args.live_inventory_basis_z_entry))
+        self.live_inventory_basis_z_exit = Decimal(str(args.live_inventory_basis_z_exit))
+        self.live_inventory_basis_min_entry_edge_bps = Decimal(str(args.live_inventory_basis_min_entry_edge_bps))
+        self.live_inventory_basis_max_entry_roundtrip_cost_bps = Decimal(
+            str(args.live_inventory_basis_max_entry_roundtrip_cost_bps)
+        )
+        self.live_inventory_basis_min_exit_pnl_bps = Decimal(str(args.live_inventory_basis_min_exit_pnl_bps))
         self.paper_notional_usd = Decimal(str(args.paper_notional_usd))
         self.paper_entry_deviation_bps = Decimal(str(args.paper_entry_deviation_bps))
         self.paper_exit_deviation_bps = Decimal(str(args.paper_exit_deviation_bps))
@@ -844,6 +856,12 @@ class VariationalToLighterRuntime:
         self.live_inventory_execution_loss_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.load_recent_live_inventory_execution_loss_bps()
         self.pending_live_inventory_var_fill_matches: list[PendingLiveInventoryVarFillMatch] = []
+        self.live_inventory_basis_state = LiveInventoryBasisState(
+            half_life_seconds=float(args.live_inventory_basis_half_life_seconds),
+            warmup_samples=int(args.live_inventory_basis_warmup_samples),
+            gap_reset_seconds=float(args.live_inventory_basis_gap_reset_seconds),
+            sigma_floor_bps=float(args.live_inventory_basis_sigma_floor_bps),
+        )
         self._order_write_lock = asyncio.Lock()
         self._opportunity_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
@@ -1136,6 +1154,33 @@ class VariationalToLighterRuntime:
             return ((var_price - lighter_price) / var_price) * Decimal("10000")
         return None
 
+    @staticmethod
+    def live_inventory_roundtrip_pnl_bps(
+        *,
+        direction: str,
+        var_entry_price: Decimal,
+        lighter_entry_price: Decimal,
+        var_exit_price: Decimal,
+        lighter_exit_price: Decimal,
+    ) -> Decimal:
+        if var_entry_price <= 0:
+            raise ValueError("var_entry_price must be > 0")
+        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+            pnl_per_unit = (var_exit_price - var_entry_price) + (lighter_entry_price - lighter_exit_price)
+        elif direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
+            pnl_per_unit = (var_entry_price - var_exit_price) + (lighter_exit_price - lighter_entry_price)
+        else:
+            raise ValueError(f"unsupported direction: {direction}")
+        return pnl_per_unit / var_entry_price * Decimal("10000")
+
+    @staticmethod
+    def live_inventory_basis_direction_signal(direction: str, z: Decimal) -> Decimal:
+        if direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
+            return z
+        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+            return -z
+        raise ValueError(f"unsupported direction: {direction}")
+
     async def live_inventory_lighter_slippage_bps(self, *, lighter_side: str, qty: Decimal) -> tuple[Decimal | None, Decimal | None]:
         best_bid, best_ask = await self.get_lighter_best_bid_ask()
         estimated_fill = await self.estimate_lighter_fill_price(lighter_side, qty)
@@ -1150,6 +1195,33 @@ class VariationalToLighterRuntime:
         if slippage_bps is not None and slippage_bps < 0:
             slippage_bps = Decimal("0")
         return estimated_fill, slippage_bps
+
+    async def fetch_live_inventory_basis_quote(self, *, asset: str) -> tuple[dict[str, Any] | None, Decimal | None]:
+        result, elapsed_ms = await self._timed_submit(
+            self.send_variational_place_order(
+                asset=asset,
+                side="BUY",
+                amount=decimal_to_str(self.live_inventory_lot_notional_usd),
+                expected_min_btc_qty=None,
+                confirm=False,
+                reduce_only=False,
+            )
+        )
+        if not result.get("ok"):
+            await self.append_live_inventory_log(
+                "live_inventory_basis_quote_failed",
+                {"asset": asset, "error": result.get("error") or result.get("step") or "unknown", "result": result},
+            )
+            return None, None
+        bid = to_decimal(result.get("bid"))
+        ask = to_decimal(result.get("ask"))
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            await self.append_live_inventory_log(
+                "live_inventory_basis_quote_failed",
+                {"asset": asset, "error": "missing_or_invalid_bid_ask", "result": result},
+            )
+            return None, None
+        return result, Decimal(str(elapsed_ms))
 
     async def maybe_append_live_inventory_actual_pnl(self, payload: dict[str, Any]) -> None:
         trade_key = str(payload.get("trade_key") or "")
@@ -4498,8 +4570,185 @@ class VariationalToLighterRuntime:
                     }
                 )
 
+    async def maybe_run_live_inventory_basis(self, snapshot: CrossSpreadSnapshot) -> None:
+        asset = snapshot.asset.upper()
+        if asset != "ETH":
+            return
+        self.live_inventory_sample_index += 1
+        index = self.live_inventory_sample_index
+        if self.live_inventory_completed_cycles >= self.live_inventory_max_cycles and not self.live_inventory_open_lots:
+            return
+        quote, quote_ms = await self.fetch_live_inventory_basis_quote(asset=asset)
+        if quote is None:
+            return
+        var_bid = to_decimal(quote.get("bid"))
+        var_ask = to_decimal(quote.get("ask"))
+        if var_bid is None or var_ask is None:
+            return
+        lighter_buy_price = snapshot.lighter_buy_fill_price or snapshot.lighter_ask
+        lighter_sell_price = snapshot.lighter_sell_fill_price or snapshot.lighter_bid
+        basis_mid = (var_bid + var_ask) / Decimal("2")
+        lighter_mid = (snapshot.lighter_bid + snapshot.lighter_ask) / Decimal("2")
+        if basis_mid <= 0 or lighter_mid <= 0:
+            return
+        basis_bps = (basis_mid - lighter_mid) / lighter_mid * Decimal("10000")
+        z_float, warm = self.live_inventory_basis_state.update(time.monotonic(), float(basis_bps))
+        z = Decimal(str(z_float))
+        long_edge_bps = self.live_inventory_pair_edge_bps(
+            direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+            var_price=var_ask,
+            lighter_price=lighter_sell_price,
+        ) or Decimal("0")
+        short_edge_bps = self.live_inventory_pair_edge_bps(
+            direction=DIRECTION_SHORT_VAR_LONG_LIGHTER,
+            var_price=var_bid,
+            lighter_price=lighter_buy_price,
+        ) or Decimal("0")
+        long_roundtrip_pnl_bps = self.live_inventory_roundtrip_pnl_bps(
+            direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+            var_entry_price=var_ask,
+            lighter_entry_price=lighter_sell_price,
+            var_exit_price=var_bid,
+            lighter_exit_price=lighter_buy_price,
+        )
+        short_roundtrip_pnl_bps = self.live_inventory_roundtrip_pnl_bps(
+            direction=DIRECTION_SHORT_VAR_LONG_LIGHTER,
+            var_entry_price=var_bid,
+            lighter_entry_price=lighter_buy_price,
+            var_exit_price=var_ask,
+            lighter_exit_price=lighter_sell_price,
+        )
+        state_payload = {
+            "asset": asset,
+            "sample_index": index,
+            "quote_id": quote.get("quoteId") or quote.get("quote_id"),
+            "quote_timestamp": quote.get("quoteTimestamp") or quote.get("quote_timestamp"),
+            "quote_ms": decimal_to_str(quote_ms),
+            "var_bid": decimal_to_str(var_bid),
+            "var_ask": decimal_to_str(var_ask),
+            "lighter_bid": decimal_to_str(snapshot.lighter_bid),
+            "lighter_ask": decimal_to_str(snapshot.lighter_ask),
+            "lighter_buy_price": decimal_to_str(lighter_buy_price),
+            "lighter_sell_price": decimal_to_str(lighter_sell_price),
+            "basis_bps": decimal_to_str(basis_bps),
+            "basis_mean_bps": None if self.live_inventory_basis_state.signal_mean is None else str(self.live_inventory_basis_state.signal_mean),
+            "basis_sigma_bps": None if self.live_inventory_basis_state.signal_sigma is None else str(self.live_inventory_basis_state.signal_sigma),
+            "basis_seen": self.live_inventory_basis_state.seen,
+            "z": decimal_to_str(z),
+            "warm": warm,
+            "long_edge_bps": decimal_to_str(long_edge_bps),
+            "short_edge_bps": decimal_to_str(short_edge_bps),
+            "long_roundtrip_pnl_bps": decimal_to_str(long_roundtrip_pnl_bps),
+            "short_roundtrip_pnl_bps": decimal_to_str(short_roundtrip_pnl_bps),
+            "open_lots_total": len(self.live_inventory_open_lots),
+            "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
+            "completed_cycles": self.live_inventory_completed_cycles,
+        }
+        await self.append_live_inventory_log("live_inventory_basis_state", state_payload)
+        if not self.live_inventory_open_lots:
+            if not warm:
+                return
+            candidates = (
+                (DIRECTION_LONG_VAR_SHORT_LIGHTER, long_edge_bps, long_roundtrip_pnl_bps, var_ask, lighter_sell_price),
+                (DIRECTION_SHORT_VAR_LONG_LIGHTER, short_edge_bps, short_roundtrip_pnl_bps, var_bid, lighter_buy_price),
+            )
+            for direction, edge_bps, roundtrip_bps, var_price, lighter_price in candidates:
+                direction_signal = self.live_inventory_basis_direction_signal(direction, z)
+                if direction_signal < self.live_inventory_basis_z_entry:
+                    continue
+                if edge_bps < self.live_inventory_basis_min_entry_edge_bps:
+                    continue
+                if roundtrip_bps < -self.live_inventory_basis_max_entry_roundtrip_cost_bps:
+                    continue
+                qty = self.live_inventory_lot_notional_usd / var_price
+                lot_id = self.live_inventory_next_lot_id
+                lot = {
+                    "lot_id": lot_id,
+                    "signal_mode": LIVE_INVENTORY_SIGNAL_BASIS,
+                    "direction": direction,
+                    "qty": decimal_to_str(qty),
+                    "entry_var_fill_price": decimal_to_str(var_price),
+                    "entry_lighter_fill_price": decimal_to_str(lighter_price),
+                    "entry_var_price_source": "fresh_quote",
+                    "entry_lighter_price_source": "estimated_snapshot",
+                    "entry_cost_status": "dry_decision",
+                    "entry_edge_bps": decimal_to_str(edge_bps),
+                    "entry_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                    "entry_basis_bps": decimal_to_str(basis_bps),
+                    "entry_z": decimal_to_str(z),
+                    "entry_direction_signal": decimal_to_str(direction_signal),
+                    "entered_at": utc_now(),
+                    "entered_sample_index": index,
+                    "status": "dry_open",
+                }
+                self.live_inventory_next_lot_id += 1
+                self.live_inventory_open_lots.append(lot)
+                await self.persist_live_inventory_memory(reason="basis_dry_entry_decision")
+                await self.append_live_inventory_log(
+                    "live_inventory_dry_entered",
+                    {**state_payload, "lot_id": lot_id, "direction": direction, "qty": lot["qty"], "edge_bps": decimal_to_str(edge_bps), "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps)},
+                )
+                return
+            return
+        lot = self.live_inventory_open_lots[0]
+        direction = str(lot.get("direction") or "")
+        entered_sample_index = int(lot.get("entered_sample_index") or index)
+        holding_samples = index - entered_sample_index
+        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+            var_exit_price = var_bid
+            lighter_exit_price = lighter_buy_price
+        elif direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
+            var_exit_price = var_ask
+            lighter_exit_price = lighter_sell_price
+        else:
+            await self.require_live_inventory_manual_review(asset=asset, reason=f"unknown_direction:{direction}")
+            return
+        entry_var_price = to_decimal(lot.get("entry_var_fill_price")) or var_exit_price
+        entry_lighter_price = to_decimal(lot.get("entry_lighter_fill_price")) or lighter_exit_price
+        qty = to_decimal(lot.get("qty")) or Decimal("0")
+        _, _, pnl = self.live_inventory_pair_pnl(
+            direction=direction,
+            qty=qty,
+            entry_var_price=entry_var_price,
+            entry_lighter_price=entry_lighter_price,
+            exit_var_price=var_exit_price,
+            exit_lighter_price=lighter_exit_price,
+        )
+        notional = qty * entry_var_price
+        pnl_bps = pnl / notional * Decimal("10000") if notional else None
+        direction_signal = self.live_inventory_basis_direction_signal(direction, z)
+        can_exit_on_reversion = holding_samples >= self.live_inventory_min_hold_samples
+        should_exit = can_exit_on_reversion and direction_signal <= self.live_inventory_basis_z_exit and (pnl_bps is not None and pnl_bps >= self.live_inventory_basis_min_exit_pnl_bps)
+        should_stop = pnl_bps is not None and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
+        should_timeout = holding_samples >= self.live_inventory_max_hold_samples
+        if not should_exit and not should_stop and not should_timeout:
+            return
+        exit_reason = "signal_reverted" if should_exit else "max_unrealized_loss_bps" if should_stop else "max_hold_samples"
+        self.live_inventory_open_lots.pop(0)
+        self.live_inventory_realized_pnl_usd += pnl
+        self.live_inventory_completed_cycles += 1
+        await self.persist_live_inventory_memory(reason="basis_dry_exit_decision")
+        await self.append_live_inventory_log(
+            "live_inventory_dry_exited",
+            {
+                **state_payload,
+                "lot_id": lot.get("lot_id"),
+                "direction": direction,
+                "qty": decimal_to_str(qty),
+                "exit_reason": exit_reason,
+                "holding_samples": holding_samples,
+                "pnl_usd": decimal_to_str(pnl),
+                "pnl_bps": decimal_to_str(pnl_bps),
+                "var_price": decimal_to_str(var_exit_price),
+                "lighter_price": decimal_to_str(lighter_exit_price),
+            },
+        )
+
     async def maybe_run_live_inventory(self, snapshot: CrossSpreadSnapshot) -> None:
         if not self.is_live_inventory_enabled():
+            return
+        if getattr(self, "live_inventory_signal_mode", LIVE_INVENTORY_SIGNAL_SNAPSHOT) == LIVE_INVENTORY_SIGNAL_BASIS:
+            await self.maybe_run_live_inventory_basis(snapshot)
             return
         if snapshot.asset.upper() != "BTC":
             return
@@ -6332,6 +6581,60 @@ class VariationalToLighterRuntime:
         await self.runtime.stop()
 
 
+class LiveInventoryBasisState:
+    def __init__(self, *, half_life_seconds: float, warmup_samples: int, gap_reset_seconds: float, sigma_floor_bps: float) -> None:
+        if half_life_seconds <= 0:
+            raise ValueError("half_life_seconds must be > 0")
+        if warmup_samples <= 0:
+            raise ValueError("warmup_samples must be > 0")
+        if gap_reset_seconds <= 0:
+            raise ValueError("gap_reset_seconds must be > 0")
+        if sigma_floor_bps < 0:
+            raise ValueError("sigma_floor_bps must be >= 0")
+        self.half_life_seconds = half_life_seconds
+        self.warmup_samples = warmup_samples
+        self.gap_reset_seconds = gap_reset_seconds
+        self.sigma_floor_bps = sigma_floor_bps
+        self.mean: float | None = None
+        self.var = 0.0
+        self.seen = 0
+        self.last_ts: float | None = None
+        self.signal_mean: float | None = None
+        self.signal_sigma: float | None = None
+
+    def update(self, ts: float, basis_bps: float) -> tuple[float, bool]:
+        if self.last_ts is not None and ts - self.last_ts > self.gap_reset_seconds:
+            self.mean = None
+            self.var = 0.0
+            self.seen = 0
+        dt = ts - self.last_ts if self.last_ts is not None else None
+        self.last_ts = ts
+        if self.mean is None or self.seen < self.warmup_samples:
+            z = 0.0
+            warm = False
+        else:
+            sigma = math.sqrt(self.var)
+            if sigma <= self.sigma_floor_bps:
+                z = 0.0
+                warm = False
+            else:
+                z = (basis_bps - self.mean) / sigma
+                warm = True
+        self.signal_mean = self.mean
+        self.signal_sigma = math.sqrt(self.var) if self.mean is not None else None
+        if self.mean is None:
+            self.mean = basis_bps
+            self.var = 0.0
+            self.seen = 1
+        else:
+            alpha = 1.0 - 0.5 ** (max(dt or 1.0, 1e-3) / self.half_life_seconds)
+            diff = basis_bps - self.mean
+            self.mean += alpha * diff
+            self.var = (1.0 - alpha) * (self.var + alpha * diff * diff)
+            self.seen += 1
+        return z, warm
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Track Variational order lifecycle and optionally auto-hedge on Lighter (ticker auto-detected)."
@@ -6539,6 +6842,12 @@ def parse_args() -> argparse.Namespace:
         help="Run live inventory V1 decision logic and state/logging without submitting real orders.",
     )
     parser.add_argument(
+        "--live-inventory-signal-mode",
+        choices=LIVE_INVENTORY_SIGNAL_CHOICES,
+        default=LIVE_INVENTORY_SIGNAL_SNAPSHOT,
+        help="Signal source for live inventory. Default: snapshot; basis is dry-decision only.",
+    )
+    parser.add_argument(
         "--live-inventory-i-confirm-flat-start",
         action="store_true",
         help="Required with --live-inventory to confirm Var and Lighter BTC positions were manually checked flat before startup.",
@@ -6591,6 +6900,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-max-hold-samples", type=int, default=300)
     parser.add_argument("--live-inventory-max-unrealized-loss-bps", type=float, default=25.0)
     parser.add_argument("--live-inventory-max-cycles", type=int, default=1)
+    parser.add_argument("--live-inventory-basis-z-entry", type=float, default=4.0)
+    parser.add_argument("--live-inventory-basis-z-exit", type=float, default=0.0)
+    parser.add_argument("--live-inventory-basis-min-entry-edge-bps", type=float, default=7.0)
+    parser.add_argument("--live-inventory-basis-max-entry-roundtrip-cost-bps", type=float, default=4.0)
+    parser.add_argument("--live-inventory-basis-min-exit-pnl-bps", type=float, default=1.0)
+    parser.add_argument("--live-inventory-basis-half-life-seconds", type=float, default=300.0)
+    parser.add_argument("--live-inventory-basis-warmup-samples", type=int, default=120)
+    parser.add_argument("--live-inventory-basis-gap-reset-seconds", type=float, default=30.0)
+    parser.add_argument("--live-inventory-basis-sigma-floor-bps", type=float, default=0.3)
     parser.add_argument(
         "--paper-notional-usd",
         type=float,
@@ -6678,8 +6996,13 @@ def parse_args() -> argparse.Namespace:
         if not args.live_inventory_i_confirm_flat_start:
             parser.error("--live-inventory requires --live-inventory-i-confirm-flat-start after manually confirming Var BTC = 0 and Lighter BTC = 0")
         allowed_assets = {asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()}
-        if allowed_assets != {"BTC"}:
-            parser.error("--live-inventory V1 requires --live-allowed-assets BTC")
+        if args.live_inventory_signal_mode == LIVE_INVENTORY_SIGNAL_BASIS:
+            if not args.live_inventory_dry_decisions:
+                parser.error("--live-inventory-signal-mode basis currently requires --live-inventory-dry-decisions")
+            if allowed_assets != {"ETH"}:
+                parser.error("--live-inventory-signal-mode basis currently requires --live-allowed-assets ETH")
+        elif allowed_assets != {"BTC"}:
+            parser.error("--live-inventory V1 snapshot mode requires --live-allowed-assets BTC")
         if args.variational_submit_transport != VARIATIONAL_SUBMIT_TRANSPORT_API:
             parser.error("--live-inventory V1 requires --variational-submit-transport api")
         if args.lighter_submit_transport != LIGHTER_SUBMIT_TRANSPORT_WS:
@@ -6729,6 +7052,24 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-max-unrealized-loss-bps must be > 0")
         if args.live_inventory_max_cycles <= 0:
             parser.error("--live-inventory-max-cycles must be > 0 in V1")
+        if args.live_inventory_basis_z_entry <= 0:
+            parser.error("--live-inventory-basis-z-entry must be > 0")
+        if args.live_inventory_basis_z_exit < 0:
+            parser.error("--live-inventory-basis-z-exit must be >= 0")
+        if args.live_inventory_basis_min_entry_edge_bps < 0:
+            parser.error("--live-inventory-basis-min-entry-edge-bps must be >= 0")
+        if args.live_inventory_basis_max_entry_roundtrip_cost_bps < 0:
+            parser.error("--live-inventory-basis-max-entry-roundtrip-cost-bps must be >= 0")
+        if args.live_inventory_basis_min_exit_pnl_bps < 0:
+            parser.error("--live-inventory-basis-min-exit-pnl-bps must be >= 0")
+        if args.live_inventory_basis_half_life_seconds <= 0:
+            parser.error("--live-inventory-basis-half-life-seconds must be > 0")
+        if args.live_inventory_basis_warmup_samples <= 0:
+            parser.error("--live-inventory-basis-warmup-samples must be > 0")
+        if args.live_inventory_basis_gap_reset_seconds <= 0:
+            parser.error("--live-inventory-basis-gap-reset-seconds must be > 0")
+        if args.live_inventory_basis_sigma_floor_bps < 0:
+            parser.error("--live-inventory-basis-sigma-floor-bps must be >= 0")
     elif args.live_inventory_reset_state_after_manual_flat:
         parser.error("--live-inventory-reset-state-after-manual-flat requires --live-inventory")
     elif args.live_inventory_dry_decisions:

@@ -247,6 +247,7 @@ def test_live_inventory_accepts_v1_safe_flags(monkeypatch) -> None:
 
     assert args.live_inventory is True
     assert args.live_inventory_dry_decisions is True
+    assert args.live_inventory_signal_mode == "snapshot"
     assert args.live_inventory_i_confirm_flat_start is True
     assert args.live_inventory_lot_notional_usd == 20.0
     assert args.live_inventory_max_total_lots == 1
@@ -254,6 +255,42 @@ def test_live_inventory_accepts_v1_safe_flags(monkeypatch) -> None:
     assert args.live_inventory_max_var_spread_bps == 5.0
     assert args.live_inventory_dynamic_entry_buffer_bps == 5.0
     assert args.live_inventory_max_lighter_slippage_bps == 3.0
+
+
+def live_inventory_basis_safe_argv() -> list[str]:
+    argv = live_inventory_safe_argv()
+    argv[argv.index("BTC")] = "ETH"
+    return argv + ["--live-inventory-signal-mode", "basis"]
+
+
+def test_live_inventory_basis_dry_accepts_eth(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", live_inventory_basis_safe_argv())
+
+    args = parse_args()
+
+    assert args.live_inventory_signal_mode == "basis"
+    assert args.live_inventory_dry_decisions is True
+    assert args.live_allowed_assets == "ETH"
+    assert args.live_inventory_basis_z_entry == 4.0
+    assert args.live_inventory_basis_min_entry_edge_bps == 7.0
+
+
+def test_live_inventory_basis_rejects_real_submit(monkeypatch) -> None:
+    argv = live_inventory_basis_safe_argv()
+    argv.remove("--live-inventory-dry-decisions")
+    monkeypatch.setattr("sys.argv", argv)
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_live_inventory_basis_rejects_non_eth(monkeypatch) -> None:
+    argv = live_inventory_basis_safe_argv()
+    argv[argv.index("ETH")] = "BTC"
+    monkeypatch.setattr("sys.argv", argv)
+
+    with pytest.raises(SystemExit):
+        parse_args()
 
 
 def test_live_inventory_real_submit_accepts_v1_safe_flags(monkeypatch) -> None:
