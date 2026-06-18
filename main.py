@@ -3677,34 +3677,37 @@ class VariationalToLighterRuntime:
             await self.append_order_log("variational_fill", filled_payload)
             await self.maybe_append_live_inventory_final_pnl_from_fill(filled_payload)
 
-        if not created or created_record is None:
+        actionable_record = created_record if created_record is not None else record if filled_payload is not None else None
+        if actionable_record is None:
+            return
+        if getattr(actionable_record, "auto_live_merge_path", None) == "synthetic_matched_real_var_fill":
             return
 
         if self.is_observe_mode():
             async with self._record_lock:
-                self.set_record_stage(created_record, STAGE_BLOCKED_BY_MODE, clear_failure=True)
+                self.set_record_stage(actionable_record, STAGE_BLOCKED_BY_MODE, clear_failure=True)
             return
 
         if self.is_dry_run_mode():
             async with self._record_lock:
-                self.set_record_stage(created_record, STAGE_DRY_RUN_PENDING, clear_failure=True)
-            await self.record_dry_run_plan(created_record)
+                self.set_record_stage(actionable_record, STAGE_DRY_RUN_PENDING, clear_failure=True)
+            await self.record_dry_run_plan(actionable_record)
             return
 
         if self.is_live_mode() and status == "filled":
-            if getattr(self, "live_inventory", False) or str(getattr(created_record, "auto_live_role", "") or "").startswith("live_inventory_"):
+            if getattr(self, "live_inventory", False) or str(getattr(actionable_record, "auto_live_role", "") or "").startswith("live_inventory_"):
                 async with self._record_lock:
-                    created_record.hedge_error = "Live inventory mode blocks trade-event auto hedges"
+                    actionable_record.hedge_error = "Live inventory mode blocks trade-event auto hedges"
                     self.set_record_stage(
-                        created_record,
+                        actionable_record,
                         STAGE_BLOCKED_BY_MODE,
                         failure_stage=FAILURE_STAGE_MODE_GUARD,
                         failure_reason="live_inventory_blocks_trade_event_auto_hedge",
                     )
-                    payload = created_record.to_payload()
+                    payload = actionable_record.to_payload()
                 await self.append_order_log("lighter_blocked", payload)
                 return
-            await self.place_lighter_order(created_record)
+            await self.place_lighter_order(actionable_record)
 
     async def trade_loop(self) -> None:
         while not self.stop_flag:
