@@ -914,7 +914,7 @@ class CommandBroker:
         if msg_type == "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN":
             await self._handle_prepare_order_input_sweep_dry_run(websocket, payload)
             return
-        if msg_type in {"VAR_API_POSITIONS", "VAR_API_QUOTE", "VAR_API_ORDER"}:
+        if msg_type in {"VAR_API_POSITIONS", "VAR_API_ORDERS", "VAR_API_QUOTE", "VAR_API_ORDER"}:
             await self._handle_var_api_command(websocket, payload, msg_type, f"{msg_type}_RESULT")
             return
         if msg_type == "PLACE_ORDER":
@@ -928,6 +928,7 @@ class CommandBroker:
             "PREPARE_ORDER_KEYBOARD_DRY_RUN_RESULT",
             "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN_RESULT",
             "VAR_API_POSITIONS_RESULT",
+            "VAR_API_ORDERS_RESULT",
             "VAR_API_QUOTE_RESULT",
             "VAR_API_ORDER_RESULT",
         }:

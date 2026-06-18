@@ -33,9 +33,43 @@ def positive_decimal(parser: argparse.ArgumentParser, value: str, name: str) -> 
     return result
 
 
+def build_payload(args: argparse.Namespace, market: str, amount: Decimal) -> dict[str, Any]:
+    if args.action == "positions":
+        return {"type": "VAR_API_POSITIONS", "account": args.account}
+    if args.action == "orders":
+        return {
+            "type": "VAR_API_ORDERS",
+            "account": args.account,
+            "status": args.status,
+            "instrument": args.instrument,
+            "createdAtGte": args.created_at_gte,
+            "limit": args.limit,
+            "offset": args.offset,
+            "orderBy": args.order_by,
+            "order": args.order,
+        }
+    if args.action == "quote":
+        return {
+            "type": "VAR_API_QUOTE",
+            "market": market,
+            "amount": str(amount),
+            "account": args.account,
+        }
+    return {
+        "type": "VAR_API_ORDER",
+        "side": str(args.side).upper(),
+        "market": market,
+        "amount": str(amount),
+        "maxSlippage": args.max_slippage,
+        "reduceOnly": args.reduce_only,
+        "reuseQuoteId": args.reuse_quote_id,
+        "account": args.account,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Call Variational page API through the Chrome command broker.")
-    parser.add_argument("action", choices=("positions", "quote", "order"))
+    parser.add_argument("action", choices=("positions", "orders", "quote", "order"))
     parser.add_argument("--endpoint", default="ws://127.0.0.1:8768")
     parser.add_argument("--market", default="BTC")
     parser.add_argument("--amount", default="0", help="Base asset quantity, e.g. BTC amount.")
@@ -44,6 +78,13 @@ def main() -> int:
     parser.add_argument("--reduce-only", action="store_true")
     parser.add_argument("--reuse-quote-id")
     parser.add_argument("--account")
+    parser.add_argument("--status", default="pending,canceled,cleared,rejected", help="Order status filter for action=orders.")
+    parser.add_argument("--instrument", help="Instrument filter for action=orders, e.g. P-ETH-USDC-3600.")
+    parser.add_argument("--created-at-gte", help="created_at_gte filter for action=orders.")
+    parser.add_argument("--limit", type=int, default=20, help="Result limit for action=orders.")
+    parser.add_argument("--offset", type=int, default=0, help="Result offset for action=orders.")
+    parser.add_argument("--order-by", default="created_at", help="Sort field for action=orders.")
+    parser.add_argument("--order", default="desc", choices=("asc", "desc"), help="Sort order for action=orders.")
     parser.add_argument("--confirm", action="store_true", help="Required for action=order.")
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     args = parser.parse_args()
@@ -65,26 +106,7 @@ def main() -> int:
     if args.max_slippage < 0:
         parser.error("--max-slippage must be >= 0")
 
-    if args.action == "positions":
-        payload: dict[str, Any] = {"type": "VAR_API_POSITIONS", "account": args.account}
-    elif args.action == "quote":
-        payload = {
-            "type": "VAR_API_QUOTE",
-            "market": market,
-            "amount": str(amount),
-            "account": args.account,
-        }
-    else:
-        payload = {
-            "type": "VAR_API_ORDER",
-            "side": str(args.side).upper(),
-            "market": market,
-            "amount": str(amount),
-            "maxSlippage": args.max_slippage,
-            "reduceOnly": args.reduce_only,
-            "reuseQuoteId": args.reuse_quote_id,
-            "account": args.account,
-        }
+    payload = build_payload(args, market, amount)
 
     result = asyncio.run(request(args.endpoint, payload, args.timeout_seconds))
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))

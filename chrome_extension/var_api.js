@@ -72,6 +72,23 @@ export function buildVariationalApiScript(action, params) {
       return { ok: true, positions: response.json, httpStatus: response.status, addressUsed: Boolean(address) };
     }
 
+    if (action === "ORDERS") {
+      const params = new URLSearchParams();
+      params.set("status", o.status || "pending,canceled,cleared,rejected");
+      if (o.instrument) params.set("instrument", o.instrument);
+      if (o.createdAtGte) params.set("created_at_gte", o.createdAtGte);
+      if (o.limit != null) params.set("limit", String(o.limit));
+      if (o.offset != null) params.set("offset", String(o.offset));
+      params.set("order_by", o.orderBy || "created_at");
+      params.set("order", o.order || "desc");
+      const path = "/api/orders/v2?" + params.toString();
+      const response = await request("GET", path, undefined);
+      if (!response.ok) {
+        return fail("orders/v2", response, { path, rateLimitResetMs: response.rateLimitResetMs });
+      }
+      return { ok: true, orders: response.json, path, httpStatus: response.status, addressUsed: Boolean(address) };
+    }
+
     if (action === "QUOTE") {
       const response = await request("POST", "/api/quotes/indicative", { instrument, qty: String(o.amount) });
       if (!response.ok || !response.json) {
