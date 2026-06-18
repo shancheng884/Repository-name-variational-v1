@@ -53,12 +53,14 @@ class VariationalMonitor:
     trade_limit: int = 20
     snapshot_file: Path | None = None
     trade_event_limit: int = 2000
+    rest_response_limit: int = 200
     quotes: dict[str, dict[str, Any]] = field(default_factory=dict)
     current_quote_asset: str | None = None
     positions: dict[str, dict[str, Any]] = field(default_factory=dict)
     recent_trades: list[dict[str, Any]] = field(default_factory=list)
     trade_events: list[dict[str, Any]] = field(default_factory=list)
     portfolio_summary: dict[str, Any] = field(default_factory=dict)
+    recent_rest_responses: list[dict[str, Any]] = field(default_factory=list)
     last_update_at: str | None = None
     last_heartbeat_iso: str | None = None
     _last_quote_log_ts: float | None = None
@@ -77,6 +79,10 @@ class VariationalMonitor:
 
         url = str(payload.get("url", ""))
         endpoint = classify_rest_endpoint(url)
+        body = decode_response_body(payload)
+        parsed = try_parse_json(body) if body is not None else None
+        async with self._lock:
+            self._remember_rest_response(payload=payload, endpoint=endpoint, parsed=parsed, body=body)
         if endpoint not in {
             QUOTES_INDICATIVE_PATH,
             ORDERS_V2_PATH,
@@ -85,11 +91,9 @@ class VariationalMonitor:
         }:
             return []
 
-        body = decode_response_body(payload)
         if body is None:
             return [f"[MONITOR] Failed to decode REST body for {url}"]
 
-        parsed = try_parse_json(body)
         if parsed is None:
             return [f"[MONITOR] REST body is not JSON for {url}"]
 
@@ -124,6 +128,48 @@ class VariationalMonitor:
                 await asyncio.to_thread(write_json_file, self.snapshot_file, self.snapshot())
 
         return lines
+
+    def _remember_rest_response(
+        self,
+        *,
+        payload: dict[str, Any],
+        endpoint: str | None,
+        parsed: Any,
+        body: str | None,
+    ) -> None:
+        url = str(payload.get("url", ""))
+        path = ""
+        try:
+            path = urlparse(url).path
+        except ValueError:
+            path = url
+        summary: dict[str, Any] = {
+            "timestamp": payload.get("timestamp"),
+            "url": url,
+            "path": path,
+            "endpoint": endpoint,
+            "status": payload.get("status"),
+            "type": payload.get("type"),
+            "matchedPattern": payload.get("matchedPattern"),
+            "body_size": len(body or ""),
+        }
+        if isinstance(parsed, dict):
+            summary["json_keys"] = list(parsed.keys())[:20]
+            result = parsed.get("result")
+            if isinstance(result, list):
+                summary["result_len"] = len(result)
+                if result and isinstance(result[0], dict):
+                    summary["first_result_keys"] = list(result[0].keys())[:20]
+            elif isinstance(result, dict):
+                summary["result_keys"] = list(result.keys())[:20]
+            elif isinstance(parsed.get("positions"), list):
+                summary["positions_len"] = len(parsed.get("positions") or [])
+        elif isinstance(parsed, list):
+            summary["json_list_len"] = len(parsed)
+            if parsed and isinstance(parsed[0], dict):
+                summary["first_item_keys"] = list(parsed[0].keys())[:20]
+        self.recent_rest_responses.insert(0, summary)
+        self.recent_rest_responses = self.recent_rest_responses[: self.rest_response_limit]
 
     async def process_ws_event(self, payload: dict[str, Any]) -> list[str]:
         kind = str(payload.get("kind", ""))
@@ -686,6 +732,7 @@ class VariationalMonitor:
             "positions": self.positions,
             "recent_trades": self.recent_trades,
             "trade_events": self.trade_events,
+            "recent_rest_responses": self.recent_rest_responses,
             "portfolio_summary": self.portfolio_summary,
         }
 
