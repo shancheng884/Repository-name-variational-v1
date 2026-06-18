@@ -1112,15 +1112,32 @@ class VariationalToLighterRuntime:
                 lot_id=item.lot_id,
                 role=item.role,
             )
+            positions_result = None
+            position_qty = None
+            position_check_error = None
+            try:
+                positions_result = await self.fetch_variational_positions()
+                position_qty = self.extract_variational_position_qty(positions_result, asset=item.asset)
+            except Exception as exc:
+                position_check_error = str(exc)
+            position_abs = abs(position_qty) if position_qty is not None else None
+            reason = (
+                "basis_entry_var_fill_timeout_position_detected"
+                if position_abs is not None and position_abs > Decimal("0")
+                else "basis_entry_var_fill_timeout"
+            )
             await self.require_live_inventory_manual_review(
                 asset=item.asset,
-                reason="basis_entry_var_fill_timeout",
+                reason=reason,
                 context={
                     "lot_id": item.lot_id,
                     "side": item.side,
                     "qty": decimal_to_str(item.qty),
                     "age_seconds": age_seconds,
                     "timeout_seconds": self.auto_live_match_window_seconds,
+                    "variational_position_qty": decimal_to_str(position_qty),
+                    "variational_position_check_error": position_check_error,
+                    "variational_positions_result": positions_result,
                     "pending_context": item.context or {},
                     "action": "confirm_variational_order_status_and_position_manually",
                 },
@@ -2630,6 +2647,9 @@ class VariationalToLighterRuntime:
             "reuseQuoteId": reuse_quote_id,
             "expectedMinBtcQty": decimal_to_str(expected_min_btc_qty) if expected_min_btc_qty is not None else "0",
         }
+        return await self.send_variational_command(payload=payload, request_id=request_id)
+
+    async def send_variational_command(self, *, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
         async with self._var_command_ws_lock:
             websocket = self._var_command_ws
             if websocket is None or getattr(websocket, "state", None) != 1:
@@ -2651,6 +2671,47 @@ class VariationalToLighterRuntime:
                     await websocket.close()
                 self._var_command_ws = None
                 raise
+
+    async def fetch_variational_positions(self) -> dict[str, Any]:
+        request_id = str(int(time.time() * 1000))
+        payload = {
+            "type": "VAR_API_POSITIONS",
+            "requestId": request_id,
+        }
+        return await self.send_variational_command(payload=payload, request_id=request_id)
+
+    @staticmethod
+    def extract_variational_position_qty(positions_result: dict[str, Any] | None, *, asset: str) -> Decimal | None:
+        if not isinstance(positions_result, dict):
+            return None
+        payload = positions_result.get("result") if isinstance(positions_result.get("result"), dict) else positions_result
+        positions = payload.get("positions") if isinstance(payload, dict) else None
+        if isinstance(positions, dict):
+            iterable = positions.values()
+        elif isinstance(positions, list):
+            iterable = positions
+        else:
+            return None
+        asset = asset.upper()
+        for position in iterable:
+            if not isinstance(position, dict):
+                continue
+            instrument = position.get("instrument")
+            candidates = [
+                position.get("asset"),
+                position.get("market"),
+                position.get("symbol"),
+                position.get("underlying"),
+            ]
+            if isinstance(instrument, dict):
+                candidates.extend([instrument.get("underlying"), instrument.get("symbol"), instrument.get("asset")])
+            if asset not in {str(item).upper() for item in candidates if item is not None}:
+                continue
+            for key in ("qty", "quantity", "size", "position", "position_size", "base_amount", "amount"):
+                value = to_decimal(position.get(key))
+                if value is not None:
+                    return value
+        return Decimal("0")
 
     async def place_lighter_order_from_plan(
         self,

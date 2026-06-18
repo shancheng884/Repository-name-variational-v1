@@ -339,6 +339,21 @@ def test_variational_api_order_quote_fields_uses_side_execution_price() -> None:
     assert sell_fields["quote_execution_price"] == "98"
 
 
+def test_extract_variational_position_qty_from_positions_result() -> None:
+    result = {
+        "ok": True,
+        "result": {
+            "positions": [
+                {"instrument": {"underlying": "BTC"}, "qty": "0"},
+                {"instrument": {"underlying": "ETH"}, "position_size": "0.011441"},
+            ]
+        },
+    }
+
+    assert VariationalToLighterRuntime.extract_variational_position_qty(result, asset="ETH") == Decimal("0.011441")
+    assert VariationalToLighterRuntime.extract_variational_position_qty(result, asset="SOL") == Decimal("0")
+
+
 def test_live_inventory_blocks_spread_reverted_exit_until_entry_cost_confirmed(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
@@ -1173,6 +1188,11 @@ def test_live_inventory_basis_pending_entry_timeout_requires_manual_review(tmp_p
             )
         ]
 
+        async def fake_fetch_variational_positions():
+            return {"ok": True, "result": {"positions": [{"instrument": {"underlying": "ETH"}, "qty": "0"}]}}
+
+        runtime.fetch_variational_positions = fake_fetch_variational_positions
+
         timed_out = await runtime.maybe_timeout_pending_live_inventory_var_entry(asset="ETH")
 
         state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
@@ -1183,8 +1203,43 @@ def test_live_inventory_basis_pending_entry_timeout_requires_manual_review(tmp_p
         assert state["status"] == "manual_review_required"
         assert state["manual_review_reason"] == "basis_entry_var_fill_timeout"
         assert state["manual_review_context"]["lot_id"] == 1
+        assert state["manual_review_context"]["variational_position_qty"] == "0"
         assert rows[-1]["event"] == "live_inventory_manual_review_required"
         assert rows[-1]["reason"] == "basis_entry_var_fill_timeout"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_basis_pending_entry_timeout_detects_var_position(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.stop_flag = False
+        runtime.auto_live_match_window_seconds = 30
+        runtime.pending_live_inventory_var_fill_matches = [
+            PendingLiveInventoryVarFillMatch(
+                asset="ETH",
+                side="buy",
+                qty=Decimal("0.011535"),
+                lot_id=1,
+                role="live_inventory_entry_pending_lighter",
+                created_at_monotonic=time.monotonic() - 31,
+            )
+        ]
+
+        async def fake_fetch_variational_positions():
+            return {"ok": True, "result": {"positions": [{"instrument": {"underlying": "ETH"}, "qty": "0.011535"}]}}
+
+        runtime.fetch_variational_positions = fake_fetch_variational_positions
+
+        timed_out = await runtime.maybe_timeout_pending_live_inventory_var_entry(asset="ETH")
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        assert timed_out is True
+        assert state["status"] == "manual_review_required"
+        assert state["manual_review_reason"] == "basis_entry_var_fill_timeout_position_detected"
+        assert state["manual_review_context"]["variational_position_qty"] == "0.011535"
+        assert runtime.pending_live_inventory_var_fill_matches == []
+        assert runtime.stop_flag is True
 
     asyncio.run(run())
 
