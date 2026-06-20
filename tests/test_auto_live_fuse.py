@@ -1186,6 +1186,7 @@ def test_live_inventory_basis_max_hold_warn_does_not_exit(tmp_path) -> None:
         runtime.live_inventory_basis_min_exit_pnl_bps = Decimal("999")
         runtime.live_inventory_basis_max_hold_action = "warn"
         runtime.live_inventory_max_hold_samples = 300
+        runtime.live_inventory_max_unrealized_loss_bps = Decimal("999")
         runtime.live_inventory_basis_state = LiveInventoryBasisState(
             half_life_seconds=300,
             warmup_samples=1,
