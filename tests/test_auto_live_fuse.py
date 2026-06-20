@@ -1183,7 +1183,7 @@ def test_live_inventory_basis_max_hold_warn_does_not_exit(tmp_path) -> None:
         runtime.live_allowed_assets = {"ETH"}
         runtime.accepted_assets = {"ETH"}
         runtime.live_inventory_basis_z_exit = Decimal("0")
-        runtime.live_inventory_basis_min_exit_pnl_bps = Decimal("1")
+        runtime.live_inventory_basis_min_exit_pnl_bps = Decimal("999")
         runtime.live_inventory_basis_max_hold_action = "warn"
         runtime.live_inventory_max_hold_samples = 300
         runtime.live_inventory_basis_state = LiveInventoryBasisState(
