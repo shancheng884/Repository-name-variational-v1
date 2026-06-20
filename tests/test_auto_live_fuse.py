@@ -366,7 +366,7 @@ def test_live_inventory_blocks_spread_reverted_exit_until_entry_cost_confirmed(t
                 "entry_lighter_fill_price": "60400",
                 "entry_var_side": "BUY",
                 "entry_cost_status": "final_fills_pending",
-                "entered_sample_index": 0,
+                "entered_sample_index": 1,
             }
         ]
         submit_calls: list[str] = []
