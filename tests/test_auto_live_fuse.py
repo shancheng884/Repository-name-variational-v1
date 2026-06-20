@@ -2031,7 +2031,7 @@ def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path) -> 
         assert rows[-1]["actual_pnl_usd"] == "0.02509222"
         state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
         assert state["asset"] == "ETH"
-        assert state["realized_pnl_usd"] == "0.02509222000000000000000000020"
+        assert state["realized_pnl_usd"] == "0.02509222000000000000000000000"
         assert state["reason"] == "actual_pnl_final_fill_update"
         assert "exit-1" not in runtime.pending_live_inventory_actual_pnl
 
