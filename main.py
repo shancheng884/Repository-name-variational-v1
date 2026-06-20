@@ -187,10 +187,14 @@ def decimal_to_str(value: Decimal | None) -> str | None:
 
 
 VARIATIONAL_API_AMOUNT_QUANTUM = Decimal("0.000001")
+VARIATIONAL_API_AMOUNT_QUANTUM_BY_ASSET = {
+    "ETH": Decimal("0.00001"),
+}
 
 
-def variational_api_amount_to_str(value: Decimal) -> str:
-    return decimal_to_str(value.quantize(VARIATIONAL_API_AMOUNT_QUANTUM, rounding=ROUND_DOWN)) or "0"
+def variational_api_amount_to_str(value: Decimal, *, asset: str | None = None) -> str:
+    quantum = VARIATIONAL_API_AMOUNT_QUANTUM_BY_ASSET.get(str(asset or "").upper(), VARIATIONAL_API_AMOUNT_QUANTUM)
+    return decimal_to_str(value.quantize(quantum, rounding=ROUND_DOWN)) or "0"
 
 
 def elapsed_ms_str(start_monotonic: float | None) -> str:
@@ -5154,7 +5158,7 @@ class VariationalToLighterRuntime:
                     if not preflight_ok:
                         await self.block_live_inventory_entry(asset=asset, reason=preflight_reason, context=preflight_context)
                         return
-                    var_amount = variational_api_amount_to_str(qty)
+                    var_amount = variational_api_amount_to_str(qty, asset=asset)
                     submitted_qty = Decimal(var_amount)
                     self.add_pending_live_inventory_var_fill_match(
                         PendingLiveInventoryVarFillMatch(
@@ -5334,7 +5338,7 @@ class VariationalToLighterRuntime:
                 )
                 return
             exit_side = self._opposite_var_side(str(lot.get("entry_var_side") or self._auto_live_direction_to_var_side(direction)))
-            var_amount = variational_api_amount_to_str(qty)
+            var_amount = variational_api_amount_to_str(qty, asset=asset)
             self.add_pending_live_inventory_var_fill_match(
                 PendingLiveInventoryVarFillMatch(
                     asset=asset,
@@ -5497,7 +5501,7 @@ class VariationalToLighterRuntime:
                 refreshed_var_quote_ms: str | None = None
                 if not self.live_inventory_dry_decisions:
                     if self.live_inventory_refresh_var_quote_before_entry:
-                        var_amount_for_quote = variational_api_amount_to_str(qty)
+                        var_amount_for_quote = variational_api_amount_to_str(qty, asset=asset)
                         quote_result, refreshed_var_quote_ms = await self._timed_submit(
                             self.send_variational_place_order(
                                 asset=snapshot.asset,
@@ -5550,7 +5554,7 @@ class VariationalToLighterRuntime:
                             context=preflight_context,
                         )
                         return
-                    var_amount = variational_api_amount_to_str(qty)
+                    var_amount = variational_api_amount_to_str(qty, asset=asset)
                     self.add_pending_live_inventory_var_fill_match(
                         PendingLiveInventoryVarFillMatch(
                             asset=snapshot.asset,
@@ -5821,7 +5825,7 @@ class VariationalToLighterRuntime:
         exit_reason = "spread_reverted" if should_exit else "max_hold_samples"
         if not self.live_inventory_dry_decisions:
             exit_side = self._opposite_var_side(str(lot.get("entry_var_side") or self._auto_live_direction_to_var_side(direction)))
-            var_amount = variational_api_amount_to_str(qty)
+            var_amount = variational_api_amount_to_str(qty, asset=asset)
             self.add_pending_live_inventory_var_fill_match(
                 PendingLiveInventoryVarFillMatch(
                     asset=snapshot.asset,
