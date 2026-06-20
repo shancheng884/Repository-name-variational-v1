@@ -1244,6 +1244,151 @@ def test_live_inventory_basis_pending_entry_timeout_detects_var_position(tmp_pat
     asyncio.run(run())
 
 
+def test_live_inventory_basis_pending_entry_orders_rejected_clears_without_lighter(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.stop_flag = False
+        runtime.auto_live_match_window_seconds = 30
+        runtime.live_inventory_next_lot_id = 2
+        runtime.pending_live_inventory_var_fill_matches = [
+            PendingLiveInventoryVarFillMatch(
+                asset="ETH",
+                side="buy",
+                qty=Decimal("0.011535"),
+                lot_id=1,
+                role="live_inventory_entry_pending_lighter",
+                created_at_monotonic=time.monotonic() - 3,
+                context={"rfq_id": "rfq-rejected", "direction": "long_var_short_lighter"},
+            )
+        ]
+        calls: list[str] = []
+
+        async def fake_fetch_variational_orders(**_kwargs):
+            return {
+                "ok": True,
+                "result": {
+                    "orders": {
+                        "result": [
+                            {
+                                "rfq_id": "rfq-rejected",
+                                "order_id": "order-rejected",
+                                "status": "rejected",
+                                "clearing_status": "rejected_failed_taker_funding",
+                                "side": "buy",
+                                "qty": "20",
+                            }
+                        ]
+                    }
+                },
+            }
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            calls.append("lighter")
+            return None, None
+
+        runtime.fetch_variational_orders = fake_fetch_variational_orders
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        resolved = await runtime.maybe_timeout_pending_live_inventory_var_entry(asset="ETH")
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert resolved is True
+        assert calls == []
+        assert runtime.pending_live_inventory_var_fill_matches == []
+        assert runtime.live_inventory_open_lots == []
+        assert runtime.stop_flag is False
+        assert state["status"] == "flat"
+        assert state["last_rejected_reason"] == "variational_order_rejected"
+        assert rows[-1]["event"] == "live_inventory_var_entry_final_rejected"
+        assert rows[-1]["clearing_status"] == "rejected_failed_taker_funding"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_basis_pending_entry_orders_cleared_submits_lighter(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.stop_flag = False
+        runtime.auto_live_match_window_seconds = 30
+        runtime.mode = "live"
+        runtime._record_lock = asyncio.Lock()
+        runtime.records = {}
+        runtime.record_order = deque(maxlen=1000)
+        runtime.lighter_client_order_to_trade_key = {}
+        runtime.pending_live_inventory_var_fill_matches = [
+            PendingLiveInventoryVarFillMatch(
+                asset="ETH",
+                side="buy",
+                qty=Decimal("0.011535"),
+                lot_id=1,
+                role="live_inventory_entry_pending_lighter",
+                created_at_monotonic=time.monotonic() - 3,
+                context={
+                    "rfq_id": "rfq-cleared",
+                    "direction": "long_var_short_lighter",
+                    "var_side": "BUY",
+                    "lighter_price": "1755.00",
+                },
+            )
+        ]
+        calls: list[dict] = []
+
+        async def fake_fetch_variational_orders(**_kwargs):
+            return {
+                "ok": True,
+                "result": {
+                    "orders": {
+                        "result": [
+                            {
+                                "rfq_id": "rfq-cleared",
+                                "order_id": "order-cleared",
+                                "status": "cleared",
+                                "clearing_status": "success_trades_booked_into_pool",
+                                "side": "buy",
+                                "qty": "0.01141",
+                                "price": "1751.58",
+                                "execution_timestamp": "2026-06-18T00:53:48.608Z",
+                            }
+                        ]
+                    }
+                },
+            }
+
+        async def fake_place_lighter_order_from_plan(**kwargs):
+            calls.append(kwargs)
+            record = OrderLifecycle(
+                trade_key="entry-1",
+                trade_id="entry-1",
+                side=str(kwargs["side"]).lower(),
+                qty=kwargs["qty"],
+                asset="ETH",
+                mode="live",
+                last_variational_status="submitted",
+                var_fill_price=kwargs["var_fill_price"],
+                lighter_fill_price=Decimal("1755.00"),
+            )
+            record.processing_stage = "lighter_filled"
+            return record, {"trade_key": "entry-1"}
+
+        runtime.fetch_variational_orders = fake_fetch_variational_orders
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        resolved = await runtime.maybe_timeout_pending_live_inventory_var_entry(asset="ETH")
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert resolved is True
+        assert len(calls) == 1
+        assert calls[0]["qty"] == Decimal("0.01141")
+        assert calls[0]["var_fill_price"] == Decimal("1751.58")
+        assert runtime.pending_live_inventory_var_fill_matches == []
+        assert runtime.live_inventory_open_lots[0]["entry_var_price_source"] == "final_fill"
+        assert rows[-2]["event"] == "variational_fill"
+        assert rows[-1]["event"] == "live_inventory_entered"
+
+    asyncio.run(run())
+
+
 def test_live_inventory_basis_pending_entry_before_timeout_does_not_stop(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)

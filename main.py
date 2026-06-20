@@ -1105,6 +1105,12 @@ class VariationalToLighterRuntime:
             if item.asset.upper() != asset.upper() or item.role != "live_inventory_entry_pending_lighter":
                 continue
             age_seconds = now_monotonic - item.created_at_monotonic
+            resolved = await self.maybe_resolve_pending_live_inventory_var_entry_from_orders(
+                item=item,
+                age_seconds=age_seconds,
+            )
+            if resolved:
+                return True
             if age_seconds < self.auto_live_match_window_seconds:
                 continue
             self.remove_pending_live_inventory_var_fill_match(
@@ -1143,6 +1149,118 @@ class VariationalToLighterRuntime:
                 },
             )
             return True
+        return False
+
+    async def maybe_resolve_pending_live_inventory_var_entry_from_orders(
+        self,
+        *,
+        item: PendingLiveInventoryVarFillMatch,
+        age_seconds: float,
+    ) -> bool:
+        context = item.context or {}
+        rfq_id = str(context.get("rfq_id") or "").strip()
+        if not rfq_id:
+            return False
+        now_monotonic = time.monotonic()
+        last_check = context.get("orders_v2_last_check_monotonic")
+        if isinstance(last_check, (int, float)) and now_monotonic - float(last_check) < 1.0:
+            return False
+        context["orders_v2_last_check_monotonic"] = now_monotonic
+        item.context = context
+
+        try:
+            orders_result = await self.fetch_variational_orders(
+                asset=item.asset,
+                status="canceled,cleared,rejected",
+                limit=20,
+            )
+        except Exception as exc:
+            context["orders_v2_last_error"] = str(exc)
+            return False
+
+        order = self.find_variational_order_by_rfq_id(orders_result, rfq_id=rfq_id)
+        if order is None:
+            context["orders_v2_last_result"] = "rfq_not_found"
+            return False
+
+        status = str(order.get("status") or "").strip().lower()
+        if status == "cleared":
+            price = to_decimal(order.get("price"))
+            qty = to_decimal(order.get("qty")) or item.qty
+            if price is None or qty <= 0:
+                self.remove_pending_live_inventory_var_fill_match(
+                    asset=item.asset,
+                    lot_id=item.lot_id,
+                    role=item.role,
+                )
+                await self.require_live_inventory_manual_review(
+                    asset=item.asset,
+                    reason="basis_entry_var_order_cleared_missing_fill_details",
+                    context={"lot_id": item.lot_id, "rfq_id": rfq_id, "order": order, "orders_result": orders_result},
+                )
+                return True
+            item.qty = qty
+            record = OrderLifecycle(
+                trade_key=f"var_order:{order.get('order_id') or rfq_id}",
+                trade_id=str(order.get("order_id") or rfq_id),
+                side=str(order.get("side") or item.side).lower(),
+                qty=qty,
+                asset=item.asset.upper(),
+                mode=self.mode,
+                last_variational_status="filled",
+                var_fill_price=price,
+                var_fill_ts_iso=str(order.get("execution_timestamp") or order.get("created_at") or utc_now()),
+                live_var_fill_seen_at_iso=utc_now(),
+                live_var_fill_seen_monotonic=time.monotonic(),
+                matched_variational_trade_id=str(order.get("order_id") or rfq_id),
+                auto_live_cycle_id=item.lot_id,
+                auto_live_role=item.role,
+                auto_live_merge_path="orders_v2_confirmed_var_fill",
+            )
+            self.remove_pending_live_inventory_var_fill_match(asset=item.asset, lot_id=item.lot_id, role=item.role)
+            await self.append_order_log("variational_fill", record.to_payload())
+            await self.complete_live_inventory_entry_after_var_fill(
+                match=item,
+                record=record,
+                fill_payload={**record.to_payload(), "variational_order": order},
+            )
+            return True
+
+        if status in {"rejected", "canceled", "cancelled"}:
+            self.remove_pending_live_inventory_var_fill_match(asset=item.asset, lot_id=item.lot_id, role=item.role)
+            await self.write_live_inventory_state_async(
+                {
+                    "status": "flat",
+                    "asset": item.asset.upper(),
+                    "next_lot_id": self.live_inventory_next_lot_id,
+                    "open_lots": self.live_inventory_open_lots,
+                    "pending_actions": [],
+                    "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
+                    "completed_cycles": self.live_inventory_completed_cycles,
+                    "last_rejected_reason": f"variational_order_{status}",
+                    "last_rejected_context": {"lot_id": item.lot_id, "rfq_id": rfq_id, "order": order},
+                }
+            )
+            await self.append_live_inventory_log(
+                "live_inventory_var_entry_final_rejected",
+                {
+                    "asset": item.asset.upper(),
+                    "lot_id": item.lot_id,
+                    "side": item.side,
+                    "qty": decimal_to_str(item.qty),
+                    "age_seconds": age_seconds,
+                    "rfq_id": rfq_id,
+                    "status": status,
+                    "clearing_status": order.get("clearing_status"),
+                    "cancel_reason": order.get("cancel_reason"),
+                    "failed_risk_checks": order.get("failed_risk_checks"),
+                    "order": order,
+                    "action": "removed_pending_without_lighter_hedge",
+                },
+            )
+            await self.persist_live_inventory_memory(reason=f"basis_var_entry_order_{status}")
+            return True
+        context["orders_v2_last_result"] = f"unhandled_status:{status or 'missing'}"
         return False
 
     @staticmethod
@@ -2679,6 +2797,55 @@ class VariationalToLighterRuntime:
             "requestId": request_id,
         }
         return await self.send_variational_command(payload=payload, request_id=request_id)
+
+    async def fetch_variational_orders(
+        self,
+        *,
+        asset: str,
+        status: str,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        request_id = str(int(time.time() * 1000))
+        asset = asset.upper()
+        payload = {
+            "type": "VAR_API_ORDERS",
+            "requestId": request_id,
+            "status": status,
+            "instrument": f"P-{asset}-USDC-3600",
+            "limit": limit,
+            "offset": offset,
+            "orderBy": "created_at",
+            "order": "desc",
+        }
+        return await self.send_variational_command(payload=payload, request_id=request_id)
+
+    @staticmethod
+    def iter_variational_orders(orders_result: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if not isinstance(orders_result, dict):
+            return []
+        payload = orders_result.get("result") if isinstance(orders_result.get("result"), dict) else orders_result
+        if isinstance(payload, dict) and isinstance(payload.get("orders"), dict):
+            payload = payload.get("orders")
+        orders = payload.get("result") if isinstance(payload, dict) else None
+        if not isinstance(orders, list):
+            return []
+        return [order for order in orders if isinstance(order, dict)]
+
+    @classmethod
+    def find_variational_order_by_rfq_id(
+        cls,
+        orders_result: dict[str, Any] | None,
+        *,
+        rfq_id: str,
+    ) -> dict[str, Any] | None:
+        rfq_id = str(rfq_id or "").strip()
+        if not rfq_id:
+            return None
+        for order in cls.iter_variational_orders(orders_result):
+            if str(order.get("rfq_id") or "").strip() == rfq_id:
+                return order
+        return None
 
     @staticmethod
     def extract_variational_position_qty(positions_result: dict[str, Any] | None, *, asset: str) -> Decimal | None:
@@ -5027,7 +5194,14 @@ class VariationalToLighterRuntime:
                         None,
                     )
                     if pending_match is not None:
-                        pending_match.context = {**(pending_match.context or {}), "var_submit_ms": var_submit_ms, "var_result": var_result}
+                        var_payload = var_result.get("result") if isinstance(var_result.get("result"), dict) else var_result
+                        pending_match.context = {
+                            **(pending_match.context or {}),
+                            "var_submit_ms": var_submit_ms,
+                            "var_result": var_result,
+                            "rfq_id": var_payload.get("rfqId") or var_payload.get("rfq_id"),
+                            "submitted_order_id": var_payload.get("orderId") or var_payload.get("order_id"),
+                        }
                     self.live_inventory_next_lot_id += 1
                     await self.persist_live_inventory_memory(reason="basis_var_entry_submitted_pending_fill")
                     await self.append_live_inventory_log(
