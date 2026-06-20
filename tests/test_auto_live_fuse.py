@@ -2001,8 +2001,10 @@ def test_live_inventory_exit_waits_for_min_hold_samples(tmp_path) -> None:
 def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_realized_pnl_usd = Decimal("0.02478067523956343718372446020")
         runtime.pending_live_inventory_actual_pnl["exit-1"] = {
-            "asset": "BTC",
+            "asset": "ETH",
             "lot_id": 1,
             "direction": "short_var_long_lighter",
             "qty": "0.000326",
@@ -2027,6 +2029,23 @@ def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path) -> 
         assert rows[-1]["actual_pnl_status"] == "lighter_final_fill_confirmed"
         assert rows[-1]["exit_lighter_final_fill_price"] == "60605.8"
         assert rows[-1]["actual_pnl_usd"] == "0.02509222"
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        assert state["asset"] == "ETH"
+        assert state["realized_pnl_usd"] == "0.02509222000000000000000000020"
+        assert state["reason"] == "actual_pnl_final_fill_update"
         assert "exit-1" not in runtime.pending_live_inventory_actual_pnl
+
+    asyncio.run(run())
+
+
+def test_live_inventory_state_asset_uses_allowed_single_asset(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+
+        await runtime.persist_live_inventory_memory(reason="test")
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        assert state["asset"] == "ETH"
 
     asyncio.run(run())

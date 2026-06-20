@@ -1025,11 +1025,19 @@ class VariationalToLighterRuntime:
         self.live_inventory_realized_pnl_usd = to_decimal(state.get("realized_pnl_usd")) or Decimal("0")
         self.live_inventory_completed_cycles = int(state.get("completed_cycles") or 0)
 
+    def live_inventory_state_asset(self) -> str:
+        for lot in self.live_inventory_open_lots:
+            if isinstance(lot, dict) and lot.get("asset"):
+                return str(lot.get("asset")).upper()
+        if len(getattr(self, "live_allowed_assets", set()) or set()) == 1:
+            return next(iter(self.live_allowed_assets)).upper()
+        return "BTC"
+
     async def persist_live_inventory_memory(self, *, reason: str) -> None:
         await self.write_live_inventory_state_async(
             {
                 "status": "open" if self.live_inventory_open_lots else "flat",
-                "asset": "BTC",
+                "asset": self.live_inventory_state_asset(),
                 "next_lot_id": self.live_inventory_next_lot_id,
                 "open_lots": self.live_inventory_open_lots,
                 "pending_actions": [],
@@ -1542,6 +1550,8 @@ class VariationalToLighterRuntime:
         )
         notional = qty * entry_var_price
         actual_pnl_bps = actual_pnl / notional * Decimal("10000") if notional else None
+        estimated_pnl = to_decimal(pending.get("estimated_pnl_usd")) or Decimal("0")
+        self.live_inventory_realized_pnl_usd += actual_pnl - estimated_pnl
         await self.append_live_inventory_log(
             "live_inventory_actual_pnl",
             {
@@ -1555,6 +1565,7 @@ class VariationalToLighterRuntime:
                 "exit_lighter_payload": payload,
             },
         )
+        await self.persist_live_inventory_memory(reason="actual_pnl_final_fill_update")
 
     @staticmethod
     def live_inventory_final_pnl_key(asset: str, lot_id: Any) -> str:
