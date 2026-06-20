@@ -909,6 +909,8 @@ class VariationalToLighterRuntime:
         self.last_variational_trade_event_at: str | None = None
         self.last_lighter_order_book_update_at: str | None = None
         self.last_live_submit_monotonic_by_asset: dict[str, float] = {}
+        self.live_inventory_var_reject_cooldown_until: dict[tuple[str, str], float] = {}
+        self.live_inventory_var_reject_cooldown_seconds = 600.0
         self.paper_position: PaperPosition | None = None
         self.auto_live_position: AutoLivePositionState | None = None
         self.pending_auto_live_matches: list[PendingAutoLiveMatch] = []
@@ -1228,6 +1230,11 @@ class VariationalToLighterRuntime:
 
         if status in {"rejected", "canceled", "cancelled"}:
             self.remove_pending_live_inventory_var_fill_match(asset=item.asset, lot_id=item.lot_id, role=item.role)
+            clearing_status = str(order.get("clearing_status") or "").strip().lower()
+            if clearing_status == "rejected_failed_taker_funding":
+                self.live_inventory_var_reject_cooldown_until[(item.asset.upper(), item.side.lower())] = (
+                    time.monotonic() + self.live_inventory_var_reject_cooldown_seconds
+                )
             await self.persist_live_inventory_memory(reason=f"basis_var_entry_order_{status}")
             await self.write_live_inventory_state_async(
                 {
@@ -1256,6 +1263,7 @@ class VariationalToLighterRuntime:
                     "cancel_reason": order.get("cancel_reason"),
                     "failed_risk_checks": order.get("failed_risk_checks"),
                     "order": order,
+                    "cooldown_seconds": self.live_inventory_var_reject_cooldown_seconds if clearing_status == "rejected_failed_taker_funding" else None,
                     "action": "removed_pending_without_lighter_hedge",
                 },
             )
@@ -5105,6 +5113,25 @@ class VariationalToLighterRuntime:
                 qty = self.live_inventory_lot_notional_usd / var_price
                 lot_id = self.live_inventory_next_lot_id
                 var_side = self._auto_live_direction_to_var_side(direction)
+                reject_cooldown_key = (asset.upper(), var_side.lower())
+                reject_cooldown_until = self.live_inventory_var_reject_cooldown_until.get(reject_cooldown_key)
+                if reject_cooldown_until is not None:
+                    reject_cooldown_remaining = reject_cooldown_until - time.monotonic()
+                    if reject_cooldown_remaining > 0:
+                        await self.block_live_inventory_entry(
+                            asset=asset,
+                            reason="variational_taker_funding_reject_cooldown_active",
+                            context={
+                                "action": "entry",
+                                "direction": direction,
+                                "var_side": var_side,
+                                "cooldown_remaining_seconds": reject_cooldown_remaining,
+                                "cooldown_seconds": self.live_inventory_var_reject_cooldown_seconds,
+                                "clearing_status": "rejected_failed_taker_funding",
+                            },
+                        )
+                        return
+                    self.live_inventory_var_reject_cooldown_until.pop(reject_cooldown_key, None)
                 var_submit_ms = None
                 lighter_submit_ms = None
                 var_result = None

@@ -902,6 +902,8 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_require_min_edge_bps = Decimal("0")
     runtime.live_cooldown_seconds = 0.0
     runtime.last_live_submit_monotonic_by_asset = {}
+    runtime.live_inventory_var_reject_cooldown_until = {}
+    runtime.live_inventory_var_reject_cooldown_seconds = 600.0
     runtime.logger = logging.getLogger("test_auto_live_fuse")
     return runtime
 
@@ -1302,6 +1304,94 @@ def test_live_inventory_basis_pending_entry_orders_rejected_clears_without_light
         assert state["last_rejected_reason"] == "variational_order_rejected"
         assert rows[-1]["event"] == "live_inventory_var_entry_final_rejected"
         assert rows[-1]["clearing_status"] == "rejected_failed_taker_funding"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_basis_taker_funding_reject_cooldown_blocks_next_entry(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.stop_flag = False
+        runtime.auto_live_match_window_seconds = 30
+        runtime.live_inventory_signal_mode = "basis"
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.accepted_assets = {"ETH"}
+        runtime.live_inventory_lot_notional_usd = Decimal("20")
+        runtime.live_max_notional_usd = Decimal("25")
+        runtime.risk_guard_max_base_amount = 10_000_000
+        runtime.live_inventory_basis_state = LiveInventoryBasisState(
+            half_life_seconds=300,
+            warmup_samples=1,
+            gap_reset_seconds=30,
+            sigma_floor_bps=0,
+        )
+        runtime.live_inventory_basis_state.mean = -7.0
+        runtime.live_inventory_basis_state.var = 0.1
+        runtime.live_inventory_basis_state.seen = 10
+        runtime.live_inventory_basis_state.last_ts = time.monotonic()
+        runtime.live_inventory_basis_z_entry = Decimal("1")
+        runtime.live_inventory_basis_min_entry_edge_bps = Decimal("0")
+        runtime.live_inventory_basis_max_entry_roundtrip_cost_bps = Decimal("20")
+        runtime.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics = True
+        runtime.pending_live_inventory_var_fill_matches = [
+            PendingLiveInventoryVarFillMatch(
+                asset="ETH",
+                side="buy",
+                qty=Decimal("0.011535"),
+                lot_id=1,
+                role="live_inventory_entry_pending_lighter",
+                created_at_monotonic=time.monotonic() - 3,
+                context={"rfq_id": "rfq-rejected", "direction": "long_var_short_lighter"},
+            )
+        ]
+        calls: list[str] = []
+
+        async def fake_fetch_variational_orders(**_kwargs):
+            return {
+                "ok": True,
+                "result": {
+                    "orders": {
+                        "result": [
+                            {
+                                "rfq_id": "rfq-rejected",
+                                "order_id": "order-rejected",
+                                "status": "rejected",
+                                "clearing_status": "rejected_failed_taker_funding",
+                                "side": "buy",
+                                "qty": "20",
+                            }
+                        ]
+                    }
+                },
+            }
+
+        async def fake_fetch_live_inventory_basis_quote(**_kwargs):
+            return {
+                "quoteId": "entry-quote",
+                "bid": "1753.00",
+                "ask": "1753.25",
+                "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+            }, Decimal("10")
+
+        async def fake_send_variational_place_order(**_kwargs):
+            calls.append("var")
+            return {"ok": True}
+
+        runtime.fetch_variational_orders = fake_fetch_variational_orders
+        runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
+        runtime.send_variational_place_order = fake_send_variational_place_order
+
+        resolved = await runtime.maybe_timeout_pending_live_inventory_var_entry(asset="ETH")
+        await runtime.maybe_run_live_inventory_basis(_eth_inventory_snapshot())
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert resolved is True
+        assert calls == []
+        assert runtime.pending_live_inventory_var_fill_matches == []
+        assert state["last_blocked_reason"] == "variational_taker_funding_reject_cooldown_active"
+        assert rows[-1]["event"] == "live_inventory_entry_blocked"
+        assert rows[-1]["reason"] == "variational_taker_funding_reject_cooldown_active"
 
     asyncio.run(run())
 
