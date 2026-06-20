@@ -37,6 +37,8 @@ class Summary:
     open_lots: int
     winning_exits: int
     losing_exits: int
+    actual_pnl_exits: int
+    estimated_pnl_exits: int
     realized_pnl_usd: Decimal
     avg_pnl_bps: Decimal | None
     min_pnl_bps: Decimal | None
@@ -52,11 +54,7 @@ class Summary:
 
 def summarize(path: Path, *, asset: str, execution_mode: str | None) -> Summary:
     entered: dict[str, dict[str, Any]] = {}
-    exited = 0
-    winning = 0
-    losing = 0
-    realized = Decimal("0")
-    pnl_bps_values: list[Decimal] = []
+    exits: dict[str, dict[str, Any]] = {}
     entry_z_values: list[Decimal] = []
     entry_edge_values: list[Decimal] = []
     entry_roundtrip_values: list[Decimal] = []
@@ -70,9 +68,16 @@ def summarize(path: Path, *, asset: str, execution_mode: str | None) -> Summary:
             row = json.loads(raw)
             if str(row.get("asset") or "").upper() != asset:
                 continue
-            if execution_mode and row.get("execution_mode") != execution_mode:
-                continue
             event = row.get("event")
+            if execution_mode and row.get("execution_mode") != execution_mode:
+                # Older actual-PnL rows may not carry execution_mode. They are
+                # live-only corrections for a preceding live_inventory_exited row.
+                if not (
+                    execution_mode == "live"
+                    and event == "live_inventory_actual_pnl"
+                    and row.get("execution_mode") is None
+                ):
+                    continue
             if event == "live_inventory_basis_state":
                 latest_state = row
                 continue
@@ -87,25 +92,38 @@ def summarize(path: Path, *, asset: str, execution_mode: str | None) -> Summary:
                     entry_roundtrip_values.append(value)
                 continue
             if event in {"live_inventory_dry_exited", "live_inventory_exited"}:
-                exited += 1
                 lot_id = str(row.get("lot_id"))
                 entered.pop(lot_id, None)
-                pnl_usd = parse_decimal(row.get("pnl_usd")) or Decimal("0")
-                realized += pnl_usd
-                if pnl_usd > 0:
-                    winning += 1
-                elif pnl_usd < 0:
-                    losing += 1
-                if (value := parse_decimal(row.get("pnl_bps"))) is not None:
-                    pnl_bps_values.append(value)
                 reason = str(row.get("exit_reason") or "unknown")
+                exits[lot_id] = {
+                    "pnl_usd": parse_decimal(row.get("pnl_usd")) or Decimal("0"),
+                    "pnl_bps": parse_decimal(row.get("pnl_bps")),
+                    "exit_reason": reason,
+                    "pnl_source": "estimated" if event == "live_inventory_exited" else "reported",
+                }
                 exit_reasons[reason] = exit_reasons.get(reason, 0) + 1
+                continue
+            if event == "live_inventory_actual_pnl":
+                lot_id = str(row.get("lot_id"))
+                if lot_id in exits:
+                    exits[lot_id]["pnl_usd"] = parse_decimal(row.get("actual_pnl_usd")) or Decimal("0")
+                    exits[lot_id]["pnl_bps"] = parse_decimal(row.get("actual_pnl_bps"))
+                    exits[lot_id]["pnl_source"] = "actual"
+
+    realized = sum((exit["pnl_usd"] for exit in exits.values()), Decimal("0"))
+    pnl_bps_values = [exit["pnl_bps"] for exit in exits.values() if exit["pnl_bps"] is not None]
+    winning = sum(1 for exit in exits.values() if exit["pnl_usd"] > 0)
+    losing = sum(1 for exit in exits.values() if exit["pnl_usd"] < 0)
+    actual_pnl_exits = sum(1 for exit in exits.values() if exit["pnl_source"] == "actual")
+    estimated_pnl_exits = sum(1 for exit in exits.values() if exit["pnl_source"] == "estimated")
     return Summary(
         entered=len(entry_z_values),
-        exited=exited,
+        exited=len(exits),
         open_lots=len(entered),
         winning_exits=winning,
         losing_exits=losing,
+        actual_pnl_exits=actual_pnl_exits,
+        estimated_pnl_exits=estimated_pnl_exits,
         realized_pnl_usd=realized,
         avg_pnl_bps=avg(pnl_bps_values),
         min_pnl_bps=min(pnl_bps_values) if pnl_bps_values else None,
@@ -126,6 +144,8 @@ def print_summary(summary: Summary) -> None:
     print(f"open_lots: {summary.open_lots}")
     print(f"winning_exits: {summary.winning_exits}")
     print(f"losing_exits: {summary.losing_exits}")
+    print(f"actual_pnl_exits: {summary.actual_pnl_exits}")
+    print(f"estimated_pnl_exits: {summary.estimated_pnl_exits}")
     print(f"realized_pnl_usd: {fmt(summary.realized_pnl_usd)}")
     print(f"avg_pnl_bps: {fmt(summary.avg_pnl_bps)}")
     print(f"min_pnl_bps: {fmt(summary.min_pnl_bps)}")

@@ -78,6 +78,8 @@ def test_summarize_live_basis_inventory(tmp_path) -> None:
     assert summary.open_lots == 0
     assert summary.winning_exits == 1
     assert summary.losing_exits == 1
+    assert summary.actual_pnl_exits == 0
+    assert summary.estimated_pnl_exits == 0
     assert summary.realized_pnl_usd == Decimal("0.001")
     assert summary.avg_pnl_bps == Decimal("0.25")
     assert summary.avg_entry_z == Decimal("-4.5")
@@ -119,4 +121,50 @@ def test_summarize_live_basis_inventory_live_events(tmp_path) -> None:
     assert summary.entered == 1
     assert summary.exited == 1
     assert summary.winning_exits == 1
+    assert summary.actual_pnl_exits == 0
+    assert summary.estimated_pnl_exits == 1
     assert summary.realized_pnl_usd == Decimal("0.003")
+
+
+def test_summarize_live_basis_inventory_prefers_actual_pnl(tmp_path) -> None:
+    path = tmp_path / "order_metrics.jsonl"
+    write_jsonl(
+        path,
+        [
+            {
+                "event": "live_inventory_entered",
+                "execution_mode": "live",
+                "asset": "ETH",
+                "lot_id": 1,
+                "z": "-1.2",
+                "edge_bps": "0",
+                "roundtrip_pnl_bps": "-2.7",
+            },
+            {
+                "event": "live_inventory_exited",
+                "execution_mode": "live",
+                "asset": "ETH",
+                "lot_id": 1,
+                "pnl_usd": "-0.0197054",
+                "pnl_bps": "-9.8613",
+                "exit_reason": "max_unrealized_loss_bps",
+            },
+            {
+                "event": "live_inventory_actual_pnl",
+                "asset": "ETH",
+                "lot_id": 1,
+                "actual_pnl_usd": "0.0043142",
+                "actual_pnl_bps": "2.1590",
+            },
+        ],
+    )
+
+    summary = summarize(path, asset="ETH", execution_mode="live")
+
+    assert summary.exited == 1
+    assert summary.winning_exits == 1
+    assert summary.losing_exits == 0
+    assert summary.actual_pnl_exits == 1
+    assert summary.estimated_pnl_exits == 0
+    assert summary.realized_pnl_usd == Decimal("0.0043142")
+    assert summary.avg_pnl_bps == Decimal("2.1590")
