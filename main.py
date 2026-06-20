@@ -1228,6 +1228,7 @@ class VariationalToLighterRuntime:
 
         if status in {"rejected", "canceled", "cancelled"}:
             self.remove_pending_live_inventory_var_fill_match(asset=item.asset, lot_id=item.lot_id, role=item.role)
+            await self.persist_live_inventory_memory(reason=f"basis_var_entry_order_{status}")
             await self.write_live_inventory_state_async(
                 {
                     "status": "flat",
@@ -1258,7 +1259,6 @@ class VariationalToLighterRuntime:
                     "action": "removed_pending_without_lighter_hedge",
                 },
             )
-            await self.persist_live_inventory_memory(reason=f"basis_var_entry_order_{status}")
             return True
         context["orders_v2_last_result"] = f"unhandled_status:{status or 'missing'}"
         return False
