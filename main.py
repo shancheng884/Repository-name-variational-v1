@@ -782,6 +782,7 @@ class VariationalToLighterRuntime:
             str(args.live_inventory_basis_max_entry_roundtrip_cost_bps)
         )
         self.live_inventory_basis_min_exit_pnl_bps = Decimal(str(args.live_inventory_basis_min_exit_pnl_bps))
+        self.live_inventory_basis_max_hold_action = args.live_inventory_basis_max_hold_action
         self.paper_notional_usd = Decimal(str(args.paper_notional_usd))
         self.paper_entry_deviation_bps = Decimal(str(args.paper_entry_deviation_bps))
         self.paper_exit_deviation_bps = Decimal(str(args.paper_exit_deviation_bps))
@@ -1507,6 +1508,9 @@ class VariationalToLighterRuntime:
                 "qty": decimal_to_str(qty),
                 "edge_bps": context.get("edge_bps"),
                 "roundtrip_pnl_bps": context.get("roundtrip_pnl_bps"),
+                "entry_basis_bps": context.get("basis_bps"),
+                "entry_z": context.get("z"),
+                "entry_direction_signal": context.get("direction_signal"),
                 "var_price": decimal_to_str(var_fill_price),
                 "lighter_price": decimal_to_str(lighter_fill_price),
                 "var_submit_ms": context.get("var_submit_ms"),
@@ -5326,7 +5330,26 @@ class VariationalToLighterRuntime:
         should_exit = can_exit_on_reversion and direction_signal <= self.live_inventory_basis_z_exit and (pnl_bps is not None and pnl_bps >= self.live_inventory_basis_min_exit_pnl_bps)
         should_stop = pnl_bps is not None and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
         should_timeout = holding_samples >= self.live_inventory_max_hold_samples
-        if not should_exit and not should_stop and not should_timeout:
+        should_timeout_exit = should_timeout and self.live_inventory_basis_max_hold_action == "exit"
+        if should_timeout and not should_timeout_exit:
+            last_warned = int(lot.get("max_hold_warned_samples") or 0)
+            if holding_samples > last_warned:
+                lot["max_hold_warned_samples"] = holding_samples
+                await self.append_live_inventory_log(
+                    "live_inventory_exit_blocked",
+                    {
+                        **state_payload,
+                        "lot_id": lot.get("lot_id"),
+                        "direction": direction,
+                        "reason": "basis_max_hold_reached_waiting_for_reversion",
+                        "holding_samples": holding_samples,
+                        "max_hold_samples": self.live_inventory_max_hold_samples,
+                        "basis_max_hold_action": self.live_inventory_basis_max_hold_action,
+                        "direction_signal": decimal_to_str(direction_signal),
+                        "pnl_bps": decimal_to_str(pnl_bps),
+                    },
+                )
+        if not should_exit and not should_stop and not should_timeout_exit:
             return
         exit_reason = "signal_reverted" if should_exit else "max_unrealized_loss_bps" if should_stop else "max_hold_samples"
         var_submit_ms = None
@@ -7635,6 +7658,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-basis-min-entry-edge-bps", type=float, default=7.0)
     parser.add_argument("--live-inventory-basis-max-entry-roundtrip-cost-bps", type=float, default=4.0)
     parser.add_argument("--live-inventory-basis-min-exit-pnl-bps", type=float, default=1.0)
+    parser.add_argument(
+        "--live-inventory-basis-max-hold-action",
+        choices=("exit", "warn"),
+        default="exit",
+        help="Basis live-inventory action when max hold samples is reached. Default exits; 'warn' logs and waits for z-score exit or stop-loss.",
+    )
     parser.add_argument("--live-inventory-basis-half-life-seconds", type=float, default=300.0)
     parser.add_argument("--live-inventory-basis-warmup-samples", type=int, default=120)
     parser.add_argument("--live-inventory-basis-gap-reset-seconds", type=float, default=30.0)
