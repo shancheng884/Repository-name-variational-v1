@@ -1207,7 +1207,7 @@ def test_live_inventory_basis_max_hold_warn_does_not_exit(tmp_path) -> None:
                 "entry_var_fill_price": "1723.84",
                 "entry_lighter_fill_price": "1725.05",
                 "entry_cost_status": "final_fills_confirmed",
-                "entered_sample_index": 0,
+                "entered_sample_index": 1,
                 "status": "open",
             }
         ]
