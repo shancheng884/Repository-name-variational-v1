@@ -1034,6 +1034,7 @@ def test_live_inventory_basis_real_entry_waits_for_var_fill_before_lighter(tmp_p
 
         assert [call["venue"] for call in calls] == ["var"]
         assert calls[0]["confirm"] is True
+        assert calls[0]["reuse_quote_id"] is None
         assert runtime.live_inventory_open_lots == []
         assert len(runtime.pending_live_inventory_var_fill_matches) == 1
         assert runtime.pending_live_inventory_var_fill_matches[0].role == "live_inventory_entry_pending_lighter"

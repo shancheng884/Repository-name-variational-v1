@@ -5178,6 +5178,8 @@ class VariationalToLighterRuntime:
                                 "z": decimal_to_str(z),
                                 "direction_signal": decimal_to_str(direction_signal),
                                 "quote_id": quote.get("quoteId") or quote.get("quote_id"),
+                                "signal_quote_id": quote.get("quoteId") or quote.get("quote_id"),
+                                "entry_order_reuses_signal_quote": False,
                                 "quote_timestamp": quote.get("quoteTimestamp") or quote.get("quote_timestamp"),
                                 "var_bid": decimal_to_str(var_bid),
                                 "var_ask": decimal_to_str(var_ask),
@@ -5193,7 +5195,7 @@ class VariationalToLighterRuntime:
                                 expected_min_btc_qty=None,
                                 confirm=True,
                                 reduce_only=False,
-                                reuse_quote_id=quote.get("quoteId") or quote.get("quote_id"),
+                                reuse_quote_id=None,
                             )
                         )
                     except Exception as exc:
