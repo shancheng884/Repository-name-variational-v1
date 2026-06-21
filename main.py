@@ -757,6 +757,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_signal_mode = args.live_inventory_signal_mode
         self.live_inventory_i_accept_basis_real_diagnostic = bool(args.live_inventory_i_accept_basis_real_diagnostic)
         self.live_inventory_i_confirm_flat_start = bool(args.live_inventory_i_confirm_flat_start)
+        self.live_inventory_i_accept_open_state_resume = bool(args.live_inventory_i_accept_open_state_resume)
         self.live_inventory_reset_state_after_manual_flat = bool(args.live_inventory_reset_state_after_manual_flat)
         self.live_inventory_lot_notional_usd = Decimal(str(args.live_inventory_lot_notional_usd))
         self.live_inventory_max_lots = int(args.live_inventory_max_lots)
@@ -2359,6 +2360,17 @@ class VariationalToLighterRuntime:
                             "live_inventory_state_not_flat: "
                             + self.live_inventory_state_summary(state)
                             + " | manually confirm Var/Lighter flat, then restart with --live-inventory-reset-state-after-manual-flat"
+                        )
+                elif self.live_inventory_i_accept_open_state_resume:
+                    state = self.load_live_inventory_state()
+                    state_status = clean_state_value(state.get("status")) or "unknown"
+                    open_lots = state.get("open_lots") if isinstance(state.get("open_lots"), list) else []
+                    if state_status == "open" and open_lots:
+                        passed.append("live_inventory_open_state_resume_accepted")
+                    else:
+                        blocking_errors.append(
+                            "live_inventory_open_state_resume_requires_open_lots: "
+                            + self.live_inventory_state_summary(state)
                         )
             if not account_index:
                 blocking_errors.append("LIGHTER_ACCOUNT_INDEX is not set")
@@ -7640,6 +7652,11 @@ def parse_args() -> argparse.Namespace:
         help="Required with --live-inventory to confirm Var and Lighter BTC positions were manually checked flat before startup.",
     )
     parser.add_argument(
+        "--live-inventory-i-accept-open-state-resume",
+        action="store_true",
+        help="Resume managing an existing live_inventory_state.json open position after manually confirming both venues match the state.",
+    )
+    parser.add_argument(
         "--live-inventory-reset-state-after-manual-flat",
         action="store_true",
         help="After manually confirming Var and Lighter are flat, reset log/live_inventory_state.json to flat during startup.",
@@ -7792,8 +7809,13 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory only works in --mode live")
         if args.auto_live_entry or args.auto_live_exit or args.auto_live_eager_hedge:
             parser.error("--live-inventory cannot be combined with --auto-live-entry/exit/eager-hedge")
-        if not args.live_inventory_i_confirm_flat_start:
-            parser.error("--live-inventory requires --live-inventory-i-confirm-flat-start after manually confirming Var BTC = 0 and Lighter BTC = 0")
+        if not args.live_inventory_i_confirm_flat_start and not args.live_inventory_i_accept_open_state_resume:
+            parser.error(
+                "--live-inventory requires --live-inventory-i-confirm-flat-start after manually confirming flat, "
+                "or --live-inventory-i-accept-open-state-resume after manually confirming the saved open state matches both venues"
+            )
+        if args.live_inventory_i_confirm_flat_start and args.live_inventory_i_accept_open_state_resume:
+            parser.error("use only one of --live-inventory-i-confirm-flat-start or --live-inventory-i-accept-open-state-resume")
         allowed_assets = {asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()}
         if args.live_inventory_signal_mode == LIVE_INVENTORY_SIGNAL_BASIS:
             if allowed_assets != {"ETH"}:

@@ -15,6 +15,7 @@ def _runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory = False
     runtime.live_inventory_dry_decisions = False
     runtime.live_inventory_i_confirm_flat_start = False
+    runtime.live_inventory_i_accept_open_state_resume = False
     runtime.live_inventory_reset_state_after_manual_flat = False
     runtime.auto_live_entry_max_precheck_edge_bps = Decimal("0")
     runtime.auto_live_state_file = tmp_path / "auto_live_state.json"
@@ -99,6 +100,30 @@ def test_live_inventory_state_open_blocks_startup(tmp_path, monkeypatch) -> None
     diagnostics = runtime.run_startup_diagnostics()
 
     assert any(error.startswith("live_inventory_state_not_flat:") for error in diagnostics.blocking_errors)
+
+
+def test_live_inventory_open_state_resume_allows_startup(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LIGHTER_ACCOUNT_INDEX", "1")
+    monkeypatch.setenv("LIGHTER_API_KEY_INDEX", "1")
+    monkeypatch.setenv("LIGHTER_PRIVATE_KEY", "secret")
+    runtime = _runtime(tmp_path)
+    runtime.auto_live_entry = False
+    runtime.live_inventory = True
+    runtime.live_inventory_dry_decisions = False
+    runtime.live_inventory_i_accept_open_state_resume = True
+    runtime.write_live_inventory_state(
+        {
+            "status": "open",
+            "asset": "ETH",
+            "next_lot_id": 3,
+            "open_lots": [{"lot_id": 1, "direction": "long_var_short_lighter", "qty": "0.01156"}],
+        }
+    )
+
+    diagnostics = runtime.run_startup_diagnostics()
+
+    assert diagnostics.blocking_errors == []
+    assert "live_inventory_open_state_resume_accepted" in diagnostics.passed
 
 
 def test_live_inventory_state_reset_allows_startup_after_manual_flat(tmp_path, monkeypatch) -> None:

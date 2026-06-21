@@ -257,6 +257,27 @@ def test_live_inventory_accepts_v1_safe_flags(monkeypatch) -> None:
     assert args.live_inventory_max_lighter_slippage_bps == 3.0
 
 
+def test_live_inventory_accepts_open_state_resume_instead_of_flat_start(monkeypatch) -> None:
+    argv = live_inventory_safe_argv()
+    argv.remove("--live-inventory-i-confirm-flat-start")
+    argv.append("--live-inventory-i-accept-open-state-resume")
+    monkeypatch.setattr("sys.argv", argv)
+
+    args = parse_args()
+
+    assert args.live_inventory_i_confirm_flat_start is False
+    assert args.live_inventory_i_accept_open_state_resume is True
+
+
+def test_live_inventory_rejects_flat_start_and_open_state_resume_together(monkeypatch) -> None:
+    argv = live_inventory_safe_argv()
+    argv.append("--live-inventory-i-accept-open-state-resume")
+    monkeypatch.setattr("sys.argv", argv)
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
 def live_inventory_basis_safe_argv() -> list[str]:
     argv = live_inventory_safe_argv()
     argv[argv.index("BTC")] = "ETH"
