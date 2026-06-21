@@ -308,6 +308,48 @@ def test_live_inventory_basis_real_submit_accepts_one_cycle_diagnostic(monkeypat
     assert args.live_inventory_max_cycles == 1
 
 
+def test_live_inventory_basis_real_submit_accepts_addon_diagnostic(monkeypatch) -> None:
+    argv = live_inventory_basis_safe_argv()
+    argv.remove("--live-inventory-dry-decisions")
+    monkeypatch.setattr(
+        "sys.argv",
+        argv
+        + [
+            "--live-inventory-max-total-lots",
+            "2",
+            "--live-inventory-max-cycles",
+            "1",
+            "--live-inventory-i-accept-basis-real-diagnostic",
+            "--live-inventory-i-accept-basis-addon-diagnostic",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.live_inventory_max_lots == 1
+    assert args.live_inventory_max_total_lots == 2
+    assert args.live_inventory_i_accept_basis_addon_diagnostic is True
+
+
+def test_live_inventory_basis_real_submit_rejects_addon_without_opt_in(monkeypatch) -> None:
+    argv = live_inventory_basis_safe_argv()
+    argv.remove("--live-inventory-dry-decisions")
+    monkeypatch.setattr(
+        "sys.argv",
+        argv
+        + [
+            "--live-inventory-max-total-lots",
+            "2",
+            "--live-inventory-max-cycles",
+            "1",
+            "--live-inventory-i-accept-basis-real-diagnostic",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
 def test_live_inventory_basis_real_submit_rejects_multiple_cycles(monkeypatch) -> None:
     argv = live_inventory_basis_safe_argv()
     argv.remove("--live-inventory-dry-decisions")

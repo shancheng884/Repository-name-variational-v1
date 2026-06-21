@@ -783,6 +783,10 @@ class VariationalToLighterRuntime:
         )
         self.live_inventory_basis_min_exit_pnl_bps = Decimal(str(args.live_inventory_basis_min_exit_pnl_bps))
         self.live_inventory_basis_max_hold_action = args.live_inventory_basis_max_hold_action
+        self.live_inventory_i_accept_basis_addon_diagnostic = bool(args.live_inventory_i_accept_basis_addon_diagnostic)
+        self.live_inventory_basis_addon_min_basis_improvement_bps = Decimal(
+            str(args.live_inventory_basis_addon_min_basis_improvement_bps)
+        )
         self.paper_notional_usd = Decimal(str(args.paper_notional_usd))
         self.paper_entry_deviation_bps = Decimal(str(args.paper_entry_deviation_bps))
         self.paper_exit_deviation_bps = Decimal(str(args.paper_exit_deviation_bps))
@@ -1490,6 +1494,7 @@ class VariationalToLighterRuntime:
             "entry_lighter_submit_ms": lighter_submit_ms,
             "entry_lighter_record_key": lighter_record.trade_key,
             "entry_lighter_payload": lighter_payload,
+            "entry_kind": context.get("entry_kind") or "basis_initial",
             "entered_at": utc_now(),
             "entered_sample_index": context.get("sample_index") or self.live_inventory_sample_index,
             "status": "open",
@@ -1511,6 +1516,7 @@ class VariationalToLighterRuntime:
                 "entry_basis_bps": context.get("basis_bps"),
                 "entry_z": context.get("z"),
                 "entry_direction_signal": context.get("direction_signal"),
+                "entry_kind": lot["entry_kind"],
                 "var_price": decimal_to_str(var_fill_price),
                 "lighter_price": decimal_to_str(lighter_fill_price),
                 "var_submit_ms": context.get("var_submit_ms"),
@@ -5106,7 +5112,30 @@ class VariationalToLighterRuntime:
             "completed_cycles": self.live_inventory_completed_cycles,
         }
         await self.append_live_inventory_log("live_inventory_basis_state", state_payload)
-        if not self.live_inventory_open_lots:
+        addon_direction: str | None = None
+        if (
+            self.live_inventory_open_lots
+            and self.live_inventory_i_accept_basis_addon_diagnostic
+            and len(self.live_inventory_open_lots) < self.live_inventory_max_total_lots
+            and warm
+        ):
+            open_directions = {str(lot.get("direction") or "") for lot in self.live_inventory_open_lots}
+            if len(open_directions) == 1:
+                existing_direction = next(iter(open_directions))
+                entry_basis_values = [
+                    value
+                    for lot in self.live_inventory_open_lots
+                    if (value := to_decimal(lot.get("entry_basis_bps"))) is not None
+                ]
+                if existing_direction == DIRECTION_LONG_VAR_SHORT_LIGHTER and entry_basis_values:
+                    addon_threshold = min(entry_basis_values) - self.live_inventory_basis_addon_min_basis_improvement_bps
+                    if basis_bps <= addon_threshold:
+                        addon_direction = existing_direction
+                elif existing_direction == DIRECTION_SHORT_VAR_LONG_LIGHTER and entry_basis_values:
+                    addon_threshold = max(entry_basis_values) + self.live_inventory_basis_addon_min_basis_improvement_bps
+                    if basis_bps >= addon_threshold:
+                        addon_direction = existing_direction
+        if not self.live_inventory_open_lots or addon_direction is not None:
             if self.has_pending_live_inventory_var_fill_match(asset=asset, roles={"live_inventory_entry_pending_lighter"}):
                 if await self.maybe_timeout_pending_live_inventory_var_entry(asset=asset):
                     return
@@ -5122,6 +5151,8 @@ class VariationalToLighterRuntime:
                 (DIRECTION_SHORT_VAR_LONG_LIGHTER, short_edge_bps, short_roundtrip_pnl_bps, var_bid, lighter_buy_price),
             )
             for direction, edge_bps, roundtrip_bps, var_price, lighter_price in candidates:
+                if addon_direction is not None and direction != addon_direction:
+                    continue
                 direction_signal = self.live_inventory_basis_direction_signal(direction, z)
                 if direction_signal < self.live_inventory_basis_z_entry:
                     continue
@@ -5202,6 +5233,7 @@ class VariationalToLighterRuntime:
                                 "quote_timestamp": quote.get("quoteTimestamp") or quote.get("quote_timestamp"),
                                 "var_bid": decimal_to_str(var_bid),
                                 "var_ask": decimal_to_str(var_ask),
+                                "entry_kind": "basis_addon" if addon_direction is not None else "basis_initial",
                             },
                         )
                     )
@@ -5285,6 +5317,7 @@ class VariationalToLighterRuntime:
                     "entry_var_result": var_result,
                     "entry_lighter_record_key": lighter_record.trade_key if lighter_record is not None else None,
                     "entry_lighter_payload": lighter_payload,
+                    "entry_kind": "basis_addon" if addon_direction is not None else "basis_initial",
                     "status": "dry_open" if self.live_inventory_dry_decisions else "open",
                 }
                 self.live_inventory_next_lot_id += 1
@@ -5295,10 +5328,11 @@ class VariationalToLighterRuntime:
                 await self.persist_live_inventory_memory(reason="basis_dry_entry_decision" if self.live_inventory_dry_decisions else "basis_entry_submitted")
                 await self.append_live_inventory_log(
                     "live_inventory_dry_entered" if self.live_inventory_dry_decisions else "live_inventory_entered",
-                    {**state_payload, "lot_id": lot_id, "direction": direction, "qty": lot["qty"], "edge_bps": decimal_to_str(edge_bps), "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps), "var_submit_ms": var_submit_ms, "lighter_submit_ms": lighter_submit_ms},
+                    {**state_payload, "lot_id": lot_id, "direction": direction, "qty": lot["qty"], "edge_bps": decimal_to_str(edge_bps), "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps), "var_submit_ms": var_submit_ms, "lighter_submit_ms": lighter_submit_ms, "entry_kind": lot["entry_kind"]},
                 )
                 return
-            return
+            if not self.live_inventory_open_lots:
+                return
         lot = self.live_inventory_open_lots[0]
         direction = str(lot.get("direction") or "")
         entered_sample_index = int(lot.get("entered_sample_index") or index)
@@ -7664,6 +7698,12 @@ def parse_args() -> argparse.Namespace:
         default="exit",
         help="Basis live-inventory action when max hold samples is reached. Default exits; 'warn' logs and waits for z-score exit or stop-loss.",
     )
+    parser.add_argument(
+        "--live-inventory-i-accept-basis-addon-diagnostic",
+        action="store_true",
+        help="Diagnostic real-submit only: allow at most one same-direction ETH basis add-on lot when basis expands further.",
+    )
+    parser.add_argument("--live-inventory-basis-addon-min-basis-improvement-bps", type=float, default=1.5)
     parser.add_argument("--live-inventory-basis-half-life-seconds", type=float, default=300.0)
     parser.add_argument("--live-inventory-basis-warmup-samples", type=int, default=120)
     parser.add_argument("--live-inventory-basis-gap-reset-seconds", type=float, default=30.0)
@@ -7765,12 +7805,17 @@ def parse_args() -> argparse.Namespace:
                     )
                 if args.live_inventory_lot_notional_usd != 20:
                     parser.error("basis real-submit diagnostic requires --live-inventory-lot-notional-usd 20")
-                if args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 1:
+                if args.live_inventory_i_accept_basis_addon_diagnostic:
+                    if args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 2:
+                        parser.error("basis add-on diagnostic requires --live-inventory-max-lots 1 --live-inventory-max-total-lots 2")
+                elif args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 1:
                     parser.error("basis real-submit diagnostic requires --live-inventory-max-lots 1 --live-inventory-max-total-lots 1")
                 if args.live_inventory_max_cycles != 1:
                     parser.error("basis real-submit diagnostic requires --live-inventory-max-cycles 1")
             elif args.live_inventory_i_accept_basis_real_diagnostic:
                 parser.error("--live-inventory-i-accept-basis-real-diagnostic is only for real-submit diagnostic runs")
+            elif args.live_inventory_i_accept_basis_addon_diagnostic:
+                parser.error("--live-inventory-i-accept-basis-addon-diagnostic is only for real-submit diagnostic runs")
         elif allowed_assets != {"BTC"}:
             parser.error("--live-inventory V1 snapshot mode requires --live-allowed-assets BTC")
         if args.variational_submit_transport != VARIATIONAL_SUBMIT_TRANSPORT_API:
