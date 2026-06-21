@@ -782,7 +782,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_max_entry_roundtrip_cost_bps = Decimal(
             str(args.live_inventory_basis_max_entry_roundtrip_cost_bps)
         )
+        self.live_inventory_basis_min_abs_entry_bps = Decimal(str(args.live_inventory_basis_min_abs_entry_bps))
         self.live_inventory_basis_min_exit_pnl_bps = Decimal(str(args.live_inventory_basis_min_exit_pnl_bps))
+        self.live_inventory_basis_exit_safety_buffer_bps = Decimal(str(args.live_inventory_basis_exit_safety_buffer_bps))
         self.live_inventory_basis_max_hold_action = args.live_inventory_basis_max_hold_action
         self.live_inventory_i_accept_basis_addon_diagnostic = bool(args.live_inventory_i_accept_basis_addon_diagnostic)
         self.live_inventory_basis_addon_min_basis_improvement_bps = Decimal(
@@ -1371,6 +1373,16 @@ class VariationalToLighterRuntime:
             return z
         if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
             return -z
+        raise ValueError(f"unsupported direction: {direction}")
+
+    def live_inventory_basis_abs_entry_ok(self, *, direction: str, basis_bps: Decimal) -> bool:
+        threshold = self.live_inventory_basis_min_abs_entry_bps
+        if threshold <= 0:
+            return True
+        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+            return basis_bps <= -threshold
+        if direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
+            return basis_bps >= threshold
         raise ValueError(f"unsupported direction: {direction}")
 
     async def live_inventory_lighter_slippage_bps(self, *, lighter_side: str, qty: Decimal) -> tuple[Decimal | None, Decimal | None]:
@@ -5173,6 +5185,18 @@ class VariationalToLighterRuntime:
                 direction_signal = self.live_inventory_basis_direction_signal(direction, z)
                 if direction_signal < self.live_inventory_basis_z_entry:
                     continue
+                if not self.live_inventory_basis_abs_entry_ok(direction=direction, basis_bps=basis_bps):
+                    await self.append_live_inventory_log(
+                        "live_inventory_entry_blocked",
+                        {
+                            **state_payload,
+                            "reason": "basis_abs_entry_threshold_not_met",
+                            "direction": direction,
+                            "basis_bps": decimal_to_str(basis_bps),
+                            "min_abs_entry_bps": decimal_to_str(self.live_inventory_basis_min_abs_entry_bps),
+                        },
+                    )
+                    continue
                 if edge_bps < self.live_inventory_basis_min_entry_edge_bps:
                     continue
                 if roundtrip_bps < -self.live_inventory_basis_max_entry_roundtrip_cost_bps:
@@ -5379,7 +5403,8 @@ class VariationalToLighterRuntime:
             pnl_bps = pnl / notional * Decimal("10000") if notional else None
             direction_signal = self.live_inventory_basis_direction_signal(direction, z)
             can_exit_on_reversion = holding_samples >= self.live_inventory_min_hold_samples
-            should_exit = can_exit_on_reversion and direction_signal <= self.live_inventory_basis_z_exit and (pnl_bps is not None and pnl_bps >= self.live_inventory_basis_min_exit_pnl_bps)
+            effective_min_exit_pnl_bps = self.live_inventory_basis_min_exit_pnl_bps + self.live_inventory_basis_exit_safety_buffer_bps
+            should_exit = can_exit_on_reversion and direction_signal <= self.live_inventory_basis_z_exit and (pnl_bps is not None and pnl_bps >= effective_min_exit_pnl_bps)
             should_stop = pnl_bps is not None and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
             should_timeout = holding_samples >= self.live_inventory_max_hold_samples
             should_timeout_exit = should_timeout and self.live_inventory_basis_max_hold_action == "exit"
@@ -5399,6 +5424,9 @@ class VariationalToLighterRuntime:
                             "basis_max_hold_action": self.live_inventory_basis_max_hold_action,
                             "direction_signal": decimal_to_str(direction_signal),
                             "pnl_bps": decimal_to_str(pnl_bps),
+                            "min_exit_pnl_bps": decimal_to_str(self.live_inventory_basis_min_exit_pnl_bps),
+                            "exit_safety_buffer_bps": decimal_to_str(self.live_inventory_basis_exit_safety_buffer_bps),
+                            "effective_min_exit_pnl_bps": decimal_to_str(effective_min_exit_pnl_bps),
                         },
                     )
             if should_exit or should_stop or should_timeout_exit:
@@ -5418,6 +5446,7 @@ class VariationalToLighterRuntime:
                     "should_stop": should_stop,
                     "should_timeout": should_timeout,
                     "should_timeout_exit": should_timeout_exit,
+                    "effective_min_exit_pnl_bps": effective_min_exit_pnl_bps,
                 }
                 break
         if selected_exit is None:
@@ -5437,6 +5466,7 @@ class VariationalToLighterRuntime:
         should_stop = bool(selected_exit["should_stop"])
         should_timeout = bool(selected_exit["should_timeout"])
         should_timeout_exit = bool(selected_exit["should_timeout_exit"])
+        effective_min_exit_pnl_bps = selected_exit["effective_min_exit_pnl_bps"]
         exit_reason = "signal_reverted" if should_exit else "max_unrealized_loss_bps" if should_stop else "max_hold_samples"
         var_submit_ms = None
         lighter_submit_ms = None
@@ -5583,6 +5613,9 @@ class VariationalToLighterRuntime:
                 "holding_samples": holding_samples,
                 "pnl_usd": decimal_to_str(pnl),
                 "pnl_bps": decimal_to_str(pnl_bps),
+                "min_exit_pnl_bps": decimal_to_str(self.live_inventory_basis_min_exit_pnl_bps),
+                "exit_safety_buffer_bps": decimal_to_str(self.live_inventory_basis_exit_safety_buffer_bps),
+                "effective_min_exit_pnl_bps": decimal_to_str(effective_min_exit_pnl_bps),
                 "var_price": decimal_to_str(var_exit_price),
                 "lighter_price": decimal_to_str(lighter_exit_price),
                 "actual_pnl_status": actual_pnl_status,
@@ -7766,7 +7799,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-basis-z-exit", type=float, default=0.0)
     parser.add_argument("--live-inventory-basis-min-entry-edge-bps", type=float, default=7.0)
     parser.add_argument("--live-inventory-basis-max-entry-roundtrip-cost-bps", type=float, default=4.0)
+    parser.add_argument(
+        "--live-inventory-basis-min-abs-entry-bps",
+        type=float,
+        default=0.0,
+        help="Minimum absolute basis bps required for ETH basis entries. Long Var/short Lighter requires basis <= -value; short Var/long Lighter requires basis >= value. Set 0 to disable. Default: 0",
+    )
     parser.add_argument("--live-inventory-basis-min-exit-pnl-bps", type=float, default=1.0)
+    parser.add_argument(
+        "--live-inventory-basis-exit-safety-buffer-bps",
+        type=float,
+        default=0.0,
+        help="Extra estimated PnL bps required above --live-inventory-basis-min-exit-pnl-bps before basis exit. Default: 0",
+    )
     parser.add_argument(
         "--live-inventory-basis-max-hold-action",
         choices=("exit", "warn"),
@@ -7955,8 +8000,12 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-basis-min-entry-edge-bps must be >= 0")
         if args.live_inventory_basis_max_entry_roundtrip_cost_bps < 0:
             parser.error("--live-inventory-basis-max-entry-roundtrip-cost-bps must be >= 0")
+        if args.live_inventory_basis_min_abs_entry_bps < 0:
+            parser.error("--live-inventory-basis-min-abs-entry-bps must be >= 0")
         if args.live_inventory_basis_min_exit_pnl_bps < 0:
             parser.error("--live-inventory-basis-min-exit-pnl-bps must be >= 0")
+        if args.live_inventory_basis_exit_safety_buffer_bps < 0:
+            parser.error("--live-inventory-basis-exit-safety-buffer-bps must be >= 0")
         if args.live_inventory_basis_half_life_seconds <= 0:
             parser.error("--live-inventory-basis-half-life-seconds must be > 0")
         if args.live_inventory_basis_warmup_samples <= 0:

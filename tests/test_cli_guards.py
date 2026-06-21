@@ -294,6 +294,26 @@ def test_live_inventory_basis_dry_accepts_eth(monkeypatch) -> None:
     assert args.live_allowed_assets == "ETH"
     assert args.live_inventory_basis_z_entry == 4.0
     assert args.live_inventory_basis_min_entry_edge_bps == 7.0
+    assert args.live_inventory_basis_min_abs_entry_bps == 0.0
+    assert args.live_inventory_basis_exit_safety_buffer_bps == 0.0
+
+
+def test_live_inventory_basis_accepts_abs_entry_and_exit_buffer(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        live_inventory_basis_safe_argv()
+        + [
+            "--live-inventory-basis-min-abs-entry-bps",
+            "12",
+            "--live-inventory-basis-exit-safety-buffer-bps",
+            "1.5",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.live_inventory_basis_min_abs_entry_bps == 12.0
+    assert args.live_inventory_basis_exit_safety_buffer_bps == 1.5
 
 
 def test_live_inventory_basis_rejects_real_submit(monkeypatch) -> None:

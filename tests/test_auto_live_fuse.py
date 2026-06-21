@@ -881,6 +881,8 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_max_hold_samples = 300
     runtime.live_inventory_max_unrealized_loss_bps = Decimal("25")
     runtime.live_inventory_basis_max_hold_action = "exit"
+    runtime.live_inventory_basis_min_abs_entry_bps = Decimal("0")
+    runtime.live_inventory_basis_exit_safety_buffer_bps = Decimal("0")
     runtime.live_inventory_i_accept_basis_addon_diagnostic = False
     runtime.live_inventory_basis_addon_min_basis_improvement_bps = Decimal("1.5")
     runtime.live_inventory_state_file = Path(tmp_path) / "live_inventory_state.json"
@@ -1064,6 +1066,52 @@ def test_live_inventory_basis_real_entry_waits_for_var_fill_before_lighter(tmp_p
         assert runtime.live_inventory_open_lots[0]["entry_var_price_source"] == "final_fill"
         assert rows[-1]["event"] == "live_inventory_entered"
         assert rows[-1]["entry_confirmation_mode"] == "var_fill_then_lighter"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_basis_abs_entry_threshold_blocks_thin_basis(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_dry_decisions = True
+        runtime.live_inventory_signal_mode = "basis"
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.accepted_assets = {"ETH"}
+        runtime.live_inventory_lot_notional_usd = Decimal("20")
+        runtime.live_inventory_basis_z_entry = Decimal("4")
+        runtime.live_inventory_basis_min_entry_edge_bps = Decimal("7")
+        runtime.live_inventory_basis_max_entry_roundtrip_cost_bps = Decimal("4")
+        runtime.live_inventory_basis_min_abs_entry_bps = Decimal("12")
+        runtime.live_inventory_basis_state = LiveInventoryBasisState(
+            half_life_seconds=300,
+            warmup_samples=1,
+            gap_reset_seconds=30,
+            sigma_floor_bps=0,
+        )
+        runtime.live_inventory_basis_state.mean = -7.0
+        runtime.live_inventory_basis_state.var = 0.1
+        runtime.live_inventory_basis_state.seen = 10
+        runtime.live_inventory_basis_state.last_ts = time.monotonic()
+
+        async def fake_fetch_live_inventory_basis_quote(**_kwargs):
+            return {
+                "quoteId": "entry-quote",
+                "bid": "1753.00",
+                "ask": "1753.25",
+                "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+            }, Decimal("10")
+
+        runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
+
+        await runtime.maybe_run_live_inventory_basis(_eth_inventory_snapshot())
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert runtime.live_inventory_open_lots == []
+        assert any(
+            row["event"] == "live_inventory_entry_blocked"
+            and row["reason"] == "basis_abs_entry_threshold_not_met"
+            for row in rows
+        )
 
     asyncio.run(run())
 
@@ -1557,6 +1605,63 @@ def test_live_inventory_basis_exit_can_skip_blocked_first_lot(tmp_path) -> None:
         assert exited[-1]["lot_id"] == 2
         assert [lot["lot_id"] for lot in runtime.live_inventory_open_lots] == [1]
         assert runtime.live_inventory_completed_cycles == 1
+
+    asyncio.run(run())
+
+
+def test_live_inventory_basis_exit_safety_buffer_raises_effective_threshold(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_signal_mode = "basis"
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.accepted_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = []
+        runtime.live_inventory_basis_z_exit = Decimal("999")
+        runtime.live_inventory_basis_min_exit_pnl_bps = Decimal("0")
+        runtime.live_inventory_basis_exit_safety_buffer_bps = Decimal("1")
+        runtime.live_inventory_basis_max_hold_action = "warn"
+        runtime.live_inventory_basis_state = LiveInventoryBasisState(
+            half_life_seconds=300,
+            warmup_samples=1,
+            gap_reset_seconds=30,
+            sigma_floor_bps=0,
+        )
+        runtime.live_inventory_basis_state.mean = -10.0
+        runtime.live_inventory_basis_state.var = 1.0
+        runtime.live_inventory_basis_state.seen = 10
+        runtime.live_inventory_basis_state.last_ts = time.monotonic()
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 1,
+                "signal_mode": "basis",
+                "direction": "long_var_short_lighter",
+                "qty": "0.01",
+                "entry_var_side": "BUY",
+                "entry_var_fill_price": "1710",
+                "entry_lighter_fill_price": "1710",
+                "entry_cost_status": "final_fills_confirmed",
+                "entered_sample_index": 1,
+                "status": "open",
+            }
+        ]
+        runtime.live_inventory_sample_index = 500
+
+        async def fake_fetch_live_inventory_basis_quote(**_kwargs):
+            return {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"}, Decimal("10")
+
+        runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
+        snapshot = _eth_inventory_snapshot()
+        snapshot.lighter_ask = Decimal("1710")
+        snapshot.lighter_buy_price = Decimal("1710")
+        snapshot.lighter_buy_fill_price = Decimal("1710")
+
+        await runtime.maybe_run_live_inventory_basis(snapshot)
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert runtime.live_inventory_open_lots
+        assert rows[-1]["event"] == "live_inventory_exit_blocked"
+        assert rows[-1]["pnl_bps"] == "0"
+        assert rows[-1]["effective_min_exit_pnl_bps"] == "1"
 
     asyncio.run(run())
 
