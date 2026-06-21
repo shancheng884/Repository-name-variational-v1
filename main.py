@@ -2925,6 +2925,11 @@ class VariationalToLighterRuntime:
                     return value
         return Decimal("0")
 
+    @staticmethod
+    def variational_error_is_no_position(error: Any) -> bool:
+        text = str(error or "").lower()
+        return "no position exists" in text
+
     async def place_lighter_order_from_plan(
         self,
         *,
@@ -5430,32 +5435,16 @@ class VariationalToLighterRuntime:
                 )
             )
             try:
-                var_task = asyncio.create_task(
-                    self._timed_submit(
-                        self.send_variational_place_order(
-                            asset=asset,
-                            side=exit_side,
-                            amount=var_amount,
-                            expected_min_btc_qty=None,
-                            confirm=True,
-                            reduce_only=True,
-                        )
+                var_result, var_submit_ms = await self._timed_submit(
+                    self.send_variational_place_order(
+                        asset=asset,
+                        side=exit_side,
+                        amount=var_amount,
+                        expected_min_btc_qty=None,
+                        confirm=True,
+                        reduce_only=True,
                     )
                 )
-                lighter_task = asyncio.create_task(
-                    self._timed_submit(
-                        self.place_lighter_order_from_plan(
-                            asset=asset,
-                            side=exit_side,
-                            qty=qty,
-                            var_fill_price=var_exit_price,
-                            cycle_id=int(lot.get("lot_id") or 0),
-                            role="live_inventory_exit",
-                            reduce_only=True,
-                        )
-                    )
-                )
-                var_outcome, lighter_outcome = await asyncio.gather(var_task, lighter_task, return_exceptions=True)
             except Exception as exc:
                 await self.require_live_inventory_manual_review(
                     asset=asset,
@@ -5463,33 +5452,67 @@ class VariationalToLighterRuntime:
                     context={"action": "exit", "lot_id": lot.get("lot_id"), "direction": direction, "qty": decimal_to_str(qty), "var_amount": var_amount},
                 )
                 return
-            if isinstance(var_outcome, Exception):
-                self.remove_pending_live_inventory_var_fill_match(asset=asset, lot_id=lot.get("lot_id"), role="live_inventory_exit")
-                await self.require_live_inventory_manual_review(
-                    asset=asset,
-                    reason=f"basis_exit_var_submit_exception:{var_outcome}",
-                    context={"action": "exit", "lot_id": lot.get("lot_id"), "direction": direction, "qty": decimal_to_str(qty), "var_amount": var_amount},
-                )
-                return
-            if isinstance(lighter_outcome, Exception):
-                await self.require_live_inventory_manual_review(
-                    asset=asset,
-                    reason=f"basis_exit_lighter_submit_exception:{lighter_outcome}",
-                    context={"action": "exit", "lot_id": lot.get("lot_id"), "direction": direction, "qty": decimal_to_str(qty), "var_amount": var_amount},
-                )
-                return
-            var_result, var_submit_ms = var_outcome
-            lighter_result, lighter_submit_ms = lighter_outcome
             if not var_result.get("ok"):
                 self.remove_pending_live_inventory_var_fill_match(asset=asset, lot_id=lot.get("lot_id"), role="live_inventory_exit")
+                var_error = var_result.get("error") or "unknown"
+                positions_result = None
+                position_qty = None
+                if self.variational_error_is_no_position(var_error):
+                    with contextlib.suppress(Exception):
+                        positions_result = await self.fetch_variational_positions()
+                        position_qty = self.extract_variational_position_qty(positions_result, asset=asset)
+                if self.variational_error_is_no_position(var_error) and position_qty == 0:
+                    await self.append_live_inventory_log(
+                        "live_inventory_var_exit_reconciled_flat",
+                        {
+                            **state_payload,
+                            "lot_id": lot.get("lot_id"),
+                            "direction": direction,
+                            "qty": decimal_to_str(qty),
+                            "var_amount": var_amount,
+                            "var_result": var_result,
+                            "variational_position_qty": decimal_to_str(position_qty),
+                            "variational_positions_result": positions_result,
+                            "action": "continue_lighter_reduce_only_exit",
+                        },
+                    )
+                else:
+                    await self.require_live_inventory_manual_review(
+                        asset=asset,
+                        reason=f"basis_exit_var_submit_failed:{var_error}",
+                        context={
+                            "action": "exit",
+                            "lot_id": lot.get("lot_id"),
+                            "direction": direction,
+                            "qty": decimal_to_str(qty),
+                            "var_amount": var_amount,
+                            "var_result": var_result,
+                            "variational_position_qty": decimal_to_str(position_qty) if position_qty is not None else None,
+                            "variational_positions_result": positions_result,
+                        },
+                    )
+                    return
+            else:
+                exit_var_order_quote = self.variational_api_order_quote_fields(exit_side, var_result)
+            try:
+                (lighter_record, lighter_payload), lighter_submit_ms = await self._timed_submit(
+                    self.place_lighter_order_from_plan(
+                        asset=asset,
+                        side=exit_side,
+                        qty=qty,
+                        var_fill_price=var_exit_price,
+                        cycle_id=int(lot.get("lot_id") or 0),
+                        role="live_inventory_exit",
+                        reduce_only=True,
+                    )
+                )
+            except Exception as exc:
                 await self.require_live_inventory_manual_review(
                     asset=asset,
-                    reason=f"basis_exit_var_submit_failed:{var_result.get('error') or 'unknown'}",
-                    context={"action": "exit", "lot_id": lot.get("lot_id"), "direction": direction, "qty": decimal_to_str(qty), "var_amount": var_amount, "var_result": var_result},
+                    reason=f"basis_exit_lighter_submit_exception:{exc}",
+                    context={"action": "exit", "lot_id": lot.get("lot_id"), "direction": direction, "qty": decimal_to_str(qty), "var_amount": var_amount},
                 )
                 return
-            exit_var_order_quote = self.variational_api_order_quote_fields(exit_side, var_result)
-            lighter_record, lighter_payload = lighter_result
             if lighter_record is None or not self.auto_live_eager_hedge_started(lighter_record):
                 await self.require_live_inventory_manual_review(
                     asset=asset,
@@ -5581,7 +5604,7 @@ class VariationalToLighterRuntime:
                 refreshed_var_quote_ms: str | None = None
                 if not self.live_inventory_dry_decisions:
                     if self.live_inventory_refresh_var_quote_before_entry:
-                        var_amount_for_quote = variational_api_amount_to_str(qty, asset=asset)
+                        var_amount_for_quote = variational_api_amount_to_str(qty, asset=snapshot.asset)
                         quote_result, refreshed_var_quote_ms = await self._timed_submit(
                             self.send_variational_place_order(
                                 asset=snapshot.asset,
@@ -5634,7 +5657,7 @@ class VariationalToLighterRuntime:
                             context=preflight_context,
                         )
                         return
-                    var_amount = variational_api_amount_to_str(qty, asset=asset)
+                    var_amount = variational_api_amount_to_str(qty, asset=snapshot.asset)
                     self.add_pending_live_inventory_var_fill_match(
                         PendingLiveInventoryVarFillMatch(
                             asset=snapshot.asset,
@@ -5905,7 +5928,7 @@ class VariationalToLighterRuntime:
         exit_reason = "spread_reverted" if should_exit else "max_hold_samples"
         if not self.live_inventory_dry_decisions:
             exit_side = self._opposite_var_side(str(lot.get("entry_var_side") or self._auto_live_direction_to_var_side(direction)))
-            var_amount = variational_api_amount_to_str(qty, asset=asset)
+            var_amount = variational_api_amount_to_str(qty, asset=snapshot.asset)
             self.add_pending_live_inventory_var_fill_match(
                 PendingLiveInventoryVarFillMatch(
                     asset=snapshot.asset,

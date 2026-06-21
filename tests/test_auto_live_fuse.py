@@ -997,8 +997,8 @@ def test_live_inventory_basis_real_entry_waits_for_var_fill_before_lighter(tmp_p
         runtime.live_inventory_basis_z_entry = Decimal("4")
         runtime.live_inventory_basis_min_entry_edge_bps = Decimal("7")
         runtime.live_inventory_basis_max_entry_roundtrip_cost_bps = Decimal("4")
-        runtime.live_inventory_basis_z_exit = Decimal("0")
-        runtime.live_inventory_basis_min_exit_pnl_bps = Decimal("1")
+        runtime.live_inventory_basis_z_exit = Decimal("999")
+        runtime.live_inventory_basis_min_exit_pnl_bps = Decimal("-999")
         runtime.pending_live_inventory_var_fill_matches = []
         calls: list[dict] = []
 
@@ -1329,6 +1329,152 @@ def test_live_inventory_basis_max_hold_warn_does_not_exit(tmp_path) -> None:
         assert runtime.live_inventory_completed_cycles == 0
         assert rows[-1]["event"] == "live_inventory_exit_blocked"
         assert rows[-1]["reason"] == "basis_max_hold_reached_waiting_for_reversion"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_basis_exit_submits_var_before_lighter(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_signal_mode = "basis"
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.accepted_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = []
+        runtime.live_inventory_basis_z_exit = Decimal("999")
+        runtime.live_inventory_basis_min_exit_pnl_bps = Decimal("-999")
+        runtime.live_inventory_basis_state = LiveInventoryBasisState(
+            half_life_seconds=300,
+            warmup_samples=1,
+            gap_reset_seconds=30,
+            sigma_floor_bps=0,
+        )
+        runtime.live_inventory_basis_state.mean = -10.0
+        runtime.live_inventory_basis_state.var = 1.0
+        runtime.live_inventory_basis_state.seen = 10
+        runtime.live_inventory_basis_state.last_ts = time.monotonic()
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 1,
+                "signal_mode": "basis",
+                "direction": "long_var_short_lighter",
+                "qty": "0.01",
+                "entry_var_side": "BUY",
+                "entry_var_fill_price": "1700",
+                "entry_lighter_fill_price": "1720",
+                "entry_cost_status": "final_fills_confirmed",
+                "entered_sample_index": 1,
+                "status": "open",
+            }
+        ]
+        runtime.live_inventory_sample_index = 5
+        calls: list[str] = []
+
+        async def fake_fetch_live_inventory_basis_quote(**_kwargs):
+            return {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"}, Decimal("10")
+
+        async def fake_send_variational_place_order(**_kwargs):
+            calls.append("var")
+            return {"ok": True, "result": {"quoteId": "exit-quote"}}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            calls.append("lighter")
+            assert calls == ["var", "lighter"]
+
+            class Record:
+                processing_stage = "live_submit_sent"
+
+            return Record(), {"trade_key": "lighter-exit"}
+
+        runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+        snapshot = _eth_inventory_snapshot()
+        snapshot.lighter_ask = Decimal("1710")
+        snapshot.lighter_buy_price = Decimal("1710")
+        snapshot.lighter_buy_fill_price = Decimal("1710")
+
+        await runtime.maybe_run_live_inventory_basis(snapshot)
+
+        assert calls == ["var", "lighter"]
+        assert runtime.live_inventory_open_lots == []
+        assert runtime.live_inventory_completed_cycles == 1
+
+    asyncio.run(run())
+
+
+def test_live_inventory_basis_exit_reconciles_var_no_position_before_lighter(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_signal_mode = "basis"
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.accepted_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = []
+        runtime.live_inventory_basis_z_exit = Decimal("999")
+        runtime.live_inventory_basis_min_exit_pnl_bps = Decimal("-999")
+        runtime.live_inventory_basis_state = LiveInventoryBasisState(
+            half_life_seconds=300,
+            warmup_samples=1,
+            gap_reset_seconds=30,
+            sigma_floor_bps=0,
+        )
+        runtime.live_inventory_basis_state.mean = -10.0
+        runtime.live_inventory_basis_state.var = 1.0
+        runtime.live_inventory_basis_state.seen = 10
+        runtime.live_inventory_basis_state.last_ts = time.monotonic()
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 1,
+                "signal_mode": "basis",
+                "direction": "long_var_short_lighter",
+                "qty": "0.01",
+                "entry_var_side": "BUY",
+                "entry_var_fill_price": "1700",
+                "entry_lighter_fill_price": "1720",
+                "entry_cost_status": "final_fills_confirmed",
+                "entered_sample_index": 1,
+                "status": "open",
+            }
+        ]
+        runtime.live_inventory_sample_index = 5
+        calls: list[str] = []
+
+        async def fake_fetch_live_inventory_basis_quote(**_kwargs):
+            return {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"}, Decimal("10")
+
+        async def fake_send_variational_place_order(**_kwargs):
+            calls.append("var")
+            return {"ok": False, "error": {"error_message": ": No position exists for ETH to reduce"}}
+
+        async def fake_fetch_variational_positions():
+            calls.append("positions")
+            return {"ok": True, "result": {"positions": []}}
+
+        async def fake_place_lighter_order_from_plan(**kwargs):
+            calls.append("lighter")
+            assert kwargs["reduce_only"] is True
+
+            class Record:
+                processing_stage = "live_submit_sent"
+
+            return Record(), {"trade_key": "lighter-exit"}
+
+        runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.fetch_variational_positions = fake_fetch_variational_positions
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+        snapshot = _eth_inventory_snapshot()
+        snapshot.lighter_ask = Decimal("1710")
+        snapshot.lighter_buy_price = Decimal("1710")
+        snapshot.lighter_buy_fill_price = Decimal("1710")
+
+        await runtime.maybe_run_live_inventory_basis(snapshot)
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert calls == ["var", "positions", "lighter"]
+        assert any(row["event"] == "live_inventory_var_exit_reconciled_flat" for row in rows)
+        assert rows[-1]["event"] == "live_inventory_exited"
+        assert runtime.live_inventory_open_lots == []
+        assert runtime.live_inventory_completed_cycles == 1
 
     asyncio.run(run())
 
