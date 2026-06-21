@@ -296,6 +296,8 @@ def test_live_inventory_basis_dry_accepts_eth(monkeypatch) -> None:
     assert args.live_inventory_basis_min_entry_edge_bps == 7.0
     assert args.live_inventory_basis_min_abs_entry_bps == 0.0
     assert args.live_inventory_basis_exit_safety_buffer_bps == 0.0
+    assert args.live_inventory_basis_dynamic_exit_buffer is False
+    assert args.live_inventory_basis_refresh_exit_quote_before_submit is False
 
 
 def test_live_inventory_basis_accepts_abs_entry_and_exit_buffer(monkeypatch) -> None:
@@ -307,6 +309,8 @@ def test_live_inventory_basis_accepts_abs_entry_and_exit_buffer(monkeypatch) -> 
             "12",
             "--live-inventory-basis-exit-safety-buffer-bps",
             "1.5",
+            "--live-inventory-basis-dynamic-exit-buffer",
+            "--live-inventory-basis-refresh-exit-quote-before-submit",
         ],
     )
 
@@ -314,6 +318,8 @@ def test_live_inventory_basis_accepts_abs_entry_and_exit_buffer(monkeypatch) -> 
 
     assert args.live_inventory_basis_min_abs_entry_bps == 12.0
     assert args.live_inventory_basis_exit_safety_buffer_bps == 1.5
+    assert args.live_inventory_basis_dynamic_exit_buffer is True
+    assert args.live_inventory_basis_refresh_exit_quote_before_submit is True
 
 
 def test_live_inventory_basis_rejects_real_submit(monkeypatch) -> None:

@@ -785,6 +785,8 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_min_abs_entry_bps = Decimal(str(args.live_inventory_basis_min_abs_entry_bps))
         self.live_inventory_basis_min_exit_pnl_bps = Decimal(str(args.live_inventory_basis_min_exit_pnl_bps))
         self.live_inventory_basis_exit_safety_buffer_bps = Decimal(str(args.live_inventory_basis_exit_safety_buffer_bps))
+        self.live_inventory_basis_dynamic_exit_buffer = bool(args.live_inventory_basis_dynamic_exit_buffer)
+        self.live_inventory_basis_refresh_exit_quote_before_submit = bool(args.live_inventory_basis_refresh_exit_quote_before_submit)
         self.live_inventory_basis_max_hold_action = args.live_inventory_basis_max_hold_action
         self.live_inventory_i_accept_basis_addon_diagnostic = bool(args.live_inventory_i_accept_basis_addon_diagnostic)
         self.live_inventory_basis_addon_min_basis_improvement_bps = Decimal(
@@ -868,7 +870,9 @@ class VariationalToLighterRuntime:
         self.pending_live_inventory_actual_pnl: dict[str, dict[str, Any]] = {}
         self.pending_live_inventory_final_pnl: dict[str, dict[str, Any]] = {}
         self.live_inventory_execution_loss_bps_samples: deque[Decimal] = deque(maxlen=20)
+        self.live_inventory_exit_estimate_shortfall_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.load_recent_live_inventory_execution_loss_bps()
+        self.load_recent_live_inventory_exit_shortfall_bps()
         self.pending_live_inventory_var_fill_matches: list[PendingLiveInventoryVarFillMatch] = []
         self.live_inventory_basis_state = LiveInventoryBasisState(
             half_life_seconds=float(args.live_inventory_basis_half_life_seconds),
@@ -985,6 +989,37 @@ class VariationalToLighterRuntime:
 
     def live_inventory_recent_execution_loss_buffer_bps(self) -> Decimal:
         return self.percentile_decimal(getattr(self, "live_inventory_execution_loss_bps_samples", []), 80) or Decimal("0")
+
+    def load_recent_live_inventory_exit_shortfall_bps(self) -> None:
+        orders_file = getattr(self, "orders_file", None)
+        if orders_file is None or not orders_file.exists():
+            return
+        samples: deque[Decimal] = deque(maxlen=self.live_inventory_exit_estimate_shortfall_bps_samples.maxlen)
+        try:
+            with orders_file.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if '"event": "live_inventory_actual_pnl"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    estimated_bps = to_decimal(row.get("estimated_pnl_bps"))
+                    actual_bps = to_decimal(row.get("actual_pnl_bps"))
+                    if estimated_bps is None or actual_bps is None:
+                        continue
+                    shortfall = estimated_bps - actual_bps
+                    if shortfall > 0:
+                        samples.append(shortfall)
+        except OSError as exc:
+            self.logger.warning("Could not load recent live inventory exit shortfall samples: %s", exc)
+            return
+        self.live_inventory_exit_estimate_shortfall_bps_samples.extend(samples)
+
+    def live_inventory_dynamic_exit_buffer_bps(self) -> Decimal:
+        if not self.live_inventory_basis_dynamic_exit_buffer:
+            return Decimal("0")
+        return self.percentile_decimal(getattr(self, "live_inventory_exit_estimate_shortfall_bps_samples", []), 80) or Decimal("0")
 
     @staticmethod
     def set_record_stage(
@@ -1574,6 +1609,13 @@ class VariationalToLighterRuntime:
         notional = qty * entry_var_price
         actual_pnl_bps = actual_pnl / notional * Decimal("10000") if notional else None
         estimated_pnl = to_decimal(pending.get("estimated_pnl_usd")) or Decimal("0")
+        estimated_pnl_bps = to_decimal(pending.get("estimated_pnl_bps"))
+        if estimated_pnl_bps is not None and actual_pnl_bps is not None:
+            if not hasattr(self, "live_inventory_exit_estimate_shortfall_bps_samples"):
+                self.live_inventory_exit_estimate_shortfall_bps_samples = deque(maxlen=20)
+            shortfall_bps = estimated_pnl_bps - actual_pnl_bps
+            if shortfall_bps > 0:
+                self.live_inventory_exit_estimate_shortfall_bps_samples.append(shortfall_bps)
         self.live_inventory_realized_pnl_usd += actual_pnl - estimated_pnl
         await self.append_live_inventory_log(
             "live_inventory_actual_pnl",
@@ -5375,6 +5417,7 @@ class VariationalToLighterRuntime:
             if not self.live_inventory_open_lots:
                 return
         selected_exit: dict[str, Any] | None = None
+        dynamic_exit_buffer_bps = self.live_inventory_dynamic_exit_buffer_bps()
         for lot_index, candidate_lot in enumerate(self.live_inventory_open_lots):
             direction = str(candidate_lot.get("direction") or "")
             entered_sample_index = int(candidate_lot.get("entered_sample_index") or index)
@@ -5403,7 +5446,7 @@ class VariationalToLighterRuntime:
             pnl_bps = pnl / notional * Decimal("10000") if notional else None
             direction_signal = self.live_inventory_basis_direction_signal(direction, z)
             can_exit_on_reversion = holding_samples >= self.live_inventory_min_hold_samples
-            effective_min_exit_pnl_bps = self.live_inventory_basis_min_exit_pnl_bps + self.live_inventory_basis_exit_safety_buffer_bps
+            effective_min_exit_pnl_bps = self.live_inventory_basis_min_exit_pnl_bps + self.live_inventory_basis_exit_safety_buffer_bps + dynamic_exit_buffer_bps
             should_exit = can_exit_on_reversion and direction_signal <= self.live_inventory_basis_z_exit and (pnl_bps is not None and pnl_bps >= effective_min_exit_pnl_bps)
             should_stop = pnl_bps is not None and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
             should_timeout = holding_samples >= self.live_inventory_max_hold_samples
@@ -5426,11 +5469,12 @@ class VariationalToLighterRuntime:
                             "pnl_bps": decimal_to_str(pnl_bps),
                             "min_exit_pnl_bps": decimal_to_str(self.live_inventory_basis_min_exit_pnl_bps),
                             "exit_safety_buffer_bps": decimal_to_str(self.live_inventory_basis_exit_safety_buffer_bps),
+                            "dynamic_exit_buffer_bps": decimal_to_str(dynamic_exit_buffer_bps),
                             "effective_min_exit_pnl_bps": decimal_to_str(effective_min_exit_pnl_bps),
                         },
                     )
             if should_exit or should_stop or should_timeout_exit:
-                selected_exit = {
+                candidate_exit = {
                     "lot_index": lot_index,
                     "lot": candidate_lot,
                     "direction": direction,
@@ -5447,8 +5491,14 @@ class VariationalToLighterRuntime:
                     "should_timeout": should_timeout,
                     "should_timeout_exit": should_timeout_exit,
                     "effective_min_exit_pnl_bps": effective_min_exit_pnl_bps,
+                    "dynamic_exit_buffer_bps": dynamic_exit_buffer_bps,
                 }
-                break
+                if should_stop:
+                    selected_exit = candidate_exit
+                    break
+                selected_pnl_bps = selected_exit.get("pnl_bps") if selected_exit is not None else None
+                if selected_exit is None or (pnl_bps is not None and (selected_pnl_bps is None or pnl_bps > selected_pnl_bps)):
+                    selected_exit = candidate_exit
         if selected_exit is None:
             return
         lot_index = int(selected_exit["lot_index"])
@@ -5467,6 +5517,7 @@ class VariationalToLighterRuntime:
         should_timeout = bool(selected_exit["should_timeout"])
         should_timeout_exit = bool(selected_exit["should_timeout_exit"])
         effective_min_exit_pnl_bps = selected_exit["effective_min_exit_pnl_bps"]
+        dynamic_exit_buffer_bps = selected_exit["dynamic_exit_buffer_bps"]
         exit_reason = "signal_reverted" if should_exit else "max_unrealized_loss_bps" if should_stop else "max_hold_samples"
         var_submit_ms = None
         lighter_submit_ms = None
@@ -5487,6 +5538,58 @@ class VariationalToLighterRuntime:
                     },
                 )
                 return
+            if should_exit and self.live_inventory_basis_refresh_exit_quote_before_submit:
+                refreshed_quote, refreshed_quote_ms = await self.fetch_live_inventory_basis_quote(asset=asset)
+                refreshed_var_bid = to_decimal(refreshed_quote.get("bid")) if refreshed_quote else None
+                refreshed_var_ask = to_decimal(refreshed_quote.get("ask")) if refreshed_quote else None
+                lighter_best_bid, lighter_best_ask = await self.get_lighter_best_bid_ask()
+                if refreshed_var_bid is None or refreshed_var_ask is None or lighter_best_bid is None or lighter_best_ask is None:
+                    await self.append_live_inventory_log(
+                        "live_inventory_exit_blocked",
+                        {
+                            **state_payload,
+                            "lot_id": lot.get("lot_id"),
+                            "direction": direction,
+                            "reason": "basis_exit_refresh_quote_unavailable",
+                            "refresh_quote_ms": decimal_to_str(refreshed_quote_ms),
+                        },
+                    )
+                    return
+                if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+                    refreshed_var_exit_price = refreshed_var_bid
+                    refreshed_lighter_exit_price = lighter_best_ask
+                else:
+                    refreshed_var_exit_price = refreshed_var_ask
+                    refreshed_lighter_exit_price = lighter_best_bid
+                _, _, refreshed_pnl = self.live_inventory_pair_pnl(
+                    direction=direction,
+                    qty=qty,
+                    entry_var_price=entry_var_price,
+                    entry_lighter_price=entry_lighter_price,
+                    exit_var_price=refreshed_var_exit_price,
+                    exit_lighter_price=refreshed_lighter_exit_price,
+                )
+                notional = qty * entry_var_price
+                refreshed_pnl_bps = refreshed_pnl / notional * Decimal("10000") if notional else None
+                if refreshed_pnl_bps is None or refreshed_pnl_bps < effective_min_exit_pnl_bps:
+                    await self.append_live_inventory_log(
+                        "live_inventory_exit_blocked",
+                        {
+                            **state_payload,
+                            "lot_id": lot.get("lot_id"),
+                            "direction": direction,
+                            "reason": "basis_exit_refresh_pnl_below_threshold",
+                            "pnl_bps": decimal_to_str(pnl_bps),
+                            "refreshed_pnl_bps": decimal_to_str(refreshed_pnl_bps),
+                            "effective_min_exit_pnl_bps": decimal_to_str(effective_min_exit_pnl_bps),
+                            "refresh_quote_ms": decimal_to_str(refreshed_quote_ms),
+                        },
+                    )
+                    return
+                var_exit_price = refreshed_var_exit_price
+                lighter_exit_price = refreshed_lighter_exit_price
+                pnl = refreshed_pnl
+                pnl_bps = refreshed_pnl_bps
             exit_side = self._opposite_var_side(str(lot.get("entry_var_side") or self._auto_live_direction_to_var_side(direction)))
             var_amount = variational_api_amount_to_str(qty, asset=asset)
             self.add_pending_live_inventory_var_fill_match(
@@ -5615,6 +5718,7 @@ class VariationalToLighterRuntime:
                 "pnl_bps": decimal_to_str(pnl_bps),
                 "min_exit_pnl_bps": decimal_to_str(self.live_inventory_basis_min_exit_pnl_bps),
                 "exit_safety_buffer_bps": decimal_to_str(self.live_inventory_basis_exit_safety_buffer_bps),
+                "dynamic_exit_buffer_bps": decimal_to_str(dynamic_exit_buffer_bps),
                 "effective_min_exit_pnl_bps": decimal_to_str(effective_min_exit_pnl_bps),
                 "var_price": decimal_to_str(var_exit_price),
                 "lighter_price": decimal_to_str(lighter_exit_price),
@@ -7811,6 +7915,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Extra estimated PnL bps required above --live-inventory-basis-min-exit-pnl-bps before basis exit. Default: 0",
+    )
+    parser.add_argument(
+        "--live-inventory-basis-dynamic-exit-buffer",
+        action="store_true",
+        help="Add the recent p80 actual-vs-estimated exit shortfall bps to the basis exit threshold.",
+    )
+    parser.add_argument(
+        "--live-inventory-basis-refresh-exit-quote-before-submit",
+        action="store_true",
+        help="Immediately before a normal basis exit submit, refresh Variational quote and Lighter top-of-book and recheck estimated PnL.",
     )
     parser.add_argument(
         "--live-inventory-basis-max-hold-action",
