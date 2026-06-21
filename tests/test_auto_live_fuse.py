@@ -1479,6 +1479,88 @@ def test_live_inventory_basis_exit_reconciles_var_no_position_before_lighter(tmp
     asyncio.run(run())
 
 
+def test_live_inventory_basis_exit_can_skip_blocked_first_lot(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_signal_mode = "basis"
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.accepted_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = []
+        runtime.live_inventory_basis_z_exit = Decimal("999")
+        runtime.live_inventory_basis_min_exit_pnl_bps = Decimal("2")
+        runtime.live_inventory_basis_state = LiveInventoryBasisState(
+            half_life_seconds=300,
+            warmup_samples=1,
+            gap_reset_seconds=30,
+            sigma_floor_bps=0,
+        )
+        runtime.live_inventory_basis_state.mean = -10.0
+        runtime.live_inventory_basis_state.var = 1.0
+        runtime.live_inventory_basis_state.seen = 10
+        runtime.live_inventory_basis_state.last_ts = time.monotonic()
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 1,
+                "signal_mode": "basis",
+                "direction": "long_var_short_lighter",
+                "qty": "0.01",
+                "entry_var_side": "BUY",
+                "entry_var_fill_price": "1710",
+                "entry_lighter_fill_price": "1710",
+                "entry_cost_status": "final_fills_confirmed",
+                "entered_sample_index": 1,
+                "status": "open",
+            },
+            {
+                "lot_id": 2,
+                "signal_mode": "basis",
+                "direction": "long_var_short_lighter",
+                "qty": "0.01",
+                "entry_var_side": "BUY",
+                "entry_var_fill_price": "1700",
+                "entry_lighter_fill_price": "1720",
+                "entry_cost_status": "final_fills_confirmed",
+                "entered_sample_index": 1,
+                "status": "open",
+            },
+        ]
+        runtime.live_inventory_sample_index = 5
+        exited_lots: list[int] = []
+
+        async def fake_fetch_live_inventory_basis_quote(**_kwargs):
+            return {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"}, Decimal("10")
+
+        async def fake_send_variational_place_order(**kwargs):
+            return {"ok": True, "result": {"quoteId": "exit-quote", "amount": kwargs["amount"]}}
+
+        async def fake_place_lighter_order_from_plan(**kwargs):
+            exited_lots.append(kwargs["cycle_id"])
+
+            class Record:
+                processing_stage = "live_submit_sent"
+
+            return Record(), {"trade_key": f"lighter-exit-{kwargs['cycle_id']}"}
+
+        runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+        snapshot = _eth_inventory_snapshot()
+        snapshot.lighter_ask = Decimal("1710")
+        snapshot.lighter_buy_price = Decimal("1710")
+        snapshot.lighter_buy_fill_price = Decimal("1710")
+
+        await runtime.maybe_run_live_inventory_basis(snapshot)
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        exited = [row for row in rows if row["event"] == "live_inventory_exited"]
+        assert exited_lots == [2]
+        assert exited[-1]["lot_id"] == 2
+        assert [lot["lot_id"] for lot in runtime.live_inventory_open_lots] == [1]
+        assert runtime.live_inventory_completed_cycles == 1
+
+    asyncio.run(run())
+
+
 def test_live_inventory_basis_pending_entry_timeout_requires_manual_review(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)

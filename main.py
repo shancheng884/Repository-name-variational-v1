@@ -5350,58 +5350,93 @@ class VariationalToLighterRuntime:
                 return
             if not self.live_inventory_open_lots:
                 return
-        lot = self.live_inventory_open_lots[0]
-        direction = str(lot.get("direction") or "")
-        entered_sample_index = int(lot.get("entered_sample_index") or index)
-        holding_samples = index - entered_sample_index
-        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
-            var_exit_price = var_bid
-            lighter_exit_price = lighter_buy_price
-        elif direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
-            var_exit_price = var_ask
-            lighter_exit_price = lighter_sell_price
-        else:
-            await self.require_live_inventory_manual_review(asset=asset, reason=f"unknown_direction:{direction}")
+        selected_exit: dict[str, Any] | None = None
+        for lot_index, candidate_lot in enumerate(self.live_inventory_open_lots):
+            direction = str(candidate_lot.get("direction") or "")
+            entered_sample_index = int(candidate_lot.get("entered_sample_index") or index)
+            holding_samples = index - entered_sample_index
+            if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+                var_exit_price = var_bid
+                lighter_exit_price = lighter_buy_price
+            elif direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
+                var_exit_price = var_ask
+                lighter_exit_price = lighter_sell_price
+            else:
+                await self.require_live_inventory_manual_review(asset=asset, reason=f"unknown_direction:{direction}")
+                return
+            entry_var_price = to_decimal(candidate_lot.get("entry_var_fill_price")) or var_exit_price
+            entry_lighter_price = to_decimal(candidate_lot.get("entry_lighter_fill_price")) or lighter_exit_price
+            qty = to_decimal(candidate_lot.get("qty")) or Decimal("0")
+            _, _, pnl = self.live_inventory_pair_pnl(
+                direction=direction,
+                qty=qty,
+                entry_var_price=entry_var_price,
+                entry_lighter_price=entry_lighter_price,
+                exit_var_price=var_exit_price,
+                exit_lighter_price=lighter_exit_price,
+            )
+            notional = qty * entry_var_price
+            pnl_bps = pnl / notional * Decimal("10000") if notional else None
+            direction_signal = self.live_inventory_basis_direction_signal(direction, z)
+            can_exit_on_reversion = holding_samples >= self.live_inventory_min_hold_samples
+            should_exit = can_exit_on_reversion and direction_signal <= self.live_inventory_basis_z_exit and (pnl_bps is not None and pnl_bps >= self.live_inventory_basis_min_exit_pnl_bps)
+            should_stop = pnl_bps is not None and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
+            should_timeout = holding_samples >= self.live_inventory_max_hold_samples
+            should_timeout_exit = should_timeout and self.live_inventory_basis_max_hold_action == "exit"
+            if should_timeout and not should_timeout_exit:
+                last_warned = int(candidate_lot.get("max_hold_warned_samples") or 0)
+                if holding_samples > last_warned:
+                    candidate_lot["max_hold_warned_samples"] = holding_samples
+                    await self.append_live_inventory_log(
+                        "live_inventory_exit_blocked",
+                        {
+                            **state_payload,
+                            "lot_id": candidate_lot.get("lot_id"),
+                            "direction": direction,
+                            "reason": "basis_max_hold_reached_waiting_for_reversion",
+                            "holding_samples": holding_samples,
+                            "max_hold_samples": self.live_inventory_max_hold_samples,
+                            "basis_max_hold_action": self.live_inventory_basis_max_hold_action,
+                            "direction_signal": decimal_to_str(direction_signal),
+                            "pnl_bps": decimal_to_str(pnl_bps),
+                        },
+                    )
+            if should_exit or should_stop or should_timeout_exit:
+                selected_exit = {
+                    "lot_index": lot_index,
+                    "lot": candidate_lot,
+                    "direction": direction,
+                    "holding_samples": holding_samples,
+                    "var_exit_price": var_exit_price,
+                    "lighter_exit_price": lighter_exit_price,
+                    "entry_var_price": entry_var_price,
+                    "entry_lighter_price": entry_lighter_price,
+                    "qty": qty,
+                    "pnl": pnl,
+                    "pnl_bps": pnl_bps,
+                    "should_exit": should_exit,
+                    "should_stop": should_stop,
+                    "should_timeout": should_timeout,
+                    "should_timeout_exit": should_timeout_exit,
+                }
+                break
+        if selected_exit is None:
             return
-        entry_var_price = to_decimal(lot.get("entry_var_fill_price")) or var_exit_price
-        entry_lighter_price = to_decimal(lot.get("entry_lighter_fill_price")) or lighter_exit_price
-        qty = to_decimal(lot.get("qty")) or Decimal("0")
-        _, _, pnl = self.live_inventory_pair_pnl(
-            direction=direction,
-            qty=qty,
-            entry_var_price=entry_var_price,
-            entry_lighter_price=entry_lighter_price,
-            exit_var_price=var_exit_price,
-            exit_lighter_price=lighter_exit_price,
-        )
-        notional = qty * entry_var_price
-        pnl_bps = pnl / notional * Decimal("10000") if notional else None
-        direction_signal = self.live_inventory_basis_direction_signal(direction, z)
-        can_exit_on_reversion = holding_samples >= self.live_inventory_min_hold_samples
-        should_exit = can_exit_on_reversion and direction_signal <= self.live_inventory_basis_z_exit and (pnl_bps is not None and pnl_bps >= self.live_inventory_basis_min_exit_pnl_bps)
-        should_stop = pnl_bps is not None and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
-        should_timeout = holding_samples >= self.live_inventory_max_hold_samples
-        should_timeout_exit = should_timeout and self.live_inventory_basis_max_hold_action == "exit"
-        if should_timeout and not should_timeout_exit:
-            last_warned = int(lot.get("max_hold_warned_samples") or 0)
-            if holding_samples > last_warned:
-                lot["max_hold_warned_samples"] = holding_samples
-                await self.append_live_inventory_log(
-                    "live_inventory_exit_blocked",
-                    {
-                        **state_payload,
-                        "lot_id": lot.get("lot_id"),
-                        "direction": direction,
-                        "reason": "basis_max_hold_reached_waiting_for_reversion",
-                        "holding_samples": holding_samples,
-                        "max_hold_samples": self.live_inventory_max_hold_samples,
-                        "basis_max_hold_action": self.live_inventory_basis_max_hold_action,
-                        "direction_signal": decimal_to_str(direction_signal),
-                        "pnl_bps": decimal_to_str(pnl_bps),
-                    },
-                )
-        if not should_exit and not should_stop and not should_timeout_exit:
-            return
+        lot_index = int(selected_exit["lot_index"])
+        lot = selected_exit["lot"]
+        direction = str(selected_exit["direction"])
+        holding_samples = int(selected_exit["holding_samples"])
+        var_exit_price = selected_exit["var_exit_price"]
+        lighter_exit_price = selected_exit["lighter_exit_price"]
+        entry_var_price = selected_exit["entry_var_price"]
+        entry_lighter_price = selected_exit["entry_lighter_price"]
+        qty = selected_exit["qty"]
+        pnl = selected_exit["pnl"]
+        pnl_bps = selected_exit["pnl_bps"]
+        should_exit = bool(selected_exit["should_exit"])
+        should_stop = bool(selected_exit["should_stop"])
+        should_timeout = bool(selected_exit["should_timeout"])
+        should_timeout_exit = bool(selected_exit["should_timeout_exit"])
         exit_reason = "signal_reverted" if should_exit else "max_unrealized_loss_bps" if should_stop else "max_hold_samples"
         var_submit_ms = None
         lighter_submit_ms = None
@@ -5520,7 +5555,7 @@ class VariationalToLighterRuntime:
                     context={"action": "exit", "lot_id": lot.get("lot_id"), "direction": direction, "qty": decimal_to_str(qty), "lighter_payload": lighter_payload},
                 )
                 return
-        self.live_inventory_open_lots.pop(0)
+        self.live_inventory_open_lots.pop(lot_index)
         self.live_inventory_realized_pnl_usd += pnl
         self.live_inventory_completed_cycles += 1
         await self.persist_live_inventory_memory(reason="basis_dry_exit_decision" if self.live_inventory_dry_decisions else "basis_exit_submitted")
