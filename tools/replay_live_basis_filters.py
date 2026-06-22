@@ -71,10 +71,36 @@ def actual_pnl_by_trace_or_lot(rows: list[dict[str, Any]]) -> dict[str, Decimal]
     return result
 
 
+def actual_pnls_in_order(rows: list[dict[str, Any]]) -> list[Decimal]:
+    values: list[Decimal] = []
+    for row in rows:
+        if row.get("event") != "live_inventory_actual_pnl":
+            continue
+        pnl = dec(row.get("actual_pnl_bps"))
+        if pnl is not None:
+            values.append(pnl)
+    return values
+
+
+def prepare_rows(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        if row.get("event") != "live_inventory_basis_state" or row.get("__basis_prepared"):
+            continue
+        row["__basis_prepared"] = True
+        row["__basis_bps"] = dec(row.get("basis_bps"))
+        row["__z"] = dec(row.get("z"))
+        row["__long_edge_bps"] = dec(row.get("long_edge_bps"))
+        row["__long_roundtrip_pnl_bps"] = dec(row.get("long_roundtrip_pnl_bps"))
+        row["__short_edge_bps"] = dec(row.get("short_edge_bps"))
+        row["__short_roundtrip_pnl_bps"] = dec(row.get("short_roundtrip_pnl_bps"))
+
+
 def replay(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
     reasons: Counter[str] = Counter()
     selected: list[dict[str, Any]] = []
+    prepare_rows(rows)
     pnl_lookup = actual_pnl_by_trace_or_lot(rows)
+    ordered_actual_pnls = actual_pnls_in_order(rows)
     confirm_counts: dict[str, int] = defaultdict(int)
     last_basis: Decimal | None = None
     open_lot = False
@@ -92,8 +118,8 @@ def replay(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, An
         if open_lot and not args.allow_overlap:
             reasons["open_lot"] += 1
             continue
-        basis = dec(row.get("basis_bps"))
-        z = dec(row.get("z"))
+        basis = row.get("__basis_bps")
+        z = row.get("__z")
         if basis is None or z is None:
             reasons["missing_basis_or_z"] += 1
             continue
@@ -105,8 +131,8 @@ def replay(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, An
             continue
 
         candidates = [
-            (LONG, dec(row.get("long_edge_bps")), dec(row.get("long_roundtrip_pnl_bps"))),
-            (SHORT, dec(row.get("short_edge_bps")), dec(row.get("short_roundtrip_pnl_bps"))),
+            (LONG, row.get("__long_edge_bps"), row.get("__long_roundtrip_pnl_bps")),
+            (SHORT, row.get("__short_edge_bps"), row.get("__short_roundtrip_pnl_bps")),
         ]
         accepted = False
         for direction, edge, roundtrip in candidates:
@@ -151,6 +177,8 @@ def replay(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, An
             if key in pnl_lookup:
                 matched_pnls.append(pnl_lookup[key])
                 break
+    if not matched_pnls and ordered_actual_pnls:
+        matched_pnls = ordered_actual_pnls[: len(selected)]
     return {"selected": selected, "matched_pnls": matched_pnls, "reasons": reasons}
 
 
