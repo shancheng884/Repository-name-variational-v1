@@ -806,6 +806,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_direction_min_avg_pnl_bps = Decimal(str(args.live_inventory_basis_direction_min_avg_pnl_bps))
         self.live_inventory_basis_entry_mode = args.live_inventory_basis_entry_mode
         self.live_inventory_basis_auto_close_unhedged = bool(args.live_inventory_basis_auto_close_unhedged)
+        self.live_inventory_reconcile_on_start = bool(args.live_inventory_reconcile_on_start)
         self.live_inventory_basis_latency_buffer_p90_ms = Decimal(str(args.live_inventory_basis_latency_buffer_p90_ms))
         self.live_inventory_basis_latency_buffer_bps = Decimal(str(args.live_inventory_basis_latency_buffer_bps))
         self.live_inventory_basis_quote_age_buffer_ms = Decimal(str(args.live_inventory_basis_quote_age_buffer_ms))
@@ -1208,6 +1209,54 @@ class VariationalToLighterRuntime:
         if len(getattr(self, "live_allowed_assets", set()) or set()) == 1:
             return next(iter(self.live_allowed_assets)).upper()
         return "BTC"
+
+    async def reconcile_live_inventory_startup_state(self) -> None:
+        if not self.live_inventory_reconcile_on_start:
+            await self.append_live_inventory_log(
+                "live_inventory_startup_reconcile_skipped",
+                {"reason": "disabled_by_config", "open_lots_total": len(self.live_inventory_open_lots)},
+            )
+            return
+        if not self.live_inventory_open_lots:
+            await self.append_live_inventory_log("live_inventory_startup_reconcile_ok", {"status": "flat_state"})
+            return
+        asset = self.live_inventory_state_asset()
+        positions_result = None
+        position_qty = None
+        try:
+            positions_result = await self.fetch_variational_positions()
+            position_qty = self.extract_variational_position_qty(positions_result, asset=asset)
+        except Exception as exc:
+            await self.require_live_inventory_manual_review(
+                asset=asset,
+                reason="startup_reconcile_variational_position_check_failed",
+                context={"error": str(exc), "open_lots": self.live_inventory_open_lots},
+            )
+            raise RuntimeError("Live inventory startup reconcile failed: could not check Variational position") from exc
+        expected_qty = sum((to_decimal(lot.get("qty")) or Decimal("0")) for lot in self.live_inventory_open_lots)
+        if position_qty is None or abs(position_qty) <= Decimal("0"):
+            await self.require_live_inventory_manual_review(
+                asset=asset,
+                reason="startup_reconcile_open_state_but_variational_flat",
+                context={
+                    "open_lots": self.live_inventory_open_lots,
+                    "expected_open_qty": decimal_to_str(expected_qty),
+                    "variational_position_qty": decimal_to_str(position_qty),
+                    "variational_positions_result": positions_result,
+                    "action": "confirm exchange state, then use --live-inventory-reset-state-after-manual-flat only if truly flat",
+                },
+            )
+            raise RuntimeError("Live inventory startup reconcile failed: state has open lots but Variational is flat")
+        await self.append_live_inventory_log(
+            "live_inventory_startup_reconcile_ok",
+            {
+                "status": "open_state_position_detected",
+                "asset": asset,
+                "open_lots_total": len(self.live_inventory_open_lots),
+                "expected_open_qty": decimal_to_str(expected_qty),
+                "variational_position_qty": decimal_to_str(position_qty),
+            },
+        )
 
     async def persist_live_inventory_memory(self, *, reason: str) -> None:
         await self.write_live_inventory_state_async(
@@ -1756,6 +1805,7 @@ class VariationalToLighterRuntime:
                 entry_lighter_slippage_bps = ((lighter_fill_price - estimated_entry_lighter_price) / estimated_entry_lighter_price) * Decimal("10000")
         lot = {
             "lot_id": lot_id,
+            "basis_trace_id": context.get("basis_trace_id"),
             "signal_mode": LIVE_INVENTORY_SIGNAL_BASIS,
             "direction": direction,
             "qty": decimal_to_str(qty),
@@ -1794,6 +1844,7 @@ class VariationalToLighterRuntime:
                 "asset": asset,
                 "sample_index": context.get("sample_index"),
                 "lot_id": lot_id,
+                "basis_trace_id": context.get("basis_trace_id"),
                 "direction": direction,
                 "qty": decimal_to_str(qty),
                 "edge_bps": context.get("edge_bps"),
@@ -4079,6 +4130,7 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_direction_min_avg_pnl_bps",
             "live_inventory_basis_entry_mode",
             "live_inventory_basis_auto_close_unhedged",
+            "live_inventory_reconcile_on_start",
             "live_inventory_basis_latency_buffer_p90_ms",
             "live_inventory_basis_latency_buffer_bps",
             "live_inventory_basis_quote_age_buffer_ms",
@@ -5808,6 +5860,7 @@ class VariationalToLighterRuntime:
                     )
                 qty = self.live_inventory_lot_notional_usd / var_price
                 lot_id = self.live_inventory_next_lot_id
+                basis_trace_id = f"{self.live_inventory_run_id}:basis:{lot_id}:{uuid.uuid4().hex[:8]}"
                 var_side = self._auto_live_direction_to_var_side(direction)
                 reject_cooldown_key = (asset.upper(), var_side.lower())
                 reject_cooldown_until = self.live_inventory_var_reject_cooldown_until.get(reject_cooldown_key)
@@ -5855,6 +5908,7 @@ class VariationalToLighterRuntime:
                     pending_context = {
                         "signal_mode": LIVE_INVENTORY_SIGNAL_BASIS,
                         "sample_index": index,
+                        "basis_trace_id": basis_trace_id,
                         "direction": direction,
                         "qty": decimal_to_str(qty),
                         "var_side": var_side,
@@ -6023,11 +6077,12 @@ class VariationalToLighterRuntime:
                     await self.persist_live_inventory_memory(reason="basis_var_entry_submitted_pending_fill")
                     await self.append_live_inventory_log(
                         "live_inventory_var_entry_submitted",
-                        {**state_payload, "lot_id": lot_id, "direction": direction, "qty": decimal_to_str(submitted_qty), "edge_bps": decimal_to_str(edge_bps), "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps), "var_submit_ms": var_submit_ms, "lighter_submit_ms": lighter_submit_ms, "entry_confirmation_mode": "concurrent_var_and_lighter_pending_var_fill", "lighter_started": lighter_started, "var_result": var_result, "lighter_payload": lighter_payload},
+                        {**state_payload, "lot_id": lot_id, "basis_trace_id": basis_trace_id, "direction": direction, "qty": decimal_to_str(submitted_qty), "edge_bps": decimal_to_str(edge_bps), "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps), "var_submit_ms": var_submit_ms, "lighter_submit_ms": lighter_submit_ms, "entry_confirmation_mode": "concurrent_var_and_lighter_pending_var_fill" if self.live_inventory_basis_entry_mode == LIVE_INVENTORY_ENTRY_MODE_CONCURRENT else "var_first_pending_var_fill", "lighter_started": lighter_started, "var_result": var_result, "lighter_payload": lighter_payload},
                     )
                     return
                 lot = {
                     "lot_id": lot_id,
+                    "basis_trace_id": basis_trace_id,
                     "signal_mode": LIVE_INVENTORY_SIGNAL_BASIS,
                     "direction": direction,
                     "qty": decimal_to_str(qty),
@@ -6066,7 +6121,7 @@ class VariationalToLighterRuntime:
                 await self.persist_live_inventory_memory(reason="basis_dry_entry_decision" if self.live_inventory_dry_decisions else "basis_entry_submitted")
                 await self.append_live_inventory_log(
                     "live_inventory_dry_entered" if self.live_inventory_dry_decisions else "live_inventory_entered",
-                    {**state_payload, "lot_id": lot_id, "direction": direction, "qty": lot["qty"], "edge_bps": decimal_to_str(edge_bps), "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps), "var_submit_ms": var_submit_ms, "lighter_submit_ms": lighter_submit_ms, "entry_kind": lot["entry_kind"]},
+                    {**state_payload, "lot_id": lot_id, "basis_trace_id": basis_trace_id, "direction": direction, "qty": lot["qty"], "edge_bps": decimal_to_str(edge_bps), "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps), "var_submit_ms": var_submit_ms, "lighter_submit_ms": lighter_submit_ms, "entry_kind": lot["entry_kind"]},
                 )
                 return
             if not self.live_inventory_open_lots:
@@ -6126,10 +6181,11 @@ class VariationalToLighterRuntime:
                     candidate_lot["max_hold_warned_samples"] = holding_samples
                     await self.append_live_inventory_log(
                         "live_inventory_exit_blocked",
-                        {
-                            **state_payload,
-                            "lot_id": candidate_lot.get("lot_id"),
-                            "direction": direction,
+                            {
+                                **state_payload,
+                                "lot_id": candidate_lot.get("lot_id"),
+                                "basis_trace_id": candidate_lot.get("basis_trace_id"),
+                                "direction": direction,
                             "reason": "basis_max_hold_reached_waiting_for_reversion",
                             "holding_samples": holding_samples,
                             "max_hold_samples": self.live_inventory_max_hold_samples,
@@ -6150,6 +6206,7 @@ class VariationalToLighterRuntime:
                     {
                         **state_payload,
                         "lot_id": candidate_lot.get("lot_id"),
+                        "basis_trace_id": candidate_lot.get("basis_trace_id"),
                         "direction": direction,
                         "reason": "basis_exit_market_data_too_old",
                         "var_quote_age_ok": var_quote_age_ok,
@@ -6433,6 +6490,7 @@ class VariationalToLighterRuntime:
             self.pending_live_inventory_actual_pnl[str(lighter_payload.get("trade_key") or "")] = {
                 "asset": asset,
                 "lot_id": lot.get("lot_id"),
+                "basis_trace_id": lot.get("basis_trace_id"),
                 "direction": direction,
                 "qty": decimal_to_str(qty),
                 "entry_var_price": decimal_to_str(entry_var_price),
@@ -6448,6 +6506,7 @@ class VariationalToLighterRuntime:
             {
                 **state_payload,
                 "lot_id": lot.get("lot_id"),
+                "basis_trace_id": lot.get("basis_trace_id"),
                 "direction": direction,
                 "qty": decimal_to_str(qty),
                 "exit_reason": exit_reason,
@@ -8257,6 +8316,8 @@ class VariationalToLighterRuntime:
                 raise
         if self.is_live_inventory_enabled():
             self.sync_live_inventory_memory_from_state()
+            if not self.live_inventory_dry_decisions:
+                await self.reconcile_live_inventory_startup_state()
 
         self.trade_event_cursor = await self.runtime.monitor.get_latest_trade_event_seq()
         self.trade_event_min_timestamp = datetime.now(timezone.utc)
@@ -8740,6 +8801,12 @@ def parse_args() -> argparse.Namespace:
         "--live-inventory-basis-auto-close-unhedged",
         action="store_true",
         help="Experimental: if one entry leg clearly fails after the other started, try a reduce-only close before manual review.",
+    )
+    parser.add_argument(
+        "--live-inventory-reconcile-on-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="On live-inventory startup, verify persisted open state against Variational position before trading. Default: enabled",
     )
     parser.add_argument("--live-inventory-basis-latency-buffer-p90-ms", type=float, default=700.0)
     parser.add_argument("--live-inventory-basis-latency-buffer-bps", type=float, default=1.0)
