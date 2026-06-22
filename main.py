@@ -7671,6 +7671,16 @@ class VariationalToLighterRuntime:
             try:
                 await self.preflight_variational_api_command_client(initial_asset)
                 self.logger.info("variational_api_command_client_preflight_passed asset=%s", initial_asset)
+            except RuntimeError as exc:
+                message = str(exc)
+                if "No extension command client connected" not in message:
+                    self.logger.exception("variational_api_command_client_preflight_failed asset=%s", initial_asset)
+                    raise
+                self.logger.warning(
+                    "variational_api_command_client_preflight_waiting_for_extension asset=%s error=%s",
+                    initial_asset,
+                    message,
+                )
             except Exception:
                 self.logger.exception("variational_api_command_client_preflight_failed asset=%s", initial_asset)
                 raise
