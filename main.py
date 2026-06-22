@@ -773,6 +773,7 @@ class VariationalToLighterRuntime:
         )
         self.live_inventory_max_lighter_slippage_bps = Decimal(str(args.live_inventory_max_lighter_slippage_bps))
         self.live_inventory_max_lighter_book_age_seconds = float(args.live_inventory_max_lighter_book_age_seconds)
+        self.live_inventory_exit_blocked_log_throttle_seconds = float(args.live_inventory_exit_blocked_log_throttle_seconds)
         self.live_inventory_min_hold_samples = int(args.live_inventory_min_hold_samples)
         self.live_inventory_max_hold_samples = int(args.live_inventory_max_hold_samples)
         self.live_inventory_max_unrealized_loss_bps = Decimal(str(args.live_inventory_max_unrealized_loss_bps))
@@ -938,6 +939,7 @@ class VariationalToLighterRuntime:
         self.auto_live_manual_review_required = False
         self.auto_live_manual_review_reason: str | None = None
         self._last_auto_live_guard_log: tuple[str, int, int] | None = None
+        self._last_live_inventory_exit_blocked_log: dict[tuple[Any, str], float] = {}
         self._last_auto_live_precheck_failure_log: dict[tuple[str, int, str, str, str], float] = {}
         self.paper_last_closed_monotonic: float | None = None
         self.paper_opportunity_counter = 0
@@ -1022,6 +1024,18 @@ class VariationalToLighterRuntime:
         if not self.live_inventory_basis_dynamic_exit_buffer:
             return Decimal("0")
         return self.percentile_decimal(getattr(self, "live_inventory_exit_estimate_shortfall_bps_samples", []), 80) or Decimal("0")
+
+    def should_log_live_inventory_exit_blocked(self, *, lot_id: Any, reason: str) -> bool:
+        throttle = self.live_inventory_exit_blocked_log_throttle_seconds
+        if throttle <= 0:
+            return True
+        key = (lot_id, reason)
+        now = time.monotonic()
+        last = self._last_live_inventory_exit_blocked_log.get(key)
+        if last is not None and now - last < throttle:
+            return False
+        self._last_live_inventory_exit_blocked_log[key] = now
+        return True
 
     @staticmethod
     def set_record_stage(
@@ -5487,7 +5501,9 @@ class VariationalToLighterRuntime:
             should_timeout_exit = should_timeout and self.live_inventory_basis_max_hold_action == "exit"
             if should_timeout and not should_timeout_exit:
                 last_warned = int(candidate_lot.get("max_hold_warned_samples") or 0)
-                if holding_samples > last_warned:
+                if holding_samples > last_warned and self.should_log_live_inventory_exit_blocked(
+                    lot_id=candidate_lot.get("lot_id"), reason="basis_max_hold_reached_waiting_for_reversion"
+                ):
                     candidate_lot["max_hold_warned_samples"] = holding_samples
                     await self.append_live_inventory_log(
                         "live_inventory_exit_blocked",
@@ -7951,6 +7967,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Maximum Lighter order-book age allowed for basis entry/normal exit. Set 0 to disable. Default: 0",
     )
+    parser.add_argument(
+        "--live-inventory-exit-blocked-log-throttle-seconds",
+        type=float,
+        default=0.0,
+        help="Throttle repeated live_inventory_exit_blocked logs by lot/reason. Set 0 to disable. Default: 0",
+    )
     parser.add_argument("--live-inventory-min-hold-samples", type=int, default=3)
     parser.add_argument("--live-inventory-max-hold-samples", type=int, default=300)
     parser.add_argument("--live-inventory-max-unrealized-loss-bps", type=float, default=25.0)
@@ -8162,6 +8184,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-max-lighter-slippage-bps must be >= 0")
         if args.live_inventory_max_lighter_book_age_seconds < 0:
             parser.error("--live-inventory-max-lighter-book-age-seconds must be >= 0")
+        if args.live_inventory_exit_blocked_log_throttle_seconds < 0:
+            parser.error("--live-inventory-exit-blocked-log-throttle-seconds must be >= 0")
         if args.live_inventory_min_hold_samples < 0:
             parser.error("--live-inventory-min-hold-samples must be >= 0")
         if args.live_inventory_max_hold_samples <= 0:

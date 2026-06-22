@@ -6,10 +6,12 @@ from decimal import Decimal
 
 from tools.inspect_live_basis_state import inspect
 from tools.analyze_live_basis_slippage import summarize as summarize_slippage
+from tools.analyze_live_basis_execution_quality import summarize as summarize_execution_quality
 from tools.grid_replay_live_basis_params import parse_decimals, run_grid
 from tools.replay_live_basis_params import replay
 from tools.recommend_live_basis_params import recommend
 from tools.summarize_latest_live_basis_round import latest_events, load_state, suggest_action
+from tools.preflight_live_basis import check as preflight_check
 
 
 def write_jsonl(path, rows):
@@ -168,12 +170,14 @@ def test_grid_replay_live_basis_params_runs_combinations(tmp_path) -> None:
         min_exit_pnl_bps=parse_decimals("1"),
         max_total_lots=[1],
         min_hold_samples=0,
+        adjust_shortfall_bps=Decimal("0"),
     )
 
     rows = run_grid(args)
 
     assert len(rows) == 2
     assert {row["entered"] for row in rows} == {1}
+    assert "adjusted_pnl_usd" in rows[0]
 
 
 def test_recommend_live_basis_params_returns_candidate(tmp_path) -> None:
@@ -225,6 +229,7 @@ def test_recommend_live_basis_params_returns_candidate(tmp_path) -> None:
         min_exit_pnl_bps=parse_decimals("1"),
         max_total_lots=[1],
         min_hold_samples=0,
+        adjust_shortfall_bps=None,
     )
 
     result = recommend(args)
@@ -244,3 +249,40 @@ def test_summarize_latest_live_basis_round_suggests_flat_action(tmp_path) -> Non
 
     assert loaded["status"] == "flat"
     assert suggest_action(loaded, events).startswith("flat:")
+
+
+def test_analyze_live_basis_execution_quality_summarizes_lighter_drift(tmp_path) -> None:
+    metrics = tmp_path / "metrics.jsonl"
+    write_jsonl(
+        metrics,
+        [
+            {
+                "event": "live_inventory_actual_pnl",
+                "asset": "ETH",
+                "estimated_pnl_bps": "1",
+                "actual_pnl_bps": "0",
+                "entry_var_price": "100",
+                "exit_lighter_price": "101",
+                "exit_lighter_final_fill_price": "102",
+                "actual_var_leg_pnl_usd": "0.1",
+                "actual_lighter_leg_pnl_usd": "-0.1",
+            }
+        ],
+    )
+
+    summary = summarize_execution_quality(metrics, asset="ETH")
+
+    assert summary["actual_rows"] == 1
+    assert summary["avg_estimated_minus_actual_bps"] == Decimal("1")
+    assert summary["avg_lighter_exit_fill_drift_bps"] == Decimal("100")
+
+
+def test_preflight_live_basis_recommends_open_state_resume(tmp_path) -> None:
+    state = tmp_path / "state.json"
+    metrics = tmp_path / "metrics.jsonl"
+    state.write_text(json.dumps({"status": "open", "open_lots": [{"lot_id": 1}]}), encoding="utf-8")
+    metrics.write_text("", encoding="utf-8")
+
+    result = preflight_check(state, metrics, asset="ETH", scan=100)
+
+    assert result["recommended_command_type"] == "open_state_resume"

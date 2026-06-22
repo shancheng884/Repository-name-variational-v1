@@ -256,6 +256,7 @@ def test_live_inventory_accepts_v1_safe_flags(monkeypatch) -> None:
     assert args.live_inventory_dynamic_entry_buffer_bps == 5.0
     assert args.live_inventory_max_lighter_slippage_bps == 3.0
     assert args.live_inventory_max_lighter_book_age_seconds == 0.0
+    assert args.live_inventory_exit_blocked_log_throttle_seconds == 0.0
 
 
 def test_live_inventory_accepts_open_state_resume_instead_of_flat_start(monkeypatch) -> None:

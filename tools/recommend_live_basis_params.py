@@ -13,10 +13,12 @@ DEFAULT_INPUT = Path("log/order_metrics.jsonl")
 
 def recommend(args: argparse.Namespace) -> dict[str, object]:
     slippage = summarize_slippage(args.input, asset=args.asset)
+    p80 = slippage.get("p80_positive_shortfall_bps")
+    if not hasattr(args, "adjust_shortfall_bps") or args.adjust_shortfall_bps is None:
+        args.adjust_shortfall_bps = Decimal("0") if p80 is None else Decimal(str(p80))
     grid_rows = run_grid(args)
     candidates = [row for row in grid_rows if int(row["entered"]) > 0 and int(row["exited"]) > 0 and int(row["open_lots"]) == 0]
     best = candidates[0] if candidates else None
-    p80 = slippage.get("p80_positive_shortfall_bps")
     suggested_exit_buffer = Decimal("0") if p80 is None else Decimal(str(p80)).quantize(Decimal("0.1"))
     return {
         "matched_actual_exits": slippage["matched_exits"],
@@ -66,6 +68,7 @@ def main() -> None:
     parser.add_argument("--min-exit-pnl-bps", type=parse_decimals, default=parse_decimals("0.5,1,1.5,2"))
     parser.add_argument("--max-total-lots", type=parse_ints, default=parse_ints("1,2"))
     parser.add_argument("--min-hold-samples", type=int, default=0)
+    parser.add_argument("--adjust-shortfall-bps", type=Decimal, default=None, help="Replay stress shortfall bps per exited lot. Default: p80 positive shortfall from actual exits.")
     args = parser.parse_args()
     print_recommendation(recommend(args))
 

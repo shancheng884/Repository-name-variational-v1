@@ -42,6 +42,8 @@ def run_grid(args: argparse.Namespace) -> list[dict[str, object]]:
                                     min_hold_samples=args.min_hold_samples,
                                 )
                                 result = replay(args.input, replay_args)
+                                realized = Decimal(str(result["realized_pnl_usd"]))
+                                adjusted = realized - (Decimal(int(result["exited"])) * args.lot_notional_usd * args.adjust_shortfall_bps / Decimal("10000"))
                                 rows.append(
                                     {
                                         "z_entry": z_entry,
@@ -51,15 +53,16 @@ def run_grid(args: argparse.Namespace) -> list[dict[str, object]]:
                                         "addon": addon,
                                         "min_exit": min_exit,
                                         "max_total": max_total,
+                                        "adjusted_pnl_usd": adjusted,
                                         **result,
                                     }
                                 )
-    rows.sort(key=lambda row: (Decimal(str(row["realized_pnl_usd"])), int(row["exited"]), -int(row["open_lots"])), reverse=True)
+    rows.sort(key=lambda row: (Decimal(str(row["adjusted_pnl_usd"])), Decimal(str(row["realized_pnl_usd"])), int(row["exited"]), -int(row["open_lots"])), reverse=True)
     return rows
 
 
 def print_rows(rows: list[dict[str, object]], *, limit: int) -> None:
-    print("rank z_entry min_abs min_edge max_cost addon min_exit max_total entered exited open_lots realized_pnl_usd")
+    print("rank z_entry min_abs min_edge max_cost addon min_exit max_total entered exited open_lots realized_pnl_usd adjusted_pnl_usd")
     for idx, row in enumerate(rows[:limit], start=1):
         print(
             idx,
@@ -74,6 +77,7 @@ def print_rows(rows: list[dict[str, object]], *, limit: int) -> None:
             row["exited"],
             row["open_lots"],
             row["realized_pnl_usd"],
+            row["adjusted_pnl_usd"],
         )
 
 
@@ -92,6 +96,7 @@ def main() -> None:
     parser.add_argument("--min-exit-pnl-bps", type=parse_decimals, default=parse_decimals("0.5,1,1.5"))
     parser.add_argument("--max-total-lots", type=parse_ints, default=parse_ints("1,2"))
     parser.add_argument("--min-hold-samples", type=int, default=0)
+    parser.add_argument("--adjust-shortfall-bps", type=Decimal, default=Decimal("0"), help="Subtract this bps per exited lot from replay PnL for actual-vs-estimated shortfall stress testing.")
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
     print_rows(run_grid(args), limit=args.limit)

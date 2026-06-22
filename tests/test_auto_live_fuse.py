@@ -876,6 +876,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics = False
     runtime.live_inventory_max_lighter_slippage_bps = Decimal("3")
     runtime.live_inventory_max_lighter_book_age_seconds = 0.0
+    runtime.live_inventory_exit_blocked_log_throttle_seconds = 0.0
     runtime.live_inventory_lot_notional_usd = Decimal("10")
     runtime.live_inventory_max_total_lots = 1
     runtime.live_inventory_min_hold_samples = 0
@@ -888,6 +889,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_basis_refresh_exit_quote_before_submit = False
     runtime.live_inventory_basis_max_var_quote_age_ms = 0.0
     runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(maxlen=20)
+    runtime._last_live_inventory_exit_blocked_log = {}
     runtime.live_inventory_i_accept_basis_addon_diagnostic = False
     runtime.live_inventory_basis_addon_min_basis_improvement_bps = Decimal("1.5")
     runtime.live_inventory_state_file = Path(tmp_path) / "live_inventory_state.json"
