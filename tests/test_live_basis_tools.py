@@ -5,6 +5,8 @@ import json
 from decimal import Decimal
 
 from tools.inspect_live_basis_state import inspect
+from tools.analyze_live_basis_slippage import summarize as summarize_slippage
+from tools.grid_replay_live_basis_params import parse_decimals, run_grid
 from tools.replay_live_basis_params import replay
 
 
@@ -111,3 +113,62 @@ def test_replay_live_basis_params_respects_abs_entry_gate(tmp_path) -> None:
 
     assert result["rows_seen"] == 2
     assert result["entered"] == 1
+
+
+def test_analyze_live_basis_slippage_reports_shortfall(tmp_path) -> None:
+    metrics = tmp_path / "metrics.jsonl"
+    write_jsonl(
+        metrics,
+        [
+            {"event": "live_inventory_exited", "asset": "ETH", "lot_id": 1, "direction": "long_var_short_lighter", "pnl_bps": "1.5", "pnl_usd": "0.003"},
+            {"event": "live_inventory_actual_pnl", "asset": "ETH", "lot_id": 1, "direction": "long_var_short_lighter", "actual_pnl_bps": "0.5", "actual_pnl_usd": "0.001"},
+        ],
+    )
+
+    summary = summarize_slippage(metrics, asset="ETH")
+
+    assert summary["matched_exits"] == 1
+    assert summary["positive_shortfalls"] == 1
+    assert summary["avg_positive_shortfall_bps"] == Decimal("1.0")
+
+
+def test_grid_replay_live_basis_params_runs_combinations(tmp_path) -> None:
+    metrics = tmp_path / "metrics.jsonl"
+    write_jsonl(
+        metrics,
+        [
+            {
+                "event": "live_inventory_basis_state",
+                "asset": "ETH",
+                "sample_index": 1,
+                "basis_bps": "-13",
+                "z": "-5",
+                "var_bid": "99",
+                "var_ask": "100",
+                "lighter_buy_price": "101",
+                "lighter_sell_price": "100",
+                "long_edge_bps": "10",
+                "long_roundtrip_pnl_bps": "-2",
+            }
+        ],
+    )
+    args = argparse.Namespace(
+        input=metrics,
+        asset="ETH",
+        lot_notional_usd=Decimal("20"),
+        max_cycles=1,
+        z_entry=parse_decimals("3,4"),
+        z_exit=Decimal("999"),
+        min_entry_edge_bps=parse_decimals("7"),
+        min_abs_entry_bps=parse_decimals("12"),
+        max_entry_roundtrip_cost_bps=parse_decimals("3"),
+        addon_min_basis_improvement_bps=parse_decimals("4"),
+        min_exit_pnl_bps=parse_decimals("1"),
+        max_total_lots=[1],
+        min_hold_samples=0,
+    )
+
+    rows = run_grid(args)
+
+    assert len(rows) == 2
+    assert {row["entered"] for row in rows} == {1}
