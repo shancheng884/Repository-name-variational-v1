@@ -823,6 +823,12 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_negative_direction_abs_penalty_bps = Decimal(str(args.live_inventory_basis_negative_direction_abs_penalty_bps))
         self.live_inventory_basis_min_entry_quality_score_bps = Decimal(str(args.live_inventory_basis_min_entry_quality_score_bps))
         self.live_inventory_basis_sample_move_penalty_multiplier = Decimal(str(args.live_inventory_basis_sample_move_penalty_multiplier))
+        self.live_inventory_basis_watch_candidate = bool(args.live_inventory_basis_watch_candidate)
+        self.live_inventory_basis_watch_edge_bps = Decimal(str(args.live_inventory_basis_watch_edge_bps))
+        self.live_inventory_basis_watch_promote_edge_bps = Decimal(str(args.live_inventory_basis_watch_promote_edge_bps))
+        self.live_inventory_basis_watch_max_age_seconds = float(args.live_inventory_basis_watch_max_age_seconds)
+        self.live_inventory_basis_watch_confirm_samples = int(args.live_inventory_basis_watch_confirm_samples)
+        self.live_inventory_basis_watch_min_quality_score_bps = Decimal(str(args.live_inventory_basis_watch_min_quality_score_bps))
         self.live_inventory_basis_direction_min_samples = int(args.live_inventory_basis_direction_min_samples)
         self.live_inventory_basis_direction_min_avg_pnl_bps = Decimal(str(args.live_inventory_basis_direction_min_avg_pnl_bps))
         self.live_inventory_basis_entry_mode = args.live_inventory_basis_entry_mode
@@ -934,6 +940,7 @@ class VariationalToLighterRuntime:
         )
         self.live_inventory_basis_entry_confirm_counts: dict[str, int] = {}
         self.live_inventory_basis_last_basis_bps: Decimal | None = None
+        self.live_inventory_basis_watch_candidates: dict[str, dict[str, Any]] = {}
         self._order_write_lock = asyncio.Lock()
         self._opportunity_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
@@ -1198,6 +1205,55 @@ class VariationalToLighterRuntime:
             "entry_quality_sample_move_penalty_bps": decimal_to_str(sample_move_penalty),
             "entry_quality_roundtrip_penalty_bps": decimal_to_str(roundtrip_penalty),
         }
+
+    def live_inventory_update_watch_candidate(
+        self,
+        *,
+        direction: str,
+        edge_bps: Decimal,
+        quality_score_bps: Decimal,
+        now: float,
+    ) -> tuple[bool, dict[str, Any]]:
+        if not self.live_inventory_basis_watch_candidate:
+            return True, {"watch_candidate_enabled": False}
+        if edge_bps < self.live_inventory_basis_watch_edge_bps:
+            self.live_inventory_basis_watch_candidates.pop(direction, None)
+            return False, {
+                "watch_candidate_enabled": True,
+                "watch_candidate_status": "below_watch_edge",
+                "watch_edge_bps": decimal_to_str(self.live_inventory_basis_watch_edge_bps),
+                "watch_promote_edge_bps": decimal_to_str(self.live_inventory_basis_watch_promote_edge_bps),
+            }
+        watch = self.live_inventory_basis_watch_candidates.get(direction)
+        if watch is None or now - float(watch.get("created_at_monotonic") or now) > self.live_inventory_basis_watch_max_age_seconds:
+            watch = {
+                "created_at_monotonic": now,
+                "first_edge_bps": edge_bps,
+                "best_edge_bps": edge_bps,
+                "best_quality_score_bps": quality_score_bps,
+                "promote_confirm_count": 0,
+            }
+            self.live_inventory_basis_watch_candidates[direction] = watch
+        watch["best_edge_bps"] = max(to_decimal(watch.get("best_edge_bps")) or edge_bps, edge_bps)
+        watch["best_quality_score_bps"] = max(to_decimal(watch.get("best_quality_score_bps")) or quality_score_bps, quality_score_bps)
+        promoted_sample = edge_bps >= self.live_inventory_basis_watch_promote_edge_bps and quality_score_bps >= self.live_inventory_basis_watch_min_quality_score_bps
+        watch["promote_confirm_count"] = int(watch.get("promote_confirm_count") or 0) + 1 if promoted_sample else 0
+        age_seconds = now - float(watch.get("created_at_monotonic") or now)
+        context = {
+            "watch_candidate_enabled": True,
+            "watch_candidate_status": "promoted" if watch["promote_confirm_count"] >= self.live_inventory_basis_watch_confirm_samples else "watching",
+            "watch_candidate_age_seconds": f"{age_seconds:.6f}",
+            "watch_candidate_confirm_count": watch["promote_confirm_count"],
+            "watch_candidate_required_confirm_samples": self.live_inventory_basis_watch_confirm_samples,
+            "watch_edge_bps": decimal_to_str(self.live_inventory_basis_watch_edge_bps),
+            "watch_promote_edge_bps": decimal_to_str(self.live_inventory_basis_watch_promote_edge_bps),
+            "watch_min_quality_score_bps": decimal_to_str(self.live_inventory_basis_watch_min_quality_score_bps),
+            "watch_best_edge_bps": decimal_to_str(watch.get("best_edge_bps")),
+            "watch_best_quality_score_bps": decimal_to_str(watch.get("best_quality_score_bps")),
+        }
+        if watch["promote_confirm_count"] >= self.live_inventory_basis_watch_confirm_samples:
+            return True, context
+        return False, context
 
     def live_inventory_dynamic_entry_quality_buffer_bps(self, *, var_quote_age_seconds: float | None = None) -> Decimal:
         buffer = self.percentile_decimal(getattr(self, "live_inventory_exit_estimate_shortfall_bps_samples", []), 80) or Decimal("0")
@@ -4216,6 +4272,12 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_negative_direction_abs_penalty_bps",
             "live_inventory_basis_min_entry_quality_score_bps",
             "live_inventory_basis_sample_move_penalty_multiplier",
+            "live_inventory_basis_watch_candidate",
+            "live_inventory_basis_watch_edge_bps",
+            "live_inventory_basis_watch_promote_edge_bps",
+            "live_inventory_basis_watch_max_age_seconds",
+            "live_inventory_basis_watch_confirm_samples",
+            "live_inventory_basis_watch_min_quality_score_bps",
             "live_inventory_basis_direction_min_samples",
             "live_inventory_basis_direction_min_avg_pnl_bps",
             "live_inventory_basis_entry_mode",
@@ -5761,6 +5823,7 @@ class VariationalToLighterRuntime:
                     if basis_bps >= addon_threshold:
                         addon_direction = existing_direction
         if not self.live_inventory_open_lots or addon_direction is not None:
+            watch_now = time.monotonic()
             if self.has_pending_live_inventory_var_fill_match(asset=asset, roles={"live_inventory_entry_pending_lighter", "live_inventory_entry_pending_var_fill"}):
                 if await self.maybe_timeout_pending_live_inventory_var_entry(asset=asset):
                     return
@@ -5855,9 +5918,53 @@ class VariationalToLighterRuntime:
                         },
                     )
                 if edge_bps < min_entry_edge_bps:
+                    promoted, watch_context = self.live_inventory_update_watch_candidate(
+                        direction=direction,
+                        edge_bps=edge_bps,
+                        quality_score_bps=entry_quality_score_bps,
+                        now=watch_now,
+                    )
+                    if self.live_inventory_basis_watch_candidate and not promoted:
+                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                        await self.append_live_inventory_log(
+                            "live_inventory_watch_candidate",
+                            {**state_payload, "reason": "basis_entry_edge_watch", "direction": direction, **negative_context, **entry_quality_context, **watch_context},
+                        )
+                        continue
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     continue
                 if entry_quality_score_bps < self.live_inventory_basis_min_entry_quality_score_bps:
+                    promoted, watch_context = self.live_inventory_update_watch_candidate(
+                        direction=direction,
+                        edge_bps=edge_bps,
+                        quality_score_bps=entry_quality_score_bps,
+                        now=watch_now,
+                    )
+                    if not promoted:
+                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                        await self.append_live_inventory_log(
+                            "live_inventory_watch_candidate",
+                            {**state_payload, "reason": "basis_entry_quality_score_watch", "direction": direction, **negative_context, **entry_quality_context, **watch_context},
+                        )
+                        continue
+                    entry_quality_context = {**entry_quality_context, **watch_context}
+                elif self.live_inventory_basis_watch_candidate:
+                    promoted, watch_context = self.live_inventory_update_watch_candidate(
+                        direction=direction,
+                        edge_bps=edge_bps,
+                        quality_score_bps=entry_quality_score_bps,
+                        now=watch_now,
+                    )
+                    if not promoted:
+                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                        await self.append_live_inventory_log(
+                            "live_inventory_watch_candidate",
+                            {**state_payload, "reason": "basis_entry_watch_pending", "direction": direction, **negative_context, **entry_quality_context, **watch_context},
+                        )
+                        continue
+                    entry_quality_context = {**entry_quality_context, **watch_context}
+
+                if entry_quality_score_bps < self.live_inventory_basis_min_entry_quality_score_bps and not self.live_inventory_basis_watch_candidate:
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     await self.append_live_inventory_log(
                         "live_inventory_entry_blocked",
@@ -8954,6 +9061,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-basis-negative-direction-abs-penalty-bps", type=float, default=2.0)
     parser.add_argument("--live-inventory-basis-min-entry-quality-score-bps", type=float, default=0.0)
     parser.add_argument("--live-inventory-basis-sample-move-penalty-multiplier", type=float, default=1.0)
+    parser.add_argument("--live-inventory-basis-watch-candidate", action="store_true")
+    parser.add_argument("--live-inventory-basis-watch-edge-bps", type=float, default=7.5)
+    parser.add_argument("--live-inventory-basis-watch-promote-edge-bps", type=float, default=8.0)
+    parser.add_argument("--live-inventory-basis-watch-max-age-seconds", type=float, default=10.0)
+    parser.add_argument("--live-inventory-basis-watch-confirm-samples", type=int, default=2)
+    parser.add_argument("--live-inventory-basis-watch-min-quality-score-bps", type=float, default=-3.0)
     parser.add_argument("--live-inventory-basis-direction-min-samples", type=int, default=3)
     parser.add_argument("--live-inventory-basis-direction-min-avg-pnl-bps", type=float, default=0.0)
     parser.add_argument(
@@ -9195,6 +9308,14 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-basis-negative-direction-abs-penalty-bps must be >= 0")
         if args.live_inventory_basis_sample_move_penalty_multiplier < 0:
             parser.error("--live-inventory-basis-sample-move-penalty-multiplier must be >= 0")
+        if args.live_inventory_basis_watch_edge_bps < 0:
+            parser.error("--live-inventory-basis-watch-edge-bps must be >= 0")
+        if args.live_inventory_basis_watch_promote_edge_bps < 0:
+            parser.error("--live-inventory-basis-watch-promote-edge-bps must be >= 0")
+        if args.live_inventory_basis_watch_max_age_seconds <= 0:
+            parser.error("--live-inventory-basis-watch-max-age-seconds must be > 0")
+        if args.live_inventory_basis_watch_confirm_samples <= 0:
+            parser.error("--live-inventory-basis-watch-confirm-samples must be > 0")
         if args.live_inventory_basis_direction_min_samples <= 0:
             parser.error("--live-inventory-basis-direction-min-samples must be > 0")
         if args.live_inventory_basis_latency_buffer_p90_ms < 0:

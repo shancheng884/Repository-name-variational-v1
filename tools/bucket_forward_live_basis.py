@@ -64,6 +64,10 @@ def summarize(values: list[Decimal]) -> str:
     )
 
 
+def bucket_start(label: str) -> Decimal:
+    return Decimal(label.split("..")[0]) if ".." in label else Decimal("0")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Bucket live basis forward PnL by entry edge bps.")
     parser.add_argument("--file", default="log/order_metrics.jsonl")
@@ -72,6 +76,10 @@ def main() -> None:
     parser.add_argument("--min-edge-bps", type=Decimal, default=Decimal("0"))
     parser.add_argument("--max-sample-move-bps", type=Decimal, default=Decimal("0"), help="Skip rows whose basis_sample_move_bps exceeds this. 0 disables.")
     parser.add_argument("--horizons", default="30,60,120")
+    parser.add_argument("--recommend-horizon", type=int, default=30)
+    parser.add_argument("--recommend-min-samples", type=int, default=3)
+    parser.add_argument("--recommend-min-avg-pnl-bps", type=Decimal, default=Decimal("0"))
+    parser.add_argument("--recommend-min-win-rate", type=Decimal, default=Decimal("0.5"))
     args = parser.parse_args()
 
     basis_rows: list[dict[str, Any]] = []
@@ -110,7 +118,7 @@ def main() -> None:
 
     print(f"basis_rows={len(basis_rows)} bucket_width_bps={args.bucket_width_bps} min_edge_bps={args.min_edge_bps}")
     for direction in (LONG, SHORT):
-        labels = sorted({label for dir_name, label in counts if dir_name == direction}, key=lambda item: Decimal(item.split("..")[0]) if ".." in item else Decimal("0"))
+        labels = sorted({label for dir_name, label in counts if dir_name == direction}, key=bucket_start)
         print(f"\n{direction}:")
         if not labels:
             print("  no buckets")
@@ -120,6 +128,28 @@ def main() -> None:
             print(f"  edge {label} candidates={count}")
             for horizon in horizons:
                 print(f"    h={horizon} {summarize(buckets[(direction, label, horizon)])}")
+
+    print("\nrecommendations:")
+    for direction in (LONG, SHORT):
+        labels = sorted({label for dir_name, label in counts if dir_name == direction}, key=bucket_start)
+        recommendation = None
+        for label in labels:
+            values = buckets[(direction, label, args.recommend_horizon)]
+            if len(values) < args.recommend_min_samples:
+                continue
+            avg = sum(values) / Decimal(len(values))
+            win_rate = Decimal(sum(1 for value in values if value > 0)) / Decimal(len(values))
+            if avg >= args.recommend_min_avg_pnl_bps and win_rate >= args.recommend_min_win_rate:
+                recommendation = (label, avg, win_rate, len(values))
+                break
+        if recommendation is None:
+            print(f"  {direction}: no bucket met criteria")
+        else:
+            label, avg, win_rate, count = recommendation
+            print(
+                f"  {direction}: min_edge_bps~{fmt(bucket_start(label))} "
+                f"bucket={label} h={args.recommend_horizon} n={count} avg={fmt(avg)} win_rate={fmt(win_rate)}"
+            )
 
 
 if __name__ == "__main__":
