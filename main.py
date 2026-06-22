@@ -161,6 +161,7 @@ VAR_QUOTE_DIAGNOSTIC_INTERVAL_SECONDS = 30.0
 VARIATIONAL_METADATA_STATS_URL = "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats"
 VARIATIONAL_METADATA_STATS_TTL_SECONDS = 30.0
 VARIATIONAL_METADATA_QUOTE_SIZE = "size_1k"
+BINANCE_USDCUSDT_TICKER_URL = "https://api.binance.com/api/v3/ticker/price?symbol=USDCUSDT"
 DASHBOARD_REFRESH_SECONDS = 1.0
 DASHBOARD_ORDERS = 8
 SPREAD_HISTORY_SECONDS = 3600.0
@@ -829,6 +830,10 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_watch_max_age_seconds = float(args.live_inventory_basis_watch_max_age_seconds)
         self.live_inventory_basis_watch_confirm_samples = int(args.live_inventory_basis_watch_confirm_samples)
         self.live_inventory_basis_watch_min_quality_score_bps = Decimal(str(args.live_inventory_basis_watch_min_quality_score_bps))
+        self.live_inventory_basis_stablecoin_normalization = bool(args.live_inventory_basis_stablecoin_normalization)
+        self.live_inventory_basis_use_normalized_edge_for_entry = bool(args.live_inventory_basis_use_normalized_edge_for_entry)
+        self.live_inventory_basis_min_normalized_entry_edge_bps = Decimal(str(args.live_inventory_basis_min_normalized_entry_edge_bps))
+        self.live_inventory_basis_stablecoin_rate_ttl_seconds = float(args.live_inventory_basis_stablecoin_rate_ttl_seconds)
         self.live_inventory_basis_direction_min_samples = int(args.live_inventory_basis_direction_min_samples)
         self.live_inventory_basis_direction_min_avg_pnl_bps = Decimal(str(args.live_inventory_basis_direction_min_avg_pnl_bps))
         self.live_inventory_basis_entry_mode = args.live_inventory_basis_entry_mode
@@ -941,6 +946,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_entry_confirm_counts: dict[str, int] = {}
         self.live_inventory_basis_last_basis_bps: Decimal | None = None
         self.live_inventory_basis_watch_candidates: dict[str, dict[str, Any]] = {}
+        self.live_inventory_stablecoin_rate_cache: dict[str, Any] = {}
         self._order_write_lock = asyncio.Lock()
         self._opportunity_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
@@ -1254,6 +1260,48 @@ class VariationalToLighterRuntime:
         if watch["promote_confirm_count"] >= self.live_inventory_basis_watch_confirm_samples:
             return True, context
         return False, context
+
+    async def fetch_live_inventory_stablecoin_context(self) -> dict[str, Any]:
+        if not self.live_inventory_basis_stablecoin_normalization:
+            return {"stablecoin_normalization_enabled": False}
+        now = time.monotonic()
+        cached_at = self.live_inventory_stablecoin_rate_cache.get("monotonic")
+        if cached_at is not None and now - float(cached_at) <= self.live_inventory_basis_stablecoin_rate_ttl_seconds:
+            return dict(self.live_inventory_stablecoin_rate_cache.get("context") or {})
+        context: dict[str, Any] = {
+            "stablecoin_normalization_enabled": True,
+            "stablecoin_rate_source": "binance_usdcusdt",
+            "stablecoin_rate_url": BINANCE_USDCUSDT_TICKER_URL,
+        }
+        try:
+            response = await asyncio.to_thread(requests.get, BINANCE_USDCUSDT_TICKER_URL, timeout=3)
+            response.raise_for_status()
+            payload = response.json()
+            usdcusdt = to_decimal(payload.get("price"))
+            if usdcusdt is None or usdcusdt <= 0:
+                raise ValueError(f"invalid USDCUSDT price: {payload!r}")
+            usdt_per_usdc = usdcusdt
+            stablecoin_basis_bps = (usdt_per_usdc - Decimal("1")) * Decimal("10000")
+            context.update(
+                {
+                    "stablecoin_rate_status": "ok",
+                    "usdcusdt_price": decimal_to_str(usdcusdt),
+                    "usdt_per_usdc": decimal_to_str(usdt_per_usdc),
+                    "stablecoin_basis_bps": decimal_to_str(stablecoin_basis_bps),
+                    "stablecoin_rate_fetched_at": utc_now(),
+                }
+            )
+        except Exception as exc:
+            context.update({"stablecoin_rate_status": "unavailable", "stablecoin_rate_error": str(exc)})
+        self.live_inventory_stablecoin_rate_cache = {"monotonic": now, "context": context}
+        return context
+
+    @staticmethod
+    def normalize_usdc_price_to_usdt(price: Decimal, stablecoin_context: dict[str, Any]) -> Decimal | None:
+        usdcusdt = to_decimal(stablecoin_context.get("usdcusdt_price"))
+        if usdcusdt is None or usdcusdt <= 0:
+            return None
+        return price * usdcusdt
 
     def live_inventory_dynamic_entry_quality_buffer_bps(self, *, var_quote_age_seconds: float | None = None) -> Decimal:
         buffer = self.percentile_decimal(getattr(self, "live_inventory_exit_estimate_shortfall_bps_samples", []), 80) or Decimal("0")
@@ -4278,6 +4326,10 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_watch_max_age_seconds",
             "live_inventory_basis_watch_confirm_samples",
             "live_inventory_basis_watch_min_quality_score_bps",
+            "live_inventory_basis_stablecoin_normalization",
+            "live_inventory_basis_use_normalized_edge_for_entry",
+            "live_inventory_basis_min_normalized_entry_edge_bps",
+            "live_inventory_basis_stablecoin_rate_ttl_seconds",
             "live_inventory_basis_direction_min_samples",
             "live_inventory_basis_direction_min_avg_pnl_bps",
             "live_inventory_basis_entry_mode",
@@ -5761,6 +5813,41 @@ class VariationalToLighterRuntime:
             var_exit_price=var_ask,
             lighter_exit_price=short_exit_lighter_price,
         )
+        stablecoin_context = await self.fetch_live_inventory_stablecoin_context()
+        normalized_var_bid = self.normalize_usdc_price_to_usdt(var_bid, stablecoin_context)
+        normalized_var_ask = self.normalize_usdc_price_to_usdt(var_ask, stablecoin_context)
+        normalized_basis_bps = None
+        normalized_long_edge_bps = None
+        normalized_short_edge_bps = None
+        normalized_long_roundtrip_pnl_bps = None
+        normalized_short_roundtrip_pnl_bps = None
+        if normalized_var_bid is not None and normalized_var_ask is not None:
+            normalized_basis_mid = (normalized_var_bid + normalized_var_ask) / Decimal("2")
+            normalized_basis_bps = (normalized_basis_mid - lighter_mid) / lighter_mid * Decimal("10000")
+            normalized_long_edge_bps = self.live_inventory_pair_edge_bps(
+                direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                var_price=normalized_var_ask,
+                lighter_price=lighter_sell_price,
+            )
+            normalized_short_edge_bps = self.live_inventory_pair_edge_bps(
+                direction=DIRECTION_SHORT_VAR_LONG_LIGHTER,
+                var_price=normalized_var_bid,
+                lighter_price=lighter_buy_price,
+            )
+            normalized_long_roundtrip_pnl_bps = self.live_inventory_roundtrip_pnl_bps(
+                direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                var_entry_price=normalized_var_ask,
+                lighter_entry_price=lighter_sell_price,
+                var_exit_price=normalized_var_bid,
+                lighter_exit_price=long_exit_lighter_price,
+            )
+            normalized_short_roundtrip_pnl_bps = self.live_inventory_roundtrip_pnl_bps(
+                direction=DIRECTION_SHORT_VAR_LONG_LIGHTER,
+                var_entry_price=normalized_var_bid,
+                lighter_entry_price=lighter_buy_price,
+                var_exit_price=normalized_var_ask,
+                lighter_exit_price=short_exit_lighter_price,
+            )
         state_payload = {
             "asset": asset,
             "sample_index": index,
@@ -5792,6 +5879,14 @@ class VariationalToLighterRuntime:
             "short_edge_bps": decimal_to_str(short_edge_bps),
             "long_roundtrip_pnl_bps": decimal_to_str(long_roundtrip_pnl_bps),
             "short_roundtrip_pnl_bps": decimal_to_str(short_roundtrip_pnl_bps),
+            **stablecoin_context,
+            "normalized_var_bid": decimal_to_str(normalized_var_bid),
+            "normalized_var_ask": decimal_to_str(normalized_var_ask),
+            "normalized_basis_bps": decimal_to_str(normalized_basis_bps),
+            "normalized_long_edge_bps": decimal_to_str(normalized_long_edge_bps),
+            "normalized_short_edge_bps": decimal_to_str(normalized_short_edge_bps),
+            "normalized_long_roundtrip_pnl_bps": decimal_to_str(normalized_long_roundtrip_pnl_bps),
+            "normalized_short_roundtrip_pnl_bps": decimal_to_str(normalized_short_roundtrip_pnl_bps),
             "open_lots_total": len(self.live_inventory_open_lots),
             "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
             "completed_cycles": self.live_inventory_completed_cycles,
@@ -5848,10 +5943,30 @@ class VariationalToLighterRuntime:
                 )
                 return
             candidates = (
-                (DIRECTION_LONG_VAR_SHORT_LIGHTER, long_edge_bps, long_roundtrip_pnl_bps, var_ask, lighter_sell_price),
-                (DIRECTION_SHORT_VAR_LONG_LIGHTER, short_edge_bps, short_roundtrip_pnl_bps, var_bid, lighter_buy_price),
+                (
+                    DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                    normalized_long_edge_bps if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_long_edge_bps is not None else long_edge_bps,
+                    normalized_long_roundtrip_pnl_bps if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_long_roundtrip_pnl_bps is not None else long_roundtrip_pnl_bps,
+                    var_ask,
+                    lighter_sell_price,
+                    long_edge_bps,
+                    long_roundtrip_pnl_bps,
+                    normalized_long_edge_bps,
+                    normalized_long_roundtrip_pnl_bps,
+                ),
+                (
+                    DIRECTION_SHORT_VAR_LONG_LIGHTER,
+                    normalized_short_edge_bps if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_short_edge_bps is not None else short_edge_bps,
+                    normalized_short_roundtrip_pnl_bps if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_short_roundtrip_pnl_bps is not None else short_roundtrip_pnl_bps,
+                    var_bid,
+                    lighter_buy_price,
+                    short_edge_bps,
+                    short_roundtrip_pnl_bps,
+                    normalized_short_edge_bps,
+                    normalized_short_roundtrip_pnl_bps,
+                ),
             )
-            for direction, edge_bps, roundtrip_bps, var_price, lighter_price in candidates:
+            for direction, edge_bps, roundtrip_bps, var_price, lighter_price, raw_edge_bps, raw_roundtrip_bps, normalized_edge_bps, normalized_roundtrip_bps in candidates:
                 if addon_direction is not None and direction != addon_direction:
                     continue
                 is_negative_direction, negative_entry_penalty_bps, negative_abs_penalty_bps, negative_context = self.live_inventory_negative_direction_penalties(direction)
@@ -5896,6 +6011,8 @@ class VariationalToLighterRuntime:
                     )
                     continue
                 min_entry_edge_bps = self.live_inventory_direction_entry_threshold_bps(direction) + negative_entry_penalty_bps
+                if self.live_inventory_basis_use_normalized_edge_for_entry and self.live_inventory_basis_min_normalized_entry_edge_bps > 0:
+                    min_entry_edge_bps = max(min_entry_edge_bps, self.live_inventory_basis_min_normalized_entry_edge_bps)
                 entry_quality_score_bps, entry_quality_context = self.live_inventory_entry_quality_score_bps(
                     edge_bps=edge_bps,
                     min_entry_bps=min_entry_edge_bps,
@@ -5910,7 +6027,12 @@ class VariationalToLighterRuntime:
                             **state_payload,
                             "direction": direction,
                             "edge_bps": decimal_to_str(edge_bps),
+                            "raw_edge_bps": decimal_to_str(raw_edge_bps),
+                            "normalized_edge_bps": decimal_to_str(normalized_edge_bps),
                             "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                            "raw_roundtrip_pnl_bps": decimal_to_str(raw_roundtrip_bps),
+                            "normalized_roundtrip_pnl_bps": decimal_to_str(normalized_roundtrip_bps),
+                            "entry_edge_source": "normalized" if self.live_inventory_basis_use_normalized_edge_for_entry else "raw",
                             "min_entry_edge_bps": decimal_to_str(min_entry_edge_bps),
                             "min_abs_entry_bps": decimal_to_str(min_abs_entry_bps),
                             **negative_context,
@@ -6043,7 +6165,8 @@ class VariationalToLighterRuntime:
                         )
                         return
                     lighter_price = depth_entry_price
-                    edge_bps = self.live_inventory_pair_edge_bps(direction=direction, var_price=var_price, lighter_price=lighter_price) or Decimal("0")
+                    raw_refreshed_edge_bps = self.live_inventory_pair_edge_bps(direction=direction, var_price=var_price, lighter_price=lighter_price) or Decimal("0")
+                    edge_bps = raw_refreshed_edge_bps
                     roundtrip_bps = self.live_inventory_roundtrip_pnl_bps(
                         direction=direction,
                         var_entry_price=var_price,
@@ -6051,6 +6174,27 @@ class VariationalToLighterRuntime:
                         var_exit_price=exit_var_price_for_roundtrip,
                         lighter_exit_price=depth_exit_price,
                     )
+                    refreshed_normalized_var_price = self.normalize_usdc_price_to_usdt(var_price, stablecoin_context)
+                    refreshed_normalized_exit_var_price = self.normalize_usdc_price_to_usdt(exit_var_price_for_roundtrip, stablecoin_context)
+                    refreshed_normalized_edge_bps = None
+                    refreshed_normalized_roundtrip_bps = None
+                    if refreshed_normalized_var_price is not None and refreshed_normalized_exit_var_price is not None:
+                        refreshed_normalized_edge_bps = self.live_inventory_pair_edge_bps(
+                            direction=direction,
+                            var_price=refreshed_normalized_var_price,
+                            lighter_price=lighter_price,
+                        )
+                        refreshed_normalized_roundtrip_bps = self.live_inventory_roundtrip_pnl_bps(
+                            direction=direction,
+                            var_entry_price=refreshed_normalized_var_price,
+                            lighter_entry_price=lighter_price,
+                            var_exit_price=refreshed_normalized_exit_var_price,
+                            lighter_exit_price=depth_exit_price,
+                        )
+                    if self.live_inventory_basis_use_normalized_edge_for_entry and refreshed_normalized_edge_bps is not None:
+                        edge_bps = refreshed_normalized_edge_bps
+                    if self.live_inventory_basis_use_normalized_edge_for_entry and refreshed_normalized_roundtrip_bps is not None:
+                        roundtrip_bps = refreshed_normalized_roundtrip_bps
                     quote = refreshed_quote
                     quote_ms = refreshed_quote_ms
                     var_bid = refreshed_var_bid
@@ -6070,6 +6214,9 @@ class VariationalToLighterRuntime:
                                 "reason": "basis_entry_refreshed_edge_below_threshold",
                                 "direction": direction,
                                 "refreshed_edge_bps": decimal_to_str(edge_bps),
+                                "raw_refreshed_edge_bps": decimal_to_str(raw_refreshed_edge_bps),
+                                "normalized_refreshed_edge_bps": decimal_to_str(refreshed_normalized_edge_bps),
+                                "entry_edge_source": "normalized" if self.live_inventory_basis_use_normalized_edge_for_entry else "raw",
                                 "min_entry_edge_bps": decimal_to_str(min_entry_edge_bps),
                                 **negative_context,
                                 **entry_quality_context,
@@ -6085,6 +6232,9 @@ class VariationalToLighterRuntime:
                                 "reason": "basis_entry_refreshed_quality_score_too_low",
                                 "direction": direction,
                                 "refreshed_edge_bps": decimal_to_str(edge_bps),
+                                "raw_refreshed_edge_bps": decimal_to_str(raw_refreshed_edge_bps),
+                                "normalized_refreshed_edge_bps": decimal_to_str(refreshed_normalized_edge_bps),
+                                "entry_edge_source": "normalized" if self.live_inventory_basis_use_normalized_edge_for_entry else "raw",
                                 **negative_context,
                                 **entry_quality_context,
                                 "entry_lighter_depth": entry_depth,
@@ -6167,6 +6317,9 @@ class VariationalToLighterRuntime:
                         "var_price": decimal_to_str(var_price),
                         "lighter_price": decimal_to_str(lighter_price),
                         "edge_bps": decimal_to_str(edge_bps),
+                        "raw_edge_bps": decimal_to_str(raw_edge_bps),
+                        "normalized_edge_bps": decimal_to_str(normalized_edge_bps),
+                        "entry_edge_source": "normalized" if self.live_inventory_basis_use_normalized_edge_for_entry else "raw",
                         "min_entry_edge_bps": decimal_to_str(min_entry_edge_bps),
                         "min_abs_entry_bps": decimal_to_str(min_abs_entry_bps),
                         "entry_quality_score_bps": decimal_to_str(entry_quality_score_bps),
@@ -9067,6 +9220,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-basis-watch-max-age-seconds", type=float, default=10.0)
     parser.add_argument("--live-inventory-basis-watch-confirm-samples", type=int, default=2)
     parser.add_argument("--live-inventory-basis-watch-min-quality-score-bps", type=float, default=-3.0)
+    parser.add_argument("--live-inventory-basis-stablecoin-normalization", action="store_true")
+    parser.add_argument("--live-inventory-basis-use-normalized-edge-for-entry", action="store_true")
+    parser.add_argument("--live-inventory-basis-min-normalized-entry-edge-bps", type=float, default=0.0)
+    parser.add_argument("--live-inventory-basis-stablecoin-rate-ttl-seconds", type=float, default=10.0)
     parser.add_argument("--live-inventory-basis-direction-min-samples", type=int, default=3)
     parser.add_argument("--live-inventory-basis-direction-min-avg-pnl-bps", type=float, default=0.0)
     parser.add_argument(
@@ -9316,6 +9473,12 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-basis-watch-max-age-seconds must be > 0")
         if args.live_inventory_basis_watch_confirm_samples <= 0:
             parser.error("--live-inventory-basis-watch-confirm-samples must be > 0")
+        if args.live_inventory_basis_min_normalized_entry_edge_bps < 0:
+            parser.error("--live-inventory-basis-min-normalized-entry-edge-bps must be >= 0")
+        if args.live_inventory_basis_stablecoin_rate_ttl_seconds <= 0:
+            parser.error("--live-inventory-basis-stablecoin-rate-ttl-seconds must be > 0")
+        if args.live_inventory_basis_use_normalized_edge_for_entry and not args.live_inventory_basis_stablecoin_normalization:
+            parser.error("--live-inventory-basis-use-normalized-edge-for-entry requires --live-inventory-basis-stablecoin-normalization")
         if args.live_inventory_basis_direction_min_samples <= 0:
             parser.error("--live-inventory-basis-direction-min-samples must be > 0")
         if args.live_inventory_basis_latency_buffer_p90_ms < 0:

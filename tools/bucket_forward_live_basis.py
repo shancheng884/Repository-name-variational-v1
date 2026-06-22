@@ -54,6 +54,13 @@ def pnl_bps(direction: str, entry: dict[str, Any], exit_row: dict[str, Any]) -> 
     return ((entry_var - exit_var) * qty + (exit_lighter - entry_lighter) * qty) / entry_var * Decimal("10000")
 
 
+def edge_value(row: dict[str, Any], direction: str, edge_field: str) -> Decimal | None:
+    prefix = "long" if direction == LONG else "short"
+    if edge_field == "normalized":
+        return dec(row.get(f"normalized_{prefix}_edge_bps"))
+    return dec(row.get(f"{prefix}_edge_bps"))
+
+
 def summarize(values: list[Decimal]) -> str:
     if not values:
         return "n=0 avg=- win_rate=- worst=- best=-"
@@ -73,6 +80,7 @@ def main() -> None:
     parser.add_argument("--file", default="log/order_metrics.jsonl")
     parser.add_argument("--tail", type=int, default=10000)
     parser.add_argument("--bucket-width-bps", type=Decimal, default=Decimal("1"))
+    parser.add_argument("--edge-field", choices=("raw", "normalized"), default="raw")
     parser.add_argument("--min-edge-bps", type=Decimal, default=Decimal("0"))
     parser.add_argument("--max-sample-move-bps", type=Decimal, default=Decimal("0"), help="Skip rows whose basis_sample_move_bps exceeds this. 0 disables.")
     parser.add_argument("--horizons", default="30,60,120")
@@ -100,8 +108,8 @@ def main() -> None:
         if args.max_sample_move_bps > 0 and move is not None and move > args.max_sample_move_bps:
             continue
         direction_edges = [
-            (LONG, dec(row.get("long_edge_bps"))),
-            (SHORT, dec(row.get("short_edge_bps"))),
+            (LONG, edge_value(row, LONG, args.edge_field)),
+            (SHORT, edge_value(row, SHORT, args.edge_field)),
         ]
         for direction, edge in direction_edges:
             if edge is None or edge < args.min_edge_bps:
@@ -116,7 +124,7 @@ def main() -> None:
                 if value is not None:
                     buckets[(direction, label, horizon)].append(value)
 
-    print(f"basis_rows={len(basis_rows)} bucket_width_bps={args.bucket_width_bps} min_edge_bps={args.min_edge_bps}")
+    print(f"basis_rows={len(basis_rows)} edge_field={args.edge_field} bucket_width_bps={args.bucket_width_bps} min_edge_bps={args.min_edge_bps}")
     for direction in (LONG, SHORT):
         labels = sorted({label for dir_name, label in counts if dir_name == direction}, key=bucket_start)
         print(f"\n{direction}:")
