@@ -875,6 +875,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_dynamic_entry_buffer_bps = Decimal("5")
     runtime.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics = False
     runtime.live_inventory_max_lighter_slippage_bps = Decimal("3")
+    runtime.live_inventory_max_lighter_book_age_seconds = 0.0
     runtime.live_inventory_lot_notional_usd = Decimal("10")
     runtime.live_inventory_max_total_lots = 1
     runtime.live_inventory_min_hold_samples = 0
@@ -885,6 +886,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_basis_exit_safety_buffer_bps = Decimal("0")
     runtime.live_inventory_basis_dynamic_exit_buffer = False
     runtime.live_inventory_basis_refresh_exit_quote_before_submit = False
+    runtime.live_inventory_basis_max_var_quote_age_ms = 0.0
     runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(maxlen=20)
     runtime.live_inventory_i_accept_basis_addon_diagnostic = False
     runtime.live_inventory_basis_addon_min_basis_improvement_bps = Decimal("1.5")
@@ -1115,6 +1117,48 @@ def test_live_inventory_basis_abs_entry_threshold_blocks_thin_basis(tmp_path) ->
             and row["reason"] == "basis_abs_entry_threshold_not_met"
             for row in rows
         )
+
+    asyncio.run(run())
+
+
+def test_live_inventory_basis_var_quote_age_guard_blocks_entry(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_dry_decisions = True
+        runtime.live_inventory_signal_mode = "basis"
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.accepted_assets = {"ETH"}
+        runtime.live_inventory_lot_notional_usd = Decimal("20")
+        runtime.live_inventory_basis_z_entry = Decimal("4")
+        runtime.live_inventory_basis_min_entry_edge_bps = Decimal("7")
+        runtime.live_inventory_basis_max_entry_roundtrip_cost_bps = Decimal("4")
+        runtime.live_inventory_basis_max_var_quote_age_ms = 1.0
+        runtime.live_inventory_basis_state = LiveInventoryBasisState(
+            half_life_seconds=300,
+            warmup_samples=1,
+            gap_reset_seconds=30,
+            sigma_floor_bps=0,
+        )
+        runtime.live_inventory_basis_state.mean = -7.0
+        runtime.live_inventory_basis_state.var = 0.1
+        runtime.live_inventory_basis_state.seen = 10
+        runtime.live_inventory_basis_state.last_ts = time.monotonic()
+
+        async def fake_fetch_live_inventory_basis_quote(**_kwargs):
+            return {
+                "quoteId": "entry-quote",
+                "bid": "1753.00",
+                "ask": "1753.25",
+                "quoteTimestamp": "2000-01-01T00:00:00.000Z",
+            }, Decimal("10")
+
+        runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
+
+        await runtime.maybe_run_live_inventory_basis(_eth_inventory_snapshot())
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert runtime.live_inventory_open_lots == []
+        assert any(row["event"] == "live_inventory_entry_blocked" and row["reason"] == "basis_var_quote_too_old" for row in rows)
 
     asyncio.run(run())
 

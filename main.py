@@ -772,6 +772,7 @@ class VariationalToLighterRuntime:
             args.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics
         )
         self.live_inventory_max_lighter_slippage_bps = Decimal(str(args.live_inventory_max_lighter_slippage_bps))
+        self.live_inventory_max_lighter_book_age_seconds = float(args.live_inventory_max_lighter_book_age_seconds)
         self.live_inventory_min_hold_samples = int(args.live_inventory_min_hold_samples)
         self.live_inventory_max_hold_samples = int(args.live_inventory_max_hold_samples)
         self.live_inventory_max_unrealized_loss_bps = Decimal(str(args.live_inventory_max_unrealized_loss_bps))
@@ -787,6 +788,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_exit_safety_buffer_bps = Decimal(str(args.live_inventory_basis_exit_safety_buffer_bps))
         self.live_inventory_basis_dynamic_exit_buffer = bool(args.live_inventory_basis_dynamic_exit_buffer)
         self.live_inventory_basis_refresh_exit_quote_before_submit = bool(args.live_inventory_basis_refresh_exit_quote_before_submit)
+        self.live_inventory_basis_max_var_quote_age_ms = float(args.live_inventory_basis_max_var_quote_age_ms)
         self.live_inventory_basis_max_hold_action = args.live_inventory_basis_max_hold_action
         self.live_inventory_i_accept_basis_addon_diagnostic = bool(args.live_inventory_i_accept_basis_addon_diagnostic)
         self.live_inventory_basis_addon_min_basis_improvement_bps = Decimal(
@@ -3475,6 +3477,21 @@ class VariationalToLighterRuntime:
     def _lighter_order_book_age_seconds(self) -> float | None:
         return self._age_seconds_from_iso(self.last_lighter_order_book_update_at)
 
+    def live_inventory_lighter_book_age_ok(self) -> tuple[bool, float | None]:
+        age = self._lighter_order_book_age_seconds()
+        limit = self.live_inventory_max_lighter_book_age_seconds
+        if limit <= 0:
+            return True, age
+        return age is not None and age <= limit, age
+
+    def live_inventory_var_quote_age_ok(self, quote: dict[str, Any]) -> tuple[bool, float | None]:
+        limit_ms = self.live_inventory_basis_max_var_quote_age_ms
+        ts = quote.get("quoteTimestamp") or quote.get("quote_timestamp")
+        age_seconds = self._age_seconds_from_iso(str(ts) if ts else None)
+        if limit_ms <= 0:
+            return True, age_seconds
+        return age_seconds is not None and (age_seconds * 1000.0) <= limit_ms, age_seconds
+
     def _lighter_order_book_is_stale(self) -> bool:
         age = self._lighter_order_book_age_seconds()
         return age is None or age >= HEALTH_LIGHTER_BOOK_STALE_SECONDS
@@ -5130,6 +5147,8 @@ class VariationalToLighterRuntime:
         if basis_mid <= 0 or lighter_mid <= 0:
             return
         basis_bps = (basis_mid - lighter_mid) / lighter_mid * Decimal("10000")
+        lighter_book_age_ok, lighter_book_age_seconds = self.live_inventory_lighter_book_age_ok()
+        var_quote_age_ok, var_quote_age_seconds = self.live_inventory_var_quote_age_ok(quote)
         z_float, warm = self.live_inventory_basis_state.update(time.monotonic(), float(basis_bps))
         z = Decimal(str(z_float))
         long_edge_bps = self.live_inventory_pair_edge_bps(
@@ -5162,6 +5181,8 @@ class VariationalToLighterRuntime:
             "quote_id": quote.get("quoteId") or quote.get("quote_id"),
             "quote_timestamp": quote.get("quoteTimestamp") or quote.get("quote_timestamp"),
             "quote_ms": decimal_to_str(quote_ms),
+            "var_quote_age_seconds": None if var_quote_age_seconds is None else f"{var_quote_age_seconds:.6f}",
+            "lighter_book_age_seconds": None if lighter_book_age_seconds is None else f"{lighter_book_age_seconds:.6f}",
             "var_bid": decimal_to_str(var_bid),
             "var_ask": decimal_to_str(var_ask),
             "lighter_bid": decimal_to_str(snapshot.lighter_bid),
@@ -5237,6 +5258,18 @@ class VariationalToLighterRuntime:
                             "basis_bps": decimal_to_str(basis_bps),
                             "min_abs_entry_bps": decimal_to_str(self.live_inventory_basis_min_abs_entry_bps),
                         },
+                    )
+                    continue
+                if not var_quote_age_ok:
+                    await self.append_live_inventory_log(
+                        "live_inventory_entry_blocked",
+                        {**state_payload, "reason": "basis_var_quote_too_old", "direction": direction, "max_var_quote_age_ms": self.live_inventory_basis_max_var_quote_age_ms},
+                    )
+                    continue
+                if not lighter_book_age_ok:
+                    await self.append_live_inventory_log(
+                        "live_inventory_entry_blocked",
+                        {**state_payload, "reason": "basis_lighter_book_too_old", "direction": direction, "max_lighter_book_age_seconds": self.live_inventory_max_lighter_book_age_seconds},
                     )
                     continue
                 if edge_bps < self.live_inventory_basis_min_entry_edge_bps:
@@ -5447,7 +5480,8 @@ class VariationalToLighterRuntime:
             direction_signal = self.live_inventory_basis_direction_signal(direction, z)
             can_exit_on_reversion = holding_samples >= self.live_inventory_min_hold_samples
             effective_min_exit_pnl_bps = self.live_inventory_basis_min_exit_pnl_bps + self.live_inventory_basis_exit_safety_buffer_bps + dynamic_exit_buffer_bps
-            should_exit = can_exit_on_reversion and direction_signal <= self.live_inventory_basis_z_exit and (pnl_bps is not None and pnl_bps >= effective_min_exit_pnl_bps)
+            raw_should_exit = can_exit_on_reversion and direction_signal <= self.live_inventory_basis_z_exit and (pnl_bps is not None and pnl_bps >= effective_min_exit_pnl_bps)
+            should_exit = raw_should_exit and var_quote_age_ok and lighter_book_age_ok
             should_stop = pnl_bps is not None and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
             should_timeout = holding_samples >= self.live_inventory_max_hold_samples
             should_timeout_exit = should_timeout and self.live_inventory_basis_max_hold_action == "exit"
@@ -5473,6 +5507,22 @@ class VariationalToLighterRuntime:
                             "effective_min_exit_pnl_bps": decimal_to_str(effective_min_exit_pnl_bps),
                         },
                     )
+            if raw_should_exit and not should_exit:
+                await self.append_live_inventory_log(
+                    "live_inventory_exit_blocked",
+                    {
+                        **state_payload,
+                        "lot_id": candidate_lot.get("lot_id"),
+                        "direction": direction,
+                        "reason": "basis_exit_market_data_too_old",
+                        "var_quote_age_ok": var_quote_age_ok,
+                        "lighter_book_age_ok": lighter_book_age_ok,
+                        "max_var_quote_age_ms": self.live_inventory_basis_max_var_quote_age_ms,
+                        "max_lighter_book_age_seconds": self.live_inventory_max_lighter_book_age_seconds,
+                        "pnl_bps": decimal_to_str(pnl_bps),
+                        "effective_min_exit_pnl_bps": decimal_to_str(effective_min_exit_pnl_bps),
+                    },
+                )
             if should_exit or should_stop or should_timeout_exit:
                 candidate_exit = {
                     "lot_index": lot_index,
@@ -7895,6 +7945,12 @@ def parse_args() -> argparse.Namespace:
         default=3.0,
         help="Maximum estimated Lighter order-book slippage allowed for live inventory entry. Default: 3.0",
     )
+    parser.add_argument(
+        "--live-inventory-max-lighter-book-age-seconds",
+        type=float,
+        default=0.0,
+        help="Maximum Lighter order-book age allowed for basis entry/normal exit. Set 0 to disable. Default: 0",
+    )
     parser.add_argument("--live-inventory-min-hold-samples", type=int, default=3)
     parser.add_argument("--live-inventory-max-hold-samples", type=int, default=300)
     parser.add_argument("--live-inventory-max-unrealized-loss-bps", type=float, default=25.0)
@@ -7925,6 +7981,12 @@ def parse_args() -> argparse.Namespace:
         "--live-inventory-basis-refresh-exit-quote-before-submit",
         action="store_true",
         help="Immediately before a normal basis exit submit, refresh Variational quote and Lighter top-of-book and recheck estimated PnL.",
+    )
+    parser.add_argument(
+        "--live-inventory-basis-max-var-quote-age-ms",
+        type=float,
+        default=0.0,
+        help="Maximum Variational basis quote age allowed for basis entry/normal exit. Set 0 to disable. Default: 0",
     )
     parser.add_argument(
         "--live-inventory-basis-max-hold-action",
@@ -8098,6 +8160,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-dynamic-entry-buffer-bps must be >= 0")
         if args.live_inventory_max_lighter_slippage_bps < 0:
             parser.error("--live-inventory-max-lighter-slippage-bps must be >= 0")
+        if args.live_inventory_max_lighter_book_age_seconds < 0:
+            parser.error("--live-inventory-max-lighter-book-age-seconds must be >= 0")
         if args.live_inventory_min_hold_samples < 0:
             parser.error("--live-inventory-min-hold-samples must be >= 0")
         if args.live_inventory_max_hold_samples <= 0:
@@ -8120,6 +8184,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-basis-min-exit-pnl-bps must be >= 0")
         if args.live_inventory_basis_exit_safety_buffer_bps < 0:
             parser.error("--live-inventory-basis-exit-safety-buffer-bps must be >= 0")
+        if args.live_inventory_basis_max_var_quote_age_ms < 0:
+            parser.error("--live-inventory-basis-max-var-quote-age-ms must be >= 0")
         if args.live_inventory_basis_half_life_seconds <= 0:
             parser.error("--live-inventory-basis-half-life-seconds must be > 0")
         if args.live_inventory_basis_warmup_samples <= 0:

@@ -8,6 +8,8 @@ from tools.inspect_live_basis_state import inspect
 from tools.analyze_live_basis_slippage import summarize as summarize_slippage
 from tools.grid_replay_live_basis_params import parse_decimals, run_grid
 from tools.replay_live_basis_params import replay
+from tools.recommend_live_basis_params import recommend
+from tools.summarize_latest_live_basis_round import latest_events, load_state, suggest_action
 
 
 def write_jsonl(path, rows):
@@ -172,3 +174,73 @@ def test_grid_replay_live_basis_params_runs_combinations(tmp_path) -> None:
 
     assert len(rows) == 2
     assert {row["entered"] for row in rows} == {1}
+
+
+def test_recommend_live_basis_params_returns_candidate(tmp_path) -> None:
+    metrics = tmp_path / "metrics.jsonl"
+    write_jsonl(
+        metrics,
+        [
+            {"event": "live_inventory_exited", "asset": "ETH", "lot_id": 1, "direction": "long_var_short_lighter", "pnl_bps": "1.5", "pnl_usd": "0.003"},
+            {"event": "live_inventory_actual_pnl", "asset": "ETH", "lot_id": 1, "direction": "long_var_short_lighter", "actual_pnl_bps": "0.5", "actual_pnl_usd": "0.001"},
+            {
+                "event": "live_inventory_basis_state",
+                "asset": "ETH",
+                "sample_index": 1,
+                "basis_bps": "-13",
+                "z": "-5",
+                "var_bid": "99",
+                "var_ask": "100",
+                "lighter_buy_price": "101",
+                "lighter_sell_price": "100",
+                "long_edge_bps": "10",
+                "long_roundtrip_pnl_bps": "-2",
+            },
+            {
+                "event": "live_inventory_basis_state",
+                "asset": "ETH",
+                "sample_index": 2,
+                "basis_bps": "-5",
+                "z": "0",
+                "var_bid": "110",
+                "var_ask": "111",
+                "lighter_buy_price": "100",
+                "lighter_sell_price": "99",
+                "long_edge_bps": "0",
+                "long_roundtrip_pnl_bps": "0",
+            },
+        ],
+    )
+    args = argparse.Namespace(
+        input=metrics,
+        asset="ETH",
+        lot_notional_usd=Decimal("20"),
+        max_cycles=1,
+        z_entry=parse_decimals("3"),
+        z_exit=Decimal("999"),
+        min_entry_edge_bps=parse_decimals("7"),
+        min_abs_entry_bps=parse_decimals("12"),
+        max_entry_roundtrip_cost_bps=parse_decimals("3"),
+        addon_min_basis_improvement_bps=parse_decimals("4"),
+        min_exit_pnl_bps=parse_decimals("1"),
+        max_total_lots=[1],
+        min_hold_samples=0,
+    )
+
+    result = recommend(args)
+
+    assert result["candidate_count"] == 1
+    assert result["suggested_exit_safety_buffer_bps"] == Decimal("1.0")
+
+
+def test_summarize_latest_live_basis_round_suggests_flat_action(tmp_path) -> None:
+    state = tmp_path / "state.json"
+    metrics = tmp_path / "metrics.jsonl"
+    state.write_text(json.dumps({"status": "flat", "open_lots": [], "completed_cycles": 1}), encoding="utf-8")
+    write_jsonl(metrics, [{"event": "live_inventory_actual_pnl", "asset": "ETH", "lot_id": 1, "actual_pnl_bps": "0"}])
+
+    loaded = load_state(state)
+    events = latest_events(metrics, asset="ETH", limit=5)
+
+    assert loaded["status"] == "flat"
+    assert suggest_action(loaded, events).startswith("flat:")
