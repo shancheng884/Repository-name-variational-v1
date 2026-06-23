@@ -47,6 +47,15 @@ def summarize(name: str, values: list[Decimal]) -> None:
     )
 
 
+def nested_decimal(row: dict[str, Any], *keys: str) -> Decimal | None:
+    value: Any = row
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return to_decimal(value)
+
+
 def avg(values: list[Decimal]) -> Decimal | None:
     return sum(values) / Decimal(len(values)) if values else None
 
@@ -80,8 +89,9 @@ def main() -> None:
     exited = [r for r in rows if r.get("event") == "live_inventory_exited"]
     actual = [r for r in rows if r.get("event") == "live_inventory_actual_pnl"]
     blocked = [r for r in rows if r.get("event") == "live_inventory_entry_blocked"]
+    shadow = [r for r in rows if r.get("event") == "live_inventory_entry_shadow_candidate"]
 
-    print(f"rows={len(rows)} entered={len(entered)} exited={len(exited)} actual_pnl={len(actual)} blocked={len(blocked)}")
+    print(f"rows={len(rows)} entered={len(entered)} exited={len(exited)} actual_pnl={len(actual)} blocked={len(blocked)} shadow={len(shadow)}")
 
     summarize("entry_lighter_slippage_bps", [v for r in entered if (v := to_decimal(r.get("entry_lighter_slippage_bps"))) is not None])
     summarize("exit_lighter_slippage_bps", [v for r in actual if (v := to_decimal(r.get("exit_lighter_slippage_bps"))) is not None])
@@ -131,6 +141,25 @@ def main() -> None:
     print("\nentry_blocked_reasons:")
     for reason, count in sorted(blocked_counts.items(), key=lambda item: item[1], reverse=True):
         print(f"  {count} {reason}")
+
+    shadow_counts: dict[str, int] = defaultdict(int)
+    for r in shadow:
+        shadow_counts[str(r.get("shadow_block_reason") or r.get("shadow_status") or "unknown")] += 1
+    if shadow_counts:
+        print("\nshadow_candidate_reasons:")
+        for reason, count in sorted(shadow_counts.items(), key=lambda item: item[1], reverse=True):
+            print(f"  {count} {reason}")
+
+        print("\nshadow_candidate_quality:")
+        summarize("  raw_edge_bps", [v for r in shadow if (v := to_decimal(r.get("raw_edge_bps"))) is not None])
+        summarize("  normalized_edge_bps", [v for r in shadow if (v := to_decimal(r.get("normalized_edge_bps"))) is not None])
+        summarize("  stablecoin_edge_share", [v for r in shadow if (v := to_decimal(r.get("stablecoin_edge_share"))) is not None])
+        summarize("  entry_quality_score_bps", [v for r in shadow if (v := to_decimal(r.get("entry_quality_score_bps"))) is not None])
+        summarize("  live_inventory_required_entry_bps", [v for r in shadow if (v := nested_decimal(r, "preflight_context", "live_inventory_required_entry_bps")) is not None])
+        summarize("  live_inventory_required_entry_margin_bps", [v for r in shadow if (v := nested_decimal(r, "preflight_context", "live_inventory_required_entry_margin_bps")) is not None])
+        summarize("  preflight_edge_bps", [v for r in shadow if (v := nested_decimal(r, "preflight_context", "entry_edge_bps")) is not None])
+        summarize("  preflight_lighter_slippage_bps", [v for r in shadow if (v := nested_decimal(r, "preflight_context", "lighter_order_book_slippage_bps")) is not None])
+        summarize("  preflight_dynamic_buffer_bps", [v for r in shadow if (v := nested_decimal(r, "preflight_context", "live_inventory_dynamic_entry_buffer_bps")) is not None])
 
     latency_values = [v for r in actual if (v := to_decimal(r.get("exit_var_fill_to_lighter_fill_ms"))) is not None]
     shortfall_values = [v for r in actual if (v := to_decimal(r.get("estimated_vs_actual_pnl_shortfall_bps"))) is not None and v > 0]

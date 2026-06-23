@@ -2514,6 +2514,9 @@ class VariationalToLighterRuntime:
         if dynamic_required_entry_bps > required_entry_bps:
             required_entry_bps = dynamic_required_entry_bps
         context["live_inventory_required_entry_bps"] = decimal_to_str(required_entry_bps)
+        context["live_inventory_required_entry_margin_bps"] = decimal_to_str(
+            None if edge_bps is None else edge_bps - required_entry_bps
+        )
         if edge_bps is None or edge_bps < required_entry_bps:
             return False, "edge_bps_below_dynamic_live_inventory_entry", context
         return True, "ok", context
@@ -4318,6 +4321,9 @@ class VariationalToLighterRuntime:
                 **payload,
             },
         )
+
+    async def append_live_inventory_entry_shadow_candidate(self, payload: dict[str, Any]) -> None:
+        await self.append_live_inventory_log("live_inventory_entry_shadow_candidate", payload)
 
     async def append_live_inventory_run_config(self) -> None:
         if not self.live_inventory:
@@ -6428,6 +6434,28 @@ class VariationalToLighterRuntime:
                         var_snapshot_timestamp=quote.get("quoteTimestamp") or quote.get("quote_timestamp"),
                         min_entry_bps=min_entry_edge_bps,
                         dynamic_entry_buffer_bps=self.live_inventory_dynamic_entry_quality_buffer_bps(var_quote_age_seconds=var_quote_age_seconds),
+                    )
+                    await self.append_live_inventory_entry_shadow_candidate(
+                        {
+                            **state_payload,
+                            "shadow_stage": "preflight",
+                            "shadow_status": "passed" if preflight_ok else "blocked",
+                            "shadow_block_reason": None if preflight_ok else preflight_reason,
+                            "direction": direction,
+                            "edge_bps": decimal_to_str(edge_bps),
+                            "raw_edge_bps": decimal_to_str(raw_edge_bps),
+                            "normalized_edge_bps": decimal_to_str(normalized_edge_bps),
+                            "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                            "raw_roundtrip_pnl_bps": decimal_to_str(raw_roundtrip_bps),
+                            "normalized_roundtrip_pnl_bps": decimal_to_str(normalized_roundtrip_bps),
+                            "entry_edge_source": "normalized" if self.live_inventory_basis_use_normalized_edge_for_entry else "raw",
+                            **stablecoin_edge_context,
+                            "min_entry_edge_bps": decimal_to_str(min_entry_edge_bps),
+                            "min_abs_entry_bps": decimal_to_str(min_abs_entry_bps),
+                            "entry_quality_score_bps": decimal_to_str(entry_quality_score_bps),
+                            "entry_quality_buffer_bps": decimal_to_str(dynamic_entry_quality_buffer_bps),
+                            "preflight_context": preflight_context,
+                        }
                     )
                     if not preflight_ok:
                         await self.block_live_inventory_entry(asset=asset, reason=preflight_reason, context=preflight_context)
