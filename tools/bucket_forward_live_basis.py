@@ -61,6 +61,32 @@ def edge_value(row: dict[str, Any], direction: str, edge_field: str) -> Decimal 
     return dec(row.get(f"{prefix}_edge_bps"))
 
 
+def direction_value(row: dict[str, Any], direction: str, suffix: str) -> Decimal | None:
+    prefix = "long" if direction == LONG else "short"
+    return dec(row.get(f"{prefix}_{suffix}"))
+
+
+def grouping_value(row: dict[str, Any], direction: str, group_by: str) -> Decimal | None:
+    if group_by == "edge":
+        return None
+    if group_by == "normalized_edge":
+        return edge_value(row, direction, "normalized")
+    if group_by == "stablecoin_share":
+        return direction_value(row, direction, "stablecoin_edge_share")
+    if group_by == "stablecoin_adjustment":
+        return direction_value(row, direction, "stablecoin_edge_adjustment_bps")
+    if group_by == "stablecoin_abs_adjustment":
+        return direction_value(row, direction, "stablecoin_edge_adjustment_abs_bps")
+    if group_by == "sample_move":
+        return dec(row.get("basis_sample_move_bps"))
+    if group_by == "hour":
+        timestamp = str(row.get("ts") or row.get("timestamp") or row.get("time") or "")
+        if len(timestamp) >= 13 and timestamp[10] in {"T", " "}:
+            return dec(timestamp[11:13])
+        return None
+    raise ValueError(f"unsupported group_by: {group_by}")
+
+
 def summarize(values: list[Decimal]) -> str:
     if not values:
         return "n=0 avg=- win_rate=- worst=- best=-"
@@ -72,6 +98,8 @@ def summarize(values: list[Decimal]) -> str:
 
 
 def bucket_start(label: str) -> Decimal:
+    if "|" in label:
+        label = label.split("|", 1)[0]
     return Decimal(label.split("..")[0]) if ".." in label else Decimal("0")
 
 
@@ -82,6 +110,16 @@ def main() -> None:
     parser.add_argument("--bucket-width-bps", type=Decimal, default=Decimal("1"))
     parser.add_argument("--edge-field", choices=("raw", "normalized"), default="raw")
     parser.add_argument("--min-edge-bps", type=Decimal, default=Decimal("0"))
+    parser.add_argument("--max-edge-bps", type=Decimal, default=Decimal("0"), help="Skip rows whose entry edge is >= this value. 0 disables.")
+    parser.add_argument("--min-normalized-edge-bps", type=Decimal, default=None)
+    parser.add_argument("--max-stablecoin-edge-share", type=Decimal, default=Decimal("0"), help="Skip rows whose direction stablecoin edge share exceeds this. 0 disables.")
+    parser.add_argument("--max-stablecoin-adjustment-abs-bps", type=Decimal, default=Decimal("0"), help="Skip rows whose abs(raw-normalized edge) exceeds this. 0 disables.")
+    parser.add_argument(
+        "--group-by",
+        choices=("edge", "normalized_edge", "stablecoin_share", "stablecoin_adjustment", "stablecoin_abs_adjustment", "sample_move", "hour"),
+        default="edge",
+    )
+    parser.add_argument("--group-width", type=Decimal, default=Decimal("1"))
     parser.add_argument("--max-sample-move-bps", type=Decimal, default=Decimal("0"), help="Skip rows whose basis_sample_move_bps exceeds this. 0 disables.")
     parser.add_argument("--horizons", default="30,60,120")
     parser.add_argument("--recommend-horizon", type=int, default=30)
@@ -114,7 +152,22 @@ def main() -> None:
         for direction, edge in direction_edges:
             if edge is None or edge < args.min_edge_bps:
                 continue
-            label = bucket_label(edge, args.bucket_width_bps)
+            if args.max_edge_bps > 0 and edge >= args.max_edge_bps:
+                continue
+            normalized_edge = edge_value(row, direction, "normalized")
+            if args.min_normalized_edge_bps is not None and (normalized_edge is None or normalized_edge < args.min_normalized_edge_bps):
+                continue
+            stablecoin_share = direction_value(row, direction, "stablecoin_edge_share")
+            if args.max_stablecoin_edge_share > 0 and stablecoin_share is not None and stablecoin_share > args.max_stablecoin_edge_share:
+                continue
+            stablecoin_abs_adjustment = direction_value(row, direction, "stablecoin_edge_adjustment_abs_bps")
+            if args.max_stablecoin_adjustment_abs_bps > 0 and stablecoin_abs_adjustment is not None and stablecoin_abs_adjustment > args.max_stablecoin_adjustment_abs_bps:
+                continue
+            group_value = edge if args.group_by == "edge" else grouping_value(row, direction, args.group_by)
+            if group_value is None:
+                continue
+            width = args.bucket_width_bps if args.group_by == "edge" else args.group_width
+            label = bucket_label(group_value, width)
             counts[(direction, label)] += 1
             for horizon in horizons:
                 exit_idx = idx + horizon
@@ -124,7 +177,14 @@ def main() -> None:
                 if value is not None:
                     buckets[(direction, label, horizon)].append(value)
 
-    print(f"basis_rows={len(basis_rows)} edge_field={args.edge_field} bucket_width_bps={args.bucket_width_bps} min_edge_bps={args.min_edge_bps}")
+    print(
+        f"basis_rows={len(basis_rows)} edge_field={args.edge_field} group_by={args.group_by} "
+        f"bucket_width_bps={args.bucket_width_bps} group_width={args.group_width} "
+        f"min_edge_bps={args.min_edge_bps} max_edge_bps={args.max_edge_bps} "
+        f"min_normalized_edge_bps={args.min_normalized_edge_bps} "
+        f"max_stablecoin_edge_share={args.max_stablecoin_edge_share} "
+        f"max_stablecoin_adjustment_abs_bps={args.max_stablecoin_adjustment_abs_bps}"
+    )
     for direction in (LONG, SHORT):
         labels = sorted({label for dir_name, label in counts if dir_name == direction}, key=bucket_start)
         print(f"\n{direction}:")
