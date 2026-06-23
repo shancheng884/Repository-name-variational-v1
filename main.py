@@ -203,6 +203,7 @@ def decimal_to_str(value: Decimal | None) -> str | None:
 VARIATIONAL_API_AMOUNT_QUANTUM = Decimal("0.000001")
 VARIATIONAL_API_AMOUNT_QUANTUM_BY_ASSET = {
     "ETH": Decimal("0.00001"),
+    "SOL": Decimal("0.001"),
 }
 
 

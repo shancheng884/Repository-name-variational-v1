@@ -2595,6 +2595,7 @@ def test_live_inventory_entry_blocks_live_cooldown_before_submit(tmp_path) -> No
 def test_variational_api_amount_to_str_truncates_to_min_qty_tick() -> None:
     assert variational_api_amount_to_str(Decimal("0.0002432227102505721546713663434")) == "0.000243"
     assert variational_api_amount_to_str(Decimal("0.01167603668610726774903526747"), asset="ETH") == "0.01167"
+    assert variational_api_amount_to_str(Decimal("0.2898975067364933127892633559"), asset="SOL") == "0.289"
 
 
 def test_live_inventory_entry_concurrent_submit_uses_formatted_var_amount(tmp_path) -> None:
