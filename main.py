@@ -9496,15 +9496,15 @@ def parse_args() -> argparse.Namespace:
                     parser.error(
                         "--live-inventory-signal-mode basis real-submit requires --live-inventory-i-accept-basis-real-diagnostic"
                     )
-                if args.live_inventory_lot_notional_usd != 20:
-                    parser.error("basis real-submit diagnostic requires --live-inventory-lot-notional-usd 20")
+                if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > 20:
+                    parser.error("basis real-submit diagnostic requires 0 < --live-inventory-lot-notional-usd <= 20")
                 if args.live_inventory_i_accept_basis_addon_diagnostic:
                     if args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 2:
                         parser.error("basis add-on diagnostic requires --live-inventory-max-lots 1 --live-inventory-max-total-lots 2")
                 elif args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 1:
                     parser.error("basis real-submit diagnostic requires --live-inventory-max-lots 1 --live-inventory-max-total-lots 1")
-                if args.live_inventory_max_cycles != 1:
-                    parser.error("basis real-submit diagnostic requires --live-inventory-max-cycles 1")
+                if args.live_inventory_max_cycles <= 0 or args.live_inventory_max_cycles > 10:
+                    parser.error("basis real-submit diagnostic requires 0 < --live-inventory-max-cycles <= 10")
             elif args.live_inventory_i_accept_basis_real_diagnostic:
                 parser.error("--live-inventory-i-accept-basis-real-diagnostic is only for real-submit diagnostic runs")
             elif args.live_inventory_i_accept_basis_addon_diagnostic:
