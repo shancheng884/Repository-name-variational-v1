@@ -66,6 +66,7 @@ VARIATIONAL_SUBMIT_TRANSPORT_CHOICES = (VARIATIONAL_SUBMIT_TRANSPORT_DOM, VARIAT
 LIVE_INVENTORY_SIGNAL_SNAPSHOT = "snapshot"
 LIVE_INVENTORY_SIGNAL_BASIS = "basis"
 LIVE_INVENTORY_SIGNAL_CHOICES = (LIVE_INVENTORY_SIGNAL_SNAPSHOT, LIVE_INVENTORY_SIGNAL_BASIS)
+LIVE_INVENTORY_BASIS_ALLOWED_ASSETS = {"BTC", "ETH", "SOL"}
 LIVE_INVENTORY_ENTRY_MODE_CONCURRENT = "concurrent"
 LIVE_INVENTORY_ENTRY_MODE_VAR_FIRST = "var-first"
 LIVE_INVENTORY_ENTRY_MODE_CHOICES = (LIVE_INVENTORY_ENTRY_MODE_CONCURRENT, LIVE_INVENTORY_ENTRY_MODE_VAR_FIRST)
@@ -5787,7 +5788,7 @@ class VariationalToLighterRuntime:
 
     async def maybe_run_live_inventory_basis(self, snapshot: CrossSpreadSnapshot) -> None:
         asset = snapshot.asset.upper()
-        if asset != "ETH":
+        if self.live_allowed_assets and asset not in self.live_allowed_assets:
             return
         self.live_inventory_sample_index += 1
         index = self.live_inventory_sample_index
@@ -8828,6 +8829,11 @@ class VariationalToLighterRuntime:
             self.initialize_lighter_client()
         if self.requires_lighter_market_data():
             initial_asset = await self.wait_for_ticker_resolution()
+            if self.live_allowed_assets and initial_asset.upper() not in self.live_allowed_assets:
+                raise RuntimeError(
+                    f"Current Variational asset {initial_asset.upper()} is not in --live-allowed-assets "
+                    f"{sorted(self.live_allowed_assets)}. Switch the Variational page to the requested asset before starting."
+                )
             await self.activate_asset(initial_asset, reason="startup")
         if self.lighter_prewarm_submit_ws:
             try:
@@ -9489,8 +9495,11 @@ def parse_args() -> argparse.Namespace:
             parser.error("use only one of --live-inventory-i-confirm-flat-start or --live-inventory-i-accept-open-state-resume")
         allowed_assets = {asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()}
         if args.live_inventory_signal_mode == LIVE_INVENTORY_SIGNAL_BASIS:
-            if allowed_assets != {"ETH"}:
-                parser.error("--live-inventory-signal-mode basis currently requires --live-allowed-assets ETH")
+            if len(allowed_assets) != 1 or not allowed_assets.issubset(LIVE_INVENTORY_BASIS_ALLOWED_ASSETS):
+                parser.error(
+                    "--live-inventory-signal-mode basis requires exactly one --live-allowed-assets value from "
+                    f"{sorted(LIVE_INVENTORY_BASIS_ALLOWED_ASSETS)}"
+                )
             if not args.live_inventory_dry_decisions:
                 if not args.live_inventory_i_accept_basis_real_diagnostic:
                     parser.error(
