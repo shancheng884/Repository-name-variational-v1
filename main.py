@@ -6423,6 +6423,158 @@ class VariationalToLighterRuntime:
                 lighter_record = None
                 lighter_payload = None
                 if not self.live_inventory_dry_decisions:
+                    var_amount = variational_api_amount_to_str(qty, asset=asset)
+                    submitted_qty = Decimal(var_amount)
+                    if submitted_qty <= 0:
+                        await self.block_live_inventory_entry(
+                            asset=asset,
+                            reason="variational_amount_below_min_tick_after_quantize",
+                            context={
+                                **state_payload,
+                                "direction": direction,
+                                "qty": decimal_to_str(qty),
+                                "var_amount": var_amount,
+                            },
+                        )
+                        return
+                    entry_lighter_side = "SELL" if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER else "BUY"
+                    exit_lighter_side = "BUY" if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER else "SELL"
+                    exit_var_price = var_bid if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER else var_ask
+                    entry_depth = await self.live_inventory_lighter_depth_context(lighter_side=entry_lighter_side, qty=submitted_qty)
+                    exit_depth = await self.live_inventory_lighter_depth_context(lighter_side=exit_lighter_side, qty=submitted_qty)
+                    submitted_lighter_price = to_decimal(entry_depth.get("estimated_fill_price"))
+                    submitted_exit_lighter_price = to_decimal(exit_depth.get("estimated_fill_price"))
+                    if submitted_lighter_price is None or submitted_exit_lighter_price is None:
+                        await self.append_live_inventory_log(
+                            "live_inventory_entry_blocked",
+                            {
+                                **state_payload,
+                                "reason": "basis_entry_lighter_depth_insufficient_after_quantize",
+                                "direction": direction,
+                                "qty": decimal_to_str(qty),
+                                "submitted_qty": decimal_to_str(submitted_qty),
+                                "var_amount": var_amount,
+                                "entry_lighter_depth": entry_depth,
+                                "exit_lighter_depth": exit_depth,
+                            },
+                        )
+                        return
+                    qty = submitted_qty
+                    lighter_price = submitted_lighter_price
+                    raw_edge_bps = self.live_inventory_pair_edge_bps(direction=direction, var_price=var_price, lighter_price=lighter_price) or Decimal("0")
+                    edge_bps = raw_edge_bps
+                    raw_roundtrip_bps = self.live_inventory_roundtrip_pnl_bps(
+                        direction=direction,
+                        var_entry_price=var_price,
+                        lighter_entry_price=lighter_price,
+                        var_exit_price=exit_var_price,
+                        lighter_exit_price=submitted_exit_lighter_price,
+                    )
+                    roundtrip_bps = raw_roundtrip_bps
+                    normalized_edge_bps = None
+                    normalized_roundtrip_bps = None
+                    normalized_var_price = self.normalize_usdc_price_to_usdt(var_price, stablecoin_context)
+                    normalized_exit_var_price = self.normalize_usdc_price_to_usdt(exit_var_price, stablecoin_context)
+                    if normalized_var_price is not None and normalized_exit_var_price is not None:
+                        normalized_edge_bps = self.live_inventory_pair_edge_bps(
+                            direction=direction,
+                            var_price=normalized_var_price,
+                            lighter_price=lighter_price,
+                        )
+                        normalized_roundtrip_bps = self.live_inventory_roundtrip_pnl_bps(
+                            direction=direction,
+                            var_entry_price=normalized_var_price,
+                            lighter_entry_price=lighter_price,
+                            var_exit_price=normalized_exit_var_price,
+                            lighter_exit_price=submitted_exit_lighter_price,
+                        )
+                    if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_edge_bps is not None:
+                        edge_bps = normalized_edge_bps
+                    if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_roundtrip_bps is not None:
+                        roundtrip_bps = normalized_roundtrip_bps
+                    stablecoin_filter_ok, stablecoin_edge_context = self.live_inventory_stablecoin_edge_context(
+                        raw_edge_bps=raw_edge_bps,
+                        normalized_edge_bps=normalized_edge_bps,
+                    )
+                    if not stablecoin_filter_ok:
+                        await self.append_live_inventory_log(
+                            "live_inventory_entry_blocked",
+                            {
+                                **state_payload,
+                                "reason": "basis_entry_quantized_stablecoin_filter_blocked",
+                                "direction": direction,
+                                "edge_bps": decimal_to_str(edge_bps),
+                                "raw_edge_bps": decimal_to_str(raw_edge_bps),
+                                "normalized_edge_bps": decimal_to_str(normalized_edge_bps),
+                                "qty": decimal_to_str(qty),
+                                "var_amount": var_amount,
+                                **stablecoin_edge_context,
+                                "entry_lighter_depth": entry_depth,
+                                "exit_lighter_depth": exit_depth,
+                            },
+                        )
+                        return
+                    entry_quality_score_bps, entry_quality_context = self.live_inventory_entry_quality_score_bps(
+                        edge_bps=edge_bps,
+                        min_entry_bps=min_entry_edge_bps,
+                        dynamic_buffer_bps=dynamic_entry_quality_buffer_bps,
+                        basis_sample_move_bps=basis_sample_move_bps,
+                        roundtrip_bps=roundtrip_bps,
+                    )
+                    if edge_bps < min_entry_edge_bps:
+                        await self.append_live_inventory_log(
+                            "live_inventory_entry_blocked",
+                            {
+                                **state_payload,
+                                "reason": "basis_entry_quantized_edge_below_threshold",
+                                "direction": direction,
+                                "edge_bps": decimal_to_str(edge_bps),
+                                "raw_edge_bps": decimal_to_str(raw_edge_bps),
+                                "normalized_edge_bps": decimal_to_str(normalized_edge_bps),
+                                "min_entry_edge_bps": decimal_to_str(min_entry_edge_bps),
+                                "qty": decimal_to_str(qty),
+                                "var_amount": var_amount,
+                                **stablecoin_edge_context,
+                                **entry_quality_context,
+                                "entry_lighter_depth": entry_depth,
+                            },
+                        )
+                        return
+                    if entry_quality_score_bps < self.live_inventory_basis_min_entry_quality_score_bps:
+                        await self.append_live_inventory_log(
+                            "live_inventory_entry_blocked",
+                            {
+                                **state_payload,
+                                "reason": "basis_entry_quantized_quality_score_too_low",
+                                "direction": direction,
+                                "edge_bps": decimal_to_str(edge_bps),
+                                "raw_edge_bps": decimal_to_str(raw_edge_bps),
+                                "normalized_edge_bps": decimal_to_str(normalized_edge_bps),
+                                "qty": decimal_to_str(qty),
+                                "var_amount": var_amount,
+                                **stablecoin_edge_context,
+                                **entry_quality_context,
+                                "entry_lighter_depth": entry_depth,
+                            },
+                        )
+                        return
+                    if roundtrip_bps < -self.live_inventory_basis_max_entry_roundtrip_cost_bps:
+                        await self.append_live_inventory_log(
+                            "live_inventory_entry_blocked",
+                            {
+                                **state_payload,
+                                "reason": "basis_entry_quantized_roundtrip_below_threshold",
+                                "direction": direction,
+                                "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                                "max_entry_roundtrip_cost_bps": decimal_to_str(self.live_inventory_basis_max_entry_roundtrip_cost_bps),
+                                "qty": decimal_to_str(qty),
+                                "var_amount": var_amount,
+                                **stablecoin_edge_context,
+                                "entry_lighter_depth": entry_depth,
+                                "exit_lighter_depth": exit_depth,
+                            },
+                        )
+                        return
                     preflight_ok, preflight_reason, preflight_context = await self.live_inventory_entry_preflight(
                         asset=asset,
                         direction=direction,
@@ -6461,8 +6613,6 @@ class VariationalToLighterRuntime:
                     if not preflight_ok:
                         await self.block_live_inventory_entry(asset=asset, reason=preflight_reason, context=preflight_context)
                         return
-                    var_amount = variational_api_amount_to_str(qty, asset=asset)
-                    submitted_qty = Decimal(var_amount)
                     pending_context = {
                         "signal_mode": LIVE_INVENTORY_SIGNAL_BASIS,
                         "sample_index": index,
