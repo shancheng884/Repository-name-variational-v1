@@ -806,6 +806,10 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_short_min_abs_entry_bps = Decimal(str(args.live_inventory_basis_short_min_abs_entry_bps))
         self.live_inventory_basis_min_exit_pnl_bps = Decimal(str(args.live_inventory_basis_min_exit_pnl_bps))
         self.live_inventory_basis_min_signal_reverted_exit_pnl_bps = Decimal(str(args.live_inventory_basis_min_signal_reverted_exit_pnl_bps))
+        self.live_inventory_basis_signal_exit_watch_samples = int(args.live_inventory_basis_signal_exit_watch_samples)
+        self.live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps = Decimal(
+            str(args.live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps)
+        )
         self.live_inventory_basis_exit_safety_buffer_bps = Decimal(str(args.live_inventory_basis_exit_safety_buffer_bps))
         self.live_inventory_basis_dynamic_exit_buffer = bool(args.live_inventory_basis_dynamic_exit_buffer)
         self.live_inventory_basis_refresh_exit_quote_before_submit = bool(args.live_inventory_basis_refresh_exit_quote_before_submit)
@@ -4351,6 +4355,8 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_addon_min_basis_improvement_bps",
             "live_inventory_basis_min_exit_pnl_bps",
             "live_inventory_basis_min_signal_reverted_exit_pnl_bps",
+            "live_inventory_basis_signal_exit_watch_samples",
+            "live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps",
             "live_inventory_basis_exit_safety_buffer_bps",
             "live_inventory_basis_dynamic_exit_buffer",
             "live_inventory_basis_refresh_entry_quote_before_submit",
@@ -6885,7 +6891,30 @@ class VariationalToLighterRuntime:
                 self.live_inventory_basis_min_signal_reverted_exit_pnl_bps,
             )
             effective_min_exit_pnl_bps = signal_reverted_min_exit_pnl_bps + self.live_inventory_basis_exit_safety_buffer_bps + dynamic_exit_buffer_bps
-            raw_should_exit = can_exit_on_reversion and direction_signal <= self.live_inventory_basis_z_exit and (pnl_bps is not None and pnl_bps >= effective_min_exit_pnl_bps)
+            signal_reverted = can_exit_on_reversion and direction_signal <= self.live_inventory_basis_z_exit
+            exit_watch_started_sample = int(candidate_lot.get("signal_exit_watch_started_sample") or 0)
+            if signal_reverted and pnl_bps is not None and pnl_bps < effective_min_exit_pnl_bps and exit_watch_started_sample <= 0:
+                candidate_lot["signal_exit_watch_started_sample"] = holding_samples
+                exit_watch_started_sample = holding_samples
+            if not signal_reverted and exit_watch_started_sample > 0:
+                candidate_lot.pop("signal_exit_watch_started_sample", None)
+                exit_watch_started_sample = 0
+            exit_watch_age_samples = holding_samples - exit_watch_started_sample if exit_watch_started_sample > 0 else 0
+            signal_exit_watch_timeout = (
+                signal_reverted
+                and exit_watch_started_sample > 0
+                and self.live_inventory_basis_signal_exit_watch_samples > 0
+                and exit_watch_age_samples >= self.live_inventory_basis_signal_exit_watch_samples
+            )
+            signal_exit_watch_timeout_ok = (
+                signal_exit_watch_timeout
+                and pnl_bps is not None
+                and pnl_bps >= self.live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps
+            )
+            raw_should_exit = signal_reverted and (
+                (pnl_bps is not None and pnl_bps >= effective_min_exit_pnl_bps)
+                or signal_exit_watch_timeout_ok
+            )
             should_profit_take = (
                 can_exit_on_reversion
                 and self.live_inventory_basis_profit_take_pnl_bps > 0
@@ -6923,8 +6952,39 @@ class VariationalToLighterRuntime:
                             "dynamic_exit_buffer_bps": decimal_to_str(dynamic_exit_buffer_bps),
                             "effective_min_exit_pnl_bps": decimal_to_str(effective_min_exit_pnl_bps),
                             "profit_take_pnl_bps": decimal_to_str(self.live_inventory_basis_profit_take_pnl_bps),
+                            "signal_reverted": signal_reverted,
+                            "signal_exit_watch_started_sample": exit_watch_started_sample,
+                            "signal_exit_watch_age_samples": exit_watch_age_samples,
+                            "signal_exit_watch_samples": self.live_inventory_basis_signal_exit_watch_samples,
+                            "signal_exit_watch_timeout_min_pnl_bps": decimal_to_str(
+                                self.live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps
+                            ),
                         },
                     )
+            if signal_reverted and not raw_should_exit and self.should_log_live_inventory_exit_blocked(
+                lot_id=candidate_lot.get("lot_id"), reason="basis_signal_exit_watch_waiting_for_pnl"
+            ):
+                await self.append_live_inventory_log(
+                    "live_inventory_exit_blocked",
+                    {
+                        **state_payload,
+                        "lot_id": candidate_lot.get("lot_id"),
+                        "basis_trace_id": candidate_lot.get("basis_trace_id"),
+                        "direction": direction,
+                        "reason": "basis_signal_exit_watch_waiting_for_pnl",
+                        "holding_samples": holding_samples,
+                        "direction_signal": decimal_to_str(direction_signal),
+                        "pnl_bps": decimal_to_str(pnl_bps),
+                        "effective_min_exit_pnl_bps": decimal_to_str(effective_min_exit_pnl_bps),
+                        "signal_exit_watch_started_sample": exit_watch_started_sample,
+                        "signal_exit_watch_age_samples": exit_watch_age_samples,
+                        "signal_exit_watch_samples": self.live_inventory_basis_signal_exit_watch_samples,
+                        "signal_exit_watch_timeout": signal_exit_watch_timeout,
+                        "signal_exit_watch_timeout_min_pnl_bps": decimal_to_str(
+                            self.live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps
+                        ),
+                    },
+                )
             if raw_should_exit and not should_exit:
                 await self.append_live_inventory_log(
                     "live_inventory_exit_blocked",
@@ -6960,6 +7020,7 @@ class VariationalToLighterRuntime:
                     "should_timeout": should_timeout,
                     "should_timeout_exit": should_timeout_exit,
                     "should_profit_take": should_profit_take,
+                    "signal_exit_watch_timeout_ok": signal_exit_watch_timeout_ok,
                     "time_decayed_min_exit_pnl_bps": time_decayed_min_exit_pnl_bps,
                     "signal_reverted_min_exit_pnl_bps": signal_reverted_min_exit_pnl_bps,
                     "effective_min_exit_pnl_bps": effective_min_exit_pnl_bps,
@@ -6989,11 +7050,22 @@ class VariationalToLighterRuntime:
         should_timeout = bool(selected_exit["should_timeout"])
         should_timeout_exit = bool(selected_exit["should_timeout_exit"])
         should_profit_take = bool(selected_exit["should_profit_take"])
+        signal_exit_watch_timeout_ok = bool(selected_exit.get("signal_exit_watch_timeout_ok"))
         time_decayed_min_exit_pnl_bps = selected_exit["time_decayed_min_exit_pnl_bps"]
         signal_reverted_min_exit_pnl_bps = selected_exit["signal_reverted_min_exit_pnl_bps"]
         effective_min_exit_pnl_bps = selected_exit["effective_min_exit_pnl_bps"]
         dynamic_exit_buffer_bps = selected_exit["dynamic_exit_buffer_bps"]
-        exit_reason = "profit_take" if should_profit_take else "signal_reverted" if should_exit else "max_unrealized_loss_bps" if should_stop else "max_hold_samples"
+        exit_reason = (
+            "profit_take"
+            if should_profit_take
+            else "signal_reverted_watch_timeout"
+            if signal_exit_watch_timeout_ok
+            else "signal_reverted"
+            if should_exit
+            else "max_unrealized_loss_bps"
+            if should_stop
+            else "max_hold_samples"
+        )
         var_submit_ms = None
         lighter_submit_ms = None
         lighter_payload = None
@@ -7243,6 +7315,11 @@ class VariationalToLighterRuntime:
                 "min_exit_pnl_bps": decimal_to_str(self.live_inventory_basis_min_exit_pnl_bps),
                 "time_decayed_min_exit_pnl_bps": decimal_to_str(time_decayed_min_exit_pnl_bps),
                 "signal_reverted_min_exit_pnl_bps": decimal_to_str(signal_reverted_min_exit_pnl_bps),
+                "signal_exit_watch_timeout_ok": signal_exit_watch_timeout_ok,
+                "signal_exit_watch_samples": self.live_inventory_basis_signal_exit_watch_samples,
+                "signal_exit_watch_timeout_min_pnl_bps": decimal_to_str(
+                    self.live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps
+                ),
                 "profit_take_pnl_bps": decimal_to_str(self.live_inventory_basis_profit_take_pnl_bps),
                 "exit_safety_buffer_bps": decimal_to_str(self.live_inventory_basis_exit_safety_buffer_bps),
                 "dynamic_exit_buffer_bps": decimal_to_str(dynamic_exit_buffer_bps),
@@ -9479,6 +9556,18 @@ def parse_args() -> argparse.Namespace:
         help="Floor for normal signal-reverted basis exits after time decay. Default: 0 prevents time decay from turning signal_reverted exits negative.",
     )
     parser.add_argument(
+        "--live-inventory-basis-signal-exit-watch-samples",
+        type=int,
+        default=0,
+        help="When signal reverts but estimated PnL is below the signal-reverted exit floor, wait up to this many holding samples before allowing a timeout exit. Default: 0 disables timeout exits from the watch.",
+    )
+    parser.add_argument(
+        "--live-inventory-basis-signal-exit-watch-timeout-min-pnl-bps",
+        type=float,
+        default=0.0,
+        help="Minimum estimated PnL required for a signal exit watch timeout. Default: 0.",
+    )
+    parser.add_argument(
         "--live-inventory-basis-exit-safety-buffer-bps",
         type=float,
         default=0.0,
@@ -9790,6 +9879,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-basis-min-exit-pnl-bps must be >= 0")
         if args.live_inventory_basis_min_signal_reverted_exit_pnl_bps < 0:
             parser.error("--live-inventory-basis-min-signal-reverted-exit-pnl-bps must be >= 0")
+        if args.live_inventory_basis_signal_exit_watch_samples < 0:
+            parser.error("--live-inventory-basis-signal-exit-watch-samples must be >= 0")
         if args.live_inventory_basis_exit_safety_buffer_bps < 0:
             parser.error("--live-inventory-basis-exit-safety-buffer-bps must be >= 0")
         if args.live_inventory_basis_max_var_quote_age_ms < 0:
