@@ -200,6 +200,20 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     return format(value, "f")
 
 
+def parse_decimal_csv(value: str | None) -> list[Decimal]:
+    if not value:
+        return []
+    values: list[Decimal] = []
+    for part in str(value).split(","):
+        text = part.strip()
+        if not text:
+            continue
+        parsed = Decimal(text)
+        if parsed > 0:
+            values.append(parsed)
+    return values
+
+
 VARIATIONAL_API_AMOUNT_QUANTUM = Decimal("0.000001")
 VARIATIONAL_API_AMOUNT_QUANTUM_BY_ASSET = {
     "ETH": Decimal("0.00001"),
@@ -810,6 +824,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps = Decimal(
             str(args.live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps)
         )
+        self.live_inventory_basis_size_ladder_notionals_usd = parse_decimal_csv(args.live_inventory_basis_size_ladder_notionals_usd)
         self.live_inventory_basis_exit_safety_buffer_bps = Decimal(str(args.live_inventory_basis_exit_safety_buffer_bps))
         self.live_inventory_basis_dynamic_exit_buffer = bool(args.live_inventory_basis_dynamic_exit_buffer)
         self.live_inventory_basis_refresh_exit_quote_before_submit = bool(args.live_inventory_basis_refresh_exit_quote_before_submit)
@@ -1874,6 +1889,104 @@ class VariationalToLighterRuntime:
             if slippage_bps is not None and slippage_bps < 0:
                 slippage_bps = Decimal("0")
         return {**depth, "slippage_bps": decimal_to_str(slippage_bps)}
+
+    async def live_inventory_basis_size_ladder_context(
+        self,
+        *,
+        var_bid: Decimal,
+        var_ask: Decimal,
+        stablecoin_context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        ladder: list[dict[str, Any]] = []
+        normalized_var_bid = self.normalize_usdc_price_to_usdt(var_bid, stablecoin_context)
+        normalized_var_ask = self.normalize_usdc_price_to_usdt(var_ask, stablecoin_context)
+        for notional in self.live_inventory_basis_size_ladder_notionals_usd:
+            long_qty = notional / var_ask if var_ask else Decimal("0")
+            short_qty = notional / var_bid if var_bid else Decimal("0")
+            long_entry_depth = await self.live_inventory_lighter_depth_context(lighter_side="SELL", qty=long_qty)
+            long_exit_depth = await self.live_inventory_lighter_depth_context(lighter_side="BUY", qty=long_qty)
+            short_entry_depth = await self.live_inventory_lighter_depth_context(lighter_side="BUY", qty=short_qty)
+            short_exit_depth = await self.live_inventory_lighter_depth_context(lighter_side="SELL", qty=short_qty)
+            long_entry_price = to_decimal(long_entry_depth.get("estimated_fill_price"))
+            long_exit_price = to_decimal(long_exit_depth.get("estimated_fill_price"))
+            short_entry_price = to_decimal(short_entry_depth.get("estimated_fill_price"))
+            short_exit_price = to_decimal(short_exit_depth.get("estimated_fill_price"))
+            long_raw_edge = (
+                self.live_inventory_pair_edge_bps(
+                    direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                    var_price=var_ask,
+                    lighter_price=long_entry_price,
+                )
+                if long_entry_price is not None
+                else None
+            )
+            short_raw_edge = (
+                self.live_inventory_pair_edge_bps(
+                    direction=DIRECTION_SHORT_VAR_LONG_LIGHTER,
+                    var_price=var_bid,
+                    lighter_price=short_entry_price,
+                )
+                if short_entry_price is not None
+                else None
+            )
+            long_normalized_edge = (
+                self.live_inventory_pair_edge_bps(
+                    direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                    var_price=normalized_var_ask,
+                    lighter_price=long_entry_price,
+                )
+                if normalized_var_ask is not None and long_entry_price is not None
+                else None
+            )
+            short_normalized_edge = (
+                self.live_inventory_pair_edge_bps(
+                    direction=DIRECTION_SHORT_VAR_LONG_LIGHTER,
+                    var_price=normalized_var_bid,
+                    lighter_price=short_entry_price,
+                )
+                if normalized_var_bid is not None and short_entry_price is not None
+                else None
+            )
+            long_roundtrip = (
+                self.live_inventory_roundtrip_pnl_bps(
+                    direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                    var_entry_price=var_ask,
+                    lighter_entry_price=long_entry_price,
+                    var_exit_price=var_bid,
+                    lighter_exit_price=long_exit_price,
+                )
+                if long_entry_price is not None and long_exit_price is not None
+                else None
+            )
+            short_roundtrip = (
+                self.live_inventory_roundtrip_pnl_bps(
+                    direction=DIRECTION_SHORT_VAR_LONG_LIGHTER,
+                    var_entry_price=var_bid,
+                    lighter_entry_price=short_entry_price,
+                    var_exit_price=var_ask,
+                    lighter_exit_price=short_exit_price,
+                )
+                if short_entry_price is not None and short_exit_price is not None
+                else None
+            )
+            ladder.append(
+                {
+                    "notional_usd": decimal_to_str(notional),
+                    "long_qty": decimal_to_str(long_qty),
+                    "short_qty": decimal_to_str(short_qty),
+                    "long_raw_edge_bps": decimal_to_str(long_raw_edge),
+                    "short_raw_edge_bps": decimal_to_str(short_raw_edge),
+                    "long_normalized_edge_bps": decimal_to_str(long_normalized_edge),
+                    "short_normalized_edge_bps": decimal_to_str(short_normalized_edge),
+                    "long_roundtrip_pnl_bps": decimal_to_str(long_roundtrip),
+                    "short_roundtrip_pnl_bps": decimal_to_str(short_roundtrip),
+                    "long_entry_lighter_depth": long_entry_depth,
+                    "long_exit_lighter_depth": long_exit_depth,
+                    "short_entry_lighter_depth": short_entry_depth,
+                    "short_exit_lighter_depth": short_exit_depth,
+                }
+            )
+        return ladder
 
     async def fetch_live_inventory_basis_quote(self, *, asset: str) -> tuple[dict[str, Any] | None, Decimal | None]:
         result, elapsed_ms = await self._timed_submit(
@@ -4357,6 +4470,7 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_min_signal_reverted_exit_pnl_bps",
             "live_inventory_basis_signal_exit_watch_samples",
             "live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps",
+            "live_inventory_basis_size_ladder_notionals_usd",
             "live_inventory_basis_exit_safety_buffer_bps",
             "live_inventory_basis_dynamic_exit_buffer",
             "live_inventory_basis_refresh_entry_quote_before_submit",
@@ -5921,6 +6035,13 @@ class VariationalToLighterRuntime:
                 raw_edge_bps=short_edge_bps,
                 normalized_edge_bps=normalized_short_edge_bps,
             )
+        size_ladder = None
+        if self.live_inventory_basis_size_ladder_notionals_usd:
+            size_ladder = await self.live_inventory_basis_size_ladder_context(
+                var_bid=var_bid,
+                var_ask=var_ask,
+                stablecoin_context=stablecoin_context,
+            )
         state_payload = {
             "asset": asset,
             "sample_index": index,
@@ -5973,6 +6094,8 @@ class VariationalToLighterRuntime:
             "completed_cycles": self.live_inventory_completed_cycles,
             "entry_quality_buffer_bps": decimal_to_str(self.live_inventory_dynamic_entry_quality_buffer_bps(var_quote_age_seconds=var_quote_age_seconds)),
         }
+        if size_ladder is not None:
+            state_payload["basis_size_ladder"] = size_ladder
         await self.append_live_inventory_log("live_inventory_basis_state", state_payload)
         dynamic_entry_quality_buffer_bps = self.live_inventory_dynamic_entry_quality_buffer_bps(var_quote_age_seconds=var_quote_age_seconds)
         addon_direction: str | None = None
@@ -9568,6 +9691,11 @@ def parse_args() -> argparse.Namespace:
         help="Minimum estimated PnL required for a signal exit watch timeout. Default: 0.",
     )
     parser.add_argument(
+        "--live-inventory-basis-size-ladder-notionals-usd",
+        default="",
+        help="Optional comma-separated notionals for read-only basis size ladder diagnostics, e.g. 20,50,100,250. Default: disabled.",
+    )
+    parser.add_argument(
         "--live-inventory-basis-exit-safety-buffer-bps",
         type=float,
         default=0.0,
@@ -9881,6 +10009,10 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-basis-min-signal-reverted-exit-pnl-bps must be >= 0")
         if args.live_inventory_basis_signal_exit_watch_samples < 0:
             parser.error("--live-inventory-basis-signal-exit-watch-samples must be >= 0")
+        try:
+            parse_decimal_csv(args.live_inventory_basis_size_ladder_notionals_usd)
+        except Exception:
+            parser.error("--live-inventory-basis-size-ladder-notionals-usd must be a comma-separated list of positive numbers")
         if args.live_inventory_basis_exit_safety_buffer_bps < 0:
             parser.error("--live-inventory-basis-exit-safety-buffer-bps must be >= 0")
         if args.live_inventory_basis_max_var_quote_age_ms < 0:
