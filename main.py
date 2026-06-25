@@ -862,6 +862,14 @@ class VariationalToLighterRuntime:
         )
         self.live_inventory_basis_max_stablecoin_edge_share = Decimal(str(args.live_inventory_basis_max_stablecoin_edge_share))
         self.live_inventory_basis_stablecoin_rate_ttl_seconds = float(args.live_inventory_basis_stablecoin_rate_ttl_seconds)
+        self.live_inventory_basis_stablecoin_regime_entry = bool(args.live_inventory_basis_stablecoin_regime_entry)
+        self.live_inventory_basis_min_stablecoin_basis_bps = Decimal(str(args.live_inventory_basis_min_stablecoin_basis_bps))
+        self.live_inventory_basis_stablecoin_regime_buffer_bps = Decimal(str(args.live_inventory_basis_stablecoin_regime_buffer_bps))
+        self.live_inventory_basis_stablecoin_regime_min_normalized_edge_bps = Decimal(
+            str(args.live_inventory_basis_stablecoin_regime_min_normalized_edge_bps)
+        )
+        self.live_inventory_basis_stablecoin_regime_lookback_samples = int(args.live_inventory_basis_stablecoin_regime_lookback_samples)
+        self.live_inventory_basis_stablecoin_regime_max_change_bps = Decimal(str(args.live_inventory_basis_stablecoin_regime_max_change_bps))
         self.live_inventory_basis_direction_min_samples = int(args.live_inventory_basis_direction_min_samples)
         self.live_inventory_basis_direction_min_avg_pnl_bps = Decimal(str(args.live_inventory_basis_direction_min_avg_pnl_bps))
         self.live_inventory_basis_entry_mode = args.live_inventory_basis_entry_mode
@@ -975,6 +983,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_last_basis_bps: Decimal | None = None
         self.live_inventory_basis_watch_candidates: dict[str, dict[str, Any]] = {}
         self.live_inventory_stablecoin_rate_cache: dict[str, Any] = {}
+        self.live_inventory_stablecoin_basis_bps_samples: deque[Decimal] = deque(maxlen=500)
         self._order_write_lock = asyncio.Lock()
         self._opportunity_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
@@ -1272,6 +1281,62 @@ class VariationalToLighterRuntime:
         if self.live_inventory_basis_max_stablecoin_edge_share > 0 and share is not None and share > self.live_inventory_basis_max_stablecoin_edge_share:
             return False, {**context, "stablecoin_filter_reason": "stablecoin_edge_share_too_high"}
         return True, {**context, "stablecoin_filter_reason": "ok"}
+
+    def live_inventory_record_stablecoin_basis_sample(self, stablecoin_context: dict[str, Any]) -> None:
+        basis_bps = to_decimal(stablecoin_context.get("stablecoin_basis_bps"))
+        if basis_bps is not None:
+            self.live_inventory_stablecoin_basis_bps_samples.append(basis_bps)
+
+    def live_inventory_stablecoin_regime_context(
+        self,
+        *,
+        raw_edge_bps: Decimal | None,
+        normalized_edge_bps: Decimal | None,
+        stablecoin_context: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        enabled = self.live_inventory_basis_stablecoin_regime_entry
+        stablecoin_basis_bps = to_decimal(stablecoin_context.get("stablecoin_basis_bps"))
+        raw_edge = raw_edge_bps if raw_edge_bps is not None else None
+        required_raw_edge_bps = None if stablecoin_basis_bps is None else abs(stablecoin_basis_bps) + self.live_inventory_basis_stablecoin_regime_buffer_bps
+        lookback = max(1, self.live_inventory_basis_stablecoin_regime_lookback_samples)
+        recent = list(self.live_inventory_stablecoin_basis_bps_samples)[-lookback:]
+        recent_abs = [abs(value) for value in recent]
+        recent_min_abs = min(recent_abs) if recent_abs else None
+        recent_max_abs = max(recent_abs) if recent_abs else None
+        recent_change_bps = None if recent_min_abs is None or recent_max_abs is None else recent_max_abs - recent_min_abs
+        context = {
+            "stablecoin_regime_entry_enabled": enabled,
+            "stablecoin_regime_min_stablecoin_basis_bps": decimal_to_str(self.live_inventory_basis_min_stablecoin_basis_bps),
+            "stablecoin_regime_buffer_bps": decimal_to_str(self.live_inventory_basis_stablecoin_regime_buffer_bps),
+            "stablecoin_regime_min_normalized_edge_bps": decimal_to_str(self.live_inventory_basis_stablecoin_regime_min_normalized_edge_bps),
+            "stablecoin_regime_lookback_samples": lookback,
+            "stablecoin_regime_samples": len(recent),
+            "stablecoin_regime_max_change_bps": decimal_to_str(self.live_inventory_basis_stablecoin_regime_max_change_bps),
+            "stablecoin_regime_recent_min_abs_basis_bps": decimal_to_str(recent_min_abs),
+            "stablecoin_regime_recent_max_abs_basis_bps": decimal_to_str(recent_max_abs),
+            "stablecoin_regime_recent_change_bps": decimal_to_str(recent_change_bps),
+            "stablecoin_regime_required_raw_edge_bps": decimal_to_str(required_raw_edge_bps),
+            "stablecoin_regime_raw_margin_bps": decimal_to_str(None if raw_edge is None or required_raw_edge_bps is None else raw_edge - required_raw_edge_bps),
+        }
+        if not enabled:
+            return False, {**context, "stablecoin_regime_reason": "disabled"}
+        if stablecoin_basis_bps is None:
+            return False, {**context, "stablecoin_regime_reason": "stablecoin_basis_unavailable"}
+        if abs(stablecoin_basis_bps) < self.live_inventory_basis_min_stablecoin_basis_bps:
+            return False, {**context, "stablecoin_regime_reason": "stablecoin_basis_below_min"}
+        if len(recent) < lookback:
+            return False, {**context, "stablecoin_regime_reason": "stablecoin_basis_insufficient_history"}
+        if recent_min_abs is None or recent_min_abs < self.live_inventory_basis_min_stablecoin_basis_bps:
+            return False, {**context, "stablecoin_regime_reason": "stablecoin_basis_not_persistent"}
+        if recent_change_bps is not None and recent_change_bps > self.live_inventory_basis_stablecoin_regime_max_change_bps:
+            return False, {**context, "stablecoin_regime_reason": "stablecoin_basis_too_unstable"}
+        if raw_edge is None or required_raw_edge_bps is None or raw_edge < required_raw_edge_bps:
+            return False, {**context, "stablecoin_regime_reason": "raw_edge_below_stablecoin_regime_requirement"}
+        if normalized_edge_bps is None:
+            return False, {**context, "stablecoin_regime_reason": "normalized_edge_unavailable"}
+        if normalized_edge_bps < self.live_inventory_basis_stablecoin_regime_min_normalized_edge_bps:
+            return False, {**context, "stablecoin_regime_reason": "normalized_edge_below_stablecoin_regime_min"}
+        return True, {**context, "stablecoin_regime_reason": "ok"}
 
     def live_inventory_update_watch_candidate(
         self,
@@ -5985,6 +6050,7 @@ class VariationalToLighterRuntime:
             lighter_exit_price=short_exit_lighter_price,
         )
         stablecoin_context = await self.fetch_live_inventory_stablecoin_context()
+        self.live_inventory_record_stablecoin_basis_sample(stablecoin_context)
         normalized_var_bid = self.normalize_usdc_price_to_usdt(var_bid, stablecoin_context)
         normalized_var_ask = self.normalize_usdc_price_to_usdt(var_ask, stablecoin_context)
         normalized_basis_bps = None
@@ -6035,6 +6101,22 @@ class VariationalToLighterRuntime:
                 raw_edge_bps=short_edge_bps,
                 normalized_edge_bps=normalized_short_edge_bps,
             )
+        long_stablecoin_regime_ok, long_stablecoin_regime_context = self.live_inventory_stablecoin_regime_context(
+            raw_edge_bps=long_edge_bps,
+            normalized_edge_bps=normalized_long_edge_bps,
+            stablecoin_context=stablecoin_context,
+        )
+        short_stablecoin_regime_ok, short_stablecoin_regime_context = self.live_inventory_stablecoin_regime_context(
+            raw_edge_bps=short_edge_bps,
+            normalized_edge_bps=normalized_short_edge_bps,
+            stablecoin_context=stablecoin_context,
+        )
+        if long_stablecoin_regime_ok:
+            long_stablecoin_filter_ok = True
+        if short_stablecoin_regime_ok:
+            short_stablecoin_filter_ok = True
+        long_stablecoin_edge_context = {**long_stablecoin_edge_context, **long_stablecoin_regime_context}
+        short_stablecoin_edge_context = {**short_stablecoin_edge_context, **short_stablecoin_regime_context}
         size_ladder = None
         if self.live_inventory_basis_size_ladder_notionals_usd:
             size_ladder = await self.live_inventory_basis_size_ladder_context(
@@ -6089,6 +6171,11 @@ class VariationalToLighterRuntime:
             "short_stablecoin_edge_adjustment_abs_bps": short_stablecoin_edge_context.get("stablecoin_edge_adjustment_abs_bps"),
             "long_stablecoin_edge_share": long_stablecoin_edge_context.get("stablecoin_edge_share"),
             "short_stablecoin_edge_share": short_stablecoin_edge_context.get("stablecoin_edge_share"),
+            "long_stablecoin_regime_ok": long_stablecoin_regime_ok,
+            "short_stablecoin_regime_ok": short_stablecoin_regime_ok,
+            "stablecoin_regime_reason": long_stablecoin_regime_context.get("stablecoin_regime_reason"),
+            "stablecoin_regime_recent_change_bps": long_stablecoin_regime_context.get("stablecoin_regime_recent_change_bps"),
+            "stablecoin_regime_required_raw_edge_bps": long_stablecoin_regime_context.get("stablecoin_regime_required_raw_edge_bps"),
             "open_lots_total": len(self.live_inventory_open_lots),
             "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
             "completed_cycles": self.live_inventory_completed_cycles,
@@ -6201,8 +6288,9 @@ class VariationalToLighterRuntime:
                 if direction_signal < self.live_inventory_basis_z_entry:
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     continue
+                stablecoin_regime_active = stablecoin_edge_context.get("stablecoin_regime_reason") == "ok"
                 min_abs_entry_bps = self.live_inventory_direction_abs_threshold_bps(direction) + negative_abs_penalty_bps
-                if not self.live_inventory_basis_abs_entry_ok(direction=direction, basis_bps=basis_bps, threshold_bps=min_abs_entry_bps):
+                if not stablecoin_regime_active and not self.live_inventory_basis_abs_entry_ok(direction=direction, basis_bps=basis_bps, threshold_bps=min_abs_entry_bps):
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     await self.append_live_inventory_log(
                         "live_inventory_entry_blocked",
@@ -6245,6 +6333,13 @@ class VariationalToLighterRuntime:
                     )
                     continue
                 min_entry_edge_bps = self.live_inventory_direction_entry_threshold_bps(direction) + negative_entry_penalty_bps
+                stablecoin_regime_required_raw_edge_bps = to_decimal(stablecoin_edge_context.get("stablecoin_regime_required_raw_edge_bps"))
+                if (
+                    stablecoin_regime_active
+                    and not self.live_inventory_basis_use_normalized_edge_for_entry
+                    and stablecoin_regime_required_raw_edge_bps is not None
+                ):
+                    min_entry_edge_bps = stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps
                 if self.live_inventory_basis_use_normalized_edge_for_entry and self.live_inventory_basis_min_normalized_entry_edge_bps > 0:
                     min_entry_edge_bps = max(min_entry_edge_bps, self.live_inventory_basis_min_normalized_entry_edge_bps)
                 entry_quality_score_bps, entry_quality_context = self.live_inventory_entry_quality_score_bps(
@@ -6435,6 +6530,23 @@ class VariationalToLighterRuntime:
                         raw_edge_bps=raw_refreshed_edge_bps,
                         normalized_edge_bps=refreshed_normalized_edge_bps,
                     )
+                    refreshed_stablecoin_regime_ok, refreshed_stablecoin_regime_context = self.live_inventory_stablecoin_regime_context(
+                        raw_edge_bps=raw_refreshed_edge_bps,
+                        normalized_edge_bps=refreshed_normalized_edge_bps,
+                        stablecoin_context=stablecoin_context,
+                    )
+                    if refreshed_stablecoin_regime_ok:
+                        refreshed_stablecoin_filter_ok = True
+                    refreshed_stablecoin_edge_context = {**refreshed_stablecoin_edge_context, **refreshed_stablecoin_regime_context}
+                    refreshed_stablecoin_regime_required_raw_edge_bps = to_decimal(
+                        refreshed_stablecoin_edge_context.get("stablecoin_regime_required_raw_edge_bps")
+                    )
+                    if (
+                        refreshed_stablecoin_regime_ok
+                        and not self.live_inventory_basis_use_normalized_edge_for_entry
+                        and refreshed_stablecoin_regime_required_raw_edge_bps is not None
+                    ):
+                        min_entry_edge_bps = refreshed_stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps
                     if not refreshed_stablecoin_filter_ok:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
@@ -6627,6 +6739,21 @@ class VariationalToLighterRuntime:
                         raw_edge_bps=raw_edge_bps,
                         normalized_edge_bps=normalized_edge_bps,
                     )
+                    stablecoin_regime_ok, stablecoin_regime_context = self.live_inventory_stablecoin_regime_context(
+                        raw_edge_bps=raw_edge_bps,
+                        normalized_edge_bps=normalized_edge_bps,
+                        stablecoin_context=stablecoin_context,
+                    )
+                    if stablecoin_regime_ok:
+                        stablecoin_filter_ok = True
+                    stablecoin_edge_context = {**stablecoin_edge_context, **stablecoin_regime_context}
+                    stablecoin_regime_required_raw_edge_bps = to_decimal(stablecoin_edge_context.get("stablecoin_regime_required_raw_edge_bps"))
+                    if (
+                        stablecoin_regime_ok
+                        and not self.live_inventory_basis_use_normalized_edge_for_entry
+                        and stablecoin_regime_required_raw_edge_bps is not None
+                    ):
+                        min_entry_edge_bps = stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps
                     if not stablecoin_filter_ok:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
@@ -9781,6 +9908,16 @@ def parse_args() -> argparse.Namespace:
         help="When >0, block entries where abs(raw edge - normalized edge) / abs(raw edge) exceeds this share. Requires stablecoin normalization.",
     )
     parser.add_argument("--live-inventory-basis-stablecoin-rate-ttl-seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--live-inventory-basis-stablecoin-regime-entry",
+        action="store_true",
+        help="Allow a stablecoin-regime entry path where persistent USDC/USDT basis is treated as part of the entry edge.",
+    )
+    parser.add_argument("--live-inventory-basis-min-stablecoin-basis-bps", type=float, default=8.0)
+    parser.add_argument("--live-inventory-basis-stablecoin-regime-buffer-bps", type=float, default=1.5)
+    parser.add_argument("--live-inventory-basis-stablecoin-regime-min-normalized-edge-bps", type=float, default=0.8)
+    parser.add_argument("--live-inventory-basis-stablecoin-regime-lookback-samples", type=int, default=30)
+    parser.add_argument("--live-inventory-basis-stablecoin-regime-max-change-bps", type=float, default=2.0)
     parser.add_argument("--live-inventory-basis-direction-min-samples", type=int, default=3)
     parser.add_argument("--live-inventory-basis-direction-min-avg-pnl-bps", type=float, default=0.0)
     parser.add_argument(
