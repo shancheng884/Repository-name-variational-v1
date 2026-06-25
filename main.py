@@ -2212,6 +2212,26 @@ class VariationalToLighterRuntime:
                 entry_lighter_slippage_bps = ((estimated_entry_lighter_price - lighter_fill_price) / estimated_entry_lighter_price) * Decimal("10000")
             else:
                 entry_lighter_slippage_bps = ((lighter_fill_price - estimated_entry_lighter_price) / estimated_entry_lighter_price) * Decimal("10000")
+            if entry_lighter_slippage_bps is not None and entry_lighter_slippage_bps < 0:
+                entry_lighter_slippage_bps = Decimal("0")
+        if entry_lighter_slippage_bps is not None and entry_lighter_slippage_bps > self.live_inventory_max_lighter_slippage_bps:
+            await self.require_live_inventory_manual_review(
+                asset=asset,
+                reason="basis_entry_lighter_actual_slippage_exceeds_limit",
+                context={
+                    "lot_id": lot_id,
+                    "basis_trace_id": context.get("basis_trace_id"),
+                    "direction": direction,
+                    "qty": decimal_to_str(qty),
+                    "estimated_entry_lighter_price": decimal_to_str(estimated_entry_lighter_price),
+                    "entry_lighter_fill_price": decimal_to_str(lighter_fill_price),
+                    "entry_lighter_slippage_bps": decimal_to_str(entry_lighter_slippage_bps),
+                    "max_lighter_slippage_bps": decimal_to_str(self.live_inventory_max_lighter_slippage_bps),
+                    "lighter_payload": lighter_payload,
+                    "action": "manual_confirm_or_flatten_lighter_leg",
+                },
+            )
+            return
         lot = {
             "lot_id": lot_id,
             "basis_trace_id": context.get("basis_trace_id"),
@@ -2317,6 +2337,8 @@ class VariationalToLighterRuntime:
                 exit_lighter_slippage_bps = ((exit_lighter_price - estimated_exit_lighter_price) / estimated_exit_lighter_price) * Decimal("10000")
             else:
                 exit_lighter_slippage_bps = ((estimated_exit_lighter_price - exit_lighter_price) / estimated_exit_lighter_price) * Decimal("10000")
+            if exit_lighter_slippage_bps is not None and exit_lighter_slippage_bps < 0:
+                exit_lighter_slippage_bps = Decimal("0")
         pnl_shortfall_usd = estimated_pnl - actual_pnl
         var_fill_to_lighter_fill_ms = decimal_to_str(elapsed_iso_ms(
             payload.get("variational_filled_at"),
@@ -2343,6 +2365,10 @@ class VariationalToLighterRuntime:
                 "exit_lighter_final_fill_price": decimal_to_str(exit_lighter_price),
                 "estimated_exit_lighter_price": decimal_to_str(estimated_exit_lighter_price),
                 "exit_lighter_slippage_bps": decimal_to_str(exit_lighter_slippage_bps),
+                "exit_lighter_slippage_exceeds_limit": bool(
+                    exit_lighter_slippage_bps is not None and exit_lighter_slippage_bps > self.live_inventory_max_lighter_slippage_bps
+                ),
+                "max_lighter_slippage_bps": decimal_to_str(self.live_inventory_max_lighter_slippage_bps),
                 "estimated_vs_actual_pnl_shortfall_usd": decimal_to_str(pnl_shortfall_usd),
                 "estimated_vs_actual_pnl_shortfall_bps": decimal_to_str(
                     estimated_pnl_bps - actual_pnl_bps if estimated_pnl_bps is not None and actual_pnl_bps is not None else None
@@ -2928,7 +2954,10 @@ class VariationalToLighterRuntime:
             return False, "lighter_order_book_not_ready", None
 
         lighter_side = "SELL" if var_side.strip().upper() == "BUY" else "BUY"
-        slippage = Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000")
+        slippage_bps = Decimal(str(HEDGE_SLIPPAGE_BPS))
+        if str(getattr(record, "auto_live_role", "") or "").startswith("live_inventory_"):
+            slippage_bps = self.live_inventory_max_lighter_slippage_bps
+        slippage = slippage_bps / Decimal("10000")
         limit_price = best_ask * (Decimal("1") + slippage) if lighter_side == "BUY" else best_bid * (Decimal("1") - slippage)
         notional = qty * limit_price
         edge_bps = basis_points_diff(limit_price, var_fill_price)
