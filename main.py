@@ -2954,10 +2954,7 @@ class VariationalToLighterRuntime:
             return False, "lighter_order_book_not_ready", None
 
         lighter_side = "SELL" if var_side.strip().upper() == "BUY" else "BUY"
-        slippage_bps = Decimal(str(HEDGE_SLIPPAGE_BPS))
-        if str(getattr(record, "auto_live_role", "") or "").startswith("live_inventory_"):
-            slippage_bps = self.live_inventory_max_lighter_slippage_bps
-        slippage = slippage_bps / Decimal("10000")
+        slippage = Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000")
         limit_price = best_ask * (Decimal("1") + slippage) if lighter_side == "BUY" else best_bid * (Decimal("1") - slippage)
         notional = qty * limit_price
         edge_bps = basis_points_diff(limit_price, var_fill_price)
