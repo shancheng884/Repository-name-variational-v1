@@ -2054,16 +2054,23 @@ class VariationalToLighterRuntime:
         return ladder
 
     async def fetch_live_inventory_basis_quote(self, *, asset: str) -> tuple[dict[str, Any] | None, Decimal | None]:
-        result, elapsed_ms = await self._timed_submit(
-            self.send_variational_place_order(
-                asset=asset,
-                side="BUY",
-                amount=decimal_to_str(self.live_inventory_lot_notional_usd),
-                expected_min_btc_qty=None,
-                confirm=False,
-                reduce_only=False,
+        try:
+            result, elapsed_ms = await self._timed_submit(
+                self.send_variational_place_order(
+                    asset=asset,
+                    side="BUY",
+                    amount=decimal_to_str(self.live_inventory_lot_notional_usd),
+                    expected_min_btc_qty=None,
+                    confirm=False,
+                    reduce_only=False,
+                )
             )
-        )
+        except Exception as exc:
+            await self.append_live_inventory_log(
+                "live_inventory_basis_quote_failed",
+                {"asset": asset, "error": f"quote_request_exception:{type(exc).__name__}:{exc}"},
+            )
+            return None, None
         if not result.get("ok"):
             await self.append_live_inventory_log(
                 "live_inventory_basis_quote_failed",
