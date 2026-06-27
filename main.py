@@ -8953,7 +8953,15 @@ class VariationalToLighterRuntime:
                 if snapshot is not None:
                     await self.append_market_sample(snapshot)
                     await self.maybe_run_paper_inventory(snapshot)
-                    await self.maybe_run_live_inventory(snapshot)
+                    try:
+                        await self.maybe_run_live_inventory(snapshot)
+                    except Exception as exc:
+                        self.logger.exception("live_inventory_sample_failed")
+                        with contextlib.suppress(Exception):
+                            await self.append_live_inventory_log(
+                                "live_inventory_sample_failed",
+                                {"asset": snapshot.asset, "error": f"{type(exc).__name__}:{exc}"},
+                            )
                     await self.maybe_close_paper_position(snapshot)
                     await self.maybe_enter_paper_position(snapshot)
                     await self.maybe_run_auto_live(snapshot)

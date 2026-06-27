@@ -29,7 +29,7 @@ def fmt(value: Decimal | None, places: str = "0.01") -> str:
     return format(value.quantize(Decimal(places)), "f")
 
 
-def tail_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
+def tail_jsonl(path: Path, limit: int) -> deque[dict[str, Any]]:
     rows: deque[dict[str, Any]] = deque(maxlen=max(1, limit))
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -37,7 +37,7 @@ def tail_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
                 rows.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    return list(rows)
+    return rows
 
 
 def max_decimal(values: list[Decimal | None]) -> Decimal | None:
