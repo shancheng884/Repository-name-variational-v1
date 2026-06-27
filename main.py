@@ -2197,14 +2197,21 @@ class VariationalToLighterRuntime:
                 context={"lot_id": lot_id, "direction": direction, "qty": decimal_to_str(qty), "lighter_payload": lighter_payload},
             )
             return
-        lighter_fill_price = lighter_record.lighter_fill_price or to_decimal(context.get("lighter_price"))
-        if lighter_fill_price is None:
+        if not await self.wait_for_lighter_final_fill(lighter_record):
             await self.require_live_inventory_manual_review(
                 asset=asset,
-                reason="basis_entry_lighter_fill_missing_price",
-                context={"lot_id": lot_id, "direction": direction, "qty": decimal_to_str(qty), "lighter_payload": lighter_payload},
+                reason="basis_entry_lighter_final_fill_not_confirmed",
+                context={
+                    "lot_id": lot_id,
+                    "direction": direction,
+                    "qty": decimal_to_str(qty),
+                    "lighter_payload": lighter_payload,
+                    "lighter_record": lighter_record.to_payload(),
+                    "action": "manual_confirm_or_flatten_unhedged_var_leg",
+                },
             )
             return
+        lighter_fill_price = lighter_record.lighter_fill_price
         estimated_entry_lighter_price = to_decimal(context.get("lighter_price"))
         entry_lighter_slippage_bps: Decimal | None = None
         if estimated_entry_lighter_price is not None:
@@ -2907,6 +2914,19 @@ class VariationalToLighterRuntime:
     @staticmethod
     def auto_live_eager_hedge_started(record: OrderLifecycle | None) -> bool:
         return record is not None and record.processing_stage in {STAGE_LIVE_SUBMIT_SENT, STAGE_LIGHTER_FILLED}
+
+    async def wait_for_lighter_final_fill(self, record: OrderLifecycle | None) -> bool:
+        if record is None:
+            return False
+        deadline = time.monotonic() + max(0.1, float(self.live_submit_timeout_seconds))
+        while time.monotonic() <= deadline:
+            async with self._record_lock:
+                if record.lighter_fill_ts_iso is not None and record.lighter_fill_price is not None:
+                    return True
+                if record.processing_stage in {STAGE_LIVE_SUBMIT_FAILED, STAGE_LIVE_SUBMIT_TIMED_OUT}:
+                    return False
+            await asyncio.sleep(0.05)
+        return False
 
     def timing_logger(self) -> logging.Logger:
         return getattr(self, "logger", logging.getLogger(__name__))
@@ -7557,6 +7577,20 @@ class VariationalToLighterRuntime:
                     asset=asset,
                     reason="basis_exit_lighter_submit_failed",
                     context={"action": "exit", "lot_id": lot.get("lot_id"), "direction": direction, "qty": decimal_to_str(qty), "lighter_payload": lighter_payload},
+                )
+                return
+            if not await self.wait_for_lighter_final_fill(lighter_record):
+                await self.require_live_inventory_manual_review(
+                    asset=asset,
+                    reason="basis_exit_lighter_final_fill_not_confirmed",
+                    context={
+                        "action": "manual_confirm_or_flatten_after_var_exit",
+                        "lot_id": lot.get("lot_id"),
+                        "direction": direction,
+                        "qty": decimal_to_str(qty),
+                        "lighter_payload": lighter_payload,
+                        "lighter_record": lighter_record.to_payload(),
+                    },
                 )
                 return
         self.live_inventory_open_lots.pop(lot_index)
