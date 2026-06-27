@@ -4651,7 +4651,10 @@ class VariationalToLighterRuntime:
             await self.append_order_log("lighter_error", payload)
             return None
 
-        slippage = Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000")
+        slippage_bps = Decimal(str(HEDGE_SLIPPAGE_BPS))
+        if str(getattr(record, "auto_live_role", "") or "").startswith("live_inventory_"):
+            slippage_bps = self.live_inventory_max_lighter_slippage_bps
+        slippage = slippage_bps / Decimal("10000")
         if side == "BUY":
             limit_price = best_ask * (Decimal("1") + slippage)
         else:
@@ -4662,6 +4665,7 @@ class VariationalToLighterRuntime:
         async with self._record_lock:
             record.live_notional_usd = notional
             record.live_edge_bps = edge_bps
+            record.live_inventory_lighter_slippage_guard_bps = slippage_bps
 
         base_amount = int(record.qty * self.base_amount_multiplier)
         if base_amount <= 0:
