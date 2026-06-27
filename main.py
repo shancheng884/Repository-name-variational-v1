@@ -4665,7 +4665,6 @@ class VariationalToLighterRuntime:
         async with self._record_lock:
             record.live_notional_usd = notional
             record.live_edge_bps = edge_bps
-            record.live_inventory_lighter_slippage_guard_bps = slippage_bps
 
         base_amount = int(record.qty * self.base_amount_multiplier)
         if base_amount <= 0:
