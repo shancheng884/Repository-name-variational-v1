@@ -92,6 +92,9 @@ STAGE_LIVE_SUBMIT_FAILED = "live_submit_failed"
 STAGE_LIVE_SUBMIT_TIMED_OUT = "live_submit_timed_out"
 STAGE_LIGHTER_FILLED = "lighter_filled"
 
+LIGHTER_TERMINAL_UNFILLED_STATUSES = {"cancelled", "canceled", "expired", "rejected", "failed"}
+LIGHTER_TERMINAL_STATUSES = LIGHTER_TERMINAL_UNFILLED_STATUSES | {"filled"}
+
 FAILURE_STAGE_FILTER = "filter"
 FAILURE_STAGE_HEDGE_PLAN = "hedge_plan"
 FAILURE_STAGE_DRY_RUN_PLAN = "dry_run_plan"
@@ -476,6 +479,10 @@ class OrderLifecycle:
     lighter_fill_price: Decimal | None = None
     lighter_fill_ts_iso: str | None = None
     lighter_tx_hash: str | None = None
+    lighter_order_status: str | None = None
+    lighter_filled_base_amount: Decimal | None = None
+    lighter_filled_quote_amount: Decimal | None = None
+    lighter_order_update: dict[str, Any] | None = None
     hedge_error: str | None = None
     lighter_reference_bid: Decimal | None = None
     lighter_reference_ask: Decimal | None = None
@@ -529,6 +536,10 @@ class OrderLifecycle:
             "lighter_reduce_only": self.lighter_reduce_only,
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
             "lighter_filled_at": self.lighter_fill_ts_iso,
+            "lighter_order_status": self.lighter_order_status,
+            "lighter_filled_base_amount": decimal_to_str(self.lighter_filled_base_amount),
+            "lighter_filled_quote_amount": decimal_to_str(self.lighter_filled_quote_amount),
+            "lighter_order_update": self.lighter_order_update,
             "mode": self.mode,
             "lighter_reference_bid": decimal_to_str(self.lighter_reference_bid),
             "lighter_reference_ask": decimal_to_str(self.lighter_reference_ask),
@@ -2213,9 +2224,13 @@ class VariationalToLighterRuntime:
             timeout_seconds=entry_lighter_fill_timeout_seconds,
         ):
             async with self._record_lock:
+                partial_lighter_fill = self.lighter_record_has_partial_fill(lighter_record)
+                lighter_failure_reason = lighter_record.failure_reason or "lighter_final_fill_not_confirmed"
                 lighter_record.hedge_error = (
                     f"Live inventory entry Lighter IOC had no confirmed fill after "
                     f"{entry_lighter_fill_timeout_seconds:.1f}s"
+                    if not lighter_record.hedge_error
+                    else lighter_record.hedge_error
                 )
                 lighter_record_payload = lighter_record.to_payload()
             await self.append_live_inventory_log(
@@ -2226,9 +2241,11 @@ class VariationalToLighterRuntime:
                     "direction": direction,
                     "qty": decimal_to_str(qty),
                     "timeout_seconds": entry_lighter_fill_timeout_seconds,
+                    "lighter_failure_reason": lighter_failure_reason,
+                    "partial_lighter_fill": partial_lighter_fill,
                     "lighter_record": lighter_record_payload,
                     "lighter_payload": lighter_payload,
-                    "action": "auto_close_unhedged_var_leg_then_manual_review",
+                    "action": "auto_close_unhedged_legs_then_manual_review" if partial_lighter_fill else "auto_close_unhedged_var_leg_then_manual_review",
                 },
             )
             auto_close_context = await self.try_auto_close_unhedged_live_inventory_leg(
@@ -2239,6 +2256,7 @@ class VariationalToLighterRuntime:
                 var_price=var_fill_price,
                 lot_id=lot_id,
                 close_var=True,
+                close_lighter=partial_lighter_fill,
             )
             await self.require_live_inventory_manual_review(
                 asset=asset,
@@ -2250,6 +2268,8 @@ class VariationalToLighterRuntime:
                     "lighter_payload": lighter_payload,
                     "lighter_record": lighter_record_payload,
                     "entry_lighter_fill_timeout_seconds": entry_lighter_fill_timeout_seconds,
+                    "lighter_failure_reason": lighter_failure_reason,
+                    "partial_lighter_fill": partial_lighter_fill,
                     "auto_close_unhedged": auto_close_context,
                     "action": "manual_confirm_or_flatten_unhedged_var_leg",
                 },
@@ -3531,14 +3551,13 @@ class VariationalToLighterRuntime:
         await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
     async def handle_lighter_fill_update(self, order: dict[str, Any]) -> None:
-        if order.get("status") != "filled":
-            return
-
         client_order_id_raw = order.get("client_order_id")
         try:
             client_order_id = int(client_order_id_raw)
         except Exception:
             return
+
+        status = str(order.get("status") or "").strip().lower()
 
         fill_price: Decimal | None = None
         filled_quote = to_decimal(order.get("filled_quote_amount"))
@@ -3548,6 +3567,7 @@ class VariationalToLighterRuntime:
 
         now_iso = utc_now()
         now_monotonic = time.monotonic()
+        event_name = "lighter_order_update"
 
         async with self._record_lock:
             trade_key = self.lighter_client_order_to_trade_key.get(client_order_id)
@@ -3556,25 +3576,67 @@ class VariationalToLighterRuntime:
             record = self.records.get(trade_key)
             if record is None:
                 return
-            if record.lighter_fill_ts_iso is not None:
+
+            record.lighter_order_status = status or record.lighter_order_status
+            record.lighter_filled_base_amount = filled_base
+            record.lighter_filled_quote_amount = filled_quote
+            record.lighter_order_update = order
+
+            expected_base_amount = record.dry_run_plan_base_amount
+            full_fill = status == "filled"
+            if expected_base_amount is not None and filled_base is not None:
+                filled_base_amount = int(filled_base * self.base_amount_multiplier)
+                full_fill = filled_base_amount >= expected_base_amount
+
+            if full_fill and record.lighter_fill_ts_iso is not None:
                 return
 
-            record.lighter_fill_ts_iso = now_iso
-            record.live_lighter_fill_seen_monotonic = now_monotonic
-            record.lighter_fill_price = fill_price
-            if record.var_fill_ts_iso:
-                with contextlib.suppress(Exception):
-                    var_fill_dt = datetime.fromisoformat(record.var_fill_ts_iso.replace("Z", "+00:00"))
-                    lighter_fill_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
-                    record.live_fill_latency_ms = Decimal(
-                        str((lighter_fill_dt - var_fill_dt).total_seconds() * 1000)
-                    )
-            self.set_record_stage(record, STAGE_LIGHTER_FILLED, clear_failure=True)
+            if full_fill:
+                record.lighter_fill_ts_iso = now_iso
+                record.live_lighter_fill_seen_monotonic = now_monotonic
+                record.lighter_fill_price = fill_price
+                if record.var_fill_ts_iso:
+                    with contextlib.suppress(Exception):
+                        var_fill_dt = datetime.fromisoformat(record.var_fill_ts_iso.replace("Z", "+00:00"))
+                        lighter_fill_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+                        record.live_fill_latency_ms = Decimal(
+                            str((lighter_fill_dt - var_fill_dt).total_seconds() * 1000)
+                        )
+                self.set_record_stage(record, STAGE_LIGHTER_FILLED, clear_failure=True)
+                event_name = "lighter_fill"
+            elif status in LIGHTER_TERMINAL_UNFILLED_STATUSES:
+                partial = filled_base is not None and filled_base > 0
+                record.hedge_error = (
+                    f"Lighter order terminal status={status} filled_base={decimal_to_str(filled_base)} "
+                    f"filled_quote={decimal_to_str(filled_quote)}"
+                )
+                self.set_record_stage(
+                    record,
+                    STAGE_LIVE_SUBMIT_FAILED,
+                    failure_stage=FAILURE_STAGE_LIVE_SUBMIT,
+                    failure_reason="lighter_ioc_partial_terminal" if partial else "lighter_ioc_zero_fill_terminal",
+                )
+                event_name = "lighter_order_terminal_unfilled"
+            elif status:
+                event_name = "lighter_order_update"
+            else:
+                event_name = "lighter_order_update_unknown_status"
+
             payload = record.to_payload()
 
-        await self.append_order_log("lighter_fill", payload)
-        await self.maybe_append_live_inventory_actual_pnl(payload)
-        await self.maybe_append_live_inventory_final_pnl_from_fill(payload)
+        await self.append_order_log(event_name, payload)
+        if event_name == "lighter_fill":
+            await self.maybe_append_live_inventory_actual_pnl(payload)
+            await self.maybe_append_live_inventory_final_pnl_from_fill(payload)
+
+    @staticmethod
+    def lighter_record_has_partial_fill(record: OrderLifecycle | None) -> bool:
+        return (
+            record is not None
+            and record.lighter_filled_base_amount is not None
+            and record.lighter_filled_base_amount > 0
+            and record.lighter_fill_ts_iso is None
+        )
 
     @staticmethod
     def _auto_live_direction_to_var_side(direction: str) -> str:
