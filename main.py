@@ -93,7 +93,6 @@ STAGE_LIVE_SUBMIT_TIMED_OUT = "live_submit_timed_out"
 STAGE_LIGHTER_FILLED = "lighter_filled"
 
 LIGHTER_TERMINAL_UNFILLED_STATUSES = {"cancelled", "canceled", "expired", "rejected", "failed"}
-LIGHTER_TERMINAL_STATUSES = LIGHTER_TERMINAL_UNFILLED_STATUSES | {"filled"}
 
 FAILURE_STAGE_FILTER = "filter"
 FAILURE_STAGE_HEDGE_PLAN = "hedge_plan"
@@ -812,6 +811,9 @@ class VariationalToLighterRuntime:
             args.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics
         )
         self.live_inventory_max_lighter_slippage_bps = Decimal(str(args.live_inventory_max_lighter_slippage_bps))
+        self.live_inventory_lighter_submit_slippage_bps = Decimal(
+            str(args.live_inventory_lighter_submit_slippage_bps)
+        )
         self.live_inventory_max_lighter_book_age_seconds = float(args.live_inventory_max_lighter_book_age_seconds)
         self.live_inventory_exit_blocked_log_throttle_seconds = float(args.live_inventory_exit_blocked_log_throttle_seconds)
         self.live_inventory_min_hold_samples = int(args.live_inventory_min_hold_samples)
@@ -2726,6 +2728,7 @@ class VariationalToLighterRuntime:
             "live_inventory_entry_bps": decimal_to_str(self.live_inventory_entry_bps),
             "live_inventory_dynamic_entry_buffer_bps": decimal_to_str(self.live_inventory_dynamic_entry_buffer_bps),
             "live_inventory_max_lighter_slippage_bps": decimal_to_str(self.live_inventory_max_lighter_slippage_bps),
+            "live_inventory_lighter_submit_slippage_bps": decimal_to_str(self.live_inventory_lighter_submit_slippage_bps),
             "live_inventory_recent_execution_loss_buffer_bps": decimal_to_str(
                 self.live_inventory_recent_execution_loss_buffer_bps()
             ),
@@ -3604,7 +3607,7 @@ class VariationalToLighterRuntime:
                         )
                 self.set_record_stage(record, STAGE_LIGHTER_FILLED, clear_failure=True)
                 event_name = "lighter_fill"
-            elif status in LIGHTER_TERMINAL_UNFILLED_STATUSES:
+            elif status in LIGHTER_TERMINAL_UNFILLED_STATUSES or status.startswith("canceled-") or status.startswith("cancelled-"):
                 partial = filled_base is not None and filled_base > 0
                 record.hedge_error = (
                     f"Lighter order terminal status={status} filled_base={decimal_to_str(filled_base)} "
@@ -4786,7 +4789,7 @@ class VariationalToLighterRuntime:
 
         slippage_bps = Decimal(str(HEDGE_SLIPPAGE_BPS))
         if str(getattr(record, "auto_live_role", "") or "").startswith("live_inventory_"):
-            slippage_bps = self.live_inventory_max_lighter_slippage_bps
+            slippage_bps = self.live_inventory_lighter_submit_slippage_bps
         slippage = slippage_bps / Decimal("10000")
         if side == "BUY":
             limit_price = best_ask * (Decimal("1") + slippage)
@@ -9953,6 +9956,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum estimated Lighter order-book slippage allowed for live inventory entry. Default: 3.0",
     )
     parser.add_argument(
+        "--live-inventory-lighter-submit-slippage-bps",
+        type=float,
+        default=5.0,
+        help="Protection price slippage used when submitting live-inventory Lighter IOC orders. Actual fills are still checked by --live-inventory-max-lighter-slippage-bps. Default: 5.0",
+    )
+    parser.add_argument(
         "--live-inventory-max-lighter-book-age-seconds",
         type=float,
         default=0.0,
@@ -10300,6 +10309,10 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-dynamic-entry-buffer-bps must be >= 0")
         if args.live_inventory_max_lighter_slippage_bps < 0:
             parser.error("--live-inventory-max-lighter-slippage-bps must be >= 0")
+        if args.live_inventory_lighter_submit_slippage_bps < args.live_inventory_max_lighter_slippage_bps:
+            parser.error(
+                "--live-inventory-lighter-submit-slippage-bps must be >= --live-inventory-max-lighter-slippage-bps"
+            )
         if args.live_inventory_max_lighter_book_age_seconds < 0:
             parser.error("--live-inventory-max-lighter-book-age-seconds must be >= 0")
         if args.live_inventory_exit_blocked_log_throttle_seconds < 0:
