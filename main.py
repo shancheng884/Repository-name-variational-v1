@@ -918,6 +918,9 @@ class VariationalToLighterRuntime:
             side.strip().lower() for side in str(args.live_allowed_sides).split(",") if side.strip()
         }
         self.live_submit_timeout_seconds = float(args.live_submit_timeout_seconds)
+        self.live_inventory_entry_lighter_fill_timeout_seconds = float(
+            args.live_inventory_entry_lighter_fill_timeout_seconds
+        )
         self.variational_submit_transport = args.variational_submit_transport
         self.variational_api_max_slippage = float(args.variational_api_max_slippage)
         self.lighter_submit_transport = args.lighter_submit_transport
@@ -2204,7 +2207,30 @@ class VariationalToLighterRuntime:
                 context={"lot_id": lot_id, "direction": direction, "qty": decimal_to_str(qty), "lighter_payload": lighter_payload},
             )
             return
-        if not await self.wait_for_lighter_final_fill(lighter_record):
+        entry_lighter_fill_timeout_seconds = self.live_inventory_entry_lighter_fill_timeout_seconds
+        if not await self.wait_for_lighter_final_fill(
+            lighter_record,
+            timeout_seconds=entry_lighter_fill_timeout_seconds,
+        ):
+            async with self._record_lock:
+                lighter_record.hedge_error = (
+                    f"Live inventory entry Lighter IOC had no confirmed fill after "
+                    f"{entry_lighter_fill_timeout_seconds:.1f}s"
+                )
+                lighter_record_payload = lighter_record.to_payload()
+            await self.append_live_inventory_log(
+                "live_inventory_entry_lighter_ioc_no_fill",
+                {
+                    "asset": asset,
+                    "lot_id": lot_id,
+                    "direction": direction,
+                    "qty": decimal_to_str(qty),
+                    "timeout_seconds": entry_lighter_fill_timeout_seconds,
+                    "lighter_record": lighter_record_payload,
+                    "lighter_payload": lighter_payload,
+                    "action": "auto_close_unhedged_var_leg_then_manual_review",
+                },
+            )
             auto_close_context = await self.try_auto_close_unhedged_live_inventory_leg(
                 asset=asset,
                 reason="basis_entry_lighter_final_fill_not_confirmed_after_var_fill",
@@ -2222,7 +2248,8 @@ class VariationalToLighterRuntime:
                     "direction": direction,
                     "qty": decimal_to_str(qty),
                     "lighter_payload": lighter_payload,
-                    "lighter_record": lighter_record.to_payload(),
+                    "lighter_record": lighter_record_payload,
+                    "entry_lighter_fill_timeout_seconds": entry_lighter_fill_timeout_seconds,
                     "auto_close_unhedged": auto_close_context,
                     "action": "manual_confirm_or_flatten_unhedged_var_leg",
                 },
@@ -2932,10 +2959,16 @@ class VariationalToLighterRuntime:
     def auto_live_eager_hedge_started(record: OrderLifecycle | None) -> bool:
         return record is not None and record.processing_stage in {STAGE_LIVE_SUBMIT_SENT, STAGE_LIGHTER_FILLED}
 
-    async def wait_for_lighter_final_fill(self, record: OrderLifecycle | None) -> bool:
+    async def wait_for_lighter_final_fill(
+        self,
+        record: OrderLifecycle | None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> bool:
         if record is None:
             return False
-        deadline = time.monotonic() + max(0.1, float(self.live_submit_timeout_seconds))
+        timeout = self.live_submit_timeout_seconds if timeout_seconds is None else timeout_seconds
+        deadline = time.monotonic() + max(0.1, float(timeout))
         while time.monotonic() <= deadline:
             async with self._record_lock:
                 if record.lighter_fill_ts_iso is not None and record.lighter_fill_price is not None:
@@ -3032,6 +3065,7 @@ class VariationalToLighterRuntime:
             "require_min_edge_bps": decimal_to_str(self.live_require_min_edge_bps),
             "cooldown_seconds": self.live_cooldown_seconds,
             "submit_timeout_seconds": self.live_submit_timeout_seconds,
+            "live_inventory_entry_lighter_fill_timeout_seconds": self.live_inventory_entry_lighter_fill_timeout_seconds,
             "variational_submit_transport": getattr(
                 self,
                 "variational_submit_transport",
@@ -10018,6 +10052,12 @@ def parse_args() -> argparse.Namespace:
         "--live-inventory-basis-auto-close-unhedged",
         action="store_true",
         help="Experimental: if one entry leg clearly fails after the other started, try a reduce-only close before manual review.",
+    )
+    parser.add_argument(
+        "--live-inventory-entry-lighter-fill-timeout-seconds",
+        type=float,
+        default=3.0,
+        help="Seconds to wait for Lighter final fill during live-inventory entry before auto-closing the Var leg. Default: 3.0",
     )
     parser.add_argument(
         "--live-inventory-reconcile-on-start",
