@@ -2205,6 +2205,15 @@ class VariationalToLighterRuntime:
             )
             return
         if not await self.wait_for_lighter_final_fill(lighter_record):
+            auto_close_context = await self.try_auto_close_unhedged_live_inventory_leg(
+                asset=asset,
+                reason="basis_entry_lighter_final_fill_not_confirmed_after_var_fill",
+                var_side=str(context.get("var_side") or self._auto_live_direction_to_var_side(direction)),
+                qty=qty,
+                var_price=var_fill_price,
+                lot_id=lot_id,
+                close_var=True,
+            )
             await self.require_live_inventory_manual_review(
                 asset=asset,
                 reason="basis_entry_lighter_final_fill_not_confirmed",
@@ -2214,6 +2223,7 @@ class VariationalToLighterRuntime:
                     "qty": decimal_to_str(qty),
                     "lighter_payload": lighter_payload,
                     "lighter_record": lighter_record.to_payload(),
+                    "auto_close_unhedged": auto_close_context,
                     "action": "manual_confirm_or_flatten_unhedged_var_leg",
                 },
             )
