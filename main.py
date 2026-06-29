@@ -482,6 +482,7 @@ class OrderLifecycle:
     lighter_filled_base_amount: Decimal | None = None
     lighter_filled_quote_amount: Decimal | None = None
     lighter_order_update: dict[str, Any] | None = None
+    lighter_submit_slippage_bps: Decimal | None = None
     hedge_error: str | None = None
     lighter_reference_bid: Decimal | None = None
     lighter_reference_ask: Decimal | None = None
@@ -541,6 +542,7 @@ class OrderLifecycle:
             "lighter_filled_base_amount": decimal_to_str(self.lighter_filled_base_amount),
             "lighter_filled_quote_amount": decimal_to_str(self.lighter_filled_quote_amount),
             "lighter_order_update": self.lighter_order_update,
+            "lighter_submit_slippage_bps": decimal_to_str(self.lighter_submit_slippage_bps),
             "mode": self.mode,
             "lighter_reference_bid": decimal_to_str(self.lighter_reference_bid),
             "lighter_reference_ask": decimal_to_str(self.lighter_reference_ask),
@@ -833,6 +835,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_max_lighter_slippage_bps = Decimal(str(args.live_inventory_max_lighter_slippage_bps))
         self.live_inventory_lighter_submit_slippage_bps = Decimal(
             str(args.live_inventory_lighter_submit_slippage_bps)
+        )
+        self.live_inventory_lighter_exit_submit_slippage_bps = Decimal(
+            str(args.live_inventory_lighter_exit_submit_slippage_bps)
         )
         self.live_inventory_max_lighter_book_age_seconds = float(args.live_inventory_max_lighter_book_age_seconds)
         self.live_inventory_exit_blocked_log_throttle_seconds = float(args.live_inventory_exit_blocked_log_throttle_seconds)
@@ -2823,6 +2828,7 @@ class VariationalToLighterRuntime:
             "live_inventory_dynamic_entry_buffer_bps": decimal_to_str(self.live_inventory_dynamic_entry_buffer_bps),
             "live_inventory_max_lighter_slippage_bps": decimal_to_str(self.live_inventory_max_lighter_slippage_bps),
             "live_inventory_lighter_submit_slippage_bps": decimal_to_str(self.live_inventory_lighter_submit_slippage_bps),
+            "live_inventory_lighter_exit_submit_slippage_bps": decimal_to_str(self.live_inventory_lighter_exit_submit_slippage_bps),
             "live_inventory_recent_execution_loss_buffer_bps": decimal_to_str(
                 self.live_inventory_recent_execution_loss_buffer_bps()
             ),
@@ -4945,8 +4951,11 @@ class VariationalToLighterRuntime:
             return None
 
         slippage_bps = Decimal(str(HEDGE_SLIPPAGE_BPS))
-        if str(getattr(record, "auto_live_role", "") or "").startswith("live_inventory_"):
+        role = str(getattr(record, "auto_live_role", "") or "")
+        if role.startswith("live_inventory_"):
             slippage_bps = self.live_inventory_lighter_submit_slippage_bps
+            if "exit" in role or bool(record.lighter_reduce_only):
+                slippage_bps = self.live_inventory_lighter_exit_submit_slippage_bps
         slippage = slippage_bps / Decimal("10000")
         if side == "BUY":
             limit_price = best_ask * (Decimal("1") + slippage)
@@ -4958,6 +4967,7 @@ class VariationalToLighterRuntime:
         async with self._record_lock:
             record.live_notional_usd = notional
             record.live_edge_bps = edge_bps
+            record.lighter_submit_slippage_bps = slippage_bps
 
         base_amount = int(record.qty * self.base_amount_multiplier)
         if base_amount <= 0:
@@ -10134,6 +10144,12 @@ def parse_args() -> argparse.Namespace:
         help="Protection price slippage used when submitting live-inventory Lighter IOC orders. Actual fills are still checked by --live-inventory-max-lighter-slippage-bps. Default: 5.0",
     )
     parser.add_argument(
+        "--live-inventory-lighter-exit-submit-slippage-bps",
+        type=float,
+        default=30.0,
+        help="Protection price slippage used when submitting live-inventory Lighter IOC exit/reduce-only orders. Actual fills are still checked by --live-inventory-max-lighter-slippage-bps. Default: 30.0",
+    )
+    parser.add_argument(
         "--live-inventory-max-lighter-book-age-seconds",
         type=float,
         default=0.0,
@@ -10500,6 +10516,10 @@ def parse_args() -> argparse.Namespace:
         if args.live_inventory_lighter_submit_slippage_bps < args.live_inventory_max_lighter_slippage_bps:
             parser.error(
                 "--live-inventory-lighter-submit-slippage-bps must be >= --live-inventory-max-lighter-slippage-bps"
+            )
+        if args.live_inventory_lighter_exit_submit_slippage_bps < args.live_inventory_max_lighter_slippage_bps:
+            parser.error(
+                "--live-inventory-lighter-exit-submit-slippage-bps must be >= --live-inventory-max-lighter-slippage-bps"
             )
         if args.live_inventory_max_lighter_book_age_seconds < 0:
             parser.error("--live-inventory-max-lighter-book-age-seconds must be >= 0")
