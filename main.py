@@ -3356,8 +3356,14 @@ class VariationalToLighterRuntime:
                 elif self.live_inventory_i_accept_open_state_resume:
                     state = self.load_live_inventory_state()
                     state_status = clean_state_value(state.get("status")) or "unknown"
+                    manual_reason = clean_state_value(state.get("manual_review_reason")) or ""
                     open_lots = state.get("open_lots") if isinstance(state.get("open_lots"), list) else []
-                    if state_status == "open" and open_lots:
+                    recoverable_open_manual_review = (
+                        state_status == "manual_review_required"
+                        and manual_reason == "startup_reconcile_open_state_but_variational_flat"
+                        and bool(open_lots)
+                    )
+                    if (state_status == "open" and open_lots) or recoverable_open_manual_review:
                         passed.append("live_inventory_open_state_resume_accepted")
                     else:
                         blocking_errors.append(
