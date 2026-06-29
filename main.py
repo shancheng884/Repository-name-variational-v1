@@ -3965,6 +3965,8 @@ class VariationalToLighterRuntime:
             if not isinstance(position, dict):
                 continue
             instrument = position.get("instrument")
+            position_info = position.get("position_info")
+            nested_instrument = position_info.get("instrument") if isinstance(position_info, dict) else None
             candidates = [
                 position.get("asset"),
                 position.get("market"),
@@ -3973,12 +3975,30 @@ class VariationalToLighterRuntime:
             ]
             if isinstance(instrument, dict):
                 candidates.extend([instrument.get("underlying"), instrument.get("symbol"), instrument.get("asset")])
+            if isinstance(position_info, dict):
+                candidates.extend([
+                    position_info.get("asset"),
+                    position_info.get("market"),
+                    position_info.get("symbol"),
+                    position_info.get("underlying"),
+                ])
+            if isinstance(nested_instrument, dict):
+                candidates.extend([
+                    nested_instrument.get("underlying"),
+                    nested_instrument.get("symbol"),
+                    nested_instrument.get("asset"),
+                ])
             if asset not in {str(item).upper() for item in candidates if item is not None}:
                 continue
             for key in ("qty", "quantity", "size", "position", "position_size", "base_amount", "amount"):
                 value = to_decimal(position.get(key))
                 if value is not None:
                     return value
+            if isinstance(position_info, dict):
+                for key in ("qty", "quantity", "size", "position", "position_size", "base_amount", "amount"):
+                    value = to_decimal(position_info.get(key))
+                    if value is not None:
+                        return value
         return Decimal("0")
 
     @staticmethod
