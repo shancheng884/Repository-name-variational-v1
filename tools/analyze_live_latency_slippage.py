@@ -42,8 +42,10 @@ def summarize(name: str, values: list[Decimal]) -> None:
         f"{name}: n={len(values)} "
         f"p50={fmt(percentile(values, Decimal('50')))} "
         f"p90={fmt(percentile(values, Decimal('90')))} "
+        f"p95={fmt(percentile(values, Decimal('95')))} "
         f"p99={fmt(percentile(values, Decimal('99')))} "
-        f"avg={fmt(sum(values) / Decimal(len(values)) if values else None)}"
+        f"avg={fmt(sum(values) / Decimal(len(values)) if values else None)} "
+        f"max={fmt(max(values) if values else None)}"
     )
 
 
@@ -60,6 +62,32 @@ def avg(values: list[Decimal]) -> Decimal | None:
     return sum(values) / Decimal(len(values)) if values else None
 
 
+def recent_values(rows: list[dict[str, Any]], event: str, field: str, limit: int) -> list[Decimal]:
+    values: list[Decimal] = []
+    for row in reversed(rows):
+        if row.get("event") != event:
+            continue
+        value = to_decimal(row.get(field))
+        if value is not None:
+            values.append(value)
+        if len(values) >= limit:
+            break
+    return list(reversed(values))
+
+
+def recent_nested_values(rows: list[dict[str, Any]], event: str, limit: int, *keys: str) -> list[Decimal]:
+    values: list[Decimal] = []
+    for row in reversed(rows):
+        if row.get("event") != event:
+            continue
+        value = nested_decimal(row, *keys)
+        if value is not None:
+            values.append(value)
+        if len(values) >= limit:
+            break
+    return list(reversed(values))
+
+
 def suggest_threshold(values: list[Decimal], *, minimum: Decimal, extra: Decimal = Decimal("0")) -> Decimal | None:
     p90 = percentile(values, Decimal("90"))
     if p90 is None:
@@ -72,6 +100,7 @@ def main() -> None:
     parser.add_argument("--file", default="log/order_metrics.jsonl", help="Path to order_metrics.jsonl")
     parser.add_argument("--run-id", default=None, help="Only include one live inventory run_id")
     parser.add_argument("--tail", type=int, default=10000, help="Only inspect the last N lines")
+    parser.add_argument("--recent-samples", type=int, default=50, help="Summarize the most recent N latency samples. Default: 50")
     args = parser.parse_args()
 
     path = Path(args.file)
@@ -99,6 +128,40 @@ def main() -> None:
     summarize("estimated_vs_actual_pnl_shortfall_bps", [v for r in actual if (v := to_decimal(r.get("estimated_vs_actual_pnl_shortfall_bps"))) is not None])
     summarize("actual_pnl_bps", [v for r in actual if (v := to_decimal(r.get("actual_pnl_bps"))) is not None])
     summarize("actual_pnl_usd", [v for r in actual if (v := to_decimal(r.get("actual_pnl_usd"))) is not None])
+
+    print(f"\nrecent_latency_last_{args.recent_samples}:")
+    summarize(
+        "  lighter_final_fill_ms_var_seen_to_fill",
+        recent_values(rows, "lighter_fill", "live_var_seen_to_lighter_fill_ms", args.recent_samples),
+    )
+    summarize(
+        "  lighter_submit_sent_to_fill_ms",
+        recent_values(rows, "lighter_fill", "live_submit_sent_to_fill_ms", args.recent_samples),
+    )
+    summarize(
+        "  lighter_submit_call_ms",
+        recent_values(rows, "lighter_fill", "live_submit_call_latency_ms", args.recent_samples),
+    )
+    summarize(
+        "  entry_var_submit_ms",
+        recent_values(rows, "live_inventory_entered", "entry_var_submit_ms", args.recent_samples),
+    )
+    summarize(
+        "  exit_var_submit_ms",
+        recent_values(rows, "live_inventory_exited", "exit_var_submit_ms", args.recent_samples),
+    )
+    summarize(
+        "  auto_close_var_submit_ms",
+        recent_nested_values(rows, "live_inventory_auto_close_unhedged_attempted", args.recent_samples, "var_close", "submit_ms"),
+    )
+    summarize(
+        "  auto_close_lighter_submit_ms",
+        recent_nested_values(rows, "live_inventory_auto_close_unhedged_attempted", args.recent_samples, "lighter_close", "submit_ms"),
+    )
+    summarize(
+        "  manual_review_lighter_slippage_bps",
+        recent_nested_values(rows, "live_inventory_manual_review_required", args.recent_samples, "manual_review_context", "entry_lighter_slippage_bps"),
+    )
 
     by_direction: dict[str, list[Decimal]] = defaultdict(list)
     entry_slippage_by_direction: dict[str, list[Decimal]] = defaultdict(list)

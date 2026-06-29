@@ -798,6 +798,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_i_confirm_flat_start = bool(args.live_inventory_i_confirm_flat_start)
         self.live_inventory_i_accept_open_state_resume = bool(args.live_inventory_i_accept_open_state_resume)
         self.live_inventory_reset_state_after_manual_flat = bool(args.live_inventory_reset_state_after_manual_flat)
+        self.live_inventory_auto_close_manual_review_position = bool(args.live_inventory_auto_close_manual_review_position)
         self.live_inventory_lot_notional_usd = Decimal(str(args.live_inventory_lot_notional_usd))
         self.live_inventory_max_lots = int(args.live_inventory_max_lots)
         self.live_inventory_max_total_lots = int(args.live_inventory_max_total_lots)
@@ -2115,9 +2116,11 @@ class VariationalToLighterRuntime:
         lot_id: int,
         close_var: bool = False,
         close_lighter: bool = False,
+        force: bool = False,
     ) -> dict[str, Any]:
-        result: dict[str, Any] = {"enabled": self.live_inventory_basis_auto_close_unhedged, "reason": reason}
-        if not self.live_inventory_basis_auto_close_unhedged:
+        enabled = self.live_inventory_basis_auto_close_unhedged or force
+        result: dict[str, Any] = {"enabled": enabled, "reason": reason, "force": force}
+        if not enabled:
             return result
         opposite_side = self._opposite_var_side(var_side)
         if close_var:
@@ -2161,6 +2164,67 @@ class VariationalToLighterRuntime:
             {"asset": asset, "lot_id": lot_id, "var_side": var_side, "qty": decimal_to_str(qty), **result},
         )
         return result
+
+    async def auto_close_live_inventory_manual_review_position_once(self) -> None:
+        state = self.load_live_inventory_state()
+        reason = str(state.get("manual_review_reason") or "")
+        if reason != "basis_entry_lighter_actual_slippage_exceeds_limit":
+            raise RuntimeError(f"manual-review auto-close refused for reason={reason or 'missing'}")
+        context = state.get("manual_review_context") if isinstance(state.get("manual_review_context"), dict) else {}
+        asset = str(state.get("asset") or context.get("asset") or self.live_inventory_state_asset()).upper()
+        direction = str(context.get("direction") or "")
+        qty = to_decimal(context.get("qty"))
+        lighter_fill_price = to_decimal(context.get("entry_lighter_fill_price"))
+        lot_id = int(context.get("lot_id") or state.get("next_lot_id") or 1)
+        if direction not in {DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER}:
+            raise RuntimeError(f"manual-review auto-close refused for unsupported direction={direction or 'missing'}")
+        if qty is None or qty <= 0:
+            raise RuntimeError(f"manual-review auto-close refused for invalid qty={context.get('qty')!r}")
+        if lighter_fill_price is None or lighter_fill_price <= 0:
+            raise RuntimeError("manual-review auto-close refused because entry_lighter_fill_price is missing")
+        auto_close_context = await self.try_auto_close_unhedged_live_inventory_leg(
+            asset=asset,
+            reason="manual_review_recovery_basis_entry_lighter_actual_slippage_exceeds_limit",
+            var_side=self._auto_live_direction_to_var_side(direction),
+            qty=qty,
+            var_price=lighter_fill_price,
+            lot_id=lot_id,
+            close_var=True,
+            close_lighter=True,
+            force=True,
+        )
+        await self.write_live_inventory_state_async(
+            {
+                "status": "manual_review_required",
+                "asset": asset,
+                "next_lot_id": state.get("next_lot_id") or self.live_inventory_next_lot_id,
+                "open_lots": [],
+                "pending_actions": [],
+                "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
+                "completed_cycles": state.get("completed_cycles") or self.live_inventory_completed_cycles,
+                "manual_review_reason": "manual_review_recovery_auto_close_attempted",
+                "manual_review_context": {
+                    "previous_manual_review_reason": reason,
+                    "previous_manual_review_context": context,
+                    "auto_close_unhedged": auto_close_context,
+                    "action": "manual_confirm_flat_after_recovery_auto_close",
+                },
+                "action": "confirm_flat_then_restart_with_reset_state_after_manual_flat",
+            }
+        )
+        await self.append_live_inventory_log(
+            "live_inventory_manual_review_auto_close_attempted",
+            {
+                "asset": asset,
+                "lot_id": lot_id,
+                "direction": direction,
+                "qty": decimal_to_str(qty),
+                "previous_manual_review_reason": reason,
+                "auto_close_unhedged": auto_close_context,
+                "action": "manual_confirm_flat_after_recovery_auto_close",
+            },
+        )
+        self.stop_flag = True
 
     async def complete_live_inventory_entry_after_var_fill(
         self,
@@ -2288,6 +2352,16 @@ class VariationalToLighterRuntime:
             if entry_lighter_slippage_bps is not None and entry_lighter_slippage_bps < 0:
                 entry_lighter_slippage_bps = Decimal("0")
         if entry_lighter_slippage_bps is not None and entry_lighter_slippage_bps > self.live_inventory_max_lighter_slippage_bps:
+            auto_close_context = await self.try_auto_close_unhedged_live_inventory_leg(
+                asset=asset,
+                reason="basis_entry_lighter_actual_slippage_exceeds_limit_after_both_legs_filled",
+                var_side=str(context.get("var_side") or self._auto_live_direction_to_var_side(direction)),
+                qty=qty,
+                var_price=var_fill_price,
+                lot_id=lot_id,
+                close_var=True,
+                close_lighter=True,
+            )
             await self.require_live_inventory_manual_review(
                 asset=asset,
                 reason="basis_entry_lighter_actual_slippage_exceeds_limit",
@@ -2301,7 +2375,8 @@ class VariationalToLighterRuntime:
                     "entry_lighter_slippage_bps": decimal_to_str(entry_lighter_slippage_bps),
                     "max_lighter_slippage_bps": decimal_to_str(self.live_inventory_max_lighter_slippage_bps),
                     "lighter_payload": lighter_payload,
-                    "action": "manual_confirm_or_flatten_lighter_leg",
+                    "auto_close_unhedged": auto_close_context,
+                    "action": "manual_confirm_auto_close_or_flatten_remaining_legs",
                 },
             )
             return
@@ -3241,7 +3316,18 @@ class VariationalToLighterRuntime:
                     passed.append("live_inventory_dry_decisions_only_no_orders")
                 else:
                     passed.append("live_inventory_real_submit_one_lot_enabled")
-                if self.live_inventory_i_confirm_flat_start:
+                if self.live_inventory_auto_close_manual_review_position:
+                    state = self.load_live_inventory_state()
+                    state_status = clean_state_value(state.get("status")) or "unknown"
+                    manual_reason = clean_state_value(state.get("manual_review_reason")) or "unknown"
+                    if state_status == "manual_review_required" and manual_reason == "basis_entry_lighter_actual_slippage_exceeds_limit":
+                        passed.append("live_inventory_manual_review_auto_close_position_requested")
+                    else:
+                        blocking_errors.append(
+                            "live_inventory_manual_review_auto_close_requires_slippage_manual_review: "
+                            + self.live_inventory_state_summary(state)
+                        )
+                elif self.live_inventory_i_confirm_flat_start:
                     passed.append("live_inventory_flat_start_manually_confirmed")
                     state = self.load_live_inventory_state()
                     state_status = clean_state_value(state.get("status")) or "unknown"
@@ -9566,6 +9652,10 @@ class VariationalToLighterRuntime:
             if not self.live_inventory_dry_decisions:
                 await self.reconcile_live_inventory_startup_state()
 
+        if self.live_inventory_auto_close_manual_review_position:
+            await self.auto_close_live_inventory_manual_review_position_once()
+            return
+
         self.trade_event_cursor = await self.runtime.monitor.get_latest_trade_event_seq()
         self.trade_event_min_timestamp = datetime.now(timezone.utc)
         self.logger.info("Tracking new Variational trade events from seq>%s", self.trade_event_cursor)
@@ -9916,6 +10006,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="After manually confirming Var and Lighter are flat, reset log/live_inventory_state.json to flat during startup.",
     )
+    parser.add_argument(
+        "--live-inventory-auto-close-manual-review-position",
+        action="store_true",
+        help="One-shot recovery: only for live_inventory manual_review caused by entry Lighter actual slippage exceeding the limit; submit reduce-only closes for both legs and exit.",
+    )
     parser.add_argument("--live-inventory-lot-notional-usd", type=float, default=20.0)
     parser.add_argument("--live-inventory-max-lots", type=int, default=1)
     parser.add_argument("--live-inventory-max-total-lots", type=int, default=1)
@@ -9952,8 +10047,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--live-inventory-max-lighter-slippage-bps",
         type=float,
-        default=3.0,
-        help="Maximum estimated Lighter order-book slippage allowed for live inventory entry. Default: 3.0",
+        default=5.0,
+        help="Maximum actual Lighter fill slippage allowed for live inventory entry/exit. Default: 5.0",
     )
     parser.add_argument(
         "--live-inventory-lighter-submit-slippage-bps",
@@ -10234,13 +10329,29 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory only works in --mode live")
         if args.auto_live_entry or args.auto_live_exit or args.auto_live_eager_hedge:
             parser.error("--live-inventory cannot be combined with --auto-live-entry/exit/eager-hedge")
-        if not args.live_inventory_i_confirm_flat_start and not args.live_inventory_i_accept_open_state_resume:
+        if (
+            not args.live_inventory_i_confirm_flat_start
+            and not args.live_inventory_i_accept_open_state_resume
+            and not args.live_inventory_auto_close_manual_review_position
+        ):
             parser.error(
                 "--live-inventory requires --live-inventory-i-confirm-flat-start after manually confirming flat, "
-                "or --live-inventory-i-accept-open-state-resume after manually confirming the saved open state matches both venues"
+                "--live-inventory-i-accept-open-state-resume after manually confirming the saved open state matches both venues, "
+                "or --live-inventory-auto-close-manual-review-position for one-shot recovery"
             )
-        if args.live_inventory_i_confirm_flat_start and args.live_inventory_i_accept_open_state_resume:
-            parser.error("use only one of --live-inventory-i-confirm-flat-start or --live-inventory-i-accept-open-state-resume")
+        live_inventory_start_modes = sum(
+            bool(flag)
+            for flag in (
+                args.live_inventory_i_confirm_flat_start,
+                args.live_inventory_i_accept_open_state_resume,
+                args.live_inventory_auto_close_manual_review_position,
+            )
+        )
+        if live_inventory_start_modes > 1:
+            parser.error(
+                "use only one of --live-inventory-i-confirm-flat-start, "
+                "--live-inventory-i-accept-open-state-resume, or --live-inventory-auto-close-manual-review-position"
+            )
         allowed_assets = {asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()}
         if args.live_inventory_signal_mode == LIVE_INVENTORY_SIGNAL_BASIS:
             if len(allowed_assets) != 1 or not allowed_assets.issubset(LIVE_INVENTORY_BASIS_ALLOWED_ASSETS):
