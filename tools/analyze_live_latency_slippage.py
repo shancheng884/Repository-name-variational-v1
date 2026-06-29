@@ -139,6 +139,18 @@ def main() -> None:
         recent_values(rows, "lighter_fill", "live_submit_sent_to_fill_ms", args.recent_samples),
     )
     summarize(
+        "  lighter_wire_sent_to_fill_ms",
+        recent_values(rows, "lighter_fill", "live_wire_sent_to_fill_ms", args.recent_samples),
+    )
+    summarize(
+        "  lighter_var_seen_to_wire_sent_ms",
+        recent_values(rows, "lighter_fill", "live_var_seen_to_lighter_wire_sent_ms", args.recent_samples),
+    )
+    summarize(
+        "  lighter_wire_sent_to_submit_ack_ms",
+        recent_values(rows, "lighter_fill", "live_wire_sent_to_submit_ack_ms", args.recent_samples),
+    )
+    summarize(
         "  lighter_submit_call_ms",
         recent_values(rows, "lighter_fill", "live_submit_call_latency_ms", args.recent_samples),
     )

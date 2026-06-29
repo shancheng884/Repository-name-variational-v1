@@ -495,11 +495,13 @@ class OrderLifecycle:
     live_plan_started_at_iso: str | None = None
     live_plan_ready_at_iso: str | None = None
     live_submit_started_at_iso: str | None = None
+    live_submit_wire_sent_at_iso: str | None = None
     live_submit_sent_at_iso: str | None = None
     live_var_fill_seen_monotonic: float | None = None
     live_plan_started_monotonic: float | None = None
     live_plan_ready_monotonic: float | None = None
     live_submit_started_monotonic: float | None = None
+    live_submit_wire_sent_monotonic: float | None = None
     live_submit_sent_monotonic: float | None = None
     live_lighter_fill_seen_monotonic: float | None = None
     processing_stage: str = STAGE_EVENT_RECEIVED
@@ -556,6 +558,7 @@ class OrderLifecycle:
             "live_plan_started_at": self.live_plan_started_at_iso,
             "live_plan_ready_at": self.live_plan_ready_at_iso,
             "live_submit_started_at": self.live_submit_started_at_iso,
+            "live_submit_wire_sent_at": self.live_submit_wire_sent_at_iso,
             "live_submit_sent_at": self.live_submit_sent_at_iso,
             "live_var_seen_to_plan_start_ms": decimal_to_str(elapsed_ms(
                 self.live_var_fill_seen_monotonic,
@@ -572,6 +575,22 @@ class OrderLifecycle:
             "live_submit_call_latency_ms": decimal_to_str(elapsed_ms(
                 self.live_submit_started_monotonic,
                 self.live_submit_sent_monotonic,
+            )),
+            "live_submit_start_to_wire_sent_ms": decimal_to_str(elapsed_ms(
+                self.live_submit_started_monotonic,
+                self.live_submit_wire_sent_monotonic,
+            )),
+            "live_wire_sent_to_submit_ack_ms": decimal_to_str(elapsed_ms(
+                self.live_submit_wire_sent_monotonic,
+                self.live_submit_sent_monotonic,
+            )),
+            "live_wire_sent_to_fill_ms": decimal_to_str(elapsed_ms(
+                self.live_submit_wire_sent_monotonic,
+                self.live_lighter_fill_seen_monotonic,
+            )),
+            "live_var_seen_to_lighter_wire_sent_ms": decimal_to_str(elapsed_ms(
+                self.live_var_fill_seen_monotonic,
+                self.live_submit_wire_sent_monotonic,
             )),
             "live_submit_sent_to_fill_ms": decimal_to_str(elapsed_ms(
                 self.live_submit_sent_monotonic,
@@ -3737,6 +3756,10 @@ class VariationalToLighterRuntime:
                     "lighter_filled_price": payload.get("lighter_filled_price"),
                     "lighter_filled_base_amount": payload.get("lighter_filled_base_amount"),
                     "live_submit_call_latency_ms": payload.get("live_submit_call_latency_ms"),
+                    "live_submit_start_to_wire_sent_ms": payload.get("live_submit_start_to_wire_sent_ms"),
+                    "live_wire_sent_to_submit_ack_ms": payload.get("live_wire_sent_to_submit_ack_ms"),
+                    "live_wire_sent_to_fill_ms": payload.get("live_wire_sent_to_fill_ms"),
+                    "live_var_seen_to_lighter_wire_sent_ms": payload.get("live_var_seen_to_lighter_wire_sent_ms"),
                     "live_submit_sent_to_fill_ms": payload.get("live_submit_sent_to_fill_ms"),
                     "live_var_seen_to_lighter_fill_ms": payload.get("live_var_seen_to_lighter_fill_ms"),
                     "live_plan_latency_ms": payload.get("live_plan_latency_ms"),
@@ -4250,7 +4273,7 @@ class VariationalToLighterRuntime:
             raw=message,
         )
 
-    async def send_lighter_tx_ws(self, *, tx_type: int, tx_info: str) -> SimpleNamespace:
+    async def send_lighter_tx_ws(self, *, tx_type: int, tx_info: str) -> tuple[SimpleNamespace, float | None]:
         total_started = time.monotonic()
         if not tx_info or tx_info[0] != "{":
             raise ValueError(f"Invalid tx_info: {tx_info}")
@@ -4304,7 +4327,7 @@ class VariationalToLighterRuntime:
                             elapsed_ms_between_str(lock_acquired, response_done),
                             elapsed_ms_between_str(total_started, response_done),
                         )
-                        return self._normalize_lighter_ws_sendtx_response(message)
+                        return self._normalize_lighter_ws_sendtx_response(message), send_done
             except asyncio.TimeoutError as exc:
                 last_type = (last_message or {}).get("type")
                 raise RuntimeError(
@@ -4329,7 +4352,7 @@ class VariationalToLighterRuntime:
         reduce_only: bool,
         trigger_price: int,
         order_expiry: int,
-    ) -> tuple[Any | None, Any | None, str | None]:
+    ) -> tuple[Any | None, Any | None, str | None, float | None]:
         total_started = time.monotonic()
         if not self.lighter_client:
             raise RuntimeError("Lighter client is not initialized")
@@ -4356,11 +4379,11 @@ class VariationalToLighterRuntime:
             sign_done = time.monotonic()
             if error is not None:
                 self.lighter_client.nonce_manager.acknowledge_failure(api_key_index)
-                return None, None, error
+                return None, None, error, None
 
             sent_to_ws = True
             ws_started = time.monotonic()
-            api_response = await self.send_lighter_tx_ws(tx_type=tx_type, tx_info=tx_info)
+            api_response, wire_sent_monotonic = await self.send_lighter_tx_ws(tx_type=tx_type, tx_info=tx_info)
             ws_done = time.monotonic()
             self.timing_logger().info(
                 "lighter_ws_create_order_timing market_index=%s client_order_index=%s side=%s base_amount=%s "
@@ -4377,13 +4400,13 @@ class VariationalToLighterRuntime:
             )
             if api_response is None or api_response.code != 200:
                 self.lighter_client.nonce_manager.acknowledge_failure(api_key_index)
-            return None, api_response, None
+            return None, api_response, None, wire_sent_monotonic
         except Exception as exc:
             if "invalid nonce" in str(exc):
                 self.lighter_client.nonce_manager.hard_refresh_nonce(api_key_index)
             elif not sent_to_ws:
                 self.lighter_client.nonce_manager.acknowledge_failure(api_key_index)
-            return None, None, str(exc)
+            return None, None, str(exc), None
 
     async def handle_lighter_ws(self) -> None:
         while not self.stop_flag:
@@ -5220,8 +5243,9 @@ class VariationalToLighterRuntime:
                         else self.lighter_client.DEFAULT_28_DAY_ORDER_EXPIRY
                     ),
                 }
+                wire_sent_monotonic = None
                 if self.lighter_submit_transport == LIGHTER_SUBMIT_TRANSPORT_WS:
-                    _, tx_hash, error = await self.create_lighter_order_ws(**order_kwargs)
+                    _, tx_hash, error, wire_sent_monotonic = await self.create_lighter_order_ws(**order_kwargs)
                 else:
                     _, tx_hash, error = await self.lighter_client.create_order(**order_kwargs)
                 submit_body_done = time.monotonic()
@@ -5245,6 +5269,9 @@ class VariationalToLighterRuntime:
 
             async with self._record_lock:
                 record.lighter_tx_hash = tx_hash
+                if wire_sent_monotonic is not None:
+                    record.live_submit_wire_sent_monotonic = wire_sent_monotonic
+                    record.live_submit_wire_sent_at_iso = utc_now()
                 record.live_submit_sent_at_iso = submit_sent_iso
                 record.live_submit_sent_monotonic = submit_sent_monotonic
                 record.hedge_error = None
