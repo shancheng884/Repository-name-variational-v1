@@ -3073,7 +3073,7 @@ class VariationalToLighterRuntime:
                     return True
                 if record.processing_stage in {STAGE_LIVE_SUBMIT_FAILED, STAGE_LIVE_SUBMIT_TIMED_OUT}:
                     return False
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.01)
         return False
 
     def timing_logger(self) -> logging.Logger:
@@ -3715,6 +3715,28 @@ class VariationalToLighterRuntime:
 
         await self.append_order_log(event_name, payload)
         if event_name == "lighter_fill":
+            await self.append_order_log(
+                "lighter_fill_timing",
+                {
+                    "record_kind": "execution_lifecycle_timing",
+                    "trade_key": payload.get("trade_key"),
+                    "trade_id": payload.get("trade_id"),
+                    "asset": payload.get("asset"),
+                    "side": payload.get("side"),
+                    "qty": payload.get("qty"),
+                    "auto_live_role": payload.get("auto_live_role"),
+                    "lighter_client_order_id": payload.get("lighter_client_order_id"),
+                    "lighter_order_side": payload.get("lighter_order_side"),
+                    "lighter_reduce_only": payload.get("lighter_reduce_only"),
+                    "lighter_filled_price": payload.get("lighter_filled_price"),
+                    "lighter_filled_base_amount": payload.get("lighter_filled_base_amount"),
+                    "live_submit_call_latency_ms": payload.get("live_submit_call_latency_ms"),
+                    "live_submit_sent_to_fill_ms": payload.get("live_submit_sent_to_fill_ms"),
+                    "live_var_seen_to_lighter_fill_ms": payload.get("live_var_seen_to_lighter_fill_ms"),
+                    "live_plan_latency_ms": payload.get("live_plan_latency_ms"),
+                    "live_plan_ready_to_submit_start_ms": payload.get("live_plan_ready_to_submit_start_ms"),
+                },
+            )
             await self.maybe_append_live_inventory_actual_pnl(payload)
             await self.maybe_append_live_inventory_final_pnl_from_fill(payload)
 
@@ -5129,6 +5151,15 @@ class VariationalToLighterRuntime:
             client_order_id = int(time.time() * 1000)
             while client_order_id in self.lighter_client_order_to_trade_key:
                 client_order_id += 1
+            record.dry_run_plan_side = side
+            record.dry_run_plan_price = limit_price
+            record.dry_run_plan_base_amount = base_amount
+            record.lighter_side = side
+            record.lighter_reduce_only = bool(record.lighter_reduce_only)
+            record.lighter_client_order_id = client_order_id
+            record.lighter_submit_transport = self.lighter_submit_transport
+            record.lighter_order_mode = self.lighter_order_mode
+            self.lighter_client_order_to_trade_key[client_order_id] = record.trade_key
 
         try:
             submit_body_started = time.monotonic()
@@ -5187,24 +5218,17 @@ class VariationalToLighterRuntime:
                 raise RuntimeError(f"Sign error: {error}")
 
             async with self._record_lock:
-                record.dry_run_plan_side = side
-                record.dry_run_plan_price = limit_price
-                record.dry_run_plan_base_amount = base_amount
-                record.lighter_side = side
-                record.lighter_reduce_only = bool(record.lighter_reduce_only)
-                record.lighter_client_order_id = client_order_id
-                record.lighter_submit_transport = self.lighter_submit_transport
-                record.lighter_order_mode = self.lighter_order_mode
                 record.lighter_tx_hash = tx_hash
                 record.live_submit_sent_at_iso = submit_sent_iso
                 record.live_submit_sent_monotonic = submit_sent_monotonic
                 record.hedge_error = None
                 self.set_record_stage(record, STAGE_LIVE_SUBMIT_SENT, clear_failure=True)
-                self.lighter_client_order_to_trade_key[client_order_id] = record.trade_key
                 self.last_live_submit_monotonic_by_asset[asset_key] = time.monotonic()
         except Exception as exc:
             async with self._record_lock:
                 record.lighter_side = side
+                if record.lighter_client_order_id is not None:
+                    self.lighter_client_order_to_trade_key.pop(record.lighter_client_order_id, None)
                 record.hedge_error = str(exc)
                 self.set_record_stage(
                     record,
