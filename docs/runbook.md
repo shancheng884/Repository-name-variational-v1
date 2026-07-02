@@ -14,7 +14,15 @@ Replace `SOL` with `BTC` or `ETH` when needed.
 
 The command refuses to start when another `python main.py` is running, when `log/live_inventory_state.json` is not flat, or when it contains `open_lots` or `pending_actions`.
 
-Before typing `YES` at the prompt, manually confirm both exchanges have no positions and no open orders.
+Before running it, manually confirm both exchanges have no positions and no open orders.
+
+Startup parameters are read once from `live_config.json`. They are not hot-reloaded into the trading loop.
+
+To inspect the full `main.py` command without starting live:
+
+```bash
+python tools/live.py --asset SOL --dry-run --verbose
+```
 
 ## Analyze Live Data
 

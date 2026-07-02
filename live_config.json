@@ -1,0 +1,20 @@
+{
+  "live_max_notional_usd": "25",
+  "lot_notional_usd": "20",
+  "max_cycles": 1,
+  "max_lots": 1,
+  "max_total_lots": 1,
+  "max_lighter_slippage_bps": "6",
+  "lighter_submit_slippage_bps": "15",
+  "lighter_exit_submit_slippage_bps": "30",
+  "min_entry_edge_bps": "13",
+  "min_abs_entry_bps": "13",
+  "min_exit_pnl_bps": "8.0",
+  "min_signal_reverted_exit_pnl_bps": "8.0",
+  "profit_take_pnl_bps": "10.0",
+  "entry_confirm_samples": 2,
+  "max_sample_move_bps": "5",
+  "min_normalized_entry_edge_bps": "1.0",
+  "min_normalized_filter_edge_bps": "0.5",
+  "entry_lighter_fill_timeout_seconds": "3"
+}

@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -14,6 +17,36 @@ from tools.lib.runtime_files import LIVE_STATE, LOG_DIR, human_bytes, read_json 
 
 
 ALLOWED_ASSETS = {"BTC", "ETH", "SOL"}
+LIVE_CONFIG = ROOT / "live_config.json"
+
+
+@dataclass(frozen=True)
+class LiveConfig:
+    live_max_notional_usd: str = "25"
+    lot_notional_usd: str = "20"
+    max_cycles: int = 1
+    max_lots: int = 1
+    max_total_lots: int = 1
+    max_lighter_slippage_bps: str = "6"
+    lighter_submit_slippage_bps: str = "15"
+    lighter_exit_submit_slippage_bps: str = "30"
+    min_entry_edge_bps: str = "13"
+    min_abs_entry_bps: str = "13"
+    min_exit_pnl_bps: str = "8.0"
+    min_signal_reverted_exit_pnl_bps: str = "8.0"
+    profit_take_pnl_bps: str = "10.0"
+    entry_confirm_samples: int = 2
+    max_sample_move_bps: str = "5"
+    min_normalized_entry_edge_bps: str = "1.0"
+    min_normalized_filter_edge_bps: str = "0.5"
+    entry_lighter_fill_timeout_seconds: str = "3"
+
+
+DEFAULT_CONFIG = LiveConfig()
+
+
+def default_config_dict() -> dict[str, Any]:
+    return DEFAULT_CONFIG.__dict__.copy()
 
 
 def running_main_processes() -> list[str]:
@@ -67,7 +100,64 @@ def dir_size_safe(path: Path) -> int:
     return total
 
 
-def build_main_command(asset: str, cycles: int) -> list[str]:
+def _positive_decimal(data: dict[str, Any], key: str) -> str:
+    value = data.get(key, getattr(DEFAULT_CONFIG, key))
+    try:
+        number = float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a positive number") from exc
+    if number <= 0:
+        raise ValueError(f"{key} must be a positive number")
+    return str(value)
+
+
+def _positive_int(data: dict[str, Any], key: str, *, max_value: int | None = None) -> int:
+    value = data.get(key, getattr(DEFAULT_CONFIG, key))
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a positive integer") from exc
+    if number <= 0:
+        raise ValueError(f"{key} must be a positive integer")
+    if max_value is not None and number > max_value:
+        raise ValueError(f"{key} must be <= {max_value}")
+    return number
+
+
+def load_config(path: Path) -> LiveConfig:
+    if not path.exists():
+        path.write_text(json.dumps(default_config_dict(), indent=2) + "\n", encoding="utf-8")
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"failed to read {path.name}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path.name} must contain a JSON object")
+
+    return LiveConfig(
+        live_max_notional_usd=_positive_decimal(raw, "live_max_notional_usd"),
+        lot_notional_usd=_positive_decimal(raw, "lot_notional_usd"),
+        max_cycles=_positive_int(raw, "max_cycles", max_value=10),
+        max_lots=_positive_int(raw, "max_lots", max_value=10),
+        max_total_lots=_positive_int(raw, "max_total_lots", max_value=10),
+        max_lighter_slippage_bps=_positive_decimal(raw, "max_lighter_slippage_bps"),
+        lighter_submit_slippage_bps=_positive_decimal(raw, "lighter_submit_slippage_bps"),
+        lighter_exit_submit_slippage_bps=_positive_decimal(raw, "lighter_exit_submit_slippage_bps"),
+        min_entry_edge_bps=_positive_decimal(raw, "min_entry_edge_bps"),
+        min_abs_entry_bps=_positive_decimal(raw, "min_abs_entry_bps"),
+        min_exit_pnl_bps=_positive_decimal(raw, "min_exit_pnl_bps"),
+        min_signal_reverted_exit_pnl_bps=_positive_decimal(raw, "min_signal_reverted_exit_pnl_bps"),
+        profit_take_pnl_bps=_positive_decimal(raw, "profit_take_pnl_bps"),
+        entry_confirm_samples=_positive_int(raw, "entry_confirm_samples", max_value=20),
+        max_sample_move_bps=_positive_decimal(raw, "max_sample_move_bps"),
+        min_normalized_entry_edge_bps=_positive_decimal(raw, "min_normalized_entry_edge_bps"),
+        min_normalized_filter_edge_bps=_positive_decimal(raw, "min_normalized_filter_edge_bps"),
+        entry_lighter_fill_timeout_seconds=_positive_decimal(raw, "entry_lighter_fill_timeout_seconds"),
+    )
+
+
+def build_main_command(asset: str, config: LiveConfig) -> list[str]:
     return [
         sys.executable,
         "main.py",
@@ -84,49 +174,49 @@ def build_main_command(asset: str, cycles: int) -> list[str]:
         "market-ioc",
         "--lighter-prewarm-submit-ws",
         "--live-max-notional-usd",
-        "25",
+        config.live_max_notional_usd,
         "--live-inventory",
         "--live-inventory-signal-mode",
         "basis",
         "--live-inventory-basis-entry-mode",
         "concurrent",
         "--live-inventory-lot-notional-usd",
-        "20",
+        config.lot_notional_usd,
         "--live-inventory-max-cycles",
-        str(cycles),
+        str(config.max_cycles),
         "--live-inventory-max-lots",
-        "1",
+        str(config.max_lots),
         "--live-inventory-max-total-lots",
-        "1",
+        str(config.max_total_lots),
         "--live-inventory-max-lighter-slippage-bps",
-        "6",
+        config.max_lighter_slippage_bps,
         "--live-inventory-lighter-submit-slippage-bps",
-        "15",
+        config.lighter_submit_slippage_bps,
         "--live-inventory-lighter-exit-submit-slippage-bps",
-        "30",
+        config.lighter_exit_submit_slippage_bps,
         "--live-inventory-basis-min-entry-edge-bps",
-        "13",
+        config.min_entry_edge_bps,
         "--live-inventory-basis-min-abs-entry-bps",
-        "13",
+        config.min_abs_entry_bps,
         "--live-inventory-basis-min-exit-pnl-bps",
-        "8.0",
+        config.min_exit_pnl_bps,
         "--live-inventory-basis-min-signal-reverted-exit-pnl-bps",
-        "8.0",
+        config.min_signal_reverted_exit_pnl_bps,
         "--live-inventory-basis-profit-take-pnl-bps",
-        "10.0",
+        config.profit_take_pnl_bps,
         "--live-inventory-basis-entry-confirm-samples",
-        "2",
+        str(config.entry_confirm_samples),
         "--live-inventory-basis-max-sample-move-bps",
-        "5",
+        config.max_sample_move_bps,
         "--live-inventory-basis-stablecoin-normalization",
         "--live-inventory-basis-use-normalized-edge-for-entry",
         "--live-inventory-basis-stablecoin-regime-entry",
         "--live-inventory-basis-min-normalized-entry-edge-bps",
-        "1.0",
+        config.min_normalized_entry_edge_bps,
         "--live-inventory-basis-min-normalized-filter-edge-bps",
-        "0.5",
+        config.min_normalized_filter_edge_bps,
         "--live-inventory-entry-lighter-fill-timeout-seconds",
-        "3",
+        config.entry_lighter_fill_timeout_seconds,
         "--live-inventory-i-confirm-flat-start",
         "--live-inventory-i-accept-basis-real-diagnostic",
     ]
@@ -135,15 +225,19 @@ def build_main_command(asset: str, cycles: int) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Start the real live arbitrage runner.")
     parser.add_argument("--asset", required=True, help="Live asset: BTC, ETH, or SOL.")
-    parser.add_argument("--cycles", type=int, default=1, help="Maximum completed cycles for this foreground run. Default: 1.")
-    parser.add_argument("--dry-run", action="store_true", help="Print checks and the main.py command without starting live.")
+    parser.add_argument("--config", default=str(LIVE_CONFIG), help="Startup config JSON. Default: live_config.json.")
+    parser.add_argument("--dry-run", action="store_true", help="Print checks without starting live.")
+    parser.add_argument("--verbose", action="store_true", help="Print the full main.py command.")
     args = parser.parse_args()
 
     asset = args.asset.upper()
     if asset not in ALLOWED_ASSETS:
         parser.error(f"--asset must be one of {sorted(ALLOWED_ASSETS)}")
-    if args.cycles <= 0 or args.cycles > 10:
-        parser.error("--cycles must be between 1 and 10")
+    try:
+        config = load_config(Path(args.config))
+    except ValueError as exc:
+        print(f"REFUSE_START reason=config_invalid detail={exc}")
+        return 2
 
     processes = running_main_processes()
     if processes:
@@ -159,8 +253,10 @@ def main() -> int:
         print("REFUSE_START reason=local_live_state_not_flat")
         return 2
 
-    command = build_main_command(asset, args.cycles)
-    print("main_command=" + " ".join(command))
+    command = build_main_command(asset, config)
+    print(f"starting asset={asset} max_cycles={config.max_cycles} lot_notional_usd={config.lot_notional_usd}")
+    if args.verbose:
+        print("main_command=" + " ".join(command))
     if args.dry_run:
         print("DRY_RUN no live process started")
         return 0
