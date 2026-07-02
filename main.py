@@ -792,6 +792,12 @@ class VariationalToLighterRuntime:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.mode = args.mode
+        self.forwarder_host = args.forwarder_host
+        self.forwarder_ws_port = int(args.forwarder_ws_port)
+        self.forwarder_rest_port = int(args.forwarder_rest_port)
+        self.forwarder_command_port = int(args.forwarder_command_port)
+        self.output_dir = Path(args.output_dir).expanduser().resolve()
+        self.app_log_file = self.output_dir / APP_LOG_FILE.name
         self.risk_guard_max_base_amount = args.risk_guard_max_base_amount
         self.risk_guard_max_price_deviation_bps = Decimal(str(args.risk_guard_max_price_deviation_bps))
         self.live_max_notional_usd = Decimal(str(args.live_max_notional_usd))
@@ -971,18 +977,18 @@ class VariationalToLighterRuntime:
         self.logger.handlers.clear()
         self.logger.propagate = False
 
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(APP_LOG_FILE, encoding="utf-8")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(self.app_log_file, encoding="utf-8")
         file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
         self.logger.addHandler(file_handler)
         self.dashboard_console = Console()
 
-        output_dir = OUTPUT_DIR.expanduser().resolve()
+        output_dir = self.output_dir
         self.runtime = VariationalRuntime(
-            host=FORWARDER_HOST,
-            ws_port=FORWARDER_WS_PORT,
-            rest_port=FORWARDER_REST_PORT,
-            command_port=FORWARDER_COMMAND_PORT,
+            host=self.forwarder_host,
+            ws_port=self.forwarder_ws_port,
+            rest_port=self.forwarder_rest_port,
+            command_port=self.forwarder_command_port,
             output_dir=output_dir,
             quiet=True,
         )
@@ -2827,8 +2833,16 @@ class VariationalToLighterRuntime:
             "live_inventory_entry_bps": decimal_to_str(self.live_inventory_entry_bps),
             "live_inventory_dynamic_entry_buffer_bps": decimal_to_str(self.live_inventory_dynamic_entry_buffer_bps),
             "live_inventory_max_lighter_slippage_bps": decimal_to_str(self.live_inventory_max_lighter_slippage_bps),
-            "live_inventory_lighter_submit_slippage_bps": decimal_to_str(self.live_inventory_lighter_submit_slippage_bps),
-            "live_inventory_lighter_exit_submit_slippage_bps": decimal_to_str(self.live_inventory_lighter_exit_submit_slippage_bps),
+            "live_inventory_lighter_submit_slippage_bps": decimal_to_str(
+                getattr(
+                    self,
+                    "live_inventory_lighter_submit_slippage_bps",
+                    getattr(self, "live_inventory_lighter_slippage_bps", self.live_inventory_max_lighter_slippage_bps),
+                )
+            ),
+            "live_inventory_lighter_exit_submit_slippage_bps": decimal_to_str(
+                getattr(self, "live_inventory_lighter_exit_submit_slippage_bps", self.live_inventory_max_lighter_slippage_bps)
+            ),
             "live_inventory_recent_execution_loss_buffer_bps": decimal_to_str(
                 self.live_inventory_recent_execution_loss_buffer_bps()
             ),
@@ -3188,7 +3202,11 @@ class VariationalToLighterRuntime:
             "require_min_edge_bps": decimal_to_str(self.live_require_min_edge_bps),
             "cooldown_seconds": self.live_cooldown_seconds,
             "submit_timeout_seconds": self.live_submit_timeout_seconds,
-            "live_inventory_entry_lighter_fill_timeout_seconds": self.live_inventory_entry_lighter_fill_timeout_seconds,
+            "live_inventory_entry_lighter_fill_timeout_seconds": getattr(
+                self,
+                "live_inventory_entry_lighter_fill_timeout_seconds",
+                3.0,
+            ),
             "variational_submit_transport": getattr(
                 self,
                 "variational_submit_transport",
@@ -3265,16 +3283,22 @@ class VariationalToLighterRuntime:
         warnings: list[str] = []
         blocking_errors: list[str] = []
 
+        output_dir = getattr(self, "output_dir", OUTPUT_DIR.expanduser().resolve())
+        forwarder_host = getattr(self, "forwarder_host", FORWARDER_HOST)
+        forwarder_ws_port = getattr(self, "forwarder_ws_port", FORWARDER_WS_PORT)
+        forwarder_rest_port = getattr(self, "forwarder_rest_port", FORWARDER_REST_PORT)
+        forwarder_command_port = getattr(self, "forwarder_command_port", FORWARDER_COMMAND_PORT)
+
         try:
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
-            passed.append(f"log_dir_ready={LOG_DIR.resolve()}")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            passed.append(f"log_dir_ready={output_dir}")
         except Exception as exc:
             blocking_errors.append(f"log_dir_unavailable: {exc}")
 
         passed.append(f"mode={self.mode}")
-        passed.append(f"forwarder_ws=ws://{FORWARDER_HOST}:{FORWARDER_WS_PORT}")
-        passed.append(f"forwarder_rest=ws://{FORWARDER_HOST}:{FORWARDER_REST_PORT}")
-        passed.append(f"forwarder_command=ws://{FORWARDER_HOST}:{FORWARDER_COMMAND_PORT}")
+        passed.append(f"forwarder_ws=ws://{forwarder_host}:{forwarder_ws_port}")
+        passed.append(f"forwarder_rest=ws://{forwarder_host}:{forwarder_rest_port}")
+        passed.append(f"forwarder_command=ws://{forwarder_host}:{forwarder_command_port}")
         passed.append(f"risk_guard_max_base_amount={self.risk_guard_max_base_amount}")
         passed.append(f"risk_guard_max_price_deviation_bps={self.risk_guard_max_price_deviation_bps}")
         passed.append(
@@ -3341,7 +3365,7 @@ class VariationalToLighterRuntime:
                     passed.append("live_inventory_dry_decisions_only_no_orders")
                 else:
                     passed.append("live_inventory_real_submit_one_lot_enabled")
-                if self.live_inventory_auto_close_manual_review_position:
+                if getattr(self, "live_inventory_auto_close_manual_review_position", False):
                     state = self.load_live_inventory_state()
                     state_status = clean_state_value(state.get("status")) or "unknown"
                     manual_reason = clean_state_value(state.get("manual_review_reason")) or "unknown"
@@ -4953,9 +4977,17 @@ class VariationalToLighterRuntime:
         slippage_bps = Decimal(str(HEDGE_SLIPPAGE_BPS))
         role = str(getattr(record, "auto_live_role", "") or "")
         if role.startswith("live_inventory_"):
-            slippage_bps = self.live_inventory_lighter_submit_slippage_bps
+            slippage_bps = getattr(
+                self,
+                "live_inventory_lighter_submit_slippage_bps",
+                getattr(self, "live_inventory_lighter_slippage_bps", self.live_inventory_max_lighter_slippage_bps),
+            )
             if "exit" in role or bool(record.lighter_reduce_only):
-                slippage_bps = self.live_inventory_lighter_exit_submit_slippage_bps
+                slippage_bps = getattr(
+                    self,
+                    "live_inventory_lighter_exit_submit_slippage_bps",
+                    self.live_inventory_max_lighter_slippage_bps,
+                )
         slippage = slippage_bps / Decimal("10000")
         if side == "BUY":
             limit_price = best_ask * (Decimal("1") + slippage)
@@ -9882,6 +9914,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Required together with --mode live to allow real Lighter hedge orders.",
     )
+    parser.add_argument("--forwarder-host", default=FORWARDER_HOST)
+    parser.add_argument("--forwarder-ws-port", type=int, default=FORWARDER_WS_PORT)
+    parser.add_argument("--forwarder-rest-port", type=int, default=FORWARDER_REST_PORT)
+    parser.add_argument("--forwarder-command-port", type=int, default=FORWARDER_COMMAND_PORT)
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument(
+        "--instance-lock-file",
+        type=Path,
+        default=None,
+        help="Override the main.py instance lock path. Defaults to <output-dir>/main.instance.lock.",
+    )
     parser.add_argument(
         "--risk-guard-max-base-amount",
         type=int,
@@ -10409,6 +10452,20 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.mode == MODE_LIVE and not args.confirm_live:
         parser.error("--mode live requires --confirm-live")
+    if args.forwarder_ws_port <= 0 or args.forwarder_ws_port > 65535:
+        parser.error("--forwarder-ws-port must be between 1 and 65535")
+    if args.forwarder_rest_port <= 0 or args.forwarder_rest_port > 65535:
+        parser.error("--forwarder-rest-port must be between 1 and 65535")
+    if args.forwarder_command_port <= 0 or args.forwarder_command_port > 65535:
+        parser.error("--forwarder-command-port must be between 1 and 65535")
+    forwarder_ports = {args.forwarder_ws_port, args.forwarder_rest_port, args.forwarder_command_port}
+    if len(forwarder_ports) != 3:
+        parser.error("forwarder ws/rest/command ports must be distinct")
+    args.output_dir = Path(args.output_dir)
+    if args.instance_lock_file is None:
+        args.instance_lock_file = args.output_dir / INSTANCE_LOCK_FILE.name
+    else:
+        args.instance_lock_file = Path(args.instance_lock_file)
     if args.mode == MODE_LIVE and args.live_max_notional_usd <= 0:
         parser.error("--mode live requires --live-max-notional-usd to be set to a positive small-test limit")
     if args.auto_live_exit and not args.auto_live_entry:
@@ -10655,7 +10712,7 @@ def parse_args() -> argparse.Namespace:
 async def _amain() -> None:
     load_dotenv()
     args = parse_args()
-    owner_pid = acquire_instance_lock(INSTANCE_LOCK_FILE)
+    owner_pid = acquire_instance_lock(args.instance_lock_file)
     runtime = VariationalToLighterRuntime(args)
     try:
         await runtime.run()
@@ -10663,7 +10720,7 @@ async def _amain() -> None:
         try:
             await runtime.close()
         finally:
-            release_instance_lock(INSTANCE_LOCK_FILE, owner_pid)
+            release_instance_lock(args.instance_lock_file, owner_pid)
 
 
 def main() -> None:
