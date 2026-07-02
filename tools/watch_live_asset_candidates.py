@@ -392,6 +392,24 @@ def run_once(args: argparse.Namespace) -> int:
             sample_move_penalty=Decimal(str(args.sample_move_penalty)),
         )
 
+    if not ranked:
+        print("RECOMMENDATION asset=- action=NO_DATA reason=no_candidate_rows")
+        return 0
+    write_ranking(args, ranked, live_status=live_status, live_asset=live_asset, live_flat=live_flat, current_score=current_score)
+    best_net, best, best_ok, best_reasons = ranked[0]
+    delta = None if current_score is None else best_net - current_score
+
+    if args.simple:
+        print_simple_recommendation(
+            ranked,
+            live_status=live_status,
+            live_asset=live_asset,
+            live_flat=live_flat,
+            current_score=current_score,
+            min_switch_delta_bps=Decimal(str(args.min_switch_delta_bps)),
+        )
+        return 0
+
     print(f"live_status={live_status} live_asset={live_asset} live_flat={str(live_flat).lower()} rows={len(rows)}")
     print("asset samples age_s pass/consec dir norm raw roundtrip move entry_slip exit_slip net best_recent ok reason")
     for net, item, ok, reasons in ranked:
@@ -401,12 +419,6 @@ def run_once(args: argparse.Namespace) -> int:
             f"{fmt(item.latest_roundtrip)} {fmt(item.latest_sample_move)} {fmt(item.latest_entry_slippage)} "
             f"{fmt(item.latest_exit_slippage)} {fmt(net)} {fmt(item.best_recent_net)} {str(ok).lower()} {','.join(reasons) or '-'}"
         )
-
-    if not ranked:
-        return 0
-    write_ranking(args, ranked, live_status=live_status, live_asset=live_asset, live_flat=live_flat, current_score=current_score)
-    best_net, best, best_ok, best_reasons = ranked[0]
-    delta = None if current_score is None else best_net - current_score
     if best_ok and live_flat and best.asset != live_asset and (delta is None or delta >= Decimal(str(args.min_switch_delta_bps))):
         print()
         print(
@@ -427,6 +439,52 @@ def run_once(args: argparse.Namespace) -> int:
         print()
         print(f"NO_SWITCH best_asset={best.asset} reasons={','.join(best_reasons) or '-'}")
     return 0
+
+
+def print_simple_recommendation(
+    ranked: list[tuple[Decimal, CandidateStats, bool, list[str]]],
+    *,
+    live_status: str,
+    live_asset: str,
+    live_flat: bool,
+    current_score: Decimal | None,
+    min_switch_delta_bps: Decimal,
+) -> None:
+    best_net, best, best_ok, best_reasons = ranked[0]
+    delta = None if current_score is None else best_net - current_score
+    top_summary = " ".join(
+        f"{item.asset}:net={fmt(net)},ok={str(ok).lower()},age={fmt(item.latest_age_seconds, '0.1')}s"
+        for net, item, ok, _ in ranked[:3]
+    )
+    if not best_ok:
+        print(
+            f"RECOMMENDATION asset=- action=NO_SWITCH reason={','.join(best_reasons) or '-'} "
+            f"best={best.asset} live_status={live_status} live_asset={live_asset} top='{top_summary}'"
+        )
+        return
+    if best.asset == live_asset:
+        print(
+            f"RECOMMENDATION asset={best.asset} action=KEEP reason=current_asset_best net={fmt(best_net)} "
+            f"live_status={live_status} top='{top_summary}'"
+        )
+        return
+    if not live_flat:
+        print(
+            f"RECOMMENDATION asset={best.asset} action=WAIT reason=live_not_flat_or_unknown net={fmt(best_net)} "
+            f"live_status={live_status} live_asset={live_asset} top='{top_summary}'"
+        )
+        return
+    if delta is not None and delta < min_switch_delta_bps:
+        print(
+            f"RECOMMENDATION asset={live_asset} action=KEEP reason=switch_delta_low best={best.asset} "
+            f"delta={fmt(delta)} min_delta={fmt(min_switch_delta_bps)} top='{top_summary}'"
+        )
+        return
+    print(
+        f"RECOMMENDATION asset={best.asset} action=SWITCH_AFTER_MANUAL_FLAT_CONFIRMATION "
+        f"reason=candidate_passed net={fmt(best_net)} current_net={fmt(current_score)} delta={fmt(delta)} "
+        f"direction={best.latest_direction} top='{top_summary}'"
+    )
 
 
 def write_ranking(
@@ -548,6 +606,7 @@ def main() -> int:
     parser.add_argument("--max-log-quote-skew-seconds", type=float, default=30.0)
     parser.add_argument("--max-quote-ms-filter", type=float, default=1000.0)
     parser.add_argument("--ranking-output", type=Path, default=None)
+    parser.add_argument("--simple", action="store_true")
     parser.add_argument("--print-live-command", action="store_true")
     parser.add_argument("--live-max-notional-usd", type=float, default=25)
     parser.add_argument("--live-inventory-lot-notional-usd", type=float, default=20)

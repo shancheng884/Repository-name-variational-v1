@@ -14,7 +14,7 @@ python tools/summarize_live_inventory_recent.py \
   --top-missed 3
 
 echo
-echo "== candidate ranking =="
+echo "== candidate recommendation =="
 python tools/watch_live_asset_candidates.py \
   --assets BTC,ETH,SOL \
   --current-asset "${CURRENT_ASSET}" \
@@ -37,4 +37,5 @@ python tools/watch_live_asset_candidates.py \
   --max-quote-ms-filter 1000 \
   --fallback-shortfall-bps 5.5 \
   --ranking-output log_probe/asset_candidate_rankings.jsonl \
+  --simple \
   --print-live-command
