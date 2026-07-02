@@ -137,7 +137,6 @@ def main() -> int:
     parser.add_argument("--asset", required=True, help="Live asset: BTC, ETH, or SOL.")
     parser.add_argument("--cycles", type=int, default=1, help="Maximum completed cycles for this foreground run. Default: 1.")
     parser.add_argument("--dry-run", action="store_true", help="Print checks and the main.py command without starting live.")
-    parser.add_argument("--yes", action="store_true", help="Skip the interactive manual flat confirmation prompt.")
     args = parser.parse_args()
 
     asset = args.asset.upper()
@@ -166,13 +165,7 @@ def main() -> int:
         print("DRY_RUN no live process started")
         return 0
 
-    if not args.yes:
-        print("Before starting, manually confirm Variational and Lighter have no positions and no open orders.")
-        confirmation = input("Type YES to start live: ").strip()
-        if confirmation != "YES":
-            print("CANCELLED no live process started")
-            return 1
-
+    print("Starting live. You are responsible for confirming both exchanges are flat before running this command.")
     return subprocess.call(command, cwd=ROOT)
 
 
