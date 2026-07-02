@@ -10504,12 +10504,16 @@ def parse_args() -> argparse.Namespace:
             )
         allowed_assets = {asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()}
         if args.live_inventory_signal_mode == LIVE_INVENTORY_SIGNAL_BASIS:
-            if len(allowed_assets) != 1 or not allowed_assets.issubset(LIVE_INVENTORY_BASIS_ALLOWED_ASSETS):
+            if not allowed_assets or not allowed_assets.issubset(LIVE_INVENTORY_BASIS_ALLOWED_ASSETS):
                 parser.error(
-                    "--live-inventory-signal-mode basis requires exactly one --live-allowed-assets value from "
+                    "--live-inventory-signal-mode basis requires --live-allowed-assets values from "
                     f"{sorted(LIVE_INVENTORY_BASIS_ALLOWED_ASSETS)}"
                 )
             if not args.live_inventory_dry_decisions:
+                if len(allowed_assets) != 1:
+                    parser.error(
+                        "--live-inventory-signal-mode basis real-submit requires exactly one --live-allowed-assets value"
+                    )
                 if not args.live_inventory_i_accept_basis_real_diagnostic:
                     parser.error(
                         "--live-inventory-signal-mode basis real-submit requires --live-inventory-i-accept-basis-real-diagnostic"

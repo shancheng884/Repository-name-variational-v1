@@ -20,6 +20,10 @@ exec python main.py \
   --forwarder-rest-port 8777 \
   --forwarder-command-port 8778 \
   --output-dir log_probe \
+  --variational-submit-transport api \
+  --lighter-submit-transport ws \
+  --lighter-order-mode market-ioc \
+  --lighter-prewarm-submit-ws \
   --live-max-notional-usd 25 \
   --live-inventory \
   --live-inventory-dry-decisions \
@@ -45,7 +49,6 @@ exec python main.py \
   --live-inventory-basis-min-normalized-entry-edge-bps 1.0 \
   --live-inventory-basis-min-normalized-filter-edge-bps 0.5 \
   --live-inventory-entry-lighter-fill-timeout-seconds 3 \
-  --live-inventory-i-accept-basis-real-diagnostic \
   --live-inventory-i-accept-diagnostic-low-entry-bps \
   --live-inventory-ignore-recent-execution-loss-buffer-for-diagnostics \
   --live-inventory-i-confirm-flat-start \
