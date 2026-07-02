@@ -49,7 +49,6 @@ exec python main.py \
   --live-inventory-basis-min-normalized-entry-edge-bps 1.0 \
   --live-inventory-basis-min-normalized-filter-edge-bps 0.5 \
   --live-inventory-entry-lighter-fill-timeout-seconds 3 \
-  --live-inventory-i-accept-diagnostic-low-entry-bps \
   --live-inventory-ignore-recent-execution-loss-buffer-for-diagnostics \
   --live-inventory-i-confirm-flat-start \
   --live-inventory-reset-state-after-manual-flat
