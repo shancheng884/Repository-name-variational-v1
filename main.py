@@ -3932,7 +3932,7 @@ class VariationalToLighterRuntime:
             websocket = self._var_command_ws
             if websocket is None or getattr(websocket, "state", None) != 1:
                 websocket = await websockets.connect(
-                    f"ws://{FORWARDER_HOST}:{FORWARDER_COMMAND_PORT}",
+                    f"ws://{self.forwarder_host}:{self.forwarder_command_port}",
                     ping_interval=20,
                     ping_timeout=20,
                 )
@@ -9716,12 +9716,12 @@ class VariationalToLighterRuntime:
         self.print_startup_next_steps()
         self.logger.info(
             "Listening for Variational forwarder events on ws://%s:%s, ws://%s:%s, command ws://%s:%s",
-            FORWARDER_HOST,
-            FORWARDER_WS_PORT,
-            FORWARDER_HOST,
-            FORWARDER_REST_PORT,
-            FORWARDER_HOST,
-            FORWARDER_COMMAND_PORT,
+            self.forwarder_host,
+            self.forwarder_ws_port,
+            self.forwarder_host,
+            self.forwarder_rest_port,
+            self.forwarder_host,
+            self.forwarder_command_port,
         )
 
         variational_ready = await self.wait_for_variational_ready()
