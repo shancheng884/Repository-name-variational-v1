@@ -278,7 +278,7 @@ Each event should include:
 
 Add a live analyzer later, separate from paper:
 
-- `tools/analyze_live_inventory.py`
+- `tools/analyze.py`
 
 It should output:
 
