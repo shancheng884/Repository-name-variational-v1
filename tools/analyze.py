@@ -364,6 +364,68 @@ def print_strategy(rows: list[dict[str, Any]], events: Counter[str], status: str
         print(f"STRATEGY action=WAIT asset={asset} reason=need_more_data")
 
 
+def print_config_advice(rows: list[dict[str, Any]]) -> None:
+    print("== config_advice ==")
+    regimes = build_basis_regimes(rows)
+    if not regimes:
+        print("CONFIG_ADVICE action=NONE reason=collect_more_data")
+        return
+
+    ranked: list[tuple[Decimal, str, dict[str, Any]]] = []
+    for asset, item in regimes.items():
+        raw = item["raw_edge_p95"] or Decimal("0")
+        norm = item["norm_edge_p95"] or Decimal("0")
+        move = item["sample_move_p80"] or Decimal("99")
+        score = raw + (norm * Decimal("2")) - max(move - Decimal("4"), Decimal("0"))
+        ranked.append((score, asset, item))
+    ranked.sort(reverse=True, key=lambda row: row[0])
+    _, asset, item = ranked[0]
+
+    raw_p95 = item["raw_edge_p95"] or Decimal("0")
+    norm_p95 = item["norm_edge_p95"] or Decimal("0")
+    move_p80 = item["sample_move_p80"] or Decimal("99")
+    suggestion = item["suggestion"]
+
+    if suggestion in {"wait_or_switch_asset_normalized_edge_weak", "do_not_lower_threshold_market_edge_too_low"}:
+        print(
+            f"CONFIG_ADVICE action=KEEP asset={asset} min_abs=current size=current "
+            f"reason={suggestion} raw_p95={fmt_decimal(raw_p95)} norm_p95={fmt_decimal(norm_p95)} move_p80={fmt_decimal(move_p80)}"
+        )
+        print("CONFIG_ADVICE size_increase=NO reason=edge_quality_not_size_limited")
+        return
+    if suggestion == "avoid_looser_entries_sample_move_high":
+        print(
+            f"CONFIG_ADVICE action=KEEP_OR_SWITCH asset={asset} min_abs=current size=current "
+            f"reason=sample_move_high move_p80={fmt_decimal(move_p80)}"
+        )
+        print("CONFIG_ADVICE size_increase=NO reason=sample_move_high")
+        return
+    if suggestion == "test_small_only_min_abs_11_no_size_increase":
+        print(
+            f"CONFIG_ADVICE action=SET asset={asset} min_entry_edge_bps=11 min_abs_entry_bps=11 "
+            f"entry_confirm_samples=1 max_sample_move_bps=5 lot_notional_usd=20 live_max_notional_usd=25 "
+            f"reason=some_edge_but_not_enough_for_larger_size raw_p95={fmt_decimal(raw_p95)} norm_p95={fmt_decimal(norm_p95)}"
+        )
+        print("CONFIG_ADVICE size_increase=NO reason=needs_successful_actual_pnl_first")
+        return
+    if suggestion == "current_threshold_reasonable_or_test_min_abs_12":
+        if norm_p95 >= Decimal("1.5") and move_p80 <= Decimal("4") and raw_p95 >= Decimal("13"):
+            print(
+                f"CONFIG_ADVICE action=OPTIONAL_SIZE_TEST asset={asset} min_entry_edge_bps=12 min_abs_entry_bps=12 "
+                f"entry_confirm_samples=1 lot_notional_usd=30 live_max_notional_usd=35 "
+                f"reason=strong_edge_quality raw_p95={fmt_decimal(raw_p95)} norm_p95={fmt_decimal(norm_p95)} move_p80={fmt_decimal(move_p80)}"
+            )
+            return
+        print(
+            f"CONFIG_ADVICE action=SET asset={asset} min_entry_edge_bps=12 min_abs_entry_bps=12 "
+            f"entry_confirm_samples=1 lot_notional_usd=20 live_max_notional_usd=25 "
+            f"reason=reasonable_edge_but_size_not_justified raw_p95={fmt_decimal(raw_p95)} norm_p95={fmt_decimal(norm_p95)} move_p80={fmt_decimal(move_p80)}"
+        )
+        print("CONFIG_ADVICE size_increase=NO reason=need_actual_pnl_before_30u")
+        return
+    print(f"CONFIG_ADVICE action=NONE asset={asset} reason={suggestion}")
+
+
 def file_size(path: Path) -> str:
     try:
         return human_bytes(path.stat().st_size)
@@ -379,6 +441,7 @@ def main() -> int:
     parser.add_argument("--what-if", action="store_true", help="Replay blocked entries against looser threshold grids.")
     parser.add_argument("--basis-regime", action="store_true", help="Summarize recent basis/edge percentiles for strategy tuning.")
     parser.add_argument("--strategy", action="store_true", help="Print a concise live strategy recommendation.")
+    parser.add_argument("--config-advice", action="store_true", help="Print recommended live_config.json changes, if any.")
     args = parser.parse_args()
     if args.tail <= 0:
         parser.error("--tail must be > 0")
@@ -501,6 +564,8 @@ def main() -> int:
         print_basis_regime(rows)
     if args.strategy:
         print_strategy(rows, events, status, open_lots, pending_actions, access_restricted)
+    if args.config_advice:
+        print_config_advice(rows)
 
     recommendation = "no_change"
     if events["live_inventory_manual_review_required"] or status == "manual_review_required":
