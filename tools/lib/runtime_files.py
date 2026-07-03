@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gzip
 from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -33,6 +34,43 @@ def tail_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
                     continue
     except FileNotFoundError:
         return []
+    return list(rows)
+
+
+def rotated_jsonl_paths(path: Path) -> list[Path]:
+    parent = path.parent
+    name = path.name
+    if not parent.exists():
+        return [path] if path.exists() else []
+    rotated = [item for item in parent.iterdir() if item.name.startswith(name + ".")]
+    def sort_key(item: Path) -> tuple[int, str]:
+        suffix = item.name[len(name) + 1 :]
+        first = suffix.split(".", 1)[0]
+        try:
+            return (int(first), item.name)
+        except ValueError:
+            return (9999, item.name)
+    paths = list(reversed(sorted(rotated, key=sort_key)))
+    if path.exists():
+        paths.append(path)
+    return paths
+
+
+def tail_jsonl_many(paths: Iterable[Path], limit: int) -> list[dict[str, Any]]:
+    rows: deque[dict[str, Any]] = deque(maxlen=max(1, limit))
+    for path in paths:
+        try:
+            opener = gzip.open if path.suffix == ".gz" else open
+            with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
     return list(rows)
 
 

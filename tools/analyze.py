@@ -24,7 +24,9 @@ from tools.lib.runtime_files import (  # noqa: E402
     parse_time,
     percentile,
     read_json,
+    rotated_jsonl_paths,
     tail_jsonl,
+    tail_jsonl_many,
     tail_text,
     to_decimal,
 )
@@ -532,6 +534,7 @@ def file_size(path: Path) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze real live trading logs.")
     parser.add_argument("--tail", type=int, default=50000, help="JSONL rows to inspect from order_metrics.jsonl. Default: 50000.")
+    parser.add_argument("--include-rotated", action="store_true", help="Include rotated order_metrics.jsonl.N and .gz files.")
     parser.add_argument("--all-runs", action="store_true", help="Analyze all tailed rows instead of only the latest run_id.")
     parser.add_argument("--top", type=int, default=5, help="Number of blocked candidates/reasons to print. Default: 5.")
     parser.add_argument("--what-if", action="store_true", help="Replay blocked entries against looser threshold grids.")
@@ -546,7 +549,8 @@ def main() -> int:
     if args.top <= 0:
         parser.error("--top must be > 0")
 
-    raw_rows = tail_jsonl(ORDER_METRICS, args.tail)
+    source_paths = rotated_jsonl_paths(ORDER_METRICS) if args.include_rotated else [ORDER_METRICS]
+    raw_rows = tail_jsonl_many(source_paths, args.tail) if args.include_rotated else tail_jsonl(ORDER_METRICS, args.tail)
     rows = raw_rows if args.all_runs else latest_run_filter(raw_rows)
     state = read_json(LIVE_STATE)
     processes = running_main_processes()
