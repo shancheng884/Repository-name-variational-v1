@@ -426,6 +426,58 @@ def print_config_advice(rows: list[dict[str, Any]]) -> None:
     print(f"CONFIG_ADVICE action=NONE asset={asset} reason={suggestion}")
 
 
+def print_asset_scores(rows: list[dict[str, Any]]) -> None:
+    print("== asset_scores ==")
+    regimes = build_basis_regimes(rows)
+    if not regimes:
+        print("ASSET_SCORE action=WAIT reason=collect_more_data")
+        return
+
+    scored: list[tuple[Decimal, str, dict[str, Any], str]] = []
+    for asset, item in regimes.items():
+        raw = item["raw_edge_p95"] or Decimal("0")
+        norm = item["norm_edge_p95"] or Decimal("0")
+        move = item["sample_move_p80"] or Decimal("99")
+        rows_count = Decimal(str(item["rows"]))
+        data_penalty = Decimal("0") if rows_count >= Decimal("1000") else Decimal("5")
+        move_penalty = max(move - Decimal("4"), Decimal("0"))
+        score = raw + (norm * Decimal("2")) - move_penalty - data_penalty
+        if item["suggestion"] in {"wait_or_switch_asset_normalized_edge_weak", "do_not_lower_threshold_market_edge_too_low"}:
+            action = "WAIT"
+        elif item["suggestion"] == "avoid_looser_entries_sample_move_high":
+            action = "AVOID_LOOSENING"
+        elif item["suggestion"] == "test_small_only_min_abs_11_no_size_increase":
+            action = "TEST_SMALL"
+        elif item["suggestion"] == "current_threshold_reasonable_or_test_min_abs_12":
+            action = "TEST_OR_CONTINUE"
+        else:
+            action = "COLLECT_MORE"
+        scored.append((score, asset, item, action))
+
+    scored.sort(reverse=True, key=lambda row: row[0])
+    for rank, (score, asset, item, action) in enumerate(scored, start=1):
+        print(
+            f"ASSET_SCORE rank={rank} asset={asset} score={fmt_decimal(score)} action={action} "
+            f"raw_p95={fmt_decimal(item['raw_edge_p95'])} norm_p95={fmt_decimal(item['norm_edge_p95'])} "
+            f"move_p80={fmt_decimal(item['sample_move_p80'])} rows={item['rows']} blocked={item['blocked_count']} "
+            f"suggestion={item['suggestion']}"
+        )
+
+    best_score, best_asset, best_item, best_action = scored[0]
+    if best_action in {"TEST_SMALL", "TEST_OR_CONTINUE"}:
+        print(
+            f"ASSET_RECOMMENDATION asset={best_asset} action={best_action} size=20u "
+            f"reason=best_current_quality score={fmt_decimal(best_score)}"
+        )
+    else:
+        print(
+            f"ASSET_RECOMMENDATION asset={best_asset} action=WAIT_OR_ROTATE "
+            f"reason={best_item['suggestion']} score={fmt_decimal(best_score)}"
+        )
+    if len(scored) == 1:
+        print("ASSET_RECOMMENDATION note=single_asset_log_use_all_runs_after_rotating_assets_for_comparison")
+
+
 def file_size(path: Path) -> str:
     try:
         return human_bytes(path.stat().st_size)
@@ -442,6 +494,7 @@ def main() -> int:
     parser.add_argument("--basis-regime", action="store_true", help="Summarize recent basis/edge percentiles for strategy tuning.")
     parser.add_argument("--strategy", action="store_true", help="Print a concise live strategy recommendation.")
     parser.add_argument("--config-advice", action="store_true", help="Print recommended live_config.json changes, if any.")
+    parser.add_argument("--asset-scores", action="store_true", help="Score assets seen in the selected log rows for rotation decisions.")
     args = parser.parse_args()
     if args.tail <= 0:
         parser.error("--tail must be > 0")
@@ -566,6 +619,8 @@ def main() -> int:
         print_strategy(rows, events, status, open_lots, pending_actions, access_restricted)
     if args.config_advice:
         print_config_advice(rows)
+    if args.asset_scores:
+        print_asset_scores(rows)
 
     recommendation = "no_change"
     if events["live_inventory_manual_review_required"] or status == "manual_review_required":
