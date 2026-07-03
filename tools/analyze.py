@@ -478,6 +478,50 @@ def print_asset_scores(rows: list[dict[str, Any]]) -> None:
         print("ASSET_RECOMMENDATION note=single_asset_log_use_all_runs_after_rotating_assets_for_comparison")
 
 
+def print_run_scores(rows: list[dict[str, Any]]) -> None:
+    print("== run_scores ==")
+    by_run: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        run_id = str(row.get("run_id") or "")
+        if not run_id:
+            continue
+        by_run.setdefault(run_id, []).append(row)
+    scored: list[tuple[Decimal, str, str, dict[str, Any], str]] = []
+    for run_id, run_rows in by_run.items():
+        regimes = build_basis_regimes(run_rows)
+        if not regimes:
+            continue
+        asset, item = max(regimes.items(), key=lambda pair: pair[1]["rows"])
+        raw = item["raw_edge_p95"] or Decimal("0")
+        norm = item["norm_edge_p95"] or Decimal("0")
+        move = item["sample_move_p80"] or Decimal("99")
+        rows_count = Decimal(str(item["rows"]))
+        data_penalty = Decimal("0") if rows_count >= Decimal("1000") else Decimal("5")
+        score = raw + (norm * Decimal("2")) - max(move - Decimal("4"), Decimal("0")) - data_penalty
+        suggestion = str(item["suggestion"])
+        scored.append((score, run_id, asset, item, suggestion))
+    if not scored:
+        print("RUN_SCORE action=WAIT reason=no_run_data")
+        return
+    scored.sort(reverse=True, key=lambda row: row[0])
+    for rank, (score, run_id, asset, item, suggestion) in enumerate(scored, start=1):
+        print(
+            f"RUN_SCORE rank={rank} run_id={run_id} asset={asset} score={fmt_decimal(score)} "
+            f"suggestion={suggestion} raw_p95={fmt_decimal(item['raw_edge_p95'])} "
+            f"norm_p95={fmt_decimal(item['norm_edge_p95'])} move_p80={fmt_decimal(item['sample_move_p80'])} "
+            f"rows={item['rows']} blocked={item['blocked_count']}"
+        )
+    best_score, best_run_id, best_asset, best_item, best_suggestion = scored[0]
+    if best_suggestion in {"current_threshold_reasonable_or_test_min_abs_12", "test_small_only_min_abs_11_no_size_increase"}:
+        action = "TEST_SMALL"
+    else:
+        action = "WAIT_OR_ROTATE"
+    print(
+        f"RUN_RECOMMENDATION asset={best_asset} run_id={best_run_id} action={action} "
+        f"reason={best_suggestion} score={fmt_decimal(best_score)}"
+    )
+
+
 def file_size(path: Path) -> str:
     try:
         return human_bytes(path.stat().st_size)
@@ -495,6 +539,7 @@ def main() -> int:
     parser.add_argument("--strategy", action="store_true", help="Print a concise live strategy recommendation.")
     parser.add_argument("--config-advice", action="store_true", help="Print recommended live_config.json changes, if any.")
     parser.add_argument("--asset-scores", action="store_true", help="Score assets seen in the selected log rows for rotation decisions.")
+    parser.add_argument("--run-scores", action="store_true", help="Score each run_id separately for asset rotation decisions.")
     args = parser.parse_args()
     if args.tail <= 0:
         parser.error("--tail must be > 0")
@@ -621,6 +666,8 @@ def main() -> int:
         print_config_advice(rows)
     if args.asset_scores:
         print_asset_scores(rows)
+    if args.run_scores:
+        print_run_scores(rows)
 
     recommendation = "no_change"
     if events["live_inventory_manual_review_required"] or status == "manual_review_required":
