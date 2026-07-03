@@ -209,6 +209,7 @@ def _abs_values(values: list[Decimal]) -> list[Decimal]:
 
 
 def print_basis_regime(rows: list[dict[str, Any]]) -> None:
+    regimes = build_basis_regimes(rows)
     signal_rows = [
         row
         for row in rows
@@ -217,14 +218,48 @@ def print_basis_regime(rows: list[dict[str, Any]]) -> None:
     ]
     print("== basis_regime ==")
     print(f"signal_rows={len(signal_rows)}")
-    if not signal_rows:
+    if not regimes:
         return
 
+    for asset, item in sorted(regimes.items()):
+        print(
+            f"asset={asset} rows={item['rows']} blocked={item['blocked_count']} "
+            f"latest_basis={fmt_decimal(item['latest_basis'])} latest_norm_basis={fmt_decimal(item['latest_norm_basis'])} "
+            f"latest_best_raw={fmt_decimal(item['latest_best_raw'])} latest_best_norm={fmt_decimal(item['latest_best_norm'])} "
+            f"latest_move={fmt_decimal(item['latest_move'])}"
+        )
+        print(
+            f"asset={asset} basis_p10={fmt_decimal(item['basis_p10'])} "
+            f"basis_p50={fmt_decimal(item['basis_p50'])} "
+            f"basis_p90={fmt_decimal(item['basis_p90'])} "
+            f"abs_basis_p90={fmt_decimal(item['abs_basis_p90'])} "
+            f"norm_basis_p90={fmt_decimal(item['norm_basis_p90'])}"
+        )
+        print(
+            f"asset={asset} raw_edge_p80={fmt_decimal(item['raw_edge_p80'])} "
+            f"raw_edge_p95={fmt_decimal(item['raw_edge_p95'])} "
+            f"norm_edge_p80={fmt_decimal(item['norm_edge_p80'])} "
+            f"norm_edge_p95={fmt_decimal(item['norm_edge_p95'])} "
+            f"sample_move_p80={fmt_decimal(item['sample_move_p80'])} "
+            f"z_abs_p95={fmt_decimal(item['z_abs_p95'])}"
+        )
+        print(f"asset={asset} blocked_reasons={dict(item['blocked'].most_common(5))}")
+        print(f"asset={asset} strategy_suggestion={item['suggestion']}")
+
+
+def build_basis_regimes(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    signal_rows = [
+        row
+        for row in rows
+        if row.get("event") in {"live_inventory_basis_state", "live_inventory_entry_blocked"}
+        and row.get("asset")
+    ]
     by_asset: dict[str, list[dict[str, Any]]] = {}
     for row in signal_rows:
         by_asset.setdefault(str(row.get("asset") or "-").upper(), []).append(row)
 
-    for asset, asset_rows in sorted(by_asset.items()):
+    regimes: dict[str, dict[str, Any]] = {}
+    for asset, asset_rows in by_asset.items():
         basis = _collect_decimal(asset_rows, "basis_bps")
         norm_basis = _collect_decimal(asset_rows, "normalized_basis_bps")
         best_raw = _best_edges(asset_rows, normalized=False)
@@ -232,10 +267,7 @@ def print_basis_regime(rows: list[dict[str, Any]]) -> None:
         sample_moves = _abs_values(_collect_decimal(asset_rows, "basis_sample_move_bps"))
         z_values = _collect_decimal(asset_rows, "z")
         blocked = Counter(str(row.get("reason") or "-") for row in asset_rows if row.get("event") == "live_inventory_entry_blocked")
-
         latest = asset_rows[-1]
-        latest_basis = to_decimal(latest.get("basis_bps"))
-        latest_norm_basis = to_decimal(latest.get("normalized_basis_bps"))
         latest_best_raw = max(
             [value for value in [to_decimal(latest.get("long_edge_bps")), to_decimal(latest.get("short_edge_bps"))] if value is not None],
             default=None,
@@ -244,47 +276,92 @@ def print_basis_regime(rows: list[dict[str, Any]]) -> None:
             [value for value in [to_decimal(latest.get("normalized_long_edge_bps")), to_decimal(latest.get("normalized_short_edge_bps"))] if value is not None],
             default=None,
         )
-        latest_move = abs(to_decimal(latest.get("basis_sample_move_bps")) or Decimal("0"))
-
-        print(
-            f"asset={asset} rows={len(asset_rows)} blocked={sum(blocked.values())} "
-            f"latest_basis={fmt_decimal(latest_basis)} latest_norm_basis={fmt_decimal(latest_norm_basis)} "
-            f"latest_best_raw={fmt_decimal(latest_best_raw)} latest_best_norm={fmt_decimal(latest_best_norm)} "
-            f"latest_move={fmt_decimal(latest_move)}"
-        )
-        print(
-            f"asset={asset} basis_p10={fmt_decimal(percentile(basis, Decimal('10')))} "
-            f"basis_p50={fmt_decimal(percentile(basis, Decimal('50')))} "
-            f"basis_p90={fmt_decimal(percentile(basis, Decimal('90')))} "
-            f"abs_basis_p90={fmt_decimal(percentile(_abs_values(basis), Decimal('90')))} "
-            f"norm_basis_p90={fmt_decimal(percentile(norm_basis, Decimal('90')))}"
-        )
-        print(
-            f"asset={asset} raw_edge_p80={fmt_decimal(percentile(best_raw, Decimal('80')))} "
-            f"raw_edge_p95={fmt_decimal(percentile(best_raw, Decimal('95')))} "
-            f"norm_edge_p80={fmt_decimal(percentile(best_norm, Decimal('80')))} "
-            f"norm_edge_p95={fmt_decimal(percentile(best_norm, Decimal('95')))} "
-            f"sample_move_p80={fmt_decimal(percentile(sample_moves, Decimal('80')))} "
-            f"z_abs_p95={fmt_decimal(percentile(_abs_values(z_values), Decimal('95')))}"
-        )
-        print(f"asset={asset} blocked_reasons={dict(blocked.most_common(5))}")
-
         raw_p95 = percentile(best_raw, Decimal("95"))
         norm_p80 = percentile(best_norm, Decimal("80"))
+        norm_p95 = percentile(best_norm, Decimal("95"))
         move_p80 = percentile(sample_moves, Decimal("80"))
-        if raw_p95 is None:
+        if raw_p95 is None or len(asset_rows) < 1000:
             suggestion = "collect_more_data"
         elif raw_p95 < Decimal("10"):
             suggestion = "do_not_lower_threshold_market_edge_too_low"
-        elif (norm_p80 is not None and norm_p80 < Decimal("1.0")):
+        elif norm_p95 is not None and norm_p95 < Decimal("0.75"):
             suggestion = "wait_or_switch_asset_normalized_edge_weak"
-        elif (move_p80 is not None and move_p80 > Decimal("6")):
+        elif move_p80 is not None and move_p80 > Decimal("6"):
             suggestion = "avoid_looser_entries_sample_move_high"
         elif raw_p95 < Decimal("12"):
             suggestion = "test_small_only_min_abs_11_no_size_increase"
         else:
             suggestion = "current_threshold_reasonable_or_test_min_abs_12"
-        print(f"asset={asset} strategy_suggestion={suggestion}")
+        regimes[asset] = {
+            "rows": len(asset_rows),
+            "blocked_count": sum(blocked.values()),
+            "blocked": blocked,
+            "latest_basis": to_decimal(latest.get("basis_bps")),
+            "latest_norm_basis": to_decimal(latest.get("normalized_basis_bps")),
+            "latest_best_raw": latest_best_raw,
+            "latest_best_norm": latest_best_norm,
+            "latest_move": abs(to_decimal(latest.get("basis_sample_move_bps")) or Decimal("0")),
+            "basis_p10": percentile(basis, Decimal("10")),
+            "basis_p50": percentile(basis, Decimal("50")),
+            "basis_p90": percentile(basis, Decimal("90")),
+            "abs_basis_p90": percentile(_abs_values(basis), Decimal("90")),
+            "norm_basis_p90": percentile(norm_basis, Decimal("90")),
+            "raw_edge_p80": percentile(best_raw, Decimal("80")),
+            "raw_edge_p95": raw_p95,
+            "norm_edge_p80": norm_p80,
+            "norm_edge_p95": norm_p95,
+            "sample_move_p80": move_p80,
+            "z_abs_p95": percentile(_abs_values(z_values), Decimal("95")),
+            "suggestion": suggestion,
+        }
+    return regimes
+
+
+def print_strategy(rows: list[dict[str, Any]], events: Counter[str], status: str, open_lots: list[Any], pending_actions: list[Any], access_restricted: int) -> None:
+    print("== strategy ==")
+    regimes = build_basis_regimes(rows)
+    if events["live_inventory_manual_review_required"] or status == "manual_review_required":
+        print("STRATEGY action=STOP reason=manual_review_required_check_both_exchanges")
+        return
+    if status == "missing":
+        print("STRATEGY action=WAIT reason=state_missing_confirm_exchanges_before_live")
+        return
+    if status != "flat" or open_lots or pending_actions:
+        print("STRATEGY action=HOLD reason=state_not_flat_do_not_start_new_live")
+        return
+    if access_restricted:
+        print("STRATEGY action=STOP reason=access_restricted_detected")
+        return
+    if not regimes:
+        print("STRATEGY action=WAIT reason=collect_more_data")
+        return
+
+    ranked: list[tuple[Decimal, str, dict[str, Any]]] = []
+    for asset, item in regimes.items():
+        raw = item["raw_edge_p95"] or Decimal("0")
+        norm = item["norm_edge_p95"] or Decimal("0")
+        move = item["sample_move_p80"] or Decimal("99")
+        score = raw + (norm * Decimal("2")) - max(move - Decimal("4"), Decimal("0"))
+        ranked.append((score, asset, item))
+    ranked.sort(reverse=True, key=lambda row: row[0])
+    score, asset, item = ranked[0]
+    print(
+        f"STRATEGY best_asset={asset} score={fmt_decimal(score)} suggestion={item['suggestion']} "
+        f"raw_p95={fmt_decimal(item['raw_edge_p95'])} norm_p95={fmt_decimal(item['norm_edge_p95'])} "
+        f"move_p80={fmt_decimal(item['sample_move_p80'])} blocked={item['blocked_count']} rows={item['rows']}"
+    )
+    if item["suggestion"] == "current_threshold_reasonable_or_test_min_abs_12":
+        print(f"STRATEGY action=CONTINUE_OR_TEST asset={asset} min_abs=12 size=20u reason=good_recent_edge_quality")
+    elif item["suggestion"] == "test_small_only_min_abs_11_no_size_increase":
+        print(f"STRATEGY action=TEST_SMALL asset={asset} min_abs=11 size=20u reason=edge_exists_but_not_enough_for_size_increase")
+    elif item["suggestion"] == "avoid_looser_entries_sample_move_high":
+        print(f"STRATEGY action=WAIT_OR_SWITCH asset={asset} reason=sample_move_high_do_not_loosen")
+    elif item["suggestion"] == "wait_or_switch_asset_normalized_edge_weak":
+        print(f"STRATEGY action=WAIT_OR_SWITCH asset={asset} reason=normalized_edge_weak_do_not_lower_threshold")
+    elif item["suggestion"] == "do_not_lower_threshold_market_edge_too_low":
+        print(f"STRATEGY action=WAIT_OR_SWITCH asset={asset} reason=raw_edge_too_low")
+    else:
+        print(f"STRATEGY action=WAIT asset={asset} reason=need_more_data")
 
 
 def file_size(path: Path) -> str:
@@ -301,6 +378,7 @@ def main() -> int:
     parser.add_argument("--top", type=int, default=5, help="Number of blocked candidates/reasons to print. Default: 5.")
     parser.add_argument("--what-if", action="store_true", help="Replay blocked entries against looser threshold grids.")
     parser.add_argument("--basis-regime", action="store_true", help="Summarize recent basis/edge percentiles for strategy tuning.")
+    parser.add_argument("--strategy", action="store_true", help="Print a concise live strategy recommendation.")
     args = parser.parse_args()
     if args.tail <= 0:
         parser.error("--tail must be > 0")
@@ -421,6 +499,8 @@ def main() -> int:
         print_what_if(rows)
     if args.basis_regime:
         print_basis_regime(rows)
+    if args.strategy:
+        print_strategy(rows, events, status, open_lots, pending_actions, access_restricted)
 
     recommendation = "no_change"
     if events["live_inventory_manual_review_required"] or status == "manual_review_required":
