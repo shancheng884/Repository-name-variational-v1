@@ -180,6 +180,113 @@ def print_what_if(rows: list[dict[str, Any]]) -> None:
         )
 
 
+def _collect_decimal(rows: list[dict[str, Any]], key: str) -> list[Decimal]:
+    values: list[Decimal] = []
+    for row in rows:
+        value = to_decimal(row.get(key))
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def _best_edges(rows: list[dict[str, Any]], *, normalized: bool) -> list[Decimal]:
+    values: list[Decimal] = []
+    keys = (
+        ("normalized_long_edge_bps", "normalized_short_edge_bps")
+        if normalized
+        else ("long_edge_bps", "short_edge_bps")
+    )
+    for row in rows:
+        candidates = [to_decimal(row.get(key)) for key in keys]
+        candidates = [value for value in candidates if value is not None]
+        if candidates:
+            values.append(max(candidates))
+    return values
+
+
+def _abs_values(values: list[Decimal]) -> list[Decimal]:
+    return [abs(value) for value in values]
+
+
+def print_basis_regime(rows: list[dict[str, Any]]) -> None:
+    signal_rows = [
+        row
+        for row in rows
+        if row.get("event") in {"live_inventory_basis_state", "live_inventory_entry_blocked"}
+        and row.get("asset")
+    ]
+    print("== basis_regime ==")
+    print(f"signal_rows={len(signal_rows)}")
+    if not signal_rows:
+        return
+
+    by_asset: dict[str, list[dict[str, Any]]] = {}
+    for row in signal_rows:
+        by_asset.setdefault(str(row.get("asset") or "-").upper(), []).append(row)
+
+    for asset, asset_rows in sorted(by_asset.items()):
+        basis = _collect_decimal(asset_rows, "basis_bps")
+        norm_basis = _collect_decimal(asset_rows, "normalized_basis_bps")
+        best_raw = _best_edges(asset_rows, normalized=False)
+        best_norm = _best_edges(asset_rows, normalized=True)
+        sample_moves = _abs_values(_collect_decimal(asset_rows, "basis_sample_move_bps"))
+        z_values = _collect_decimal(asset_rows, "z")
+        blocked = Counter(str(row.get("reason") or "-") for row in asset_rows if row.get("event") == "live_inventory_entry_blocked")
+
+        latest = asset_rows[-1]
+        latest_basis = to_decimal(latest.get("basis_bps"))
+        latest_norm_basis = to_decimal(latest.get("normalized_basis_bps"))
+        latest_best_raw = max(
+            [value for value in [to_decimal(latest.get("long_edge_bps")), to_decimal(latest.get("short_edge_bps"))] if value is not None],
+            default=None,
+        )
+        latest_best_norm = max(
+            [value for value in [to_decimal(latest.get("normalized_long_edge_bps")), to_decimal(latest.get("normalized_short_edge_bps"))] if value is not None],
+            default=None,
+        )
+        latest_move = abs(to_decimal(latest.get("basis_sample_move_bps")) or Decimal("0"))
+
+        print(
+            f"asset={asset} rows={len(asset_rows)} blocked={sum(blocked.values())} "
+            f"latest_basis={fmt_decimal(latest_basis)} latest_norm_basis={fmt_decimal(latest_norm_basis)} "
+            f"latest_best_raw={fmt_decimal(latest_best_raw)} latest_best_norm={fmt_decimal(latest_best_norm)} "
+            f"latest_move={fmt_decimal(latest_move)}"
+        )
+        print(
+            f"asset={asset} basis_p10={fmt_decimal(percentile(basis, Decimal('10')))} "
+            f"basis_p50={fmt_decimal(percentile(basis, Decimal('50')))} "
+            f"basis_p90={fmt_decimal(percentile(basis, Decimal('90')))} "
+            f"abs_basis_p90={fmt_decimal(percentile(_abs_values(basis), Decimal('90')))} "
+            f"norm_basis_p90={fmt_decimal(percentile(norm_basis, Decimal('90')))}"
+        )
+        print(
+            f"asset={asset} raw_edge_p80={fmt_decimal(percentile(best_raw, Decimal('80')))} "
+            f"raw_edge_p95={fmt_decimal(percentile(best_raw, Decimal('95')))} "
+            f"norm_edge_p80={fmt_decimal(percentile(best_norm, Decimal('80')))} "
+            f"norm_edge_p95={fmt_decimal(percentile(best_norm, Decimal('95')))} "
+            f"sample_move_p80={fmt_decimal(percentile(sample_moves, Decimal('80')))} "
+            f"z_abs_p95={fmt_decimal(percentile(_abs_values(z_values), Decimal('95')))}"
+        )
+        print(f"asset={asset} blocked_reasons={dict(blocked.most_common(5))}")
+
+        raw_p95 = percentile(best_raw, Decimal("95"))
+        norm_p80 = percentile(best_norm, Decimal("80"))
+        move_p80 = percentile(sample_moves, Decimal("80"))
+        if raw_p95 is None:
+            suggestion = "collect_more_data"
+        elif raw_p95 < Decimal("10"):
+            suggestion = "do_not_lower_threshold_market_edge_too_low"
+        elif (norm_p80 is not None and norm_p80 < Decimal("1.0")):
+            suggestion = "wait_or_switch_asset_normalized_edge_weak"
+        elif (move_p80 is not None and move_p80 > Decimal("6")):
+            suggestion = "avoid_looser_entries_sample_move_high"
+        elif raw_p95 < Decimal("12"):
+            suggestion = "test_small_only_min_abs_11_no_size_increase"
+        else:
+            suggestion = "current_threshold_reasonable_or_test_min_abs_12"
+        print(f"asset={asset} strategy_suggestion={suggestion}")
+
+
 def file_size(path: Path) -> str:
     try:
         return human_bytes(path.stat().st_size)
@@ -193,6 +300,7 @@ def main() -> int:
     parser.add_argument("--all-runs", action="store_true", help="Analyze all tailed rows instead of only the latest run_id.")
     parser.add_argument("--top", type=int, default=5, help="Number of blocked candidates/reasons to print. Default: 5.")
     parser.add_argument("--what-if", action="store_true", help="Replay blocked entries against looser threshold grids.")
+    parser.add_argument("--basis-regime", action="store_true", help="Summarize recent basis/edge percentiles for strategy tuning.")
     args = parser.parse_args()
     if args.tail <= 0:
         parser.error("--tail must be > 0")
@@ -311,6 +419,8 @@ def main() -> int:
         print(f"blocked_candidate_{index}=asset={asset} dir={direction} score={fmt_decimal(score)} reason={reason}")
     if args.what_if:
         print_what_if(rows)
+    if args.basis_regime:
+        print_basis_regime(rows)
 
     recommendation = "no_change"
     if events["live_inventory_manual_review_required"] or status == "manual_review_required":
