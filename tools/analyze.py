@@ -78,6 +78,108 @@ def best_entry_score(row: dict[str, Any], shortfall_buffer: Decimal, sample_move
     return edge + min(roundtrip, Decimal("0")) - shortfall_buffer - (sample_move * sample_move_penalty), direction
 
 
+def best_direction_metrics(row: dict[str, Any]) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for direction, edge_key, normalized_key, roundtrip_key, stablecoin_key in (
+        ("long_var_short_lighter", "long_edge_bps", "normalized_long_edge_bps", "long_roundtrip_pnl_bps", "long_stablecoin_filter_ok"),
+        ("short_var_long_lighter", "short_edge_bps", "normalized_short_edge_bps", "short_roundtrip_pnl_bps", "short_stablecoin_filter_ok"),
+    ):
+        edge = to_decimal(row.get(edge_key))
+        if edge is None:
+            continue
+        normalized = to_decimal(row.get(normalized_key))
+        roundtrip = to_decimal(row.get(roundtrip_key))
+        candidates.append(
+            {
+                "direction": direction,
+                "edge": edge,
+                "normalized_edge": normalized,
+                "roundtrip": roundtrip,
+                "stablecoin_ok": row.get(stablecoin_key),
+            }
+        )
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item["edge"])
+
+
+def what_if_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("event") != "live_inventory_entry_blocked":
+            continue
+        metrics = best_direction_metrics(row)
+        sample_move = abs(to_decimal(row.get("basis_sample_move_bps")) or Decimal("0"))
+        if metrics is None:
+            continue
+        out.append(
+            {
+                **metrics,
+                "asset": str(row.get("asset") or "-").upper(),
+                "reason": str(row.get("reason") or "unknown"),
+                "sample_move": sample_move,
+                "basis_seen": row.get("basis_seen"),
+            }
+        )
+    return out
+
+
+def print_what_if(rows: list[dict[str, Any]]) -> None:
+    samples = what_if_rows(rows)
+    print("== what_if ==")
+    print(f"blocked_samples={len(samples)}")
+    if not samples:
+        return
+
+    min_abs_grid = [Decimal("13"), Decimal("12"), Decimal("11.5"), Decimal("11"), Decimal("10.5"), Decimal("10")]
+    sample_move_grid = [Decimal("5"), Decimal("5.5"), Decimal("6"), Decimal("7")]
+    min_norm = Decimal("1.0")
+    min_roundtrip = Decimal("-3.0")
+
+    for min_abs in min_abs_grid:
+        for max_move in sample_move_grid:
+            passed = [
+                item
+                for item in samples
+                if abs(item["edge"]) >= min_abs
+                and item["sample_move"] <= max_move
+                and (item["normalized_edge"] is None or item["normalized_edge"] >= min_norm)
+                and (item["roundtrip"] is None or item["roundtrip"] >= min_roundtrip)
+                and item["stablecoin_ok"] is not False
+            ]
+            if not passed:
+                print(f"candidate min_abs={min_abs} max_move={max_move} count=0")
+                continue
+            edges = [item["edge"] for item in passed]
+            moves = [item["sample_move"] for item in passed]
+            norms = [item["normalized_edge"] for item in passed if item["normalized_edge"] is not None]
+            reasons = Counter(item["reason"] for item in passed)
+            dirs = Counter(item["direction"] for item in passed)
+            print(
+                f"candidate min_abs={min_abs} max_move={max_move} count={len(passed)} "
+                f"edge_p50={fmt_decimal(percentile(edges, Decimal('50')))} "
+                f"edge_p80={fmt_decimal(percentile(edges, Decimal('80')))} "
+                f"move_p80={fmt_decimal(percentile(moves, Decimal('80')))} "
+                f"norm_p80={fmt_decimal(percentile(norms, Decimal('80')))} "
+                f"dirs={dict(dirs.most_common())} reasons={dict(reasons.most_common(3))}"
+            )
+
+    best = sorted(
+        samples,
+        key=lambda item: (
+            item["edge"] - (item["sample_move"] * Decimal("0.5")) + min(item["roundtrip"] or Decimal("0"), Decimal("0"))
+        ),
+        reverse=True,
+    )[:5]
+    for index, item in enumerate(best, start=1):
+        print(
+            f"what_if_top_{index}=asset={item['asset']} dir={item['direction']} "
+            f"edge={fmt_decimal(item['edge'])} norm={fmt_decimal(item['normalized_edge'])} "
+            f"roundtrip={fmt_decimal(item['roundtrip'])} move={fmt_decimal(item['sample_move'])} "
+            f"stablecoin_ok={item['stablecoin_ok']} reason={item['reason']}"
+        )
+
+
 def file_size(path: Path) -> str:
     try:
         return human_bytes(path.stat().st_size)
@@ -90,6 +192,7 @@ def main() -> int:
     parser.add_argument("--tail", type=int, default=50000, help="JSONL rows to inspect from order_metrics.jsonl. Default: 50000.")
     parser.add_argument("--all-runs", action="store_true", help="Analyze all tailed rows instead of only the latest run_id.")
     parser.add_argument("--top", type=int, default=5, help="Number of blocked candidates/reasons to print. Default: 5.")
+    parser.add_argument("--what-if", action="store_true", help="Replay blocked entries against looser threshold grids.")
     args = parser.parse_args()
     if args.tail <= 0:
         parser.error("--tail must be > 0")
@@ -206,6 +309,8 @@ def main() -> int:
     )
     for index, (score, asset, direction, reason) in enumerate(sorted(blocked_scores, reverse=True)[: args.top], start=1):
         print(f"blocked_candidate_{index}=asset={asset} dir={direction} score={fmt_decimal(score)} reason={reason}")
+    if args.what_if:
+        print_what_if(rows)
 
     recommendation = "no_change"
     if events["live_inventory_manual_review_required"] or status == "manual_review_required":
