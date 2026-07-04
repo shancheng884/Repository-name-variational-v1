@@ -303,6 +303,18 @@ def test_live_inventory_basis_dry_accepts_eth(monkeypatch) -> None:
     assert args.live_inventory_basis_max_var_quote_age_ms == 0.0
 
 
+def test_live_inventory_basis_dry_accepts_bnb(monkeypatch) -> None:
+    argv = live_inventory_basis_safe_argv()
+    argv[argv.index("ETH")] = "BNB"
+    monkeypatch.setattr("sys.argv", argv)
+
+    args = parse_args()
+
+    assert args.live_inventory_signal_mode == "basis"
+    assert args.live_inventory_dry_decisions is True
+    assert args.live_allowed_assets == "BNB"
+
+
 def test_live_inventory_basis_accepts_abs_entry_and_exit_buffer(monkeypatch) -> None:
     monkeypatch.setattr(
         "sys.argv",
