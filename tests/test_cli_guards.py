@@ -394,6 +394,47 @@ def test_live_inventory_basis_real_submit_accepts_one_cycle_diagnostic(monkeypat
     assert args.live_inventory_max_cycles == 1
 
 
+def test_live_inventory_basis_real_submit_accepts_xrp_larger_minimum_notional(monkeypatch) -> None:
+    argv = live_inventory_basis_safe_argv()
+    argv[argv.index("ETH")] = "XRP"
+    argv.remove("--live-inventory-dry-decisions")
+    monkeypatch.setattr(
+        "sys.argv",
+        argv
+        + [
+            "--live-inventory-lot-notional-usd",
+            "50",
+            "--live-inventory-max-cycles",
+            "1",
+            "--live-inventory-i-accept-basis-real-diagnostic",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.live_allowed_assets == "XRP"
+    assert args.live_inventory_lot_notional_usd == 50.0
+
+
+def test_live_inventory_basis_real_submit_rejects_non_xrp_larger_notional(monkeypatch) -> None:
+    argv = live_inventory_basis_safe_argv()
+    argv.remove("--live-inventory-dry-decisions")
+    monkeypatch.setattr(
+        "sys.argv",
+        argv
+        + [
+            "--live-inventory-lot-notional-usd",
+            "50",
+            "--live-inventory-max-cycles",
+            "1",
+            "--live-inventory-i-accept-basis-real-diagnostic",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
 def test_live_inventory_basis_real_submit_accepts_addon_diagnostic(monkeypatch) -> None:
     argv = live_inventory_basis_safe_argv()
     argv.remove("--live-inventory-dry-decisions")

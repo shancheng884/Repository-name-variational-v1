@@ -10503,6 +10503,7 @@ def parse_args() -> argparse.Namespace:
                 "--live-inventory-i-accept-open-state-resume, or --live-inventory-auto-close-manual-review-position"
             )
         allowed_assets = {asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()}
+        live_inventory_max_lot_notional_usd = 20
         if args.live_inventory_signal_mode == LIVE_INVENTORY_SIGNAL_BASIS:
             if not allowed_assets or not allowed_assets.issubset(LIVE_INVENTORY_BASIS_ALLOWED_ASSETS):
                 parser.error(
@@ -10514,12 +10515,17 @@ def parse_args() -> argparse.Namespace:
                     parser.error(
                         "--live-inventory-signal-mode basis real-submit requires exactly one --live-allowed-assets value"
                     )
+                if allowed_assets == {"XRP"}:
+                    live_inventory_max_lot_notional_usd = 60
                 if not args.live_inventory_i_accept_basis_real_diagnostic:
                     parser.error(
                         "--live-inventory-signal-mode basis real-submit requires --live-inventory-i-accept-basis-real-diagnostic"
                     )
-                if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > 20:
-                    parser.error("basis real-submit diagnostic requires 0 < --live-inventory-lot-notional-usd <= 20")
+                if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > live_inventory_max_lot_notional_usd:
+                    parser.error(
+                        "basis real-submit diagnostic requires "
+                        f"0 < --live-inventory-lot-notional-usd <= {live_inventory_max_lot_notional_usd}"
+                    )
                 if args.live_inventory_i_accept_basis_addon_diagnostic:
                     if args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 2:
                         parser.error("basis add-on diagnostic requires --live-inventory-max-lots 1 --live-inventory-max-total-lots 2")
@@ -10541,8 +10547,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory V1 requires --lighter-order-mode market-ioc")
         if not args.lighter_prewarm_submit_ws:
             parser.error("--live-inventory V1 requires --lighter-prewarm-submit-ws")
-        if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > 20:
-            parser.error("--live-inventory-lot-notional-usd must be > 0 and <= 20 in V1")
+        if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > live_inventory_max_lot_notional_usd:
+            parser.error(f"--live-inventory-lot-notional-usd must be > 0 and <= {live_inventory_max_lot_notional_usd} in V1")
         if args.live_inventory_max_lots <= 0 or args.live_inventory_max_lots > 3:
             parser.error("--live-inventory-max-lots must be > 0 and <= 3 in V1")
         if args.live_inventory_max_total_lots <= 0 or args.live_inventory_max_total_lots > 3:
