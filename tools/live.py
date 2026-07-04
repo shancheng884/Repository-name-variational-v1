@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 from tools.lib.runtime_files import LIVE_STATE, LOG_DIR, human_bytes, read_json  # noqa: E402
 
 
-ALLOWED_ASSETS = {"BNB", "BTC", "ETH", "SOL"}
+ALLOWED_ASSETS = {"BNB", "BTC", "ETH", "HYPE", "SOL"}
 LIVE_CONFIG = ROOT / "live_config.json"
 
 
