@@ -32,6 +32,8 @@ class LiveConfig:
     lighter_exit_submit_slippage_bps: str = "30"
     min_entry_edge_bps: str = "13"
     min_abs_entry_bps: str = "13"
+    max_entry_roundtrip_cost_bps: str = "0"
+    min_entry_quality_score_bps: str = "0"
     min_exit_pnl_bps: str = "8.0"
     min_signal_reverted_exit_pnl_bps: str = "8.0"
     profit_take_pnl_bps: str = "10.0"
@@ -111,6 +113,26 @@ def _positive_decimal(data: dict[str, Any], key: str) -> str:
     return str(value)
 
 
+def _non_negative_decimal(data: dict[str, Any], key: str) -> str:
+    value = data.get(key, getattr(DEFAULT_CONFIG, key))
+    try:
+        number = float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a non-negative number") from exc
+    if number < 0:
+        raise ValueError(f"{key} must be a non-negative number")
+    return str(value)
+
+
+def _decimal(data: dict[str, Any], key: str) -> str:
+    value = data.get(key, getattr(DEFAULT_CONFIG, key))
+    try:
+        float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a number") from exc
+    return str(value)
+
+
 def _positive_int(data: dict[str, Any], key: str, *, max_value: int | None = None) -> int:
     value = data.get(key, getattr(DEFAULT_CONFIG, key))
     try:
@@ -146,6 +168,8 @@ def load_config(path: Path) -> LiveConfig:
         lighter_exit_submit_slippage_bps=_positive_decimal(raw, "lighter_exit_submit_slippage_bps"),
         min_entry_edge_bps=_positive_decimal(raw, "min_entry_edge_bps"),
         min_abs_entry_bps=_positive_decimal(raw, "min_abs_entry_bps"),
+        max_entry_roundtrip_cost_bps=_non_negative_decimal(raw, "max_entry_roundtrip_cost_bps"),
+        min_entry_quality_score_bps=_decimal(raw, "min_entry_quality_score_bps"),
         min_exit_pnl_bps=_positive_decimal(raw, "min_exit_pnl_bps"),
         min_signal_reverted_exit_pnl_bps=_positive_decimal(raw, "min_signal_reverted_exit_pnl_bps"),
         profit_take_pnl_bps=_positive_decimal(raw, "profit_take_pnl_bps"),
@@ -198,6 +222,10 @@ def build_main_command(asset: str, config: LiveConfig) -> list[str]:
         config.min_entry_edge_bps,
         "--live-inventory-basis-min-abs-entry-bps",
         config.min_abs_entry_bps,
+        "--live-inventory-basis-max-entry-roundtrip-cost-bps",
+        config.max_entry_roundtrip_cost_bps,
+        "--live-inventory-basis-min-entry-quality-score-bps",
+        config.min_entry_quality_score_bps,
         "--live-inventory-basis-min-exit-pnl-bps",
         config.min_exit_pnl_bps,
         "--live-inventory-basis-min-signal-reverted-exit-pnl-bps",
