@@ -210,6 +210,227 @@ def _abs_values(values: list[Decimal]) -> list[Decimal]:
     return [abs(value) for value in values]
 
 
+def _spread_bps_from_bid_ask(row: dict[str, Any], bid_key: str, ask_key: str) -> Decimal | None:
+    bid = to_decimal(row.get(bid_key))
+    ask = to_decimal(row.get(ask_key))
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        return None
+    if ask < bid:
+        bid, ask = ask, bid
+    mid = (bid + ask) / Decimal("2")
+    if mid <= 0:
+        return None
+    return (ask - bid) / mid * Decimal("10000")
+
+
+def _spread_regime(current: Decimal | None, values: list[Decimal]) -> tuple[str, Decimal]:
+    if current is None or not values:
+        return "unknown", Decimal("0")
+    median = percentile(values, Decimal("50"))
+    p80 = percentile(values, Decimal("80"))
+    p95 = percentile(values, Decimal("95"))
+    if median is None or p80 is None or p95 is None:
+        return "unknown", Decimal("0")
+    if current > p95:
+        return "extreme_filter", current - median
+    if current > p80:
+        return "wide_add_buffer", current - median
+    return "normal", Decimal("0")
+
+
+def _direction_abs_entry_ok(direction: str, basis: Decimal, threshold: Decimal) -> bool:
+    if direction == "long_var_short_lighter":
+        return basis <= -threshold
+    if direction == "short_var_long_lighter":
+        return basis >= threshold
+    return False
+
+
+def _direction_basis_pnl_bps(direction: str, entry_basis: Decimal, current_basis: Decimal) -> Decimal:
+    if direction == "long_var_short_lighter":
+        return current_basis - entry_basis
+    return entry_basis - current_basis
+
+
+def dynamic_cost_summary(rows: list[dict[str, Any]], *, asset_filter: str | None = None) -> dict[str, Any]:
+    signal_rows = [
+        row
+        for row in rows
+        if row.get("event") in {"live_inventory_basis_state", "live_inventory_entry_blocked"}
+        and row.get("asset")
+        and (asset_filter is None or str(row.get("asset") or "").upper() == asset_filter.upper())
+    ]
+    var_spreads: list[Decimal] = []
+    lighter_spreads: list[Decimal] = []
+    latest: dict[str, Any] | None = None
+    latest_var_spread = None
+    latest_lighter_spread = None
+    for row in signal_rows:
+        var_spread = _spread_bps_from_bid_ask(row, "var_bid", "var_ask")
+        lighter_spread = _spread_bps_from_bid_ask(row, "lighter_bid", "lighter_ask")
+        if var_spread is not None:
+            var_spreads.append(var_spread)
+        if lighter_spread is not None:
+            lighter_spreads.append(lighter_spread)
+        if var_spread is not None or lighter_spread is not None:
+            latest = row
+            latest_var_spread = var_spread
+            latest_lighter_spread = lighter_spread
+
+    slippage_rows = [row for row in rows if row.get("event") == "live_inventory_actual_pnl"]
+    entry_slippage = _collect_decimal(slippage_rows, "entry_lighter_slippage_bps")
+    exit_slippage = _collect_decimal(slippage_rows, "exit_lighter_slippage_bps")
+    slippage_pool = [value for value in entry_slippage + exit_slippage if value >= 0]
+    expected_slippage = percentile(slippage_pool, Decimal("80")) or Decimal("0")
+    var_regime, var_penalty = _spread_regime(latest_var_spread, var_spreads)
+    lighter_regime, lighter_penalty = _spread_regime(latest_lighter_spread, lighter_spreads)
+    current_var_cost = latest_var_spread or Decimal("0")
+    current_lighter_cost = latest_lighter_spread or Decimal("0")
+    dynamic_cost = current_var_cost + current_lighter_cost + expected_slippage + var_penalty + lighter_penalty
+    return {
+        "rows": len(signal_rows),
+        "asset": str(latest.get("asset") or asset_filter or "-").upper() if latest else (asset_filter or "-").upper(),
+        "latest_var_spread": latest_var_spread,
+        "latest_lighter_spread": latest_lighter_spread,
+        "var_spread_p50": percentile(var_spreads, Decimal("50")),
+        "var_spread_p80": percentile(var_spreads, Decimal("80")),
+        "var_spread_p95": percentile(var_spreads, Decimal("95")),
+        "lighter_spread_p50": percentile(lighter_spreads, Decimal("50")),
+        "lighter_spread_p80": percentile(lighter_spreads, Decimal("80")),
+        "lighter_spread_p95": percentile(lighter_spreads, Decimal("95")),
+        "expected_slippage": expected_slippage,
+        "var_regime": var_regime,
+        "lighter_regime": lighter_regime,
+        "spread_regime_penalty": var_penalty + lighter_penalty,
+        "dynamic_roundtrip_cost": dynamic_cost,
+    }
+
+
+def print_dynamic_cost(rows: list[dict[str, Any]], *, asset: str | None = None) -> None:
+    item = dynamic_cost_summary(rows, asset_filter=asset)
+    print("== dynamic_cost ==")
+    print(
+        f"asset={item['asset']} rows={item['rows']} "
+        f"current_var_spread={fmt_decimal(item['latest_var_spread'])} "
+        f"current_lighter_spread={fmt_decimal(item['latest_lighter_spread'])} "
+        f"expected_slippage_p80={fmt_decimal(item['expected_slippage'])} "
+        f"spread_penalty={fmt_decimal(item['spread_regime_penalty'])} "
+        f"dynamic_roundtrip_cost={fmt_decimal(item['dynamic_roundtrip_cost'])}"
+    )
+    print(
+        f"var_spread p50={fmt_decimal(item['var_spread_p50'])} p80={fmt_decimal(item['var_spread_p80'])} p95={fmt_decimal(item['var_spread_p95'])} "
+        f"regime={item['var_regime']}"
+    )
+    print(
+        f"lighter_spread p50={fmt_decimal(item['lighter_spread_p50'])} p80={fmt_decimal(item['lighter_spread_p80'])} p95={fmt_decimal(item['lighter_spread_p95'])} "
+        f"regime={item['lighter_regime']}"
+    )
+
+
+def print_ladder_what_if(
+    rows: list[dict[str, Any]],
+    *,
+    asset: str | None,
+    lot_notional: Decimal,
+    max_lots: int,
+    addon_step: Decimal,
+    min_entry_edge: Decimal,
+    min_abs_entry: Decimal,
+    min_norm_entry: Decimal,
+    min_exit_pnl: Decimal,
+    profit_take_pnl: Decimal,
+) -> None:
+    print("== ladder_what_if ==")
+    cost = dynamic_cost_summary(rows, asset_filter=asset)
+    dynamic_cost = cost["dynamic_roundtrip_cost"] or Decimal("0")
+    signal_rows = [
+        row
+        for row in rows
+        if row.get("event") in {"live_inventory_basis_state", "live_inventory_entry_blocked"}
+        and row.get("asset")
+        and (asset is None or str(row.get("asset") or "").upper() == asset.upper())
+    ]
+    open_lots: list[dict[str, Any]] = []
+    entries = 0
+    exits = 0
+    blocked_cost = 0
+    portfolio_pnls: list[Decimal] = []
+    for row in signal_rows:
+        basis = to_decimal(row.get("basis_bps"))
+        if basis is None:
+            continue
+        if open_lots:
+            direction = str(open_lots[0]["direction"])
+            lot_pnls = [_direction_basis_pnl_bps(direction, lot["entry_basis"], basis) for lot in open_lots]
+            gross_portfolio_pnl = sum(lot_pnls) / Decimal(len(lot_pnls))
+            executable_pnl = gross_portfolio_pnl - dynamic_cost
+            portfolio_pnls.append(executable_pnl)
+            exit_target = profit_take_pnl if executable_pnl >= profit_take_pnl else min_exit_pnl
+            if executable_pnl >= exit_target:
+                exits += len(open_lots)
+                open_lots.clear()
+                continue
+
+        metrics = best_direction_metrics(row)
+        if metrics is None:
+            continue
+        direction = str(metrics["direction"])
+        edge = metrics["edge"]
+        normalized = metrics["normalized_edge"]
+        roundtrip = metrics["roundtrip"]
+        stablecoin_ok = metrics["stablecoin_ok"]
+        if open_lots and direction != open_lots[0]["direction"]:
+            continue
+        if not _direction_abs_entry_ok(direction, basis, min_abs_entry):
+            continue
+        if edge < min_entry_edge:
+            continue
+        if normalized is not None and normalized < min_norm_entry:
+            continue
+        if stablecoin_ok is False:
+            continue
+        if roundtrip is not None and roundtrip < Decimal("0"):
+            blocked_cost += 1
+            continue
+        if edge < dynamic_cost:
+            blocked_cost += 1
+            continue
+        if not open_lots:
+            open_lots.append({"direction": direction, "entry_basis": basis, "notional": lot_notional})
+            entries += 1
+            continue
+        if len(open_lots) >= max_lots:
+            continue
+        entry_bases = [lot["entry_basis"] for lot in open_lots]
+        if direction == "long_var_short_lighter":
+            addon_ok = basis <= min(entry_bases) - addon_step
+        else:
+            addon_ok = basis >= max(entry_bases) + addon_step
+        if addon_ok:
+            open_lots.append({"direction": direction, "entry_basis": basis, "notional": lot_notional})
+            entries += 1
+
+    print(
+        f"asset={cost['asset']} rows={len(signal_rows)} lot_notional={fmt_decimal(lot_notional)} max_lots={max_lots} "
+        f"addon_step_bps={fmt_decimal(addon_step)} dynamic_cost={fmt_decimal(dynamic_cost)}"
+    )
+    print(
+        f"entries={entries} exits={exits} open_lots={len(open_lots)} blocked_by_cost={blocked_cost} "
+        f"portfolio_pnl_p50={fmt_decimal(percentile(portfolio_pnls, Decimal('50')))} "
+        f"portfolio_pnl_p80={fmt_decimal(percentile(portfolio_pnls, Decimal('80')))} "
+        f"portfolio_pnl_p95={fmt_decimal(percentile(portfolio_pnls, Decimal('95')))}"
+    )
+    if open_lots:
+        basis = to_decimal(signal_rows[-1].get("basis_bps")) if signal_rows else None
+        if basis is not None:
+            direction = str(open_lots[0]["direction"])
+            gross = sum(_direction_basis_pnl_bps(direction, lot["entry_basis"], basis) for lot in open_lots) / Decimal(len(open_lots))
+            print(
+                f"open_direction={direction} open_entry_basis={[fmt_decimal(lot['entry_basis']) for lot in open_lots]} "
+                f"latest_basis={fmt_decimal(basis)} executable_pnl={fmt_decimal(gross - dynamic_cost)}"
+            )
+
+
 def print_basis_regime(rows: list[dict[str, Any]]) -> None:
     regimes = build_basis_regimes(rows)
     signal_rows = [
@@ -543,11 +764,36 @@ def main() -> int:
     parser.add_argument("--config-advice", action="store_true", help="Print recommended live_config.json changes, if any.")
     parser.add_argument("--asset-scores", action="store_true", help="Score assets seen in the selected log rows for rotation decisions.")
     parser.add_argument("--run-scores", action="store_true", help="Score each run_id separately for asset rotation decisions.")
+    parser.add_argument("--dynamic-cost", action="store_true", help="Summarize current spread regime and dynamic roundtrip cost.")
+    parser.add_argument("--ladder-what-if", action="store_true", help="Simulate the SOL 20U x 3 add-on strategy over selected rows.")
+    parser.add_argument("--asset", help="Optional asset filter for dynamic-cost and ladder what-if sections.")
+    parser.add_argument("--ladder-lot-notional-usd", default="20", help="What-if lot size. Default: 20.")
+    parser.add_argument("--ladder-max-lots", type=int, default=3, help="What-if max open lots. Default: 3.")
+    parser.add_argument("--ladder-addon-step-bps", default="2.0", help="Basis improvement required for each add-on. Default: 2.0.")
+    parser.add_argument("--ladder-min-entry-edge-bps", default="9", help="Minimum entry edge for what-if. Default: 9.")
+    parser.add_argument("--ladder-min-abs-entry-bps", default="9", help="Minimum absolute basis for what-if. Default: 9.")
+    parser.add_argument("--ladder-min-normalized-entry-edge-bps", default="1.0", help="Minimum normalized edge for what-if. Default: 1.0.")
+    parser.add_argument("--ladder-min-exit-pnl-bps", default="3.0", help="Minimum executable portfolio exit PnL. Default: 3.0.")
+    parser.add_argument("--ladder-profit-take-pnl-bps", default="5.0", help="Portfolio profit-take PnL. Default: 5.0.")
     args = parser.parse_args()
     if args.tail <= 0:
         parser.error("--tail must be > 0")
     if args.top <= 0:
         parser.error("--top must be > 0")
+    if args.ladder_max_lots <= 0:
+        parser.error("--ladder-max-lots must be > 0")
+    try:
+        ladder_lot_notional = Decimal(str(args.ladder_lot_notional_usd))
+        ladder_addon_step = Decimal(str(args.ladder_addon_step_bps))
+        ladder_min_entry = Decimal(str(args.ladder_min_entry_edge_bps))
+        ladder_min_abs_entry = Decimal(str(args.ladder_min_abs_entry_bps))
+        ladder_min_norm_entry = Decimal(str(args.ladder_min_normalized_entry_edge_bps))
+        ladder_min_exit = Decimal(str(args.ladder_min_exit_pnl_bps))
+        ladder_profit_take = Decimal(str(args.ladder_profit_take_pnl_bps))
+    except Exception as exc:
+        parser.error(f"invalid ladder decimal option: {exc}")
+    if ladder_lot_notional <= 0 or ladder_addon_step <= 0:
+        parser.error("ladder lot notional and addon step must be > 0")
 
     source_paths = rotated_jsonl_paths(ORDER_METRICS) if args.include_rotated else [ORDER_METRICS]
     raw_rows = tail_jsonl_many(source_paths, args.tail) if args.include_rotated else tail_jsonl(ORDER_METRICS, args.tail)
@@ -672,6 +918,21 @@ def main() -> int:
         print_asset_scores(rows)
     if args.run_scores:
         print_run_scores(rows)
+    if args.dynamic_cost:
+        print_dynamic_cost(rows, asset=args.asset)
+    if args.ladder_what_if:
+        print_ladder_what_if(
+            rows,
+            asset=args.asset,
+            lot_notional=ladder_lot_notional,
+            max_lots=args.ladder_max_lots,
+            addon_step=ladder_addon_step,
+            min_entry_edge=ladder_min_entry,
+            min_abs_entry=ladder_min_abs_entry,
+            min_norm_entry=ladder_min_norm_entry,
+            min_exit_pnl=ladder_min_exit,
+            profit_take_pnl=ladder_profit_take,
+        )
 
     recommendation = "no_change"
     if events["live_inventory_manual_review_required"] or status == "manual_review_required":

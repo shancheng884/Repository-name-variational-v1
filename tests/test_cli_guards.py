@@ -254,7 +254,7 @@ def test_live_inventory_accepts_v1_safe_flags(monkeypatch) -> None:
     assert args.live_inventory_entry_bps == 50.0
     assert args.live_inventory_max_var_spread_bps == 5.0
     assert args.live_inventory_dynamic_entry_buffer_bps == 5.0
-    assert args.live_inventory_max_lighter_slippage_bps == 3.0
+    assert args.live_inventory_max_lighter_slippage_bps == 5.0
     assert args.live_inventory_max_lighter_book_age_seconds == 0.0
     assert args.live_inventory_exit_blocked_log_throttle_seconds == 0.0
 
@@ -458,6 +458,32 @@ def test_live_inventory_basis_real_submit_accepts_addon_diagnostic(monkeypatch) 
     assert args.live_inventory_i_accept_basis_addon_diagnostic is True
 
 
+def test_live_inventory_basis_real_submit_accepts_three_lot_addon_diagnostic(monkeypatch) -> None:
+    argv = live_inventory_basis_safe_argv()
+    argv.remove("--live-inventory-dry-decisions")
+    monkeypatch.setattr(
+        "sys.argv",
+        argv
+        + [
+            "--live-inventory-max-total-lots",
+            "3",
+            "--live-inventory-max-cycles",
+            "1",
+            "--live-inventory-i-accept-basis-real-diagnostic",
+            "--live-inventory-i-accept-basis-addon-diagnostic",
+            "--live-inventory-basis-addon-min-basis-improvement-bps",
+            "2.0",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.live_inventory_max_lots == 1
+    assert args.live_inventory_max_total_lots == 3
+    assert args.live_inventory_i_accept_basis_addon_diagnostic is True
+    assert args.live_inventory_basis_addon_min_basis_improvement_bps == 2.0
+
+
 def test_live_inventory_basis_real_submit_rejects_addon_without_opt_in(monkeypatch) -> None:
     argv = live_inventory_basis_safe_argv()
     argv.remove("--live-inventory-dry-decisions")
@@ -477,7 +503,7 @@ def test_live_inventory_basis_real_submit_rejects_addon_without_opt_in(monkeypat
         parse_args()
 
 
-def test_live_inventory_basis_real_submit_rejects_multiple_cycles(monkeypatch) -> None:
+def test_live_inventory_basis_real_submit_accepts_multiple_cycles(monkeypatch) -> None:
     argv = live_inventory_basis_safe_argv()
     argv.remove("--live-inventory-dry-decisions")
     monkeypatch.setattr(
@@ -490,17 +516,20 @@ def test_live_inventory_basis_real_submit_rejects_multiple_cycles(monkeypatch) -
         ],
     )
 
-    with pytest.raises(SystemExit):
-        parse_args()
+    args = parse_args()
+
+    assert args.live_inventory_max_cycles == 2
 
 
-def test_live_inventory_basis_rejects_non_eth(monkeypatch) -> None:
+def test_live_inventory_basis_dry_accepts_btc(monkeypatch) -> None:
     argv = live_inventory_basis_safe_argv()
     argv[argv.index("ETH")] = "BTC"
     monkeypatch.setattr("sys.argv", argv)
 
-    with pytest.raises(SystemExit):
-        parse_args()
+    args = parse_args()
+
+    assert args.live_inventory_signal_mode == "basis"
+    assert args.live_allowed_assets == "BTC"
 
 
 def test_live_inventory_real_submit_accepts_v1_safe_flags(monkeypatch) -> None:

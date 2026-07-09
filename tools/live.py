@@ -26,22 +26,23 @@ class LiveConfig:
     lot_notional_usd: str = "20"
     max_cycles: int = 1
     max_lots: int = 1
-    max_total_lots: int = 1
+    max_total_lots: int = 3
     max_lighter_slippage_bps: str = "6"
     lighter_submit_slippage_bps: str = "15"
     lighter_exit_submit_slippage_bps: str = "30"
-    min_entry_edge_bps: str = "13"
-    min_abs_entry_bps: str = "13"
+    min_entry_edge_bps: str = "9"
+    min_abs_entry_bps: str = "9"
     max_entry_roundtrip_cost_bps: str = "0"
     min_entry_quality_score_bps: str = "0"
-    min_exit_pnl_bps: str = "8.0"
-    min_signal_reverted_exit_pnl_bps: str = "8.0"
-    profit_take_pnl_bps: str = "10.0"
-    entry_confirm_samples: int = 2
-    max_sample_move_bps: str = "5"
+    min_exit_pnl_bps: str = "3.0"
+    min_signal_reverted_exit_pnl_bps: str = "3.0"
+    profit_take_pnl_bps: str = "5.0"
+    entry_confirm_samples: int = 1
+    max_sample_move_bps: str = "3"
     min_normalized_entry_edge_bps: str = "1.0"
     min_normalized_filter_edge_bps: str = "0.5"
     entry_lighter_fill_timeout_seconds: str = "3"
+    addon_min_basis_improvement_bps: str = "2.0"
 
 
 DEFAULT_CONFIG = LiveConfig()
@@ -178,11 +179,12 @@ def load_config(path: Path) -> LiveConfig:
         min_normalized_entry_edge_bps=_positive_decimal(raw, "min_normalized_entry_edge_bps"),
         min_normalized_filter_edge_bps=_positive_decimal(raw, "min_normalized_filter_edge_bps"),
         entry_lighter_fill_timeout_seconds=_positive_decimal(raw, "entry_lighter_fill_timeout_seconds"),
+        addon_min_basis_improvement_bps=_positive_decimal(raw, "addon_min_basis_improvement_bps"),
     )
 
 
 def build_main_command(asset: str, config: LiveConfig) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "main.py",
         "--mode",
@@ -248,6 +250,15 @@ def build_main_command(asset: str, config: LiveConfig) -> list[str]:
         "--live-inventory-i-confirm-flat-start",
         "--live-inventory-i-accept-basis-real-diagnostic",
     ]
+    if config.max_total_lots > 1:
+        command.extend(
+            [
+                "--live-inventory-i-accept-basis-addon-diagnostic",
+                "--live-inventory-basis-addon-min-basis-improvement-bps",
+                config.addon_min_basis_improvement_bps,
+            ]
+        )
+    return command
 
 
 def main() -> int:

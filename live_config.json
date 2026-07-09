@@ -3,7 +3,7 @@
   "lot_notional_usd": "20",
   "max_cycles": 1,
   "max_lots": 1,
-  "max_total_lots": 1,
+  "max_total_lots": 3,
   "max_lighter_slippage_bps": "6",
   "lighter_submit_slippage_bps": "15",
   "lighter_exit_submit_slippage_bps": "30",
@@ -18,5 +18,6 @@
   "max_sample_move_bps": "3",
   "min_normalized_entry_edge_bps": "1.0",
   "min_normalized_filter_edge_bps": "0.5",
-  "entry_lighter_fill_timeout_seconds": "3"
+  "entry_lighter_fill_timeout_seconds": "3",
+  "addon_min_basis_improvement_bps": "2.0"
 }

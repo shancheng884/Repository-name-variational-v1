@@ -10527,8 +10527,15 @@ def parse_args() -> argparse.Namespace:
                         f"0 < --live-inventory-lot-notional-usd <= {live_inventory_max_lot_notional_usd}"
                     )
                 if args.live_inventory_i_accept_basis_addon_diagnostic:
-                    if args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 2:
-                        parser.error("basis add-on diagnostic requires --live-inventory-max-lots 1 --live-inventory-max-total-lots 2")
+                    if (
+                        args.live_inventory_max_lots != 1
+                        or args.live_inventory_max_total_lots < 2
+                        or args.live_inventory_max_total_lots > 3
+                    ):
+                        parser.error(
+                            "basis add-on diagnostic requires --live-inventory-max-lots 1 "
+                            "and 2 <= --live-inventory-max-total-lots <= 3"
+                        )
                 elif args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 1:
                     parser.error("basis real-submit diagnostic requires --live-inventory-max-lots 1 --live-inventory-max-total-lots 1")
                 if args.live_inventory_max_cycles <= 0 or args.live_inventory_max_cycles > 10:
