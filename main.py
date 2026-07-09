@@ -1037,6 +1037,7 @@ class VariationalToLighterRuntime:
         )
         self.live_inventory_basis_entry_confirm_counts: dict[str, int] = {}
         self.live_inventory_basis_last_basis_bps: Decimal | None = None
+        self._last_live_inventory_snapshot_unavailable_log = 0.0
         self.live_inventory_basis_watch_candidates: dict[str, dict[str, Any]] = {}
         self.live_inventory_stablecoin_rate_cache: dict[str, Any] = {}
         self.live_inventory_stablecoin_basis_bps_samples: deque[Decimal] = deque(maxlen=500)
@@ -6058,12 +6059,21 @@ class VariationalToLighterRuntime:
     async def get_cross_spread_snapshot(self) -> CrossSpreadSnapshot | None:
         quote = await self.get_variational_quote(self.variational_ticker)
         if quote is None:
+            await self.log_live_inventory_snapshot_unavailable("variational_quote_unavailable")
             return None
         var_bid = to_decimal(quote.get("bid"))
         var_ask = to_decimal(quote.get("ask"))
         quote_asset = str(quote.get("asset", ""))
         lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
         if var_bid is None or var_ask is None or lighter_bid is None or lighter_ask is None:
+            await self.log_live_inventory_snapshot_unavailable(
+                "missing_quote_price",
+                quote_asset=quote_asset,
+                var_bid=var_bid,
+                var_ask=var_ask,
+                lighter_bid=lighter_bid,
+                lighter_ask=lighter_ask,
+            )
             return None
 
         var_buy_price, var_sell_price, var_spread_source = self.extract_variational_button_prices(quote)
@@ -6094,11 +6104,13 @@ class VariationalToLighterRuntime:
         var_full_spread_pct = spread_percent(var_full_spread, var_mid)
         var_full_spread_bps = decimal_percent_to_bps(var_full_spread_pct)
         if var_full_spread_bps is None:
+            await self.log_live_inventory_snapshot_unavailable("var_spread_unavailable", quote_asset=quote_asset)
             return None
         var_half_spread_bps = var_full_spread_bps / Decimal("2")
         lighter_full_spread_pct = spread_percent(lighter_buy_price - lighter_sell_price, lighter_mid)
         lighter_full_spread_bps = decimal_percent_to_bps(lighter_full_spread_pct)
         if lighter_full_spread_bps is None:
+            await self.log_live_inventory_snapshot_unavailable("lighter_spread_unavailable", quote_asset=quote_asset)
             return None
         lighter_half_spread_bps = lighter_full_spread_bps / Decimal("2")
 
@@ -6143,6 +6155,24 @@ class VariationalToLighterRuntime:
             long_sample_count_5m=long_count,
             short_sample_count_5m=short_count,
         )
+
+    async def log_live_inventory_snapshot_unavailable(self, reason: str, **context: Any) -> None:
+        if not self.is_live_inventory_enabled():
+            return
+        now = time.monotonic()
+        if now - self._last_live_inventory_snapshot_unavailable_log < 5.0:
+            return
+        self._last_live_inventory_snapshot_unavailable_log = now
+        payload = {
+            "reason": reason,
+            "asset": self.variational_ticker or self.ticker or "-",
+            "ticker": self.ticker or "-",
+            "variational_ticker": self.variational_ticker or "-",
+        }
+        payload.update({key: decimal_to_str(value) if isinstance(value, Decimal) else value for key, value in context.items()})
+        self.logger.warning("live_inventory_snapshot_unavailable reason=%s asset=%s", reason, payload.get("asset"))
+        with contextlib.suppress(Exception):
+            await self.append_live_inventory_log("live_inventory_snapshot_unavailable", payload)
 
     def _next_paper_opportunity_id(self) -> str:
         self.paper_opportunity_counter += 1
