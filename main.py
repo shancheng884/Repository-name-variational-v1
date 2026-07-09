@@ -1020,6 +1020,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_exit_fill_latency_ms_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_basis_var_spread_bps_samples: deque[Decimal] = deque(maxlen=200)
         self.live_inventory_basis_lighter_spread_bps_samples: deque[Decimal] = deque(maxlen=200)
+        self.live_inventory_basis_sample_move_bps_samples: deque[Decimal] = deque(maxlen=200)
         self.live_inventory_actual_pnl_bps_by_direction: dict[str, deque[Decimal]] = {
             DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(maxlen=20),
             DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(maxlen=20),
@@ -1334,6 +1335,30 @@ class VariationalToLighterRuntime:
             "dynamic_entry_lighter_spread_p95_bps": decimal_to_str(lighter_p95),
             "dynamic_entry_var_spread_regime": var_regime,
             "dynamic_entry_lighter_spread_regime": lighter_regime,
+        }
+
+    def live_inventory_basis_dynamic_sample_move_threshold_bps(self) -> tuple[Decimal, dict[str, Any]]:
+        static_floor = self.live_inventory_basis_max_sample_move_bps
+        if static_floor <= 0:
+            return static_floor, {
+                "basis_dynamic_sample_move_enabled": False,
+                "basis_static_max_sample_move_bps": decimal_to_str(static_floor),
+                "basis_dynamic_max_sample_move_bps": decimal_to_str(static_floor),
+                "basis_sample_move_p80_bps": None,
+                "basis_sample_move_p90_bps": None,
+            }
+        sample_p80 = self.percentile_decimal(self.live_inventory_basis_sample_move_bps_samples, 80)
+        sample_p90 = self.percentile_decimal(self.live_inventory_basis_sample_move_bps_samples, 90)
+        dynamic_threshold = max(static_floor, sample_p80 or Decimal("0"))
+        dynamic_cap = max(static_floor, Decimal("6"))
+        dynamic_threshold = min(dynamic_threshold, dynamic_cap)
+        return dynamic_threshold, {
+            "basis_dynamic_sample_move_enabled": True,
+            "basis_static_max_sample_move_bps": decimal_to_str(static_floor),
+            "basis_dynamic_max_sample_move_bps": decimal_to_str(dynamic_threshold),
+            "basis_sample_move_p80_bps": decimal_to_str(sample_p80),
+            "basis_sample_move_p90_bps": decimal_to_str(sample_p90),
+            "basis_sample_move_dynamic_cap_bps": decimal_to_str(dynamic_cap),
         }
 
     def live_inventory_direction_abs_threshold_bps(self, direction: str) -> Decimal:
@@ -6523,10 +6548,13 @@ class VariationalToLighterRuntime:
             if self.live_inventory_basis_last_basis_bps is not None
             else None
         )
+        if basis_sample_move_bps is not None:
+            self.live_inventory_basis_sample_move_bps_samples.append(basis_sample_move_bps)
+        basis_dynamic_max_sample_move_bps, basis_sample_move_context = self.live_inventory_basis_dynamic_sample_move_threshold_bps()
         basis_sample_move_ok = (
             True
-            if self.live_inventory_basis_max_sample_move_bps <= 0 or basis_sample_move_bps is None
-            else basis_sample_move_bps <= self.live_inventory_basis_max_sample_move_bps
+            if basis_dynamic_max_sample_move_bps <= 0 or basis_sample_move_bps is None
+            else basis_sample_move_bps <= basis_dynamic_max_sample_move_bps
         )
         self.live_inventory_basis_last_basis_bps = basis_bps
         var_spread_bps = self.spread_bps_from_bid_ask(var_bid, var_ask)
@@ -6659,7 +6687,8 @@ class VariationalToLighterRuntime:
             "basis_bps": decimal_to_str(basis_bps),
             "basis_sample_move_bps": decimal_to_str(basis_sample_move_bps),
             "basis_sample_move_ok": basis_sample_move_ok,
-            "basis_max_sample_move_bps": decimal_to_str(self.live_inventory_basis_max_sample_move_bps),
+            "basis_max_sample_move_bps": decimal_to_str(basis_dynamic_max_sample_move_bps),
+            **basis_sample_move_context,
             "basis_mean_bps": None if self.live_inventory_basis_state.signal_mean is None else str(self.live_inventory_basis_state.signal_mean),
             "basis_sigma_bps": None if self.live_inventory_basis_state.signal_sigma is None else str(self.live_inventory_basis_state.signal_sigma),
             "basis_seen": self.live_inventory_basis_state.seen,
@@ -6743,7 +6772,8 @@ class VariationalToLighterRuntime:
                         **state_payload,
                         "reason": "basis_sample_move_too_large",
                         "basis_sample_move_bps": decimal_to_str(basis_sample_move_bps),
-                        "basis_max_sample_move_bps": decimal_to_str(self.live_inventory_basis_max_sample_move_bps),
+                        "basis_max_sample_move_bps": decimal_to_str(basis_dynamic_max_sample_move_bps),
+                        **basis_sample_move_context,
                     },
                 )
                 return

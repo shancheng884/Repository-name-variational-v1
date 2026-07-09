@@ -901,10 +901,13 @@ def main() -> int:
     )
 
     print("== signal_quality ==")
+    latest_signal_row = next((row for row in reversed(rows) if row.get("event") == "live_inventory_basis_state"), None)
     print(
         f"sample_move_p50={fmt_decimal(percentile(sample_moves, Decimal('50')))} "
         f"sample_move_p80={fmt_decimal(percentile(sample_moves, Decimal('80')))} "
-        f"normalized_edge_p80={fmt_decimal(percentile(normalized_edges, Decimal('80')))}"
+        f"normalized_edge_p80={fmt_decimal(percentile(normalized_edges, Decimal('80')))} "
+        f"latest_max_sample_move={fmt_decimal(to_decimal(latest_signal_row.get('basis_max_sample_move_bps')) if latest_signal_row else None)} "
+        f"latest_sample_move_p80={fmt_decimal(to_decimal(latest_signal_row.get('basis_sample_move_p80_bps')) if latest_signal_row else None)}"
     )
     for index, (score, asset, direction, reason) in enumerate(sorted(blocked_scores, reverse=True)[: args.top], start=1):
         print(f"blocked_candidate_{index}=asset={asset} dir={direction} score={fmt_decimal(score)} reason={reason}")
