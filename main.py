@@ -6483,6 +6483,16 @@ class VariationalToLighterRuntime:
         self.live_inventory_sample_index += 1
         index = self.live_inventory_sample_index
         if self.live_inventory_completed_cycles >= self.live_inventory_max_cycles and not self.live_inventory_open_lots:
+            if index == 1 or index % 30 == 0:
+                await self.append_live_inventory_log(
+                    "live_inventory_cycle_cap_reached",
+                    {
+                        "asset": asset,
+                        "sample_index": index,
+                        "completed_cycles": self.live_inventory_completed_cycles,
+                        "max_cycles": self.live_inventory_max_cycles,
+                    },
+                )
             return
         quote, quote_ms = await self.fetch_live_inventory_basis_quote(asset=asset)
         if quote is None:

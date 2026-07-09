@@ -69,7 +69,7 @@ def running_main_processes() -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip() and "tools/live.py" not in line]
 
 
-def validate_state() -> tuple[bool, str]:
+def validate_state(config: LiveConfig) -> tuple[bool, str]:
     state = read_json(LIVE_STATE)
     if not state:
         return True, "state=missing allowed=start_after_manual_exchange_flat_confirmation"
@@ -78,6 +78,10 @@ def validate_state() -> tuple[bool, str]:
     open_lots = state.get("open_lots") or []
     pending_actions = state.get("pending_actions") or []
     asset = str(state.get("asset") or "-").upper()
+    try:
+        completed_cycles = int(state.get("completed_cycles") or 0)
+    except (TypeError, ValueError):
+        completed_cycles = 0
 
     if status != "flat":
         return False, f"state_not_flat status={status} asset={asset}"
@@ -85,7 +89,13 @@ def validate_state() -> tuple[bool, str]:
         return False, f"open_lots_present count={len(open_lots)} asset={asset}"
     if pending_actions:
         return False, f"pending_actions_present count={len(pending_actions)} asset={asset}"
-    return True, f"state=flat asset={asset} open_lots=0 pending_actions=0"
+    if completed_cycles >= config.max_cycles:
+        return (
+            False,
+            f"state_cycle_cap_reached asset={asset} completed_cycles={completed_cycles} max_cycles={config.max_cycles} "
+            "open_lots=0 pending_actions=0",
+        )
+    return True, f"state=flat asset={asset} open_lots=0 pending_actions=0 completed_cycles={completed_cycles} max_cycles={config.max_cycles}"
 
 
 def disk_warning() -> str:
@@ -301,7 +311,7 @@ def main() -> int:
             print(process)
         return 2
 
-    state_ok, state_message = validate_state()
+    state_ok, state_message = validate_state(config)
     print(state_message)
     print(disk_warning())
     if not state_ok:

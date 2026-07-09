@@ -1,4 +1,7 @@
-from tools.live import LiveConfig, build_main_command
+import json
+
+from tools import live
+from tools.live import LiveConfig, build_main_command, validate_state
 
 
 def test_live_tool_adds_basis_addon_flags_for_three_lots() -> None:
@@ -29,3 +32,26 @@ def test_live_tool_can_disable_dynamic_entry_threshold() -> None:
     command = build_main_command("SOL", LiveConfig(max_total_lots=1, dynamic_entry_threshold=False))
 
     assert "--live-inventory-basis-dynamic-entry-threshold" not in command
+
+
+def test_live_tool_refuses_flat_state_when_cycle_cap_reached(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "flat",
+                "asset": "SOL",
+                "open_lots": [],
+                "pending_actions": [],
+                "completed_cycles": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(live, "LIVE_STATE", state_path)
+
+    ok, message = validate_state(LiveConfig(max_cycles=1))
+
+    assert ok is False
+    assert "state_cycle_cap_reached" in message
+    assert "completed_cycles=1" in message
