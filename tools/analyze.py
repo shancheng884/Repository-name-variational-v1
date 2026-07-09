@@ -383,7 +383,8 @@ def print_ladder_what_if(
             continue
         if not _direction_abs_entry_ok(direction, basis, min_abs_entry):
             continue
-        if edge < min_entry_edge:
+        dynamic_entry_threshold = max(min_entry_edge, dynamic_cost + min_exit_pnl + Decimal("2.0"))
+        if edge < dynamic_entry_threshold:
             continue
         if normalized is not None and normalized < min_norm_entry:
             continue
@@ -412,7 +413,8 @@ def print_ladder_what_if(
 
     print(
         f"asset={cost['asset']} rows={len(signal_rows)} lot_notional={fmt_decimal(lot_notional)} max_lots={max_lots} "
-        f"addon_step_bps={fmt_decimal(addon_step)} dynamic_cost={fmt_decimal(dynamic_cost)}"
+        f"addon_step_bps={fmt_decimal(addon_step)} dynamic_cost={fmt_decimal(dynamic_cost)} "
+        f"dynamic_entry_threshold={fmt_decimal(max(min_entry_edge, dynamic_cost + min_exit_pnl + Decimal('2.0')))}"
     )
     print(
         f"entries={entries} exits={exits} open_lots={len(open_lots)} blocked_by_cost={blocked_cost} "
@@ -770,8 +772,8 @@ def main() -> int:
     parser.add_argument("--ladder-lot-notional-usd", default="20", help="What-if lot size. Default: 20.")
     parser.add_argument("--ladder-max-lots", type=int, default=3, help="What-if max open lots. Default: 3.")
     parser.add_argument("--ladder-addon-step-bps", default="2.0", help="Basis improvement required for each add-on. Default: 2.0.")
-    parser.add_argument("--ladder-min-entry-edge-bps", default="9", help="Minimum entry edge for what-if. Default: 9.")
-    parser.add_argument("--ladder-min-abs-entry-bps", default="9", help="Minimum absolute basis for what-if. Default: 9.")
+    parser.add_argument("--ladder-min-entry-edge-bps", default="7", help="Static floor for what-if entry edge. Default: 7.")
+    parser.add_argument("--ladder-min-abs-entry-bps", default="7", help="Static floor for what-if absolute basis. Default: 7.")
     parser.add_argument("--ladder-min-normalized-entry-edge-bps", default="1.0", help="Minimum normalized edge for what-if. Default: 1.0.")
     parser.add_argument("--ladder-min-exit-pnl-bps", default="3.0", help="Minimum executable portfolio exit PnL. Default: 3.0.")
     parser.add_argument("--ladder-profit-take-pnl-bps", default="5.0", help="Portfolio profit-take PnL. Default: 5.0.")

@@ -30,10 +30,13 @@ class LiveConfig:
     max_lighter_slippage_bps: str = "6"
     lighter_submit_slippage_bps: str = "15"
     lighter_exit_submit_slippage_bps: str = "30"
-    min_entry_edge_bps: str = "9"
-    min_abs_entry_bps: str = "9"
+    min_entry_edge_bps: str = "7"
+    min_abs_entry_bps: str = "7"
     max_entry_roundtrip_cost_bps: str = "0"
     min_entry_quality_score_bps: str = "0"
+    dynamic_entry_threshold: bool = True
+    dynamic_entry_noise_buffer_bps: str = "2.0"
+    spread_regime_penalty_multiplier: str = "1.0"
     min_exit_pnl_bps: str = "3.0"
     min_signal_reverted_exit_pnl_bps: str = "3.0"
     profit_take_pnl_bps: str = "5.0"
@@ -171,6 +174,9 @@ def load_config(path: Path) -> LiveConfig:
         min_abs_entry_bps=_positive_decimal(raw, "min_abs_entry_bps"),
         max_entry_roundtrip_cost_bps=_non_negative_decimal(raw, "max_entry_roundtrip_cost_bps"),
         min_entry_quality_score_bps=_decimal(raw, "min_entry_quality_score_bps"),
+        dynamic_entry_threshold=bool(raw.get("dynamic_entry_threshold", DEFAULT_CONFIG.dynamic_entry_threshold)),
+        dynamic_entry_noise_buffer_bps=_positive_decimal(raw, "dynamic_entry_noise_buffer_bps"),
+        spread_regime_penalty_multiplier=_positive_decimal(raw, "spread_regime_penalty_multiplier"),
         min_exit_pnl_bps=_positive_decimal(raw, "min_exit_pnl_bps"),
         min_signal_reverted_exit_pnl_bps=_positive_decimal(raw, "min_signal_reverted_exit_pnl_bps"),
         profit_take_pnl_bps=_positive_decimal(raw, "profit_take_pnl_bps"),
@@ -228,6 +234,10 @@ def build_main_command(asset: str, config: LiveConfig) -> list[str]:
         config.max_entry_roundtrip_cost_bps,
         "--live-inventory-basis-min-entry-quality-score-bps",
         config.min_entry_quality_score_bps,
+        "--live-inventory-basis-dynamic-entry-noise-buffer-bps",
+        config.dynamic_entry_noise_buffer_bps,
+        "--live-inventory-basis-spread-regime-penalty-multiplier",
+        config.spread_regime_penalty_multiplier,
         "--live-inventory-basis-min-exit-pnl-bps",
         config.min_exit_pnl_bps,
         "--live-inventory-basis-min-signal-reverted-exit-pnl-bps",
@@ -250,6 +260,8 @@ def build_main_command(asset: str, config: LiveConfig) -> list[str]:
         "--live-inventory-i-confirm-flat-start",
         "--live-inventory-i-accept-basis-real-diagnostic",
     ]
+    if config.dynamic_entry_threshold:
+        command.append("--live-inventory-basis-dynamic-entry-threshold")
     if config.max_total_lots > 1:
         command.extend(
             [

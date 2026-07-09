@@ -889,6 +889,13 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_negative_direction_entry_penalty_bps = Decimal(str(args.live_inventory_basis_negative_direction_entry_penalty_bps))
         self.live_inventory_basis_negative_direction_abs_penalty_bps = Decimal(str(args.live_inventory_basis_negative_direction_abs_penalty_bps))
         self.live_inventory_basis_min_entry_quality_score_bps = Decimal(str(args.live_inventory_basis_min_entry_quality_score_bps))
+        self.live_inventory_basis_dynamic_entry_threshold = bool(args.live_inventory_basis_dynamic_entry_threshold)
+        self.live_inventory_basis_dynamic_entry_noise_buffer_bps = Decimal(
+            str(args.live_inventory_basis_dynamic_entry_noise_buffer_bps)
+        )
+        self.live_inventory_basis_spread_regime_penalty_multiplier = Decimal(
+            str(args.live_inventory_basis_spread_regime_penalty_multiplier)
+        )
         self.live_inventory_basis_sample_move_penalty_multiplier = Decimal(str(args.live_inventory_basis_sample_move_penalty_multiplier))
         self.live_inventory_basis_watch_candidate = bool(args.live_inventory_basis_watch_candidate)
         self.live_inventory_basis_watch_edge_bps = Decimal(str(args.live_inventory_basis_watch_edge_bps))
@@ -1011,6 +1018,8 @@ class VariationalToLighterRuntime:
         self.live_inventory_execution_loss_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_exit_estimate_shortfall_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_exit_fill_latency_ms_samples: deque[Decimal] = deque(maxlen=20)
+        self.live_inventory_basis_var_spread_bps_samples: deque[Decimal] = deque(maxlen=200)
+        self.live_inventory_basis_lighter_spread_bps_samples: deque[Decimal] = deque(maxlen=200)
         self.live_inventory_actual_pnl_bps_by_direction: dict[str, deque[Decimal]] = {
             DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(maxlen=20),
             DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(maxlen=20),
@@ -1242,6 +1251,89 @@ class VariationalToLighterRuntime:
         if direction == DIRECTION_SHORT_VAR_LONG_LIGHTER and self.live_inventory_basis_short_min_entry_edge_bps > 0:
             return self.live_inventory_basis_short_min_entry_edge_bps
         return self.live_inventory_basis_min_entry_edge_bps
+
+    @staticmethod
+    def spread_bps_from_bid_ask(bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            return None
+        if ask < bid:
+            bid, ask = ask, bid
+        mid = (bid + ask) / Decimal("2")
+        if mid <= 0:
+            return None
+        return (ask - bid) / mid * Decimal("10000")
+
+    def live_inventory_basis_dynamic_entry_threshold_bps(
+        self,
+        *,
+        static_floor_bps: Decimal,
+        var_spread_bps: Decimal | None,
+        lighter_spread_bps: Decimal | None,
+    ) -> tuple[Decimal, dict[str, Any]]:
+        var_spread = var_spread_bps or Decimal("0")
+        lighter_spread = lighter_spread_bps or Decimal("0")
+        slippage_buffer = max(
+            self.live_inventory_recent_execution_loss_buffer_bps(),
+            self.live_inventory_dynamic_exit_buffer_bps(),
+        )
+        var_median = self.percentile_decimal(self.live_inventory_basis_var_spread_bps_samples, 50)
+        var_p80 = self.percentile_decimal(self.live_inventory_basis_var_spread_bps_samples, 80)
+        var_p95 = self.percentile_decimal(self.live_inventory_basis_var_spread_bps_samples, 95)
+        lighter_median = self.percentile_decimal(self.live_inventory_basis_lighter_spread_bps_samples, 50)
+        lighter_p80 = self.percentile_decimal(self.live_inventory_basis_lighter_spread_bps_samples, 80)
+        lighter_p95 = self.percentile_decimal(self.live_inventory_basis_lighter_spread_bps_samples, 95)
+
+        spread_penalty = Decimal("0")
+        var_regime = "unknown"
+        if var_p95 is not None and var_median is not None and var_spread > var_p95:
+            var_regime = "extreme"
+            spread_penalty += max(Decimal("0"), var_spread - var_median)
+        elif var_p80 is not None and var_median is not None and var_spread > var_p80:
+            var_regime = "wide"
+            spread_penalty += max(Decimal("0"), var_spread - var_median)
+        elif var_spread_bps is not None:
+            var_regime = "normal"
+
+        lighter_regime = "unknown"
+        if lighter_p95 is not None and lighter_median is not None and lighter_spread > lighter_p95:
+            lighter_regime = "extreme"
+            spread_penalty += max(Decimal("0"), lighter_spread - lighter_median)
+        elif lighter_p80 is not None and lighter_median is not None and lighter_spread > lighter_p80:
+            lighter_regime = "wide"
+            spread_penalty += max(Decimal("0"), lighter_spread - lighter_median)
+        elif lighter_spread_bps is not None:
+            lighter_regime = "normal"
+
+        spread_penalty *= self.live_inventory_basis_spread_regime_penalty_multiplier
+        dynamic_required = (
+            var_spread
+            + lighter_spread
+            + slippage_buffer
+            + self.live_inventory_basis_min_signal_reverted_exit_pnl_bps
+            + self.live_inventory_basis_dynamic_entry_noise_buffer_bps
+            + spread_penalty
+        )
+        threshold = max(static_floor_bps, dynamic_required) if self.live_inventory_basis_dynamic_entry_threshold else static_floor_bps
+        return threshold, {
+            "dynamic_entry_threshold_enabled": self.live_inventory_basis_dynamic_entry_threshold,
+            "dynamic_entry_static_floor_bps": decimal_to_str(static_floor_bps),
+            "dynamic_entry_required_bps": decimal_to_str(dynamic_required),
+            "dynamic_entry_threshold_bps": decimal_to_str(threshold),
+            "dynamic_entry_var_spread_bps": decimal_to_str(var_spread_bps),
+            "dynamic_entry_lighter_spread_bps": decimal_to_str(lighter_spread_bps),
+            "dynamic_entry_slippage_buffer_bps": decimal_to_str(slippage_buffer),
+            "dynamic_entry_exit_profit_bps": decimal_to_str(self.live_inventory_basis_min_signal_reverted_exit_pnl_bps),
+            "dynamic_entry_noise_buffer_bps": decimal_to_str(self.live_inventory_basis_dynamic_entry_noise_buffer_bps),
+            "dynamic_entry_spread_penalty_bps": decimal_to_str(spread_penalty),
+            "dynamic_entry_var_spread_p50_bps": decimal_to_str(var_median),
+            "dynamic_entry_var_spread_p80_bps": decimal_to_str(var_p80),
+            "dynamic_entry_var_spread_p95_bps": decimal_to_str(var_p95),
+            "dynamic_entry_lighter_spread_p50_bps": decimal_to_str(lighter_median),
+            "dynamic_entry_lighter_spread_p80_bps": decimal_to_str(lighter_p80),
+            "dynamic_entry_lighter_spread_p95_bps": decimal_to_str(lighter_p95),
+            "dynamic_entry_var_spread_regime": var_regime,
+            "dynamic_entry_lighter_spread_regime": lighter_regime,
+        }
 
     def live_inventory_direction_abs_threshold_bps(self, direction: str) -> Decimal:
         if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER and self.live_inventory_basis_long_min_abs_entry_bps > 0:
@@ -4902,6 +4994,9 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_negative_direction_entry_penalty_bps",
             "live_inventory_basis_negative_direction_abs_penalty_bps",
             "live_inventory_basis_min_entry_quality_score_bps",
+            "live_inventory_basis_dynamic_entry_threshold",
+            "live_inventory_basis_dynamic_entry_noise_buffer_bps",
+            "live_inventory_basis_spread_regime_penalty_multiplier",
             "live_inventory_basis_sample_move_penalty_multiplier",
             "live_inventory_basis_watch_candidate",
             "live_inventory_basis_watch_edge_bps",
@@ -6393,6 +6488,12 @@ class VariationalToLighterRuntime:
             else basis_sample_move_bps <= self.live_inventory_basis_max_sample_move_bps
         )
         self.live_inventory_basis_last_basis_bps = basis_bps
+        var_spread_bps = self.spread_bps_from_bid_ask(var_bid, var_ask)
+        lighter_spread_bps = self.spread_bps_from_bid_ask(snapshot.lighter_bid, snapshot.lighter_ask)
+        if var_spread_bps is not None:
+            self.live_inventory_basis_var_spread_bps_samples.append(var_spread_bps)
+        if lighter_spread_bps is not None:
+            self.live_inventory_basis_lighter_spread_bps_samples.append(lighter_spread_bps)
         z_float, warm = self.live_inventory_basis_state.update(time.monotonic(), float(basis_bps))
         z = Decimal(str(z_float))
         long_edge_bps = self.live_inventory_pair_edge_bps(
@@ -6506,6 +6607,8 @@ class VariationalToLighterRuntime:
             "var_ask": decimal_to_str(var_ask),
             "lighter_bid": decimal_to_str(snapshot.lighter_bid),
             "lighter_ask": decimal_to_str(snapshot.lighter_ask),
+            "var_spread_bps": decimal_to_str(var_spread_bps),
+            "lighter_spread_bps": decimal_to_str(lighter_spread_bps),
             "lighter_buy_price": decimal_to_str(lighter_buy_price),
             "lighter_sell_price": decimal_to_str(lighter_sell_price),
             "long_entry_lighter_depth": long_entry_lighter_depth,
@@ -6659,7 +6762,14 @@ class VariationalToLighterRuntime:
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     continue
                 stablecoin_regime_active = stablecoin_edge_context.get("stablecoin_regime_reason") == "ok"
-                min_abs_entry_bps = self.live_inventory_direction_abs_threshold_bps(direction) + negative_abs_penalty_bps
+                static_min_entry_edge_bps = self.live_inventory_direction_entry_threshold_bps(direction) + negative_entry_penalty_bps
+                min_entry_edge_bps, dynamic_entry_threshold_context = self.live_inventory_basis_dynamic_entry_threshold_bps(
+                    static_floor_bps=static_min_entry_edge_bps,
+                    var_spread_bps=var_spread_bps,
+                    lighter_spread_bps=lighter_spread_bps,
+                )
+                static_min_abs_entry_bps = self.live_inventory_direction_abs_threshold_bps(direction) + negative_abs_penalty_bps
+                min_abs_entry_bps = max(static_min_abs_entry_bps, min_entry_edge_bps)
                 if not stablecoin_regime_active and not self.live_inventory_basis_abs_entry_ok(direction=direction, basis_bps=basis_bps, threshold_bps=min_abs_entry_bps):
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     await self.append_live_inventory_log(
@@ -6670,6 +6780,7 @@ class VariationalToLighterRuntime:
                             "direction": direction,
                             "basis_bps": decimal_to_str(basis_bps),
                             "min_abs_entry_bps": decimal_to_str(min_abs_entry_bps),
+                            **dynamic_entry_threshold_context,
                             **negative_context,
                         },
                     )
@@ -6702,14 +6813,16 @@ class VariationalToLighterRuntime:
                         },
                     )
                     continue
-                min_entry_edge_bps = self.live_inventory_direction_entry_threshold_bps(direction) + negative_entry_penalty_bps
                 stablecoin_regime_required_raw_edge_bps = to_decimal(stablecoin_edge_context.get("stablecoin_regime_required_raw_edge_bps"))
                 if (
                     stablecoin_regime_active
                     and not self.live_inventory_basis_use_normalized_edge_for_entry
                     and stablecoin_regime_required_raw_edge_bps is not None
                 ):
-                    min_entry_edge_bps = stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps
+                    min_entry_edge_bps = max(
+                        min_entry_edge_bps,
+                        stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps,
+                    )
                 if self.live_inventory_basis_use_normalized_edge_for_entry and self.live_inventory_basis_min_normalized_entry_edge_bps > 0:
                     min_entry_edge_bps = max(min_entry_edge_bps, self.live_inventory_basis_min_normalized_entry_edge_bps)
                 entry_quality_score_bps, entry_quality_context = self.live_inventory_entry_quality_score_bps(
@@ -6736,6 +6849,7 @@ class VariationalToLighterRuntime:
                             "min_abs_entry_bps": decimal_to_str(min_abs_entry_bps),
                             **stablecoin_edge_context,
                             **negative_context,
+                            **dynamic_entry_threshold_context,
                             **entry_quality_context,
                         },
                     )
@@ -6916,7 +7030,10 @@ class VariationalToLighterRuntime:
                         and not self.live_inventory_basis_use_normalized_edge_for_entry
                         and refreshed_stablecoin_regime_required_raw_edge_bps is not None
                     ):
-                        min_entry_edge_bps = refreshed_stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps
+                        min_entry_edge_bps = max(
+                            min_entry_edge_bps,
+                            refreshed_stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps,
+                        )
                     if not refreshed_stablecoin_filter_ok:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
@@ -10309,6 +10426,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-basis-negative-direction-entry-penalty-bps", type=float, default=4.0)
     parser.add_argument("--live-inventory-basis-negative-direction-abs-penalty-bps", type=float, default=2.0)
     parser.add_argument("--live-inventory-basis-min-entry-quality-score-bps", type=float, default=0.0)
+    parser.add_argument(
+        "--live-inventory-basis-dynamic-entry-threshold",
+        action="store_true",
+        help="Use current spread, recent slippage/shortfall, exit target, and noise buffer to raise the basis entry threshold above the static floor.",
+    )
+    parser.add_argument("--live-inventory-basis-dynamic-entry-noise-buffer-bps", type=float, default=0.0)
+    parser.add_argument("--live-inventory-basis-spread-regime-penalty-multiplier", type=float, default=1.0)
     parser.add_argument("--live-inventory-basis-sample-move-penalty-multiplier", type=float, default=1.0)
     parser.add_argument("--live-inventory-basis-watch-candidate", action="store_true")
     parser.add_argument("--live-inventory-basis-watch-edge-bps", type=float, default=7.5)
@@ -10651,6 +10775,12 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-basis-negative-direction-entry-penalty-bps must be >= 0")
         if args.live_inventory_basis_negative_direction_abs_penalty_bps < 0:
             parser.error("--live-inventory-basis-negative-direction-abs-penalty-bps must be >= 0")
+        if args.live_inventory_basis_min_entry_quality_score_bps < 0:
+            parser.error("--live-inventory-basis-min-entry-quality-score-bps must be >= 0")
+        if args.live_inventory_basis_dynamic_entry_noise_buffer_bps < 0:
+            parser.error("--live-inventory-basis-dynamic-entry-noise-buffer-bps must be >= 0")
+        if args.live_inventory_basis_spread_regime_penalty_multiplier < 0:
+            parser.error("--live-inventory-basis-spread-regime-penalty-multiplier must be >= 0")
         if args.live_inventory_basis_sample_move_penalty_multiplier < 0:
             parser.error("--live-inventory-basis-sample-move-penalty-multiplier must be >= 0")
         if args.live_inventory_basis_watch_edge_bps < 0:
