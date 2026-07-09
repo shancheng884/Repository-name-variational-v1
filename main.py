@@ -3359,6 +3359,7 @@ class VariationalToLighterRuntime:
         self.dashboard_console.print(Panel("\n".join(lines), title=title, border_style="yellow"))
 
     def track_background_task(self, task: asyncio.Task[None], name: str) -> asyncio.Task[None]:
+        self.logger.info("background_task_started name=%s", name)
         task.add_done_callback(lambda completed: self._handle_background_task_done(name, completed))
         return task
 
@@ -9408,10 +9409,19 @@ class VariationalToLighterRuntime:
         )
 
     async def paper_loop(self) -> None:
+        self.logger.info(
+            "paper_loop_started live_inventory=%s auto_live=%s paper_mode=%s interval_seconds=%s",
+            self.is_live_inventory_enabled(),
+            self.is_auto_live_enabled(),
+            self.is_paper_mode(),
+            self.paper_interval_seconds,
+        )
         try:
             while not self.stop_flag:
                 snapshot_timeout_seconds = getattr(self, "live_inventory_snapshot_timeout_seconds", 10.0)
                 try:
+                    if self.is_live_inventory_enabled():
+                        self.logger.info("live_inventory_snapshot_fetch_started timeout_seconds=%s", snapshot_timeout_seconds)
                     snapshot = await asyncio.wait_for(
                         self.get_cross_spread_snapshot(),
                         snapshot_timeout_seconds,
@@ -9449,6 +9459,8 @@ class VariationalToLighterRuntime:
                     await self.maybe_close_paper_position(snapshot)
                     await self.maybe_enter_paper_position(snapshot)
                     await self.maybe_run_auto_live(snapshot)
+                elif self.is_live_inventory_enabled():
+                    self.logger.warning("live_inventory_snapshot_none")
                 await asyncio.sleep(self.paper_interval_seconds)
         except asyncio.CancelledError:
             raise
