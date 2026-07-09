@@ -14,6 +14,7 @@ def test_live_tool_adds_basis_addon_flags_for_three_lots() -> None:
     assert command[command.index("--live-inventory-basis-min-entry-edge-bps") + 1] == "7"
     assert command[command.index("--live-inventory-basis-min-abs-entry-bps") + 1] == "7"
     assert command[command.index("--live-inventory-basis-dynamic-entry-noise-buffer-bps") + 1] == "2.0"
+    assert command[command.index("--live-inventory-snapshot-timeout-seconds") + 1] == "10"
     assert command[command.index("--live-inventory-basis-addon-min-basis-improvement-bps") + 1] == "2.0"
 
 

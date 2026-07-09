@@ -22,5 +22,6 @@
   "min_normalized_entry_edge_bps": "1.0",
   "min_normalized_filter_edge_bps": "0.5",
   "entry_lighter_fill_timeout_seconds": "3",
+  "snapshot_timeout_seconds": "10",
   "addon_min_basis_improvement_bps": "2.0"
 }

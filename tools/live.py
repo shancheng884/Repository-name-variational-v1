@@ -45,6 +45,7 @@ class LiveConfig:
     min_normalized_entry_edge_bps: str = "1.0"
     min_normalized_filter_edge_bps: str = "0.5"
     entry_lighter_fill_timeout_seconds: str = "3"
+    snapshot_timeout_seconds: str = "10"
     addon_min_basis_improvement_bps: str = "2.0"
 
 
@@ -185,6 +186,7 @@ def load_config(path: Path) -> LiveConfig:
         min_normalized_entry_edge_bps=_positive_decimal(raw, "min_normalized_entry_edge_bps"),
         min_normalized_filter_edge_bps=_positive_decimal(raw, "min_normalized_filter_edge_bps"),
         entry_lighter_fill_timeout_seconds=_positive_decimal(raw, "entry_lighter_fill_timeout_seconds"),
+        snapshot_timeout_seconds=_positive_decimal(raw, "snapshot_timeout_seconds"),
         addon_min_basis_improvement_bps=_positive_decimal(raw, "addon_min_basis_improvement_bps"),
     )
 
@@ -257,6 +259,8 @@ def build_main_command(asset: str, config: LiveConfig) -> list[str]:
         config.min_normalized_filter_edge_bps,
         "--live-inventory-entry-lighter-fill-timeout-seconds",
         config.entry_lighter_fill_timeout_seconds,
+        "--live-inventory-snapshot-timeout-seconds",
+        config.snapshot_timeout_seconds,
         "--live-inventory-i-confirm-flat-start",
         "--live-inventory-i-accept-basis-real-diagnostic",
     ]

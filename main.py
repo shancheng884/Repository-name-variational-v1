@@ -9380,7 +9380,29 @@ class VariationalToLighterRuntime:
     async def paper_loop(self) -> None:
         try:
             while not self.stop_flag:
-                snapshot = await self.get_cross_spread_snapshot()
+                try:
+                    snapshot = await asyncio.wait_for(
+                        self.get_cross_spread_snapshot(),
+                        timeout=self.live_inventory_snapshot_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        "live_inventory_snapshot_timeout timeout_seconds=%s asset=%s ticker=%s",
+                        self.live_inventory_snapshot_timeout_seconds,
+                        self.variational_ticker or self.ticker or "-",
+                        self.ticker or "-",
+                    )
+                    if self.is_live_inventory_enabled():
+                        with contextlib.suppress(Exception):
+                            await self.append_live_inventory_log(
+                                "live_inventory_snapshot_timeout",
+                                {
+                                    "asset": self.variational_ticker or self.ticker or "-",
+                                    "timeout_seconds": self.live_inventory_snapshot_timeout_seconds,
+                                },
+                            )
+                    await asyncio.sleep(self.paper_interval_seconds)
+                    continue
                 if snapshot is not None:
                     await self.append_market_sample(snapshot)
                     await self.maybe_run_paper_inventory(snapshot)
@@ -10486,6 +10508,12 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to wait for Lighter final fill during live-inventory entry before auto-closing the Var leg. Default: 3.0",
     )
     parser.add_argument(
+        "--live-inventory-snapshot-timeout-seconds",
+        type=float,
+        default=10.0,
+        help="Maximum seconds allowed for one live-inventory quote/book snapshot fetch before logging a timeout. Default: 10.0",
+    )
+    parser.add_argument(
         "--live-inventory-reconcile-on-start",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -10723,6 +10751,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-max-lighter-book-age-seconds must be >= 0")
         if args.live_inventory_exit_blocked_log_throttle_seconds < 0:
             parser.error("--live-inventory-exit-blocked-log-throttle-seconds must be >= 0")
+        if args.live_inventory_snapshot_timeout_seconds <= 0:
+            parser.error("--live-inventory-snapshot-timeout-seconds must be > 0")
         if args.live_inventory_min_hold_samples < 0:
             parser.error("--live-inventory-min-hold-samples must be >= 0")
         if args.live_inventory_max_hold_samples <= 0:
