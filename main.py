@@ -9380,15 +9380,16 @@ class VariationalToLighterRuntime:
     async def paper_loop(self) -> None:
         try:
             while not self.stop_flag:
+                snapshot_timeout_seconds = getattr(self, "live_inventory_snapshot_timeout_seconds", 10.0)
                 try:
                     snapshot = await asyncio.wait_for(
                         self.get_cross_spread_snapshot(),
-                        self.live_inventory_snapshot_timeout_seconds,
+                        snapshot_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
                     self.logger.warning(
                         "live_inventory_snapshot_timeout timeout_seconds=%s asset=%s ticker=%s",
-                        self.live_inventory_snapshot_timeout_seconds,
+                        snapshot_timeout_seconds,
                         self.variational_ticker or self.ticker or "-",
                         self.ticker or "-",
                     )
@@ -9398,7 +9399,7 @@ class VariationalToLighterRuntime:
                                 "live_inventory_snapshot_timeout",
                                 {
                                     "asset": self.variational_ticker or self.ticker or "-",
-                                    "timeout_seconds": self.live_inventory_snapshot_timeout_seconds,
+                                    "timeout_seconds": snapshot_timeout_seconds,
                                 },
                             )
                     await asyncio.sleep(self.paper_interval_seconds)
