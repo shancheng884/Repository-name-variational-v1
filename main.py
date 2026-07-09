@@ -9383,7 +9383,7 @@ class VariationalToLighterRuntime:
                 try:
                     snapshot = await asyncio.wait_for(
                         self.get_cross_spread_snapshot(),
-                        timeout=self.live_inventory_snapshot_timeout_seconds,
+                        self.live_inventory_snapshot_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
                     self.logger.warning(
