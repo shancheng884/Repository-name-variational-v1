@@ -40,6 +40,7 @@ class LiveConfig:
     spread_regime_penalty_multiplier: str = "1.0"
     min_exit_pnl_bps: str = "3.0"
     min_signal_reverted_exit_pnl_bps: str = "3.0"
+    reversion_signal_exit_min_pnl_bps: str = "-1.0"
     profit_take_pnl_bps: str = "5.0"
     entry_confirm_samples: int = 1
     max_sample_move_bps: str = "3"
@@ -198,6 +199,7 @@ def load_config(path: Path) -> LiveConfig:
         spread_regime_penalty_multiplier=_positive_decimal(raw, "spread_regime_penalty_multiplier"),
         min_exit_pnl_bps=_positive_decimal(raw, "min_exit_pnl_bps"),
         min_signal_reverted_exit_pnl_bps=_positive_decimal(raw, "min_signal_reverted_exit_pnl_bps"),
+        reversion_signal_exit_min_pnl_bps=_decimal(raw, "reversion_signal_exit_min_pnl_bps"),
         profit_take_pnl_bps=_positive_decimal(raw, "profit_take_pnl_bps"),
         entry_confirm_samples=_positive_int(raw, "entry_confirm_samples", max_value=20),
         max_sample_move_bps=_positive_decimal(raw, "max_sample_move_bps"),
@@ -327,6 +329,8 @@ def build_main_command(asset: str, config: LiveConfig) -> list[str]:
                 config.reversion_max_entry_roundtrip_cost_bps,
                 "--live-inventory-basis-reversion-context-gap-bps",
                 config.reversion_context_gap_bps,
+                "--live-inventory-basis-reversion-signal-exit-min-pnl-bps",
+                config.reversion_signal_exit_min_pnl_bps,
             ]
         )
     if effective_max_total_lots > 1:

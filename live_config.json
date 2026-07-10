@@ -17,6 +17,7 @@
   "spread_regime_penalty_multiplier": "1.0",
   "min_exit_pnl_bps": "3.0",
   "min_signal_reverted_exit_pnl_bps": "3.0",
+  "reversion_signal_exit_min_pnl_bps": "-1.0",
   "profit_take_pnl_bps": "5.0",
   "entry_confirm_samples": 1,
   "max_sample_move_bps": "3",

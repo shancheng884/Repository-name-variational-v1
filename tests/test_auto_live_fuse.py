@@ -396,6 +396,22 @@ def test_live_inventory_blocks_spread_reverted_exit_until_entry_cost_confirmed(t
     asyncio.run(run())
 
 
+def test_reversion_signal_exit_floor_is_separate_from_normal_exit_floor() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_min_signal_reverted_exit_pnl_bps = Decimal("3")
+    runtime.live_inventory_basis_reversion_signal_exit_min_pnl_bps = Decimal("-1")
+
+    runtime.live_inventory_basis_reversion_mode = False
+    assert runtime.live_inventory_signal_reverted_exit_min_pnl_bps(
+        time_decayed_min_exit_pnl_bps=Decimal("0.03")
+    ) == Decimal("3")
+
+    runtime.live_inventory_basis_reversion_mode = True
+    assert runtime.live_inventory_signal_reverted_exit_min_pnl_bps(
+        time_decayed_min_exit_pnl_bps=Decimal("0.03")
+    ) == Decimal("-1")
+
+
 def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_path) -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)

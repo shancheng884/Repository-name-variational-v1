@@ -20,6 +20,7 @@ def test_live_tool_adds_basis_addon_flags_for_three_lots() -> None:
     assert command[command.index("--live-inventory-basis-dynamic-entry-noise-buffer-bps") + 1] == "2.0"
     assert command[command.index("--live-inventory-snapshot-timeout-seconds") + 1] == "10"
     assert command[command.index("--live-inventory-basis-addon-min-basis-improvement-bps") + 1] == "2.0"
+    assert "--live-inventory-basis-reversion-signal-exit-min-pnl-bps" not in command
 
 
 def test_live_tool_omits_basis_addon_flags_for_single_lot() -> None:
@@ -45,6 +46,7 @@ def test_live_tool_reversion_forces_one_small_lot_and_omits_normalized_primary()
             max_total_lots=3,
             max_total_inventory_notional_usd="60",
             reversion_min_deviation_bps="1.2",
+            reversion_signal_exit_min_pnl_bps="-0.8",
         ),
     )
 
@@ -59,6 +61,7 @@ def test_live_tool_reversion_forces_one_small_lot_and_omits_normalized_primary()
     assert command[command.index("--live-inventory-basis-max-var-quote-age-ms") + 1] == "1500"
     assert command[command.index("--live-inventory-max-lighter-book-age-seconds") + 1] == "2"
     assert command[command.index("--live-inventory-basis-reversion-min-deviation-bps") + 1] == "1.2"
+    assert command[command.index("--live-inventory-basis-reversion-signal-exit-min-pnl-bps") + 1] == "-0.8"
 
 
 def test_live_tool_reversion_state_uses_one_cycle_cap(tmp_path, monkeypatch) -> None:

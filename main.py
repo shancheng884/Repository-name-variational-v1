@@ -865,6 +865,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_short_min_abs_entry_bps = Decimal(str(args.live_inventory_basis_short_min_abs_entry_bps))
         self.live_inventory_basis_min_exit_pnl_bps = Decimal(str(args.live_inventory_basis_min_exit_pnl_bps))
         self.live_inventory_basis_min_signal_reverted_exit_pnl_bps = Decimal(str(args.live_inventory_basis_min_signal_reverted_exit_pnl_bps))
+        self.live_inventory_basis_reversion_signal_exit_min_pnl_bps = Decimal(
+            str(args.live_inventory_basis_reversion_signal_exit_min_pnl_bps)
+        )
         self.live_inventory_basis_signal_exit_watch_samples = int(args.live_inventory_basis_signal_exit_watch_samples)
         self.live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps = Decimal(
             str(args.live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps)
@@ -1645,6 +1648,14 @@ class VariationalToLighterRuntime:
             return base_min_exit_pnl_bps
         progress = min(Decimal("1"), Decimal(holding_samples - self.live_inventory_min_hold_samples) / Decimal(decay_samples))
         return base_min_exit_pnl_bps - (base_min_exit_pnl_bps - floor) * progress
+
+    def live_inventory_signal_reverted_exit_min_pnl_bps(self, *, time_decayed_min_exit_pnl_bps: Decimal) -> Decimal:
+        if getattr(self, "live_inventory_basis_reversion_mode", False):
+            return self.live_inventory_basis_reversion_signal_exit_min_pnl_bps
+        return max(
+            time_decayed_min_exit_pnl_bps,
+            self.live_inventory_basis_min_signal_reverted_exit_pnl_bps,
+        )
 
     def should_log_live_inventory_exit_blocked(self, *, lot_id: Any, reason: str) -> bool:
         throttle = self.live_inventory_exit_blocked_log_throttle_seconds
@@ -2607,6 +2618,10 @@ class VariationalToLighterRuntime:
             "entry_basis_bps": context.get("basis_bps"),
             "entry_z": context.get("z"),
             "entry_direction_signal": context.get("direction_signal"),
+            "entry_reversion_median_5m_bps": context.get("entry_reversion_median_5m_bps"),
+            "entry_reversion_median_30m_bps": context.get("entry_reversion_median_30m_bps"),
+            "entry_reversion_median_60m_bps": context.get("entry_reversion_median_60m_bps"),
+            "entry_reversion_deviation_bps": context.get("entry_reversion_deviation_bps"),
             "entry_var_side": context.get("var_side"),
             "entry_var_order_quote_id": context.get("quote_id"),
             "entry_var_order_quote_bid": context.get("var_bid"),
@@ -2640,6 +2655,10 @@ class VariationalToLighterRuntime:
                 "entry_basis_bps": context.get("basis_bps"),
                 "entry_z": context.get("z"),
                 "entry_direction_signal": context.get("direction_signal"),
+                "entry_reversion_median_5m_bps": context.get("entry_reversion_median_5m_bps"),
+                "entry_reversion_median_30m_bps": context.get("entry_reversion_median_30m_bps"),
+                "entry_reversion_median_60m_bps": context.get("entry_reversion_median_60m_bps"),
+                "entry_reversion_deviation_bps": context.get("entry_reversion_deviation_bps"),
                 "entry_kind": lot["entry_kind"],
                 "var_price": decimal_to_str(var_fill_price),
                 "lighter_price": decimal_to_str(lighter_fill_price),
@@ -5071,6 +5090,7 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_addon_min_basis_improvement_bps",
             "live_inventory_basis_min_exit_pnl_bps",
             "live_inventory_basis_min_signal_reverted_exit_pnl_bps",
+            "live_inventory_basis_reversion_signal_exit_min_pnl_bps",
             "live_inventory_basis_signal_exit_watch_samples",
             "live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps",
             "live_inventory_basis_size_ladder_notionals_usd",
@@ -7738,7 +7758,25 @@ class VariationalToLighterRuntime:
                         "var_bid": decimal_to_str(var_bid),
                         "var_ask": decimal_to_str(var_ask),
                         "entry_lighter_depth": preflight_context.get("lighter_order_book_depth"),
-                        "entry_kind": "basis_addon" if addon_direction is not None else "basis_initial",
+                        "entry_kind": (
+                            "basis_reversion_initial"
+                            if self.live_inventory_basis_reversion_mode
+                            else "basis_addon"
+                            if addon_direction is not None
+                            else "basis_initial"
+                        ),
+                        "entry_reversion_median_5m_bps": decimal_to_str(
+                            reversion_medians[300] if self.live_inventory_basis_reversion_mode else None
+                        ),
+                        "entry_reversion_median_30m_bps": decimal_to_str(
+                            reversion_medians[1800] if self.live_inventory_basis_reversion_mode else None
+                        ),
+                        "entry_reversion_median_60m_bps": decimal_to_str(
+                            reversion_medians[3600] if self.live_inventory_basis_reversion_mode else None
+                        ),
+                        "entry_reversion_deviation_bps": decimal_to_str(
+                            reversion_deviation_bps if self.live_inventory_basis_reversion_mode else None
+                        ),
                         "lighter_submitted_before_var_fill": self.live_inventory_basis_entry_mode == LIVE_INVENTORY_ENTRY_MODE_CONCURRENT,
                     }
                     pending_match = PendingLiveInventoryVarFillMatch(
@@ -7959,7 +7997,22 @@ class VariationalToLighterRuntime:
                 await self.persist_live_inventory_memory(reason="basis_dry_entry_decision" if self.live_inventory_dry_decisions else "basis_entry_submitted")
                 await self.append_live_inventory_log(
                     "live_inventory_dry_entered" if self.live_inventory_dry_decisions else "live_inventory_entered",
-                    {**state_payload, "lot_id": lot_id, "basis_trace_id": basis_trace_id, "direction": direction, "qty": lot["qty"], "edge_bps": decimal_to_str(edge_bps), "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps), "var_submit_ms": var_submit_ms, "lighter_submit_ms": lighter_submit_ms, "entry_kind": lot["entry_kind"]},
+                    {
+                        **state_payload,
+                        "lot_id": lot_id,
+                        "basis_trace_id": basis_trace_id,
+                        "direction": direction,
+                        "qty": lot["qty"],
+                        "edge_bps": decimal_to_str(edge_bps),
+                        "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                        "var_submit_ms": var_submit_ms,
+                        "lighter_submit_ms": lighter_submit_ms,
+                        "entry_kind": lot["entry_kind"],
+                        "entry_reversion_median_5m_bps": lot.get("entry_reversion_median_5m_bps"),
+                        "entry_reversion_median_30m_bps": lot.get("entry_reversion_median_30m_bps"),
+                        "entry_reversion_median_60m_bps": lot.get("entry_reversion_median_60m_bps"),
+                        "entry_reversion_deviation_bps": lot.get("entry_reversion_deviation_bps"),
+                    },
                 )
                 return
             if not self.live_inventory_open_lots:
@@ -8016,9 +8069,8 @@ class VariationalToLighterRuntime:
                 holding_samples=holding_samples,
                 base_min_exit_pnl_bps=self.live_inventory_basis_min_exit_pnl_bps,
             )
-            signal_reverted_min_exit_pnl_bps = max(
-                time_decayed_min_exit_pnl_bps,
-                self.live_inventory_basis_min_signal_reverted_exit_pnl_bps,
+            signal_reverted_min_exit_pnl_bps = self.live_inventory_signal_reverted_exit_min_pnl_bps(
+                time_decayed_min_exit_pnl_bps=time_decayed_min_exit_pnl_bps,
             )
             effective_min_exit_pnl_bps = signal_reverted_min_exit_pnl_bps + self.live_inventory_basis_exit_safety_buffer_bps + dynamic_exit_buffer_bps
             signal_reverted = can_exit_on_reversion and (
@@ -10783,6 +10835,12 @@ def parse_args() -> argparse.Namespace:
         help="Floor for normal signal-reverted basis exits after time decay. Default: 0 prevents time decay from turning signal_reverted exits negative.",
     )
     parser.add_argument(
+        "--live-inventory-basis-reversion-signal-exit-min-pnl-bps",
+        type=float,
+        default=-1.0,
+        help="Reversion-only estimated PnL floor for exiting after the 5m deviation has reverted. Default: -1 bps.",
+    )
+    parser.add_argument(
         "--live-inventory-basis-signal-exit-watch-samples",
         type=int,
         default=0,
@@ -11229,6 +11287,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-basis-min-exit-pnl-bps must be >= 0")
         if args.live_inventory_basis_min_signal_reverted_exit_pnl_bps < 0:
             parser.error("--live-inventory-basis-min-signal-reverted-exit-pnl-bps must be >= 0")
+        if args.live_inventory_basis_reversion_signal_exit_min_pnl_bps < -5:
+            parser.error("--live-inventory-basis-reversion-signal-exit-min-pnl-bps must be >= -5")
         if args.live_inventory_basis_signal_exit_watch_samples < 0:
             parser.error("--live-inventory-basis-signal-exit-watch-samples must be >= 0")
         try:
