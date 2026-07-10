@@ -1,6 +1,7 @@
 {
   "live_max_notional_usd": "25",
   "lot_notional_usd": "20",
+  "max_total_inventory_notional_usd": "60",
   "max_cycles": 1,
   "max_lots": 1,
   "max_total_lots": 3,

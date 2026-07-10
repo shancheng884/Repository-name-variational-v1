@@ -52,6 +52,14 @@ def latest_run_filter(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if str(row.get("run_id") or "") == latest_run_id]
 
 
+def basis_state_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    states = [row for row in rows if row.get("event") == "live_inventory_basis_state" and row.get("asset")]
+    if states:
+        return states
+    # Compatibility fallback for older logs that did not emit a state row per sample.
+    return [row for row in rows if row.get("event") == "live_inventory_entry_blocked" and row.get("asset")]
+
+
 def depth_slippage(row: dict[str, Any], key: str) -> Decimal | None:
     value = row.get(key)
     if not isinstance(value, dict):
@@ -255,9 +263,8 @@ def _direction_basis_pnl_bps(direction: str, entry_basis: Decimal, current_basis
 def dynamic_cost_summary(rows: list[dict[str, Any]], *, asset_filter: str | None = None) -> dict[str, Any]:
     signal_rows = [
         row
-        for row in rows
-        if row.get("event") in {"live_inventory_basis_state", "live_inventory_entry_blocked"}
-        and row.get("asset")
+        for row in basis_state_rows(rows)
+        if row.get("asset")
         and (asset_filter is None or str(row.get("asset") or "").upper() == asset_filter.upper())
     ]
     var_spreads: list[Decimal] = []
@@ -341,13 +348,13 @@ def print_ladder_what_if(
     profit_take_pnl: Decimal,
 ) -> None:
     print("== ladder_what_if ==")
+    print("model=rough_latest_cost_not_execution_replay")
     cost = dynamic_cost_summary(rows, asset_filter=asset)
     dynamic_cost = cost["dynamic_roundtrip_cost"] or Decimal("0")
     signal_rows = [
         row
-        for row in rows
-        if row.get("event") in {"live_inventory_basis_state", "live_inventory_entry_blocked"}
-        and row.get("asset")
+        for row in basis_state_rows(rows)
+        if row.get("asset")
         and (asset is None or str(row.get("asset") or "").upper() == asset.upper())
     ]
     open_lots: list[dict[str, Any]] = []
@@ -435,12 +442,7 @@ def print_ladder_what_if(
 
 def print_basis_regime(rows: list[dict[str, Any]]) -> None:
     regimes = build_basis_regimes(rows)
-    signal_rows = [
-        row
-        for row in rows
-        if row.get("event") in {"live_inventory_basis_state", "live_inventory_entry_blocked"}
-        and row.get("asset")
-    ]
+    signal_rows = basis_state_rows(rows)
     print("== basis_regime ==")
     print(f"signal_rows={len(signal_rows)}")
     if not regimes:
@@ -473,12 +475,7 @@ def print_basis_regime(rows: list[dict[str, Any]]) -> None:
 
 
 def build_basis_regimes(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    signal_rows = [
-        row
-        for row in rows
-        if row.get("event") in {"live_inventory_basis_state", "live_inventory_entry_blocked"}
-        and row.get("asset")
-    ]
+    signal_rows = basis_state_rows(rows)
     by_asset: dict[str, list[dict[str, Any]]] = {}
     for row in signal_rows:
         by_asset.setdefault(str(row.get("asset") or "-").upper(), []).append(row)
@@ -491,7 +488,12 @@ def build_basis_regimes(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
         best_norm = _best_edges(asset_rows, normalized=True)
         sample_moves = _abs_values(_collect_decimal(asset_rows, "basis_sample_move_bps"))
         z_values = _collect_decimal(asset_rows, "z")
-        blocked = Counter(str(row.get("reason") or "-") for row in asset_rows if row.get("event") == "live_inventory_entry_blocked")
+        blocked = Counter(
+            str(row.get("reason") or "-")
+            for row in rows
+            if row.get("event") == "live_inventory_entry_blocked"
+            and str(row.get("asset") or "-").upper() == asset
+        )
         latest = asset_rows[-1]
         latest_best_raw = max(
             [value for value in [to_decimal(latest.get("long_edge_bps")), to_decimal(latest.get("short_edge_bps"))] if value is not None],
@@ -806,14 +808,28 @@ def main() -> int:
     events = Counter(str(row.get("event") or "-") for row in rows)
     assets = Counter(str(row.get("asset") or "-").upper() for row in rows if row.get("asset"))
     blocked_reasons = Counter(str(row.get("reason") or "unknown") for row in rows if row.get("event") == "live_inventory_entry_blocked")
+    state_rows = basis_state_rows(rows)
+    pre_gate_large_moves = sum(row.get("basis_sample_move_ok") is False for row in state_rows)
+    qualified_large_move_blocks = sum(
+        row.get("event") == "live_inventory_entry_blocked"
+        and row.get("reason") == "basis_sample_move_too_large"
+        and row.get("candidate_qualified") is True
+        for row in rows
+    )
 
     actual_pnl_bps: list[Decimal] = []
     actual_pnl_usd: list[Decimal] = []
     shortfalls: list[Decimal] = []
     entry_slippage: list[Decimal] = []
     exit_slippage: list[Decimal] = []
-    sample_moves: list[Decimal] = []
-    normalized_edges: list[Decimal] = []
+    all_sample_moves = _abs_values(_collect_decimal(basis_state_rows(rows), "basis_sample_move_bps"))
+    blocked_sample_moves: list[Decimal] = []
+    normalized_edges = [
+        value
+        for row in basis_state_rows(rows)
+        for key in ("normalized_long_edge_bps", "normalized_short_edge_bps")
+        if (value := to_decimal(row.get(key))) is not None
+    ]
     blocked_scores: list[tuple[Decimal, str, str, str]] = []
     access_restricted = 0
 
@@ -835,10 +851,7 @@ def main() -> int:
                 exit_slippage.append(value)
         if event == "live_inventory_entry_blocked":
             if (move := to_decimal(row.get("basis_sample_move_bps"))) is not None:
-                sample_moves.append(abs(move))
-            for key in ("normalized_long_edge_bps", "normalized_short_edge_bps"):
-                if (value := to_decimal(row.get(key))) is not None:
-                    normalized_edges.append(value)
+                blocked_sample_moves.append(abs(move))
             score, direction = best_entry_score(row, Decimal("5.5"), Decimal("0.5"))
             if score is not None:
                 blocked_scores.append((score, str(row.get("asset") or "-").upper(), direction, str(row.get("reason") or "unknown")))
@@ -885,6 +898,10 @@ def main() -> int:
     )
     print(f"assets={dict(assets.most_common())}")
     print(f"blocked_reasons={dict(blocked_reasons.most_common(args.top))}")
+    print(
+        f"large_move_pre_gate_samples={pre_gate_large_moves} "
+        f"qualified_large_move_blocks={qualified_large_move_blocks}"
+    )
     print(f"access_restricted_rows={access_restricted}")
 
     print("== pnl ==")
@@ -903,14 +920,15 @@ def main() -> int:
     print("== signal_quality ==")
     latest_signal_row = next((row for row in reversed(rows) if row.get("event") == "live_inventory_basis_state"), None)
     print(
-        f"sample_move_p50={fmt_decimal(percentile(sample_moves, Decimal('50')))} "
-        f"sample_move_p80={fmt_decimal(percentile(sample_moves, Decimal('80')))} "
+        f"all_sample_move_p50={fmt_decimal(percentile(all_sample_moves, Decimal('50')))} "
+        f"all_sample_move_p80={fmt_decimal(percentile(all_sample_moves, Decimal('80')))} "
+        f"blocked_event_move_p80={fmt_decimal(percentile(blocked_sample_moves, Decimal('80')))} "
         f"normalized_edge_p80={fmt_decimal(percentile(normalized_edges, Decimal('80')))} "
         f"latest_max_sample_move={fmt_decimal(to_decimal(latest_signal_row.get('basis_max_sample_move_bps')) if latest_signal_row else None)} "
         f"latest_sample_move_p80={fmt_decimal(to_decimal(latest_signal_row.get('basis_sample_move_p80_bps')) if latest_signal_row else None)}"
     )
     for index, (score, asset, direction, reason) in enumerate(sorted(blocked_scores, reverse=True)[: args.top], start=1):
-        print(f"blocked_candidate_{index}=asset={asset} dir={direction} score={fmt_decimal(score)} reason={reason}")
+        print(f"blocked_observation_{index}=asset={asset} dir={direction} score={fmt_decimal(score)} reason={reason}")
     if args.what_if:
         print_what_if(rows)
     if args.basis_regime:
@@ -939,18 +957,20 @@ def main() -> int:
             profit_take_pnl=ladder_profit_take,
         )
 
-    recommendation = "no_change"
+    operational_readiness = "unknown"
     if events["live_inventory_manual_review_required"] or status == "manual_review_required":
-        recommendation = "manual_review_required_check_both_exchanges"
+        operational_readiness = "manual_review_required_check_both_exchanges"
     elif status == "missing":
-        recommendation = "state_missing_manual_exchange_flat_confirmation_required_before_start"
+        operational_readiness = "state_missing_manual_exchange_flat_confirmation_required_before_start"
     elif status != "flat" or open_lots or pending_actions:
-        recommendation = "do_not_start_new_live_state_not_flat"
+        operational_readiness = "not_ready_state_not_flat"
     elif access_restricted:
-        recommendation = "do_not_run_probe_access_restricted_detected"
+        operational_readiness = "not_ready_access_restricted_detected"
     elif not processes:
-        recommendation = "ok_to_start_live_after_manual_exchange_flat_confirmation"
-    print(f"recommendation={recommendation}")
+        operational_readiness = "flat_manual_exchange_confirmation_required"
+    else:
+        operational_readiness = "live_process_running"
+    print(f"operational_readiness={operational_readiness}")
 
     runtime_tail = tail_text(RUNTIME_LOG, 5)
     if runtime_tail:

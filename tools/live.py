@@ -24,6 +24,7 @@ LIVE_CONFIG = ROOT / "live_config.json"
 class LiveConfig:
     live_max_notional_usd: str = "25"
     lot_notional_usd: str = "20"
+    max_total_inventory_notional_usd: str = "60"
     max_cycles: int = 1
     max_lots: int = 1
     max_total_lots: int = 3
@@ -175,6 +176,7 @@ def load_config(path: Path) -> LiveConfig:
     return LiveConfig(
         live_max_notional_usd=_positive_decimal(raw, "live_max_notional_usd"),
         lot_notional_usd=_positive_decimal(raw, "lot_notional_usd"),
+        max_total_inventory_notional_usd=_positive_decimal(raw, "max_total_inventory_notional_usd"),
         max_cycles=_positive_int(raw, "max_cycles", max_value=10),
         max_lots=_positive_int(raw, "max_lots", max_value=10),
         max_total_lots=_positive_int(raw, "max_total_lots", max_value=10),
@@ -226,6 +228,8 @@ def build_main_command(asset: str, config: LiveConfig) -> list[str]:
         "concurrent",
         "--live-inventory-lot-notional-usd",
         config.lot_notional_usd,
+        "--live-inventory-max-total-notional-usd",
+        config.max_total_inventory_notional_usd,
         "--live-inventory-max-cycles",
         str(config.max_cycles),
         "--live-inventory-max-lots",

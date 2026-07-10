@@ -878,6 +878,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_max_lighter_book_age_seconds = 0.0
     runtime.live_inventory_exit_blocked_log_throttle_seconds = 0.0
     runtime.live_inventory_lot_notional_usd = Decimal("10")
+    runtime.live_inventory_max_total_notional_usd = Decimal("10")
     runtime.live_inventory_max_total_lots = 1
     runtime.live_inventory_min_hold_samples = 0
     runtime.live_inventory_max_hold_samples = 300
@@ -971,6 +972,7 @@ def test_live_inventory_log_includes_run_id_and_config(tmp_path) -> None:
     assert rows[0]["event"] == "live_inventory_run_config"
     assert rows[0]["run_id"] == "test-run-id"
     assert rows[0]["config"]["live_inventory_signal_mode"] == "basis"
+    assert rows[0]["config"]["live_inventory_max_total_notional_usd"] == "10"
     assert rows[1]["event"] == "live_inventory_test_event"
     assert rows[1]["run_id"] == "test-run-id"
 
@@ -1100,6 +1102,17 @@ def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tm
         assert rows[-1]["entry_confirmation_mode"] == "concurrent_var_and_lighter_then_var_fill_confirmed"
 
     asyncio.run(run())
+
+
+def test_live_inventory_open_notional_uses_final_fill_and_conservative_legacy_fallback(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_lot_notional_usd = Decimal("10")
+    runtime.live_inventory_open_lots = [
+        {"qty": "0.0002", "entry_var_fill_price": "60000"},
+        {"qty": "invalid", "entry_var_fill_price": "60000"},
+    ]
+
+    assert runtime.live_inventory_open_notional_usd() == Decimal("22")
 
 
 def test_live_inventory_basis_abs_entry_threshold_blocks_thin_basis(tmp_path) -> None:
@@ -2284,6 +2297,39 @@ def test_live_inventory_entry_blocks_below_lighter_min_quote_before_submit(tmp_p
         assert runtime.live_inventory_completed_cycles == 0
         assert state["status"] == "flat"
         assert state["last_blocked_reason"] == "hedge_below_lighter_min_quote_amount"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_entry_blocks_below_lighter_min_base_after_quantize(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_lot_notional_usd = Decimal("10")
+        runtime.lighter_min_base_amount = Decimal("0.05")
+        runtime.live_inventory_lighter_submit_slippage_bps = Decimal("15")
+        submit_calls: list[str] = []
+
+        async def fake_send_variational_place_order(**_kwargs):
+            submit_calls.append("var")
+            return {"ok": True}
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            submit_calls.append("lighter")
+            return None, None
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        await runtime.maybe_run_live_inventory(_inventory_entry_snapshot())
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+
+        assert submit_calls == []
+        assert runtime.live_inventory_open_lots == []
+        assert state["status"] == "flat"
+        assert state["last_blocked_reason"] == "hedge_below_lighter_min_base_amount"
+        assert Decimal(state["last_blocked_context"]["lighter_min_base_amount"]) == Decimal("0.05")
+        assert Decimal(state["last_blocked_context"]["qty"]) > Decimal("0")
 
     asyncio.run(run())
 

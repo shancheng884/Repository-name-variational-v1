@@ -827,6 +827,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_reset_state_after_manual_flat = bool(args.live_inventory_reset_state_after_manual_flat)
         self.live_inventory_auto_close_manual_review_position = bool(args.live_inventory_auto_close_manual_review_position)
         self.live_inventory_lot_notional_usd = Decimal(str(args.live_inventory_lot_notional_usd))
+        self.live_inventory_max_total_notional_usd = Decimal(str(args.live_inventory_max_total_notional_usd))
         self.live_inventory_max_lots = int(args.live_inventory_max_lots)
         self.live_inventory_max_total_lots = int(args.live_inventory_max_total_lots)
         self.live_inventory_entry_bps = Decimal(str(args.live_inventory_entry_bps))
@@ -1360,6 +1361,18 @@ class VariationalToLighterRuntime:
             "basis_sample_move_p90_bps": decimal_to_str(sample_p90),
             "basis_sample_move_dynamic_cap_bps": decimal_to_str(dynamic_cap),
         }
+
+    def live_inventory_open_notional_usd(self) -> Decimal:
+        total = Decimal("0")
+        for lot in self.live_inventory_open_lots:
+            qty = to_decimal(lot.get("qty"))
+            entry_price = to_decimal(lot.get("entry_var_fill_price"))
+            if qty is not None and qty > 0 and entry_price is not None and entry_price > 0:
+                total += qty * entry_price
+            else:
+                # Older persisted lots may lack final fill fields; reserve one lot conservatively.
+                total += self.live_inventory_lot_notional_usd
+        return total
 
     def live_inventory_direction_abs_threshold_bps(self, direction: str) -> Decimal:
         if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER and self.live_inventory_basis_long_min_abs_entry_bps > 0:
@@ -2955,7 +2968,7 @@ class VariationalToLighterRuntime:
                 getattr(
                     self,
                     "live_inventory_lighter_submit_slippage_bps",
-                    getattr(self, "live_inventory_lighter_slippage_bps", self.live_inventory_max_lighter_slippage_bps),
+                    self.live_inventory_max_lighter_slippage_bps,
                 )
             ),
             "live_inventory_lighter_exit_submit_slippage_bps": decimal_to_str(
@@ -4986,6 +4999,7 @@ class VariationalToLighterRuntime:
             "live_inventory_signal_mode",
             "live_inventory_dry_decisions",
             "live_inventory_lot_notional_usd",
+            "live_inventory_max_total_notional_usd",
             "live_inventory_max_lots",
             "live_inventory_max_total_lots",
             "live_inventory_max_cycles",
@@ -5102,7 +5116,7 @@ class VariationalToLighterRuntime:
             slippage_bps = getattr(
                 self,
                 "live_inventory_lighter_submit_slippage_bps",
-                getattr(self, "live_inventory_lighter_slippage_bps", self.live_inventory_max_lighter_slippage_bps),
+                self.live_inventory_max_lighter_slippage_bps,
             )
             if "exit" in role or bool(record.lighter_reduce_only):
                 slippage_bps = getattr(
@@ -6764,19 +6778,6 @@ class VariationalToLighterRuntime:
             if not warm:
                 self.live_inventory_basis_entry_confirm_counts.clear()
                 return
-            if not basis_sample_move_ok:
-                self.live_inventory_basis_entry_confirm_counts.clear()
-                await self.append_live_inventory_log(
-                    "live_inventory_entry_blocked",
-                    {
-                        **state_payload,
-                        "reason": "basis_sample_move_too_large",
-                        "basis_sample_move_bps": decimal_to_str(basis_sample_move_bps),
-                        "basis_max_sample_move_bps": decimal_to_str(basis_dynamic_max_sample_move_bps),
-                        **basis_sample_move_context,
-                    },
-                )
-                return
             candidates = (
                 (
                     DIRECTION_LONG_VAR_SHORT_LIGHTER,
@@ -6981,6 +6982,52 @@ class VariationalToLighterRuntime:
                 if roundtrip_bps < -self.live_inventory_basis_max_entry_roundtrip_cost_bps:
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     continue
+                if not basis_sample_move_ok:
+                    self.live_inventory_basis_entry_confirm_counts.clear()
+                    await self.append_live_inventory_log(
+                        "live_inventory_entry_blocked",
+                        {
+                            **state_payload,
+                            "reason": "basis_sample_move_too_large",
+                            "candidate_qualified": True,
+                            "candidate_qualification": "passed_except_sample_move",
+                            "direction": direction,
+                            "edge_bps": decimal_to_str(edge_bps),
+                            "raw_edge_bps": decimal_to_str(raw_edge_bps),
+                            "normalized_edge_bps": decimal_to_str(normalized_edge_bps),
+                            "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                            "min_entry_edge_bps": decimal_to_str(min_entry_edge_bps),
+                            "min_abs_entry_bps": decimal_to_str(min_abs_entry_bps),
+                            "basis_sample_move_bps": decimal_to_str(basis_sample_move_bps),
+                            "basis_max_sample_move_bps": decimal_to_str(basis_dynamic_max_sample_move_bps),
+                            **basis_sample_move_context,
+                            **dynamic_entry_threshold_context,
+                            **stablecoin_edge_context,
+                            **entry_quality_context,
+                            **negative_context,
+                        },
+                    )
+                    return
+                open_notional_usd = self.live_inventory_open_notional_usd()
+                proposed_total_notional_usd = open_notional_usd + self.live_inventory_lot_notional_usd
+                if (
+                    self.live_inventory_max_total_notional_usd > 0
+                    and proposed_total_notional_usd > self.live_inventory_max_total_notional_usd
+                ):
+                    self.live_inventory_basis_entry_confirm_counts.clear()
+                    await self.block_live_inventory_entry(
+                        asset=asset,
+                        reason="live_inventory_total_notional_exceeds_limit",
+                        context={
+                            **state_payload,
+                            "direction": direction,
+                            "open_notional_usd": decimal_to_str(open_notional_usd),
+                            "requested_notional_usd": decimal_to_str(self.live_inventory_lot_notional_usd),
+                            "proposed_total_notional_usd": decimal_to_str(proposed_total_notional_usd),
+                            "max_total_notional_usd": decimal_to_str(self.live_inventory_max_total_notional_usd),
+                        },
+                    )
+                    return
                 confirm_count = self.live_inventory_basis_entry_confirm_counts.get(direction, 0) + 1
                 self.live_inventory_basis_entry_confirm_counts[direction] = confirm_count
                 for other_direction in (DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER):
@@ -7235,6 +7282,20 @@ class VariationalToLighterRuntime:
                                 "direction": direction,
                                 "qty": decimal_to_str(qty),
                                 "var_amount": var_amount,
+                            },
+                        )
+                        return
+                    if self.lighter_min_base_amount is not None and submitted_qty < self.lighter_min_base_amount:
+                        await self.block_live_inventory_entry(
+                            asset=asset,
+                            reason="hedge_below_lighter_min_base_amount",
+                            context={
+                                **state_payload,
+                                "direction": direction,
+                                "qty": decimal_to_str(qty),
+                                "submitted_qty": decimal_to_str(submitted_qty),
+                                "var_amount": var_amount,
+                                "lighter_min_base_amount": decimal_to_str(self.lighter_min_base_amount),
                             },
                         )
                         return
@@ -10363,6 +10424,12 @@ def parse_args() -> argparse.Namespace:
         help="One-shot recovery: only for live_inventory manual_review caused by entry Lighter actual slippage exceeding the limit; submit reduce-only closes for both legs and exit.",
     )
     parser.add_argument("--live-inventory-lot-notional-usd", type=float, default=20.0)
+    parser.add_argument(
+        "--live-inventory-max-total-notional-usd",
+        type=float,
+        default=20.0,
+        help="Maximum aggregate Variational-side live inventory notional across open lots. Default: 20.",
+    )
     parser.add_argument("--live-inventory-max-lots", type=int, default=1)
     parser.add_argument("--live-inventory-max-total-lots", type=int, default=1)
     parser.add_argument("--live-inventory-entry-bps", type=float, default=50.0)
@@ -10790,6 +10857,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory V1 requires --lighter-prewarm-submit-ws")
         if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > live_inventory_max_lot_notional_usd:
             parser.error(f"--live-inventory-lot-notional-usd must be > 0 and <= {live_inventory_max_lot_notional_usd} in V1")
+        if args.live_inventory_max_total_notional_usd <= 0:
+            parser.error("--live-inventory-max-total-notional-usd must be > 0 in V1")
         if args.live_inventory_max_lots <= 0 or args.live_inventory_max_lots > 3:
             parser.error("--live-inventory-max-lots must be > 0 and <= 3 in V1")
         if args.live_inventory_max_total_lots <= 0 or args.live_inventory_max_total_lots > 3:
