@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left, bisect_right
 import subprocess
 import sys
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -362,6 +363,327 @@ def print_entry_semantics(
                 f"pnl_proxy_p50={fmt_decimal(percentile(pnl_values, Decimal('50')))} "
                 f"pnl_proxy_p80={fmt_decimal(percentile(pnl_values, Decimal('80')))} positive_pct={fmt_decimal(positive_pct)}"
             )
+
+
+V2_HORIZONS_SECONDS = (1, 3, 5, 10, 30, 60, 300)
+V2_DIRECTIONS = ("long_var_short_lighter", "short_var_long_lighter")
+V2_WINDOWS_SECONDS = (300, 1800, 3600)
+
+
+class _RollingMedian:
+    """Maintain a time-windowed median without using future observations."""
+
+    def __init__(self, window_seconds: int) -> None:
+        self.window_seconds = float(window_seconds)
+        self.queue: deque[tuple[float, Decimal]] = deque()
+        self.sorted_values: list[Decimal] = []
+
+    def _prune(self, timestamp: float) -> None:
+        cutoff = timestamp - self.window_seconds
+        while self.queue and self.queue[0][0] <= cutoff:
+            _, value = self.queue.popleft()
+            index = bisect_left(self.sorted_values, value)
+            if index < len(self.sorted_values) and self.sorted_values[index] == value:
+                self.sorted_values.pop(index)
+
+    def median_before(self, timestamp: float) -> Decimal | None:
+        self._prune(timestamp)
+        if not self.sorted_values:
+            return None
+        middle = len(self.sorted_values) // 2
+        if len(self.sorted_values) % 2:
+            return self.sorted_values[middle]
+        return (self.sorted_values[middle - 1] + self.sorted_values[middle]) / Decimal("2")
+
+    def add(self, timestamp: float, value: Decimal) -> None:
+        self._prune(timestamp)
+        self.queue.append((timestamp, value))
+        index = bisect_right(self.sorted_values, value)
+        self.sorted_values.insert(index, value)
+
+
+def _basis_v2_stats() -> dict[str, Any]:
+    return {"attempts": 0, "pnl_bps": [], "edge_deltas": []}
+
+
+def _basis_v2_add_stat(
+    item: dict[str, Any],
+    *,
+    horizon: int,
+    pnl_bps: Decimal | None,
+    edge_delta: Decimal | None,
+    dimension: str,
+    bucket: str,
+) -> None:
+    if dimension == "short_vs_long":
+        horizon_stats = item["horizons"][horizon]
+        horizon_stats["attempts"] += 1
+        if pnl_bps is not None:
+            horizon_stats["pnl_bps"].append(pnl_bps)
+        if edge_delta is not None:
+            horizon_stats["edge_deltas"].append(edge_delta)
+    bucket_stats = item["contexts"][dimension].setdefault(bucket, {})
+    bucket_horizon = bucket_stats.setdefault(horizon, _basis_v2_stats())
+    bucket_horizon["attempts"] += 1
+    if pnl_bps is not None:
+        bucket_horizon["pnl_bps"].append(pnl_bps)
+    if edge_delta is not None:
+        bucket_horizon["edge_deltas"].append(edge_delta)
+
+
+def _basis_v2_quote_age_bucket(row: dict[str, Any], fresh_quote_ms: Decimal) -> str:
+    age_seconds = to_decimal(row.get("var_quote_age_seconds"))
+    if age_seconds is None:
+        return "unknown"
+    age_ms = age_seconds * Decimal("1000")
+    if age_ms <= fresh_quote_ms:
+        return "fresh"
+    if age_ms <= fresh_quote_ms * Decimal("3"):
+        return "aged"
+    return "stale"
+
+
+def _basis_v2_context_bucket(
+    medians: dict[int, Decimal | None],
+    gap_threshold_bps: Decimal,
+) -> str:
+    short_median = medians.get(300)
+    long_median = medians.get(3600)
+    if short_median is None or long_median is None:
+        return "insufficient_history"
+    gap = short_median - long_median
+    if gap <= -gap_threshold_bps:
+        return "short_below_long"
+    if gap >= gap_threshold_bps:
+        return "short_above_long"
+    return "aligned"
+
+
+def _basis_v2_cost_bucket(
+    row: dict[str, Any],
+    var_spread_p80: Decimal | None,
+    lighter_spread_p80: Decimal | None,
+) -> str:
+    var_spread = _spread_bps_from_bid_ask(row, "var_bid", "var_ask")
+    lighter_spread = _spread_bps_from_bid_ask(row, "lighter_bid", "lighter_ask")
+    if var_spread is None or lighter_spread is None or var_spread_p80 is None or lighter_spread_p80 is None:
+        return "unknown"
+    if var_spread > var_spread_p80 or lighter_spread > lighter_spread_p80:
+        return "wide"
+    return "normal"
+
+
+def _basis_v2_candidate_edge(row: dict[str, Any], direction: str) -> Decimal | None:
+    key = "long_edge_bps" if direction == "long_var_short_lighter" else "short_edge_bps"
+    return to_decimal(row.get(key))
+
+
+def build_basis_v2_replay(
+    rows: list[dict[str, Any]],
+    *,
+    asset_filter: str | None = None,
+    min_raw_edge_bps: Decimal = Decimal("7"),
+    max_quote_age_ms: Decimal = Decimal("0"),
+    max_var_spread_bps: Decimal = Decimal("0"),
+    max_lighter_spread_bps: Decimal = Decimal("0"),
+    context_gap_bps: Decimal = Decimal("1"),
+    fresh_quote_ms: Decimal = Decimal("500"),
+    horizons: tuple[int, ...] = V2_HORIZONS_SECONDS,
+) -> dict[str, dict[str, Any]]:
+    """Replay directional executable edges using strictly prior rolling context.
+
+    This is intentionally a diagnostic model. It does not model order submission,
+    fees, or actual fills, and it never changes the live strategy.
+    """
+    groups: dict[tuple[str, str], list[tuple[float, dict[str, Any]]]] = {}
+    for row in basis_state_rows(rows):
+        asset = str(row.get("asset") or "-").upper()
+        if asset_filter and asset != asset_filter.upper():
+            continue
+        timestamp = parse_time(row.get("logged_at"))
+        if timestamp is None:
+            continue
+        run_id = str(row.get("run_id") or "legacy")
+        groups.setdefault((run_id, asset), []).append((timestamp.timestamp(), row))
+
+    results: dict[str, dict[str, Any]] = {}
+    for (_run_id, asset), group in groups.items():
+        group.sort(key=lambda item: item[0])
+        times = [timestamp for timestamp, _ in group]
+        group_rows = [row for _, row in group]
+        var_spreads = [
+            value for row in group_rows if (value := _spread_bps_from_bid_ask(row, "var_bid", "var_ask")) is not None
+        ]
+        lighter_spreads = [
+            value for row in group_rows if (value := _spread_bps_from_bid_ask(row, "lighter_bid", "lighter_ask")) is not None
+        ]
+        var_spread_p80 = percentile(var_spreads, Decimal("80"))
+        lighter_spread_p80 = percentile(lighter_spreads, Decimal("80"))
+        item = results.setdefault(
+            asset,
+            {
+                "rows": 0,
+                "candidate_count": 0,
+                "direction_counts": Counter(),
+                "horizons": {horizon: _basis_v2_stats() for horizon in horizons},
+                "contexts": {"short_vs_long": {}, "quote_age": {}, "cost_regime": {}},
+                "candidate_edges": [],
+                "var_spread_values": [],
+                "lighter_spread_values": [],
+            },
+        )
+        item["rows"] += len(group_rows)
+        item["var_spread_values"].extend(var_spreads)
+        item["lighter_spread_values"].extend(lighter_spreads)
+        rolling = {
+            direction: {window: _RollingMedian(window) for window in V2_WINDOWS_SECONDS}
+            for direction in V2_DIRECTIONS
+        }
+
+        for timestamp, row in group:
+            medians_by_direction: dict[str, dict[int, Decimal | None]] = {}
+            for direction in V2_DIRECTIONS:
+                medians_by_direction[direction] = {
+                    window: rolling[direction][window].median_before(timestamp)
+                    for window in V2_WINDOWS_SECONDS
+                }
+
+            for direction in V2_DIRECTIONS:
+                edge = _basis_v2_candidate_edge(row, direction)
+                if edge is None:
+                    continue
+                if edge < min_raw_edge_bps:
+                    continue
+                quote_age = to_decimal(row.get("var_quote_age_seconds"))
+                if max_quote_age_ms > 0 and (quote_age is None or quote_age * Decimal("1000") > max_quote_age_ms):
+                    continue
+                var_spread = _spread_bps_from_bid_ask(row, "var_bid", "var_ask")
+                if max_var_spread_bps > 0 and (var_spread is None or var_spread > max_var_spread_bps):
+                    continue
+                lighter_spread = _spread_bps_from_bid_ask(row, "lighter_bid", "lighter_ask")
+                if max_lighter_spread_bps > 0 and (lighter_spread is None or lighter_spread > max_lighter_spread_bps):
+                    continue
+                item["candidate_count"] += 1
+                item["direction_counts"][direction] += 1
+                item["candidate_edges"].append(edge)
+                medians = medians_by_direction[direction]
+                for horizon in horizons:
+                    future_index = bisect_left(times, timestamp + horizon)
+                    if future_index >= len(group_rows):
+                        continue
+                    future = group_rows[future_index]
+                    pnl_bps = _entry_semantics_forward_pnl_bps(row, future, direction)
+                    future_edge = _basis_v2_candidate_edge(future, direction)
+                    edge_delta = future_edge - edge if future_edge is not None else None
+                    _basis_v2_add_stat(
+                        item,
+                        horizon=horizon,
+                        pnl_bps=pnl_bps,
+                        edge_delta=edge_delta,
+                        dimension="short_vs_long",
+                        bucket=_basis_v2_context_bucket(medians, context_gap_bps),
+                    )
+                    _basis_v2_add_stat(
+                        item,
+                        horizon=horizon,
+                        pnl_bps=pnl_bps,
+                        edge_delta=edge_delta,
+                        dimension="quote_age",
+                        bucket=_basis_v2_quote_age_bucket(row, fresh_quote_ms),
+                    )
+                    _basis_v2_add_stat(
+                        item,
+                        horizon=horizon,
+                        pnl_bps=pnl_bps,
+                        edge_delta=edge_delta,
+                        dimension="cost_regime",
+                        bucket=_basis_v2_cost_bucket(row, var_spread_p80, lighter_spread_p80),
+                    )
+
+            for direction in V2_DIRECTIONS:
+                edge = _basis_v2_candidate_edge(row, direction)
+                if edge is not None:
+                    for window in V2_WINDOWS_SECONDS:
+                        rolling[direction][window].add(timestamp, edge)
+
+    for item in results.values():
+        item["var_spread_p80"] = percentile(item.pop("var_spread_values"), Decimal("80"))
+        item["lighter_spread_p80"] = percentile(item.pop("lighter_spread_values"), Decimal("80"))
+    return results
+
+
+def _basis_v2_stat_text(stats: dict[str, Any]) -> str:
+    pnl_values = stats["pnl_bps"]
+    positive_pct = (
+        Decimal(sum(value > 0 for value in pnl_values)) / Decimal(len(pnl_values)) * Decimal("100")
+        if pnl_values
+        else None
+    )
+    return (
+        f"n={len(pnl_values)} attempts={stats['attempts']} "
+        f"p20={fmt_decimal(percentile(pnl_values, Decimal('20')))} "
+        f"p50={fmt_decimal(percentile(pnl_values, Decimal('50')))} "
+        f"p80={fmt_decimal(percentile(pnl_values, Decimal('80')))} "
+        f"positive_pct={fmt_decimal(positive_pct)}"
+    )
+
+
+def print_basis_v2(
+    rows: list[dict[str, Any]],
+    *,
+    asset: str | None,
+    min_raw_edge_bps: Decimal,
+    max_quote_age_ms: Decimal,
+    max_var_spread_bps: Decimal,
+    max_lighter_spread_bps: Decimal,
+    context_gap_bps: Decimal,
+    fresh_quote_ms: Decimal,
+) -> None:
+    print("== basis_v2 ==")
+    print(
+        "model=read_only_directional_executable_edge_time_aligned_strict_prior_context "
+        "excludes_fees_submission_latency_and_actual_fills"
+    )
+    print(
+        f"min_raw_edge_bps={fmt_decimal(min_raw_edge_bps)} max_quote_age_ms={fmt_decimal(max_quote_age_ms)} "
+        f"max_var_spread_bps={fmt_decimal(max_var_spread_bps)} max_lighter_spread_bps={fmt_decimal(max_lighter_spread_bps)} "
+        f"context_gap_bps={fmt_decimal(context_gap_bps)} fresh_quote_ms={fmt_decimal(fresh_quote_ms)}"
+    )
+    results = build_basis_v2_replay(
+        rows,
+        asset_filter=asset,
+        min_raw_edge_bps=min_raw_edge_bps,
+        max_quote_age_ms=max_quote_age_ms,
+        max_var_spread_bps=max_var_spread_bps,
+        max_lighter_spread_bps=max_lighter_spread_bps,
+        context_gap_bps=context_gap_bps,
+        fresh_quote_ms=fresh_quote_ms,
+    )
+    if not results:
+        print("BASIS_V2 action=WAIT reason=no_time_aligned_basis_state_rows")
+        return
+    for asset_name, item in sorted(results.items()):
+        print(
+            f"asset={asset_name} rows={item['rows']} candidates={item['candidate_count']} "
+            f"directions={dict(item['direction_counts'])} "
+            f"candidate_edge_p50={fmt_decimal(percentile(item['candidate_edges'], Decimal('50')))} "
+            f"candidate_edge_p80={fmt_decimal(percentile(item['candidate_edges'], Decimal('80')))}"
+        )
+        print(
+            f"asset={asset_name} cost_reference_var_p80={fmt_decimal(item['var_spread_p80'])} "
+            f"cost_reference_lighter_p80={fmt_decimal(item['lighter_spread_p80'])}"
+        )
+        for horizon, stats in item["horizons"].items():
+            print(f"asset={asset_name} horizon={horizon}s {_basis_v2_stat_text(stats)}")
+        for dimension, buckets in item["contexts"].items():
+            for bucket, horizon_stats in sorted(buckets.items()):
+                five_second = horizon_stats.get(5)
+                if five_second is not None:
+                    print(
+                        f"asset={asset_name} context={dimension} bucket={bucket} "
+                        f"horizon=5s {_basis_v2_stat_text(five_second)}"
+                    )
+    print("recommendation=review_holdout_and_execution_reserve_before_shadow")
 
 
 def _collect_decimal(rows: list[dict[str, Any]], key: str) -> list[Decimal]:
@@ -948,6 +1270,13 @@ def main() -> int:
     parser.add_argument("--semantics-primary-threshold", default="7", help="Static primary edge threshold for --entry-semantics. Default: 7.")
     parser.add_argument("--semantics-min-abs-entry-bps", default="7", help="Static absolute basis threshold for --entry-semantics. Default: 7.")
     parser.add_argument("--semantics-min-normalized-filter-bps", default="1", help="Normalized filter threshold for --entry-semantics. Default: 1.")
+    parser.add_argument("--basis-v2", action="store_true", help="Replay directional executable edges with strict time-aligned multiscale context.")
+    parser.add_argument("--basis-v2-min-raw-edge-bps", default="7", help="Basis V2 raw directional edge floor. Default: 7.")
+    parser.add_argument("--basis-v2-max-quote-age-ms", default="0", help="Optional Basis V2 Var quote age cap; 0 disables the filter.")
+    parser.add_argument("--basis-v2-max-var-spread-bps", default="0", help="Optional Basis V2 Var spread cap; 0 disables the filter.")
+    parser.add_argument("--basis-v2-max-lighter-spread-bps", default="0", help="Optional Basis V2 Lighter spread cap; 0 disables the filter.")
+    parser.add_argument("--basis-v2-context-gap-bps", default="1", help="Short/long median separation used for context buckets. Default: 1.")
+    parser.add_argument("--basis-v2-fresh-quote-ms", default="500", help="Quote age boundary for Basis V2 context buckets. Default: 500.")
     parser.add_argument("--asset", help="Optional asset filter for dynamic-cost and ladder what-if sections.")
     parser.add_argument("--ladder-lot-notional-usd", default="20", help="What-if lot size. Default: 20.")
     parser.add_argument("--ladder-max-lots", type=int, default=3, help="What-if max open lots. Default: 3.")
@@ -975,12 +1304,27 @@ def main() -> int:
         semantics_primary_threshold = Decimal(str(args.semantics_primary_threshold))
         semantics_min_abs_entry = Decimal(str(args.semantics_min_abs_entry_bps))
         semantics_min_normalized_filter = Decimal(str(args.semantics_min_normalized_filter_bps))
+        basis_v2_min_raw_edge = Decimal(str(args.basis_v2_min_raw_edge_bps))
+        basis_v2_max_quote_age = Decimal(str(args.basis_v2_max_quote_age_ms))
+        basis_v2_max_var_spread = Decimal(str(args.basis_v2_max_var_spread_bps))
+        basis_v2_max_lighter_spread = Decimal(str(args.basis_v2_max_lighter_spread_bps))
+        basis_v2_context_gap = Decimal(str(args.basis_v2_context_gap_bps))
+        basis_v2_fresh_quote = Decimal(str(args.basis_v2_fresh_quote_ms))
     except Exception as exc:
         parser.error(f"invalid ladder decimal option: {exc}")
     if ladder_lot_notional <= 0 or ladder_addon_step <= 0:
         parser.error("ladder lot notional and addon step must be > 0")
     if semantics_primary_threshold <= 0 or semantics_min_abs_entry <= 0 or semantics_min_normalized_filter < 0:
         parser.error("entry semantics thresholds must be positive, except normalized filter may be 0")
+    if (
+        basis_v2_min_raw_edge < 0
+        or basis_v2_max_quote_age < 0
+        or basis_v2_max_var_spread < 0
+        or basis_v2_max_lighter_spread < 0
+        or basis_v2_context_gap <= 0
+        or basis_v2_fresh_quote <= 0
+    ):
+        parser.error("basis V2 thresholds must be non-negative, with positive context gap and fresh quote age")
 
     source_paths = rotated_jsonl_paths(ORDER_METRICS) if args.include_rotated else [ORDER_METRICS]
     raw_rows = tail_jsonl_many(source_paths, args.tail) if args.include_rotated else tail_jsonl(ORDER_METRICS, args.tail)
@@ -1153,6 +1497,17 @@ def main() -> int:
             primary_threshold=semantics_primary_threshold,
             min_abs_entry=semantics_min_abs_entry,
             min_normalized_filter=semantics_min_normalized_filter,
+        )
+    if args.basis_v2:
+        print_basis_v2(
+            rows,
+            asset=args.asset,
+            min_raw_edge_bps=basis_v2_min_raw_edge,
+            max_quote_age_ms=basis_v2_max_quote_age,
+            max_var_spread_bps=basis_v2_max_var_spread,
+            max_lighter_spread_bps=basis_v2_max_lighter_spread,
+            context_gap_bps=basis_v2_context_gap,
+            fresh_quote_ms=basis_v2_fresh_quote,
         )
 
     operational_readiness = "unknown"

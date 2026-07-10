@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from tools.analyze import basis_state_rows, build_basis_regimes, build_entry_semantics, dynamic_cost_summary
+from tools.analyze import basis_state_rows, build_basis_regimes, build_basis_v2_replay, build_entry_semantics, dynamic_cost_summary
 
 
 def test_basis_state_metrics_do_not_double_count_matching_block_event() -> None:
@@ -83,3 +83,37 @@ def test_entry_semantics_distinguishes_normalized_primary_from_raw_primary_filte
     assert result["forward"][1]["attempts"] == 1
     assert result["forward"][1]["retained"] == 1
     assert result["forward"][1]["pnl_bps"] == [Decimal("20")]
+
+
+def test_basis_v2_uses_real_time_and_does_not_require_normalized_edge() -> None:
+    rows = []
+    for timestamp, edge, age in (
+        ("2026-07-10T00:00:00+00:00", "8", "0.1"),
+        ("2026-07-10T00:00:00.100000+00:00", "8.5", "0.1"),
+        ("2026-07-10T00:00:01.200000+00:00", "9", "0.1"),
+    ):
+        rows.append(
+            {
+                "event": "live_inventory_basis_state",
+                "run_id": "run-v2",
+                "logged_at": timestamp,
+                "asset": "SOL",
+                "long_edge_bps": edge,
+                "short_edge_bps": "-2",
+                "var_bid": "99.9",
+                "var_ask": "100",
+                "lighter_bid": "100.08",
+                "lighter_ask": "100.1",
+                "lighter_sell_price": "100.08",
+                "lighter_buy_price": "100.1",
+                "var_quote_age_seconds": age,
+            }
+        )
+
+    result = build_basis_v2_replay(rows, min_raw_edge_bps=Decimal("7"))["SOL"]
+
+    assert result["candidate_count"] == 3
+    assert result["direction_counts"]["long_var_short_lighter"] == 3
+    assert result["horizons"][1]["attempts"] == 2
+    assert result["horizons"][1]["pnl_bps"]
+    assert not result["contexts"]["short_vs_long"]["insufficient_history"][1]["pnl_bps"] == []
