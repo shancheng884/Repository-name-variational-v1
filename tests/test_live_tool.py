@@ -35,6 +35,55 @@ def test_live_tool_can_disable_dynamic_entry_threshold() -> None:
     assert "--live-inventory-basis-dynamic-entry-threshold" not in command
 
 
+def test_live_tool_reversion_forces_one_small_lot_and_omits_normalized_primary() -> None:
+    command = build_main_command(
+        "SOL",
+        LiveConfig(
+            reversion_mode=True,
+            max_cycles=3,
+            max_lots=3,
+            max_total_lots=3,
+            max_total_inventory_notional_usd="60",
+            reversion_min_deviation_bps="1.2",
+        ),
+    )
+
+    assert "--live-inventory-basis-reversion" in command
+    assert command[command.index("--live-inventory-max-total-notional-usd") + 1] == "25"
+    assert command[command.index("--live-inventory-max-cycles") + 1] == "1"
+    assert command[command.index("--live-inventory-max-lots") + 1] == "1"
+    assert command[command.index("--live-inventory-max-total-lots") + 1] == "1"
+    assert "--live-inventory-basis-use-normalized-edge-for-entry" not in command
+    assert "--live-inventory-i-accept-basis-addon-diagnostic" not in command
+    assert "--live-inventory-basis-refresh-exit-quote-before-submit" in command
+    assert command[command.index("--live-inventory-basis-max-var-quote-age-ms") + 1] == "1500"
+    assert command[command.index("--live-inventory-max-lighter-book-age-seconds") + 1] == "2"
+    assert command[command.index("--live-inventory-basis-reversion-min-deviation-bps") + 1] == "1.2"
+
+
+def test_live_tool_reversion_state_uses_one_cycle_cap(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "flat",
+                "asset": "SOL",
+                "open_lots": [],
+                "pending_actions": [],
+                "completed_cycles": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(live, "LIVE_STATE", state_path)
+
+    ok, message = validate_state(LiveConfig(reversion_mode=True, max_cycles=3))
+
+    assert ok is False
+    assert "state_cycle_cap_reached" in message
+    assert "max_cycles=1" in message
+
+
 def test_live_tool_refuses_flat_state_when_cycle_cap_reached(tmp_path, monkeypatch) -> None:
     state_path = tmp_path / "live_inventory_state.json"
     state_path.write_text(

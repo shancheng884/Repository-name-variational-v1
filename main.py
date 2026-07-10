@@ -905,6 +905,19 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_watch_confirm_samples = int(args.live_inventory_basis_watch_confirm_samples)
         self.live_inventory_basis_watch_min_quality_score_bps = Decimal(str(args.live_inventory_basis_watch_min_quality_score_bps))
         self.live_inventory_basis_stablecoin_normalization = bool(args.live_inventory_basis_stablecoin_normalization)
+        self.live_inventory_basis_reversion_mode = bool(args.live_inventory_basis_reversion)
+        self.live_inventory_basis_reversion_min_deviation_bps = Decimal(
+            str(args.live_inventory_basis_reversion_min_deviation_bps)
+        )
+        self.live_inventory_basis_reversion_exit_deviation_bps = Decimal(
+            str(args.live_inventory_basis_reversion_exit_deviation_bps)
+        )
+        self.live_inventory_basis_reversion_max_entry_roundtrip_cost_bps = Decimal(
+            str(args.live_inventory_basis_reversion_max_entry_roundtrip_cost_bps)
+        )
+        self.live_inventory_basis_reversion_context_gap_bps = Decimal(
+            str(args.live_inventory_basis_reversion_context_gap_bps)
+        )
         self.live_inventory_basis_use_normalized_edge_for_entry = bool(args.live_inventory_basis_use_normalized_edge_for_entry)
         self.live_inventory_basis_min_normalized_entry_edge_bps = Decimal(str(args.live_inventory_basis_min_normalized_entry_edge_bps))
         self.live_inventory_basis_min_normalized_filter_edge_bps = (
@@ -1043,6 +1056,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_watch_candidates: dict[str, dict[str, Any]] = {}
         self.live_inventory_stablecoin_rate_cache: dict[str, Any] = {}
         self.live_inventory_stablecoin_basis_bps_samples: deque[Decimal] = deque(maxlen=500)
+        self.live_inventory_basis_reversion_history: deque[tuple[float, float | None, float | None]] = deque()
         self._order_write_lock = asyncio.Lock()
         self._opportunity_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
@@ -2094,6 +2108,42 @@ class VariationalToLighterRuntime:
         if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
             return -z
         raise ValueError(f"unsupported direction: {direction}")
+
+    def live_inventory_basis_reversion_medians(
+        self,
+        *,
+        now: float,
+        direction: str,
+    ) -> dict[int, Decimal | None]:
+        value_index = 1 if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER else 2
+        medians: dict[int, Decimal | None] = {}
+        for window_seconds in (300, 1800, 3600):
+            cutoff = now - window_seconds
+            values = [
+                Decimal(str(row[value_index]))
+                for row in self.live_inventory_basis_reversion_history
+                if row[0] >= cutoff and row[value_index] is not None
+            ]
+            medians[window_seconds] = median(values) if values else None
+        return medians
+
+    def record_live_inventory_basis_reversion_edges(
+        self,
+        *,
+        now: float,
+        long_edge_bps: Decimal | None,
+        short_edge_bps: Decimal | None,
+    ) -> None:
+        self.live_inventory_basis_reversion_history.append(
+            (
+                now,
+                None if long_edge_bps is None else float(long_edge_bps),
+                None if short_edge_bps is None else float(short_edge_bps),
+            )
+        )
+        cutoff = now - 3600.0
+        while self.live_inventory_basis_reversion_history and self.live_inventory_basis_reversion_history[0][0] < cutoff:
+            self.live_inventory_basis_reversion_history.popleft()
 
     def live_inventory_basis_abs_entry_ok(self, *, direction: str, basis_bps: Decimal, threshold_bps: Decimal | None = None) -> bool:
         threshold = self.live_inventory_basis_min_abs_entry_bps if threshold_bps is None else threshold_bps
@@ -3709,6 +3759,7 @@ class VariationalToLighterRuntime:
             self.record_order.clear()
             self.lighter_client_order_to_trade_key.clear()
         self.cross_spread_history.clear()
+        self.live_inventory_basis_reversion_history.clear()
         self.paper_position = None
         self.auto_live_position = None
         self.pending_auto_live_matches.clear()
@@ -5005,6 +5056,11 @@ class VariationalToLighterRuntime:
             "live_inventory_max_cycles",
             "live_inventory_basis_z_entry",
             "live_inventory_basis_z_exit",
+            "live_inventory_basis_reversion_mode",
+            "live_inventory_basis_reversion_min_deviation_bps",
+            "live_inventory_basis_reversion_exit_deviation_bps",
+            "live_inventory_basis_reversion_max_entry_roundtrip_cost_bps",
+            "live_inventory_basis_reversion_context_gap_bps",
             "live_inventory_basis_min_entry_edge_bps",
             "live_inventory_basis_long_min_entry_edge_bps",
             "live_inventory_basis_short_min_entry_edge_bps",
@@ -6589,6 +6645,41 @@ class VariationalToLighterRuntime:
             var_price=var_bid,
             lighter_price=lighter_buy_price,
         ) or Decimal("0")
+        reversion_now = time.monotonic()
+        reversion_long_medians = self.live_inventory_basis_reversion_medians(
+            now=reversion_now,
+            direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
+        )
+        reversion_short_medians = self.live_inventory_basis_reversion_medians(
+            now=reversion_now,
+            direction=DIRECTION_SHORT_VAR_LONG_LIGHTER,
+        )
+        reversion_long_deviation_bps = (
+            long_edge_bps - reversion_long_medians[300]
+            if reversion_long_medians[300] is not None
+            else None
+        )
+        reversion_short_deviation_bps = (
+            short_edge_bps - reversion_short_medians[300]
+            if reversion_short_medians[300] is not None
+            else None
+        )
+        reversion_long_context_gap_bps = (
+            reversion_long_medians[300] - reversion_long_medians[3600]
+            if reversion_long_medians[300] is not None and reversion_long_medians[3600] is not None
+            else None
+        )
+        reversion_short_context_gap_bps = (
+            reversion_short_medians[300] - reversion_short_medians[3600]
+            if reversion_short_medians[300] is not None and reversion_short_medians[3600] is not None
+            else None
+        )
+        if self.live_inventory_basis_reversion_mode:
+            self.record_live_inventory_basis_reversion_edges(
+                now=reversion_now,
+                long_edge_bps=long_edge_bps,
+                short_edge_bps=short_edge_bps,
+            )
         long_roundtrip_pnl_bps = self.live_inventory_roundtrip_pnl_bps(
             direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
             var_entry_price=var_ask,
@@ -6708,6 +6799,19 @@ class VariationalToLighterRuntime:
             "basis_seen": self.live_inventory_basis_state.seen,
             "z": decimal_to_str(z),
             "warm": warm,
+            "basis_reversion_enabled": self.live_inventory_basis_reversion_mode,
+            "basis_reversion_min_deviation_bps": decimal_to_str(self.live_inventory_basis_reversion_min_deviation_bps),
+            "basis_reversion_exit_deviation_bps": decimal_to_str(self.live_inventory_basis_reversion_exit_deviation_bps),
+            "basis_reversion_long_median_5m_bps": decimal_to_str(reversion_long_medians[300]),
+            "basis_reversion_long_median_30m_bps": decimal_to_str(reversion_long_medians[1800]),
+            "basis_reversion_long_median_60m_bps": decimal_to_str(reversion_long_medians[3600]),
+            "basis_reversion_short_median_5m_bps": decimal_to_str(reversion_short_medians[300]),
+            "basis_reversion_short_median_30m_bps": decimal_to_str(reversion_short_medians[1800]),
+            "basis_reversion_short_median_60m_bps": decimal_to_str(reversion_short_medians[3600]),
+            "basis_reversion_long_deviation_bps": decimal_to_str(reversion_long_deviation_bps),
+            "basis_reversion_short_deviation_bps": decimal_to_str(reversion_short_deviation_bps),
+            "basis_reversion_long_context_gap_bps": decimal_to_str(reversion_long_context_gap_bps),
+            "basis_reversion_short_context_gap_bps": decimal_to_str(reversion_short_context_gap_bps),
             "long_edge_bps": decimal_to_str(long_edge_bps),
             "short_edge_bps": decimal_to_str(short_edge_bps),
             "long_roundtrip_pnl_bps": decimal_to_str(long_roundtrip_pnl_bps),
@@ -6775,14 +6879,22 @@ class VariationalToLighterRuntime:
                     {**state_payload, "reason": "basis_var_entry_pending_fill"},
                 )
                 return
-            if not warm:
+            if not warm and not self.live_inventory_basis_reversion_mode:
                 self.live_inventory_basis_entry_confirm_counts.clear()
                 return
             candidates = (
                 (
                     DIRECTION_LONG_VAR_SHORT_LIGHTER,
-                    normalized_long_edge_bps if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_long_edge_bps is not None else long_edge_bps,
-                    normalized_long_roundtrip_pnl_bps if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_long_roundtrip_pnl_bps is not None else long_roundtrip_pnl_bps,
+                    long_edge_bps
+                    if self.live_inventory_basis_reversion_mode
+                    else normalized_long_edge_bps
+                    if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_long_edge_bps is not None
+                    else long_edge_bps,
+                    long_roundtrip_pnl_bps
+                    if self.live_inventory_basis_reversion_mode
+                    else normalized_long_roundtrip_pnl_bps
+                    if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_long_roundtrip_pnl_bps is not None
+                    else long_roundtrip_pnl_bps,
                     var_ask,
                     lighter_sell_price,
                     long_edge_bps,
@@ -6794,8 +6906,16 @@ class VariationalToLighterRuntime:
                 ),
                 (
                     DIRECTION_SHORT_VAR_LONG_LIGHTER,
-                    normalized_short_edge_bps if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_short_edge_bps is not None else short_edge_bps,
-                    normalized_short_roundtrip_pnl_bps if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_short_roundtrip_pnl_bps is not None else short_roundtrip_pnl_bps,
+                    short_edge_bps
+                    if self.live_inventory_basis_reversion_mode
+                    else normalized_short_edge_bps
+                    if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_short_edge_bps is not None
+                    else short_edge_bps,
+                    short_roundtrip_pnl_bps
+                    if self.live_inventory_basis_reversion_mode
+                    else normalized_short_roundtrip_pnl_bps
+                    if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_short_roundtrip_pnl_bps is not None
+                    else short_roundtrip_pnl_bps,
                     var_bid,
                     lighter_buy_price,
                     short_edge_bps,
@@ -6829,20 +6949,67 @@ class VariationalToLighterRuntime:
                         {**state_payload, "reason": "basis_direction_paused_negative_recent_pnl", **negative_context},
                     )
                     continue
-                direction_signal = self.live_inventory_basis_direction_signal(direction, z)
-                if direction_signal < self.live_inventory_basis_z_entry:
-                    self.live_inventory_basis_entry_confirm_counts[direction] = 0
-                    continue
                 stablecoin_regime_active = stablecoin_edge_context.get("stablecoin_regime_reason") == "ok"
-                static_min_entry_edge_bps = self.live_inventory_direction_entry_threshold_bps(direction) + negative_entry_penalty_bps
-                min_entry_edge_bps, dynamic_entry_threshold_context = self.live_inventory_basis_dynamic_entry_threshold_bps(
-                    static_floor_bps=static_min_entry_edge_bps,
-                    var_spread_bps=var_spread_bps,
-                    lighter_spread_bps=lighter_spread_bps,
-                )
-                static_min_abs_entry_bps = self.live_inventory_direction_abs_threshold_bps(direction) + negative_abs_penalty_bps
-                min_abs_entry_bps = max(static_min_abs_entry_bps, min_entry_edge_bps)
-                if not stablecoin_regime_active and not self.live_inventory_basis_abs_entry_ok(direction=direction, basis_bps=basis_bps, threshold_bps=min_abs_entry_bps):
+                if self.live_inventory_basis_reversion_mode:
+                    reversion_medians = (
+                        reversion_long_medians
+                        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                        else reversion_short_medians
+                    )
+                    reversion_deviation_bps = (
+                        reversion_long_deviation_bps
+                        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                        else reversion_short_deviation_bps
+                    )
+                    if reversion_deviation_bps is None:
+                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                        continue
+                    reversion_median_5m_bps = reversion_medians[300]
+                    if reversion_median_5m_bps is None:
+                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                        continue
+                    direction_signal = reversion_deviation_bps
+                    if direction_signal < self.live_inventory_basis_reversion_min_deviation_bps:
+                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                        continue
+                    min_entry_edge_bps = reversion_median_5m_bps + self.live_inventory_basis_reversion_min_deviation_bps
+                    min_abs_entry_bps = Decimal("0")
+                    dynamic_entry_threshold_context = {
+                        "reversion_entry_enabled": True,
+                        "reversion_median_5m_bps": decimal_to_str(reversion_medians[300]),
+                        "reversion_median_30m_bps": decimal_to_str(reversion_medians[1800]),
+                        "reversion_median_60m_bps": decimal_to_str(reversion_medians[3600]),
+                        "reversion_deviation_bps": decimal_to_str(reversion_deviation_bps),
+                        "reversion_context_gap_bps": decimal_to_str(
+                            reversion_long_context_gap_bps
+                            if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                            else reversion_short_context_gap_bps
+                        ),
+                        "reversion_context_gap_threshold_bps": decimal_to_str(
+                            self.live_inventory_basis_reversion_context_gap_bps
+                        ),
+                        "reversion_min_deviation_bps": decimal_to_str(
+                            self.live_inventory_basis_reversion_min_deviation_bps
+                        ),
+                    }
+                else:
+                    direction_signal = self.live_inventory_basis_direction_signal(direction, z)
+                    if direction_signal < self.live_inventory_basis_z_entry:
+                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                        continue
+                    static_min_entry_edge_bps = self.live_inventory_direction_entry_threshold_bps(direction) + negative_entry_penalty_bps
+                    min_entry_edge_bps, dynamic_entry_threshold_context = self.live_inventory_basis_dynamic_entry_threshold_bps(
+                        static_floor_bps=static_min_entry_edge_bps,
+                        var_spread_bps=var_spread_bps,
+                        lighter_spread_bps=lighter_spread_bps,
+                    )
+                    static_min_abs_entry_bps = self.live_inventory_direction_abs_threshold_bps(direction) + negative_abs_penalty_bps
+                    min_abs_entry_bps = max(static_min_abs_entry_bps, min_entry_edge_bps)
+                if (
+                    not self.live_inventory_basis_reversion_mode
+                    and not stablecoin_regime_active
+                    and not self.live_inventory_basis_abs_entry_ok(direction=direction, basis_bps=basis_bps, threshold_bps=min_abs_entry_bps)
+                ):
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     await self.append_live_inventory_log(
                         "live_inventory_entry_blocked",
@@ -6871,7 +7038,7 @@ class VariationalToLighterRuntime:
                         {**state_payload, "reason": "basis_lighter_book_too_old", "direction": direction, "max_lighter_book_age_seconds": self.live_inventory_max_lighter_book_age_seconds},
                     )
                     continue
-                if not stablecoin_filter_ok:
+                if not stablecoin_filter_ok and not self.live_inventory_basis_reversion_mode:
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     await self.append_live_inventory_log(
                         "live_inventory_entry_blocked",
@@ -6888,6 +7055,7 @@ class VariationalToLighterRuntime:
                 stablecoin_regime_required_raw_edge_bps = to_decimal(stablecoin_edge_context.get("stablecoin_regime_required_raw_edge_bps"))
                 if (
                     stablecoin_regime_active
+                    and not self.live_inventory_basis_reversion_mode
                     and not self.live_inventory_basis_use_normalized_edge_for_entry
                     and stablecoin_regime_required_raw_edge_bps is not None
                 ):
@@ -6895,15 +7063,27 @@ class VariationalToLighterRuntime:
                         min_entry_edge_bps,
                         stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps,
                     )
-                if self.live_inventory_basis_use_normalized_edge_for_entry and self.live_inventory_basis_min_normalized_entry_edge_bps > 0:
+                if (
+                    not self.live_inventory_basis_reversion_mode
+                    and self.live_inventory_basis_use_normalized_edge_for_entry
+                    and self.live_inventory_basis_min_normalized_entry_edge_bps > 0
+                ):
                     min_entry_edge_bps = max(min_entry_edge_bps, self.live_inventory_basis_min_normalized_entry_edge_bps)
-                entry_quality_score_bps, entry_quality_context = self.live_inventory_entry_quality_score_bps(
-                    edge_bps=edge_bps,
-                    min_entry_bps=min_entry_edge_bps,
-                    dynamic_buffer_bps=dynamic_entry_quality_buffer_bps,
-                    basis_sample_move_bps=basis_sample_move_bps,
-                    roundtrip_bps=roundtrip_bps,
-                )
+                if self.live_inventory_basis_reversion_mode:
+                    entry_quality_score_bps = edge_bps - min_entry_edge_bps
+                    entry_quality_context = {
+                        "entry_quality_mode": "reversion_deviation",
+                        "entry_quality_reversion_deviation_bps": decimal_to_str(direction_signal),
+                        "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                    }
+                else:
+                    entry_quality_score_bps, entry_quality_context = self.live_inventory_entry_quality_score_bps(
+                        edge_bps=edge_bps,
+                        min_entry_bps=min_entry_edge_bps,
+                        dynamic_buffer_bps=dynamic_entry_quality_buffer_bps,
+                        basis_sample_move_bps=basis_sample_move_bps,
+                        roundtrip_bps=roundtrip_bps,
+                    )
                 if is_negative_direction:
                     await self.append_live_inventory_log(
                         "live_inventory_negative_direction_shadow_candidate",
@@ -6979,7 +7159,12 @@ class VariationalToLighterRuntime:
                         {**state_payload, "reason": "basis_entry_quality_score_too_low", "direction": direction, **negative_context, **entry_quality_context},
                     )
                     continue
-                if roundtrip_bps < -self.live_inventory_basis_max_entry_roundtrip_cost_bps:
+                max_entry_roundtrip_cost_bps = (
+                    self.live_inventory_basis_reversion_max_entry_roundtrip_cost_bps
+                    if self.live_inventory_basis_reversion_mode
+                    else self.live_inventory_basis_max_entry_roundtrip_cost_bps
+                )
+                if roundtrip_bps < -max_entry_roundtrip_cost_bps:
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     continue
                 if not basis_sample_move_ok:
@@ -7145,6 +7330,7 @@ class VariationalToLighterRuntime:
                     )
                     if (
                         refreshed_stablecoin_regime_ok
+                        and not self.live_inventory_basis_reversion_mode
                         and not self.live_inventory_basis_use_normalized_edge_for_entry
                         and refreshed_stablecoin_regime_required_raw_edge_bps is not None
                     ):
@@ -7152,7 +7338,7 @@ class VariationalToLighterRuntime:
                             min_entry_edge_bps,
                             refreshed_stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps,
                         )
-                    if not refreshed_stablecoin_filter_ok:
+                    if not refreshed_stablecoin_filter_ok and not self.live_inventory_basis_reversion_mode:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
@@ -7178,13 +7364,23 @@ class VariationalToLighterRuntime:
                     quote_ms = refreshed_quote_ms
                     var_bid = refreshed_var_bid
                     var_ask = refreshed_var_ask
-                    entry_quality_score_bps, entry_quality_context = self.live_inventory_entry_quality_score_bps(
-                        edge_bps=edge_bps,
-                        min_entry_bps=min_entry_edge_bps,
-                        dynamic_buffer_bps=dynamic_entry_quality_buffer_bps,
-                        basis_sample_move_bps=basis_sample_move_bps,
-                        roundtrip_bps=roundtrip_bps,
-                    )
+                    if self.live_inventory_basis_reversion_mode:
+                        entry_quality_score_bps = edge_bps - min_entry_edge_bps
+                        entry_quality_context = {
+                            "entry_quality_mode": "reversion_deviation",
+                            "entry_quality_reversion_deviation_bps": decimal_to_str(
+                                edge_bps - (reversion_medians[300] or edge_bps)
+                            ),
+                            "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                        }
+                    else:
+                        entry_quality_score_bps, entry_quality_context = self.live_inventory_entry_quality_score_bps(
+                            edge_bps=edge_bps,
+                            min_entry_bps=min_entry_edge_bps,
+                            dynamic_buffer_bps=dynamic_entry_quality_buffer_bps,
+                            basis_sample_move_bps=basis_sample_move_bps,
+                            roundtrip_bps=roundtrip_bps,
+                        )
                     if edge_bps < min_entry_edge_bps:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
@@ -7222,7 +7418,12 @@ class VariationalToLighterRuntime:
                             },
                         )
                         return
-                    if roundtrip_bps < -self.live_inventory_basis_max_entry_roundtrip_cost_bps:
+                    max_entry_roundtrip_cost_bps = (
+                        self.live_inventory_basis_reversion_max_entry_roundtrip_cost_bps
+                        if self.live_inventory_basis_reversion_mode
+                        else self.live_inventory_basis_max_entry_roundtrip_cost_bps
+                    )
+                    if roundtrip_bps < -max_entry_roundtrip_cost_bps:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
@@ -7230,7 +7431,7 @@ class VariationalToLighterRuntime:
                                 "reason": "basis_entry_refreshed_roundtrip_below_threshold",
                                 "direction": direction,
                                 "refreshed_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
-                                "max_entry_roundtrip_cost_bps": decimal_to_str(self.live_inventory_basis_max_entry_roundtrip_cost_bps),
+                                "max_entry_roundtrip_cost_bps": decimal_to_str(max_entry_roundtrip_cost_bps),
                                 **stablecoin_edge_context,
                                 "entry_lighter_depth": entry_depth,
                                 "exit_lighter_depth": exit_depth,
@@ -7363,17 +7564,18 @@ class VariationalToLighterRuntime:
                         normalized_edge_bps=normalized_edge_bps,
                         stablecoin_context=stablecoin_context,
                     )
-                    if stablecoin_regime_ok:
+                    if stablecoin_regime_ok and not self.live_inventory_basis_reversion_mode:
                         stablecoin_filter_ok = True
                     stablecoin_edge_context = {**stablecoin_edge_context, **stablecoin_regime_context}
                     stablecoin_regime_required_raw_edge_bps = to_decimal(stablecoin_edge_context.get("stablecoin_regime_required_raw_edge_bps"))
                     if (
                         stablecoin_regime_ok
+                        and not self.live_inventory_basis_reversion_mode
                         and not self.live_inventory_basis_use_normalized_edge_for_entry
                         and stablecoin_regime_required_raw_edge_bps is not None
                     ):
                         min_entry_edge_bps = stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps
-                    if not stablecoin_filter_ok:
+                    if not stablecoin_filter_ok and not self.live_inventory_basis_reversion_mode:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
@@ -7391,13 +7593,23 @@ class VariationalToLighterRuntime:
                             },
                         )
                         return
-                    entry_quality_score_bps, entry_quality_context = self.live_inventory_entry_quality_score_bps(
-                        edge_bps=edge_bps,
-                        min_entry_bps=min_entry_edge_bps,
-                        dynamic_buffer_bps=dynamic_entry_quality_buffer_bps,
-                        basis_sample_move_bps=basis_sample_move_bps,
-                        roundtrip_bps=roundtrip_bps,
-                    )
+                    if self.live_inventory_basis_reversion_mode:
+                        entry_quality_score_bps = edge_bps - min_entry_edge_bps
+                        entry_quality_context = {
+                            "entry_quality_mode": "reversion_deviation",
+                            "entry_quality_reversion_deviation_bps": decimal_to_str(
+                                edge_bps - (reversion_medians[300] or edge_bps)
+                            ),
+                            "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                        }
+                    else:
+                        entry_quality_score_bps, entry_quality_context = self.live_inventory_entry_quality_score_bps(
+                            edge_bps=edge_bps,
+                            min_entry_bps=min_entry_edge_bps,
+                            dynamic_buffer_bps=dynamic_entry_quality_buffer_bps,
+                            basis_sample_move_bps=basis_sample_move_bps,
+                            roundtrip_bps=roundtrip_bps,
+                        )
                     if edge_bps < min_entry_edge_bps:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
@@ -7435,7 +7647,12 @@ class VariationalToLighterRuntime:
                             },
                         )
                         return
-                    if roundtrip_bps < -self.live_inventory_basis_max_entry_roundtrip_cost_bps:
+                    max_entry_roundtrip_cost_bps = (
+                        self.live_inventory_basis_reversion_max_entry_roundtrip_cost_bps
+                        if self.live_inventory_basis_reversion_mode
+                        else self.live_inventory_basis_max_entry_roundtrip_cost_bps
+                    )
+                    if roundtrip_bps < -max_entry_roundtrip_cost_bps:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
@@ -7443,7 +7660,7 @@ class VariationalToLighterRuntime:
                                 "reason": "basis_entry_quantized_roundtrip_below_threshold",
                                 "direction": direction,
                                 "roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
-                                "max_entry_roundtrip_cost_bps": decimal_to_str(self.live_inventory_basis_max_entry_roundtrip_cost_bps),
+                                "max_entry_roundtrip_cost_bps": decimal_to_str(max_entry_roundtrip_cost_bps),
                                 "qty": decimal_to_str(qty),
                                 "var_amount": var_amount,
                                 **stablecoin_edge_context,
@@ -7691,6 +7908,26 @@ class VariationalToLighterRuntime:
                     "entry_basis_bps": decimal_to_str(basis_bps),
                     "entry_z": decimal_to_str(z),
                     "entry_direction_signal": decimal_to_str(direction_signal),
+                    "entry_reversion_median_5m_bps": decimal_to_str(
+                        reversion_long_medians[300]
+                        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                        else reversion_short_medians[300]
+                    ),
+                    "entry_reversion_median_30m_bps": decimal_to_str(
+                        reversion_long_medians[1800]
+                        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                        else reversion_short_medians[1800]
+                    ),
+                    "entry_reversion_median_60m_bps": decimal_to_str(
+                        reversion_long_medians[3600]
+                        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                        else reversion_short_medians[3600]
+                    ),
+                    "entry_reversion_deviation_bps": decimal_to_str(
+                        reversion_long_deviation_bps
+                        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                        else reversion_short_deviation_bps
+                    ),
                     "entered_at": utc_now(),
                     "entered_sample_index": index,
                     "entry_var_side": var_side,
@@ -7704,7 +7941,13 @@ class VariationalToLighterRuntime:
                     "entry_var_result": var_result,
                     "entry_lighter_record_key": lighter_record.trade_key if lighter_record is not None else None,
                     "entry_lighter_payload": lighter_payload,
-                    "entry_kind": "basis_addon" if addon_direction is not None else "basis_initial",
+                    "entry_kind": (
+                        "basis_reversion_initial"
+                        if self.live_inventory_basis_reversion_mode
+                        else "basis_addon"
+                        if addon_direction is not None
+                        else "basis_initial"
+                    ),
                     "status": "dry_open" if self.live_inventory_dry_decisions else "open",
                 }
                 self.live_inventory_next_lot_id += 1
@@ -7749,7 +7992,25 @@ class VariationalToLighterRuntime:
             )
             notional = qty * entry_var_price
             pnl_bps = pnl / notional * Decimal("10000") if notional else None
-            direction_signal = self.live_inventory_basis_direction_signal(direction, z)
+            if self.live_inventory_basis_reversion_mode:
+                exit_reversion_medians = self.live_inventory_basis_reversion_medians(
+                    now=reversion_now,
+                    direction=direction,
+                )
+                current_reversion_edge_bps = (
+                    long_edge_bps
+                    if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                    else short_edge_bps
+                )
+                reversion_median_5m_bps = exit_reversion_medians[300]
+                reversion_deviation_bps = (
+                    current_reversion_edge_bps - reversion_median_5m_bps
+                    if reversion_median_5m_bps is not None
+                    else None
+                )
+                direction_signal = reversion_deviation_bps if reversion_deviation_bps is not None else Decimal("999")
+            else:
+                direction_signal = self.live_inventory_basis_direction_signal(direction, z)
             can_exit_on_reversion = holding_samples >= self.live_inventory_min_hold_samples
             time_decayed_min_exit_pnl_bps = self.live_inventory_time_decayed_min_exit_pnl_bps(
                 holding_samples=holding_samples,
@@ -7760,7 +8021,11 @@ class VariationalToLighterRuntime:
                 self.live_inventory_basis_min_signal_reverted_exit_pnl_bps,
             )
             effective_min_exit_pnl_bps = signal_reverted_min_exit_pnl_bps + self.live_inventory_basis_exit_safety_buffer_bps + dynamic_exit_buffer_bps
-            signal_reverted = can_exit_on_reversion and direction_signal <= self.live_inventory_basis_z_exit
+            signal_reverted = can_exit_on_reversion and (
+                direction_signal <= self.live_inventory_basis_reversion_exit_deviation_bps
+                if self.live_inventory_basis_reversion_mode
+                else direction_signal <= self.live_inventory_basis_z_exit
+            )
             exit_watch_started_sample = int(candidate_lot.get("signal_exit_watch_started_sample") or 0)
             if signal_reverted and pnl_bps is not None and pnl_bps < effective_min_exit_pnl_bps and exit_watch_started_sample <= 0:
                 candidate_lot["signal_exit_watch_started_sample"] = holding_samples
@@ -10612,6 +10877,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-basis-watch-confirm-samples", type=int, default=2)
     parser.add_argument("--live-inventory-basis-watch-min-quality-score-bps", type=float, default=-3.0)
     parser.add_argument("--live-inventory-basis-stablecoin-normalization", action="store_true")
+    parser.add_argument(
+        "--live-inventory-basis-reversion",
+        action="store_true",
+        help="Opt-in basis reversion signal: use directional executable edge versus prior 5m median. Forces one small live lot via tools/live.py.",
+    )
+    parser.add_argument("--live-inventory-basis-reversion-min-deviation-bps", type=float, default=1.0)
+    parser.add_argument("--live-inventory-basis-reversion-exit-deviation-bps", type=float, default=0.0)
+    parser.add_argument("--live-inventory-basis-reversion-max-entry-roundtrip-cost-bps", type=float, default=3.0)
+    parser.add_argument("--live-inventory-basis-reversion-context-gap-bps", type=float, default=1.0)
     parser.add_argument("--live-inventory-basis-use-normalized-edge-for-entry", action="store_true")
     parser.add_argument("--live-inventory-basis-min-normalized-entry-edge-bps", type=float, default=0.0)
     parser.add_argument(
@@ -10912,6 +11186,19 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-max-unrealized-loss-bps must be > 0")
         if args.live_inventory_max_cycles <= 0:
             parser.error("--live-inventory-max-cycles must be > 0 in V1")
+        if args.live_inventory_basis_reversion:
+            if args.live_inventory_signal_mode != LIVE_INVENTORY_SIGNAL_BASIS:
+                parser.error("--live-inventory-basis-reversion requires --live-inventory-signal-mode basis")
+            if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > 20:
+                parser.error("--live-inventory-basis-reversion requires lot notional <= 20 USD")
+            if args.live_inventory_max_total_notional_usd <= 0 or args.live_inventory_max_total_notional_usd > 25:
+                parser.error("--live-inventory-basis-reversion requires total notional <= 25 USD")
+            if args.live_inventory_max_cycles != 1 or args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 1:
+                parser.error("--live-inventory-basis-reversion requires max_cycles=1, max_lots=1, max_total_lots=1")
+            if args.live_inventory_i_accept_basis_addon_diagnostic:
+                parser.error("--live-inventory-basis-reversion does not allow basis addon diagnostics")
+            if args.live_inventory_basis_use_normalized_edge_for_entry:
+                parser.error("--live-inventory-basis-reversion cannot use normalized edge as the primary entry edge")
         if args.live_inventory_basis_z_entry <= 0:
             parser.error("--live-inventory-basis-z-entry must be > 0")
         if args.live_inventory_basis_z_exit < 0:
@@ -10924,6 +11211,14 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-basis-short-min-entry-edge-bps must be >= 0")
         if args.live_inventory_basis_max_entry_roundtrip_cost_bps < 0:
             parser.error("--live-inventory-basis-max-entry-roundtrip-cost-bps must be >= 0")
+        if args.live_inventory_basis_reversion_min_deviation_bps <= 0:
+            parser.error("--live-inventory-basis-reversion-min-deviation-bps must be > 0")
+        if args.live_inventory_basis_reversion_exit_deviation_bps < 0:
+            parser.error("--live-inventory-basis-reversion-exit-deviation-bps must be >= 0")
+        if args.live_inventory_basis_reversion_max_entry_roundtrip_cost_bps < 0:
+            parser.error("--live-inventory-basis-reversion-max-entry-roundtrip-cost-bps must be >= 0")
+        if args.live_inventory_basis_reversion_context_gap_bps <= 0:
+            parser.error("--live-inventory-basis-reversion-context-gap-bps must be > 0")
         if args.live_inventory_basis_min_abs_entry_bps < 0:
             parser.error("--live-inventory-basis-min-abs-entry-bps must be >= 0")
         if args.live_inventory_basis_long_min_abs_entry_bps < 0:

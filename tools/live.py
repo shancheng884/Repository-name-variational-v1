@@ -6,7 +6,7 @@ import json
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +45,11 @@ class LiveConfig:
     max_sample_move_bps: str = "3"
     min_normalized_entry_edge_bps: str = "1.0"
     min_normalized_filter_edge_bps: str = "0.5"
+    reversion_mode: bool = False
+    reversion_min_deviation_bps: str = "1.0"
+    reversion_exit_deviation_bps: str = "0.0"
+    reversion_max_entry_roundtrip_cost_bps: str = "3.0"
+    reversion_context_gap_bps: str = "1.0"
     entry_lighter_fill_timeout_seconds: str = "3"
     snapshot_timeout_seconds: str = "10"
     addon_min_basis_improvement_bps: str = "2.0"
@@ -90,13 +95,14 @@ def validate_state(config: LiveConfig) -> tuple[bool, str]:
         return False, f"open_lots_present count={len(open_lots)} asset={asset}"
     if pending_actions:
         return False, f"pending_actions_present count={len(pending_actions)} asset={asset}"
-    if completed_cycles >= config.max_cycles:
+    effective_max_cycles = 1 if config.reversion_mode else config.max_cycles
+    if completed_cycles >= effective_max_cycles:
         return (
             False,
-            f"state_cycle_cap_reached asset={asset} completed_cycles={completed_cycles} max_cycles={config.max_cycles} "
+            f"state_cycle_cap_reached asset={asset} completed_cycles={completed_cycles} max_cycles={effective_max_cycles} "
             "open_lots=0 pending_actions=0",
         )
-    return True, f"state=flat asset={asset} open_lots=0 pending_actions=0 completed_cycles={completed_cycles} max_cycles={config.max_cycles}"
+    return True, f"state=flat asset={asset} open_lots=0 pending_actions=0 completed_cycles={completed_cycles} max_cycles={effective_max_cycles}"
 
 
 def disk_warning() -> str:
@@ -197,6 +203,11 @@ def load_config(path: Path) -> LiveConfig:
         max_sample_move_bps=_positive_decimal(raw, "max_sample_move_bps"),
         min_normalized_entry_edge_bps=_positive_decimal(raw, "min_normalized_entry_edge_bps"),
         min_normalized_filter_edge_bps=_positive_decimal(raw, "min_normalized_filter_edge_bps"),
+        reversion_mode=bool(raw.get("reversion_mode", DEFAULT_CONFIG.reversion_mode)),
+        reversion_min_deviation_bps=_positive_decimal(raw, "reversion_min_deviation_bps"),
+        reversion_exit_deviation_bps=_non_negative_decimal(raw, "reversion_exit_deviation_bps"),
+        reversion_max_entry_roundtrip_cost_bps=_non_negative_decimal(raw, "reversion_max_entry_roundtrip_cost_bps"),
+        reversion_context_gap_bps=_positive_decimal(raw, "reversion_context_gap_bps"),
         entry_lighter_fill_timeout_seconds=_positive_decimal(raw, "entry_lighter_fill_timeout_seconds"),
         snapshot_timeout_seconds=_positive_decimal(raw, "snapshot_timeout_seconds"),
         addon_min_basis_improvement_bps=_positive_decimal(raw, "addon_min_basis_improvement_bps"),
@@ -204,6 +215,18 @@ def load_config(path: Path) -> LiveConfig:
 
 
 def build_main_command(asset: str, config: LiveConfig) -> list[str]:
+    reversion_mode = config.reversion_mode
+    effective_max_total_notional_usd = "25" if reversion_mode else config.max_total_inventory_notional_usd
+    effective_max_cycles = 1 if reversion_mode else config.max_cycles
+    effective_max_lots = 1 if reversion_mode else config.max_lots
+    effective_max_total_lots = 1 if reversion_mode else config.max_total_lots
+    effective_min_entry_edge_bps = "0" if reversion_mode else config.min_entry_edge_bps
+    effective_min_abs_entry_bps = "0" if reversion_mode else config.min_abs_entry_bps
+    effective_max_entry_roundtrip_cost_bps = (
+        config.reversion_max_entry_roundtrip_cost_bps
+        if reversion_mode
+        else config.max_entry_roundtrip_cost_bps
+    )
     command = [
         sys.executable,
         "main.py",
@@ -229,13 +252,13 @@ def build_main_command(asset: str, config: LiveConfig) -> list[str]:
         "--live-inventory-lot-notional-usd",
         config.lot_notional_usd,
         "--live-inventory-max-total-notional-usd",
-        config.max_total_inventory_notional_usd,
+        effective_max_total_notional_usd,
         "--live-inventory-max-cycles",
-        str(config.max_cycles),
+        str(effective_max_cycles),
         "--live-inventory-max-lots",
-        str(config.max_lots),
+        str(effective_max_lots),
         "--live-inventory-max-total-lots",
-        str(config.max_total_lots),
+        str(effective_max_total_lots),
         "--live-inventory-max-lighter-slippage-bps",
         config.max_lighter_slippage_bps,
         "--live-inventory-lighter-submit-slippage-bps",
@@ -243,11 +266,11 @@ def build_main_command(asset: str, config: LiveConfig) -> list[str]:
         "--live-inventory-lighter-exit-submit-slippage-bps",
         config.lighter_exit_submit_slippage_bps,
         "--live-inventory-basis-min-entry-edge-bps",
-        config.min_entry_edge_bps,
+        effective_min_entry_edge_bps,
         "--live-inventory-basis-min-abs-entry-bps",
-        config.min_abs_entry_bps,
+        effective_min_abs_entry_bps,
         "--live-inventory-basis-max-entry-roundtrip-cost-bps",
-        config.max_entry_roundtrip_cost_bps,
+        effective_max_entry_roundtrip_cost_bps,
         "--live-inventory-basis-min-entry-quality-score-bps",
         config.min_entry_quality_score_bps,
         "--live-inventory-basis-dynamic-entry-noise-buffer-bps",
@@ -265,12 +288,6 @@ def build_main_command(asset: str, config: LiveConfig) -> list[str]:
         "--live-inventory-basis-max-sample-move-bps",
         config.max_sample_move_bps,
         "--live-inventory-basis-stablecoin-normalization",
-        "--live-inventory-basis-use-normalized-edge-for-entry",
-        "--live-inventory-basis-stablecoin-regime-entry",
-        "--live-inventory-basis-min-normalized-entry-edge-bps",
-        config.min_normalized_entry_edge_bps,
-        "--live-inventory-basis-min-normalized-filter-edge-bps",
-        config.min_normalized_filter_edge_bps,
         "--live-inventory-entry-lighter-fill-timeout-seconds",
         config.entry_lighter_fill_timeout_seconds,
         "--live-inventory-snapshot-timeout-seconds",
@@ -280,7 +297,39 @@ def build_main_command(asset: str, config: LiveConfig) -> list[str]:
     ]
     if config.dynamic_entry_threshold:
         command.append("--live-inventory-basis-dynamic-entry-threshold")
-    if config.max_total_lots > 1:
+    if not reversion_mode:
+        command.extend(
+            [
+                "--live-inventory-basis-use-normalized-edge-for-entry",
+                "--live-inventory-basis-stablecoin-regime-entry",
+                "--live-inventory-basis-min-normalized-entry-edge-bps",
+                config.min_normalized_entry_edge_bps,
+                "--live-inventory-basis-min-normalized-filter-edge-bps",
+                config.min_normalized_filter_edge_bps,
+            ]
+        )
+    else:
+        command.extend(
+            [
+                "--live-inventory-basis-max-hold-action",
+                "exit",
+                "--live-inventory-basis-refresh-exit-quote-before-submit",
+                "--live-inventory-basis-max-var-quote-age-ms",
+                "1500",
+                "--live-inventory-max-lighter-book-age-seconds",
+                "2",
+                "--live-inventory-basis-reversion",
+                "--live-inventory-basis-reversion-min-deviation-bps",
+                config.reversion_min_deviation_bps,
+                "--live-inventory-basis-reversion-exit-deviation-bps",
+                config.reversion_exit_deviation_bps,
+                "--live-inventory-basis-reversion-max-entry-roundtrip-cost-bps",
+                config.reversion_max_entry_roundtrip_cost_bps,
+                "--live-inventory-basis-reversion-context-gap-bps",
+                config.reversion_context_gap_bps,
+            ]
+        )
+    if effective_max_total_lots > 1:
         command.extend(
             [
                 "--live-inventory-i-accept-basis-addon-diagnostic",
@@ -295,6 +344,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Start the real live arbitrage runner.")
     parser.add_argument("--asset", required=True, help="Live asset: BTC, ETH, or SOL.")
     parser.add_argument("--config", default=str(LIVE_CONFIG), help="Startup config JSON. Default: live_config.json.")
+    parser.add_argument("--reversion", action="store_true", help="Explicitly enable the one-lot basis reversion live test.")
     parser.add_argument("--dry-run", action="store_true", help="Print checks without starting live.")
     parser.add_argument("--verbose", action="store_true", help="Print the full main.py command.")
     args = parser.parse_args()
@@ -307,6 +357,8 @@ def main() -> int:
     except ValueError as exc:
         print(f"REFUSE_START reason=config_invalid detail={exc}")
         return 2
+    if args.reversion:
+        config = replace(config, reversion_mode=True)
 
     processes = running_main_processes()
     if processes:
