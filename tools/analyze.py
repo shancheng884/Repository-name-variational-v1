@@ -190,6 +190,150 @@ def print_what_if(rows: list[dict[str, Any]]) -> None:
         )
 
 
+def _entry_semantics_values(row: dict[str, Any], direction: str) -> tuple[Decimal | None, Decimal | None, Decimal | None, bool]:
+    if direction == "long_var_short_lighter":
+        raw_edge = to_decimal(row.get("long_edge_bps"))
+        normalized_edge = to_decimal(row.get("normalized_long_edge_bps"))
+        stablecoin_ok = row.get("long_stablecoin_filter_ok") is not False
+    else:
+        raw_edge = to_decimal(row.get("short_edge_bps"))
+        normalized_edge = to_decimal(row.get("normalized_short_edge_bps"))
+        stablecoin_ok = row.get("short_stablecoin_filter_ok") is not False
+    return to_decimal(row.get("basis_bps")), raw_edge, normalized_edge, stablecoin_ok
+
+
+def _entry_semantics_gate(
+    row: dict[str, Any],
+    *,
+    direction: str,
+    primary: str,
+    primary_threshold: Decimal,
+    min_abs_entry: Decimal,
+    min_normalized_filter: Decimal,
+) -> bool:
+    basis, raw_edge, normalized_edge, stablecoin_ok = _entry_semantics_values(row, direction)
+    if basis is None or raw_edge is None or normalized_edge is None:
+        return False
+    if row.get("basis_sample_move_ok") is False or not stablecoin_ok:
+        return False
+    if not _direction_abs_entry_ok(direction, basis, min_abs_entry):
+        return False
+    if normalized_edge < min_normalized_filter:
+        return False
+    edge = normalized_edge if primary == "normalized" else raw_edge
+    return edge >= primary_threshold
+
+
+def build_entry_semantics(
+    rows: list[dict[str, Any]],
+    *,
+    primary_threshold: Decimal,
+    min_abs_entry: Decimal,
+    min_normalized_filter: Decimal,
+    horizons: tuple[int, ...] = (1, 3, 5, 10),
+) -> dict[str, dict[str, Any]]:
+    by_run_asset: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in basis_state_rows(rows):
+        asset = str(row.get("asset") or "-").upper()
+        run_id = str(row.get("run_id") or "legacy")
+        by_run_asset.setdefault((run_id, asset), []).append(row)
+
+    results: dict[str, dict[str, Any]] = {}
+    for (_run_id, asset), run_rows in by_run_asset.items():
+        run_rows.sort(key=lambda row: str(row.get("logged_at") or ""))
+        item = results.setdefault(
+            asset,
+            {
+                "rows": 0,
+                "normalized_primary_candidates": 0,
+                "raw_primary_candidates": 0,
+                "forward": {horizon: {"attempts": 0, "retained": 0, "raw_edge_deltas": []} for horizon in horizons},
+            },
+        )
+        item["rows"] += len(run_rows)
+        for index, row in enumerate(run_rows):
+            for direction in ("long_var_short_lighter", "short_var_long_lighter"):
+                normalized_candidate = _entry_semantics_gate(
+                    row,
+                    direction=direction,
+                    primary="normalized",
+                    primary_threshold=primary_threshold,
+                    min_abs_entry=min_abs_entry,
+                    min_normalized_filter=min_normalized_filter,
+                )
+                raw_candidate = _entry_semantics_gate(
+                    row,
+                    direction=direction,
+                    primary="raw",
+                    primary_threshold=primary_threshold,
+                    min_abs_entry=min_abs_entry,
+                    min_normalized_filter=min_normalized_filter,
+                )
+                if normalized_candidate:
+                    item["normalized_primary_candidates"] += 1
+                if not raw_candidate:
+                    continue
+                item["raw_primary_candidates"] += 1
+                _, entry_raw_edge, _, _ = _entry_semantics_values(row, direction)
+                for horizon in horizons:
+                    future_index = index + horizon
+                    if future_index >= len(run_rows):
+                        continue
+                    future = run_rows[future_index]
+                    forward = item["forward"][horizon]
+                    forward["attempts"] += 1
+                    if _entry_semantics_gate(
+                        future,
+                        direction=direction,
+                        primary="raw",
+                        primary_threshold=primary_threshold,
+                        min_abs_entry=min_abs_entry,
+                        min_normalized_filter=min_normalized_filter,
+                    ):
+                        forward["retained"] += 1
+                    _, future_raw_edge, _, _ = _entry_semantics_values(future, direction)
+                    if entry_raw_edge is not None and future_raw_edge is not None:
+                        forward["raw_edge_deltas"].append(future_raw_edge - entry_raw_edge)
+    return results
+
+
+def print_entry_semantics(
+    rows: list[dict[str, Any]],
+    *,
+    primary_threshold: Decimal,
+    min_abs_entry: Decimal,
+    min_normalized_filter: Decimal,
+) -> None:
+    print("== entry_semantics ==")
+    print(
+        "model=static_proxy_excludes_z_dynamic_cost_quote_age_and_execution "
+        f"primary_threshold={fmt_decimal(primary_threshold)} min_abs_entry={fmt_decimal(min_abs_entry)} "
+        f"min_normalized_filter={fmt_decimal(min_normalized_filter)}"
+    )
+    results = build_entry_semantics(
+        rows,
+        primary_threshold=primary_threshold,
+        min_abs_entry=min_abs_entry,
+        min_normalized_filter=min_normalized_filter,
+    )
+    if not results:
+        print("ENTRY_SEMANTICS action=WAIT reason=no_basis_state_rows")
+        return
+    for asset, item in sorted(results.items()):
+        print(
+            f"asset={asset} rows={item['rows']} normalized_primary_candidates={item['normalized_primary_candidates']} "
+            f"raw_primary_normalized_filter_candidates={item['raw_primary_candidates']}"
+        )
+        for horizon, forward in item["forward"].items():
+            attempts = forward["attempts"]
+            retained = forward["retained"]
+            retained_pct = Decimal(retained) / Decimal(attempts) * Decimal("100") if attempts else None
+            print(
+                f"asset={asset} raw_primary_forward_samples={horizon} attempts={attempts} retained={retained} "
+                f"retained_pct={fmt_decimal(retained_pct)} raw_edge_delta_p50={fmt_decimal(percentile(forward['raw_edge_deltas'], Decimal('50')))}"
+            )
+
+
 def _collect_decimal(rows: list[dict[str, Any]], key: str) -> list[Decimal]:
     values: list[Decimal] = []
     for row in rows:
@@ -770,6 +914,10 @@ def main() -> int:
     parser.add_argument("--run-scores", action="store_true", help="Score each run_id separately for asset rotation decisions.")
     parser.add_argument("--dynamic-cost", action="store_true", help="Summarize current spread regime and dynamic roundtrip cost.")
     parser.add_argument("--ladder-what-if", action="store_true", help="Simulate the SOL 20U x 3 add-on strategy over selected rows.")
+    parser.add_argument("--entry-semantics", action="store_true", help="Compare normalized-primary and raw-primary-plus-normalized-filter entry proxies.")
+    parser.add_argument("--semantics-primary-threshold", default="7", help="Static primary edge threshold for --entry-semantics. Default: 7.")
+    parser.add_argument("--semantics-min-abs-entry-bps", default="7", help="Static absolute basis threshold for --entry-semantics. Default: 7.")
+    parser.add_argument("--semantics-min-normalized-filter-bps", default="1", help="Normalized filter threshold for --entry-semantics. Default: 1.")
     parser.add_argument("--asset", help="Optional asset filter for dynamic-cost and ladder what-if sections.")
     parser.add_argument("--ladder-lot-notional-usd", default="20", help="What-if lot size. Default: 20.")
     parser.add_argument("--ladder-max-lots", type=int, default=3, help="What-if max open lots. Default: 3.")
@@ -794,14 +942,20 @@ def main() -> int:
         ladder_min_norm_entry = Decimal(str(args.ladder_min_normalized_entry_edge_bps))
         ladder_min_exit = Decimal(str(args.ladder_min_exit_pnl_bps))
         ladder_profit_take = Decimal(str(args.ladder_profit_take_pnl_bps))
+        semantics_primary_threshold = Decimal(str(args.semantics_primary_threshold))
+        semantics_min_abs_entry = Decimal(str(args.semantics_min_abs_entry_bps))
+        semantics_min_normalized_filter = Decimal(str(args.semantics_min_normalized_filter_bps))
     except Exception as exc:
         parser.error(f"invalid ladder decimal option: {exc}")
     if ladder_lot_notional <= 0 or ladder_addon_step <= 0:
         parser.error("ladder lot notional and addon step must be > 0")
+    if semantics_primary_threshold <= 0 or semantics_min_abs_entry <= 0 or semantics_min_normalized_filter < 0:
+        parser.error("entry semantics thresholds must be positive, except normalized filter may be 0")
 
     source_paths = rotated_jsonl_paths(ORDER_METRICS) if args.include_rotated else [ORDER_METRICS]
     raw_rows = tail_jsonl_many(source_paths, args.tail) if args.include_rotated else tail_jsonl(ORDER_METRICS, args.tail)
     rows = raw_rows if args.all_runs else latest_run_filter(raw_rows)
+    current_run_rows = latest_run_filter(raw_rows)
     state = read_json(LIVE_STATE)
     processes = running_main_processes()
 
@@ -832,6 +986,7 @@ def main() -> int:
     ]
     blocked_scores: list[tuple[Decimal, str, str, str]] = []
     access_restricted = 0
+    current_run_access_restricted = 0
 
     for row in rows:
         text = str(row)
@@ -855,6 +1010,10 @@ def main() -> int:
             score, direction = best_entry_score(row, Decimal("5.5"), Decimal("0.5"))
             if score is not None:
                 blocked_scores.append((score, str(row.get("asset") or "-").upper(), direction, str(row.get("reason") or "unknown")))
+    for row in current_run_rows:
+        if "Access Restricted" in str(row):
+            current_run_access_restricted += 1
+    strategy_access_restricted = current_run_access_restricted if args.all_runs else access_restricted
 
     latest_at = "-"
     latest_dt = None
@@ -903,6 +1062,8 @@ def main() -> int:
         f"qualified_large_move_blocks={qualified_large_move_blocks}"
     )
     print(f"access_restricted_rows={access_restricted}")
+    if args.all_runs:
+        print(f"access_restricted_rows_current_run={current_run_access_restricted}")
 
     print("== pnl ==")
     print(
@@ -934,7 +1095,7 @@ def main() -> int:
     if args.basis_regime:
         print_basis_regime(rows)
     if args.strategy:
-        print_strategy(rows, events, status, open_lots, pending_actions, access_restricted)
+        print_strategy(rows, events, status, open_lots, pending_actions, strategy_access_restricted)
     if args.config_advice:
         print_config_advice(rows)
     if args.asset_scores:
@@ -956,6 +1117,13 @@ def main() -> int:
             min_exit_pnl=ladder_min_exit,
             profit_take_pnl=ladder_profit_take,
         )
+    if args.entry_semantics:
+        print_entry_semantics(
+            rows,
+            primary_threshold=semantics_primary_threshold,
+            min_abs_entry=semantics_min_abs_entry,
+            min_normalized_filter=semantics_min_normalized_filter,
+        )
 
     operational_readiness = "unknown"
     if events["live_inventory_manual_review_required"] or status == "manual_review_required":
@@ -964,7 +1132,7 @@ def main() -> int:
         operational_readiness = "state_missing_manual_exchange_flat_confirmation_required_before_start"
     elif status != "flat" or open_lots or pending_actions:
         operational_readiness = "not_ready_state_not_flat"
-    elif access_restricted:
+    elif strategy_access_restricted:
         operational_readiness = "not_ready_access_restricted_detected"
     elif not processes:
         operational_readiness = "flat_manual_exchange_confirmation_required"
