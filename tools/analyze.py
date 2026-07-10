@@ -224,6 +224,26 @@ def _entry_semantics_gate(
     return edge >= primary_threshold
 
 
+def _entry_semantics_forward_pnl_bps(entry: dict[str, Any], future: dict[str, Any], direction: str) -> Decimal | None:
+    if direction == "long_var_short_lighter":
+        entry_var = to_decimal(entry.get("var_ask"))
+        entry_lighter = to_decimal(entry.get("lighter_sell_price"))
+        exit_var = to_decimal(future.get("var_bid"))
+        exit_lighter = to_decimal(future.get("lighter_buy_price"))
+        if entry_var is None or entry_lighter is None or exit_var is None or exit_lighter is None or entry_var <= 0:
+            return None
+        pnl_per_unit = (exit_var - entry_var) + (entry_lighter - exit_lighter)
+    else:
+        entry_var = to_decimal(entry.get("var_bid"))
+        entry_lighter = to_decimal(entry.get("lighter_buy_price"))
+        exit_var = to_decimal(future.get("var_ask"))
+        exit_lighter = to_decimal(future.get("lighter_sell_price"))
+        if entry_var is None or entry_lighter is None or exit_var is None or exit_lighter is None or entry_var <= 0:
+            return None
+        pnl_per_unit = (entry_var - exit_var) + (exit_lighter - entry_lighter)
+    return pnl_per_unit / entry_var * Decimal("10000")
+
+
 def build_entry_semantics(
     rows: list[dict[str, Any]],
     *,
@@ -247,7 +267,7 @@ def build_entry_semantics(
                 "rows": 0,
                 "normalized_primary_candidates": 0,
                 "raw_primary_candidates": 0,
-                "forward": {horizon: {"attempts": 0, "retained": 0, "raw_edge_deltas": []} for horizon in horizons},
+                "forward": {horizon: {"attempts": 0, "retained": 0, "raw_edge_deltas": [], "pnl_bps": []} for horizon in horizons},
             },
         )
         item["rows"] += len(run_rows)
@@ -294,6 +314,8 @@ def build_entry_semantics(
                     _, future_raw_edge, _, _ = _entry_semantics_values(future, direction)
                     if entry_raw_edge is not None and future_raw_edge is not None:
                         forward["raw_edge_deltas"].append(future_raw_edge - entry_raw_edge)
+                    if (pnl_bps := _entry_semantics_forward_pnl_bps(row, future, direction)) is not None:
+                        forward["pnl_bps"].append(pnl_bps)
     return results
 
 
@@ -306,7 +328,7 @@ def print_entry_semantics(
 ) -> None:
     print("== entry_semantics ==")
     print(
-        "model=static_proxy_excludes_z_dynamic_cost_quote_age_and_execution "
+        "model=static_proxy_forward_pnl_uses_logged_executable_prices_excludes_latency_fees_and_actual_fills "
         f"primary_threshold={fmt_decimal(primary_threshold)} min_abs_entry={fmt_decimal(min_abs_entry)} "
         f"min_normalized_filter={fmt_decimal(min_normalized_filter)}"
     )
@@ -328,9 +350,17 @@ def print_entry_semantics(
             attempts = forward["attempts"]
             retained = forward["retained"]
             retained_pct = Decimal(retained) / Decimal(attempts) * Decimal("100") if attempts else None
+            pnl_values = forward["pnl_bps"]
+            positive_pct = (
+                Decimal(sum(value > 0 for value in pnl_values)) / Decimal(len(pnl_values)) * Decimal("100")
+                if pnl_values
+                else None
+            )
             print(
                 f"asset={asset} raw_primary_forward_samples={horizon} attempts={attempts} retained={retained} "
-                f"retained_pct={fmt_decimal(retained_pct)} raw_edge_delta_p50={fmt_decimal(percentile(forward['raw_edge_deltas'], Decimal('50')))}"
+                f"retained_pct={fmt_decimal(retained_pct)} raw_edge_delta_p50={fmt_decimal(percentile(forward['raw_edge_deltas'], Decimal('50')))} "
+                f"pnl_proxy_p50={fmt_decimal(percentile(pnl_values, Decimal('50')))} "
+                f"pnl_proxy_p80={fmt_decimal(percentile(pnl_values, Decimal('80')))} positive_pct={fmt_decimal(positive_pct)}"
             )
 
 

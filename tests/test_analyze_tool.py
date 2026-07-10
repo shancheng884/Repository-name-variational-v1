@@ -43,6 +43,10 @@ def test_entry_semantics_distinguishes_normalized_primary_from_raw_primary_filte
             "short_edge_bps": "-9",
             "normalized_long_edge_bps": "2",
             "normalized_short_edge_bps": "-3",
+            "var_bid": "99.9",
+            "var_ask": "100",
+            "lighter_buy_price": "100.1",
+            "lighter_sell_price": "100.2",
             "long_stablecoin_filter_ok": True,
             "short_stablecoin_filter_ok": False,
             "basis_sample_move_ok": True,
@@ -57,6 +61,10 @@ def test_entry_semantics_distinguishes_normalized_primary_from_raw_primary_filte
             "short_edge_bps": "-9",
             "normalized_long_edge_bps": "2.1",
             "normalized_short_edge_bps": "-3",
+            "var_bid": "100",
+            "var_ask": "100.1",
+            "lighter_buy_price": "100",
+            "lighter_sell_price": "100.2",
             "long_stablecoin_filter_ok": True,
             "short_stablecoin_filter_ok": False,
             "basis_sample_move_ok": True,
@@ -74,3 +82,4 @@ def test_entry_semantics_distinguishes_normalized_primary_from_raw_primary_filte
     assert result["raw_primary_candidates"] == 2
     assert result["forward"][1]["attempts"] == 1
     assert result["forward"][1]["retained"] == 1
+    assert result["forward"][1]["pnl_bps"] == [Decimal("20")]
