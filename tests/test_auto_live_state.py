@@ -144,6 +144,7 @@ def test_live_inventory_state_reset_allows_startup_after_manual_flat(tmp_path, m
     assert diagnostics.blocking_errors == []
     assert "live_inventory_state_reset_after_manual_flat" in diagnostics.passed
     assert state["status"] == "flat"
+    assert state["asset"] == runtime.live_inventory_state_asset()
     assert state["open_lots"] == []
 
 

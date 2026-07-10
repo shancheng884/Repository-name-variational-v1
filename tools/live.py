@@ -76,7 +76,11 @@ def running_main_processes() -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip() and "tools/live.py" not in line]
 
 
-def validate_state(config: LiveConfig) -> tuple[bool, str]:
+def validate_state(
+    config: LiveConfig,
+    *,
+    reset_state_after_manual_flat: bool = False,
+) -> tuple[bool, str]:
     state = read_json(LIVE_STATE)
     if not state:
         return True, "state=missing allowed=start_after_manual_exchange_flat_confirmation"
@@ -98,6 +102,12 @@ def validate_state(config: LiveConfig) -> tuple[bool, str]:
         return False, f"pending_actions_present count={len(pending_actions)} asset={asset}"
     effective_max_cycles = 1 if config.reversion_mode else config.max_cycles
     if completed_cycles >= effective_max_cycles:
+        if reset_state_after_manual_flat:
+            return (
+                True,
+                f"state=flat asset={asset} open_lots=0 pending_actions=0 completed_cycles={completed_cycles} "
+                f"max_cycles={effective_max_cycles} reset_after_manual_flat_requested",
+            )
         return (
             False,
             f"state_cycle_cap_reached asset={asset} completed_cycles={completed_cycles} max_cycles={effective_max_cycles} "
@@ -216,7 +226,12 @@ def load_config(path: Path) -> LiveConfig:
     )
 
 
-def build_main_command(asset: str, config: LiveConfig) -> list[str]:
+def build_main_command(
+    asset: str,
+    config: LiveConfig,
+    *,
+    reset_state_after_manual_flat: bool = False,
+) -> list[str]:
     reversion_mode = config.reversion_mode
     effective_max_total_notional_usd = "25" if reversion_mode else config.max_total_inventory_notional_usd
     effective_max_cycles = 1 if reversion_mode else config.max_cycles
@@ -341,6 +356,8 @@ def build_main_command(asset: str, config: LiveConfig) -> list[str]:
                 config.addon_min_basis_improvement_bps,
             ]
         )
+    if reset_state_after_manual_flat:
+        command.append("--live-inventory-reset-state-after-manual-flat")
     return command
 
 
@@ -349,6 +366,11 @@ def main() -> int:
     parser.add_argument("--asset", required=True, help="Live asset: BTC, ETH, or SOL.")
     parser.add_argument("--config", default=str(LIVE_CONFIG), help="Startup config JSON. Default: live_config.json.")
     parser.add_argument("--reversion", action="store_true", help="Explicitly enable the one-lot basis reversion live test.")
+    parser.add_argument(
+        "--reset-state-after-manual-flat",
+        action="store_true",
+        help="After manually confirming both venues are flat, reset the completed-cycle state during startup.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print checks without starting live.")
     parser.add_argument("--verbose", action="store_true", help="Print the full main.py command.")
     args = parser.parse_args()
@@ -371,14 +393,21 @@ def main() -> int:
             print(process)
         return 2
 
-    state_ok, state_message = validate_state(config)
+    state_ok, state_message = validate_state(
+        config,
+        reset_state_after_manual_flat=args.reset_state_after_manual_flat,
+    )
     print(state_message)
     print(disk_warning())
     if not state_ok:
         print("REFUSE_START reason=local_live_state_not_flat")
         return 2
 
-    command = build_main_command(asset, config)
+    command = build_main_command(
+        asset,
+        config,
+        reset_state_after_manual_flat=args.reset_state_after_manual_flat,
+    )
     print(f"starting asset={asset} max_cycles={config.max_cycles} lot_notional_usd={config.lot_notional_usd}")
     if args.verbose:
         print("main_command=" + " ".join(command))

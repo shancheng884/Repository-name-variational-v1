@@ -87,6 +87,37 @@ def test_live_tool_reversion_state_uses_one_cycle_cap(tmp_path, monkeypatch) -> 
     assert "max_cycles=1" in message
 
 
+def test_live_tool_reset_state_allows_next_reversion_cycle(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "flat",
+                "asset": "SOL",
+                "open_lots": [],
+                "pending_actions": [],
+                "completed_cycles": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(live, "LIVE_STATE", state_path)
+
+    ok, message = validate_state(
+        LiveConfig(reversion_mode=True),
+        reset_state_after_manual_flat=True,
+    )
+    command = build_main_command(
+        "SOL",
+        LiveConfig(reversion_mode=True),
+        reset_state_after_manual_flat=True,
+    )
+
+    assert ok is True
+    assert "reset_after_manual_flat_requested" in message
+    assert "--live-inventory-reset-state-after-manual-flat" in command
+
+
 def test_live_tool_refuses_flat_state_when_cycle_cap_reached(tmp_path, monkeypatch) -> None:
     state_path = tmp_path / "live_inventory_state.json"
     state_path.write_text(

@@ -3585,7 +3585,7 @@ class VariationalToLighterRuntime:
                         self.write_live_inventory_state(
                             {
                                 "status": "flat",
-                                "asset": "BTC",
+                                "asset": self.live_inventory_state_asset(),
                                 "next_lot_id": 1,
                                 "open_lots": [],
                                 "pending_actions": [],
