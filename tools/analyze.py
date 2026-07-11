@@ -732,7 +732,7 @@ def print_basis_v2_filter_sweep(
     print("== basis_v2_filter_sweep ==")
     print(
         "model=raw_edge_plus_prior_5m_reversion_with_normalized_and_stablecoin_filters "
-        "forward_pnl_is_executable_price_proxy"
+        "forward_pnl_uses_executable_bid_ask_and_excludes_fees_latency_actual_fills"
     )
     for normalized_threshold in normalized_thresholds:
         for stablecoin_share_threshold in stablecoin_share_thresholds:
@@ -772,10 +772,8 @@ def print_basis_v2_filter_sweep(
                     if pnl_values
                     else None
                 )
-                net_after_spread = None if p50 is None else p50 - spread_reference
                 horizon_text.append(
                     f"h{horizon}_n={len(pnl_values)} h{horizon}_p50={fmt_decimal(p50)} "
-                    f"h{horizon}_minus_spread_ref={fmt_decimal(net_after_spread)} "
                     f"h{horizon}_positive_pct={fmt_decimal(positive_pct)}"
                 )
             print(
