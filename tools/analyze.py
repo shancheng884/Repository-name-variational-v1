@@ -367,6 +367,7 @@ def print_entry_semantics(
 
 V2_HORIZONS_SECONDS = (1, 3, 5, 10, 30, 60, 300)
 V2_DIRECTIONS = ("long_var_short_lighter", "short_var_long_lighter")
+DEFAULT_FILTER_SWEEP_HORIZONS = (5, 60, 300)
 V2_WINDOWS_SECONDS = (300, 1800, 3600)
 
 
@@ -726,6 +727,7 @@ def print_basis_v2_filter_sweep(
     normalized_thresholds: tuple[Decimal, ...],
     stablecoin_share_thresholds: tuple[Decimal, ...],
     min_reversion_deviation_bps: Decimal,
+    horizons: tuple[int, ...],
 ) -> None:
     print("== basis_v2_filter_sweep ==")
     print(
@@ -746,6 +748,7 @@ def print_basis_v2_filter_sweep(
                 min_normalized_edge_bps=normalized_threshold,
                 max_stablecoin_edge_share=stablecoin_share_threshold,
                 min_reversion_deviation_bps=min_reversion_deviation_bps,
+                horizons=horizons,
             )
             item = results.get(asset.upper()) if asset and results else None
             if item is None and results:
@@ -756,11 +759,30 @@ def print_basis_v2_filter_sweep(
                     "candidates=0 horizon=5s n=0 p50=- positive_pct=-"
                 )
                 continue
-            stats = item["horizons"][5]
+            spread_reference = (item["var_spread_p80"] or Decimal("0")) + (
+                item["lighter_spread_p80"] or Decimal("0")
+            )
+            horizon_text: list[str] = []
+            for horizon in horizons:
+                stats = item["horizons"][horizon]
+                pnl_values = stats["pnl_bps"]
+                p50 = percentile(pnl_values, Decimal("50"))
+                positive_pct = (
+                    Decimal(sum(value > 0 for value in pnl_values)) / Decimal(len(pnl_values)) * Decimal("100")
+                    if pnl_values
+                    else None
+                )
+                net_after_spread = None if p50 is None else p50 - spread_reference
+                horizon_text.append(
+                    f"h{horizon}_n={len(pnl_values)} h{horizon}_p50={fmt_decimal(p50)} "
+                    f"h{horizon}_minus_spread_ref={fmt_decimal(net_after_spread)} "
+                    f"h{horizon}_positive_pct={fmt_decimal(positive_pct)}"
+                )
             print(
                 f"asset={asset or '-'} min_norm={fmt_decimal(normalized_threshold)} "
                 f"max_share={fmt_decimal(stablecoin_share_threshold)} "
-                f"candidates={item['candidate_count']} {_basis_v2_stat_text(stats)}"
+                f"candidates={item['candidate_count']} spread_ref_p80={fmt_decimal(spread_reference)} "
+                + " ".join(horizon_text)
             )
     print(f"min_reversion_deviation_bps={fmt_decimal(min_reversion_deviation_bps)}")
 
@@ -1346,6 +1368,24 @@ def parse_decimal_list(value: str, *, label: str) -> tuple[Decimal, ...]:
     return tuple(values)
 
 
+def parse_positive_int_list(value: str, *, label: str) -> tuple[int, ...]:
+    values: list[int] = []
+    for token in str(value).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            number = int(token)
+        except ValueError as exc:
+            raise ValueError(f"{label} contains invalid integer: {token}") from exc
+        if number <= 0:
+            raise ValueError(f"{label} values must be > 0")
+        values.append(number)
+    if not values:
+        raise ValueError(f"{label} must contain at least one positive integer")
+    return tuple(values)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze real live trading logs.")
     parser.add_argument("--tail", type=int, default=50000, help="JSONL rows to inspect from order_metrics.jsonl. Default: 50000.")
@@ -1375,6 +1415,7 @@ def main() -> int:
     parser.add_argument("--basis-v2-sweep-normalized-thresholds", default="0,1,1.5,2,2.5", help="Comma-separated normalized edge floors for --basis-v2-filter-sweep.")
     parser.add_argument("--basis-v2-sweep-stablecoin-share-thresholds", default="0.6,0.75,1.0", help="Comma-separated stablecoin edge share caps for --basis-v2-filter-sweep.")
     parser.add_argument("--basis-v2-sweep-min-reversion-deviation-bps", default="1.0", help="Prior 5m deviation floor for --basis-v2-filter-sweep. Default: 1.")
+    parser.add_argument("--basis-v2-sweep-horizons", default="5,60,300", help="Comma-separated forward horizons for --basis-v2-filter-sweep. Default: 5,60,300.")
     parser.add_argument("--asset", help="Optional asset filter for dynamic-cost and ladder what-if sections.")
     parser.add_argument("--ladder-lot-notional-usd", default="20", help="What-if lot size. Default: 20.")
     parser.add_argument("--ladder-max-lots", type=int, default=3, help="What-if max open lots. Default: 3.")
@@ -1416,6 +1457,10 @@ def main() -> int:
         basis_v2_sweep_stablecoin_share_thresholds = parse_decimal_list(
             args.basis_v2_sweep_stablecoin_share_thresholds,
             label="--basis-v2-sweep-stablecoin-share-thresholds",
+        )
+        basis_v2_sweep_horizons = parse_positive_int_list(
+            args.basis_v2_sweep_horizons,
+            label="--basis-v2-sweep-horizons",
         )
     except Exception as exc:
         parser.error(f"invalid ladder decimal option: {exc}")
@@ -1632,6 +1677,7 @@ def main() -> int:
             normalized_thresholds=basis_v2_sweep_normalized_thresholds,
             stablecoin_share_thresholds=basis_v2_sweep_stablecoin_share_thresholds,
             min_reversion_deviation_bps=basis_v2_sweep_min_reversion_deviation,
+            horizons=basis_v2_sweep_horizons,
         )
 
     operational_readiness = "unknown"
