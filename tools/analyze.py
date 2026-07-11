@@ -478,6 +478,16 @@ def _basis_v2_candidate_edge(row: dict[str, Any], direction: str) -> Decimal | N
     return to_decimal(row.get(key))
 
 
+def _basis_v2_normalized_edge(row: dict[str, Any], direction: str) -> Decimal | None:
+    key = "normalized_long_edge_bps" if direction == "long_var_short_lighter" else "normalized_short_edge_bps"
+    return to_decimal(row.get(key))
+
+
+def _basis_v2_stablecoin_edge_share(row: dict[str, Any], direction: str) -> Decimal | None:
+    key = "long_stablecoin_edge_share" if direction == "long_var_short_lighter" else "short_stablecoin_edge_share"
+    return to_decimal(row.get(key))
+
+
 def build_basis_v2_replay(
     rows: list[dict[str, Any]],
     *,
@@ -488,6 +498,9 @@ def build_basis_v2_replay(
     max_lighter_spread_bps: Decimal = Decimal("0"),
     context_gap_bps: Decimal = Decimal("1"),
     fresh_quote_ms: Decimal = Decimal("500"),
+    min_normalized_edge_bps: Decimal | None = None,
+    max_stablecoin_edge_share: Decimal = Decimal("0"),
+    min_reversion_deviation_bps: Decimal = Decimal("0"),
     horizons: tuple[int, ...] = V2_HORIZONS_SECONDS,
 ) -> dict[str, dict[str, Any]]:
     """Replay directional executable edges using strictly prior rolling context.
@@ -552,6 +565,21 @@ def build_basis_v2_replay(
                 edge = _basis_v2_candidate_edge(row, direction)
                 if edge is None:
                     continue
+                medians = medians_by_direction[direction]
+                if min_reversion_deviation_bps > 0:
+                    median_5m = medians[300]
+                    if median_5m is None or edge - median_5m < min_reversion_deviation_bps:
+                        continue
+                normalized_edge = _basis_v2_normalized_edge(row, direction)
+                if min_normalized_edge_bps is not None and (
+                    normalized_edge is None or normalized_edge < min_normalized_edge_bps
+                ):
+                    continue
+                stablecoin_edge_share = _basis_v2_stablecoin_edge_share(row, direction)
+                if max_stablecoin_edge_share > 0 and (
+                    stablecoin_edge_share is None or stablecoin_edge_share > max_stablecoin_edge_share
+                ):
+                    continue
                 if edge < min_raw_edge_bps:
                     continue
                 quote_age = to_decimal(row.get("var_quote_age_seconds"))
@@ -566,7 +594,6 @@ def build_basis_v2_replay(
                 item["candidate_count"] += 1
                 item["direction_counts"][direction] += 1
                 item["candidate_edges"].append(edge)
-                medians = medians_by_direction[direction]
                 for horizon in horizons:
                     future_index = bisect_left(times, timestamp + horizon)
                     if future_index >= len(group_rows):
@@ -684,6 +711,58 @@ def print_basis_v2(
                         f"horizon=5s {_basis_v2_stat_text(five_second)}"
                     )
     print("recommendation=review_holdout_and_execution_reserve_before_shadow")
+
+
+def print_basis_v2_filter_sweep(
+    rows: list[dict[str, Any]],
+    *,
+    asset: str | None,
+    min_raw_edge_bps: Decimal,
+    max_quote_age_ms: Decimal,
+    max_var_spread_bps: Decimal,
+    max_lighter_spread_bps: Decimal,
+    context_gap_bps: Decimal,
+    fresh_quote_ms: Decimal,
+    normalized_thresholds: tuple[Decimal, ...],
+    stablecoin_share_thresholds: tuple[Decimal, ...],
+    min_reversion_deviation_bps: Decimal,
+) -> None:
+    print("== basis_v2_filter_sweep ==")
+    print(
+        "model=raw_edge_plus_prior_5m_reversion_with_normalized_and_stablecoin_filters "
+        "forward_pnl_is_executable_price_proxy"
+    )
+    for normalized_threshold in normalized_thresholds:
+        for stablecoin_share_threshold in stablecoin_share_thresholds:
+            results = build_basis_v2_replay(
+                rows,
+                asset_filter=asset,
+                min_raw_edge_bps=min_raw_edge_bps,
+                max_quote_age_ms=max_quote_age_ms,
+                max_var_spread_bps=max_var_spread_bps,
+                max_lighter_spread_bps=max_lighter_spread_bps,
+                context_gap_bps=context_gap_bps,
+                fresh_quote_ms=fresh_quote_ms,
+                min_normalized_edge_bps=normalized_threshold,
+                max_stablecoin_edge_share=stablecoin_share_threshold,
+                min_reversion_deviation_bps=min_reversion_deviation_bps,
+            )
+            item = results.get(asset.upper()) if asset and results else None
+            if item is None and results:
+                item = next(iter(results.values()))
+            if item is None:
+                print(
+                    f"min_norm={fmt_decimal(normalized_threshold)} max_share={fmt_decimal(stablecoin_share_threshold)} "
+                    "candidates=0 horizon=5s n=0 p50=- positive_pct=-"
+                )
+                continue
+            stats = item["horizons"][5]
+            print(
+                f"asset={asset or '-'} min_norm={fmt_decimal(normalized_threshold)} "
+                f"max_share={fmt_decimal(stablecoin_share_threshold)} "
+                f"candidates={item['candidate_count']} {_basis_v2_stat_text(stats)}"
+            )
+    print(f"min_reversion_deviation_bps={fmt_decimal(min_reversion_deviation_bps)}")
 
 
 def _collect_decimal(rows: list[dict[str, Any]], key: str) -> list[Decimal]:
@@ -1252,6 +1331,21 @@ def file_size(path: Path) -> str:
         return "missing"
 
 
+def parse_decimal_list(value: str, *, label: str) -> tuple[Decimal, ...]:
+    values: list[Decimal] = []
+    for token in str(value).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            values.append(Decimal(token))
+        except Exception as exc:
+            raise ValueError(f"{label} contains invalid decimal: {token}") from exc
+    if not values:
+        raise ValueError(f"{label} must contain at least one decimal")
+    return tuple(values)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze real live trading logs.")
     parser.add_argument("--tail", type=int, default=50000, help="JSONL rows to inspect from order_metrics.jsonl. Default: 50000.")
@@ -1277,6 +1371,10 @@ def main() -> int:
     parser.add_argument("--basis-v2-max-lighter-spread-bps", default="0", help="Optional Basis V2 Lighter spread cap; 0 disables the filter.")
     parser.add_argument("--basis-v2-context-gap-bps", default="1", help="Short/long median separation used for context buckets. Default: 1.")
     parser.add_argument("--basis-v2-fresh-quote-ms", default="500", help="Quote age boundary for Basis V2 context buckets. Default: 500.")
+    parser.add_argument("--basis-v2-filter-sweep", action="store_true", help="Sweep normalized edge and stablecoin share filters over the Basis V2 forward proxy.")
+    parser.add_argument("--basis-v2-sweep-normalized-thresholds", default="0,1,1.5,2,2.5", help="Comma-separated normalized edge floors for --basis-v2-filter-sweep.")
+    parser.add_argument("--basis-v2-sweep-stablecoin-share-thresholds", default="0.6,0.75,1.0", help="Comma-separated stablecoin edge share caps for --basis-v2-filter-sweep.")
+    parser.add_argument("--basis-v2-sweep-min-reversion-deviation-bps", default="1.0", help="Prior 5m deviation floor for --basis-v2-filter-sweep. Default: 1.")
     parser.add_argument("--asset", help="Optional asset filter for dynamic-cost and ladder what-if sections.")
     parser.add_argument("--ladder-lot-notional-usd", default="20", help="What-if lot size. Default: 20.")
     parser.add_argument("--ladder-max-lots", type=int, default=3, help="What-if max open lots. Default: 3.")
@@ -1310,6 +1408,15 @@ def main() -> int:
         basis_v2_max_lighter_spread = Decimal(str(args.basis_v2_max_lighter_spread_bps))
         basis_v2_context_gap = Decimal(str(args.basis_v2_context_gap_bps))
         basis_v2_fresh_quote = Decimal(str(args.basis_v2_fresh_quote_ms))
+        basis_v2_sweep_min_reversion_deviation = Decimal(str(args.basis_v2_sweep_min_reversion_deviation_bps))
+        basis_v2_sweep_normalized_thresholds = parse_decimal_list(
+            args.basis_v2_sweep_normalized_thresholds,
+            label="--basis-v2-sweep-normalized-thresholds",
+        )
+        basis_v2_sweep_stablecoin_share_thresholds = parse_decimal_list(
+            args.basis_v2_sweep_stablecoin_share_thresholds,
+            label="--basis-v2-sweep-stablecoin-share-thresholds",
+        )
     except Exception as exc:
         parser.error(f"invalid ladder decimal option: {exc}")
     if ladder_lot_notional <= 0 or ladder_addon_step <= 0:
@@ -1323,6 +1430,9 @@ def main() -> int:
         or basis_v2_max_lighter_spread < 0
         or basis_v2_context_gap <= 0
         or basis_v2_fresh_quote <= 0
+        or basis_v2_sweep_min_reversion_deviation < 0
+        or any(value < 0 for value in basis_v2_sweep_normalized_thresholds)
+        or any(value < 0 for value in basis_v2_sweep_stablecoin_share_thresholds)
     ):
         parser.error("basis V2 thresholds must be non-negative, with positive context gap and fresh quote age")
 
@@ -1508,6 +1618,20 @@ def main() -> int:
             max_lighter_spread_bps=basis_v2_max_lighter_spread,
             context_gap_bps=basis_v2_context_gap,
             fresh_quote_ms=basis_v2_fresh_quote,
+        )
+    if args.basis_v2_filter_sweep:
+        print_basis_v2_filter_sweep(
+            rows,
+            asset=args.asset,
+            min_raw_edge_bps=basis_v2_min_raw_edge,
+            max_quote_age_ms=basis_v2_max_quote_age,
+            max_var_spread_bps=basis_v2_max_var_spread,
+            max_lighter_spread_bps=basis_v2_max_lighter_spread,
+            context_gap_bps=basis_v2_context_gap,
+            fresh_quote_ms=basis_v2_fresh_quote,
+            normalized_thresholds=basis_v2_sweep_normalized_thresholds,
+            stablecoin_share_thresholds=basis_v2_sweep_stablecoin_share_thresholds,
+            min_reversion_deviation_bps=basis_v2_sweep_min_reversion_deviation,
         )
 
     operational_readiness = "unknown"

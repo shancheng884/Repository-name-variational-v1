@@ -117,3 +117,35 @@ def test_basis_v2_uses_real_time_and_does_not_require_normalized_edge() -> None:
     assert result["horizons"][1]["attempts"] == 2
     assert result["horizons"][1]["pnl_bps"]
     assert not result["contexts"]["short_vs_long"]["insufficient_history"][1]["pnl_bps"] == []
+
+
+def test_basis_v2_filter_sweep_inputs_filter_normalized_edge_and_stablecoin_share() -> None:
+    rows = []
+    for index, (edge, normalized, share) in enumerate(
+        (("8", "1", "0.5"), ("8.5", "2.5", "0.5"), ("9", "3", "0.8"))
+    ):
+        rows.append(
+            {
+                "event": "live_inventory_basis_state",
+                "run_id": "run-filter",
+                "logged_at": f"2026-07-10T00:00:0{index}+00:00",
+                "asset": "SOL",
+                "long_edge_bps": edge,
+                "short_edge_bps": "-2",
+                "normalized_long_edge_bps": normalized,
+                "normalized_short_edge_bps": "-3",
+                "long_stablecoin_edge_share": share,
+                "short_stablecoin_edge_share": "0.2",
+            }
+        )
+
+    unfiltered = build_basis_v2_replay(rows, min_raw_edge_bps=Decimal("7"))["SOL"]
+    filtered = build_basis_v2_replay(
+        rows,
+        min_raw_edge_bps=Decimal("7"),
+        min_normalized_edge_bps=Decimal("2.5"),
+        max_stablecoin_edge_share=Decimal("0.6"),
+    )["SOL"]
+
+    assert unfiltered["candidate_count"] == 3
+    assert filtered["candidate_count"] == 1
