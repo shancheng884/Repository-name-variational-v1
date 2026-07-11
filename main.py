@@ -7058,13 +7058,17 @@ class VariationalToLighterRuntime:
                         {**state_payload, "reason": "basis_lighter_book_too_old", "direction": direction, "max_lighter_book_age_seconds": self.live_inventory_max_lighter_book_age_seconds},
                     )
                     continue
-                if not stablecoin_filter_ok and not self.live_inventory_basis_reversion_mode:
+                if not stablecoin_filter_ok:
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     await self.append_live_inventory_log(
                         "live_inventory_entry_blocked",
                         {
                             **state_payload,
-                            "reason": "basis_stablecoin_filter_blocked",
+                            "reason": (
+                                "basis_reversion_stablecoin_filter_blocked"
+                                if self.live_inventory_basis_reversion_mode
+                                else "basis_stablecoin_filter_blocked"
+                            ),
                             "direction": direction,
                             "raw_edge_bps": decimal_to_str(raw_edge_bps),
                             "normalized_edge_bps": decimal_to_str(normalized_edge_bps),
@@ -7358,12 +7362,16 @@ class VariationalToLighterRuntime:
                             min_entry_edge_bps,
                             refreshed_stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps,
                         )
-                    if not refreshed_stablecoin_filter_ok and not self.live_inventory_basis_reversion_mode:
+                    if not refreshed_stablecoin_filter_ok:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
                                 **state_payload,
-                                "reason": "basis_entry_refreshed_stablecoin_filter_blocked",
+                                "reason": (
+                                    "basis_reversion_entry_refreshed_stablecoin_filter_blocked"
+                                    if self.live_inventory_basis_reversion_mode
+                                    else "basis_entry_refreshed_stablecoin_filter_blocked"
+                                ),
                                 "direction": direction,
                                 "refreshed_edge_bps": decimal_to_str(edge_bps),
                                 "raw_refreshed_edge_bps": decimal_to_str(raw_refreshed_edge_bps),
@@ -7595,12 +7603,16 @@ class VariationalToLighterRuntime:
                         and stablecoin_regime_required_raw_edge_bps is not None
                     ):
                         min_entry_edge_bps = stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps
-                    if not stablecoin_filter_ok and not self.live_inventory_basis_reversion_mode:
+                    if not stablecoin_filter_ok:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
                                 **state_payload,
-                                "reason": "basis_entry_quantized_stablecoin_filter_blocked",
+                                "reason": (
+                                    "basis_reversion_entry_quantized_stablecoin_filter_blocked"
+                                    if self.live_inventory_basis_reversion_mode
+                                    else "basis_entry_quantized_stablecoin_filter_blocked"
+                                ),
                                 "direction": direction,
                                 "edge_bps": decimal_to_str(edge_bps),
                                 "raw_edge_bps": decimal_to_str(raw_edge_bps),

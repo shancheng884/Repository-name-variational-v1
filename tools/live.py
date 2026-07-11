@@ -51,6 +51,8 @@ class LiveConfig:
     reversion_exit_deviation_bps: str = "0.0"
     reversion_max_entry_roundtrip_cost_bps: str = "3.0"
     reversion_context_gap_bps: str = "1.0"
+    reversion_min_normalized_edge_bps: str = "0.0"
+    reversion_max_stablecoin_edge_share: str = "0.75"
     entry_lighter_fill_timeout_seconds: str = "3"
     snapshot_timeout_seconds: str = "10"
     addon_min_basis_improvement_bps: str = "2.0"
@@ -220,6 +222,8 @@ def load_config(path: Path) -> LiveConfig:
         reversion_exit_deviation_bps=_non_negative_decimal(raw, "reversion_exit_deviation_bps"),
         reversion_max_entry_roundtrip_cost_bps=_non_negative_decimal(raw, "reversion_max_entry_roundtrip_cost_bps"),
         reversion_context_gap_bps=_positive_decimal(raw, "reversion_context_gap_bps"),
+        reversion_min_normalized_edge_bps=_non_negative_decimal(raw, "reversion_min_normalized_edge_bps"),
+        reversion_max_stablecoin_edge_share=_non_negative_decimal(raw, "reversion_max_stablecoin_edge_share"),
         entry_lighter_fill_timeout_seconds=_positive_decimal(raw, "entry_lighter_fill_timeout_seconds"),
         snapshot_timeout_seconds=_positive_decimal(raw, "snapshot_timeout_seconds"),
         addon_min_basis_improvement_bps=_positive_decimal(raw, "addon_min_basis_improvement_bps"),
@@ -346,6 +350,10 @@ def build_main_command(
                 config.reversion_context_gap_bps,
                 "--live-inventory-basis-reversion-signal-exit-min-pnl-bps",
                 config.reversion_signal_exit_min_pnl_bps,
+                "--live-inventory-basis-min-normalized-filter-edge-bps",
+                config.reversion_min_normalized_edge_bps,
+                "--live-inventory-basis-max-stablecoin-edge-share",
+                config.reversion_max_stablecoin_edge_share,
             ]
         )
     if effective_max_total_lots > 1:

@@ -47,6 +47,8 @@ def test_live_tool_reversion_forces_one_small_lot_and_omits_normalized_primary()
             max_total_inventory_notional_usd="60",
             reversion_min_deviation_bps="1.2",
             reversion_signal_exit_min_pnl_bps="-0.8",
+            reversion_min_normalized_edge_bps="0.0",
+            reversion_max_stablecoin_edge_share="0.75",
         ),
     )
 
@@ -62,6 +64,8 @@ def test_live_tool_reversion_forces_one_small_lot_and_omits_normalized_primary()
     assert command[command.index("--live-inventory-max-lighter-book-age-seconds") + 1] == "2"
     assert command[command.index("--live-inventory-basis-reversion-min-deviation-bps") + 1] == "1.2"
     assert command[command.index("--live-inventory-basis-reversion-signal-exit-min-pnl-bps") + 1] == "-0.8"
+    assert command[command.index("--live-inventory-basis-min-normalized-filter-edge-bps") + 1] == "0.0"
+    assert command[command.index("--live-inventory-basis-max-stablecoin-edge-share") + 1] == "0.75"
 
 
 def test_live_tool_reversion_state_uses_one_cycle_cap(tmp_path, monkeypatch) -> None:
