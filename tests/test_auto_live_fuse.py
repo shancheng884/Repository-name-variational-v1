@@ -412,6 +412,19 @@ def test_reversion_signal_exit_floor_is_separate_from_normal_exit_floor() -> Non
     ) == Decimal("-1")
 
 
+def test_reversion_execution_reserve_is_directional() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_reversion_long_execution_reserve_bps = Decimal("4.5")
+    runtime.live_inventory_basis_reversion_short_execution_reserve_bps = Decimal("3.5")
+
+    assert runtime.live_inventory_basis_reversion_execution_reserve_bps(
+        "long_var_short_lighter"
+    ) == Decimal("4.5")
+    assert runtime.live_inventory_basis_reversion_execution_reserve_bps(
+        "short_var_long_lighter"
+    ) == Decimal("3.5")
+
+
 def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_path) -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)

@@ -73,6 +73,7 @@ def print_execution_calibration(rows: list[dict[str, Any]]) -> None:
         grouped.setdefault(key, []).append(row)
 
     all_pnl: list[Decimal] = []
+    suggested_reserves: list[str] = []
     for (asset, direction), group in sorted(grouped.items()):
         pnl = [value for row in group if (value := to_decimal(row.get("actual_pnl_bps"))) is not None]
         shortfall = [
@@ -87,6 +88,11 @@ def print_execution_calibration(rows: list[dict[str, Any]]) -> None:
             value for row in group if (value := to_decimal(row.get("exit_lighter_slippage_bps"))) is not None
         ]
         all_pnl.extend(pnl)
+        adverse_p20 = percentile(pnl, Decimal("20"))
+        suggested_reserve = max(Decimal("0"), -(adverse_p20 or Decimal("0"))) + Decimal("1.0")
+        suggested_reserves.append(
+            f"{asset}:{direction}:{fmt_decimal(suggested_reserve)}"
+        )
         print(
             f"asset={asset} direction={direction} n={len(group)} "
             f"actual_pnl_p20={fmt_decimal(percentile(pnl, Decimal('20')))} "
@@ -95,12 +101,19 @@ def print_execution_calibration(rows: list[dict[str, Any]]) -> None:
             f"shortfall_p80={fmt_decimal(percentile(shortfall, Decimal('80')))} "
             f"entry_lighter_slip_p80={fmt_decimal(percentile(entry_slippage, Decimal('80')))} "
             f"exit_lighter_slip_p80={fmt_decimal(percentile(exit_slippage, Decimal('80')))}"
+            f" suggested_execution_reserve={fmt_decimal(suggested_reserve)}"
         )
     print(
         f"overall_actual_pnl_p50={fmt_decimal(percentile(all_pnl, Decimal('50')))} "
         f"overall_actual_pnl_p80={fmt_decimal(percentile(all_pnl, Decimal('80')))}"
     )
-    print("recommendation=need_at_least_10_cycles_per_asset_before_setting_execution_reserve")
+    if len(final_rows) < 10:
+        print("recommendation=need_at_least_10_cycles_per_asset_before_setting_execution_reserve")
+    else:
+        print(
+            "recommendation=execution_reserve_ready_for_bounded_strategy_test "
+            f"reserves={','.join(suggested_reserves)}"
+        )
 
 
 def basis_state_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

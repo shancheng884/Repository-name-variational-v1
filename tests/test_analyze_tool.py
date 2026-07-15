@@ -191,6 +191,28 @@ def test_execution_calibration_summary_only_uses_versioned_final_actual_rows(cap
     assert "99" not in output
 
 
+def test_execution_calibration_recommends_reserve_after_ten_cycles(capsys) -> None:
+    rows = [
+        {
+            "event": "live_inventory_actual_pnl",
+            "strategy_version": "execution-calibration-v1",
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "asset": "SOL",
+            "direction": "long_var_short_lighter" if index % 2 == 0 else "short_var_long_lighter",
+            "actual_pnl_bps": "-3" if index % 2 == 0 else "-2",
+        }
+        for index in range(10)
+    ]
+
+    print_execution_calibration(rows)
+
+    output = capsys.readouterr().out
+    assert "completed_actual_cycles=10" in output
+    assert "suggested_execution_reserve=4.00" in output
+    assert "suggested_execution_reserve=3.00" in output
+    assert "recommendation=execution_reserve_ready_for_bounded_strategy_test" in output
+
+
 def test_basis_v2_event_cooldown_collapses_repeated_same_direction_candidates() -> None:
     rows = []
     for index in range(3):

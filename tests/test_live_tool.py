@@ -47,6 +47,9 @@ def test_live_tool_reversion_forces_one_small_lot_and_omits_normalized_primary()
             max_total_lots=3,
             max_total_inventory_notional_usd="60",
             reversion_min_deviation_bps="1.2",
+            reversion_long_execution_reserve_bps="4.5",
+            reversion_short_execution_reserve_bps="3.5",
+            reversion_min_net_expected_pnl_bps="1.5",
             reversion_signal_exit_min_pnl_bps="-0.8",
             reversion_min_normalized_edge_bps="2.5",
             reversion_max_stablecoin_edge_share="0.6",
@@ -64,9 +67,24 @@ def test_live_tool_reversion_forces_one_small_lot_and_omits_normalized_primary()
     assert command[command.index("--live-inventory-basis-max-var-quote-age-ms") + 1] == "1500"
     assert command[command.index("--live-inventory-max-lighter-book-age-seconds") + 1] == "2"
     assert command[command.index("--live-inventory-basis-reversion-min-deviation-bps") + 1] == "1.2"
+    assert command[command.index("--live-inventory-basis-reversion-long-execution-reserve-bps") + 1] == "4.5"
+    assert command[command.index("--live-inventory-basis-reversion-short-execution-reserve-bps") + 1] == "3.5"
+    assert command[command.index("--live-inventory-basis-reversion-min-net-expected-pnl-bps") + 1] == "1.5"
     assert command[command.index("--live-inventory-basis-reversion-signal-exit-min-pnl-bps") + 1] == "-0.8"
     assert command[command.index("--live-inventory-basis-min-normalized-filter-edge-bps") + 1] == "2.5"
     assert command[command.index("--live-inventory-basis-max-stablecoin-edge-share") + 1] == "0.6"
+
+
+def test_live_tool_cost_calibrated_reversion_command_passes_main_cli_guards(monkeypatch) -> None:
+    command = build_main_command("SOL", LiveConfig(reversion_mode=True))
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_basis_reversion is True
+    assert args.live_inventory_basis_reversion_long_execution_reserve_bps == 4.5
+    assert args.live_inventory_basis_reversion_short_execution_reserve_bps == 3.5
+    assert args.live_inventory_basis_reversion_min_net_expected_pnl_bps == 1.5
 
 
 def test_live_tool_calibration_is_bounded_and_bypasses_strategy_filters() -> None:

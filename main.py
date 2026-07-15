@@ -922,6 +922,15 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_reversion_context_gap_bps = Decimal(
             str(args.live_inventory_basis_reversion_context_gap_bps)
         )
+        self.live_inventory_basis_reversion_long_execution_reserve_bps = Decimal(
+            str(args.live_inventory_basis_reversion_long_execution_reserve_bps)
+        )
+        self.live_inventory_basis_reversion_short_execution_reserve_bps = Decimal(
+            str(args.live_inventory_basis_reversion_short_execution_reserve_bps)
+        )
+        self.live_inventory_basis_reversion_min_net_expected_pnl_bps = Decimal(
+            str(args.live_inventory_basis_reversion_min_net_expected_pnl_bps)
+        )
         self.live_inventory_execution_calibration = bool(args.live_inventory_execution_calibration)
         self.live_inventory_accept_execution_calibration_loss = bool(
             args.live_inventory_i_accept_execution_calibration_loss
@@ -1049,7 +1058,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_strategy_version = (
             "execution-calibration-v1"
             if self.live_inventory_execution_calibration
-            else "basis-reversion-v2"
+            else "cost-calibrated-reversion-v3"
             if self.live_inventory_basis_reversion_mode
             else "basis-v1"
         )
@@ -2173,6 +2182,21 @@ class VariationalToLighterRuntime:
             return z
         if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
             return -z
+        raise ValueError(f"unsupported direction: {direction}")
+
+    def live_inventory_basis_reversion_execution_reserve_bps(self, direction: str) -> Decimal:
+        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+            return getattr(
+                self,
+                "live_inventory_basis_reversion_long_execution_reserve_bps",
+                Decimal("4.5"),
+            )
+        if direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
+            return getattr(
+                self,
+                "live_inventory_basis_reversion_short_execution_reserve_bps",
+                Decimal("3.5"),
+            )
         raise ValueError(f"unsupported direction: {direction}")
 
     def live_inventory_basis_reversion_medians(
@@ -5180,6 +5204,9 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_reversion_exit_deviation_bps",
             "live_inventory_basis_reversion_max_entry_roundtrip_cost_bps",
             "live_inventory_basis_reversion_context_gap_bps",
+            "live_inventory_basis_reversion_long_execution_reserve_bps",
+            "live_inventory_basis_reversion_short_execution_reserve_bps",
+            "live_inventory_basis_reversion_min_net_expected_pnl_bps",
             "live_inventory_execution_calibration",
             "live_inventory_calibration_warmup_samples",
             "live_inventory_calibration_entry_cooldown_samples",
@@ -6826,6 +6853,22 @@ class VariationalToLighterRuntime:
             if reversion_short_medians[300] is not None
             else None
         )
+        reversion_long_execution_reserve_bps = self.live_inventory_basis_reversion_execution_reserve_bps(
+            DIRECTION_LONG_VAR_SHORT_LIGHTER
+        )
+        reversion_short_execution_reserve_bps = self.live_inventory_basis_reversion_execution_reserve_bps(
+            DIRECTION_SHORT_VAR_LONG_LIGHTER
+        )
+        reversion_long_net_expected_pnl_bps = (
+            reversion_long_deviation_bps - reversion_long_execution_reserve_bps
+            if reversion_long_deviation_bps is not None
+            else None
+        )
+        reversion_short_net_expected_pnl_bps = (
+            reversion_short_deviation_bps - reversion_short_execution_reserve_bps
+            if reversion_short_deviation_bps is not None
+            else None
+        )
         reversion_long_context_gap_bps = (
             reversion_long_medians[300] - reversion_long_medians[3600]
             if reversion_long_medians[300] is not None and reversion_long_medians[3600] is not None
@@ -6980,6 +7023,13 @@ class VariationalToLighterRuntime:
             "basis_reversion_short_median_60m_bps": decimal_to_str(reversion_short_medians[3600]),
             "basis_reversion_long_deviation_bps": decimal_to_str(reversion_long_deviation_bps),
             "basis_reversion_short_deviation_bps": decimal_to_str(reversion_short_deviation_bps),
+            "basis_reversion_long_execution_reserve_bps": decimal_to_str(reversion_long_execution_reserve_bps),
+            "basis_reversion_short_execution_reserve_bps": decimal_to_str(reversion_short_execution_reserve_bps),
+            "basis_reversion_long_net_expected_pnl_bps": decimal_to_str(reversion_long_net_expected_pnl_bps),
+            "basis_reversion_short_net_expected_pnl_bps": decimal_to_str(reversion_short_net_expected_pnl_bps),
+            "basis_reversion_min_net_expected_pnl_bps": decimal_to_str(
+                self.live_inventory_basis_reversion_min_net_expected_pnl_bps
+            ),
             "basis_reversion_long_context_gap_bps": decimal_to_str(reversion_long_context_gap_bps),
             "basis_reversion_short_context_gap_bps": decimal_to_str(reversion_short_context_gap_bps),
             "long_edge_bps": decimal_to_str(long_edge_bps),
@@ -7155,6 +7205,14 @@ class VariationalToLighterRuntime:
                         if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
                         else reversion_short_deviation_bps
                     )
+                    reversion_execution_reserve_bps = self.live_inventory_basis_reversion_execution_reserve_bps(
+                        direction
+                    )
+                    reversion_min_net_expected_pnl_bps = getattr(
+                        self,
+                        "live_inventory_basis_reversion_min_net_expected_pnl_bps",
+                        Decimal("1.5"),
+                    )
                     if reversion_deviation_bps is None:
                         self.live_inventory_basis_entry_confirm_counts[direction] = 0
                         continue
@@ -7166,7 +7224,34 @@ class VariationalToLighterRuntime:
                     if direction_signal < self.live_inventory_basis_reversion_min_deviation_bps:
                         self.live_inventory_basis_entry_confirm_counts[direction] = 0
                         continue
-                    min_entry_edge_bps = reversion_median_5m_bps + self.live_inventory_basis_reversion_min_deviation_bps
+                    reversion_net_expected_pnl_bps = direction_signal - reversion_execution_reserve_bps
+                    if reversion_net_expected_pnl_bps < reversion_min_net_expected_pnl_bps:
+                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                        if index % 30 == 0:
+                            await self.append_live_inventory_log(
+                                "live_inventory_entry_blocked",
+                                {
+                                    **state_payload,
+                                    "reason": "basis_reversion_net_expected_pnl_below_threshold",
+                                    "direction": direction,
+                                    "reversion_deviation_bps": decimal_to_str(direction_signal),
+                                    "reversion_execution_reserve_bps": decimal_to_str(
+                                        reversion_execution_reserve_bps
+                                    ),
+                                    "reversion_net_expected_pnl_bps": decimal_to_str(
+                                        reversion_net_expected_pnl_bps
+                                    ),
+                                    "reversion_min_net_expected_pnl_bps": decimal_to_str(
+                                        reversion_min_net_expected_pnl_bps
+                                    ),
+                                },
+                            )
+                        continue
+                    required_reversion_deviation_bps = max(
+                        self.live_inventory_basis_reversion_min_deviation_bps,
+                        reversion_execution_reserve_bps + reversion_min_net_expected_pnl_bps,
+                    )
+                    min_entry_edge_bps = reversion_median_5m_bps + required_reversion_deviation_bps
                     min_abs_entry_bps = Decimal("0")
                     dynamic_entry_threshold_context = {
                         "reversion_entry_enabled": True,
@@ -7184,6 +7269,18 @@ class VariationalToLighterRuntime:
                         ),
                         "reversion_min_deviation_bps": decimal_to_str(
                             self.live_inventory_basis_reversion_min_deviation_bps
+                        ),
+                        "reversion_required_deviation_bps": decimal_to_str(
+                            required_reversion_deviation_bps
+                        ),
+                        "reversion_execution_reserve_bps": decimal_to_str(
+                            reversion_execution_reserve_bps
+                        ),
+                        "reversion_net_expected_pnl_bps": decimal_to_str(
+                            reversion_net_expected_pnl_bps
+                        ),
+                        "reversion_min_net_expected_pnl_bps": decimal_to_str(
+                            reversion_min_net_expected_pnl_bps
                         ),
                     }
                 else:
@@ -11198,6 +11295,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-basis-reversion-exit-deviation-bps", type=float, default=0.0)
     parser.add_argument("--live-inventory-basis-reversion-max-entry-roundtrip-cost-bps", type=float, default=3.0)
     parser.add_argument("--live-inventory-basis-reversion-context-gap-bps", type=float, default=1.0)
+    parser.add_argument("--live-inventory-basis-reversion-long-execution-reserve-bps", type=float, default=4.5)
+    parser.add_argument("--live-inventory-basis-reversion-short-execution-reserve-bps", type=float, default=3.5)
+    parser.add_argument("--live-inventory-basis-reversion-min-net-expected-pnl-bps", type=float, default=1.5)
     parser.add_argument("--live-inventory-basis-use-normalized-edge-for-entry", action="store_true")
     parser.add_argument("--live-inventory-basis-min-normalized-entry-edge-bps", type=float, default=0.0)
     parser.add_argument(
@@ -11566,6 +11666,12 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-basis-reversion-max-entry-roundtrip-cost-bps must be >= 0")
         if args.live_inventory_basis_reversion_context_gap_bps <= 0:
             parser.error("--live-inventory-basis-reversion-context-gap-bps must be > 0")
+        if args.live_inventory_basis_reversion_long_execution_reserve_bps < 0:
+            parser.error("--live-inventory-basis-reversion-long-execution-reserve-bps must be >= 0")
+        if args.live_inventory_basis_reversion_short_execution_reserve_bps < 0:
+            parser.error("--live-inventory-basis-reversion-short-execution-reserve-bps must be >= 0")
+        if args.live_inventory_basis_reversion_min_net_expected_pnl_bps <= 0:
+            parser.error("--live-inventory-basis-reversion-min-net-expected-pnl-bps must be > 0")
         if args.live_inventory_basis_min_abs_entry_bps < 0:
             parser.error("--live-inventory-basis-min-abs-entry-bps must be >= 0")
         if args.live_inventory_basis_long_min_abs_entry_bps < 0:

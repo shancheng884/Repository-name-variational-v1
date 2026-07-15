@@ -51,6 +51,9 @@ class LiveConfig:
     reversion_exit_deviation_bps: str = "0.0"
     reversion_max_entry_roundtrip_cost_bps: str = "3.0"
     reversion_context_gap_bps: str = "1.0"
+    reversion_long_execution_reserve_bps: str = "4.5"
+    reversion_short_execution_reserve_bps: str = "3.5"
+    reversion_min_net_expected_pnl_bps: str = "1.5"
     reversion_min_normalized_edge_bps: str = "2.5"
     reversion_max_stablecoin_edge_share: str = "0.6"
     calibration_mode: bool = False
@@ -236,6 +239,9 @@ def load_config(path: Path) -> LiveConfig:
         reversion_exit_deviation_bps=_non_negative_decimal(raw, "reversion_exit_deviation_bps"),
         reversion_max_entry_roundtrip_cost_bps=_non_negative_decimal(raw, "reversion_max_entry_roundtrip_cost_bps"),
         reversion_context_gap_bps=_positive_decimal(raw, "reversion_context_gap_bps"),
+        reversion_long_execution_reserve_bps=_non_negative_decimal(raw, "reversion_long_execution_reserve_bps"),
+        reversion_short_execution_reserve_bps=_non_negative_decimal(raw, "reversion_short_execution_reserve_bps"),
+        reversion_min_net_expected_pnl_bps=_positive_decimal(raw, "reversion_min_net_expected_pnl_bps"),
         reversion_min_normalized_edge_bps=_non_negative_decimal(raw, "reversion_min_normalized_edge_bps"),
         reversion_max_stablecoin_edge_share=_non_negative_decimal(raw, "reversion_max_stablecoin_edge_share"),
         calibration_mode=bool(raw.get("calibration_mode", DEFAULT_CONFIG.calibration_mode)),
@@ -374,6 +380,12 @@ def build_main_command(
                 config.reversion_max_entry_roundtrip_cost_bps,
                 "--live-inventory-basis-reversion-context-gap-bps",
                 config.reversion_context_gap_bps,
+                "--live-inventory-basis-reversion-long-execution-reserve-bps",
+                config.reversion_long_execution_reserve_bps,
+                "--live-inventory-basis-reversion-short-execution-reserve-bps",
+                config.reversion_short_execution_reserve_bps,
+                "--live-inventory-basis-reversion-min-net-expected-pnl-bps",
+                config.reversion_min_net_expected_pnl_bps,
                 "--live-inventory-basis-reversion-signal-exit-min-pnl-bps",
                 config.reversion_signal_exit_min_pnl_bps,
                 "--live-inventory-basis-min-normalized-filter-edge-bps",
