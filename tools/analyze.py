@@ -89,7 +89,9 @@ def print_execution_calibration(rows: list[dict[str, Any]]) -> None:
         ]
         all_pnl.extend(pnl)
         adverse_p20 = percentile(pnl, Decimal("20"))
-        suggested_reserve = max(Decimal("0"), -(adverse_p20 or Decimal("0"))) + Decimal("1.0")
+        total_roundtrip_floor = max(Decimal("0"), -(adverse_p20 or Decimal("0"))) + Decimal("1.0")
+        shortfall_p80 = percentile(shortfall, Decimal("80"))
+        suggested_reserve = max(Decimal("0"), shortfall_p80 or Decimal("0")) + Decimal("0.5")
         suggested_reserves.append(
             f"{asset}:{direction}:{fmt_decimal(suggested_reserve)}"
         )
@@ -98,21 +100,22 @@ def print_execution_calibration(rows: list[dict[str, Any]]) -> None:
             f"actual_pnl_p20={fmt_decimal(percentile(pnl, Decimal('20')))} "
             f"actual_pnl_p50={fmt_decimal(percentile(pnl, Decimal('50')))} "
             f"actual_pnl_p80={fmt_decimal(percentile(pnl, Decimal('80')))} "
-            f"shortfall_p80={fmt_decimal(percentile(shortfall, Decimal('80')))} "
+            f"shortfall_p80={fmt_decimal(shortfall_p80)} "
             f"entry_lighter_slip_p80={fmt_decimal(percentile(entry_slippage, Decimal('80')))} "
             f"exit_lighter_slip_p80={fmt_decimal(percentile(exit_slippage, Decimal('80')))}"
-            f" suggested_execution_reserve={fmt_decimal(suggested_reserve)}"
+            f" suggested_shortfall_reserve={fmt_decimal(suggested_reserve)}"
+            f" observed_total_roundtrip_floor={fmt_decimal(total_roundtrip_floor)}"
         )
     print(
         f"overall_actual_pnl_p50={fmt_decimal(percentile(all_pnl, Decimal('50')))} "
         f"overall_actual_pnl_p80={fmt_decimal(percentile(all_pnl, Decimal('80')))}"
     )
     if len(final_rows) < 10:
-        print("recommendation=need_at_least_10_cycles_per_asset_before_setting_execution_reserve")
+        print("recommendation=need_at_least_10_cycles_per_asset_before_setting_shortfall_reserve")
     else:
         print(
-            "recommendation=execution_reserve_ready_for_bounded_strategy_test "
-            f"reserves={','.join(suggested_reserves)}"
+            "recommendation=shortfall_reserve_ready_for_executable_price_replay "
+            f"shortfall_reserves={','.join(suggested_reserves)}"
         )
 
 
@@ -432,6 +435,11 @@ V2_HORIZONS_SECONDS = (1, 3, 5, 10, 30, 60, 300)
 V2_DIRECTIONS = ("long_var_short_lighter", "short_var_long_lighter")
 DEFAULT_FILTER_SWEEP_HORIZONS = (5, 60, 300)
 V2_WINDOWS_SECONDS = (300, 1800, 3600)
+V3_WINDOWS_SECONDS = (3600, 21600, 86400, 604800)
+V3_VARIANTS = {
+    "main_p90_to_p55": (Decimal("90"), Decimal("55")),
+    "explore_p85_to_p60": (Decimal("85"), Decimal("60")),
+}
 DEFAULT_FILTER_SWEEP_EVENT_COOLDOWN_SECONDS = 300
 DEFAULT_FILTER_SWEEP_HOLDOUT_FRACTION = Decimal("0.30")
 DEFAULT_FILTER_SWEEP_MIN_INDEPENDENT_SAMPLES = 30
@@ -462,11 +470,422 @@ class _RollingMedian:
             return self.sorted_values[middle]
         return (self.sorted_values[middle - 1] + self.sorted_values[middle]) / Decimal("2")
 
+    def percentile_before(self, timestamp: float, pct: Decimal) -> Decimal | None:
+        self._prune(timestamp)
+        if not self.sorted_values:
+            return None
+        index = int(
+            (Decimal(len(self.sorted_values) - 1) * pct / Decimal("100")).to_integral_value(
+                rounding="ROUND_HALF_UP"
+            )
+        )
+        return self.sorted_values[max(0, min(index, len(self.sorted_values) - 1))]
+
+    def history_context(self, timestamp: float) -> tuple[int, float]:
+        self._prune(timestamp)
+        if not self.queue:
+            return 0, 0.0
+        return len(self.queue), max(0.0, timestamp - self.queue[0][0])
+
     def add(self, timestamp: float, value: Decimal) -> None:
         self._prune(timestamp)
         self.queue.append((timestamp, value))
         index = bisect_right(self.sorted_values, value)
         self.sorted_values.insert(index, value)
+
+
+def _basis_v3_alignment(row: dict[str, Any], direction: str) -> str:
+    key = "long_stablecoin_alignment" if direction == "long_var_short_lighter" else "short_stablecoin_alignment"
+    value = str(row.get(key) or "unknown").strip().lower()
+    return value if value in {"aligned", "neutral", "opposed"} else "unknown"
+
+
+def _basis_v3_quotes_fresh(
+    row: dict[str, Any],
+    *,
+    max_quote_age_ms: Decimal,
+    max_lighter_book_age_seconds: Decimal,
+) -> bool:
+    quote_age_seconds = to_decimal(row.get("var_quote_age_seconds"))
+    lighter_age_seconds = to_decimal(row.get("lighter_book_age_seconds"))
+    return (
+        (
+            max_quote_age_ms <= 0
+            or quote_age_seconds is not None
+            and quote_age_seconds * Decimal("1000") <= max_quote_age_ms
+        )
+        and (
+            max_lighter_book_age_seconds <= 0
+            or lighter_age_seconds is not None
+            and lighter_age_seconds <= max_lighter_book_age_seconds
+        )
+    )
+
+
+def _basis_v3_simulate_episode(
+    *,
+    rows: list[dict[str, Any]],
+    times: list[float],
+    entry_index: int,
+    direction: str,
+    target_exit_edge_bps: Decimal,
+    max_hold_seconds: int,
+    shortfall_reserve_bps: Decimal,
+    max_quote_age_ms: Decimal,
+    max_lighter_book_age_seconds: Decimal,
+) -> dict[str, Any] | None:
+    entry_time = times[entry_index]
+    last_index = bisect_right(times, entry_time + max_hold_seconds) - 1
+    if last_index <= entry_index:
+        return None
+    exit_index: int | None = None
+    exit_reason = "max_hold_timeout"
+    mfe: Decimal | None = None
+    mae: Decimal | None = None
+    for index in range(entry_index + 1, last_index + 1):
+        if not _basis_v3_quotes_fresh(
+            rows[index],
+            max_quote_age_ms=max_quote_age_ms,
+            max_lighter_book_age_seconds=max_lighter_book_age_seconds,
+        ):
+            continue
+        exit_index = index
+        pnl = _entry_semantics_forward_pnl_bps(rows[entry_index], rows[index], direction)
+        if pnl is not None:
+            mfe = pnl if mfe is None else max(mfe, pnl)
+            mae = pnl if mae is None else min(mae, pnl)
+        future_edge = _basis_v2_candidate_edge(rows[index], direction)
+        if future_edge is not None and future_edge <= target_exit_edge_bps:
+            exit_index = index
+            exit_reason = "target_quantile_reached"
+            break
+    if exit_index is None:
+        return None
+    executable_pnl = _entry_semantics_forward_pnl_bps(rows[entry_index], rows[exit_index], direction)
+    if executable_pnl is None:
+        return None
+    exit_time = times[exit_index]
+    return {
+        "exit_index": exit_index,
+        "exit_timestamp": exit_time,
+        "holding_seconds": Decimal(str(max(0.0, exit_time - entry_time))),
+        "exit_reason": exit_reason,
+        "executable_pnl_bps": executable_pnl,
+        "net_pnl_bps": executable_pnl - shortfall_reserve_bps,
+        "mfe_bps": mfe,
+        "mae_bps": mae,
+    }
+
+
+def build_basis_v3_replay(
+    rows: list[dict[str, Any]],
+    *,
+    asset_filter: str | None = None,
+    evaluation_interval_seconds: int = 60,
+    history_sample_seconds: int = 30,
+    episode_cooldown_seconds: int = 180,
+    max_hold_seconds: int = 21600,
+    min_window_coverage: Decimal = Decimal("0.80"),
+    min_history_samples: int = 100,
+    long_shortfall_reserve_bps: Decimal = Decimal("1.0"),
+    short_shortfall_reserve_bps: Decimal = Decimal("1.0"),
+    min_net_expected_bps: Decimal = Decimal("1.0"),
+    max_quote_age_ms: Decimal = Decimal("1500"),
+    max_lighter_book_age_seconds: Decimal = Decimal("2"),
+) -> dict[str, dict[str, Any]]:
+    """Replay strictly-prior multiscale quantile entries and target exits.
+
+    Logged executable prices already contain crossing spread. The configured
+    reserve therefore covers only unmodeled fill shortfall, not spread again.
+    """
+    grouped: dict[str, list[tuple[float, dict[str, Any]]]] = {}
+    for row in basis_state_rows(rows):
+        asset = str(row.get("asset") or "-").upper()
+        if asset_filter and asset != asset_filter.upper():
+            continue
+        timestamp = parse_time(row.get("logged_at"))
+        if timestamp is None:
+            continue
+        grouped.setdefault(asset, []).append((timestamp.timestamp(), row))
+
+    results: dict[str, dict[str, Any]] = {}
+    for asset, group in grouped.items():
+        group.sort(key=lambda item: item[0])
+        times = [timestamp for timestamp, _ in group]
+        group_rows = [row for _, row in group]
+        rolling = {
+            direction: {window: _RollingMedian(window) for window in V3_WINDOWS_SECONDS}
+            for direction in V2_DIRECTIONS
+        }
+        next_evaluation_at = times[0] if times else 0.0
+        next_history_sample_at = times[0] if times else 0.0
+        next_episode_at = {
+            (variant, direction): 0.0
+            for variant in V3_VARIANTS
+            for direction in V2_DIRECTIONS
+        }
+        item: dict[str, Any] = {
+            "rows": len(group_rows),
+            "started_at": times[0] if times else None,
+            "ended_at": times[-1] if times else None,
+            "latest_quantiles": {},
+            "episodes": [],
+            "candidate_checks": Counter(),
+            "blocked": Counter(),
+        }
+
+        for row_index, (timestamp, row) in enumerate(group):
+            should_evaluate = timestamp >= next_evaluation_at
+            if should_evaluate:
+                next_evaluation_at = timestamp + evaluation_interval_seconds
+                for direction in V2_DIRECTIONS:
+                    edge = _basis_v2_candidate_edge(row, direction)
+                    if edge is None:
+                        continue
+                    quantiles_by_window: dict[int, dict[str, Any]] = {}
+                    mature_windows: list[int] = []
+                    for window in V3_WINDOWS_SECONDS:
+                        tracker = rolling[direction][window]
+                        count, coverage_seconds = tracker.history_context(timestamp)
+                        mature = (
+                            count >= min_history_samples
+                            and Decimal(str(coverage_seconds)) >= Decimal(window) * min_window_coverage
+                        )
+                        quantiles_by_window[window] = {
+                            "count": count,
+                            "coverage_seconds": coverage_seconds,
+                            "mature": mature,
+                            "p55": tracker.percentile_before(timestamp, Decimal("55")),
+                            "p60": tracker.percentile_before(timestamp, Decimal("60")),
+                            "p85": tracker.percentile_before(timestamp, Decimal("85")),
+                            "p90": tracker.percentile_before(timestamp, Decimal("90")),
+                        }
+                        if mature:
+                            mature_windows.append(window)
+                    item["latest_quantiles"][direction] = quantiles_by_window
+                    if not mature_windows:
+                        item["blocked"]["insufficient_multiscale_history"] += 1
+                        continue
+                    baseline_window = max(mature_windows)
+                    baseline = quantiles_by_window[baseline_window]
+                    reserve = (
+                        long_shortfall_reserve_bps
+                        if direction == "long_var_short_lighter"
+                        else short_shortfall_reserve_bps
+                    )
+                    safety_ok = (
+                        row.get("basis_sample_move_ok") is not False
+                        and _basis_v3_quotes_fresh(
+                            row,
+                            max_quote_age_ms=max_quote_age_ms,
+                            max_lighter_book_age_seconds=max_lighter_book_age_seconds,
+                        )
+                    )
+                    for variant, (entry_pct, exit_pct) in V3_VARIANTS.items():
+                        key = (variant, direction)
+                        item["candidate_checks"][key] += 1
+                        if timestamp < next_episode_at[key]:
+                            continue
+                        entry_threshold = baseline[f"p{int(entry_pct)}"]
+                        exit_target = baseline[f"p{int(exit_pct)}"]
+                        if entry_threshold is None or exit_target is None or edge < entry_threshold:
+                            continue
+                        expected_capture = edge - exit_target
+                        net_expected = expected_capture - reserve
+                        if net_expected < min_net_expected_bps:
+                            item["blocked"][f"{variant}:net_expected_below_threshold"] += 1
+                            continue
+                        if not safety_ok:
+                            item["blocked"][f"{variant}:market_data_guard"] += 1
+                            continue
+                        simulated = _basis_v3_simulate_episode(
+                            rows=group_rows,
+                            times=times,
+                            entry_index=row_index,
+                            direction=direction,
+                            target_exit_edge_bps=exit_target,
+                            max_hold_seconds=max_hold_seconds,
+                            shortfall_reserve_bps=reserve,
+                            max_quote_age_ms=max_quote_age_ms,
+                            max_lighter_book_age_seconds=max_lighter_book_age_seconds,
+                        )
+                        if simulated is None:
+                            item["blocked"][f"{variant}:no_executable_exit"] += 1
+                            continue
+                        episode_id = f"{asset}:{direction}:{variant}:{int(timestamp * 1000)}"
+                        episode = {
+                            "episode_id": episode_id,
+                            "timestamp": timestamp,
+                            "asset": asset,
+                            "direction": direction,
+                            "variant": variant,
+                            "baseline_window_seconds": baseline_window,
+                            "entry_percentile": entry_pct,
+                            "exit_percentile": exit_pct,
+                            "entry_edge_bps": edge,
+                            "entry_threshold_bps": entry_threshold,
+                            "target_exit_edge_bps": exit_target,
+                            "expected_capture_bps": expected_capture,
+                            "shortfall_reserve_bps": reserve,
+                            "net_expected_bps": net_expected,
+                            "stablecoin_alignment": _basis_v3_alignment(row, direction),
+                            **simulated,
+                        }
+                        item["episodes"].append(episode)
+                        next_episode_at[key] = simulated["exit_timestamp"] + episode_cooldown_seconds
+
+            if timestamp >= next_history_sample_at:
+                next_history_sample_at = timestamp + history_sample_seconds
+                for direction in V2_DIRECTIONS:
+                    edge = _basis_v2_candidate_edge(row, direction)
+                    if edge is not None:
+                        for window in V3_WINDOWS_SECONDS:
+                            rolling[direction][window].add(timestamp, edge)
+
+        results[asset] = item
+    return results
+
+
+def _basis_v3_split_stats(
+    episodes: list[dict[str, Any]],
+    *,
+    holdout_fraction: Decimal,
+    min_independent_samples: int,
+) -> dict[str, Any]:
+    ordered = sorted(episodes, key=lambda episode: float(episode["timestamp"]))
+    if len(ordered) < 2:
+        train, holdout = ordered, []
+    else:
+        split = int(Decimal(len(ordered)) * (Decimal("1") - holdout_fraction))
+        split = min(max(split, 1), len(ordered) - 1)
+        train, holdout = ordered[:split], ordered[split:]
+
+    def stats(items: list[dict[str, Any]]) -> dict[str, Any]:
+        pnl = [item["net_pnl_bps"] for item in items]
+        return {
+            "n": len(items),
+            "p20": percentile(pnl, Decimal("20")),
+            "p50": percentile(pnl, Decimal("50")),
+            "positive_pct": (
+                Decimal(sum(value > 0 for value in pnl)) / Decimal(len(pnl)) * Decimal("100")
+                if pnl
+                else None
+            ),
+        }
+
+    train_stats = stats(train)
+    holdout_stats = stats(holdout)
+    if train_stats["n"] < min_independent_samples or holdout_stats["n"] < min_independent_samples:
+        verdict = "insufficient_independent_data"
+    elif (
+        train_stats["p20"] is None
+        or holdout_stats["p20"] is None
+        or train_stats["p20"] <= 0
+        or holdout_stats["p20"] <= 0
+    ):
+        verdict = "net_p20_not_positive"
+    else:
+        verdict = "bounded_live_candidate"
+    return {"train": train_stats, "holdout": holdout_stats, "verdict": verdict}
+
+
+def print_basis_v3(
+    rows: list[dict[str, Any]],
+    *,
+    asset: str | None,
+    evaluation_interval_seconds: int,
+    history_sample_seconds: int,
+    episode_cooldown_seconds: int,
+    max_hold_seconds: int,
+    min_window_coverage: Decimal,
+    min_history_samples: int,
+    long_shortfall_reserve_bps: Decimal,
+    short_shortfall_reserve_bps: Decimal,
+    min_net_expected_bps: Decimal,
+    holdout_fraction: Decimal,
+    min_independent_samples: int,
+) -> None:
+    print("== basis_v3 ==")
+    print(
+        "model=strictly_prior_1h_6h_24h_7d_quantiles_executable_target_exit "
+        "reserve_is_unmodeled_shortfall_only_no_spread_double_count"
+    )
+    print(
+        f"evaluation_interval_seconds={evaluation_interval_seconds} history_sample_seconds={history_sample_seconds} "
+        f"episode_cooldown_seconds={episode_cooldown_seconds} max_hold_seconds={max_hold_seconds} "
+        f"min_window_coverage={fmt_decimal(min_window_coverage)} min_history_samples={min_history_samples} "
+        f"long_shortfall_reserve={fmt_decimal(long_shortfall_reserve_bps)} "
+        f"short_shortfall_reserve={fmt_decimal(short_shortfall_reserve_bps)} "
+        f"min_net_expected={fmt_decimal(min_net_expected_bps)}"
+    )
+    results = build_basis_v3_replay(
+        rows,
+        asset_filter=asset,
+        evaluation_interval_seconds=evaluation_interval_seconds,
+        history_sample_seconds=history_sample_seconds,
+        episode_cooldown_seconds=episode_cooldown_seconds,
+        max_hold_seconds=max_hold_seconds,
+        min_window_coverage=min_window_coverage,
+        min_history_samples=min_history_samples,
+        long_shortfall_reserve_bps=long_shortfall_reserve_bps,
+        short_shortfall_reserve_bps=short_shortfall_reserve_bps,
+        min_net_expected_bps=min_net_expected_bps,
+    )
+    if not results:
+        print("BASIS_V3 action=WAIT reason=no_time_aligned_basis_state_rows")
+        return
+    for asset_name, item in sorted(results.items()):
+        coverage_seconds = (
+            float(item["ended_at"]) - float(item["started_at"])
+            if item["started_at"] is not None and item["ended_at"] is not None
+            else 0.0
+        )
+        coverage_days = Decimal(str(coverage_seconds / 86400.0))
+        print(
+            f"asset={asset_name} rows={item['rows']} coverage_days={fmt_decimal(coverage_days)} "
+            f"episodes={len(item['episodes'])} blocked={dict(item['blocked'])}"
+        )
+        for direction, windows in item["latest_quantiles"].items():
+            for window, context in windows.items():
+                print(
+                    f"asset={asset_name} direction={direction} window={window}s count={context['count']} "
+                    f"coverage_seconds={context['coverage_seconds']:.0f} mature={context['mature']} "
+                    f"p55={fmt_decimal(context['p55'])} p60={fmt_decimal(context['p60'])} "
+                    f"p85={fmt_decimal(context['p85'])} p90={fmt_decimal(context['p90'])}"
+                )
+        for variant in V3_VARIANTS:
+            for direction in V2_DIRECTIONS:
+                episodes = [
+                    episode
+                    for episode in item["episodes"]
+                    if episode["variant"] == variant and episode["direction"] == direction
+                ]
+                split = _basis_v3_split_stats(
+                    episodes,
+                    holdout_fraction=holdout_fraction,
+                    min_independent_samples=min_independent_samples,
+                )
+                pnl = [episode["net_pnl_bps"] for episode in episodes]
+                holding = [episode["holding_seconds"] for episode in episodes]
+                mfe = [episode["mfe_bps"] for episode in episodes if episode["mfe_bps"] is not None]
+                mae = [episode["mae_bps"] for episode in episodes if episode["mae_bps"] is not None]
+                episodes_per_day = (
+                    Decimal(len(episodes)) / coverage_days if coverage_days > 0 else None
+                )
+                alignments = Counter(episode["stablecoin_alignment"] for episode in episodes)
+                print(
+                    f"asset={asset_name} variant={variant} direction={direction} n={len(episodes)} "
+                    f"episodes_per_day={fmt_decimal(episodes_per_day)} net_p20={fmt_decimal(percentile(pnl, Decimal('20')))} "
+                    f"net_p50={fmt_decimal(percentile(pnl, Decimal('50')))} "
+                    f"hold_p50={fmt_decimal(percentile(holding, Decimal('50')))} "
+                    f"hold_p80={fmt_decimal(percentile(holding, Decimal('80')))} "
+                    f"mfe_p50={fmt_decimal(percentile(mfe, Decimal('50')))} "
+                    f"mae_p20={fmt_decimal(percentile(mae, Decimal('20')))} "
+                    f"train_n={split['train']['n']} train_p20={fmt_decimal(split['train']['p20'])} "
+                    f"holdout_n={split['holdout']['n']} holdout_p20={fmt_decimal(split['holdout']['p20'])} "
+                    f"alignments={dict(alignments)} verdict={split['verdict']}"
+                )
+    print("recommendation=require_positive_time_holdout_before_any_basis_v3_live_start")
 
 
 def _basis_v2_stats() -> dict[str, Any]:
@@ -1577,6 +1996,18 @@ def main() -> int:
     parser.add_argument("--semantics-min-abs-entry-bps", default="7", help="Static absolute basis threshold for --entry-semantics. Default: 7.")
     parser.add_argument("--semantics-min-normalized-filter-bps", default="1", help="Normalized filter threshold for --entry-semantics. Default: 1.")
     parser.add_argument("--basis-v2", action="store_true", help="Replay directional executable edges with strict time-aligned multiscale context.")
+    parser.add_argument("--basis-v3", action="store_true", help="Replay independent multiscale quantile convergence episodes using executable prices.")
+    parser.add_argument("--basis-v3-evaluation-interval-seconds", type=int, default=60, help="Evaluate V3 entries at most once per interval. Default: 60.")
+    parser.add_argument("--basis-v3-history-sample-seconds", type=int, default=30, help="Downsample prior quantile history to this interval. Default: 30.")
+    parser.add_argument("--basis-v3-episode-cooldown-seconds", type=int, default=180, help="Cooldown after each independent V3 episode. Default: 180.")
+    parser.add_argument("--basis-v3-max-hold-seconds", type=int, default=21600, help="Maximum V3 episode holding horizon. Default: 21600.")
+    parser.add_argument("--basis-v3-min-window-coverage", default="0.80", help="Required elapsed coverage for a quantile window. Default: 0.80.")
+    parser.add_argument("--basis-v3-min-history-samples", type=int, default=100, help="Minimum strictly-prior samples in a mature window. Default: 100.")
+    parser.add_argument("--basis-v3-long-shortfall-reserve-bps", default="1.0", help="Unmodeled shortfall reserve for long-Var episodes. Default: 1.0.")
+    parser.add_argument("--basis-v3-short-shortfall-reserve-bps", default="1.0", help="Unmodeled shortfall reserve for short-Var episodes. Default: 1.0.")
+    parser.add_argument("--basis-v3-min-net-expected-bps", default="1.0", help="Minimum entry quantile distance after shortfall reserve. Default: 1.0.")
+    parser.add_argument("--basis-v3-holdout-fraction", default="0.30", help="Chronological V3 holdout fraction. Default: 0.30.")
+    parser.add_argument("--basis-v3-min-independent-samples", type=int, default=5, help="Minimum train and holdout episodes for a bounded-live verdict. Default: 5.")
     parser.add_argument("--basis-v2-min-raw-edge-bps", default="7", help="Basis V2 raw directional edge floor. Default: 7.")
     parser.add_argument("--basis-v2-max-quote-age-ms", default="0", help="Optional Basis V2 Var quote age cap; 0 disables the filter.")
     parser.add_argument("--basis-v2-max-var-spread-bps", default="0", help="Optional Basis V2 Var spread cap; 0 disables the filter.")
@@ -1646,6 +2077,11 @@ def main() -> int:
         basis_v2_sweep_min_reversion_deviation = Decimal(str(args.basis_v2_sweep_min_reversion_deviation_bps))
         basis_v2_sweep_holdout_fraction = Decimal(str(args.basis_v2_sweep_holdout_fraction))
         basis_v2_sweep_execution_reserve = Decimal(str(args.basis_v2_sweep_execution_reserve_bps))
+        basis_v3_min_window_coverage = Decimal(str(args.basis_v3_min_window_coverage))
+        basis_v3_long_shortfall_reserve = Decimal(str(args.basis_v3_long_shortfall_reserve_bps))
+        basis_v3_short_shortfall_reserve = Decimal(str(args.basis_v3_short_shortfall_reserve_bps))
+        basis_v3_min_net_expected = Decimal(str(args.basis_v3_min_net_expected_bps))
+        basis_v3_holdout_fraction = Decimal(str(args.basis_v3_holdout_fraction))
         basis_v2_sweep_normalized_thresholds = parse_decimal_list(
             args.basis_v2_sweep_normalized_thresholds,
             label="--basis-v2-sweep-normalized-thresholds",
@@ -1683,6 +2119,23 @@ def main() -> int:
         parser.error("--basis-v2-sweep-holdout-fraction must be between 0 and 1")
     if args.basis_v2_sweep_min_independent_samples <= 0:
         parser.error("--basis-v2-sweep-min-independent-samples must be > 0")
+    if not Decimal("0") < basis_v3_min_window_coverage <= Decimal("1"):
+        parser.error("--basis-v3-min-window-coverage must be between 0 and 1")
+    if basis_v3_long_shortfall_reserve < 0 or basis_v3_short_shortfall_reserve < 0:
+        parser.error("basis V3 shortfall reserves must be >= 0")
+    if basis_v3_min_net_expected < 0:
+        parser.error("--basis-v3-min-net-expected-bps must be >= 0")
+    if not Decimal("0") < basis_v3_holdout_fraction < Decimal("1"):
+        parser.error("--basis-v3-holdout-fraction must be between 0 and 1")
+    if (
+        args.basis_v3_evaluation_interval_seconds <= 0
+        or args.basis_v3_history_sample_seconds <= 0
+        or args.basis_v3_episode_cooldown_seconds < 0
+        or args.basis_v3_max_hold_seconds <= 0
+        or args.basis_v3_min_history_samples <= 0
+        or args.basis_v3_min_independent_samples <= 0
+    ):
+        parser.error("basis V3 intervals, history, hold, and sample counts must be positive; cooldown may be 0")
 
     source_paths = rotated_jsonl_paths(ORDER_METRICS) if args.include_rotated else [ORDER_METRICS]
     raw_rows = tail_jsonl_many(source_paths, args.tail) if args.include_rotated else tail_jsonl(ORDER_METRICS, args.tail)
@@ -1869,6 +2322,22 @@ def main() -> int:
             max_lighter_spread_bps=basis_v2_max_lighter_spread,
             context_gap_bps=basis_v2_context_gap,
             fresh_quote_ms=basis_v2_fresh_quote,
+        )
+    if args.basis_v3:
+        print_basis_v3(
+            rows,
+            asset=args.asset,
+            evaluation_interval_seconds=args.basis_v3_evaluation_interval_seconds,
+            history_sample_seconds=args.basis_v3_history_sample_seconds,
+            episode_cooldown_seconds=args.basis_v3_episode_cooldown_seconds,
+            max_hold_seconds=args.basis_v3_max_hold_seconds,
+            min_window_coverage=basis_v3_min_window_coverage,
+            min_history_samples=args.basis_v3_min_history_samples,
+            long_shortfall_reserve_bps=basis_v3_long_shortfall_reserve,
+            short_shortfall_reserve_bps=basis_v3_short_shortfall_reserve,
+            min_net_expected_bps=basis_v3_min_net_expected,
+            holdout_fraction=basis_v3_holdout_fraction,
+            min_independent_samples=args.basis_v3_min_independent_samples,
         )
     if args.basis_v2_filter_sweep:
         print_basis_v2_filter_sweep(
