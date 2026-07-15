@@ -2842,6 +2842,18 @@ class VariationalToLighterRuntime:
         )
         await self.persist_live_inventory_memory(reason="actual_pnl_final_fill_update")
 
+    async def register_live_inventory_actual_pnl(
+        self,
+        *,
+        trade_key: str,
+        pending: dict[str, Any],
+        lighter_record: OrderLifecycle | None,
+    ) -> bool:
+        self.pending_live_inventory_actual_pnl[trade_key] = pending
+        if lighter_record is not None and lighter_record.lighter_fill_ts_iso is not None:
+            await self.maybe_append_live_inventory_actual_pnl(lighter_record.to_payload())
+        return trade_key not in self.pending_live_inventory_actual_pnl
+
     @staticmethod
     def live_inventory_final_pnl_key(asset: str, lot_id: Any) -> str:
         return f"{str(asset).upper()}:{lot_id}"
@@ -8707,20 +8719,26 @@ class VariationalToLighterRuntime:
         await self.persist_live_inventory_memory(reason="basis_dry_exit_decision" if self.live_inventory_dry_decisions else "basis_exit_submitted")
         actual_pnl_status = "dry_decision" if self.live_inventory_dry_decisions else "pending_lighter_final_fill"
         if not self.live_inventory_dry_decisions and lighter_payload:
-            self.pending_live_inventory_actual_pnl[str(lighter_payload.get("trade_key") or "")] = {
-                "asset": asset,
-                "lot_id": lot.get("lot_id"),
-                "basis_trace_id": lot.get("basis_trace_id"),
-                "direction": direction,
-                "qty": decimal_to_str(qty),
-                "entry_var_price": decimal_to_str(entry_var_price),
-                "entry_lighter_price": decimal_to_str(entry_lighter_price),
-                "exit_var_price": decimal_to_str(var_exit_price),
-                "estimated_exit_lighter_price": decimal_to_str(lighter_exit_price),
-                "exit_lighter_depth": exit_lighter_depth,
-                "estimated_pnl_usd": decimal_to_str(pnl),
-                "estimated_pnl_bps": decimal_to_str(pnl_bps),
-            }
+            actual_pnl_finalized = await self.register_live_inventory_actual_pnl(
+                trade_key=str(lighter_payload.get("trade_key") or ""),
+                pending={
+                    "asset": asset,
+                    "lot_id": lot.get("lot_id"),
+                    "basis_trace_id": lot.get("basis_trace_id"),
+                    "direction": direction,
+                    "qty": decimal_to_str(qty),
+                    "entry_var_price": decimal_to_str(entry_var_price),
+                    "entry_lighter_price": decimal_to_str(entry_lighter_price),
+                    "exit_var_price": decimal_to_str(var_exit_price),
+                    "estimated_exit_lighter_price": decimal_to_str(lighter_exit_price),
+                    "exit_lighter_depth": exit_lighter_depth,
+                    "estimated_pnl_usd": decimal_to_str(pnl),
+                    "estimated_pnl_bps": decimal_to_str(pnl_bps),
+                },
+                lighter_record=lighter_record,
+            )
+            if actual_pnl_finalized:
+                actual_pnl_status = "lighter_final_fill_confirmed"
         await self.append_live_inventory_log(
             "live_inventory_dry_exited" if self.live_inventory_dry_decisions else "live_inventory_exited",
             {

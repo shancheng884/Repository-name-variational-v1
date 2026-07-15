@@ -2854,6 +2854,47 @@ def test_execution_calibration_cycle_loss_triggers_fuse(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_register_actual_pnl_replays_fill_that_arrived_before_pending(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+
+        class FilledRecord:
+            lighter_fill_ts_iso = "2026-07-15T12:00:00+00:00"
+
+            @staticmethod
+            def to_payload() -> dict[str, str]:
+                return {
+                    "trade_key": "exit-race",
+                    "lighter_filled_price": "100",
+                    "lighter_filled_at": "2026-07-15T12:00:00+00:00",
+                }
+
+        finalized = await runtime.register_live_inventory_actual_pnl(
+            trade_key="exit-race",
+            pending={
+                "asset": "ETH",
+                "lot_id": 1,
+                "direction": "long_var_short_lighter",
+                "qty": "1",
+                "entry_var_price": "100",
+                "entry_lighter_price": "100",
+                "exit_var_price": "100.1",
+                "estimated_pnl_usd": "0.1",
+                "estimated_pnl_bps": "10",
+            },
+            lighter_record=FilledRecord(),
+        )
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert finalized is True
+        assert "exit-race" not in runtime.pending_live_inventory_actual_pnl
+        assert rows[-1]["event"] == "live_inventory_actual_pnl"
+        assert rows[-1]["actual_pnl_usd"] == "0.1"
+
+    asyncio.run(run())
+
+
 def test_live_inventory_state_asset_uses_allowed_single_asset(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
