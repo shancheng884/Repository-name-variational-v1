@@ -821,6 +821,7 @@ class VariationalToLighterRuntime:
         self.auto_live_max_cycles = int(args.auto_live_max_cycles)
         self.live_inventory = bool(args.live_inventory)
         self.live_inventory_dry_decisions = bool(args.live_inventory_dry_decisions)
+        self.live_inventory_collect_only = bool(args.live_inventory_collect_only)
         self.live_inventory_signal_mode = args.live_inventory_signal_mode
         self.live_inventory_i_accept_basis_real_diagnostic = bool(args.live_inventory_i_accept_basis_real_diagnostic)
         self.live_inventory_i_confirm_flat_start = bool(args.live_inventory_i_confirm_flat_start)
@@ -1056,14 +1057,18 @@ class VariationalToLighterRuntime:
         self.live_inventory_run_id = f"liveinv-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
         self.live_inventory_schema_version = "2"
         self.live_inventory_strategy_version = (
-            "execution-calibration-v1"
+            "basis-v3-collector-v1"
+            if self.live_inventory_collect_only
+            else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
             else "cost-calibrated-reversion-v3"
             if self.live_inventory_basis_reversion_mode
             else "basis-v1"
         )
         self.live_inventory_strategy_variant = (
-            "alternating-direction-fixed-hold"
+            "read-only-executable-state"
+            if self.live_inventory_collect_only
+            else "alternating-direction-fixed-hold"
             if self.live_inventory_execution_calibration
             else "legacy-5m-reversion"
             if self.live_inventory_basis_reversion_mode
@@ -3683,6 +3688,8 @@ class VariationalToLighterRuntime:
                 passed.append("live_inventory_enabled")
                 if self.live_inventory_dry_decisions:
                     passed.append("live_inventory_dry_decisions_only_no_orders")
+                    if getattr(self, "live_inventory_collect_only", False):
+                        passed.append("live_inventory_basis_collect_only_state_logging_no_orders")
                 else:
                     passed.append("live_inventory_real_submit_one_lot_enabled")
                 if getattr(self, "live_inventory_auto_close_manual_review_position", False):
@@ -6726,11 +6733,16 @@ class VariationalToLighterRuntime:
     async def maybe_run_live_inventory_basis(self, snapshot: CrossSpreadSnapshot) -> None:
         asset = snapshot.asset.upper()
         calibration_mode = bool(getattr(self, "live_inventory_execution_calibration", False))
+        collect_only = bool(getattr(self, "live_inventory_collect_only", False))
         if self.live_allowed_assets and asset not in self.live_allowed_assets:
             return
         self.live_inventory_sample_index += 1
         index = self.live_inventory_sample_index
-        if self.live_inventory_completed_cycles >= self.live_inventory_max_cycles and not self.live_inventory_open_lots:
+        if (
+            not collect_only
+            and self.live_inventory_completed_cycles >= self.live_inventory_max_cycles
+            and not self.live_inventory_open_lots
+        ):
             if index == 1 or index % 30 == 0:
                 await self.append_live_inventory_log(
                     "live_inventory_cycle_cap_reached",
@@ -7062,11 +7074,14 @@ class VariationalToLighterRuntime:
             "open_lots_total": len(self.live_inventory_open_lots),
             "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
             "completed_cycles": self.live_inventory_completed_cycles,
+            "basis_collect_only": collect_only,
             "entry_quality_buffer_bps": decimal_to_str(self.live_inventory_dynamic_entry_quality_buffer_bps(var_quote_age_seconds=var_quote_age_seconds)),
         }
         if size_ladder is not None:
             state_payload["basis_size_ladder"] = size_ladder
         await self.append_live_inventory_log("live_inventory_basis_state", state_payload)
+        if collect_only:
+            return
         dynamic_entry_quality_buffer_bps = self.live_inventory_dynamic_entry_quality_buffer_bps(var_quote_age_seconds=var_quote_age_seconds)
         addon_direction: str | None = None
         if (
@@ -10685,7 +10700,10 @@ class VariationalToLighterRuntime:
             except Exception:
                 self.logger.exception("lighter_submit_ws_prewarm_failed")
                 raise
-        if self.is_live_inventory_enabled() and not self.live_inventory_dry_decisions:
+        if self.is_live_inventory_enabled() and (
+            not self.live_inventory_dry_decisions
+            or getattr(self, "live_inventory_collect_only", False)
+        ):
             try:
                 await self.preflight_variational_api_command_client(initial_asset)
                 self.logger.info("variational_api_command_client_preflight_passed asset=%s", initial_asset)
@@ -11045,6 +11063,11 @@ def parse_args() -> argparse.Namespace:
         "--live-inventory-dry-decisions",
         action="store_true",
         help="Run live inventory V1 decision logic and state/logging without submitting real orders.",
+    )
+    parser.add_argument(
+        "--live-inventory-collect-only",
+        action="store_true",
+        help="Collect basis state rows only; requires basis dry-decisions and never enters dry or real inventory.",
     )
     parser.add_argument(
         "--live-inventory-signal-mode",
@@ -11490,6 +11513,14 @@ def parse_args() -> argparse.Namespace:
                 "--live-inventory-i-accept-open-state-resume, or --live-inventory-auto-close-manual-review-position"
             )
         allowed_assets = {asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()}
+        if args.live_inventory_collect_only and (
+            not args.live_inventory_dry_decisions
+            or args.live_inventory_signal_mode != LIVE_INVENTORY_SIGNAL_BASIS
+        ):
+            parser.error(
+                "--live-inventory-collect-only requires --live-inventory-dry-decisions "
+                "and --live-inventory-signal-mode basis"
+            )
         live_inventory_max_lot_notional_usd = 20
         if args.live_inventory_signal_mode == LIVE_INVENTORY_SIGNAL_BASIS:
             if not allowed_assets or not allowed_assets.issubset(LIVE_INVENTORY_BASIS_ALLOWED_ASSETS):
@@ -11539,7 +11570,7 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory V1 requires --lighter-submit-transport ws")
         if args.lighter_order_mode != LIGHTER_ORDER_MODE_MARKET_IOC:
             parser.error("--live-inventory V1 requires --lighter-order-mode market-ioc")
-        if not args.lighter_prewarm_submit_ws:
+        if not args.lighter_prewarm_submit_ws and not args.live_inventory_collect_only:
             parser.error("--live-inventory V1 requires --lighter-prewarm-submit-ws")
         if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > live_inventory_max_lot_notional_usd:
             parser.error(f"--live-inventory-lot-notional-usd must be > 0 and <= {live_inventory_max_lot_notional_usd} in V1")
@@ -11757,6 +11788,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--live-inventory-reset-state-after-manual-flat requires --live-inventory")
     elif args.live_inventory_dry_decisions:
         parser.error("--live-inventory-dry-decisions requires --live-inventory")
+    elif args.live_inventory_collect_only:
+        parser.error("--live-inventory-collect-only requires --live-inventory")
     elif args.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics:
         parser.error("--live-inventory-ignore-recent-execution-loss-buffer-for-diagnostics requires --live-inventory")
     if args.auto_live_min_holding_seconds < 0:

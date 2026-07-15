@@ -93,6 +93,7 @@ def validate_state(
     config: LiveConfig,
     *,
     reset_state_after_manual_flat: bool = False,
+    collect_only: bool = False,
 ) -> tuple[bool, str]:
     state = read_json(LIVE_STATE)
     if not state:
@@ -120,7 +121,7 @@ def validate_state(
         if config.reversion_mode
         else config.max_cycles
     )
-    if completed_cycles >= effective_max_cycles:
+    if completed_cycles >= effective_max_cycles and not collect_only:
         if reset_state_after_manual_flat:
             return (
                 True,
@@ -132,7 +133,8 @@ def validate_state(
             f"state_cycle_cap_reached asset={asset} completed_cycles={completed_cycles} max_cycles={effective_max_cycles} "
             "open_lots=0 pending_actions=0",
         )
-    return True, f"state=flat asset={asset} open_lots=0 pending_actions=0 completed_cycles={completed_cycles} max_cycles={effective_max_cycles}"
+    mode = " collect_only=true" if collect_only else ""
+    return True, f"state=flat asset={asset} open_lots=0 pending_actions=0 completed_cycles={completed_cycles} max_cycles={effective_max_cycles}{mode}"
 
 
 def disk_warning() -> str:
@@ -263,10 +265,11 @@ def build_main_command(
     config: LiveConfig,
     *,
     reset_state_after_manual_flat: bool = False,
+    collect_only: bool = False,
 ) -> list[str]:
     reversion_mode = config.reversion_mode
     calibration_mode = config.calibration_mode
-    diagnostic_single_lot = reversion_mode or calibration_mode
+    diagnostic_single_lot = reversion_mode or calibration_mode or collect_only
     effective_max_total_notional_usd = "25" if diagnostic_single_lot else config.max_total_inventory_notional_usd
     effective_max_cycles = config.calibration_max_cycles if calibration_mode else 1 if reversion_mode else config.max_cycles
     effective_max_lots = 1 if diagnostic_single_lot else config.max_lots
@@ -294,7 +297,6 @@ def build_main_command(
         "ws",
         "--lighter-order-mode",
         "market-ioc",
-        "--lighter-prewarm-submit-ws",
         "--live-max-notional-usd",
         config.live_max_notional_usd,
         "--live-inventory",
@@ -346,8 +348,11 @@ def build_main_command(
         "--live-inventory-snapshot-timeout-seconds",
         config.snapshot_timeout_seconds,
         "--live-inventory-i-confirm-flat-start",
-        "--live-inventory-i-accept-basis-real-diagnostic",
     ]
+    if collect_only:
+        command.extend(["--live-inventory-dry-decisions", "--live-inventory-collect-only"])
+    else:
+        command.extend(["--lighter-prewarm-submit-ws", "--live-inventory-i-accept-basis-real-diagnostic"])
     if config.dynamic_entry_threshold:
         command.append("--live-inventory-basis-dynamic-entry-threshold")
     if not reversion_mode and not calibration_mode:
@@ -445,6 +450,11 @@ def main() -> int:
         help="Explicitly enable bounded real execution-cost calibration. This intentionally submits and closes small real positions.",
     )
     parser.add_argument(
+        "--collect-only",
+        action="store_true",
+        help="Continuously collect executable basis states without real or dry inventory entries.",
+    )
+    parser.add_argument(
         "--reset-state-after-manual-flat",
         action="store_true",
         help="After manually confirming both venues are flat, reset the completed-cycle state during startup.",
@@ -461,12 +471,16 @@ def main() -> int:
     except ValueError as exc:
         print(f"REFUSE_START reason=config_invalid detail={exc}")
         return 2
-    if args.reversion and args.calibration:
-        parser.error("use only one of --reversion or --calibration")
+    if sum(bool(value) for value in (args.reversion, args.calibration, args.collect_only)) > 1:
+        parser.error("use only one of --reversion, --calibration, or --collect-only")
+    if args.collect_only and args.reset_state_after_manual_flat:
+        parser.error("--collect-only does not allow --reset-state-after-manual-flat")
     if args.reversion:
         config = replace(config, reversion_mode=True, calibration_mode=False)
     if args.calibration:
         config = replace(config, calibration_mode=True, reversion_mode=False)
+    if args.collect_only:
+        config = replace(config, calibration_mode=False, reversion_mode=False)
     if config.reversion_mode and config.calibration_mode:
         print("REFUSE_START reason=config_invalid detail=reversion_mode_and_calibration_mode_are_mutually_exclusive")
         return 2
@@ -481,6 +495,7 @@ def main() -> int:
     state_ok, state_message = validate_state(
         config,
         reset_state_after_manual_flat=args.reset_state_after_manual_flat,
+        collect_only=args.collect_only,
     )
     print(state_message)
     print(disk_warning())
@@ -492,9 +507,10 @@ def main() -> int:
         asset,
         config,
         reset_state_after_manual_flat=args.reset_state_after_manual_flat,
+        collect_only=args.collect_only,
     )
     effective_max_cycles = config.calibration_max_cycles if config.calibration_mode else 1 if config.reversion_mode else config.max_cycles
-    strategy_mode = "execution_calibration" if config.calibration_mode else "reversion" if config.reversion_mode else "basis"
+    strategy_mode = "basis_v3_collect_only" if args.collect_only else "execution_calibration" if config.calibration_mode else "reversion" if config.reversion_mode else "basis"
     print(
         f"starting asset={asset} strategy_mode={strategy_mode} "
         f"max_cycles={effective_max_cycles} lot_notional_usd={config.lot_notional_usd}"
@@ -505,7 +521,10 @@ def main() -> int:
         print("DRY_RUN no live process started")
         return 0
 
-    print("Starting live. You are responsible for confirming both exchanges are flat before running this command.")
+    if args.collect_only:
+        print("Starting collect-only basis logging. Real and dry inventory entries are disabled.")
+    else:
+        print("Starting live. You are responsible for confirming both exchanges are flat before running this command.")
     return subprocess.call(command, cwd=ROOT)
 
 

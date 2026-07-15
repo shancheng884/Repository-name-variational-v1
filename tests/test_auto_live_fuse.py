@@ -1190,6 +1190,81 @@ def test_live_inventory_basis_abs_entry_threshold_blocks_thin_basis(tmp_path) ->
     asyncio.run(run())
 
 
+def test_live_inventory_basis_collect_only_logs_state_without_touching_inventory_state(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_dry_decisions = True
+        runtime.live_inventory_collect_only = True
+        runtime.live_inventory_completed_cycles = runtime.live_inventory_max_cycles
+        runtime.live_inventory_signal_mode = "basis"
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.accepted_assets = {"ETH"}
+        runtime.live_inventory_lot_notional_usd = Decimal("20")
+        runtime.live_inventory_basis_state = LiveInventoryBasisState(
+            half_life_seconds=300,
+            warmup_samples=1,
+            gap_reset_seconds=30,
+            sigma_floor_bps=0,
+        )
+        runtime.live_inventory_basis_state.mean = -7.0
+        runtime.live_inventory_basis_state.var = 0.1
+        runtime.live_inventory_basis_state.seen = 10
+        runtime.live_inventory_basis_state.last_ts = time.monotonic()
+        runtime.live_inventory_basis_var_spread_bps_samples = deque(maxlen=20)
+        runtime.live_inventory_basis_lighter_spread_bps_samples = deque(maxlen=20)
+        runtime.live_inventory_basis_sample_move_bps_samples = deque(maxlen=20)
+        runtime.live_inventory_basis_size_ladder_notionals_usd = []
+        runtime.live_inventory_basis_reversion_mode = False
+        runtime.live_inventory_basis_reversion_min_deviation_bps = Decimal("0")
+        runtime.live_inventory_basis_reversion_exit_deviation_bps = Decimal("0")
+        runtime.live_inventory_basis_reversion_min_net_expected_pnl_bps = Decimal("0")
+        runtime.live_inventory_basis_dynamic_sample_move_threshold_bps = lambda: (Decimal("3"), {})
+        runtime.live_inventory_basis_reversion_medians = lambda **_kwargs: {
+            300: None,
+            1800: None,
+            3600: None,
+        }
+        runtime.live_inventory_basis_reversion_execution_reserve_bps = lambda _direction: Decimal("0")
+        runtime.live_inventory_record_stablecoin_basis_sample = lambda _context: None
+        runtime.normalize_usdc_price_to_usdt = lambda _price, _context: None
+        runtime.live_inventory_stablecoin_edge_context = lambda **_kwargs: (True, {})
+        runtime.live_inventory_stablecoin_regime_context = lambda **_kwargs: (False, {})
+        runtime.live_inventory_stablecoin_alignment = lambda **_kwargs: "unknown"
+        runtime.live_inventory_dynamic_entry_quality_buffer_bps = lambda **_kwargs: Decimal("0")
+        original_state = '{"status":"flat","completed_cycles":1}\n'
+        runtime.live_inventory_state_file.write_text(original_state, encoding="utf-8")
+
+        async def fake_fetch_live_inventory_stablecoin_context():
+            return {}
+
+        async def fake_fetch_live_inventory_basis_quote(**_kwargs):
+            return {
+                "quoteId": "collect-quote",
+                "bid": "1753.00",
+                "ask": "1753.25",
+                "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+            }, Decimal("10")
+
+        async def refuse_submit(**_kwargs):
+            raise AssertionError("collect-only must not submit orders")
+
+        runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
+        runtime.fetch_live_inventory_stablecoin_context = fake_fetch_live_inventory_stablecoin_context
+        runtime.send_variational_place_order = refuse_submit
+        runtime.place_lighter_order_from_plan = refuse_submit
+
+        await runtime.maybe_run_live_inventory_basis(_eth_inventory_snapshot())
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert [row["event"] for row in rows] == ["live_inventory_basis_state"]
+        assert rows[0]["basis_collect_only"] is True
+        assert runtime.live_inventory_open_lots == []
+        assert runtime.live_inventory_completed_cycles == 1
+        assert runtime.live_inventory_state_file.read_text(encoding="utf-8") == original_state
+
+    asyncio.run(run())
+
+
 def test_live_inventory_basis_var_quote_age_guard_blocks_entry(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)

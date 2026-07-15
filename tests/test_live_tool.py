@@ -131,6 +131,44 @@ def test_live_tool_calibration_command_passes_main_cli_guards(monkeypatch) -> No
     assert args.live_inventory_min_hold_samples == args.live_inventory_max_hold_samples == 5
 
 
+def test_live_tool_collect_only_disables_all_inventory_entries(monkeypatch) -> None:
+    command = build_main_command("SOL", LiveConfig(max_total_lots=3), collect_only=True)
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_dry_decisions is True
+    assert args.live_inventory_collect_only is True
+    assert args.live_inventory_signal_mode == "basis"
+    assert args.live_inventory_max_lots == 1
+    assert args.live_inventory_max_total_lots == 1
+    assert "--lighter-prewarm-submit-ws" not in command
+    assert "--live-inventory-i-accept-basis-real-diagnostic" not in command
+    assert "--live-inventory-i-accept-basis-addon-diagnostic" not in command
+
+
+def test_live_tool_collect_only_ignores_completed_cycle_cap_but_requires_flat_state(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "flat",
+                "asset": "SOL",
+                "open_lots": [],
+                "pending_actions": [],
+                "completed_cycles": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(live, "LIVE_STATE", state_path)
+
+    ok, message = validate_state(LiveConfig(max_cycles=1), collect_only=True)
+
+    assert ok is True
+    assert "collect_only=true" in message
+
+
 def test_live_tool_calibration_state_uses_calibration_cycle_cap(tmp_path, monkeypatch) -> None:
     state_path = tmp_path / "live_inventory_state.json"
     state_path.write_text(
