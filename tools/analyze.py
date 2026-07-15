@@ -369,6 +369,9 @@ V2_HORIZONS_SECONDS = (1, 3, 5, 10, 30, 60, 300)
 V2_DIRECTIONS = ("long_var_short_lighter", "short_var_long_lighter")
 DEFAULT_FILTER_SWEEP_HORIZONS = (5, 60, 300)
 V2_WINDOWS_SECONDS = (300, 1800, 3600)
+DEFAULT_FILTER_SWEEP_EVENT_COOLDOWN_SECONDS = 300
+DEFAULT_FILTER_SWEEP_HOLDOUT_FRACTION = Decimal("0.30")
+DEFAULT_FILTER_SWEEP_MIN_INDEPENDENT_SAMPLES = 30
 
 
 class _RollingMedian:
@@ -503,6 +506,7 @@ def build_basis_v2_replay(
     max_stablecoin_edge_share: Decimal = Decimal("0"),
     min_reversion_deviation_bps: Decimal = Decimal("0"),
     horizons: tuple[int, ...] = V2_HORIZONS_SECONDS,
+    event_cooldown_seconds: int = 0,
 ) -> dict[str, dict[str, Any]]:
     """Replay directional executable edges using strictly prior rolling context.
 
@@ -538,10 +542,12 @@ def build_basis_v2_replay(
             {
                 "rows": 0,
                 "candidate_count": 0,
+                "raw_candidate_count": 0,
                 "direction_counts": Counter(),
                 "horizons": {horizon: _basis_v2_stats() for horizon in horizons},
                 "contexts": {"short_vs_long": {}, "quote_age": {}, "cost_regime": {}},
                 "candidate_edges": [],
+                "candidate_events": [],
                 "var_spread_values": [],
                 "lighter_spread_values": [],
             },
@@ -553,6 +559,7 @@ def build_basis_v2_replay(
             direction: {window: _RollingMedian(window) for window in V2_WINDOWS_SECONDS}
             for direction in V2_DIRECTIONS
         }
+        last_event_at: dict[str, float | None] = {direction: None for direction in V2_DIRECTIONS}
 
         for timestamp, row in group:
             medians_by_direction: dict[str, dict[int, Decimal | None]] = {}
@@ -592,15 +599,32 @@ def build_basis_v2_replay(
                 lighter_spread = _spread_bps_from_bid_ask(row, "lighter_bid", "lighter_ask")
                 if max_lighter_spread_bps > 0 and (lighter_spread is None or lighter_spread > max_lighter_spread_bps):
                     continue
+                item["raw_candidate_count"] += 1
+                previous_event_at = last_event_at[direction]
+                if (
+                    event_cooldown_seconds > 0
+                    and previous_event_at is not None
+                    and timestamp < previous_event_at + event_cooldown_seconds
+                ):
+                    continue
+                last_event_at[direction] = timestamp
                 item["candidate_count"] += 1
                 item["direction_counts"][direction] += 1
                 item["candidate_edges"].append(edge)
+                candidate_event = {
+                    "timestamp": timestamp,
+                    "direction": direction,
+                    "pnl_bps": {},
+                }
+                item["candidate_events"].append(candidate_event)
                 for horizon in horizons:
                     future_index = bisect_left(times, timestamp + horizon)
                     if future_index >= len(group_rows):
                         continue
                     future = group_rows[future_index]
                     pnl_bps = _entry_semantics_forward_pnl_bps(row, future, direction)
+                    if pnl_bps is not None:
+                        candidate_event["pnl_bps"][horizon] = pnl_bps
                     future_edge = _basis_v2_candidate_edge(future, direction)
                     edge_delta = future_edge - edge if future_edge is not None else None
                     _basis_v2_add_stat(
@@ -714,6 +738,75 @@ def print_basis_v2(
     print("recommendation=review_holdout_and_execution_reserve_before_shadow")
 
 
+def _basis_v2_net_pnl_stats(
+    events: list[dict[str, Any]],
+    *,
+    horizon: int,
+    execution_reserve_bps: Decimal,
+) -> dict[str, Any]:
+    pnl_values = [
+        pnl_bps - execution_reserve_bps
+        for event in events
+        if (pnl_bps := event["pnl_bps"].get(horizon)) is not None
+    ]
+    positive_pct = (
+        Decimal(sum(value > 0 for value in pnl_values)) / Decimal(len(pnl_values)) * Decimal("100")
+        if pnl_values
+        else None
+    )
+    return {
+        "n": len(pnl_values),
+        "p20": percentile(pnl_values, Decimal("20")),
+        "p50": percentile(pnl_values, Decimal("50")),
+        "positive_pct": positive_pct,
+    }
+
+
+def summarize_basis_v2_sweep_events(
+    events: list[dict[str, Any]],
+    *,
+    horizons: tuple[int, ...],
+    holdout_fraction: Decimal,
+    min_independent_samples: int,
+    execution_reserve_bps: Decimal,
+) -> dict[int, dict[str, Any]]:
+    """Split de-duplicated events chronologically and score net forward PnL.
+
+    The split is diagnostic only: it prevents a threshold from being judged solely
+    on the same events that made it look attractive.
+    """
+    ordered_events = sorted(events, key=lambda event: float(event["timestamp"]))
+    if len(ordered_events) < 2:
+        train_events = ordered_events
+        holdout_events: list[dict[str, Any]] = []
+    else:
+        split_index = int(Decimal(len(ordered_events)) * (Decimal("1") - holdout_fraction))
+        split_index = min(max(split_index, 1), len(ordered_events) - 1)
+        train_events = ordered_events[:split_index]
+        holdout_events = ordered_events[split_index:]
+
+    summary: dict[int, dict[str, Any]] = {}
+    for horizon in horizons:
+        train = _basis_v2_net_pnl_stats(
+            train_events,
+            horizon=horizon,
+            execution_reserve_bps=execution_reserve_bps,
+        )
+        holdout = _basis_v2_net_pnl_stats(
+            holdout_events,
+            horizon=horizon,
+            execution_reserve_bps=execution_reserve_bps,
+        )
+        if train["n"] < min_independent_samples or holdout["n"] < min_independent_samples:
+            verdict = "insufficient_independent_data"
+        elif train["p20"] is None or holdout["p20"] is None or train["p20"] <= 0 or holdout["p20"] <= 0:
+            verdict = "net_p20_not_positive"
+        else:
+            verdict = "manual_review_candidate"
+        summary[horizon] = {"train": train, "holdout": holdout, "verdict": verdict}
+    return summary
+
+
 def print_basis_v2_filter_sweep(
     rows: list[dict[str, Any]],
     *,
@@ -728,11 +821,19 @@ def print_basis_v2_filter_sweep(
     stablecoin_share_thresholds: tuple[Decimal, ...],
     min_reversion_deviation_bps: Decimal,
     horizons: tuple[int, ...],
+    event_cooldown_seconds: int,
+    holdout_fraction: Decimal,
+    min_independent_samples: int,
+    execution_reserve_bps: Decimal,
 ) -> None:
     print("== basis_v2_filter_sweep ==")
     print(
         "model=raw_edge_plus_prior_5m_reversion_with_normalized_and_stablecoin_filters "
-        "forward_pnl_uses_executable_bid_ask_and_excludes_fees_latency_actual_fills"
+        "forward_pnl_uses_executable_bid_ask_minus_configured_execution_reserve"
+    )
+    print(
+        f"event_cooldown_seconds={event_cooldown_seconds} holdout_fraction={fmt_decimal(holdout_fraction)} "
+        f"min_independent_samples={min_independent_samples} execution_reserve_bps={fmt_decimal(execution_reserve_bps)}"
     )
     for normalized_threshold in normalized_thresholds:
         for stablecoin_share_threshold in stablecoin_share_thresholds:
@@ -749,6 +850,7 @@ def print_basis_v2_filter_sweep(
                 max_stablecoin_edge_share=stablecoin_share_threshold,
                 min_reversion_deviation_bps=min_reversion_deviation_bps,
                 horizons=horizons,
+                event_cooldown_seconds=event_cooldown_seconds,
             )
             item = results.get(asset.upper()) if asset and results else None
             if item is None and results:
@@ -756,30 +858,34 @@ def print_basis_v2_filter_sweep(
             if item is None:
                 print(
                     f"min_norm={fmt_decimal(normalized_threshold)} max_share={fmt_decimal(stablecoin_share_threshold)} "
-                    "candidates=0 horizon=5s n=0 p50=- positive_pct=-"
+                    "candidate_rows=0 independent_events=0 horizon=5s train_n=0 holdout_n=0 verdict=insufficient_independent_data"
                 )
                 continue
             spread_reference = (item["var_spread_p80"] or Decimal("0")) + (
                 item["lighter_spread_p80"] or Decimal("0")
             )
+            event_summary = summarize_basis_v2_sweep_events(
+                item["candidate_events"],
+                horizons=horizons,
+                holdout_fraction=holdout_fraction,
+                min_independent_samples=min_independent_samples,
+                execution_reserve_bps=execution_reserve_bps,
+            )
             horizon_text: list[str] = []
             for horizon in horizons:
-                stats = item["horizons"][horizon]
-                pnl_values = stats["pnl_bps"]
-                p50 = percentile(pnl_values, Decimal("50"))
-                positive_pct = (
-                    Decimal(sum(value > 0 for value in pnl_values)) / Decimal(len(pnl_values)) * Decimal("100")
-                    if pnl_values
-                    else None
-                )
+                stats = event_summary[horizon]
+                train = stats["train"]
+                holdout = stats["holdout"]
                 horizon_text.append(
-                    f"h{horizon}_n={len(pnl_values)} h{horizon}_p50={fmt_decimal(p50)} "
-                    f"h{horizon}_positive_pct={fmt_decimal(positive_pct)}"
+                    f"h{horizon}_train_n={train['n']} h{horizon}_train_p20={fmt_decimal(train['p20'])} "
+                    f"h{horizon}_holdout_n={holdout['n']} h{horizon}_holdout_p20={fmt_decimal(holdout['p20'])} "
+                    f"h{horizon}_holdout_p50={fmt_decimal(holdout['p50'])} h{horizon}_verdict={stats['verdict']}"
                 )
             print(
                 f"asset={asset or '-'} min_norm={fmt_decimal(normalized_threshold)} "
                 f"max_share={fmt_decimal(stablecoin_share_threshold)} "
-                f"candidates={item['candidate_count']} spread_ref_p80={fmt_decimal(spread_reference)} "
+                f"candidate_rows={item['raw_candidate_count']} independent_events={item['candidate_count']} "
+                f"spread_ref_p80={fmt_decimal(spread_reference)} "
                 + " ".join(horizon_text)
             )
     print(f"min_reversion_deviation_bps={fmt_decimal(min_reversion_deviation_bps)}")
@@ -1414,6 +1520,28 @@ def main() -> int:
     parser.add_argument("--basis-v2-sweep-stablecoin-share-thresholds", default="0.6,0.75,1.0", help="Comma-separated stablecoin edge share caps for --basis-v2-filter-sweep.")
     parser.add_argument("--basis-v2-sweep-min-reversion-deviation-bps", default="1.0", help="Prior 5m deviation floor for --basis-v2-filter-sweep. Default: 1.")
     parser.add_argument("--basis-v2-sweep-horizons", default="5,60,300", help="Comma-separated forward horizons for --basis-v2-filter-sweep. Default: 5,60,300.")
+    parser.add_argument(
+        "--basis-v2-sweep-event-cooldown-seconds",
+        type=int,
+        default=DEFAULT_FILTER_SWEEP_EVENT_COOLDOWN_SECONDS,
+        help="Collapse repeated same-direction candidates into independent events. Default: 300.",
+    )
+    parser.add_argument(
+        "--basis-v2-sweep-holdout-fraction",
+        default=str(DEFAULT_FILTER_SWEEP_HOLDOUT_FRACTION),
+        help="Chronological fraction reserved for out-of-sample validation. Default: 0.30.",
+    )
+    parser.add_argument(
+        "--basis-v2-sweep-min-independent-samples",
+        type=int,
+        default=DEFAULT_FILTER_SWEEP_MIN_INDEPENDENT_SAMPLES,
+        help="Minimum train and holdout event count before a setting is reviewable. Default: 30.",
+    )
+    parser.add_argument(
+        "--basis-v2-sweep-execution-reserve-bps",
+        default="0",
+        help="Bps reserve subtracted from each forward proxy for unmodeled execution loss. Default: 0.",
+    )
     parser.add_argument("--asset", help="Optional asset filter for dynamic-cost and ladder what-if sections.")
     parser.add_argument("--ladder-lot-notional-usd", default="20", help="What-if lot size. Default: 20.")
     parser.add_argument("--ladder-max-lots", type=int, default=3, help="What-if max open lots. Default: 3.")
@@ -1448,6 +1576,8 @@ def main() -> int:
         basis_v2_context_gap = Decimal(str(args.basis_v2_context_gap_bps))
         basis_v2_fresh_quote = Decimal(str(args.basis_v2_fresh_quote_ms))
         basis_v2_sweep_min_reversion_deviation = Decimal(str(args.basis_v2_sweep_min_reversion_deviation_bps))
+        basis_v2_sweep_holdout_fraction = Decimal(str(args.basis_v2_sweep_holdout_fraction))
+        basis_v2_sweep_execution_reserve = Decimal(str(args.basis_v2_sweep_execution_reserve_bps))
         basis_v2_sweep_normalized_thresholds = parse_decimal_list(
             args.basis_v2_sweep_normalized_thresholds,
             label="--basis-v2-sweep-normalized-thresholds",
@@ -1474,10 +1604,17 @@ def main() -> int:
         or basis_v2_context_gap <= 0
         or basis_v2_fresh_quote <= 0
         or basis_v2_sweep_min_reversion_deviation < 0
+        or basis_v2_sweep_execution_reserve < 0
         or any(value < 0 for value in basis_v2_sweep_normalized_thresholds)
         or any(value < 0 for value in basis_v2_sweep_stablecoin_share_thresholds)
     ):
         parser.error("basis V2 thresholds must be non-negative, with positive context gap and fresh quote age")
+    if args.basis_v2_sweep_event_cooldown_seconds <= 0:
+        parser.error("--basis-v2-sweep-event-cooldown-seconds must be > 0")
+    if not Decimal("0") < basis_v2_sweep_holdout_fraction < Decimal("1"):
+        parser.error("--basis-v2-sweep-holdout-fraction must be between 0 and 1")
+    if args.basis_v2_sweep_min_independent_samples <= 0:
+        parser.error("--basis-v2-sweep-min-independent-samples must be > 0")
 
     source_paths = rotated_jsonl_paths(ORDER_METRICS) if args.include_rotated else [ORDER_METRICS]
     raw_rows = tail_jsonl_many(source_paths, args.tail) if args.include_rotated else tail_jsonl(ORDER_METRICS, args.tail)
@@ -1676,6 +1813,10 @@ def main() -> int:
             stablecoin_share_thresholds=basis_v2_sweep_stablecoin_share_thresholds,
             min_reversion_deviation_bps=basis_v2_sweep_min_reversion_deviation,
             horizons=basis_v2_sweep_horizons,
+            event_cooldown_seconds=args.basis_v2_sweep_event_cooldown_seconds,
+            holdout_fraction=basis_v2_sweep_holdout_fraction,
+            min_independent_samples=args.basis_v2_sweep_min_independent_samples,
+            execution_reserve_bps=basis_v2_sweep_execution_reserve,
         )
 
     operational_readiness = "unknown"

@@ -1,6 +1,13 @@
 from decimal import Decimal
 
-from tools.analyze import basis_state_rows, build_basis_regimes, build_basis_v2_replay, build_entry_semantics, dynamic_cost_summary
+from tools.analyze import (
+    basis_state_rows,
+    build_basis_regimes,
+    build_basis_v2_replay,
+    build_entry_semantics,
+    dynamic_cost_summary,
+    summarize_basis_v2_sweep_events,
+)
 
 
 def test_basis_state_metrics_do_not_double_count_matching_block_event() -> None:
@@ -149,3 +156,56 @@ def test_basis_v2_filter_sweep_inputs_filter_normalized_edge_and_stablecoin_shar
 
     assert unfiltered["candidate_count"] == 3
     assert filtered["candidate_count"] == 1
+
+
+def test_basis_v2_event_cooldown_collapses_repeated_same_direction_candidates() -> None:
+    rows = []
+    for index in range(3):
+        rows.append(
+            {
+                "event": "live_inventory_basis_state",
+                "run_id": "run-cooldown",
+                "logged_at": f"2026-07-10T00:00:0{index}+00:00",
+                "asset": "SOL",
+                "long_edge_bps": "8",
+                "short_edge_bps": "-2",
+                "var_bid": "99.9",
+                "var_ask": "100",
+                "lighter_bid": "100.08",
+                "lighter_ask": "100.1",
+                "lighter_sell_price": "100.08",
+                "lighter_buy_price": "100.1",
+            }
+        )
+
+    result = build_basis_v2_replay(
+        rows,
+        min_raw_edge_bps=Decimal("7"),
+        horizons=(1,),
+        event_cooldown_seconds=300,
+    )["SOL"]
+
+    assert result["raw_candidate_count"] == 3
+    assert result["candidate_count"] == 1
+    assert len(result["candidate_events"]) == 1
+
+
+def test_basis_v2_sweep_requires_train_and_holdout_positive_p20() -> None:
+    events = [
+        {"timestamp": float(index), "direction": "long_var_short_lighter", "pnl_bps": {5: Decimal(value)}}
+        for index, value in enumerate(("3", "4", "5", "4", "5", "6"))
+    ]
+
+    summary = summarize_basis_v2_sweep_events(
+        events,
+        horizons=(5,),
+        holdout_fraction=Decimal("0.5"),
+        min_independent_samples=3,
+        execution_reserve_bps=Decimal("1"),
+    )[5]
+
+    assert summary["train"]["n"] == 3
+    assert summary["holdout"]["n"] == 3
+    assert summary["train"]["p20"] == Decimal("2")
+    assert summary["holdout"]["p20"] == Decimal("3")
+    assert summary["verdict"] == "manual_review_candidate"
