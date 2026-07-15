@@ -2784,6 +2784,8 @@ def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path) -> 
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
         runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_execution_calibration = True
+        runtime.live_inventory_calibration_max_cycle_loss_usd = Decimal("0.10")
         runtime.live_inventory_realized_pnl_usd = Decimal("0.02478067523956343718372446020")
         runtime.pending_live_inventory_actual_pnl["exit-1"] = {
             "asset": "ETH",
@@ -2816,6 +2818,38 @@ def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path) -> 
         assert state["realized_pnl_usd"] == "0.02509222000000000000000000000"
         assert state["reason"] == "actual_pnl_final_fill_update"
         assert "exit-1" not in runtime.pending_live_inventory_actual_pnl
+        assert getattr(runtime, "live_inventory_calibration_halted_reason", None) is None
+
+    asyncio.run(run())
+
+
+def test_execution_calibration_cycle_loss_triggers_fuse(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_execution_calibration = True
+        runtime.live_inventory_calibration_max_cycle_loss_usd = Decimal("0.10")
+        runtime.pending_live_inventory_actual_pnl["exit-loss"] = {
+            "asset": "ETH",
+            "lot_id": 1,
+            "direction": "long_var_short_lighter",
+            "qty": "1",
+            "entry_var_price": "100",
+            "entry_lighter_price": "100",
+            "exit_var_price": "99.8",
+            "estimated_pnl_usd": "-0.2",
+            "estimated_pnl_bps": "-20",
+        }
+
+        await runtime.maybe_append_live_inventory_actual_pnl(
+            {"trade_key": "exit-loss", "lighter_filled_price": "100"}
+        )
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert runtime.live_inventory_calibration_halted_reason == "calibration_max_cycle_loss_reached"
+        assert any(row["event"] == "live_inventory_calibration_loss_fuse_triggered" for row in rows)
+        assert rows[-1]["event"] == "live_inventory_actual_pnl"
+        assert rows[-1]["actual_pnl_usd"] == "-0.2"
 
     asyncio.run(run())
 

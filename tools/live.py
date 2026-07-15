@@ -53,6 +53,14 @@ class LiveConfig:
     reversion_context_gap_bps: str = "1.0"
     reversion_min_normalized_edge_bps: str = "2.5"
     reversion_max_stablecoin_edge_share: str = "0.6"
+    calibration_mode: bool = False
+    calibration_max_cycles: int = 5
+    calibration_hold_samples: int = 5
+    calibration_warmup_samples: int = 30
+    calibration_entry_cooldown_samples: int = 180
+    calibration_max_run_loss_usd: str = "0.25"
+    calibration_max_cycle_loss_usd: str = "0.10"
+    calibration_max_roundtrip_cost_bps: str = "6.0"
     entry_lighter_fill_timeout_seconds: str = "3"
     snapshot_timeout_seconds: str = "10"
     addon_min_basis_improvement_bps: str = "2.0"
@@ -102,7 +110,13 @@ def validate_state(
         return False, f"open_lots_present count={len(open_lots)} asset={asset}"
     if pending_actions:
         return False, f"pending_actions_present count={len(pending_actions)} asset={asset}"
-    effective_max_cycles = 1 if config.reversion_mode else config.max_cycles
+    effective_max_cycles = (
+        config.calibration_max_cycles
+        if config.calibration_mode
+        else 1
+        if config.reversion_mode
+        else config.max_cycles
+    )
     if completed_cycles >= effective_max_cycles:
         if reset_state_after_manual_flat:
             return (
@@ -224,6 +238,14 @@ def load_config(path: Path) -> LiveConfig:
         reversion_context_gap_bps=_positive_decimal(raw, "reversion_context_gap_bps"),
         reversion_min_normalized_edge_bps=_non_negative_decimal(raw, "reversion_min_normalized_edge_bps"),
         reversion_max_stablecoin_edge_share=_non_negative_decimal(raw, "reversion_max_stablecoin_edge_share"),
+        calibration_mode=bool(raw.get("calibration_mode", DEFAULT_CONFIG.calibration_mode)),
+        calibration_max_cycles=_positive_int(raw, "calibration_max_cycles", max_value=5),
+        calibration_hold_samples=_positive_int(raw, "calibration_hold_samples", max_value=60),
+        calibration_warmup_samples=_positive_int(raw, "calibration_warmup_samples", max_value=3600),
+        calibration_entry_cooldown_samples=_positive_int(raw, "calibration_entry_cooldown_samples", max_value=3600),
+        calibration_max_run_loss_usd=_positive_decimal(raw, "calibration_max_run_loss_usd"),
+        calibration_max_cycle_loss_usd=_positive_decimal(raw, "calibration_max_cycle_loss_usd"),
+        calibration_max_roundtrip_cost_bps=_positive_decimal(raw, "calibration_max_roundtrip_cost_bps"),
         entry_lighter_fill_timeout_seconds=_positive_decimal(raw, "entry_lighter_fill_timeout_seconds"),
         snapshot_timeout_seconds=_positive_decimal(raw, "snapshot_timeout_seconds"),
         addon_min_basis_improvement_bps=_positive_decimal(raw, "addon_min_basis_improvement_bps"),
@@ -237,14 +259,18 @@ def build_main_command(
     reset_state_after_manual_flat: bool = False,
 ) -> list[str]:
     reversion_mode = config.reversion_mode
-    effective_max_total_notional_usd = "25" if reversion_mode else config.max_total_inventory_notional_usd
-    effective_max_cycles = 1 if reversion_mode else config.max_cycles
-    effective_max_lots = 1 if reversion_mode else config.max_lots
-    effective_max_total_lots = 1 if reversion_mode else config.max_total_lots
-    effective_min_entry_edge_bps = "0" if reversion_mode else config.min_entry_edge_bps
-    effective_min_abs_entry_bps = "0" if reversion_mode else config.min_abs_entry_bps
+    calibration_mode = config.calibration_mode
+    diagnostic_single_lot = reversion_mode or calibration_mode
+    effective_max_total_notional_usd = "25" if diagnostic_single_lot else config.max_total_inventory_notional_usd
+    effective_max_cycles = config.calibration_max_cycles if calibration_mode else 1 if reversion_mode else config.max_cycles
+    effective_max_lots = 1 if diagnostic_single_lot else config.max_lots
+    effective_max_total_lots = 1 if diagnostic_single_lot else config.max_total_lots
+    effective_min_entry_edge_bps = "0" if diagnostic_single_lot else config.min_entry_edge_bps
+    effective_min_abs_entry_bps = "0" if diagnostic_single_lot else config.min_abs_entry_bps
     effective_max_entry_roundtrip_cost_bps = (
-        config.reversion_max_entry_roundtrip_cost_bps
+        config.calibration_max_roundtrip_cost_bps
+        if calibration_mode
+        else config.reversion_max_entry_roundtrip_cost_bps
         if reversion_mode
         else config.max_entry_roundtrip_cost_bps
     )
@@ -318,7 +344,7 @@ def build_main_command(
     ]
     if config.dynamic_entry_threshold:
         command.append("--live-inventory-basis-dynamic-entry-threshold")
-    if not reversion_mode:
+    if not reversion_mode and not calibration_mode:
         command.extend(
             [
                 "--live-inventory-basis-use-normalized-edge-for-entry",
@@ -329,7 +355,7 @@ def build_main_command(
                 config.min_normalized_filter_edge_bps,
             ]
         )
-    else:
+    elif reversion_mode:
         command.extend(
             [
                 "--live-inventory-basis-max-hold-action",
@@ -356,6 +382,33 @@ def build_main_command(
                 config.reversion_max_stablecoin_edge_share,
             ]
         )
+    else:
+        command.extend(
+            [
+                "--live-inventory-execution-calibration",
+                "--live-inventory-i-accept-execution-calibration-loss",
+                "--live-inventory-calibration-warmup-samples",
+                str(config.calibration_warmup_samples),
+                "--live-inventory-calibration-entry-cooldown-samples",
+                str(config.calibration_entry_cooldown_samples),
+                "--live-inventory-calibration-max-run-loss-usd",
+                config.calibration_max_run_loss_usd,
+                "--live-inventory-calibration-max-cycle-loss-usd",
+                config.calibration_max_cycle_loss_usd,
+                "--live-inventory-min-hold-samples",
+                str(config.calibration_hold_samples),
+                "--live-inventory-max-hold-samples",
+                str(config.calibration_hold_samples),
+                "--live-inventory-basis-max-hold-action",
+                "exit",
+                "--live-inventory-basis-profit-take-pnl-bps",
+                "0",
+                "--live-inventory-basis-max-var-quote-age-ms",
+                "750",
+                "--live-inventory-max-lighter-book-age-seconds",
+                "1",
+            ]
+        )
     if effective_max_total_lots > 1:
         command.extend(
             [
@@ -375,6 +428,11 @@ def main() -> int:
     parser.add_argument("--config", default=str(LIVE_CONFIG), help="Startup config JSON. Default: live_config.json.")
     parser.add_argument("--reversion", action="store_true", help="Explicitly enable the one-lot basis reversion live test.")
     parser.add_argument(
+        "--calibration",
+        action="store_true",
+        help="Explicitly enable bounded real execution-cost calibration. This intentionally submits and closes small real positions.",
+    )
+    parser.add_argument(
         "--reset-state-after-manual-flat",
         action="store_true",
         help="After manually confirming both venues are flat, reset the completed-cycle state during startup.",
@@ -391,8 +449,15 @@ def main() -> int:
     except ValueError as exc:
         print(f"REFUSE_START reason=config_invalid detail={exc}")
         return 2
+    if args.reversion and args.calibration:
+        parser.error("use only one of --reversion or --calibration")
     if args.reversion:
-        config = replace(config, reversion_mode=True)
+        config = replace(config, reversion_mode=True, calibration_mode=False)
+    if args.calibration:
+        config = replace(config, calibration_mode=True, reversion_mode=False)
+    if config.reversion_mode and config.calibration_mode:
+        print("REFUSE_START reason=config_invalid detail=reversion_mode_and_calibration_mode_are_mutually_exclusive")
+        return 2
 
     processes = running_main_processes()
     if processes:
@@ -416,7 +481,12 @@ def main() -> int:
         config,
         reset_state_after_manual_flat=args.reset_state_after_manual_flat,
     )
-    print(f"starting asset={asset} max_cycles={config.max_cycles} lot_notional_usd={config.lot_notional_usd}")
+    effective_max_cycles = config.calibration_max_cycles if config.calibration_mode else 1 if config.reversion_mode else config.max_cycles
+    strategy_mode = "execution_calibration" if config.calibration_mode else "reversion" if config.reversion_mode else "basis"
+    print(
+        f"starting asset={asset} strategy_mode={strategy_mode} "
+        f"max_cycles={effective_max_cycles} lot_notional_usd={config.lot_notional_usd}"
+    )
     if args.verbose:
         print("main_command=" + " ".join(command))
     if args.dry_run:

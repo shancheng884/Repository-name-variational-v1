@@ -53,6 +53,56 @@ def latest_run_filter(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if str(row.get("run_id") or "") == latest_run_id]
 
 
+def print_execution_calibration(rows: list[dict[str, Any]]) -> None:
+    final_rows = [
+        row
+        for row in rows
+        if row.get("event") == "live_inventory_actual_pnl"
+        and row.get("strategy_version") == "execution-calibration-v1"
+        and row.get("actual_pnl_status") == "lighter_final_fill_confirmed"
+    ]
+    print("== execution_calibration ==")
+    print(f"completed_actual_cycles={len(final_rows)}")
+    if not final_rows:
+        print("recommendation=collect_real_calibration_cycles")
+        return
+
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in final_rows:
+        key = (str(row.get("asset") or "-").upper(), str(row.get("direction") or "unknown"))
+        grouped.setdefault(key, []).append(row)
+
+    all_pnl: list[Decimal] = []
+    for (asset, direction), group in sorted(grouped.items()):
+        pnl = [value for row in group if (value := to_decimal(row.get("actual_pnl_bps"))) is not None]
+        shortfall = [
+            value
+            for row in group
+            if (value := to_decimal(row.get("estimated_vs_actual_pnl_shortfall_bps"))) is not None
+        ]
+        entry_slippage = [
+            value for row in group if (value := to_decimal(row.get("entry_lighter_slippage_bps"))) is not None
+        ]
+        exit_slippage = [
+            value for row in group if (value := to_decimal(row.get("exit_lighter_slippage_bps"))) is not None
+        ]
+        all_pnl.extend(pnl)
+        print(
+            f"asset={asset} direction={direction} n={len(group)} "
+            f"actual_pnl_p20={fmt_decimal(percentile(pnl, Decimal('20')))} "
+            f"actual_pnl_p50={fmt_decimal(percentile(pnl, Decimal('50')))} "
+            f"actual_pnl_p80={fmt_decimal(percentile(pnl, Decimal('80')))} "
+            f"shortfall_p80={fmt_decimal(percentile(shortfall, Decimal('80')))} "
+            f"entry_lighter_slip_p80={fmt_decimal(percentile(entry_slippage, Decimal('80')))} "
+            f"exit_lighter_slip_p80={fmt_decimal(percentile(exit_slippage, Decimal('80')))}"
+        )
+    print(
+        f"overall_actual_pnl_p50={fmt_decimal(percentile(all_pnl, Decimal('50')))} "
+        f"overall_actual_pnl_p80={fmt_decimal(percentile(all_pnl, Decimal('80')))}"
+    )
+    print("recommendation=need_at_least_10_cycles_per_asset_before_setting_execution_reserve")
+
+
 def basis_state_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     states = [row for row in rows if row.get("event") == "live_inventory_basis_state" and row.get("asset")]
     if states:
@@ -1495,6 +1545,11 @@ def main() -> int:
     parser.add_argument("--tail", type=int, default=50000, help="JSONL rows to inspect from order_metrics.jsonl. Default: 50000.")
     parser.add_argument("--include-rotated", action="store_true", help="Include rotated order_metrics.jsonl.N and .gz files.")
     parser.add_argument("--all-runs", action="store_true", help="Analyze all tailed rows instead of only the latest run_id.")
+    parser.add_argument(
+        "--execution-calibration",
+        action="store_true",
+        help="Summarize versioned real execution-calibration cycles by asset and direction.",
+    )
     parser.add_argument("--top", type=int, default=5, help="Number of blocked candidates/reasons to print. Default: 5.")
     parser.add_argument("--what-if", action="store_true", help="Replay blocked entries against looser threshold grids.")
     parser.add_argument("--basis-regime", action="store_true", help="Summarize recent basis/edge percentiles for strategy tuning.")
@@ -1622,6 +1677,9 @@ def main() -> int:
     current_run_rows = latest_run_filter(raw_rows)
     state = read_json(LIVE_STATE)
     processes = running_main_processes()
+
+    if args.execution_calibration:
+        print_execution_calibration(rows)
 
     events = Counter(str(row.get("event") or "-") for row in rows)
     assets = Counter(str(row.get("asset") or "-").upper() for row in rows if row.get("asset"))

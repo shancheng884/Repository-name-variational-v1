@@ -1,5 +1,6 @@
 import json
 
+from main import parse_args
 from tools import live
 from tools.live import LiveConfig, build_main_command, validate_state
 
@@ -66,6 +67,72 @@ def test_live_tool_reversion_forces_one_small_lot_and_omits_normalized_primary()
     assert command[command.index("--live-inventory-basis-reversion-signal-exit-min-pnl-bps") + 1] == "-0.8"
     assert command[command.index("--live-inventory-basis-min-normalized-filter-edge-bps") + 1] == "2.5"
     assert command[command.index("--live-inventory-basis-max-stablecoin-edge-share") + 1] == "0.6"
+
+
+def test_live_tool_calibration_is_bounded_and_bypasses_strategy_filters() -> None:
+    command = build_main_command(
+        "SOL",
+        LiveConfig(
+            calibration_mode=True,
+            calibration_max_cycles=5,
+            calibration_hold_samples=5,
+            calibration_warmup_samples=30,
+            calibration_entry_cooldown_samples=180,
+            calibration_max_run_loss_usd="0.25",
+            calibration_max_cycle_loss_usd="0.10",
+            calibration_max_roundtrip_cost_bps="6.0",
+            max_total_lots=3,
+        ),
+    )
+
+    assert "--live-inventory-execution-calibration" in command
+    assert "--live-inventory-i-accept-execution-calibration-loss" in command
+    assert "--live-inventory-basis-reversion" not in command
+    assert "--live-inventory-basis-min-normalized-filter-edge-bps" not in command
+    assert "--live-inventory-basis-max-stablecoin-edge-share" not in command
+    assert command[command.index("--live-inventory-max-cycles") + 1] == "5"
+    assert command[command.index("--live-inventory-max-lots") + 1] == "1"
+    assert command[command.index("--live-inventory-max-total-lots") + 1] == "1"
+    assert command[command.index("--live-inventory-max-total-notional-usd") + 1] == "25"
+    assert command[command.index("--live-inventory-basis-max-entry-roundtrip-cost-bps") + 1] == "6.0"
+    assert command[command.index("--live-inventory-min-hold-samples") + 1] == "5"
+    assert command[command.index("--live-inventory-max-hold-samples") + 1] == "5"
+    assert command[command.index("--live-inventory-basis-max-hold-action") + 1] == "exit"
+    assert command[command.index("--live-inventory-calibration-max-run-loss-usd") + 1] == "0.25"
+
+
+def test_live_tool_calibration_command_passes_main_cli_guards(monkeypatch) -> None:
+    command = build_main_command("SOL", LiveConfig(calibration_mode=True))
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_execution_calibration is True
+    assert args.live_inventory_i_accept_execution_calibration_loss is True
+    assert args.live_inventory_max_cycles == 5
+    assert args.live_inventory_min_hold_samples == args.live_inventory_max_hold_samples == 5
+
+
+def test_live_tool_calibration_state_uses_calibration_cycle_cap(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "flat",
+                "asset": "SOL",
+                "open_lots": [],
+                "pending_actions": [],
+                "completed_cycles": 4,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(live, "LIVE_STATE", state_path)
+
+    ok, message = validate_state(LiveConfig(calibration_mode=True, calibration_max_cycles=5))
+
+    assert ok is True
+    assert "max_cycles=5" in message
 
 
 def test_live_tool_reversion_state_uses_one_cycle_cap(tmp_path, monkeypatch) -> None:

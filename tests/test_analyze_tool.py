@@ -7,6 +7,7 @@ from tools.analyze import (
     build_entry_semantics,
     dynamic_cost_summary,
     summarize_basis_v2_sweep_events,
+    print_execution_calibration,
 )
 
 
@@ -156,6 +157,38 @@ def test_basis_v2_filter_sweep_inputs_filter_normalized_edge_and_stablecoin_shar
 
     assert unfiltered["candidate_count"] == 3
     assert filtered["candidate_count"] == 1
+
+
+def test_execution_calibration_summary_only_uses_versioned_final_actual_rows(capsys) -> None:
+    rows = [
+        {
+            "event": "live_inventory_actual_pnl",
+            "strategy_version": "execution-calibration-v1",
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "asset": "SOL",
+            "direction": "long_var_short_lighter",
+            "actual_pnl_bps": "-2",
+            "estimated_vs_actual_pnl_shortfall_bps": "1.5",
+            "entry_lighter_slippage_bps": "0.2",
+            "exit_lighter_slippage_bps": "0.3",
+        },
+        {
+            "event": "live_inventory_actual_pnl",
+            "strategy_version": "legacy",
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "asset": "SOL",
+            "direction": "long_var_short_lighter",
+            "actual_pnl_bps": "99",
+        },
+    ]
+
+    print_execution_calibration(rows)
+
+    output = capsys.readouterr().out
+    assert "completed_actual_cycles=1" in output
+    assert "actual_pnl_p50=-2.00" in output
+    assert "shortfall_p80=1.50" in output
+    assert "99" not in output
 
 
 def test_basis_v2_event_cooldown_collapses_repeated_same_direction_candidates() -> None:
