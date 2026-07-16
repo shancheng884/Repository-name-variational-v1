@@ -440,6 +440,11 @@ V3_VARIANTS = {
     "main_p90_to_p55": (Decimal("90"), Decimal("55")),
     "explore_p85_to_p60": (Decimal("85"), Decimal("60")),
 }
+# V4 is deliberately a small, pre-registered entry grid. It evaluates
+# convergence with executable PnL, rather than using the same-direction edge
+# as a proxy for the prices available when both legs are closed.
+V4_ENTRY_PERCENTILES = (Decimal("90"), Decimal("95"), Decimal("97.5"))
+V4_NET_EXIT_TARGET_BPS = Decimal("1.0")
 DEFAULT_FILTER_SWEEP_EVENT_COOLDOWN_SECONDS = 300
 DEFAULT_FILTER_SWEEP_HOLDOUT_FRACTION = Decimal("0.30")
 DEFAULT_FILTER_SWEEP_MIN_INDEPENDENT_SAMPLES = 30
@@ -558,6 +563,62 @@ def _basis_v3_simulate_episode(
         if future_edge is not None and future_edge <= target_exit_edge_bps:
             exit_index = index
             exit_reason = "target_quantile_reached"
+            break
+    if exit_index is None:
+        return None
+    executable_pnl = _entry_semantics_forward_pnl_bps(rows[entry_index], rows[exit_index], direction)
+    if executable_pnl is None:
+        return None
+    exit_time = times[exit_index]
+    return {
+        "exit_index": exit_index,
+        "exit_timestamp": exit_time,
+        "holding_seconds": Decimal(str(max(0.0, exit_time - entry_time))),
+        "exit_reason": exit_reason,
+        "executable_pnl_bps": executable_pnl,
+        "net_pnl_bps": executable_pnl - shortfall_reserve_bps,
+        "mfe_bps": mfe,
+        "mae_bps": mae,
+    }
+
+
+def _basis_v4_simulate_episode(
+    *,
+    rows: list[dict[str, Any]],
+    times: list[float],
+    entry_index: int,
+    direction: str,
+    max_hold_seconds: int,
+    shortfall_reserve_bps: Decimal,
+    net_exit_target_bps: Decimal,
+    max_quote_age_ms: Decimal,
+    max_lighter_book_age_seconds: Decimal,
+) -> dict[str, Any] | None:
+    """Close only once logged executable PnL meets the net target, or at timeout."""
+    entry_time = times[entry_index]
+    last_index = bisect_right(times, entry_time + max_hold_seconds) - 1
+    if last_index <= entry_index:
+        return None
+    exit_index: int | None = None
+    exit_reason = "max_hold_timeout"
+    mfe: Decimal | None = None
+    mae: Decimal | None = None
+    for index in range(entry_index + 1, last_index + 1):
+        if not _basis_v3_quotes_fresh(
+            rows[index],
+            max_quote_age_ms=max_quote_age_ms,
+            max_lighter_book_age_seconds=max_lighter_book_age_seconds,
+        ):
+            continue
+        exit_index = index
+        executable_pnl = _entry_semantics_forward_pnl_bps(rows[entry_index], rows[index], direction)
+        if executable_pnl is None:
+            continue
+        net_pnl = executable_pnl - shortfall_reserve_bps
+        mfe = net_pnl if mfe is None else max(mfe, net_pnl)
+        mae = net_pnl if mae is None else min(mae, net_pnl)
+        if net_pnl >= net_exit_target_bps:
+            exit_reason = "executable_net_target_reached"
             break
     if exit_index is None:
         return None
@@ -746,6 +807,142 @@ def build_basis_v3_replay(
     return results
 
 
+def build_basis_v4_replay(
+    rows: list[dict[str, Any]],
+    *,
+    asset_filter: str | None = None,
+    evaluation_interval_seconds: int = 60,
+    history_sample_seconds: int = 30,
+    episode_cooldown_seconds: int = 180,
+    max_hold_seconds: int = 21600,
+    min_window_coverage: Decimal = Decimal("0.80"),
+    min_history_samples: int = 100,
+    long_shortfall_reserve_bps: Decimal = Decimal("1.0"),
+    short_shortfall_reserve_bps: Decimal = Decimal("1.0"),
+    net_exit_target_bps: Decimal = V4_NET_EXIT_TARGET_BPS,
+    max_quote_age_ms: Decimal = Decimal("1500"),
+    max_lighter_book_age_seconds: Decimal = Decimal("2"),
+) -> dict[str, dict[str, Any]]:
+    """Replay extreme entries with exits based only on executable net PnL."""
+    grouped: dict[str, list[tuple[float, dict[str, Any]]]] = {}
+    for row in basis_state_rows(rows):
+        asset = str(row.get("asset") or "-").upper()
+        if asset_filter and asset != asset_filter.upper():
+            continue
+        timestamp = parse_time(row.get("logged_at"))
+        if timestamp is not None:
+            grouped.setdefault(asset, []).append((timestamp.timestamp(), row))
+
+    results: dict[str, dict[str, Any]] = {}
+    for asset, group in grouped.items():
+        group.sort(key=lambda entry: entry[0])
+        times = [timestamp for timestamp, _ in group]
+        group_rows = [row for _, row in group]
+        rolling = {
+            direction: {window: _RollingMedian(window) for window in V3_WINDOWS_SECONDS}
+            for direction in V2_DIRECTIONS
+        }
+        next_evaluation_at = times[0] if times else 0.0
+        next_history_sample_at = times[0] if times else 0.0
+        next_episode_at = {
+            (entry_percentile, direction): 0.0
+            for entry_percentile in V4_ENTRY_PERCENTILES
+            for direction in V2_DIRECTIONS
+        }
+        item: dict[str, Any] = {
+            "rows": len(group_rows),
+            "started_at": times[0] if times else None,
+            "ended_at": times[-1] if times else None,
+            "episodes": [],
+            "blocked": Counter(),
+        }
+        for row_index, (timestamp, row) in enumerate(group):
+            if timestamp >= next_evaluation_at:
+                next_evaluation_at = timestamp + evaluation_interval_seconds
+                for direction in V2_DIRECTIONS:
+                    edge = _basis_v2_candidate_edge(row, direction)
+                    if edge is None:
+                        continue
+                    mature_windows: list[int] = []
+                    for window in V3_WINDOWS_SECONDS:
+                        tracker = rolling[direction][window]
+                        count, coverage_seconds = tracker.history_context(timestamp)
+                        if (
+                            count >= min_history_samples
+                            and Decimal(str(coverage_seconds)) >= Decimal(window) * min_window_coverage
+                        ):
+                            mature_windows.append(window)
+                    if not mature_windows:
+                        item["blocked"]["insufficient_multiscale_history"] += 1
+                        continue
+                    baseline_window = max(mature_windows)
+                    tracker = rolling[direction][baseline_window]
+                    reserve = (
+                        long_shortfall_reserve_bps
+                        if direction == "long_var_short_lighter"
+                        else short_shortfall_reserve_bps
+                    )
+                    safety_ok = (
+                        row.get("basis_sample_move_ok") is not False
+                        and _basis_v3_quotes_fresh(
+                            row,
+                            max_quote_age_ms=max_quote_age_ms,
+                            max_lighter_book_age_seconds=max_lighter_book_age_seconds,
+                        )
+                    )
+                    for entry_percentile in V4_ENTRY_PERCENTILES:
+                        key = (entry_percentile, direction)
+                        if timestamp < next_episode_at[key]:
+                            continue
+                        entry_threshold = tracker.percentile_before(timestamp, entry_percentile)
+                        # Equality is common in a tightly quoted market; require a true
+                        # tail excursion rather than repeatedly entering at the percentile.
+                        if entry_threshold is None or edge <= entry_threshold:
+                            continue
+                        if not safety_ok:
+                            item["blocked"][f"p{entry_percentile}:market_data_guard"] += 1
+                            continue
+                        simulated = _basis_v4_simulate_episode(
+                            rows=group_rows,
+                            times=times,
+                            entry_index=row_index,
+                            direction=direction,
+                            max_hold_seconds=max_hold_seconds,
+                            shortfall_reserve_bps=reserve,
+                            net_exit_target_bps=net_exit_target_bps,
+                            max_quote_age_ms=max_quote_age_ms,
+                            max_lighter_book_age_seconds=max_lighter_book_age_seconds,
+                        )
+                        if simulated is None:
+                            item["blocked"][f"p{entry_percentile}:no_executable_exit"] += 1
+                            continue
+                        item["episodes"].append(
+                            {
+                                "timestamp": timestamp,
+                                "asset": asset,
+                                "direction": direction,
+                                "entry_percentile": entry_percentile,
+                                "baseline_window_seconds": baseline_window,
+                                "entry_edge_bps": edge,
+                                "entry_threshold_bps": entry_threshold,
+                                "shortfall_reserve_bps": reserve,
+                                "net_exit_target_bps": net_exit_target_bps,
+                                "stablecoin_alignment": _basis_v3_alignment(row, direction),
+                                **simulated,
+                            }
+                        )
+                        next_episode_at[key] = simulated["exit_timestamp"] + episode_cooldown_seconds
+            if timestamp >= next_history_sample_at:
+                next_history_sample_at = timestamp + history_sample_seconds
+                for direction in V2_DIRECTIONS:
+                    edge = _basis_v2_candidate_edge(row, direction)
+                    if edge is not None:
+                        for window in V3_WINDOWS_SECONDS:
+                            rolling[direction][window].add(timestamp, edge)
+        results[asset] = item
+    return results
+
+
 def _basis_v3_split_stats(
     episodes: list[dict[str, Any]],
     *,
@@ -886,6 +1083,92 @@ def print_basis_v3(
                     f"alignments={dict(alignments)} verdict={split['verdict']}"
                 )
     print("recommendation=require_positive_time_holdout_before_any_basis_v3_live_start")
+
+
+def print_basis_v4(
+    rows: list[dict[str, Any]],
+    *,
+    asset: str | None,
+    evaluation_interval_seconds: int,
+    history_sample_seconds: int,
+    episode_cooldown_seconds: int,
+    max_hold_seconds: int,
+    min_window_coverage: Decimal,
+    min_history_samples: int,
+    long_shortfall_reserve_bps: Decimal,
+    short_shortfall_reserve_bps: Decimal,
+    net_exit_target_bps: Decimal,
+    holdout_fraction: Decimal,
+    min_independent_samples: int,
+) -> None:
+    print("== basis_v4 ==")
+    print(
+        "model=strictly_prior_extreme_raw_edge_entry_executable_net_pnl_exit "
+        "pre_registered_entry_percentiles=90,95,97.5 no_same_direction_exit_proxy"
+    )
+    print(
+        f"evaluation_interval_seconds={evaluation_interval_seconds} history_sample_seconds={history_sample_seconds} "
+        f"episode_cooldown_seconds={episode_cooldown_seconds} max_hold_seconds={max_hold_seconds} "
+        f"min_window_coverage={fmt_decimal(min_window_coverage)} min_history_samples={min_history_samples} "
+        f"long_shortfall_reserve={fmt_decimal(long_shortfall_reserve_bps)} "
+        f"short_shortfall_reserve={fmt_decimal(short_shortfall_reserve_bps)} "
+        f"net_exit_target={fmt_decimal(net_exit_target_bps)}"
+    )
+    results = build_basis_v4_replay(
+        rows,
+        asset_filter=asset,
+        evaluation_interval_seconds=evaluation_interval_seconds,
+        history_sample_seconds=history_sample_seconds,
+        episode_cooldown_seconds=episode_cooldown_seconds,
+        max_hold_seconds=max_hold_seconds,
+        min_window_coverage=min_window_coverage,
+        min_history_samples=min_history_samples,
+        long_shortfall_reserve_bps=long_shortfall_reserve_bps,
+        short_shortfall_reserve_bps=short_shortfall_reserve_bps,
+        net_exit_target_bps=net_exit_target_bps,
+    )
+    if not results:
+        print("BASIS_V4 action=WAIT reason=no_time_aligned_basis_state_rows")
+        return
+    for asset_name, item in sorted(results.items()):
+        coverage_seconds = (
+            float(item["ended_at"]) - float(item["started_at"])
+            if item["started_at"] is not None and item["ended_at"] is not None
+            else 0.0
+        )
+        coverage_days = Decimal(str(coverage_seconds / 86400.0))
+        print(
+            f"asset={asset_name} rows={item['rows']} coverage_days={fmt_decimal(coverage_days)} "
+            f"episodes={len(item['episodes'])} blocked={dict(item['blocked'])}"
+        )
+        for entry_percentile in V4_ENTRY_PERCENTILES:
+            variant = f"p{entry_percentile}"
+            for direction in V2_DIRECTIONS:
+                episodes = [
+                    episode
+                    for episode in item["episodes"]
+                    if episode["entry_percentile"] == entry_percentile and episode["direction"] == direction
+                ]
+                split = _basis_v3_split_stats(
+                    episodes,
+                    holdout_fraction=holdout_fraction,
+                    min_independent_samples=min_independent_samples,
+                )
+                pnl = [episode["net_pnl_bps"] for episode in episodes]
+                holding = [episode["holding_seconds"] for episode in episodes]
+                target_exits = sum(episode["exit_reason"] == "executable_net_target_reached" for episode in episodes)
+                episodes_per_day = Decimal(len(episodes)) / coverage_days if coverage_days > 0 else None
+                print(
+                    f"asset={asset_name} variant={variant} direction={direction} n={len(episodes)} "
+                    f"episodes_per_day={fmt_decimal(episodes_per_day)} target_exit_pct="
+                    f"{fmt_decimal(Decimal(target_exits) / Decimal(len(episodes)) * Decimal('100') if episodes else None)} "
+                    f"net_p20={fmt_decimal(percentile(pnl, Decimal('20')))} net_p50={fmt_decimal(percentile(pnl, Decimal('50')))} "
+                    f"hold_p50={fmt_decimal(percentile(holding, Decimal('50')))} "
+                    f"train_n={split['train']['n']} train_p20={fmt_decimal(split['train']['p20'])} "
+                    f"holdout_n={split['holdout']['n']} holdout_p20={fmt_decimal(split['holdout']['p20'])} "
+                    f"verdict={split['verdict']}"
+                )
+    print("recommendation=require_positive_time_holdout_before_any_basis_v4_live_start")
 
 
 def _basis_v2_stats() -> dict[str, Any]:
@@ -1997,6 +2280,7 @@ def main() -> int:
     parser.add_argument("--semantics-min-normalized-filter-bps", default="1", help="Normalized filter threshold for --entry-semantics. Default: 1.")
     parser.add_argument("--basis-v2", action="store_true", help="Replay directional executable edges with strict time-aligned multiscale context.")
     parser.add_argument("--basis-v3", action="store_true", help="Replay independent multiscale quantile convergence episodes using executable prices.")
+    parser.add_argument("--basis-v4", action="store_true", help="Replay extreme entries with executable net-PnL exits; read-only offline analysis.")
     parser.add_argument("--basis-v3-evaluation-interval-seconds", type=int, default=60, help="Evaluate V3 entries at most once per interval. Default: 60.")
     parser.add_argument("--basis-v3-history-sample-seconds", type=int, default=30, help="Downsample prior quantile history to this interval. Default: 30.")
     parser.add_argument("--basis-v3-episode-cooldown-seconds", type=int, default=180, help="Cooldown after each independent V3 episode. Default: 180.")
@@ -2006,6 +2290,7 @@ def main() -> int:
     parser.add_argument("--basis-v3-long-shortfall-reserve-bps", default="1.0", help="Unmodeled shortfall reserve for long-Var episodes. Default: 1.0.")
     parser.add_argument("--basis-v3-short-shortfall-reserve-bps", default="1.0", help="Unmodeled shortfall reserve for short-Var episodes. Default: 1.0.")
     parser.add_argument("--basis-v3-min-net-expected-bps", default="1.0", help="Minimum entry quantile distance after shortfall reserve. Default: 1.0.")
+    parser.add_argument("--basis-v4-net-exit-target-bps", default="1.0", help="Required net executable PnL before V4 exits. Default: 1.0.")
     parser.add_argument("--basis-v3-holdout-fraction", default="0.30", help="Chronological V3 holdout fraction. Default: 0.30.")
     parser.add_argument("--basis-v3-min-independent-samples", type=int, default=5, help="Minimum train and holdout episodes for a bounded-live verdict. Default: 5.")
     parser.add_argument("--basis-v2-min-raw-edge-bps", default="7", help="Basis V2 raw directional edge floor. Default: 7.")
@@ -2081,6 +2366,7 @@ def main() -> int:
         basis_v3_long_shortfall_reserve = Decimal(str(args.basis_v3_long_shortfall_reserve_bps))
         basis_v3_short_shortfall_reserve = Decimal(str(args.basis_v3_short_shortfall_reserve_bps))
         basis_v3_min_net_expected = Decimal(str(args.basis_v3_min_net_expected_bps))
+        basis_v4_net_exit_target = Decimal(str(args.basis_v4_net_exit_target_bps))
         basis_v3_holdout_fraction = Decimal(str(args.basis_v3_holdout_fraction))
         basis_v2_sweep_normalized_thresholds = parse_decimal_list(
             args.basis_v2_sweep_normalized_thresholds,
@@ -2125,6 +2411,8 @@ def main() -> int:
         parser.error("basis V3 shortfall reserves must be >= 0")
     if basis_v3_min_net_expected < 0:
         parser.error("--basis-v3-min-net-expected-bps must be >= 0")
+    if basis_v4_net_exit_target < 0:
+        parser.error("--basis-v4-net-exit-target-bps must be >= 0")
     if not Decimal("0") < basis_v3_holdout_fraction < Decimal("1"):
         parser.error("--basis-v3-holdout-fraction must be between 0 and 1")
     if (
@@ -2336,6 +2624,22 @@ def main() -> int:
             long_shortfall_reserve_bps=basis_v3_long_shortfall_reserve,
             short_shortfall_reserve_bps=basis_v3_short_shortfall_reserve,
             min_net_expected_bps=basis_v3_min_net_expected,
+            holdout_fraction=basis_v3_holdout_fraction,
+            min_independent_samples=args.basis_v3_min_independent_samples,
+        )
+    if args.basis_v4:
+        print_basis_v4(
+            rows,
+            asset=args.asset,
+            evaluation_interval_seconds=args.basis_v3_evaluation_interval_seconds,
+            history_sample_seconds=args.basis_v3_history_sample_seconds,
+            episode_cooldown_seconds=args.basis_v3_episode_cooldown_seconds,
+            max_hold_seconds=args.basis_v3_max_hold_seconds,
+            min_window_coverage=basis_v3_min_window_coverage,
+            min_history_samples=args.basis_v3_min_history_samples,
+            long_shortfall_reserve_bps=basis_v3_long_shortfall_reserve,
+            short_shortfall_reserve_bps=basis_v3_short_shortfall_reserve,
+            net_exit_target_bps=basis_v4_net_exit_target,
             holdout_fraction=basis_v3_holdout_fraction,
             min_independent_samples=args.basis_v3_min_independent_samples,
         )

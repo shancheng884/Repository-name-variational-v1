@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from tools.analyze import (
     basis_state_rows,
     build_basis_v3_replay,
+    build_basis_v4_replay,
     build_basis_regimes,
     build_basis_v2_replay,
     build_entry_semantics,
@@ -268,6 +269,54 @@ def test_basis_v3_uses_prior_quantiles_across_runs_and_does_not_double_count_spr
     assert episode["stablecoin_alignment"] == "opposed"
     assert episode["executable_pnl_bps"] == Decimal("3")
     assert episode["net_pnl_bps"] == Decimal("2")
+
+
+def test_basis_v4_exits_only_after_executable_net_target() -> None:
+    started_at = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    rows = []
+    for index in range(11):
+        edge = Decimal("10") if index == 8 else Decimal("5")
+        rows.append(
+            {
+                "event": "live_inventory_basis_state",
+                "logged_at": (started_at + timedelta(minutes=index)).isoformat(),
+                "asset": "SOL",
+                "long_edge_bps": str(edge),
+                "short_edge_bps": "-2",
+                "var_bid": "100" if index == 9 else "99.99",
+                "var_ask": "100",
+                "lighter_sell_price": str(Decimal("100") + edge / Decimal("100")),
+                "lighter_buy_price": "100" if index == 9 else "100.01",
+                "var_quote_age_seconds": "0.1",
+                "lighter_book_age_seconds": "0.1",
+                "basis_sample_move_ok": True,
+            }
+        )
+
+    result = build_basis_v4_replay(
+        rows,
+        asset_filter="SOL",
+        evaluation_interval_seconds=60,
+        history_sample_seconds=60,
+        episode_cooldown_seconds=0,
+        max_hold_seconds=300,
+        min_window_coverage=Decimal("0.10"),
+        min_history_samples=5,
+        long_shortfall_reserve_bps=Decimal("1"),
+        short_shortfall_reserve_bps=Decimal("1"),
+        net_exit_target_bps=Decimal("1"),
+    )["SOL"]
+
+    episodes = [
+        episode
+        for episode in result["episodes"]
+        if episode["entry_percentile"] == Decimal("90")
+        and episode["direction"] == "long_var_short_lighter"
+    ]
+    assert len(episodes) == 1
+    assert episodes[0]["exit_reason"] == "executable_net_target_reached"
+    assert episodes[0]["holding_seconds"] == Decimal("60.0")
+    assert episodes[0]["net_pnl_bps"] == Decimal("9")
 
 
 def test_basis_v2_event_cooldown_collapses_repeated_same_direction_candidates() -> None:
