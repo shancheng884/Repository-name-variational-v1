@@ -11,8 +11,10 @@ from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parents[2]
 LOG_DIR = ROOT / "log"
+BASIS_SAMPLES_DIR = LOG_DIR / "basis_samples"
 ORDER_METRICS = LOG_DIR / "order_metrics.jsonl"
 RUNTIME_LOG = LOG_DIR / "runtime.log"
+COLLECTOR_LOG = LOG_DIR / "basis_collector.log"
 LIVE_STATE = LOG_DIR / "live_inventory_state.json"
 
 

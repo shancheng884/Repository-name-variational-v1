@@ -79,7 +79,7 @@ def default_config_dict() -> dict[str, Any]:
 def running_main_processes() -> list[str]:
     try:
         result = subprocess.run(
-            ["pgrep", "-af", "python.*main.py"],
+            ["pgrep", "-af", "python.*(main.py|tools/basis_collector.py)"],
             check=False,
             capture_output=True,
             text=True,
@@ -87,6 +87,15 @@ def running_main_processes() -> list[str]:
     except FileNotFoundError:
         return []
     return [line for line in result.stdout.splitlines() if line.strip() and "tools/live.py" not in line]
+
+
+def build_multi_asset_collector_command(assets: tuple[str, ...]) -> list[str]:
+    return [
+        sys.executable,
+        "tools/basis_collector.py",
+        "--assets",
+        ",".join(assets),
+    ]
 
 
 def validate_state(
@@ -441,7 +450,9 @@ def build_main_command(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Start the real live arbitrage runner.")
-    parser.add_argument("--asset", required=True, help="Live asset: BTC, ETH, or SOL.")
+    asset_group = parser.add_mutually_exclusive_group(required=True)
+    asset_group.add_argument("--asset", help="Single live or collect-only asset: BTC, ETH, or SOL.")
+    asset_group.add_argument("--assets", help="Comma-separated assets for the hard-isolated multi-asset collect-only process.")
     parser.add_argument("--config", default=str(LIVE_CONFIG), help="Startup config JSON. Default: live_config.json.")
     parser.add_argument("--reversion", action="store_true", help="Explicitly enable the one-lot basis reversion live test.")
     parser.add_argument(
@@ -463,9 +474,14 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true", help="Print the full main.py command.")
     args = parser.parse_args()
 
-    asset = args.asset.upper()
-    if asset not in ALLOWED_ASSETS:
+    asset = args.asset.upper() if args.asset else None
+    assets = tuple(dict.fromkeys(token.strip().upper() for token in str(args.assets or "").split(",") if token.strip()))
+    if asset is not None and asset not in ALLOWED_ASSETS:
         parser.error(f"--asset must be one of {sorted(ALLOWED_ASSETS)}")
+    if assets and (len(assets) < 2 or any(item not in ALLOWED_ASSETS for item in assets)):
+        parser.error(f"--assets requires at least two unique values from {sorted(ALLOWED_ASSETS)}")
+    if assets and not args.collect_only:
+        parser.error("--assets is hard-isolated to --collect-only and cannot be used by live/reversion/calibration")
     try:
         config = load_config(Path(args.config))
     except ValueError as exc:
@@ -503,16 +519,23 @@ def main() -> int:
         print("REFUSE_START reason=local_live_state_not_flat")
         return 2
 
-    command = build_main_command(
-        asset,
-        config,
-        reset_state_after_manual_flat=args.reset_state_after_manual_flat,
-        collect_only=args.collect_only,
+    command = (
+        build_multi_asset_collector_command(assets)
+        if assets
+        else build_main_command(
+            str(asset),
+            config,
+            reset_state_after_manual_flat=args.reset_state_after_manual_flat,
+            collect_only=args.collect_only,
+        )
     )
     effective_max_cycles = config.calibration_max_cycles if config.calibration_mode else 1 if config.reversion_mode else config.max_cycles
     strategy_mode = "basis_v3_collect_only" if args.collect_only else "execution_calibration" if config.calibration_mode else "reversion" if config.reversion_mode else "basis"
+    asset_text = ",".join(assets) if assets else str(asset)
+    if assets:
+        strategy_mode = "basis_multi_asset_collect_only"
     print(
-        f"starting asset={asset} strategy_mode={strategy_mode} "
+        f"starting asset={asset_text} strategy_mode={strategy_mode} "
         f"max_cycles={effective_max_cycles} lot_notional_usd={config.lot_notional_usd}"
     )
     if args.verbose:

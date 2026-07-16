@@ -2,7 +2,16 @@ import json
 
 from main import parse_args
 from tools import live
-from tools.live import LiveConfig, build_main_command, validate_state
+from tools.live import LiveConfig, build_main_command, build_multi_asset_collector_command, validate_state
+
+
+def test_multi_asset_collector_command_has_no_live_submit_path() -> None:
+    command = build_multi_asset_collector_command(("SOL", "BTC", "ETH"))
+
+    assert command[1:] == ["tools/basis_collector.py", "--assets", "SOL,BTC,ETH"]
+    assert "main.py" not in command
+    assert "--confirm-live" not in command
+    assert "--lighter-prewarm-submit-ws" not in command
 
 
 def test_live_tool_adds_basis_addon_flags_for_three_lots() -> None:

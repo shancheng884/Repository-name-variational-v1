@@ -2,6 +2,8 @@ from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
 from tools.analyze import (
+    _basis_v4_simulate_episode,
+    _deduplicate_sample_rows,
     basis_state_rows,
     build_basis_v3_replay,
     build_basis_v4_replay,
@@ -12,6 +14,38 @@ from tools.analyze import (
     summarize_basis_v2_sweep_events,
     print_execution_calibration,
 )
+
+
+def test_sample_dedup_prefers_baseline_over_burst_copy() -> None:
+    rows = [
+        {"sample_id": "same", "sample_kind": "burst", "logged_at": "2026-07-10T00:00:00+00:00"},
+        {"sample_id": "same", "sample_kind": "baseline", "logged_at": "2026-07-10T00:00:00+00:00"},
+    ]
+    assert _deduplicate_sample_rows(rows) == [rows[1]]
+
+
+def test_basis_v4_drops_right_censored_timeout() -> None:
+    rows = [
+        {"var_ask": "100", "lighter_sell_price": "100.10"},
+        {
+            "var_bid": "99.99",
+            "lighter_buy_price": "100.10",
+            "var_quote_age_seconds": "0.1",
+            "lighter_book_age_seconds": "0.1",
+        },
+    ]
+    result = _basis_v4_simulate_episode(
+        rows=rows,
+        times=[0.0, 60.0],
+        entry_index=0,
+        direction="long_var_short_lighter",
+        max_hold_seconds=300,
+        shortfall_reserve_bps=Decimal("1"),
+        net_exit_target_bps=Decimal("1"),
+        max_quote_age_ms=Decimal("1500"),
+        max_lighter_book_age_seconds=Decimal("2"),
+    )
+    assert result is None
 
 
 def test_basis_state_metrics_do_not_double_count_matching_block_event() -> None:

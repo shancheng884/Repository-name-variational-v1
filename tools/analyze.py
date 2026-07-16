@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.lib.runtime_files import (  # noqa: E402
+    BASIS_SAMPLES_DIR,
+    COLLECTOR_LOG,
     LIVE_STATE,
     LOG_DIR,
     ORDER_METRICS,
@@ -31,11 +33,17 @@ from tools.lib.runtime_files import (  # noqa: E402
     tail_text,
     to_decimal,
 )
+from tools.lib.basis_store import read_basis_samples  # noqa: E402
 
 
 def running_main_processes() -> list[str]:
     try:
-        result = subprocess.run(["pgrep", "-af", "python.*main.py"], check=False, capture_output=True, text=True)
+        result = subprocess.run(
+            ["pgrep", "-af", "python.*(main.py|tools/basis_collector.py)"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     except FileNotFoundError:
         return []
     return [line for line in result.stdout.splitlines() if line.strip() and "tools/analyze.py" not in line]
@@ -125,6 +133,23 @@ def basis_state_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return states
     # Compatibility fallback for older logs that did not emit a state row per sample.
     return [row for row in rows if row.get("event") == "live_inventory_entry_blocked" and row.get("asset")]
+
+
+def _deduplicate_sample_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prefer baseline over burst copies of the same observed quote."""
+    by_id: dict[str, dict[str, Any]] = {}
+    without_id: list[dict[str, Any]] = []
+    for row in rows:
+        sample_id = str(row.get("sample_id") or "")
+        if not sample_id:
+            without_id.append(row)
+            continue
+        previous = by_id.get(sample_id)
+        if previous is None or str(row.get("sample_kind") or "") == "baseline":
+            by_id[sample_id] = row
+    merged = [*without_id, *by_id.values()]
+    merged.sort(key=lambda row: str(row.get("logged_at") or ""))
+    return merged
 
 
 def depth_slippage(row: dict[str, Any], key: str) -> Decimal | None:
@@ -511,6 +536,9 @@ def _basis_v3_quotes_fresh(
     max_quote_age_ms: Decimal,
     max_lighter_book_age_seconds: Decimal,
 ) -> bool:
+    sample_quality = str(row.get("sample_quality") or "valid").lower()
+    if sample_quality != "valid" or row.get("lighter_continuity_ok") is False:
+        return False
     quote_age_seconds = to_decimal(row.get("var_quote_age_seconds"))
     lighter_age_seconds = to_decimal(row.get("lighter_book_age_seconds"))
     return (
@@ -621,6 +649,10 @@ def _basis_v4_simulate_episode(
             exit_reason = "executable_net_target_reached"
             break
     if exit_index is None:
+        return None
+    if exit_reason == "max_hold_timeout" and times[-1] < entry_time + max_hold_seconds:
+        # The observation ends before this episode's timeout. Counting the
+        # last available quote as an exit would introduce look-end bias.
         return None
     executable_pnl = _entry_semantics_forward_pnl_bps(rows[entry_index], rows[exit_index], direction)
     if executable_pnl is None:
@@ -795,7 +827,7 @@ def build_basis_v3_replay(
                         item["episodes"].append(episode)
                         next_episode_at[key] = simulated["exit_timestamp"] + episode_cooldown_seconds
 
-            if timestamp >= next_history_sample_at:
+            if str(row.get("sample_kind") or "baseline") == "baseline" and timestamp >= next_history_sample_at:
                 next_history_sample_at = timestamp + history_sample_seconds
                 for direction in V2_DIRECTIONS:
                     edge = _basis_v2_candidate_edge(row, direction)
@@ -811,7 +843,7 @@ def build_basis_v4_replay(
     rows: list[dict[str, Any]],
     *,
     asset_filter: str | None = None,
-    evaluation_interval_seconds: int = 60,
+    evaluation_interval_seconds: int = 1,
     history_sample_seconds: int = 30,
     episode_cooldown_seconds: int = 180,
     max_hold_seconds: int = 21600,
@@ -932,7 +964,7 @@ def build_basis_v4_replay(
                             }
                         )
                         next_episode_at[key] = simulated["exit_timestamp"] + episode_cooldown_seconds
-            if timestamp >= next_history_sample_at:
+            if str(row.get("sample_kind") or "baseline") == "baseline" and timestamp >= next_history_sample_at:
                 next_history_sample_at = timestamp + history_sample_seconds
                 for direction in V2_DIRECTIONS:
                     edge = _basis_v2_candidate_edge(row, direction)
@@ -2281,6 +2313,7 @@ def main() -> int:
     parser.add_argument("--basis-v2", action="store_true", help="Replay directional executable edges with strict time-aligned multiscale context.")
     parser.add_argument("--basis-v3", action="store_true", help="Replay independent multiscale quantile convergence episodes using executable prices.")
     parser.add_argument("--basis-v4", action="store_true", help="Replay extreme entries with executable net-PnL exits; read-only offline analysis.")
+    parser.add_argument("--basis-v4-evaluation-interval-seconds", type=int, default=1, help="Evaluate V4 entries at most once per interval. Default: 1.")
     parser.add_argument("--basis-v3-evaluation-interval-seconds", type=int, default=60, help="Evaluate V3 entries at most once per interval. Default: 60.")
     parser.add_argument("--basis-v3-history-sample-seconds", type=int, default=30, help="Downsample prior quantile history to this interval. Default: 30.")
     parser.add_argument("--basis-v3-episode-cooldown-seconds", type=int, default=180, help="Cooldown after each independent V3 episode. Default: 180.")
@@ -2422,11 +2455,14 @@ def main() -> int:
         or args.basis_v3_max_hold_seconds <= 0
         or args.basis_v3_min_history_samples <= 0
         or args.basis_v3_min_independent_samples <= 0
+        or args.basis_v4_evaluation_interval_seconds <= 0
     ):
         parser.error("basis V3 intervals, history, hold, and sample counts must be positive; cooldown may be 0")
 
     source_paths = rotated_jsonl_paths(ORDER_METRICS) if args.include_rotated else [ORDER_METRICS]
-    raw_rows = tail_jsonl_many(source_paths, args.tail) if args.include_rotated else tail_jsonl(ORDER_METRICS, args.tail)
+    legacy_rows = tail_jsonl_many(source_paths, args.tail) if args.include_rotated else tail_jsonl(ORDER_METRICS, args.tail)
+    collector_rows = read_basis_samples(BASIS_SAMPLES_DIR, limit=args.tail, asset_filter=args.asset)
+    raw_rows = _deduplicate_sample_rows([*legacy_rows, *collector_rows])[-args.tail :]
     rows = raw_rows if args.all_runs else latest_run_filter(raw_rows)
     current_run_rows = latest_run_filter(raw_rows)
     state = read_json(LIVE_STATE)
@@ -2437,6 +2473,8 @@ def main() -> int:
 
     events = Counter(str(row.get("event") or "-") for row in rows)
     assets = Counter(str(row.get("asset") or "-").upper() for row in rows if row.get("asset"))
+    sample_kinds = Counter(str(row.get("sample_kind") or "legacy") for row in rows if row.get("event") == "live_inventory_basis_state")
+    sample_quality = Counter(str(row.get("sample_quality") or "legacy") for row in rows if row.get("event") == "live_inventory_basis_state")
     blocked_reasons = Counter(str(row.get("reason") or "unknown") for row in rows if row.get("event") == "live_inventory_entry_blocked")
     state_rows = basis_state_rows(rows)
     pre_gate_large_moves = sum(row.get("basis_sample_move_ok") is False for row in state_rows)
@@ -2513,6 +2551,12 @@ def main() -> int:
         print(f"process_detail={process}")
     print(f"state={status} asset={state_asset} open_lots={len(open_lots)} pending_actions={len(pending_actions)}")
     print(f"logs order_metrics={file_size(ORDER_METRICS)} runtime={file_size(RUNTIME_LOG)} log_dir={human_bytes(sum(p.stat().st_size for p in LOG_DIR.rglob('*') if p.is_file())) if LOG_DIR.exists() else 'missing'}")
+    collector_health = read_json(BASIS_SAMPLES_DIR / "health.json")
+    if collector_health:
+        print(
+            f"collector run_id={collector_health.get('run_id')} assets={collector_health.get('assets')} "
+            f"disk_free_gb={collector_health.get('disk_free_gb')} extension_failures={collector_health.get('extension_consecutive_failures')}"
+        )
     print(f"rows={len(rows)}/{len(raw_rows)} latest_at={latest_at} latest_age={age}")
 
     print("== events ==")
@@ -2532,6 +2576,7 @@ def main() -> int:
         )
     )
     print(f"assets={dict(assets.most_common())}")
+    print(f"sample_kinds={dict(sample_kinds.most_common())} sample_quality={dict(sample_quality.most_common())}")
     print(f"blocked_reasons={dict(blocked_reasons.most_common(args.top))}")
     print(
         f"large_move_pre_gate_samples={pre_gate_large_moves} "
@@ -2631,7 +2676,7 @@ def main() -> int:
         print_basis_v4(
             rows,
             asset=args.asset,
-            evaluation_interval_seconds=args.basis_v3_evaluation_interval_seconds,
+            evaluation_interval_seconds=args.basis_v4_evaluation_interval_seconds,
             history_sample_seconds=args.basis_v3_history_sample_seconds,
             episode_cooldown_seconds=args.basis_v3_episode_cooldown_seconds,
             max_hold_seconds=args.basis_v3_max_hold_seconds,
@@ -2678,9 +2723,9 @@ def main() -> int:
         operational_readiness = "live_process_running"
     print(f"operational_readiness={operational_readiness}")
 
-    runtime_tail = tail_text(RUNTIME_LOG, 5)
+    runtime_tail = tail_text(COLLECTOR_LOG, 5) if collector_health else tail_text(RUNTIME_LOG, 5)
     if runtime_tail:
-        print("== runtime_tail ==")
+        print("== collector_tail ==" if collector_health else "== runtime_tail ==")
         for line in runtime_tail:
             print(line)
     return 0
