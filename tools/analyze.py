@@ -566,6 +566,7 @@ def _basis_v3_simulate_episode(
     shortfall_reserve_bps: Decimal,
     max_quote_age_ms: Decimal,
     max_lighter_book_age_seconds: Decimal,
+    max_sample_gap_seconds: int = 60,
 ) -> dict[str, Any] | None:
     entry_time = times[entry_index]
     last_index = bisect_right(times, entry_time + max_hold_seconds) - 1
@@ -575,6 +576,7 @@ def _basis_v3_simulate_episode(
     exit_reason = "max_hold_timeout"
     mfe: Decimal | None = None
     mae: Decimal | None = None
+    last_usable_time = entry_time
     for index in range(entry_index + 1, last_index + 1):
         if not _basis_v3_quotes_fresh(
             rows[index],
@@ -582,6 +584,9 @@ def _basis_v3_simulate_episode(
             max_lighter_book_age_seconds=max_lighter_book_age_seconds,
         ):
             continue
+        if max_sample_gap_seconds > 0 and times[index] - last_usable_time > max_sample_gap_seconds:
+            return {"blocked_reason": "sample_gap"}
+        last_usable_time = times[index]
         exit_index = index
         pnl = _entry_semantics_forward_pnl_bps(rows[entry_index], rows[index], direction)
         if pnl is not None:
@@ -593,6 +598,8 @@ def _basis_v3_simulate_episode(
             exit_reason = "target_quantile_reached"
             break
     if exit_index is None:
+        return None
+    if exit_reason == "max_hold_timeout" and times[-1] < entry_time + max_hold_seconds:
         return None
     executable_pnl = _entry_semantics_forward_pnl_bps(rows[entry_index], rows[exit_index], direction)
     if executable_pnl is None:
@@ -621,6 +628,7 @@ def _basis_v4_simulate_episode(
     net_exit_target_bps: Decimal,
     max_quote_age_ms: Decimal,
     max_lighter_book_age_seconds: Decimal,
+    max_sample_gap_seconds: int = 60,
 ) -> dict[str, Any] | None:
     """Close only once logged executable PnL meets the net target, or at timeout."""
     entry_time = times[entry_index]
@@ -631,6 +639,7 @@ def _basis_v4_simulate_episode(
     exit_reason = "max_hold_timeout"
     mfe: Decimal | None = None
     mae: Decimal | None = None
+    last_usable_time = entry_time
     for index in range(entry_index + 1, last_index + 1):
         if not _basis_v3_quotes_fresh(
             rows[index],
@@ -638,6 +647,9 @@ def _basis_v4_simulate_episode(
             max_lighter_book_age_seconds=max_lighter_book_age_seconds,
         ):
             continue
+        if max_sample_gap_seconds > 0 and times[index] - last_usable_time > max_sample_gap_seconds:
+            return {"blocked_reason": "sample_gap"}
+        last_usable_time = times[index]
         exit_index = index
         executable_pnl = _entry_semantics_forward_pnl_bps(rows[entry_index], rows[index], direction)
         if executable_pnl is None:
@@ -685,6 +697,7 @@ def build_basis_v3_replay(
     min_net_expected_bps: Decimal = Decimal("1.0"),
     max_quote_age_ms: Decimal = Decimal("1500"),
     max_lighter_book_age_seconds: Decimal = Decimal("2"),
+    max_sample_gap_seconds: int = 60,
 ) -> dict[str, dict[str, Any]]:
     """Replay strictly-prior multiscale quantile entries and target exits.
 
@@ -801,7 +814,11 @@ def build_basis_v3_replay(
                             shortfall_reserve_bps=reserve,
                             max_quote_age_ms=max_quote_age_ms,
                             max_lighter_book_age_seconds=max_lighter_book_age_seconds,
+                            max_sample_gap_seconds=max_sample_gap_seconds,
                         )
+                        if simulated is not None and simulated.get("blocked_reason"):
+                            item["blocked"][f"{variant}:{simulated['blocked_reason']}"] += 1
+                            continue
                         if simulated is None:
                             item["blocked"][f"{variant}:no_executable_exit"] += 1
                             continue
@@ -854,6 +871,7 @@ def build_basis_v4_replay(
     net_exit_target_bps: Decimal = V4_NET_EXIT_TARGET_BPS,
     max_quote_age_ms: Decimal = Decimal("1500"),
     max_lighter_book_age_seconds: Decimal = Decimal("2"),
+    max_sample_gap_seconds: int = 60,
 ) -> dict[str, dict[str, Any]]:
     """Replay extreme entries with exits based only on executable net PnL."""
     grouped: dict[str, list[tuple[float, dict[str, Any]]]] = {}
@@ -944,7 +962,11 @@ def build_basis_v4_replay(
                             net_exit_target_bps=net_exit_target_bps,
                             max_quote_age_ms=max_quote_age_ms,
                             max_lighter_book_age_seconds=max_lighter_book_age_seconds,
+                            max_sample_gap_seconds=max_sample_gap_seconds,
                         )
+                        if simulated is not None and simulated.get("blocked_reason"):
+                            item["blocked"][f"p{entry_percentile}:{simulated['blocked_reason']}"] += 1
+                            continue
                         if simulated is None:
                             item["blocked"][f"p{entry_percentile}:no_executable_exit"] += 1
                             continue
@@ -1026,6 +1048,7 @@ def print_basis_v3(
     history_sample_seconds: int,
     episode_cooldown_seconds: int,
     max_hold_seconds: int,
+    max_sample_gap_seconds: int,
     min_window_coverage: Decimal,
     min_history_samples: int,
     long_shortfall_reserve_bps: Decimal,
@@ -1042,6 +1065,7 @@ def print_basis_v3(
     print(
         f"evaluation_interval_seconds={evaluation_interval_seconds} history_sample_seconds={history_sample_seconds} "
         f"episode_cooldown_seconds={episode_cooldown_seconds} max_hold_seconds={max_hold_seconds} "
+        f"max_sample_gap_seconds={max_sample_gap_seconds} "
         f"min_window_coverage={fmt_decimal(min_window_coverage)} min_history_samples={min_history_samples} "
         f"long_shortfall_reserve={fmt_decimal(long_shortfall_reserve_bps)} "
         f"short_shortfall_reserve={fmt_decimal(short_shortfall_reserve_bps)} "
@@ -1054,6 +1078,7 @@ def print_basis_v3(
         history_sample_seconds=history_sample_seconds,
         episode_cooldown_seconds=episode_cooldown_seconds,
         max_hold_seconds=max_hold_seconds,
+        max_sample_gap_seconds=max_sample_gap_seconds,
         min_window_coverage=min_window_coverage,
         min_history_samples=min_history_samples,
         long_shortfall_reserve_bps=long_shortfall_reserve_bps,
@@ -1125,6 +1150,7 @@ def print_basis_v4(
     history_sample_seconds: int,
     episode_cooldown_seconds: int,
     max_hold_seconds: int,
+    max_sample_gap_seconds: int,
     min_window_coverage: Decimal,
     min_history_samples: int,
     long_shortfall_reserve_bps: Decimal,
@@ -1141,6 +1167,7 @@ def print_basis_v4(
     print(
         f"evaluation_interval_seconds={evaluation_interval_seconds} history_sample_seconds={history_sample_seconds} "
         f"episode_cooldown_seconds={episode_cooldown_seconds} max_hold_seconds={max_hold_seconds} "
+        f"max_sample_gap_seconds={max_sample_gap_seconds} "
         f"min_window_coverage={fmt_decimal(min_window_coverage)} min_history_samples={min_history_samples} "
         f"long_shortfall_reserve={fmt_decimal(long_shortfall_reserve_bps)} "
         f"short_shortfall_reserve={fmt_decimal(short_shortfall_reserve_bps)} "
@@ -1153,6 +1180,7 @@ def print_basis_v4(
         history_sample_seconds=history_sample_seconds,
         episode_cooldown_seconds=episode_cooldown_seconds,
         max_hold_seconds=max_hold_seconds,
+        max_sample_gap_seconds=max_sample_gap_seconds,
         min_window_coverage=min_window_coverage,
         min_history_samples=min_history_samples,
         long_shortfall_reserve_bps=long_shortfall_reserve_bps,
@@ -2318,6 +2346,7 @@ def main() -> int:
     parser.add_argument("--basis-v3-history-sample-seconds", type=int, default=30, help="Downsample prior quantile history to this interval. Default: 30.")
     parser.add_argument("--basis-v3-episode-cooldown-seconds", type=int, default=180, help="Cooldown after each independent V3 episode. Default: 180.")
     parser.add_argument("--basis-v3-max-hold-seconds", type=int, default=21600, help="Maximum V3 episode holding horizon. Default: 21600.")
+    parser.add_argument("--basis-v3-max-sample-gap-seconds", type=int, default=60, help="Reject replay paths crossing a larger observation gap. Default: 60.")
     parser.add_argument("--basis-v3-min-window-coverage", default="0.80", help="Required elapsed coverage for a quantile window. Default: 0.80.")
     parser.add_argument("--basis-v3-min-history-samples", type=int, default=100, help="Minimum strictly-prior samples in a mature window. Default: 100.")
     parser.add_argument("--basis-v3-long-shortfall-reserve-bps", default="1.0", help="Unmodeled shortfall reserve for long-Var episodes. Default: 1.0.")
@@ -2453,6 +2482,7 @@ def main() -> int:
         or args.basis_v3_history_sample_seconds <= 0
         or args.basis_v3_episode_cooldown_seconds < 0
         or args.basis_v3_max_hold_seconds <= 0
+        or args.basis_v3_max_sample_gap_seconds <= 0
         or args.basis_v3_min_history_samples <= 0
         or args.basis_v3_min_independent_samples <= 0
         or args.basis_v4_evaluation_interval_seconds <= 0
@@ -2664,6 +2694,7 @@ def main() -> int:
             history_sample_seconds=args.basis_v3_history_sample_seconds,
             episode_cooldown_seconds=args.basis_v3_episode_cooldown_seconds,
             max_hold_seconds=args.basis_v3_max_hold_seconds,
+            max_sample_gap_seconds=args.basis_v3_max_sample_gap_seconds,
             min_window_coverage=basis_v3_min_window_coverage,
             min_history_samples=args.basis_v3_min_history_samples,
             long_shortfall_reserve_bps=basis_v3_long_shortfall_reserve,
@@ -2680,6 +2711,7 @@ def main() -> int:
             history_sample_seconds=args.basis_v3_history_sample_seconds,
             episode_cooldown_seconds=args.basis_v3_episode_cooldown_seconds,
             max_hold_seconds=args.basis_v3_max_hold_seconds,
+            max_sample_gap_seconds=args.basis_v3_max_sample_gap_seconds,
             min_window_coverage=basis_v3_min_window_coverage,
             min_history_samples=args.basis_v3_min_history_samples,
             long_shortfall_reserve_bps=basis_v3_long_shortfall_reserve,

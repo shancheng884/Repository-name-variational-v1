@@ -2,6 +2,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
 from tools.analyze import (
+    _basis_v3_simulate_episode,
     _basis_v4_simulate_episode,
     _deduplicate_sample_rows,
     basis_state_rows,
@@ -42,6 +43,56 @@ def test_basis_v4_drops_right_censored_timeout() -> None:
         max_hold_seconds=300,
         shortfall_reserve_bps=Decimal("1"),
         net_exit_target_bps=Decimal("1"),
+        max_quote_age_ms=Decimal("1500"),
+        max_lighter_book_age_seconds=Decimal("2"),
+    )
+    assert result is None
+
+
+def test_basis_v4_rejects_path_crossing_sample_gap() -> None:
+    rows = [
+        {"var_ask": "100", "lighter_sell_price": "100.10"},
+        {
+            "var_bid": "100.10",
+            "lighter_buy_price": "100.00",
+            "var_quote_age_seconds": "0.1",
+            "lighter_book_age_seconds": "0.1",
+        },
+    ]
+    result = _basis_v4_simulate_episode(
+        rows=rows,
+        times=[0.0, 61.0],
+        entry_index=0,
+        direction="long_var_short_lighter",
+        max_hold_seconds=300,
+        shortfall_reserve_bps=Decimal("1"),
+        net_exit_target_bps=Decimal("1"),
+        max_quote_age_ms=Decimal("1500"),
+        max_lighter_book_age_seconds=Decimal("2"),
+        max_sample_gap_seconds=60,
+    )
+    assert result == {"blocked_reason": "sample_gap"}
+
+
+def test_basis_v3_drops_right_censored_timeout() -> None:
+    rows = [
+        {"var_ask": "100", "lighter_sell_price": "100.10"},
+        {
+            "var_bid": "99.99",
+            "lighter_buy_price": "100.10",
+            "long_edge_bps": "5",
+            "var_quote_age_seconds": "0.1",
+            "lighter_book_age_seconds": "0.1",
+        },
+    ]
+    result = _basis_v3_simulate_episode(
+        rows=rows,
+        times=[0.0, 60.0],
+        entry_index=0,
+        direction="long_var_short_lighter",
+        target_exit_edge_bps=Decimal("1"),
+        max_hold_seconds=300,
+        shortfall_reserve_bps=Decimal("1"),
         max_quote_age_ms=Decimal("1500"),
         max_lighter_book_age_seconds=Decimal("2"),
     )
@@ -287,6 +338,7 @@ def test_basis_v3_uses_prior_quantiles_across_runs_and_does_not_double_count_spr
         long_shortfall_reserve_bps=Decimal("1"),
         short_shortfall_reserve_bps=Decimal("1"),
         min_net_expected_bps=Decimal("1"),
+        max_sample_gap_seconds=180,
     )["SOL"]
 
     episodes = [
