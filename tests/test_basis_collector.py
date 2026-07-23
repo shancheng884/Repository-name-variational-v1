@@ -160,3 +160,14 @@ def test_collector_builds_valid_zero_fee_executable_row(tmp_path) -> None:
         assert row["asset"] == "SOL"
 
     asyncio.run(run())
+
+
+def test_collector_normalizes_unbounded_error_responses() -> None:
+    html = "<!doctype html><html><style>" + ("x" * 10000) + "</style></html>"
+
+    assert MultiAssetCollector._normalize_error(html) == "variational_html_response"
+    assert MultiAssetCollector._normalize_error('{"error":"' + ("x" * 10000)) == (
+        "variational_structured_error_response"
+    )
+    assert MultiAssetCollector._normalize_error("HTTP 503") == "HTTP 503"
+    assert len(MultiAssetCollector._normalize_error("error " + ("x" * 10000))) == 160

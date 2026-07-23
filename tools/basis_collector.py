@@ -9,6 +9,7 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -379,6 +380,21 @@ class MultiAssetCollector:
     def request_stop(self, *_args: Any) -> None:
         self.stop = True
 
+    @staticmethod
+    def _normalize_error(error: Any) -> str:
+        text = " ".join(str(error or "unknown_error").split())
+        lowered = text.lower()
+        if "<!doctype html" in lowered or "<html" in lowered:
+            return "variational_html_response"
+        if text.startswith("{") or text.startswith("["):
+            return "variational_structured_error_response"
+        status = re.search(r"\bHTTP\s+([45]\d\d)\b", text, flags=re.IGNORECASE)
+        if status:
+            return f"HTTP {status.group(1)}"
+        if len(text) > 160:
+            return text[:157] + "..."
+        return text
+
     def _load_history(self) -> None:
         for asset in self.assets:
             rows = read_basis_samples(self.sample_root, limit=20000, asset_filter=asset)
@@ -661,7 +677,8 @@ class MultiAssetCollector:
                 row, error = await self._build_row(asset)
                 self.last_poll[asset] = time.monotonic()
                 if error:
-                    self.errors[f"{asset}:{error}"] += 1
+                    normalized_error = self._normalize_error(error)
+                    self.errors[f"{asset}:{normalized_error}"] += 1
                     if "No extension command client connected" in error:
                         self.extension_failures += 1
                         if self.extension_failures >= self.args.extension_failure_limit:
@@ -678,9 +695,12 @@ class MultiAssetCollector:
                     self._write_health()
                     health = self._health()
                     self.logger.info(
-                        "collector_health samples=%s errors=%s disk_free_gb=%s",
+                        "collector_health samples=%s error_total=%s error_types=%s "
+                        "extension_failures=%s disk_free_gb=%s",
                         health["samples"],
-                        health["errors"],
+                        sum(health["errors"].values()),
+                        len(health["errors"]),
+                        health["extension_consecutive_failures"],
                         health["disk_free_gb"],
                     )
                     free_gb = float(health["disk_free_gb"])
