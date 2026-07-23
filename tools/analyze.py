@@ -36,6 +36,12 @@ from tools.lib.runtime_files import (  # noqa: E402
 from tools.lib.basis_store import read_basis_samples  # noqa: E402
 
 
+def bounded_diagnostic_line(line: str, max_chars: int = 500) -> str:
+    if len(line) <= max_chars:
+        return line
+    return f"{line[:max_chars]}... [truncated original_chars={len(line)}]"
+
+
 def running_main_processes() -> list[str]:
     try:
         result = subprocess.run(
@@ -2759,7 +2765,7 @@ def main() -> int:
     if runtime_tail:
         print("== collector_tail ==" if collector_health else "== runtime_tail ==")
         for line in runtime_tail:
-            print(line)
+            print(bounded_diagnostic_line(line))
     return 0
 
 

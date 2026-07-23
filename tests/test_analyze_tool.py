@@ -6,6 +6,7 @@ from tools.analyze import (
     _basis_v4_simulate_episode,
     _deduplicate_sample_rows,
     basis_state_rows,
+    bounded_diagnostic_line,
     build_basis_v3_replay,
     build_basis_v4_replay,
     build_basis_regimes,
@@ -15,6 +16,14 @@ from tools.analyze import (
     summarize_basis_v2_sweep_events,
     print_execution_calibration,
 )
+
+
+def test_diagnostic_log_lines_are_bounded() -> None:
+    assert bounded_diagnostic_line("short") == "short"
+    rendered = bounded_diagnostic_line("x" * 10000)
+    assert rendered.startswith("x" * 500)
+    assert rendered.endswith("[truncated original_chars=10000]")
+    assert len(rendered) < 550
 
 
 def test_sample_dedup_prefers_baseline_over_burst_copy() -> None:
