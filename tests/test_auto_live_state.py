@@ -190,11 +190,59 @@ def test_variational_api_command_preflight_fails_when_extension_disconnected(tmp
         runtime.send_variational_place_order = fake_send_variational_place_order
 
         try:
-            await runtime.preflight_variational_api_command_client("BTC")
+            await runtime.preflight_variational_api_command_client("BTC", extension_wait_seconds=0)
         except RuntimeError as exc:
             assert "No extension command client connected" in str(exc)
         else:
             raise AssertionError("preflight should fail")
+
+    asyncio.run(run())
+
+
+def test_variational_api_command_preflight_waits_for_extension_reconnect(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _runtime(tmp_path)
+        calls = []
+
+        async def fake_send_variational_place_order(**kwargs):
+            calls.append(kwargs)
+            if len(calls) < 3:
+                return {"ok": False, "error": "No extension command client connected."}
+            return {"ok": True}
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+
+        await runtime.preflight_variational_api_command_client(
+            "ETH",
+            extension_wait_seconds=1,
+            retry_interval_seconds=0,
+        )
+
+        assert len(calls) == 3
+        assert all(call["asset"] == "ETH" for call in calls)
+
+    asyncio.run(run())
+
+
+def test_variational_api_command_preflight_does_not_retry_other_errors(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _runtime(tmp_path)
+        calls = []
+
+        async def fake_send_variational_place_order(**kwargs):
+            calls.append(kwargs)
+            return {"ok": False, "error": "Access Restricted"}
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+
+        try:
+            await runtime.preflight_variational_api_command_client("ETH", extension_wait_seconds=1)
+        except RuntimeError as exc:
+            assert "Access Restricted" in str(exc)
+        else:
+            raise AssertionError("preflight should fail")
+
+        assert len(calls) == 1
 
     asyncio.run(run())
 

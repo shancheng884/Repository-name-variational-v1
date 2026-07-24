@@ -4619,17 +4619,43 @@ class VariationalToLighterRuntime:
         result = await awaitable
         return result, elapsed_ms_str(started)
 
-    async def preflight_variational_api_command_client(self, asset: str) -> None:
-        result = await self.send_variational_place_order(
-            asset=asset,
-            side="BUY",
-            amount="0.00000001",
-            expected_min_btc_qty=None,
-            confirm=False,
-            reduce_only=False,
-        )
-        if not result.get("ok"):
-            raise RuntimeError(f"Variational API command preflight failed: {result.get('error') or result}")
+    async def preflight_variational_api_command_client(
+        self,
+        asset: str,
+        *,
+        extension_wait_seconds: float = 10.0,
+        retry_interval_seconds: float = 0.5,
+    ) -> None:
+        deadline = time.monotonic() + max(0.0, extension_wait_seconds)
+        attempt = 0
+        while True:
+            attempt += 1
+            result = await self.send_variational_place_order(
+                asset=asset,
+                side="BUY",
+                amount="0.00000001",
+                expected_min_btc_qty=None,
+                confirm=False,
+                reduce_only=False,
+            )
+            if result.get("ok"):
+                return
+
+            error = result.get("error") or result
+            is_extension_disconnected = "No extension command client connected" in str(error)
+            remaining_seconds = deadline - time.monotonic()
+            if not is_extension_disconnected or remaining_seconds <= 0:
+                raise RuntimeError(f"Variational API command preflight failed: {error}")
+
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.info(
+                    "variational_api_command_client_preflight_waiting asset=%s attempt=%s remaining_seconds=%.1f",
+                    asset,
+                    attempt,
+                    remaining_seconds,
+                )
+            await asyncio.sleep(min(max(0.0, retry_interval_seconds), remaining_seconds))
 
     @staticmethod
     def _is_lighter_ws_sendtx_response(message: dict[str, Any]) -> bool:
