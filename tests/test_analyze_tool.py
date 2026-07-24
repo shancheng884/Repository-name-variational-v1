@@ -2,6 +2,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
 from tools.analyze import (
+    _basis_v4_formal_profile,
     _basis_v3_simulate_episode,
     _basis_v4_candidate_verdict,
     _basis_v4_simulate_episode,
@@ -18,6 +19,53 @@ from tools.analyze import (
     summarize_basis_v2_sweep_events,
     print_execution_calibration,
 )
+
+
+def test_basis_v4_formal_profile_accepts_only_versioned_calibrated_eth_short_config() -> None:
+    common = {
+        "evaluation_interval_seconds": 1,
+        "history_sample_seconds": 30,
+        "episode_cooldown_seconds": 180,
+        "max_hold_seconds": 21600,
+        "max_sample_gap_seconds": 60,
+        "min_window_coverage": Decimal("0.80"),
+        "min_history_samples": 100,
+        "long_shortfall_reserve_bps": Decimal("2"),
+        "net_exit_target_bps": Decimal("1"),
+    }
+
+    assert (
+        _basis_v4_formal_profile(
+            asset="ETH",
+            short_shortfall_reserve_bps=Decimal("0.50"),
+            **common,
+        )
+        == "eth_short_execution_calibrated_20260724_n10"
+    )
+    assert (
+        _basis_v4_formal_profile(
+            asset="ETH",
+            short_shortfall_reserve_bps=Decimal("2"),
+            **common,
+        )
+        == "fixed_2bps_v1"
+    )
+    assert (
+        _basis_v4_formal_profile(
+            asset="SOL",
+            short_shortfall_reserve_bps=Decimal("0.50"),
+            **common,
+        )
+        is None
+    )
+    assert (
+        _basis_v4_formal_profile(
+            asset="ETH",
+            short_shortfall_reserve_bps=Decimal("0.75"),
+            **common,
+        )
+        is None
+    )
 
 
 def test_diagnostic_log_lines_are_bounded() -> None:

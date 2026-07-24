@@ -1249,9 +1249,25 @@ def print_basis_v4_stratified(
     holdout_fraction: Decimal,
     min_independent_samples: int,
 ) -> None:
+    formal_profile = _basis_v4_formal_profile(
+        asset=asset,
+        evaluation_interval_seconds=evaluation_interval_seconds,
+        history_sample_seconds=history_sample_seconds,
+        episode_cooldown_seconds=episode_cooldown_seconds,
+        max_hold_seconds=max_hold_seconds,
+        max_sample_gap_seconds=max_sample_gap_seconds,
+        min_window_coverage=min_window_coverage,
+        min_history_samples=min_history_samples,
+        long_shortfall_reserve_bps=long_shortfall_reserve_bps,
+        short_shortfall_reserve_bps=short_shortfall_reserve_bps,
+        net_exit_target_bps=net_exit_target_bps,
+    )
     print("== basis_v4_stratified ==")
     print(
-        "formal_candidate=p97.5 reserve=2bps max_hold=21600s net_exit_target=1bps "
+        f"formal_candidate=p97.5 profile={formal_profile or 'none'} "
+        f"long_reserve={fmt_decimal(long_shortfall_reserve_bps)}bps "
+        f"short_reserve={fmt_decimal(short_shortfall_reserve_bps)}bps "
+        "max_hold=21600s net_exit_target=1bps "
         "segments=weekday_weekend,utc_4h,relative_total_spread"
     )
     results = build_basis_v4_replay(
@@ -1268,18 +1284,7 @@ def print_basis_v4_stratified(
         short_shortfall_reserve_bps=short_shortfall_reserve_bps,
         net_exit_target_bps=net_exit_target_bps,
     )
-    formal_config = (
-        evaluation_interval_seconds == 1
-        and history_sample_seconds == 30
-        and episode_cooldown_seconds == 180
-        and max_hold_seconds == 21600
-        and max_sample_gap_seconds == 60
-        and min_window_coverage == Decimal("0.80")
-        and min_history_samples == 100
-        and long_shortfall_reserve_bps == Decimal("2")
-        and short_shortfall_reserve_bps == Decimal("2")
-        and net_exit_target_bps == Decimal("1")
-    )
+    formal_config = formal_profile is not None
     if not formal_config:
         print("formal_config=false verdict=non_formal_diagnostic_only")
     if not results:
@@ -1367,6 +1372,43 @@ def print_basis_v4_stratified(
                 f"{verdict if formal_config else 'non_formal_diagnostic_only'} "
                 f"reasons={','.join(reasons) if reasons else '-'}"
             )
+
+
+def _basis_v4_formal_profile(
+    *,
+    asset: str | None,
+    evaluation_interval_seconds: int,
+    history_sample_seconds: int,
+    episode_cooldown_seconds: int,
+    max_hold_seconds: int,
+    max_sample_gap_seconds: int,
+    min_window_coverage: Decimal,
+    min_history_samples: int,
+    long_shortfall_reserve_bps: Decimal,
+    short_shortfall_reserve_bps: Decimal,
+    net_exit_target_bps: Decimal,
+) -> str | None:
+    common_formal_config = (
+        evaluation_interval_seconds == 1
+        and history_sample_seconds == 30
+        and episode_cooldown_seconds == 180
+        and max_hold_seconds == 21600
+        and max_sample_gap_seconds == 60
+        and min_window_coverage == Decimal("0.80")
+        and min_history_samples == 100
+        and net_exit_target_bps == Decimal("1")
+    )
+    if not common_formal_config:
+        return None
+    if long_shortfall_reserve_bps == Decimal("2") and short_shortfall_reserve_bps == Decimal("2"):
+        return "fixed_2bps_v1"
+    if (
+        str(asset or "").upper() == "ETH"
+        and long_shortfall_reserve_bps == Decimal("2")
+        and short_shortfall_reserve_bps == Decimal("0.50")
+    ):
+        return "eth_short_execution_calibrated_20260724_n10"
+    return None
 
 
 def print_basis_v3(
