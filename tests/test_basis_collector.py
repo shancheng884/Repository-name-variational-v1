@@ -33,6 +33,38 @@ def test_basis_store_rotates_closed_days_without_losing_rows(tmp_path) -> None:
     assert manifest["rows_this_process"] == 1
 
 
+def test_basis_store_can_read_only_valid_baseline_rows(tmp_path) -> None:
+    store = BasisSampleStore(tmp_path, config_hash="config", commit="commit")
+    for sample_kind, sample_quality in (
+        ("baseline", "valid"),
+        ("burst", "valid"),
+        ("baseline", "degraded"),
+        (None, None),
+    ):
+        row = {
+            "event": "live_inventory_basis_state",
+            "logged_at": "2026-07-24T00:00:00+00:00",
+            "asset": "ETH",
+        }
+        if sample_kind is not None:
+            row["sample_kind"] = sample_kind
+        if sample_quality is not None:
+            row["sample_quality"] = sample_quality
+        store.append(row)
+
+    rows = read_basis_samples(
+        tmp_path,
+        limit=10,
+        asset_filter="ETH",
+        sample_kind_filter="baseline",
+        sample_quality_filter="valid",
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["sample_kind"] == "baseline"
+    assert rows[0]["sample_quality"] == "valid"
+
+
 def test_legacy_archive_preserves_content_and_reopens_active_file(tmp_path) -> None:
     source = tmp_path / "order_metrics.jsonl"
     source.write_text('{"event":"old"}\n', encoding="utf-8")

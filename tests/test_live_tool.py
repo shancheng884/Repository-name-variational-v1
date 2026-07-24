@@ -146,6 +146,29 @@ def test_live_tool_calibration_command_passes_main_cli_guards(monkeypatch) -> No
     assert args.live_inventory_min_hold_samples == args.live_inventory_max_hold_samples == 5
 
 
+def test_live_tool_v4_profile_is_bounded_and_passes_main_cli_guards(monkeypatch) -> None:
+    command = build_main_command("ETH", LiveConfig(v4_live_mode=True))
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_basis_v4_profile == "eth_short_execution_calibrated_20260724_n10"
+    assert args.live_inventory_i_accept_basis_v4_live is True
+    assert args.live_allowed_assets == "ETH"
+    assert args.live_inventory_max_cycles == 1
+    assert args.live_inventory_max_lots == 1
+    assert args.live_inventory_max_total_lots == 1
+    assert args.live_inventory_lot_notional_usd == 20
+    assert args.live_inventory_max_total_notional_usd == 25
+    assert args.live_inventory_basis_profit_take_pnl_bps == 0
+    assert args.live_inventory_basis_max_hold_action == "exit"
+    assert args.live_inventory_basis_refresh_exit_quote_before_submit is True
+    assert args.live_inventory_basis_use_normalized_edge_for_entry is False
+    assert "--live-inventory-basis-reversion" not in command
+    assert "--live-inventory-execution-calibration" not in command
+    assert "--live-inventory-i-accept-basis-addon-diagnostic" not in command
+
+
 def test_live_tool_collect_only_disables_all_inventory_entries(monkeypatch) -> None:
     command = build_main_command("SOL", LiveConfig(max_total_lots=3), collect_only=True)
     monkeypatch.setattr("sys.argv", command[1:])

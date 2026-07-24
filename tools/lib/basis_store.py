@@ -142,7 +142,14 @@ def basis_sample_paths(root: Path, asset_filter: str | None = None) -> list[Path
     return sorted(paths, key=lambda path: (path.parent.name, path.name))
 
 
-def read_basis_samples(root: Path, *, limit: int, asset_filter: str | None = None) -> list[dict[str, Any]]:
+def read_basis_samples(
+    root: Path,
+    *,
+    limit: int,
+    asset_filter: str | None = None,
+    sample_kind_filter: str | None = None,
+    sample_quality_filter: str | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     paths_by_asset: dict[str, list[Path]] = {}
     for path in basis_sample_paths(root, asset_filter):
@@ -158,8 +165,21 @@ def read_basis_samples(root: Path, *, limit: int, asset_filter: str | None = Non
                             row = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        if isinstance(row, dict):
-                            asset_rows.append(row)
+                        if not isinstance(row, dict):
+                            continue
+                        if (
+                            sample_kind_filter is not None
+                            and str(row.get("sample_kind") or "")
+                            != sample_kind_filter
+                        ):
+                            continue
+                        if (
+                            sample_quality_filter is not None
+                            and str(row.get("sample_quality") or "")
+                            != sample_quality_filter
+                        ):
+                            continue
+                        asset_rows.append(row)
             except OSError:
                 continue
         rows.extend(asset_rows)

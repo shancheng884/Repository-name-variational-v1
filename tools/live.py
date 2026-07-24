@@ -23,6 +23,7 @@ CALIBRATION_DIRECTIONS = {
     "short_var_long_lighter",
 }
 LIVE_CONFIG = ROOT / "live_config.json"
+V4_PROFILE_ETH_SHORT_20260724 = "eth_short_execution_calibrated_20260724_n10"
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ class LiveConfig:
     calibration_max_run_loss_usd: str = "0.25"
     calibration_max_cycle_loss_usd: str = "0.10"
     calibration_max_roundtrip_cost_bps: str = "6.0"
+    v4_live_mode: bool = False
     entry_lighter_fill_timeout_seconds: str = "3"
     snapshot_timeout_seconds: str = "10"
     addon_min_basis_improvement_bps: str = "2.0"
@@ -134,7 +136,7 @@ def validate_state(
         config.calibration_max_cycles
         if config.calibration_mode
         else 1
-        if config.reversion_mode
+        if config.reversion_mode or config.v4_live_mode
         else config.max_cycles
     )
     if completed_cycles >= effective_max_cycles and not collect_only:
@@ -284,6 +286,7 @@ def load_config(path: Path) -> LiveConfig:
         calibration_max_run_loss_usd=_positive_decimal(raw, "calibration_max_run_loss_usd"),
         calibration_max_cycle_loss_usd=_positive_decimal(raw, "calibration_max_cycle_loss_usd"),
         calibration_max_roundtrip_cost_bps=_positive_decimal(raw, "calibration_max_roundtrip_cost_bps"),
+        v4_live_mode=bool(raw.get("v4_live_mode", DEFAULT_CONFIG.v4_live_mode)),
         entry_lighter_fill_timeout_seconds=_positive_decimal(raw, "entry_lighter_fill_timeout_seconds"),
         snapshot_timeout_seconds=_positive_decimal(raw, "snapshot_timeout_seconds"),
         addon_min_basis_improvement_bps=_positive_decimal(raw, "addon_min_basis_improvement_bps"),
@@ -299,9 +302,16 @@ def build_main_command(
 ) -> list[str]:
     reversion_mode = config.reversion_mode
     calibration_mode = config.calibration_mode
-    diagnostic_single_lot = reversion_mode or calibration_mode or collect_only
+    v4_live_mode = config.v4_live_mode
+    diagnostic_single_lot = reversion_mode or calibration_mode or v4_live_mode or collect_only
     effective_max_total_notional_usd = "25" if diagnostic_single_lot else config.max_total_inventory_notional_usd
-    effective_max_cycles = config.calibration_max_cycles if calibration_mode else 1 if reversion_mode else config.max_cycles
+    effective_max_cycles = (
+        config.calibration_max_cycles
+        if calibration_mode
+        else 1
+        if reversion_mode or v4_live_mode
+        else config.max_cycles
+    )
     effective_max_lots = 1 if diagnostic_single_lot else config.max_lots
     effective_max_total_lots = 1 if diagnostic_single_lot else config.max_total_lots
     effective_min_entry_edge_bps = "0" if diagnostic_single_lot else config.min_entry_edge_bps
@@ -367,7 +377,7 @@ def build_main_command(
         "--live-inventory-basis-min-signal-reverted-exit-pnl-bps",
         config.min_signal_reverted_exit_pnl_bps,
         "--live-inventory-basis-profit-take-pnl-bps",
-        config.profit_take_pnl_bps,
+        "0" if v4_live_mode else config.profit_take_pnl_bps,
         "--live-inventory-basis-entry-confirm-samples",
         str(config.entry_confirm_samples),
         "--live-inventory-basis-max-sample-move-bps",
@@ -383,9 +393,9 @@ def build_main_command(
         command.extend(["--live-inventory-dry-decisions", "--live-inventory-collect-only"])
     else:
         command.extend(["--lighter-prewarm-submit-ws", "--live-inventory-i-accept-basis-real-diagnostic"])
-    if config.dynamic_entry_threshold:
+    if config.dynamic_entry_threshold and not v4_live_mode:
         command.append("--live-inventory-basis-dynamic-entry-threshold")
-    if not reversion_mode and not calibration_mode:
+    if not reversion_mode and not calibration_mode and not v4_live_mode:
         command.extend(
             [
                 "--live-inventory-basis-use-normalized-edge-for-entry",
@@ -394,6 +404,25 @@ def build_main_command(
                 config.min_normalized_entry_edge_bps,
                 "--live-inventory-basis-min-normalized-filter-edge-bps",
                 config.min_normalized_filter_edge_bps,
+            ]
+        )
+    elif v4_live_mode:
+        command.extend(
+            [
+                "--live-inventory-basis-v4-profile",
+                V4_PROFILE_ETH_SHORT_20260724,
+                "--live-inventory-i-accept-basis-v4-live",
+                "--live-inventory-basis-max-hold-action",
+                "exit",
+                "--live-inventory-basis-refresh-exit-quote-before-submit",
+                "--live-inventory-min-hold-samples",
+                "0",
+                "--live-inventory-max-hold-samples",
+                "2147483647",
+                "--live-inventory-basis-max-var-quote-age-ms",
+                "1500",
+                "--live-inventory-max-lighter-book-age-seconds",
+                "2",
             ]
         )
     elif reversion_mode:
@@ -481,6 +510,11 @@ def main() -> int:
     parser.add_argument("--config", default=str(LIVE_CONFIG), help="Startup config JSON. Default: live_config.json.")
     parser.add_argument("--reversion", action="store_true", help="Explicitly enable the one-lot basis reversion live test.")
     parser.add_argument(
+        "--v4-live",
+        action="store_true",
+        help="Enable the immutable, one-cycle ETH V4 live profile.",
+    )
+    parser.add_argument(
         "--calibration",
         action="store_true",
         help="Explicitly enable bounded real execution-cost calibration. This intentionally submits and closes small real positions.",
@@ -523,23 +557,37 @@ def main() -> int:
     except ValueError as exc:
         print(f"REFUSE_START reason=config_invalid detail={exc}")
         return 2
-    if sum(bool(value) for value in (args.reversion, args.calibration, args.collect_only)) > 1:
-        parser.error("use only one of --reversion, --calibration, or --collect-only")
+    if sum(bool(value) for value in (args.reversion, args.calibration, args.v4_live, args.collect_only)) > 1:
+        parser.error("use only one of --reversion, --calibration, --v4-live, or --collect-only")
     if args.collect_only and args.reset_state_after_manual_flat:
         parser.error("--collect-only does not allow --reset-state-after-manual-flat")
     if args.reversion:
-        config = replace(config, reversion_mode=True, calibration_mode=False)
+        config = replace(
+            config,
+            reversion_mode=True,
+            calibration_mode=False,
+            v4_live_mode=False,
+        )
     if args.calibration:
-        config = replace(config, calibration_mode=True, reversion_mode=False)
+        config = replace(config, calibration_mode=True, reversion_mode=False, v4_live_mode=False)
+    if args.v4_live:
+        config = replace(
+            config,
+            calibration_mode=False,
+            reversion_mode=False,
+            v4_live_mode=True,
+        )
     if args.calibration_direction is not None:
         config = replace(config, calibration_direction=args.calibration_direction)
     if args.calibration_weekdays_only is not None:
         config = replace(config, calibration_weekdays_only=args.calibration_weekdays_only)
     if args.collect_only:
-        config = replace(config, calibration_mode=False, reversion_mode=False)
-    if config.reversion_mode and config.calibration_mode:
-        print("REFUSE_START reason=config_invalid detail=reversion_mode_and_calibration_mode_are_mutually_exclusive")
+        config = replace(config, calibration_mode=False, reversion_mode=False, v4_live_mode=False)
+    if sum(bool(value) for value in (config.reversion_mode, config.calibration_mode, config.v4_live_mode)) > 1:
+        print("REFUSE_START reason=config_invalid detail=live_strategy_modes_are_mutually_exclusive")
         return 2
+    if config.v4_live_mode and asset != "ETH":
+        parser.error("--v4-live requires --asset ETH")
     if (
         args.calibration_direction is not None
         or args.calibration_weekdays_only is not None
@@ -574,8 +622,24 @@ def main() -> int:
             collect_only=args.collect_only,
         )
     )
-    effective_max_cycles = config.calibration_max_cycles if config.calibration_mode else 1 if config.reversion_mode else config.max_cycles
-    strategy_mode = "basis_v3_collect_only" if args.collect_only else "execution_calibration" if config.calibration_mode else "reversion" if config.reversion_mode else "basis"
+    effective_max_cycles = (
+        config.calibration_max_cycles
+        if config.calibration_mode
+        else 1
+        if config.reversion_mode or config.v4_live_mode
+        else config.max_cycles
+    )
+    strategy_mode = (
+        "basis_v3_collect_only"
+        if args.collect_only
+        else "execution_calibration"
+        if config.calibration_mode
+        else "basis_v4_live"
+        if config.v4_live_mode
+        else "reversion"
+        if config.reversion_mode
+        else "basis"
+    )
     asset_text = ",".join(assets) if assets else str(asset)
     if assets:
         strategy_mode = "basis_multi_asset_collect_only"

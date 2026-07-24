@@ -13,7 +13,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from pathlib import Path
 from types import SimpleNamespace
 from statistics import median
@@ -49,6 +49,7 @@ from paper_engine import (
     paper_var_spread_cost_usd,
 )
 from inventory_engine import DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER, PaperInventoryEngine
+from tools.lib.basis_store import read_basis_samples
 
 MODE_OBSERVE = "observe"
 MODE_DRY_RUN = "dry-run"
@@ -79,6 +80,19 @@ LIVE_INVENTORY_NEGATIVE_DIRECTION_MODE_CHOICES = (
     LIVE_INVENTORY_NEGATIVE_DIRECTION_MODE_PAUSE,
     LIVE_INVENTORY_NEGATIVE_DIRECTION_MODE_PENALIZE,
 )
+LIVE_INVENTORY_BASIS_V4_PROFILE_ETH_SHORT_20260724 = "eth_short_execution_calibrated_20260724_n10"
+LIVE_INVENTORY_BASIS_V4_PROFILE_CHOICES = (
+    LIVE_INVENTORY_BASIS_V4_PROFILE_ETH_SHORT_20260724,
+)
+LIVE_INVENTORY_BASIS_V4_WINDOWS_SECONDS = (3600, 21600, 86400, 604800)
+LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE = Decimal("97.5")
+LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS = 30
+LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE = Decimal("0.80")
+LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES = 100
+LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS = Decimal("0.50")
+LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
+LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
+LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS = 60
 
 STAGE_EVENT_RECEIVED = "event_received"
 STAGE_EVENT_FILTERED = "event_filtered"
@@ -911,6 +925,11 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_watch_min_quality_score_bps = Decimal(str(args.live_inventory_basis_watch_min_quality_score_bps))
         self.live_inventory_basis_stablecoin_normalization = bool(args.live_inventory_basis_stablecoin_normalization)
         self.live_inventory_basis_reversion_mode = bool(args.live_inventory_basis_reversion)
+        self.live_inventory_basis_v4_profile = str(args.live_inventory_basis_v4_profile or "")
+        self.live_inventory_basis_v4_mode = bool(self.live_inventory_basis_v4_profile)
+        self.live_inventory_accept_basis_v4_live = bool(
+            args.live_inventory_i_accept_basis_v4_live
+        )
         self.live_inventory_basis_reversion_min_deviation_bps = Decimal(
             str(args.live_inventory_basis_reversion_min_deviation_bps)
         )
@@ -1065,6 +1084,8 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
+            else "basis-v4-live-v1"
+            if self.live_inventory_basis_v4_mode
             else "cost-calibrated-reversion-v3"
             if self.live_inventory_basis_reversion_mode
             else "basis-v1"
@@ -1074,6 +1095,8 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
+            else self.live_inventory_basis_v4_profile
+            if self.live_inventory_basis_v4_mode
             else "legacy-5m-reversion"
             if self.live_inventory_basis_reversion_mode
             else "legacy-basis"
@@ -1119,6 +1142,10 @@ class VariationalToLighterRuntime:
         self.live_inventory_stablecoin_rate_cache: dict[str, Any] = {}
         self.live_inventory_stablecoin_basis_bps_samples: deque[Decimal] = deque(maxlen=500)
         self.live_inventory_basis_reversion_history: deque[tuple[float, float | None, float | None]] = deque()
+        self.live_inventory_basis_v4_history: deque[tuple[float, Decimal]] = deque()
+        self.live_inventory_basis_v4_next_history_sample_at = 0.0
+        self.live_inventory_basis_v4_history_ready = False
+        self.live_inventory_basis_v4_history_reason = "not_loaded"
         self._order_write_lock = asyncio.Lock()
         self._opportunity_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
@@ -2263,6 +2290,150 @@ class VariationalToLighterRuntime:
         while self.live_inventory_basis_reversion_history and self.live_inventory_basis_reversion_history[0][0] < cutoff:
             self.live_inventory_basis_reversion_history.popleft()
 
+    @staticmethod
+    def live_inventory_basis_v4_percentile(
+        values: list[Decimal],
+        pct: Decimal = LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE,
+    ) -> Decimal | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        index = int(
+            (Decimal(len(ordered) - 1) * pct / Decimal("100")).to_integral_value(
+                rounding=ROUND_HALF_UP
+            )
+        )
+        return ordered[max(0, min(index, len(ordered) - 1))]
+
+    def load_live_inventory_basis_v4_history(self, *, asset: str) -> dict[str, Any]:
+        self.live_inventory_basis_v4_history.clear()
+        self.live_inventory_basis_v4_history_ready = False
+        self.live_inventory_basis_v4_history_reason = "insufficient_multiscale_history"
+        now = datetime.now(timezone.utc).timestamp()
+        cutoff = now - max(LIVE_INVENTORY_BASIS_V4_WINDOWS_SECONDS)
+        next_sample_at = cutoff
+        source_rows = read_basis_samples(
+            self.output_dir / "basis_samples",
+            limit=100000,
+            asset_filter=asset,
+            sample_kind_filter="baseline",
+            sample_quality_filter="valid",
+        )
+        for row in source_rows:
+            logged_at = self._parse_iso_ts(str(row.get("logged_at") or ""))
+            edge_bps = to_decimal(row.get("short_edge_bps"))
+            if logged_at is None or edge_bps is None:
+                continue
+            timestamp = logged_at.timestamp()
+            if timestamp < cutoff or timestamp >= now or timestamp < next_sample_at:
+                continue
+            self.live_inventory_basis_v4_history.append((timestamp, edge_bps))
+            next_sample_at = timestamp + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
+        latest_at = (
+            self.live_inventory_basis_v4_history[-1][0]
+            if self.live_inventory_basis_v4_history
+            else None
+        )
+        latest_age_seconds = None if latest_at is None else max(0.0, now - latest_at)
+        if (
+            latest_age_seconds is not None
+            and latest_age_seconds <= LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
+        ):
+            threshold, context = self.live_inventory_basis_v4_entry_threshold(now=now)
+            self.live_inventory_basis_v4_history_ready = threshold is not None
+            self.live_inventory_basis_v4_history_reason = (
+                "ready" if threshold is not None else "insufficient_multiscale_history"
+            )
+        else:
+            context = {}
+            self.live_inventory_basis_v4_history_reason = "history_latest_sample_stale"
+        self.live_inventory_basis_v4_next_history_sample_at = (
+            (latest_at + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS)
+            if latest_at is not None
+            else now
+        )
+        return {
+            "profile": self.live_inventory_basis_v4_profile,
+            "asset": asset,
+            "source_rows": len(source_rows),
+            "history_samples": len(self.live_inventory_basis_v4_history),
+            "latest_age_seconds": latest_age_seconds,
+            "ready": self.live_inventory_basis_v4_history_ready,
+            "reason": self.live_inventory_basis_v4_history_reason,
+            **context,
+        }
+
+    def live_inventory_basis_v4_entry_threshold(
+        self,
+        *,
+        now: float,
+    ) -> tuple[Decimal | None, dict[str, Any]]:
+        mature_windows: list[int] = []
+        contexts: dict[int, tuple[int, float]] = {}
+        for window_seconds in LIVE_INVENTORY_BASIS_V4_WINDOWS_SECONDS:
+            cutoff = now - window_seconds
+            rows = [row for row in self.live_inventory_basis_v4_history if row[0] > cutoff]
+            coverage_seconds = max(0.0, now - rows[0][0]) if rows else 0.0
+            contexts[window_seconds] = (len(rows), coverage_seconds)
+            if (
+                len(rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
+                and Decimal(str(coverage_seconds))
+                >= Decimal(window_seconds) * LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
+            ):
+                mature_windows.append(window_seconds)
+        if not mature_windows:
+            return None, {
+                "v4_history_samples": len(self.live_inventory_basis_v4_history),
+                "v4_mature_windows": [],
+            }
+        baseline_window_seconds = max(mature_windows)
+        cutoff = now - baseline_window_seconds
+        values = [
+            edge_bps
+            for timestamp, edge_bps in self.live_inventory_basis_v4_history
+            if timestamp > cutoff
+        ]
+        threshold = self.live_inventory_basis_v4_percentile(values)
+        count, coverage_seconds = contexts[baseline_window_seconds]
+        return threshold, {
+            "v4_history_samples": len(self.live_inventory_basis_v4_history),
+            "v4_mature_windows": mature_windows,
+            "v4_baseline_window_seconds": baseline_window_seconds,
+            "v4_baseline_count": count,
+            "v4_baseline_coverage_seconds": f"{coverage_seconds:.3f}",
+            "v4_entry_percentile": decimal_to_str(
+                LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE
+            ),
+            "v4_entry_threshold_bps": decimal_to_str(threshold),
+        }
+
+    def record_live_inventory_basis_v4_edge(
+        self,
+        *,
+        now: float,
+        short_edge_bps: Decimal,
+    ) -> None:
+        if now < self.live_inventory_basis_v4_next_history_sample_at:
+            return
+        if (
+            self.live_inventory_basis_v4_history
+            and now - self.live_inventory_basis_v4_history[-1][0]
+            > LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
+        ):
+            self.live_inventory_basis_v4_history.clear()
+            self.live_inventory_basis_v4_history_ready = False
+            self.live_inventory_basis_v4_history_reason = "history_sample_gap_rebuild_required"
+        self.live_inventory_basis_v4_history.append((now, short_edge_bps))
+        self.live_inventory_basis_v4_next_history_sample_at = (
+            now + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
+        )
+        cutoff = now - max(LIVE_INVENTORY_BASIS_V4_WINDOWS_SECONDS)
+        while (
+            self.live_inventory_basis_v4_history
+            and self.live_inventory_basis_v4_history[0][0] <= cutoff
+        ):
+            self.live_inventory_basis_v4_history.popleft()
+
     def live_inventory_basis_abs_entry_ok(self, *, direction: str, basis_bps: Decimal, threshold_bps: Decimal | None = None) -> bool:
         threshold = self.live_inventory_basis_min_abs_entry_bps if threshold_bps is None else threshold_bps
         if threshold <= 0:
@@ -2734,6 +2905,11 @@ class VariationalToLighterRuntime:
             "entry_reversion_median_30m_bps": context.get("entry_reversion_median_30m_bps"),
             "entry_reversion_median_60m_bps": context.get("entry_reversion_median_60m_bps"),
             "entry_reversion_deviation_bps": context.get("entry_reversion_deviation_bps"),
+            "entry_v4_profile": context.get("entry_v4_profile"),
+            "entry_v4_threshold_bps": context.get("entry_v4_threshold_bps"),
+            "entry_v4_baseline_window_seconds": context.get(
+                "entry_v4_baseline_window_seconds"
+            ),
             "entry_var_side": context.get("var_side"),
             "entry_var_order_quote_id": context.get("quote_id"),
             "entry_var_order_quote_bid": context.get("var_bid"),
@@ -5256,6 +5432,9 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_z_entry",
             "live_inventory_basis_z_exit",
             "live_inventory_basis_reversion_mode",
+            "live_inventory_basis_v4_profile",
+            "live_inventory_basis_v4_mode",
+            "live_inventory_accept_basis_v4_live",
             "live_inventory_basis_reversion_min_deviation_bps",
             "live_inventory_basis_reversion_exit_deviation_bps",
             "live_inventory_basis_reversion_max_entry_roundtrip_cost_bps",
@@ -6782,6 +6961,7 @@ class VariationalToLighterRuntime:
     async def maybe_run_live_inventory_basis(self, snapshot: CrossSpreadSnapshot) -> None:
         asset = snapshot.asset.upper()
         calibration_mode = bool(getattr(self, "live_inventory_execution_calibration", False))
+        v4_mode = bool(getattr(self, "live_inventory_basis_v4_mode", False))
         collect_only = bool(getattr(self, "live_inventory_collect_only", False))
         if self.live_allowed_assets and asset not in self.live_allowed_assets:
             return
@@ -6855,6 +7035,19 @@ class VariationalToLighterRuntime:
                 < self.live_inventory_calibration_entry_cooldown_samples
             ):
                 return
+        if v4_mode and not self.live_inventory_open_lots and datetime.now(timezone.utc).weekday() >= 5:
+            if index == 1 or index % 30 == 0:
+                await self.append_live_inventory_log(
+                    "live_inventory_v4_entry_blocked",
+                    {
+                        "asset": asset,
+                        "sample_index": index,
+                        "reason": "v4_weekend_entry_blocked",
+                        "profile": self.live_inventory_basis_v4_profile,
+                        "utc_weekday": datetime.now(timezone.utc).weekday(),
+                    },
+                )
+            return
         quote, quote_ms = await self.fetch_live_inventory_basis_quote(asset=asset)
         if quote is None:
             return
@@ -6908,6 +7101,25 @@ class VariationalToLighterRuntime:
             var_price=var_bid,
             lighter_price=lighter_buy_price,
         ) or Decimal("0")
+        v4_now = datetime.now(timezone.utc).timestamp()
+        v4_entry_threshold_bps = None
+        v4_entry_context: dict[str, Any] = {}
+        if v4_mode:
+            v4_entry_threshold_bps, v4_entry_context = (
+                self.live_inventory_basis_v4_entry_threshold(now=v4_now)
+            )
+            if v4_entry_threshold_bps is not None:
+                self.live_inventory_basis_v4_history_ready = True
+                self.live_inventory_basis_v4_history_reason = "ready"
+            elif self.live_inventory_basis_v4_history_reason == "ready":
+                self.live_inventory_basis_v4_history_ready = False
+                self.live_inventory_basis_v4_history_reason = (
+                    "insufficient_multiscale_history"
+                )
+            self.record_live_inventory_basis_v4_edge(
+                now=v4_now,
+                short_edge_bps=short_edge_bps,
+            )
         reversion_now = time.monotonic()
         reversion_long_medians = self.live_inventory_basis_reversion_medians(
             now=reversion_now,
@@ -7087,6 +7299,8 @@ class VariationalToLighterRuntime:
             "z": decimal_to_str(z),
             "warm": warm,
             "basis_reversion_enabled": self.live_inventory_basis_reversion_mode,
+            "basis_v4_profile": getattr(self, "live_inventory_basis_v4_profile", "") or None,
+            **v4_entry_context,
             "basis_reversion_min_deviation_bps": decimal_to_str(self.live_inventory_basis_reversion_min_deviation_bps),
             "basis_reversion_exit_deviation_bps": decimal_to_str(self.live_inventory_basis_reversion_exit_deviation_bps),
             "basis_reversion_long_median_5m_bps": decimal_to_str(reversion_long_medians[300]),
@@ -7178,19 +7392,24 @@ class VariationalToLighterRuntime:
                     {**state_payload, "reason": "basis_var_entry_pending_fill"},
                 )
                 return
-            if not warm and not self.live_inventory_basis_reversion_mode and not calibration_mode:
+            if (
+                not warm
+                and not self.live_inventory_basis_reversion_mode
+                and not calibration_mode
+                and not v4_mode
+            ):
                 self.live_inventory_basis_entry_confirm_counts.clear()
                 return
             candidates = (
                 (
                     DIRECTION_LONG_VAR_SHORT_LIGHTER,
                     long_edge_bps
-                    if self.live_inventory_basis_reversion_mode or calibration_mode
+                    if self.live_inventory_basis_reversion_mode or calibration_mode or v4_mode
                     else normalized_long_edge_bps
                     if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_long_edge_bps is not None
                     else long_edge_bps,
                     long_roundtrip_pnl_bps
-                    if self.live_inventory_basis_reversion_mode or calibration_mode
+                    if self.live_inventory_basis_reversion_mode or calibration_mode or v4_mode
                     else normalized_long_roundtrip_pnl_bps
                     if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_long_roundtrip_pnl_bps is not None
                     else long_roundtrip_pnl_bps,
@@ -7206,12 +7425,12 @@ class VariationalToLighterRuntime:
                 (
                     DIRECTION_SHORT_VAR_LONG_LIGHTER,
                     short_edge_bps
-                    if self.live_inventory_basis_reversion_mode or calibration_mode
+                    if self.live_inventory_basis_reversion_mode or calibration_mode or v4_mode
                     else normalized_short_edge_bps
                     if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_short_edge_bps is not None
                     else short_edge_bps,
                     short_roundtrip_pnl_bps
-                    if self.live_inventory_basis_reversion_mode or calibration_mode
+                    if self.live_inventory_basis_reversion_mode or calibration_mode or v4_mode
                     else normalized_short_roundtrip_pnl_bps
                     if self.live_inventory_basis_use_normalized_edge_for_entry and normalized_short_roundtrip_pnl_bps is not None
                     else short_roundtrip_pnl_bps,
@@ -7244,9 +7463,12 @@ class VariationalToLighterRuntime:
                     calibration_direction = self.live_inventory_calibration_direction_for_cycle()
                     if direction != calibration_direction:
                         continue
+                if v4_mode and direction != DIRECTION_SHORT_VAR_LONG_LIGHTER:
+                    continue
                 is_negative_direction, negative_entry_penalty_bps, negative_abs_penalty_bps, negative_context = self.live_inventory_negative_direction_penalties(direction)
                 if (
                     not calibration_mode
+                    and not v4_mode
                     and is_negative_direction
                     and self.live_inventory_basis_negative_direction_mode == LIVE_INVENTORY_NEGATIVE_DIRECTION_MODE_PAUSE
                 ):
@@ -7266,6 +7488,33 @@ class VariationalToLighterRuntime:
                         "calibration_direction": direction,
                         "calibration_cycle_number": self.live_inventory_completed_cycles + 1,
                         "calibration_alpha_filters_bypassed": True,
+                    }
+                elif v4_mode:
+                    if (
+                        not self.live_inventory_basis_v4_history_ready
+                        or v4_entry_threshold_bps is None
+                    ):
+                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                        if index == 1 or index % 30 == 0:
+                            await self.append_live_inventory_log(
+                                "live_inventory_v4_entry_blocked",
+                                {
+                                    **state_payload,
+                                    "reason": self.live_inventory_basis_v4_history_reason,
+                                    "direction": direction,
+                                    **v4_entry_context,
+                                },
+                            )
+                        continue
+                    direction_signal = short_edge_bps - v4_entry_threshold_bps
+                    # Existing common guards use >=. Add a negligible epsilon to
+                    # preserve the replay's strict edge > percentile condition.
+                    min_entry_edge_bps = v4_entry_threshold_bps + Decimal("0.000000001")
+                    min_abs_entry_bps = Decimal("0")
+                    dynamic_entry_threshold_context = {
+                        "v4_entry_enabled": True,
+                        "v4_profile": self.live_inventory_basis_v4_profile,
+                        **v4_entry_context,
                     }
                 elif self.live_inventory_basis_reversion_mode:
                     reversion_medians = (
@@ -7372,6 +7621,7 @@ class VariationalToLighterRuntime:
                 if (
                     not self.live_inventory_basis_reversion_mode
                     and not calibration_mode
+                    and not v4_mode
                     and not stablecoin_regime_active
                     and not self.live_inventory_basis_abs_entry_ok(direction=direction, basis_bps=basis_bps, threshold_bps=min_abs_entry_bps)
                 ):
@@ -7403,7 +7653,7 @@ class VariationalToLighterRuntime:
                         {**state_payload, "reason": "basis_lighter_book_too_old", "direction": direction, "max_lighter_book_age_seconds": self.live_inventory_max_lighter_book_age_seconds},
                     )
                     continue
-                if not stablecoin_filter_ok and not calibration_mode:
+                if not stablecoin_filter_ok and not calibration_mode and not v4_mode:
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     await self.append_live_inventory_log(
                         "live_inventory_entry_blocked",
@@ -7426,6 +7676,7 @@ class VariationalToLighterRuntime:
                     stablecoin_regime_active
                     and not self.live_inventory_basis_reversion_mode
                     and not calibration_mode
+                    and not v4_mode
                     and not self.live_inventory_basis_use_normalized_edge_for_entry
                     and stablecoin_regime_required_raw_edge_bps is not None
                 ):
@@ -7436,6 +7687,7 @@ class VariationalToLighterRuntime:
                 if (
                     not self.live_inventory_basis_reversion_mode
                     and not calibration_mode
+                    and not v4_mode
                     and self.live_inventory_basis_use_normalized_edge_for_entry
                     and self.live_inventory_basis_min_normalized_entry_edge_bps > 0
                 ):
@@ -7445,6 +7697,13 @@ class VariationalToLighterRuntime:
                     entry_quality_context = {
                         "entry_quality_mode": "execution_calibration",
                         "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                    }
+                elif v4_mode:
+                    entry_quality_score_bps = edge_bps - min_entry_edge_bps
+                    entry_quality_context = {
+                        "entry_quality_mode": "v4_strict_prior_p97_5",
+                        "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                        **v4_entry_context,
                     }
                 elif self.live_inventory_basis_reversion_mode:
                     entry_quality_score_bps = edge_bps - min_entry_edge_bps
@@ -7541,7 +7800,7 @@ class VariationalToLighterRuntime:
                     if self.live_inventory_basis_reversion_mode
                     else self.live_inventory_basis_max_entry_roundtrip_cost_bps
                 )
-                if roundtrip_bps < -max_entry_roundtrip_cost_bps:
+                if not v4_mode and roundtrip_bps < -max_entry_roundtrip_cost_bps:
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     continue
                 if not basis_sample_move_ok:
@@ -7708,6 +7967,7 @@ class VariationalToLighterRuntime:
                     if (
                         refreshed_stablecoin_regime_ok
                         and not self.live_inventory_basis_reversion_mode
+                        and not v4_mode
                         and not self.live_inventory_basis_use_normalized_edge_for_entry
                         and refreshed_stablecoin_regime_required_raw_edge_bps is not None
                     ):
@@ -7715,7 +7975,11 @@ class VariationalToLighterRuntime:
                             min_entry_edge_bps,
                             refreshed_stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps,
                         )
-                    if not refreshed_stablecoin_filter_ok and not calibration_mode:
+                    if (
+                        not refreshed_stablecoin_filter_ok
+                        and not calibration_mode
+                        and not v4_mode
+                    ):
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
@@ -7751,6 +8015,13 @@ class VariationalToLighterRuntime:
                         entry_quality_context = {
                             "entry_quality_mode": "execution_calibration",
                             "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                        }
+                    elif v4_mode:
+                        entry_quality_score_bps = edge_bps - min_entry_edge_bps
+                        entry_quality_context = {
+                            "entry_quality_mode": "v4_strict_prior_p97_5",
+                            "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                            **v4_entry_context,
                         }
                     elif self.live_inventory_basis_reversion_mode:
                         entry_quality_score_bps = edge_bps - min_entry_edge_bps
@@ -7814,7 +8085,7 @@ class VariationalToLighterRuntime:
                         if self.live_inventory_basis_reversion_mode
                         else self.live_inventory_basis_max_entry_roundtrip_cost_bps
                     )
-                    if roundtrip_bps < -max_entry_roundtrip_cost_bps:
+                    if not v4_mode and roundtrip_bps < -max_entry_roundtrip_cost_bps:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
@@ -7955,18 +8226,23 @@ class VariationalToLighterRuntime:
                         normalized_edge_bps=normalized_edge_bps,
                         stablecoin_context=stablecoin_context,
                     )
-                    if stablecoin_regime_ok and not self.live_inventory_basis_reversion_mode:
+                    if (
+                        stablecoin_regime_ok
+                        and not self.live_inventory_basis_reversion_mode
+                        and not v4_mode
+                    ):
                         stablecoin_filter_ok = True
                     stablecoin_edge_context = {**stablecoin_edge_context, **stablecoin_regime_context}
                     stablecoin_regime_required_raw_edge_bps = to_decimal(stablecoin_edge_context.get("stablecoin_regime_required_raw_edge_bps"))
                     if (
                         stablecoin_regime_ok
                         and not self.live_inventory_basis_reversion_mode
+                        and not v4_mode
                         and not self.live_inventory_basis_use_normalized_edge_for_entry
                         and stablecoin_regime_required_raw_edge_bps is not None
                     ):
                         min_entry_edge_bps = stablecoin_regime_required_raw_edge_bps + negative_entry_penalty_bps
-                    if not stablecoin_filter_ok and not calibration_mode:
+                    if not stablecoin_filter_ok and not calibration_mode and not v4_mode:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
@@ -7994,6 +8270,13 @@ class VariationalToLighterRuntime:
                         entry_quality_context = {
                             "entry_quality_mode": "execution_calibration",
                             "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                        }
+                    elif v4_mode:
+                        entry_quality_score_bps = edge_bps - min_entry_edge_bps
+                        entry_quality_context = {
+                            "entry_quality_mode": "v4_strict_prior_p97_5",
+                            "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
+                            **v4_entry_context,
                         }
                     elif self.live_inventory_basis_reversion_mode:
                         entry_quality_score_bps = edge_bps - min_entry_edge_bps
@@ -8057,7 +8340,7 @@ class VariationalToLighterRuntime:
                         if self.live_inventory_basis_reversion_mode
                         else self.live_inventory_basis_max_entry_roundtrip_cost_bps
                     )
-                    if roundtrip_bps < -max_entry_roundtrip_cost_bps:
+                    if not v4_mode and roundtrip_bps < -max_entry_roundtrip_cost_bps:
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
@@ -8147,11 +8430,24 @@ class VariationalToLighterRuntime:
                         "entry_kind": (
                             "execution_calibration"
                             if calibration_mode
+                            else "basis_v4_eth_short_p97_5"
+                            if v4_mode
                             else "basis_reversion_initial"
                             if self.live_inventory_basis_reversion_mode
                             else "basis_addon"
                             if addon_direction is not None
                             else "basis_initial"
+                        ),
+                        "entry_v4_profile": (
+                            self.live_inventory_basis_v4_profile if v4_mode else None
+                        ),
+                        "entry_v4_threshold_bps": (
+                            decimal_to_str(v4_entry_threshold_bps) if v4_mode else None
+                        ),
+                        "entry_v4_baseline_window_seconds": (
+                            v4_entry_context.get("v4_baseline_window_seconds")
+                            if v4_mode
+                            else None
                         ),
                         "entry_reversion_median_5m_bps": decimal_to_str(
                             reversion_medians[300] if self.live_inventory_basis_reversion_mode else None
@@ -8379,11 +8675,24 @@ class VariationalToLighterRuntime:
                     "entry_kind": (
                         "execution_calibration"
                         if calibration_mode
+                        else "basis_v4_eth_short_p97_5"
+                        if v4_mode
                         else "basis_reversion_initial"
                         if self.live_inventory_basis_reversion_mode
                         else "basis_addon"
                         if addon_direction is not None
                         else "basis_initial"
+                    ),
+                    "entry_v4_profile": (
+                        self.live_inventory_basis_v4_profile if v4_mode else None
+                    ),
+                    "entry_v4_threshold_bps": (
+                        decimal_to_str(v4_entry_threshold_bps) if v4_mode else None
+                    ),
+                    "entry_v4_baseline_window_seconds": (
+                        v4_entry_context.get("v4_baseline_window_seconds")
+                        if v4_mode
+                        else None
                     ),
                     "status": "dry_open" if self.live_inventory_dry_decisions else "open",
                 }
@@ -8422,6 +8731,15 @@ class VariationalToLighterRuntime:
             direction = str(candidate_lot.get("direction") or "")
             entered_sample_index = int(candidate_lot.get("entered_sample_index") or index)
             holding_samples = index - entered_sample_index
+            entered_at = self._parse_iso_ts(str(candidate_lot.get("entered_at") or ""))
+            holding_seconds = (
+                max(
+                    0.0,
+                    (datetime.now(timezone.utc) - entered_at).total_seconds(),
+                )
+                if entered_at is not None
+                else 0.0
+            )
             if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
                 var_exit_price = var_bid
                 lighter_exit_price = lighter_buy_price
@@ -8511,6 +8829,29 @@ class VariationalToLighterRuntime:
             should_stop = pnl_bps is not None and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
             should_timeout = holding_samples >= self.live_inventory_max_hold_samples
             should_timeout_exit = should_timeout and self.live_inventory_basis_max_hold_action == "exit"
+            if v4_mode and candidate_lot.get("entry_kind") == "basis_v4_eth_short_p97_5":
+                effective_min_exit_pnl_bps = (
+                    LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS
+                    + LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS
+                )
+                signal_reverted = False
+                signal_exit_watch_timeout = False
+                signal_exit_watch_timeout_ok = False
+                should_profit_take = False
+                raw_should_exit = (
+                    pnl_bps is not None
+                    and pnl_bps >= effective_min_exit_pnl_bps
+                )
+                should_exit = raw_should_exit and var_quote_age_ok and lighter_book_age_ok
+                should_timeout = (
+                    holding_seconds >= LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS
+                )
+                should_timeout_exit = (
+                    should_timeout
+                    and self.live_inventory_basis_max_hold_action == "exit"
+                    and var_quote_age_ok
+                    and lighter_book_age_ok
+                )
             if should_timeout and not should_timeout_exit:
                 last_warned = int(candidate_lot.get("max_hold_warned_samples") or 0)
                 if holding_samples > last_warned and self.should_log_live_inventory_exit_blocked(
@@ -8593,6 +8934,7 @@ class VariationalToLighterRuntime:
                     "lot": candidate_lot,
                     "direction": direction,
                     "holding_samples": holding_samples,
+                    "holding_seconds": holding_seconds,
                     "var_exit_price": var_exit_price,
                     "lighter_exit_price": lighter_exit_price,
                     "entry_var_price": entry_var_price,
@@ -8623,6 +8965,7 @@ class VariationalToLighterRuntime:
         lot = selected_exit["lot"]
         direction = str(selected_exit["direction"])
         holding_samples = int(selected_exit["holding_samples"])
+        holding_seconds = float(selected_exit.get("holding_seconds") or 0.0)
         var_exit_price = selected_exit["var_exit_price"]
         lighter_exit_price = selected_exit["lighter_exit_price"]
         entry_var_price = selected_exit["entry_var_price"]
@@ -8643,6 +8986,10 @@ class VariationalToLighterRuntime:
         exit_reason = (
             "execution_calibration_fixed_hold"
             if calibration_mode and should_timeout_exit
+            else "v4_executable_net_target_reached"
+            if v4_mode and should_exit
+            else "v4_max_hold_timeout"
+            if v4_mode and should_timeout_exit
             else "profit_take"
             if should_profit_take
             else "signal_reverted_watch_timeout"
@@ -8673,7 +9020,10 @@ class VariationalToLighterRuntime:
                     },
                 )
                 return
-            if should_exit and self.live_inventory_basis_refresh_exit_quote_before_submit:
+            if (
+                (should_exit or (v4_mode and should_timeout_exit))
+                and self.live_inventory_basis_refresh_exit_quote_before_submit
+            ):
                 refreshed_quote, refreshed_quote_ms = await self.fetch_live_inventory_basis_quote(asset=asset)
                 refreshed_var_bid = to_decimal(refreshed_quote.get("bid")) if refreshed_quote else None
                 refreshed_var_ask = to_decimal(refreshed_quote.get("ask")) if refreshed_quote else None
@@ -8706,7 +9056,13 @@ class VariationalToLighterRuntime:
                 )
                 notional = qty * entry_var_price
                 refreshed_pnl_bps = refreshed_pnl / notional * Decimal("10000") if notional else None
-                if refreshed_pnl_bps is None or refreshed_pnl_bps < effective_min_exit_pnl_bps:
+                if (
+                    should_exit
+                    and (
+                        refreshed_pnl_bps is None
+                        or refreshed_pnl_bps < effective_min_exit_pnl_bps
+                    )
+                ):
                     await self.append_live_inventory_log(
                         "live_inventory_exit_blocked",
                         {
@@ -10777,6 +11133,19 @@ class VariationalToLighterRuntime:
             except Exception:
                 self.logger.exception("variational_api_command_client_preflight_failed asset=%s", initial_asset)
                 raise
+        if self.live_inventory_basis_v4_mode:
+            v4_history_context = await asyncio.to_thread(
+                self.load_live_inventory_basis_v4_history,
+                asset=initial_asset,
+            )
+            self.logger.info(
+                "live_inventory_basis_v4_history_loaded %s",
+                json.dumps(v4_history_context, ensure_ascii=True, sort_keys=True),
+            )
+            await self.append_live_inventory_log(
+                "live_inventory_basis_v4_history_loaded",
+                v4_history_context,
+            )
         if self.is_live_inventory_enabled():
             self.sync_live_inventory_memory_from_state()
             self.live_inventory_calibration_start_realized_pnl_usd = self.live_inventory_realized_pnl_usd
@@ -11359,6 +11728,17 @@ def parse_args() -> argparse.Namespace:
         help="Opt-in basis reversion signal: use directional executable edge versus prior 5m median. Forces one small live lot via tools/live.py.",
     )
     parser.add_argument(
+        "--live-inventory-basis-v4-profile",
+        choices=LIVE_INVENTORY_BASIS_V4_PROFILE_CHOICES,
+        default="",
+        help="Enable an immutable, execution-calibrated V4 live profile.",
+    )
+    parser.add_argument(
+        "--live-inventory-i-accept-basis-v4-live",
+        action="store_true",
+        help="Acknowledge that the selected V4 profile submits real orders.",
+    )
+    parser.add_argument(
         "--live-inventory-execution-calibration",
         action="store_true",
         help="Opt-in real execution-cost calibration. Uses the configured direction, bypasses alpha filters, and exits after a fixed short hold.",
@@ -11701,8 +12081,10 @@ def parse_args() -> argparse.Namespace:
         if args.live_inventory_execution_calibration:
             if args.live_inventory_signal_mode != LIVE_INVENTORY_SIGNAL_BASIS:
                 parser.error("--live-inventory-execution-calibration requires --live-inventory-signal-mode basis")
-            if args.live_inventory_basis_reversion:
-                parser.error("use only one of --live-inventory-execution-calibration or --live-inventory-basis-reversion")
+            if args.live_inventory_basis_reversion or args.live_inventory_basis_v4_profile:
+                parser.error(
+                    "use only one of execution calibration, basis reversion, or basis V4"
+                )
             if args.live_inventory_dry_decisions:
                 parser.error("--live-inventory-execution-calibration is a real-submit mode and cannot use dry decisions")
             if not args.live_inventory_i_accept_execution_calibration_loss:
@@ -11741,6 +12123,8 @@ def parse_args() -> argparse.Namespace:
                 "calibration direction/time controls require --live-inventory-execution-calibration"
             )
         if args.live_inventory_basis_reversion:
+            if args.live_inventory_basis_v4_profile:
+                parser.error("use only one of basis reversion or basis V4")
             if args.live_inventory_signal_mode != LIVE_INVENTORY_SIGNAL_BASIS:
                 parser.error("--live-inventory-basis-reversion requires --live-inventory-signal-mode basis")
             if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > 20:
@@ -11753,6 +12137,56 @@ def parse_args() -> argparse.Namespace:
                 parser.error("--live-inventory-basis-reversion does not allow basis addon diagnostics")
             if args.live_inventory_basis_use_normalized_edge_for_entry:
                 parser.error("--live-inventory-basis-reversion cannot use normalized edge as the primary entry edge")
+        if args.live_inventory_basis_v4_profile:
+            if allowed_assets != {"ETH"}:
+                parser.error("basis V4 profile requires --live-allowed-assets ETH")
+            if args.live_inventory_execution_calibration or args.live_inventory_basis_reversion:
+                parser.error(
+                    "basis V4 cannot be combined with calibration or reversion"
+                )
+            if args.live_inventory_dry_decisions or args.live_inventory_collect_only:
+                parser.error("basis V4 is a real-submit mode")
+            if not args.live_inventory_i_accept_basis_v4_live:
+                parser.error(
+                    "basis V4 requires --live-inventory-i-accept-basis-v4-live"
+                )
+            if (
+                args.live_inventory_max_cycles != 1
+                or args.live_inventory_max_lots != 1
+                or args.live_inventory_max_total_lots != 1
+            ):
+                parser.error("basis V4 requires max_cycles=1 and one total lot")
+            if (
+                args.live_inventory_lot_notional_usd != 20
+                or args.live_inventory_max_total_notional_usd != 25
+            ):
+                parser.error("basis V4 profile requires lot=20 USD and total notional=25 USD")
+            if args.live_inventory_i_accept_basis_addon_diagnostic:
+                parser.error("basis V4 does not allow add-on inventory")
+            if args.live_inventory_basis_use_normalized_edge_for_entry:
+                parser.error("basis V4 requires raw executable edge")
+            if args.live_inventory_basis_max_hold_action != "exit":
+                parser.error("basis V4 requires max-hold action exit")
+            if not args.live_inventory_basis_refresh_exit_quote_before_submit:
+                parser.error("basis V4 requires refreshed exit quotes")
+            if args.live_inventory_basis_profit_take_pnl_bps != 0:
+                parser.error("basis V4 requires generic profit take disabled")
+            if args.live_inventory_basis_entry_mode != LIVE_INVENTORY_ENTRY_MODE_CONCURRENT:
+                parser.error("basis V4 requires concurrent entry")
+            if not args.live_inventory_basis_refresh_entry_quote_before_submit:
+                parser.error("basis V4 requires refreshed entry quotes")
+            if args.live_inventory_basis_entry_confirm_samples != 1:
+                parser.error("basis V4 profile requires one entry confirmation sample")
+            if args.live_inventory_basis_max_sample_move_bps != 3:
+                parser.error("basis V4 profile requires max sample move=3 bps")
+            if args.live_inventory_basis_max_var_quote_age_ms != 1500:
+                parser.error("basis V4 profile requires max Variational quote age=1500ms")
+            if args.live_inventory_max_lighter_book_age_seconds != 2:
+                parser.error("basis V4 profile requires max Lighter book age=2s")
+        elif args.live_inventory_i_accept_basis_v4_live:
+            parser.error(
+                "--live-inventory-i-accept-basis-v4-live requires a V4 profile"
+            )
         if args.live_inventory_basis_z_entry <= 0:
             parser.error("--live-inventory-basis-z-entry must be > 0")
         if args.live_inventory_basis_z_exit < 0:

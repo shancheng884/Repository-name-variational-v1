@@ -426,6 +426,83 @@ def test_reversion_execution_reserve_is_directional() -> None:
     ) == Decimal("3.5")
 
 
+def test_v4_entry_threshold_uses_strictly_prior_multiscale_history() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    now = 10_000.0
+    runtime.live_inventory_basis_v4_history = deque(
+        (now - 3000 + index * 30, Decimal(index))
+        for index in range(100)
+    )
+
+    threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
+
+    assert threshold == Decimal("97")
+    assert context["v4_baseline_window_seconds"] == 3600
+    assert context["v4_baseline_count"] == 100
+    assert Decimal("97") <= threshold < Decimal("99")
+
+
+def test_v4_history_gap_clears_prior_regime_before_recording() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_history = deque(
+        [(100.0, Decimal("4.2"))]
+    )
+    runtime.live_inventory_basis_v4_next_history_sample_at = 130.0
+    runtime.live_inventory_basis_v4_history_ready = True
+    runtime.live_inventory_basis_v4_history_reason = "ready"
+
+    runtime.record_live_inventory_basis_v4_edge(
+        now=200.0,
+        short_edge_bps=Decimal("5.1"),
+    )
+
+    assert list(runtime.live_inventory_basis_v4_history) == [
+        (200.0, Decimal("5.1"))
+    ]
+    assert runtime.live_inventory_basis_v4_history_ready is False
+    assert runtime.live_inventory_basis_v4_history_reason == "history_sample_gap_rebuild_required"
+
+
+def test_v4_history_loader_requires_fresh_valid_baseline_rows(tmp_path) -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.output_dir = Path(tmp_path)
+    runtime.live_inventory_basis_v4_profile = (
+        "eth_short_execution_calibrated_20260724_n10"
+    )
+    runtime.live_inventory_basis_v4_history = deque()
+    runtime.live_inventory_basis_v4_next_history_sample_at = 0.0
+    runtime.live_inventory_basis_v4_history_ready = False
+    runtime.live_inventory_basis_v4_history_reason = "not_loaded"
+    asset_dir = Path(tmp_path) / "basis_samples" / "ETH"
+    asset_dir.mkdir(parents=True)
+    now = datetime.now(timezone.utc).timestamp()
+    rows = []
+    for index in range(101):
+        timestamp = now - 3001 + index * 30
+        rows.append(
+            {
+                "asset": "ETH",
+                "logged_at": datetime.fromtimestamp(
+                    timestamp, tz=timezone.utc
+                ).isoformat(),
+                "sample_kind": "baseline",
+                "sample_quality": "valid",
+                "short_edge_bps": str(index),
+            }
+        )
+    (asset_dir / "2026-07-24.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    context = runtime.load_live_inventory_basis_v4_history(asset="ETH")
+
+    assert context["ready"] is True
+    assert context["reason"] == "ready"
+    assert context["v4_baseline_window_seconds"] == 3600
+    assert context["v4_entry_threshold_bps"] == "98"
+
+
 def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_path) -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
