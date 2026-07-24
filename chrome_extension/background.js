@@ -421,6 +421,9 @@ function cleanupForwardingState() {
   wsForwarder.close();
   restForwarder.close();
   commandForwarder.close();
+  wsForwarder.queue = [];
+  restForwarder.queue = [];
+  commandForwarder.queue = [];
 }
 
 async function handleCommandSocketMessage(data) {
