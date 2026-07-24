@@ -3,6 +3,7 @@ import json
 import logging
 import time
 from collections import deque
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -2940,6 +2941,40 @@ def test_execution_calibration_cycle_loss_triggers_fuse(tmp_path) -> None:
         assert rows[-1]["actual_pnl_usd"] == "-0.2"
 
     asyncio.run(run())
+
+
+def test_execution_calibration_can_lock_direction(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_execution_calibration = True
+    runtime.live_inventory_calibration_direction = "short_var_long_lighter"
+
+    runtime.live_inventory_completed_cycles = 0
+    assert runtime.live_inventory_calibration_direction_for_cycle() == "short_var_long_lighter"
+    runtime.live_inventory_completed_cycles = 1
+    assert runtime.live_inventory_calibration_direction_for_cycle() == "short_var_long_lighter"
+
+
+def test_execution_calibration_alternate_direction_remains_default(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_execution_calibration = True
+    runtime.live_inventory_calibration_direction = "alternate"
+
+    runtime.live_inventory_completed_cycles = 0
+    assert runtime.live_inventory_calibration_direction_for_cycle() == "long_var_short_lighter"
+    runtime.live_inventory_completed_cycles = 1
+    assert runtime.live_inventory_calibration_direction_for_cycle() == "short_var_long_lighter"
+
+
+def test_execution_calibration_weekday_gate_uses_utc(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_calibration_weekdays_only = True
+
+    assert runtime.live_inventory_calibration_entry_time_allowed(
+        datetime(2026, 7, 24, 23, 59, tzinfo=timezone.utc)
+    )
+    assert not runtime.live_inventory_calibration_entry_time_allowed(
+        datetime(2026, 7, 25, 0, 0, tzinfo=timezone.utc)
+    )
 
 
 def test_register_actual_pnl_replays_fill_that_arrived_before_pending(tmp_path) -> None:

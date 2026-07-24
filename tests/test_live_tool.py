@@ -101,6 +101,8 @@ def test_live_tool_calibration_is_bounded_and_bypasses_strategy_filters() -> Non
         "SOL",
         LiveConfig(
             calibration_mode=True,
+            calibration_direction="short_var_long_lighter",
+            calibration_weekdays_only=True,
             calibration_max_cycles=5,
             calibration_hold_samples=5,
             calibration_warmup_samples=30,
@@ -114,6 +116,8 @@ def test_live_tool_calibration_is_bounded_and_bypasses_strategy_filters() -> Non
 
     assert "--live-inventory-execution-calibration" in command
     assert "--live-inventory-i-accept-execution-calibration-loss" in command
+    assert command[command.index("--live-inventory-calibration-direction") + 1] == "short_var_long_lighter"
+    assert "--live-inventory-calibration-weekdays-only" in command
     assert "--live-inventory-basis-reversion" not in command
     assert "--live-inventory-basis-min-normalized-filter-edge-bps" not in command
     assert "--live-inventory-basis-max-stablecoin-edge-share" not in command
@@ -136,6 +140,8 @@ def test_live_tool_calibration_command_passes_main_cli_guards(monkeypatch) -> No
 
     assert args.live_inventory_execution_calibration is True
     assert args.live_inventory_i_accept_execution_calibration_loss is True
+    assert args.live_inventory_calibration_direction == "alternate"
+    assert args.live_inventory_calibration_weekdays_only is False
     assert args.live_inventory_max_cycles == 5
     assert args.live_inventory_min_hold_samples == args.live_inventory_max_hold_samples == 5
 

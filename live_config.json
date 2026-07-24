@@ -34,6 +34,8 @@
   "reversion_min_normalized_edge_bps": "2.5",
   "reversion_max_stablecoin_edge_share": "0.6",
   "calibration_mode": false,
+  "calibration_direction": "alternate",
+  "calibration_weekdays_only": false,
   "calibration_max_cycles": 5,
   "calibration_hold_samples": 5,
   "calibration_warmup_samples": 30,

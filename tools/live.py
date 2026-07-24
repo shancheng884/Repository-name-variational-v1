@@ -17,6 +17,11 @@ from tools.lib.runtime_files import LIVE_STATE, LOG_DIR, human_bytes, read_json 
 
 
 ALLOWED_ASSETS = {"BNB", "BTC", "ETH", "HYPE", "SOL", "XRP"}
+CALIBRATION_DIRECTIONS = {
+    "alternate",
+    "long_var_short_lighter",
+    "short_var_long_lighter",
+}
 LIVE_CONFIG = ROOT / "live_config.json"
 
 
@@ -57,6 +62,8 @@ class LiveConfig:
     reversion_min_normalized_edge_bps: str = "2.5"
     reversion_max_stablecoin_edge_share: str = "0.6"
     calibration_mode: bool = False
+    calibration_direction: str = "alternate"
+    calibration_weekdays_only: bool = False
     calibration_max_cycles: int = 5
     calibration_hold_samples: int = 5
     calibration_warmup_samples: int = 30
@@ -209,6 +216,16 @@ def _positive_int(data: dict[str, Any], key: str, *, max_value: int | None = Non
     return number
 
 
+def _calibration_direction(data: dict[str, Any]) -> str:
+    value = str(data.get("calibration_direction", DEFAULT_CONFIG.calibration_direction))
+    if value not in CALIBRATION_DIRECTIONS:
+        raise ValueError(
+            "calibration_direction must be one of "
+            + ", ".join(sorted(CALIBRATION_DIRECTIONS))
+        )
+    return value
+
+
 def load_config(path: Path) -> LiveConfig:
     if not path.exists():
         path.write_text(json.dumps(default_config_dict(), indent=2) + "\n", encoding="utf-8")
@@ -256,6 +273,10 @@ def load_config(path: Path) -> LiveConfig:
         reversion_min_normalized_edge_bps=_non_negative_decimal(raw, "reversion_min_normalized_edge_bps"),
         reversion_max_stablecoin_edge_share=_non_negative_decimal(raw, "reversion_max_stablecoin_edge_share"),
         calibration_mode=bool(raw.get("calibration_mode", DEFAULT_CONFIG.calibration_mode)),
+        calibration_direction=_calibration_direction(raw),
+        calibration_weekdays_only=bool(
+            raw.get("calibration_weekdays_only", DEFAULT_CONFIG.calibration_weekdays_only)
+        ),
         calibration_max_cycles=_positive_int(raw, "calibration_max_cycles", max_value=5),
         calibration_hold_samples=_positive_int(raw, "calibration_hold_samples", max_value=60),
         calibration_warmup_samples=_positive_int(raw, "calibration_warmup_samples", max_value=3600),
@@ -413,6 +434,8 @@ def build_main_command(
             [
                 "--live-inventory-execution-calibration",
                 "--live-inventory-i-accept-execution-calibration-loss",
+                "--live-inventory-calibration-direction",
+                config.calibration_direction,
                 "--live-inventory-calibration-warmup-samples",
                 str(config.calibration_warmup_samples),
                 "--live-inventory-calibration-entry-cooldown-samples",
@@ -435,6 +458,8 @@ def build_main_command(
                 "1",
             ]
         )
+        if config.calibration_weekdays_only:
+            command.append("--live-inventory-calibration-weekdays-only")
     if effective_max_total_lots > 1:
         command.extend(
             [
@@ -459,6 +484,17 @@ def main() -> int:
         "--calibration",
         action="store_true",
         help="Explicitly enable bounded real execution-cost calibration. This intentionally submits and closes small real positions.",
+    )
+    parser.add_argument(
+        "--calibration-direction",
+        choices=sorted(CALIBRATION_DIRECTIONS),
+        help="Override the execution-calibration direction for this run.",
+    )
+    parser.add_argument(
+        "--calibration-weekdays-only",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Allow new execution-calibration entries only on UTC weekdays.",
     )
     parser.add_argument(
         "--collect-only",
@@ -495,11 +531,20 @@ def main() -> int:
         config = replace(config, reversion_mode=True, calibration_mode=False)
     if args.calibration:
         config = replace(config, calibration_mode=True, reversion_mode=False)
+    if args.calibration_direction is not None:
+        config = replace(config, calibration_direction=args.calibration_direction)
+    if args.calibration_weekdays_only is not None:
+        config = replace(config, calibration_weekdays_only=args.calibration_weekdays_only)
     if args.collect_only:
         config = replace(config, calibration_mode=False, reversion_mode=False)
     if config.reversion_mode and config.calibration_mode:
         print("REFUSE_START reason=config_invalid detail=reversion_mode_and_calibration_mode_are_mutually_exclusive")
         return 2
+    if (
+        args.calibration_direction is not None
+        or args.calibration_weekdays_only is not None
+    ) and not config.calibration_mode:
+        parser.error("--calibration-direction/--calibration-weekdays-only require calibration mode")
 
     processes = running_main_processes()
     if processes:

@@ -933,6 +933,10 @@ class VariationalToLighterRuntime:
             str(args.live_inventory_basis_reversion_min_net_expected_pnl_bps)
         )
         self.live_inventory_execution_calibration = bool(args.live_inventory_execution_calibration)
+        self.live_inventory_calibration_direction = str(args.live_inventory_calibration_direction)
+        self.live_inventory_calibration_weekdays_only = bool(
+            args.live_inventory_calibration_weekdays_only
+        )
         self.live_inventory_accept_execution_calibration_loss = bool(
             args.live_inventory_i_accept_execution_calibration_loss
         )
@@ -1068,7 +1072,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_strategy_variant = (
             "read-only-executable-state"
             if self.live_inventory_collect_only
-            else "alternating-direction-fixed-hold"
+            else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
             else "legacy-5m-reversion"
             if self.live_inventory_basis_reversion_mode
@@ -1326,6 +1330,25 @@ class VariationalToLighterRuntime:
         if direction == DIRECTION_SHORT_VAR_LONG_LIGHTER and self.live_inventory_basis_short_min_entry_edge_bps > 0:
             return self.live_inventory_basis_short_min_entry_edge_bps
         return self.live_inventory_basis_min_entry_edge_bps
+
+    def live_inventory_calibration_direction_for_cycle(self) -> str:
+        configured = getattr(self, "live_inventory_calibration_direction", "alternate")
+        if configured != "alternate":
+            return configured
+        return (
+            DIRECTION_LONG_VAR_SHORT_LIGHTER
+            if self.live_inventory_completed_cycles % 2 == 0
+            else DIRECTION_SHORT_VAR_LONG_LIGHTER
+        )
+
+    def live_inventory_calibration_entry_time_allowed(
+        self,
+        now_utc: datetime | None = None,
+    ) -> bool:
+        if not getattr(self, "live_inventory_calibration_weekdays_only", False):
+            return True
+        current = now_utc or datetime.now(timezone.utc)
+        return current.astimezone(timezone.utc).weekday() < 5
 
     @staticmethod
     def spread_bps_from_bid_ask(bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
@@ -6755,6 +6778,19 @@ class VariationalToLighterRuntime:
                 )
             return
         if calibration_mode and not self.live_inventory_open_lots:
+            if not self.live_inventory_calibration_entry_time_allowed():
+                if index == 1 or index % 30 == 0:
+                    await self.append_live_inventory_log(
+                        "live_inventory_calibration_entry_blocked",
+                        {
+                            "asset": asset,
+                            "sample_index": index,
+                            "reason": "calibration_weekend_entry_blocked",
+                            "calibration_direction": self.live_inventory_calibration_direction_for_cycle(),
+                            "utc_weekday": datetime.now(timezone.utc).weekday(),
+                        },
+                    )
+                return
             calibration_run_pnl_usd = (
                 self.live_inventory_realized_pnl_usd
                 - self.live_inventory_calibration_start_realized_pnl_usd
@@ -7179,11 +7215,7 @@ class VariationalToLighterRuntime:
                 if addon_direction is not None and direction != addon_direction:
                     continue
                 if calibration_mode:
-                    calibration_direction = (
-                        DIRECTION_LONG_VAR_SHORT_LIGHTER
-                        if self.live_inventory_completed_cycles % 2 == 0
-                        else DIRECTION_SHORT_VAR_LONG_LIGHTER
-                    )
+                    calibration_direction = self.live_inventory_calibration_direction_for_cycle()
                     if direction != calibration_direction:
                         continue
                 is_negative_direction, negative_entry_penalty_bps, negative_abs_penalty_bps, negative_context = self.live_inventory_negative_direction_penalties(direction)
@@ -11303,7 +11335,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--live-inventory-execution-calibration",
         action="store_true",
-        help="Opt-in real execution-cost calibration. Alternates directions, bypasses alpha filters, and exits after a fixed short hold.",
+        help="Opt-in real execution-cost calibration. Uses the configured direction, bypasses alpha filters, and exits after a fixed short hold.",
+    )
+    parser.add_argument(
+        "--live-inventory-calibration-direction",
+        choices=("alternate", DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER),
+        default="alternate",
+        help="Execution-calibration direction. Default: alternate",
+    )
+    parser.add_argument(
+        "--live-inventory-calibration-weekdays-only",
+        action="store_true",
+        help="Block new execution-calibration entries on UTC Saturday and Sunday.",
     )
     parser.add_argument(
         "--live-inventory-i-accept-execution-calibration-loss",
@@ -11663,6 +11706,13 @@ def parse_args() -> argparse.Namespace:
         elif args.live_inventory_i_accept_execution_calibration_loss:
             parser.error(
                 "--live-inventory-i-accept-execution-calibration-loss requires --live-inventory-execution-calibration"
+            )
+        elif (
+            args.live_inventory_calibration_direction != "alternate"
+            or args.live_inventory_calibration_weekdays_only
+        ):
+            parser.error(
+                "calibration direction/time controls require --live-inventory-execution-calibration"
             )
         if args.live_inventory_basis_reversion:
             if args.live_inventory_signal_mode != LIVE_INVENTORY_SIGNAL_BASIS:
