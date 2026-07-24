@@ -3,10 +3,12 @@ from datetime import datetime, timedelta, timezone
 
 from tools.analyze import (
     _basis_v3_simulate_episode,
+    _basis_v4_candidate_verdict,
     _basis_v4_simulate_episode,
     _deduplicate_sample_rows,
     basis_state_rows,
     bounded_diagnostic_line,
+    build_basis_v4_stratification,
     build_basis_v3_replay,
     build_basis_v4_replay,
     build_basis_regimes,
@@ -24,6 +26,49 @@ def test_diagnostic_log_lines_are_bounded() -> None:
     assert rendered.startswith("x" * 500)
     assert rendered.endswith("[truncated original_chars=10000]")
     assert len(rendered) < 550
+
+
+def test_basis_v4_stratification_reports_balanced_all_week_candidate() -> None:
+    started_at = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    episodes = []
+    for index in range(30):
+        timestamp = started_at + timedelta(hours=index * 6)
+        episodes.append(
+            {
+                "timestamp": timestamp.timestamp(),
+                "net_pnl_bps": Decimal("2"),
+                "holding_seconds": Decimal("900"),
+                "exit_reason": "executable_net_target_reached",
+                "entry_var_spread_bps": Decimal(str(1 + index % 4)),
+                "entry_lighter_spread_bps": Decimal("0.5"),
+            }
+        )
+    baseline_rows = [
+        {
+            "var_spread_bps": str(1 + index % 4),
+            "lighter_spread_bps": "0.5",
+        }
+        for index in range(90)
+    ]
+
+    result = build_basis_v4_stratification(
+        episodes,
+        baseline_rows,
+        holdout_fraction=Decimal("0.30"),
+        min_independent_samples=5,
+    )
+    verdict, reasons = _basis_v4_candidate_verdict(
+        result,
+        effective_coverage_hours=Decimal("168"),
+    )
+
+    assert result["overall"]["n"] == 30
+    assert result["periods"]["weekday"]["n"] > 5
+    assert result["periods"]["weekend"]["n"] > 5
+    assert set(result["liquidity"]) == {"tight", "normal", "wide"}
+    assert result["max_utc_share_pct"] < Decimal("50")
+    assert verdict == "bounded_all_week_real_calibration_candidate"
+    assert reasons == []
 
 
 def test_sample_dedup_prefers_baseline_over_burst_copy() -> None:

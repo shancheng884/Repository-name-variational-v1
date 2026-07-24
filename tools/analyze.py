@@ -979,12 +979,15 @@ def build_basis_v4_replay(
                         item["episodes"].append(
                             {
                                 "timestamp": timestamp,
+                                "entry_logged_at": row.get("logged_at"),
                                 "asset": asset,
                                 "direction": direction,
                                 "entry_percentile": entry_percentile,
                                 "baseline_window_seconds": baseline_window,
                                 "entry_edge_bps": edge,
                                 "entry_threshold_bps": entry_threshold,
+                                "entry_var_spread_bps": to_decimal(row.get("var_spread_bps")),
+                                "entry_lighter_spread_bps": to_decimal(row.get("lighter_spread_bps")),
                                 "shortfall_reserve_bps": reserve,
                                 "net_exit_target_bps": net_exit_target_bps,
                                 "stablecoin_alignment": _basis_v3_alignment(row, direction),
@@ -1044,6 +1047,326 @@ def _basis_v3_split_stats(
     else:
         verdict = "bounded_live_candidate"
     return {"train": train_stats, "holdout": holdout_stats, "verdict": verdict}
+
+
+def _basis_v4_episode_stats(
+    episodes: list[dict[str, Any]],
+    *,
+    holdout_fraction: Decimal,
+    min_independent_samples: int,
+) -> dict[str, Any]:
+    pnl = [episode["net_pnl_bps"] for episode in episodes]
+    holding = [episode["holding_seconds"] for episode in episodes]
+    target_exits = sum(
+        episode["exit_reason"] == "executable_net_target_reached"
+        for episode in episodes
+    )
+    return {
+        "n": len(episodes),
+        "net_p20": percentile(pnl, Decimal("20")),
+        "net_p50": percentile(pnl, Decimal("50")),
+        "hold_p50": percentile(holding, Decimal("50")),
+        "target_exit_pct": (
+            Decimal(target_exits) / Decimal(len(episodes)) * Decimal("100")
+            if episodes
+            else None
+        ),
+        "split": _basis_v3_split_stats(
+            episodes,
+            holdout_fraction=holdout_fraction,
+            min_independent_samples=min_independent_samples,
+        ),
+    }
+
+
+def build_basis_v4_stratification(
+    episodes: list[dict[str, Any]],
+    baseline_rows: list[dict[str, Any]],
+    *,
+    holdout_fraction: Decimal,
+    min_independent_samples: int,
+) -> dict[str, Any]:
+    spread_values: list[Decimal] = []
+    for row in baseline_rows:
+        var_spread = to_decimal(row.get("var_spread_bps"))
+        lighter_spread = to_decimal(row.get("lighter_spread_bps"))
+        if var_spread is not None and lighter_spread is not None:
+            spread_values.append(var_spread + lighter_spread)
+    spread_p33 = percentile(spread_values, Decimal("33"))
+    spread_p67 = percentile(spread_values, Decimal("67"))
+
+    periods: dict[str, list[dict[str, Any]]] = {"weekday": [], "weekend": []}
+    utc_blocks: dict[str, list[dict[str, Any]]] = {}
+    liquidity: dict[str, list[dict[str, Any]]] = {
+        "tight": [],
+        "normal": [],
+        "wide": [],
+        "unknown": [],
+    }
+    for episode in episodes:
+        entered_at = datetime.fromtimestamp(float(episode["timestamp"]), tz=timezone.utc)
+        periods["weekday" if entered_at.weekday() < 5 else "weekend"].append(episode)
+        block_start = (entered_at.hour // 4) * 4
+        block = f"{block_start:02d}-{(block_start + 4) % 24:02d}"
+        utc_blocks.setdefault(block, []).append(episode)
+        var_spread = episode.get("entry_var_spread_bps")
+        lighter_spread = episode.get("entry_lighter_spread_bps")
+        total_spread = (
+            var_spread + lighter_spread
+            if var_spread is not None and lighter_spread is not None
+            else None
+        )
+        if total_spread is None or spread_p33 is None or spread_p67 is None:
+            bucket = "unknown"
+        elif total_spread <= spread_p33:
+            bucket = "tight"
+        elif total_spread <= spread_p67:
+            bucket = "normal"
+        else:
+            bucket = "wide"
+        liquidity[bucket].append(episode)
+
+    overall = _basis_v4_episode_stats(
+        episodes,
+        holdout_fraction=holdout_fraction,
+        min_independent_samples=min_independent_samples,
+    )
+    period_stats = {
+        key: _basis_v4_episode_stats(
+            items,
+            holdout_fraction=holdout_fraction,
+            min_independent_samples=min_independent_samples,
+        )
+        for key, items in periods.items()
+    }
+    utc_stats = {
+        key: _basis_v4_episode_stats(
+            items,
+            holdout_fraction=holdout_fraction,
+            min_independent_samples=min_independent_samples,
+        )
+        for key, items in sorted(utc_blocks.items())
+    }
+    liquidity_stats = {
+        key: _basis_v4_episode_stats(
+            items,
+            holdout_fraction=holdout_fraction,
+            min_independent_samples=min_independent_samples,
+        )
+        for key, items in liquidity.items()
+        if items
+    }
+    max_utc_share_pct = (
+        Decimal(max((len(items) for items in utc_blocks.values()), default=0))
+        / Decimal(len(episodes))
+        * Decimal("100")
+        if episodes
+        else None
+    )
+    period_max_utc_share_pct: dict[str, Decimal | None] = {}
+    for period, items in periods.items():
+        counts = Counter(
+            (datetime.fromtimestamp(float(episode["timestamp"]), tz=timezone.utc).hour // 4) * 4
+            for episode in items
+        )
+        period_max_utc_share_pct[period] = (
+            Decimal(max(counts.values())) / Decimal(len(items)) * Decimal("100")
+            if items
+            else None
+        )
+    return {
+        "overall": overall,
+        "periods": period_stats,
+        "utc_blocks": utc_stats,
+        "liquidity": liquidity_stats,
+        "spread_p33": spread_p33,
+        "spread_p67": spread_p67,
+        "max_utc_share_pct": max_utc_share_pct,
+        "period_max_utc_share_pct": period_max_utc_share_pct,
+    }
+
+
+def _basis_v4_candidate_verdict(
+    stratification: dict[str, Any],
+    *,
+    effective_coverage_hours: Decimal,
+) -> tuple[str, list[str]]:
+    overall = stratification["overall"]
+    weekday = stratification["periods"]["weekday"]
+    weekend = stratification["periods"]["weekend"]
+    max_utc_share = stratification["max_utc_share_pct"]
+    weekday_max_utc_share = stratification["period_max_utc_share_pct"]["weekday"]
+    common_reasons: list[str] = []
+    if effective_coverage_hours < Decimal("168"):
+        common_reasons.append("effective_coverage_below_168h")
+    if overall["n"] < 30:
+        common_reasons.append("episodes_below_30")
+    if overall["target_exit_pct"] is None or overall["target_exit_pct"] < Decimal("85"):
+        common_reasons.append("target_exit_pct_below_85")
+    if overall["split"]["verdict"] != "bounded_live_candidate":
+        common_reasons.append(f"overall_{overall['split']['verdict']}")
+    if max_utc_share is None or max_utc_share > Decimal("50"):
+        common_reasons.append("single_utc_block_dominance")
+    all_week_reasons = list(common_reasons)
+    for label, stats in (("weekday", weekday), ("weekend", weekend)):
+        if stats["n"] < 5:
+            all_week_reasons.append(f"{label}_episodes_below_5")
+        elif stats["net_p20"] is None or stats["net_p20"] <= 0:
+            all_week_reasons.append(f"{label}_net_p20_not_positive")
+    if not all_week_reasons:
+        return "bounded_all_week_real_calibration_candidate", []
+
+    weekday_reasons: list[str] = []
+    if effective_coverage_hours < Decimal("168"):
+        weekday_reasons.append("effective_coverage_below_168h")
+    if weekday["n"] < 30:
+        weekday_reasons.append("weekday_episodes_below_30")
+    if weekday["target_exit_pct"] is None or weekday["target_exit_pct"] < Decimal("85"):
+        weekday_reasons.append("weekday_target_exit_pct_below_85")
+    if weekday["split"]["verdict"] != "bounded_live_candidate":
+        weekday_reasons.append(f"weekday_{weekday['split']['verdict']}")
+    if weekday_max_utc_share is None or weekday_max_utc_share > Decimal("50"):
+        weekday_reasons.append("single_utc_block_dominance")
+    if not weekday_reasons:
+        return "bounded_weekday_real_calibration_candidate", all_week_reasons
+    return "wait", sorted(set([*all_week_reasons, *weekday_reasons]))
+
+
+def print_basis_v4_stratified(
+    rows: list[dict[str, Any]],
+    *,
+    asset: str | None,
+    evaluation_interval_seconds: int,
+    history_sample_seconds: int,
+    episode_cooldown_seconds: int,
+    max_hold_seconds: int,
+    max_sample_gap_seconds: int,
+    min_window_coverage: Decimal,
+    min_history_samples: int,
+    long_shortfall_reserve_bps: Decimal,
+    short_shortfall_reserve_bps: Decimal,
+    net_exit_target_bps: Decimal,
+    holdout_fraction: Decimal,
+    min_independent_samples: int,
+) -> None:
+    print("== basis_v4_stratified ==")
+    print(
+        "formal_candidate=p97.5 reserve=2bps max_hold=21600s net_exit_target=1bps "
+        "segments=weekday_weekend,utc_4h,relative_total_spread"
+    )
+    results = build_basis_v4_replay(
+        rows,
+        asset_filter=asset,
+        evaluation_interval_seconds=evaluation_interval_seconds,
+        history_sample_seconds=history_sample_seconds,
+        episode_cooldown_seconds=episode_cooldown_seconds,
+        max_hold_seconds=max_hold_seconds,
+        max_sample_gap_seconds=max_sample_gap_seconds,
+        min_window_coverage=min_window_coverage,
+        min_history_samples=min_history_samples,
+        long_shortfall_reserve_bps=long_shortfall_reserve_bps,
+        short_shortfall_reserve_bps=short_shortfall_reserve_bps,
+        net_exit_target_bps=net_exit_target_bps,
+    )
+    formal_config = (
+        evaluation_interval_seconds == 1
+        and history_sample_seconds == 30
+        and episode_cooldown_seconds == 180
+        and max_hold_seconds == 21600
+        and max_sample_gap_seconds == 60
+        and min_window_coverage == Decimal("0.80")
+        and min_history_samples == 100
+        and long_shortfall_reserve_bps == Decimal("2")
+        and short_shortfall_reserve_bps == Decimal("2")
+        and net_exit_target_bps == Decimal("1")
+    )
+    if not formal_config:
+        print("formal_config=false verdict=non_formal_diagnostic_only")
+    if not results:
+        print("BASIS_V4_STRATIFIED action=WAIT reason=no_time_aligned_basis_state_rows")
+        return
+    for asset_name, item in sorted(results.items()):
+        baseline_rows = [
+            row
+            for row in basis_state_rows(rows)
+            if str(row.get("asset") or "-").upper() == asset_name
+            and str(row.get("sample_kind") or "baseline") == "baseline"
+            and str(row.get("sample_quality") or "valid") == "valid"
+        ]
+        baseline_times = sorted(
+            parsed.timestamp()
+            for row in baseline_rows
+            if (parsed := parse_time(row.get("logged_at"))) is not None
+        )
+        gaps = [right - left for left, right in zip(baseline_times, baseline_times[1:])]
+        raw_seconds = baseline_times[-1] - baseline_times[0] if len(baseline_times) >= 2 else 0.0
+        excluded_seconds = sum(gap for gap in gaps if gap > max_sample_gap_seconds)
+        effective_hours = Decimal(str(max(0.0, raw_seconds - excluded_seconds) / 3600.0))
+        print(
+            f"asset={asset_name} valid_baseline={len(baseline_rows)} "
+            f"raw_hours={fmt_decimal(Decimal(str(raw_seconds / 3600.0)))} "
+            f"excluded_gap_hours={fmt_decimal(Decimal(str(excluded_seconds / 3600.0)))} "
+            f"effective_hours={fmt_decimal(effective_hours)}"
+        )
+        for direction in V2_DIRECTIONS:
+            episodes = [
+                episode
+                for episode in item["episodes"]
+                if episode["entry_percentile"] == Decimal("97.5")
+                and episode["direction"] == direction
+            ]
+            strata = build_basis_v4_stratification(
+                episodes,
+                baseline_rows,
+                holdout_fraction=holdout_fraction,
+                min_independent_samples=min_independent_samples,
+            )
+            overall = strata["overall"]
+            verdict, reasons = _basis_v4_candidate_verdict(
+                strata,
+                effective_coverage_hours=effective_hours,
+            )
+            print(
+                f"asset={asset_name} direction={direction} n={overall['n']} "
+                f"target_exit_pct={fmt_decimal(overall['target_exit_pct'])} "
+                f"net_p20={fmt_decimal(overall['net_p20'])} net_p50={fmt_decimal(overall['net_p50'])} "
+                f"hold_p50={fmt_decimal(overall['hold_p50'])} "
+                f"train_n={overall['split']['train']['n']} "
+                f"train_p20={fmt_decimal(overall['split']['train']['p20'])} "
+                f"holdout_n={overall['split']['holdout']['n']} "
+                f"holdout_p20={fmt_decimal(overall['split']['holdout']['p20'])} "
+                f"max_utc_share_pct={fmt_decimal(strata['max_utc_share_pct'])} "
+                f"weekday_max_utc_share_pct="
+                f"{fmt_decimal(strata['period_max_utc_share_pct']['weekday'])}"
+            )
+            for period, stats in strata["periods"].items():
+                print(
+                    f"asset={asset_name} direction={direction} period={period} n={stats['n']} "
+                    f"target_exit_pct={fmt_decimal(stats['target_exit_pct'])} "
+                    f"net_p20={fmt_decimal(stats['net_p20'])} net_p50={fmt_decimal(stats['net_p50'])} "
+                    f"train_p20={fmt_decimal(stats['split']['train']['p20'])} "
+                    f"holdout_p20={fmt_decimal(stats['split']['holdout']['p20'])}"
+                )
+            print(
+                f"asset={asset_name} direction={direction} liquidity_thresholds "
+                f"total_spread_p33={fmt_decimal(strata['spread_p33'])} "
+                f"total_spread_p67={fmt_decimal(strata['spread_p67'])}"
+            )
+            for bucket, stats in strata["liquidity"].items():
+                print(
+                    f"asset={asset_name} direction={direction} liquidity={bucket} n={stats['n']} "
+                    f"net_p20={fmt_decimal(stats['net_p20'])} net_p50={fmt_decimal(stats['net_p50'])}"
+                )
+            for block, stats in strata["utc_blocks"].items():
+                print(
+                    f"asset={asset_name} direction={direction} utc={block} n={stats['n']} "
+                    f"net_p20={fmt_decimal(stats['net_p20'])} net_p50={fmt_decimal(stats['net_p50'])}"
+                )
+            print(
+                f"asset={asset_name} direction={direction} verdict="
+                f"{verdict if formal_config else 'non_formal_diagnostic_only'} "
+                f"reasons={','.join(reasons) if reasons else '-'}"
+            )
 
 
 def print_basis_v3(
@@ -2327,6 +2650,10 @@ def main() -> int:
     parser.add_argument("--include-rotated", action="store_true", help="Include rotated order_metrics.jsonl.N and .gz files.")
     parser.add_argument("--all-runs", action="store_true", help="Analyze all tailed rows instead of only the latest run_id.")
     parser.add_argument(
+        "--data-cutoff-utc",
+        help="Optional inclusive ISO-8601 UTC cutoff for reproducible offline reports.",
+    )
+    parser.add_argument(
         "--execution-calibration",
         action="store_true",
         help="Summarize versioned real execution-calibration cycles by asset and direction.",
@@ -2347,6 +2674,11 @@ def main() -> int:
     parser.add_argument("--basis-v2", action="store_true", help="Replay directional executable edges with strict time-aligned multiscale context.")
     parser.add_argument("--basis-v3", action="store_true", help="Replay independent multiscale quantile convergence episodes using executable prices.")
     parser.add_argument("--basis-v4", action="store_true", help="Replay extreme entries with executable net-PnL exits; read-only offline analysis.")
+    parser.add_argument(
+        "--basis-v4-stratified",
+        action="store_true",
+        help="Print the pre-registered p97.5 V4 candidate split by weekday, UTC block, and relative spread.",
+    )
     parser.add_argument("--basis-v4-evaluation-interval-seconds", type=int, default=1, help="Evaluate V4 entries at most once per interval. Default: 1.")
     parser.add_argument("--basis-v3-evaluation-interval-seconds", type=int, default=60, help="Evaluate V3 entries at most once per interval. Default: 60.")
     parser.add_argument("--basis-v3-history-sample-seconds", type=int, default=30, help="Downsample prior quantile history to this interval. Default: 30.")
@@ -2411,6 +2743,9 @@ def main() -> int:
     if args.ladder_max_lots <= 0:
         parser.error("--ladder-max-lots must be > 0")
     try:
+        data_cutoff = parse_time(args.data_cutoff_utc) if args.data_cutoff_utc else None
+        if args.data_cutoff_utc and data_cutoff is None:
+            raise ValueError("--data-cutoff-utc must be an ISO-8601 timestamp")
         ladder_lot_notional = Decimal(str(args.ladder_lot_notional_usd))
         ladder_addon_step = Decimal(str(args.ladder_addon_step_bps))
         ladder_min_entry = Decimal(str(args.ladder_min_entry_edge_bps))
@@ -2449,7 +2784,7 @@ def main() -> int:
             label="--basis-v2-sweep-horizons",
         )
     except Exception as exc:
-        parser.error(f"invalid ladder decimal option: {exc}")
+        parser.error(f"invalid numeric or timestamp option: {exc}")
     if ladder_lot_notional <= 0 or ladder_addon_step <= 0:
         parser.error("ladder lot notional and addon step must be > 0")
     if semantics_primary_threshold <= 0 or semantics_min_abs_entry <= 0 or semantics_min_normalized_filter < 0:
@@ -2498,7 +2833,14 @@ def main() -> int:
     source_paths = rotated_jsonl_paths(ORDER_METRICS) if args.include_rotated else [ORDER_METRICS]
     legacy_rows = tail_jsonl_many(source_paths, args.tail) if args.include_rotated else tail_jsonl(ORDER_METRICS, args.tail)
     collector_rows = read_basis_samples(BASIS_SAMPLES_DIR, limit=args.tail, asset_filter=args.asset)
-    raw_rows = _deduplicate_sample_rows([*legacy_rows, *collector_rows])[-args.tail :]
+    merged_rows = _deduplicate_sample_rows([*legacy_rows, *collector_rows])
+    if data_cutoff is not None:
+        merged_rows = [
+            row
+            for row in merged_rows
+            if (logged_at := parse_time(row.get("logged_at"))) is None or logged_at <= data_cutoff
+        ]
+    raw_rows = merged_rows[-args.tail :]
     rows = raw_rows if args.all_runs else latest_run_filter(raw_rows)
     current_run_rows = latest_run_filter(raw_rows)
     state = read_json(LIVE_STATE)
@@ -2582,6 +2924,8 @@ def main() -> int:
     pending_actions = state.get("pending_actions") or []
 
     print("== live ==")
+    if data_cutoff is not None:
+        print(f"data_cutoff_utc={data_cutoff.isoformat()}")
     print(f"process={'YES' if processes else 'NO'}")
     for process in processes:
         print(f"process_detail={process}")
@@ -2711,6 +3055,23 @@ def main() -> int:
         )
     if args.basis_v4:
         print_basis_v4(
+            rows,
+            asset=args.asset,
+            evaluation_interval_seconds=args.basis_v4_evaluation_interval_seconds,
+            history_sample_seconds=args.basis_v3_history_sample_seconds,
+            episode_cooldown_seconds=args.basis_v3_episode_cooldown_seconds,
+            max_hold_seconds=args.basis_v3_max_hold_seconds,
+            max_sample_gap_seconds=args.basis_v3_max_sample_gap_seconds,
+            min_window_coverage=basis_v3_min_window_coverage,
+            min_history_samples=args.basis_v3_min_history_samples,
+            long_shortfall_reserve_bps=basis_v3_long_shortfall_reserve,
+            short_shortfall_reserve_bps=basis_v3_short_shortfall_reserve,
+            net_exit_target_bps=basis_v4_net_exit_target,
+            holdout_fraction=basis_v3_holdout_fraction,
+            min_independent_samples=args.basis_v3_min_independent_samples,
+        )
+    if args.basis_v4_stratified:
+        print_basis_v4_stratified(
             rows,
             asset=args.asset,
             evaluation_interval_seconds=args.basis_v4_evaluation_interval_seconds,
