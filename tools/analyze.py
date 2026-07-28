@@ -67,6 +67,124 @@ def latest_run_filter(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if str(row.get("run_id") or "") == latest_run_id]
 
 
+def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    v4_rows = [
+        row
+        for row in rows
+        if row.get("strategy_version") == "basis-v4-live-v1"
+        or row.get("basis_v4_profile")
+        or str(row.get("profile") or "").startswith("eth_short_execution_calibrated_")
+    ]
+    if not v4_rows:
+        return None
+
+    state_rows = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_basis_state"
+    ]
+    threshold_crossings = 0
+    for row in state_rows:
+        edge = to_decimal(row.get("short_edge_bps"))
+        threshold = to_decimal(row.get("v4_entry_threshold_bps"))
+        if edge is not None and threshold is not None and edge > threshold:
+            threshold_crossings += 1
+
+    events = Counter(str(row.get("event") or "-") for row in v4_rows)
+    reasons = Counter(
+        str(row.get("reason") or "unknown")
+        for row in v4_rows
+        if row.get("event") == "live_inventory_entry_blocked"
+    )
+    shadows = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_entry_shadow_candidate"
+    ]
+    preflight_passed = sum(row.get("shadow_status") == "passed" for row in shadows)
+    preflight_blocked = sum(row.get("shadow_status") == "blocked" for row in shadows)
+    dynamic_floor_blocks = reasons["edge_bps_below_dynamic_live_inventory_entry"]
+
+    if dynamic_floor_blocks:
+        status = "ERROR_V4_IMMEDIATE_ARB_FLOOR_APPLIED"
+    elif events["live_inventory_manual_review_required"]:
+        status = "ERROR_MANUAL_REVIEW_REQUIRED"
+    elif events["live_inventory_actual_pnl"]:
+        status = "CYCLE_COMPLETE"
+    elif events["live_inventory_entered"]:
+        status = "POSITION_OPEN"
+    elif events["live_inventory_var_entry_submitted"]:
+        status = "CANDIDATE_SUBMITTED"
+    elif preflight_passed:
+        status = "REVIEW_PREFLIGHT_PASSED_WITHOUT_SUBMIT"
+    elif threshold_crossings:
+        status = "CANDIDATES_FILTERED_BY_EXPECTED_GUARDS"
+    else:
+        status = "WAITING_FOR_THRESHOLD_CROSSING"
+
+    latest_state = state_rows[-1] if state_rows else {}
+    return {
+        "profile": (
+            latest_state.get("basis_v4_profile")
+            or next(
+                (
+                    row.get("profile")
+                    for row in reversed(v4_rows)
+                    if row.get("profile")
+                ),
+                "-",
+            )
+        ),
+        "samples": len(state_rows),
+        "threshold_crossings": threshold_crossings,
+        "large_move_blocks": reasons["basis_sample_move_too_large"],
+        "refreshed_edge_blocks": reasons["basis_entry_refreshed_edge_below_threshold"],
+        "preflight_reached": len(shadows),
+        "preflight_passed": preflight_passed,
+        "preflight_blocked": preflight_blocked,
+        "dynamic_floor_blocks": dynamic_floor_blocks,
+        "submits": events["live_inventory_var_entry_submitted"],
+        "entered": events["live_inventory_entered"],
+        "exited": events["live_inventory_exited"],
+        "actual_pnl": events["live_inventory_actual_pnl"],
+        "latest_edge_bps": latest_state.get("short_edge_bps"),
+        "latest_threshold_bps": latest_state.get("v4_entry_threshold_bps"),
+        "latest_window_seconds": latest_state.get("v4_baseline_window_seconds"),
+        "latest_window_max_gap_seconds": latest_state.get(
+            "v4_baseline_max_sample_gap_seconds"
+        ),
+        "status": status,
+    }
+
+
+def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
+    funnel = build_v4_live_funnel(rows)
+    if funnel is None:
+        return
+    print("== v4_live_funnel ==")
+    print(
+        f"profile={funnel['profile']} samples={funnel['samples']} "
+        f"threshold_crossings={funnel['threshold_crossings']} "
+        f"large_move_blocks={funnel['large_move_blocks']} "
+        f"refreshed_edge_blocks={funnel['refreshed_edge_blocks']}"
+    )
+    print(
+        f"preflight_reached={funnel['preflight_reached']} "
+        f"preflight_passed={funnel['preflight_passed']} "
+        f"preflight_blocked={funnel['preflight_blocked']} "
+        f"dynamic_floor_blocks={funnel['dynamic_floor_blocks']} "
+        f"submits={funnel['submits']} entered={funnel['entered']} "
+        f"exited={funnel['exited']} actual_pnl={funnel['actual_pnl']}"
+    )
+    print(
+        f"latest_edge_bps={funnel['latest_edge_bps']} "
+        f"latest_threshold_bps={funnel['latest_threshold_bps']} "
+        f"latest_window_seconds={funnel['latest_window_seconds']} "
+        f"latest_window_max_gap_seconds={funnel['latest_window_max_gap_seconds']} "
+        f"status={funnel['status']}"
+    )
+
+
 def print_execution_calibration(rows: list[dict[str, Any]]) -> None:
     final_rows = [
         row
@@ -3033,6 +3151,7 @@ def main() -> int:
     )
     for index, (score, asset, direction, reason) in enumerate(sorted(blocked_scores, reverse=True)[: args.top], start=1):
         print(f"blocked_observation_{index}=asset={asset} dir={direction} score={fmt_decimal(score)} reason={reason}")
+    print_v4_live_funnel(rows)
     if args.what_if:
         print_what_if(rows)
     if args.basis_regime:

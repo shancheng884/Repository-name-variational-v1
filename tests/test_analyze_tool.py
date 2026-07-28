@@ -10,6 +10,7 @@ from tools.analyze import (
     basis_state_rows,
     bounded_diagnostic_line,
     build_basis_v4_stratification,
+    build_v4_live_funnel,
     build_basis_v3_replay,
     build_basis_v4_replay,
     build_basis_regimes,
@@ -19,6 +20,46 @@ from tools.analyze import (
     summarize_basis_v2_sweep_events,
     print_execution_calibration,
 )
+
+
+def test_v4_live_funnel_flags_incompatible_immediate_arb_floor() -> None:
+    common = {
+        "run_id": "live-v4-test",
+        "strategy_version": "basis-v4-live-v1",
+        "asset": "ETH",
+    }
+    rows = [
+        {
+            **common,
+            "event": "live_inventory_basis_state",
+            "basis_v4_profile": "eth_short_execution_calibrated_20260724_n10",
+            "short_edge_bps": "-5",
+            "v4_entry_threshold_bps": "-6",
+            "v4_baseline_window_seconds": 21600,
+            "v4_baseline_max_sample_gap_seconds": "30.000",
+        },
+        {
+            **common,
+            "event": "live_inventory_entry_shadow_candidate",
+            "shadow_status": "blocked",
+            "shadow_block_reason": "edge_bps_below_dynamic_live_inventory_entry",
+        },
+        {
+            **common,
+            "event": "live_inventory_entry_blocked",
+            "reason": "edge_bps_below_dynamic_live_inventory_entry",
+        },
+    ]
+
+    funnel = build_v4_live_funnel(rows)
+
+    assert funnel is not None
+    assert funnel["threshold_crossings"] == 1
+    assert funnel["preflight_reached"] == 1
+    assert funnel["preflight_blocked"] == 1
+    assert funnel["dynamic_floor_blocks"] == 1
+    assert funnel["latest_window_max_gap_seconds"] == "30.000"
+    assert funnel["status"] == "ERROR_V4_IMMEDIATE_ARB_FLOOR_APPLIED"
 
 
 def test_basis_v4_formal_profile_accepts_only_versioned_calibrated_eth_short_config() -> None:
