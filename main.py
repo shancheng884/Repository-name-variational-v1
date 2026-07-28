@@ -11108,6 +11108,16 @@ class VariationalToLighterRuntime:
             raise RuntimeError("Startup diagnostics failed")
         await self.append_live_inventory_run_config()
         await self.runtime.start()
+        v4_history_task: asyncio.Task[dict[str, Any]] | None = None
+        if self.live_inventory_basis_v4_mode:
+            # Read the on-disk baseline while exchange clients initialize. The
+            # first live sample still enforces the strict 60-second gap guard.
+            v4_history_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.load_live_inventory_basis_v4_history,
+                    asset=next(iter(self.live_allowed_assets)),
+                )
+            )
         self.print_startup_next_steps()
         self.logger.info(
             "Listening for Variational forwarder events on ws://%s:%s, ws://%s:%s, command ws://%s:%s",
@@ -11164,10 +11174,9 @@ class VariationalToLighterRuntime:
                 self.logger.exception("variational_api_command_client_preflight_failed asset=%s", initial_asset)
                 raise
         if self.live_inventory_basis_v4_mode:
-            v4_history_context = await asyncio.to_thread(
-                self.load_live_inventory_basis_v4_history,
-                asset=initial_asset,
-            )
+            if v4_history_task is None:
+                raise RuntimeError("V4 history task was not initialized")
+            v4_history_context = await v4_history_task
             self.logger.info(
                 "live_inventory_basis_v4_history_loaded %s",
                 json.dumps(v4_history_context, ensure_ascii=True, sort_keys=True),
