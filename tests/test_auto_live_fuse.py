@@ -442,6 +442,26 @@ def test_v4_entry_threshold_uses_strictly_prior_multiscale_history() -> None:
     assert Decimal("97") <= threshold < Decimal("99")
 
 
+def test_v4_entry_threshold_rejects_longer_window_with_internal_gap() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    now = 1_000_000.0
+    recent_rows = [
+        (now - 21_570 + index * 30, Decimal(index))
+        for index in range(720)
+    ]
+    runtime.live_inventory_basis_v4_history = deque(
+        [(now - 604_790, Decimal("9999")), *recent_rows]
+    )
+
+    threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
+
+    assert threshold is not None
+    assert context["v4_mature_windows"] == [3600, 21600]
+    assert context["v4_baseline_window_seconds"] == 21600
+    assert context["v4_baseline_max_sample_gap_seconds"] == "30.000"
+    assert threshold < Decimal("9999")
+
+
 def test_v4_history_gap_clears_prior_regime_before_recording() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_basis_v4_history = deque(

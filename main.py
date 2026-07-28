@@ -2369,22 +2369,46 @@ class VariationalToLighterRuntime:
         now: float,
     ) -> tuple[Decimal | None, dict[str, Any]]:
         mature_windows: list[int] = []
-        contexts: dict[int, tuple[int, float]] = {}
+        contexts: dict[int, tuple[int, float, float]] = {}
         for window_seconds in LIVE_INVENTORY_BASIS_V4_WINDOWS_SECONDS:
             cutoff = now - window_seconds
             rows = [row for row in self.live_inventory_basis_v4_history if row[0] > cutoff]
             coverage_seconds = max(0.0, now - rows[0][0]) if rows else 0.0
-            contexts[window_seconds] = (len(rows), coverage_seconds)
+            max_sample_gap_seconds = max(
+                (
+                    current[0] - previous[0]
+                    for previous, current in zip(rows, rows[1:])
+                ),
+                default=0.0,
+            )
+            contexts[window_seconds] = (
+                len(rows),
+                coverage_seconds,
+                max_sample_gap_seconds,
+            )
             if (
                 len(rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
                 and Decimal(str(coverage_seconds))
                 >= Decimal(window_seconds) * LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
+                and max_sample_gap_seconds
+                <= LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
             ):
                 mature_windows.append(window_seconds)
         if not mature_windows:
+            full_history_max_gap_seconds = max(
+                (
+                    current[0] - previous[0]
+                    for previous, current in zip(
+                        self.live_inventory_basis_v4_history,
+                        list(self.live_inventory_basis_v4_history)[1:],
+                    )
+                ),
+                default=0.0,
+            )
             return None, {
                 "v4_history_samples": len(self.live_inventory_basis_v4_history),
                 "v4_mature_windows": [],
+                "v4_history_max_sample_gap_seconds": f"{full_history_max_gap_seconds:.3f}",
             }
         baseline_window_seconds = max(mature_windows)
         cutoff = now - baseline_window_seconds
@@ -2394,13 +2418,16 @@ class VariationalToLighterRuntime:
             if timestamp > cutoff
         ]
         threshold = self.live_inventory_basis_v4_percentile(values)
-        count, coverage_seconds = contexts[baseline_window_seconds]
+        count, coverage_seconds, max_sample_gap_seconds = contexts[
+            baseline_window_seconds
+        ]
         return threshold, {
             "v4_history_samples": len(self.live_inventory_basis_v4_history),
             "v4_mature_windows": mature_windows,
             "v4_baseline_window_seconds": baseline_window_seconds,
             "v4_baseline_count": count,
             "v4_baseline_coverage_seconds": f"{coverage_seconds:.3f}",
+            "v4_baseline_max_sample_gap_seconds": f"{max_sample_gap_seconds:.3f}",
             "v4_entry_percentile": decimal_to_str(
                 LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE
             ),
