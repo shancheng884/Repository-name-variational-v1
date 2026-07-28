@@ -3334,6 +3334,7 @@ class VariationalToLighterRuntime:
         var_snapshot_timestamp: str | None = None,
         min_entry_bps: Decimal | None = None,
         dynamic_entry_buffer_bps: Decimal | None = None,
+        apply_dynamic_entry_floor: bool = True,
         enforce_entry_edge: bool = True,
     ) -> tuple[bool, str, dict[str, Any]]:
         var_snapshot_age_seconds = self._age_seconds_from_iso(var_snapshot_timestamp)
@@ -3369,6 +3370,7 @@ class VariationalToLighterRuntime:
                 self.live_inventory_recent_execution_loss_buffer_bps()
             ),
             "live_inventory_required_entry_bps": None,
+            "live_inventory_dynamic_entry_floor_applied": apply_dynamic_entry_floor,
             "lighter_side": None,
             "lighter_estimated_fill_price": None,
             "lighter_order_book_slippage_bps": None,
@@ -3431,7 +3433,7 @@ class VariationalToLighterRuntime:
         context["live_inventory_ignored_recent_execution_loss_buffer_for_diagnostics"] = (
             self.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics
         )
-        if dynamic_required_entry_bps > required_entry_bps:
+        if apply_dynamic_entry_floor and dynamic_required_entry_bps > required_entry_bps:
             required_entry_bps = dynamic_required_entry_bps
         context["live_inventory_required_entry_bps"] = decimal_to_str(required_entry_bps)
         context["live_inventory_required_entry_margin_bps"] = decimal_to_str(
@@ -8369,6 +8371,7 @@ class VariationalToLighterRuntime:
                         var_snapshot_timestamp=quote.get("quoteTimestamp") or quote.get("quote_timestamp"),
                         min_entry_bps=min_entry_edge_bps,
                         dynamic_entry_buffer_bps=self.live_inventory_dynamic_entry_quality_buffer_bps(var_quote_age_seconds=var_quote_age_seconds),
+                        apply_dynamic_entry_floor=not v4_mode,
                         enforce_entry_edge=not calibration_mode,
                     )
                     await self.append_live_inventory_entry_shadow_candidate(

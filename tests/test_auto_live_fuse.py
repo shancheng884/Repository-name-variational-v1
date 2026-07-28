@@ -2662,6 +2662,57 @@ def test_live_inventory_entry_blocks_dynamic_threshold_before_submit(tmp_path) -
     asyncio.run(run())
 
 
+def test_v4_entry_preflight_keeps_percentile_floor_without_immediate_arb_floor(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_dynamic_entry_buffer_bps = Decimal("5")
+        runtime.lighter_order_book = {
+            "bids": {Decimal("1755.00"): Decimal("1")},
+            "asks": {Decimal("1755.10"): Decimal("1")},
+        }
+        runtime.lighter_best_bid = Decimal("1755.00")
+        runtime.lighter_best_ask = Decimal("1755.10")
+
+        kwargs = {
+            "asset": "ETH",
+            "direction": "short_var_long_lighter",
+            "var_side": "SELL",
+            "qty": Decimal("0.01"),
+            "var_price": Decimal("1753"),
+            "lighter_price": Decimal("1755.10"),
+            "edge_bps": Decimal("-2"),
+            "var_spread_bps": Decimal("2"),
+            "var_snapshot_timestamp": "2999-06-16T03:25:20.000Z",
+            "min_entry_bps": Decimal("-6"),
+            "dynamic_entry_buffer_bps": Decimal("5"),
+        }
+
+        standard_ok, standard_reason, standard_context = (
+            await runtime.live_inventory_entry_preflight(**kwargs)
+        )
+        v4_ok, v4_reason, v4_context = (
+            await runtime.live_inventory_entry_preflight(
+                **kwargs,
+                apply_dynamic_entry_floor=False,
+            )
+        )
+
+        assert standard_ok is False
+        assert standard_reason == "edge_bps_below_dynamic_live_inventory_entry"
+        assert Decimal(standard_context["live_inventory_required_entry_bps"]) > 0
+        assert standard_context["live_inventory_dynamic_entry_floor_applied"] is True
+        assert v4_ok is True
+        assert v4_reason == "ok"
+        assert v4_context["live_inventory_required_entry_bps"] == "-6"
+        assert v4_context["live_inventory_required_entry_margin_bps"] == "4"
+        assert v4_context["live_inventory_dynamic_entry_floor_applied"] is False
+
+    asyncio.run(run())
+
+
 def test_live_inventory_entry_uses_recent_execution_loss_buffer_before_submit(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
