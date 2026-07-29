@@ -37,6 +37,10 @@ def test_v4_live_funnel_flags_incompatible_immediate_arb_floor() -> None:
             "v4_entry_threshold_bps": "-6",
             "v4_baseline_window_seconds": 21600,
             "v4_baseline_max_sample_gap_seconds": "30.000",
+            "v4_anchor_ready": True,
+            "v4_health_ready": True,
+            "v4_health_coverage_seconds": "3000.000",
+            "v4_health_max_sample_gap_seconds": "30.000",
         },
         {
             **common,
@@ -59,7 +63,42 @@ def test_v4_live_funnel_flags_incompatible_immediate_arb_floor() -> None:
     assert funnel["preflight_blocked"] == 1
     assert funnel["dynamic_floor_blocks"] == 1
     assert funnel["latest_window_max_gap_seconds"] == "30.000"
+    assert funnel["anchor_ready"] is True
+    assert funnel["health_ready"] is True
     assert funnel["status"] == "ERROR_V4_IMMEDIATE_ARB_FLOOR_APPLIED"
+
+
+def test_v4_live_funnel_distinguishes_anchor_and_recent_health_waits() -> None:
+    common = {
+        "run_id": "live-v4-wait-test",
+        "strategy_version": "basis-v4-live-v1",
+        "event": "live_inventory_basis_state",
+        "asset": "ETH",
+        "basis_v4_profile": "eth_short_execution_calibrated_20260724_n10",
+    }
+    anchor_wait = build_v4_live_funnel(
+        [
+            {
+                **common,
+                "v4_anchor_ready": False,
+                "v4_health_ready": True,
+            }
+        ]
+    )
+    health_wait = build_v4_live_funnel(
+        [
+            {
+                **common,
+                "v4_anchor_ready": True,
+                "v4_health_ready": False,
+            }
+        ]
+    )
+
+    assert anchor_wait is not None
+    assert anchor_wait["status"] == "WAITING_FOR_ROLLING_7D_ANCHOR"
+    assert health_wait is not None
+    assert health_wait["status"] == "WAITING_FOR_RECENT_HEALTH_WINDOW"
 
 
 def test_basis_v4_formal_profile_accepts_only_versioned_calibrated_eth_short_config() -> None:

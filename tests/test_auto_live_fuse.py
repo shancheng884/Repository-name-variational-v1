@@ -445,43 +445,93 @@ def test_reversion_execution_reserve_is_directional() -> None:
     ) == Decimal("3.5")
 
 
-def test_v4_entry_threshold_uses_strictly_prior_multiscale_history() -> None:
+def _v4_rolling_anchor_rows(
+    now: float,
+    recent_rows: list[tuple[float, Decimal]],
+) -> deque[tuple[float, Decimal]]:
+    older_count = 5760 - len(recent_rows)
+    older_rows = [
+        (
+            now - 604_700 + index * 30,
+            Decimal(index % 100),
+        )
+        for index in range(older_count)
+    ]
+    return deque([*older_rows, *recent_rows])
+
+
+def test_v4_entry_threshold_uses_rolling_7d_anchor_with_recent_health() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
-    now = 10_000.0
-    runtime.live_inventory_basis_v4_history = deque(
+    now = 1_000_000.0
+    recent_rows = [
         (now - 3000 + index * 30, Decimal(index))
         for index in range(100)
+    ]
+    runtime.live_inventory_basis_v4_history = _v4_rolling_anchor_rows(
+        now,
+        recent_rows,
     )
 
     threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
 
     assert threshold == Decimal("97")
-    assert context["v4_baseline_window_seconds"] == 3600
-    assert context["v4_baseline_count"] == 100
+    assert context["v4_anchor_ready"] is True
+    assert context["v4_health_ready"] is True
+    assert context["v4_baseline_window_seconds"] == 604800
+    assert context["v4_baseline_count"] == 5760
+    assert context["v4_anchor_effective_seconds"] == 172800
     assert Decimal("97") <= threshold < Decimal("99")
 
 
-def test_v4_entry_threshold_rejects_longer_window_with_internal_gap() -> None:
+def test_v4_entry_threshold_keeps_7d_anchor_across_historical_gap() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     now = 1_000_000.0
     recent_rows = [
         (now - 21_570 + index * 30, Decimal(index))
         for index in range(720)
     ]
-    runtime.live_inventory_basis_v4_history = deque(
-        [(now - 604_790, Decimal("9999")), *recent_rows]
+    runtime.live_inventory_basis_v4_history = _v4_rolling_anchor_rows(
+        now,
+        recent_rows,
     )
 
     threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
 
     assert threshold is not None
-    assert context["v4_mature_windows"] == [3600, 21600]
-    assert context["v4_baseline_window_seconds"] == 21600
-    assert context["v4_baseline_max_sample_gap_seconds"] == "30.000"
+    assert context["v4_mature_windows"] == [604800]
+    assert context["v4_anchor_ready"] is True
+    assert context["v4_health_ready"] is True
+    assert context["v4_baseline_window_seconds"] == 604800
+    assert Decimal(context["v4_anchor_max_sample_gap_seconds"]) > Decimal("60")
+    assert context["v4_health_max_sample_gap_seconds"] == "30.000"
     assert threshold < Decimal("9999")
 
 
-def test_v4_history_gap_clears_prior_regime_before_recording() -> None:
+def test_v4_entry_threshold_rejects_recent_health_gap_without_dropping_anchor() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    now = 1_000_000.0
+    health_rows = [
+        (now - 3000 + index * 30, Decimal(index))
+        for index in range(50)
+    ] + [
+        (now - 1400 + index * 30, Decimal(index + 50))
+        for index in range(50)
+    ]
+    runtime.live_inventory_basis_v4_history = _v4_rolling_anchor_rows(
+        now,
+        health_rows,
+    )
+
+    threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
+
+    assert threshold is None
+    assert context["v4_anchor_ready"] is True
+    assert context["v4_health_ready"] is False
+    assert Decimal(context["v4_health_max_sample_gap_seconds"]) > Decimal("60")
+    assert len(runtime.live_inventory_basis_v4_history) == 5760
+
+
+def test_v4_history_gap_preserves_rolling_anchor_before_recording() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_basis_v4_history = deque(
         [(100.0, Decimal("4.2"))]
@@ -490,19 +540,21 @@ def test_v4_history_gap_clears_prior_regime_before_recording() -> None:
     runtime.live_inventory_basis_v4_history_ready = True
     runtime.live_inventory_basis_v4_history_reason = "ready"
 
-    runtime.record_live_inventory_basis_v4_edge(
+    recorded = runtime.record_live_inventory_basis_v4_edge(
         now=200.0,
         short_edge_bps=Decimal("5.1"),
     )
 
     assert list(runtime.live_inventory_basis_v4_history) == [
+        (100.0, Decimal("4.2")),
         (200.0, Decimal("5.1"))
     ]
-    assert runtime.live_inventory_basis_v4_history_ready is False
-    assert runtime.live_inventory_basis_v4_history_reason == "history_sample_gap_rebuild_required"
+    assert recorded is True
+    assert runtime.live_inventory_basis_v4_history_ready is True
+    assert runtime.live_inventory_basis_v4_history_reason == "ready"
 
 
-def test_v4_history_loader_requires_fresh_valid_baseline_rows(tmp_path) -> None:
+def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.output_dir = Path(tmp_path)
     runtime.live_inventory_basis_v4_profile = (
@@ -515,20 +567,25 @@ def test_v4_history_loader_requires_fresh_valid_baseline_rows(tmp_path) -> None:
     asset_dir = Path(tmp_path) / "basis_samples" / "ETH"
     asset_dir.mkdir(parents=True)
     now = datetime.now(timezone.utc).timestamp()
-    rows = []
-    for index in range(101):
-        timestamp = now - 3001 + index * 30
-        rows.append(
-            {
-                "asset": "ETH",
-                "logged_at": datetime.fromtimestamp(
-                    timestamp, tz=timezone.utc
-                ).isoformat(),
-                "sample_kind": "baseline",
-                "sample_quality": "valid",
-                "short_edge_bps": str(index),
-            }
-        )
+    sample_rows = _v4_rolling_anchor_rows(
+        now,
+        [
+            (now - 3001 + index * 30, Decimal(index))
+            for index in range(101)
+        ],
+    )
+    rows = [
+        {
+            "asset": "ETH",
+            "logged_at": datetime.fromtimestamp(
+                timestamp, tz=timezone.utc
+            ).isoformat(),
+            "sample_kind": "baseline",
+            "sample_quality": "valid",
+            "short_edge_bps": str(edge_bps),
+        }
+        for timestamp, edge_bps in sample_rows
+    ]
     (asset_dir / "2026-07-24.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows),
         encoding="utf-8",
@@ -538,8 +595,51 @@ def test_v4_history_loader_requires_fresh_valid_baseline_rows(tmp_path) -> None:
 
     assert context["ready"] is True
     assert context["reason"] == "ready"
-    assert context["v4_baseline_window_seconds"] == 3600
-    assert context["v4_entry_threshold_bps"] == "98"
+    assert context["v4_anchor_ready"] is True
+    assert context["v4_health_ready"] is True
+    assert context["v4_baseline_window_seconds"] == 604800
+    assert context["v4_anchor_effective_seconds"] == 172800
+    assert context["v4_entry_threshold_bps"] == "97"
+
+
+def test_v4_history_loader_does_not_authorize_recent_1h_without_7d_anchor(
+    tmp_path,
+) -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.output_dir = Path(tmp_path)
+    runtime.live_inventory_basis_v4_profile = (
+        "eth_short_execution_calibrated_20260724_n10"
+    )
+    runtime.live_inventory_basis_v4_history = deque()
+    runtime.live_inventory_basis_v4_next_history_sample_at = 0.0
+    runtime.live_inventory_basis_v4_history_ready = False
+    runtime.live_inventory_basis_v4_history_reason = "not_loaded"
+    asset_dir = Path(tmp_path) / "basis_samples" / "ETH"
+    asset_dir.mkdir(parents=True)
+    now = datetime.now(timezone.utc).timestamp()
+    rows = [
+        {
+            "asset": "ETH",
+            "logged_at": datetime.fromtimestamp(
+                now - 3001 + index * 30, tz=timezone.utc
+            ).isoformat(),
+            "sample_kind": "baseline",
+            "sample_quality": "valid",
+            "short_edge_bps": str(index),
+        }
+        for index in range(101)
+    ]
+    (asset_dir / "2026-07-24.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    context = runtime.load_live_inventory_basis_v4_history(asset="ETH")
+
+    assert context["ready"] is False
+    assert context["v4_anchor_ready"] is False
+    assert context["v4_health_ready"] is True
+    assert "v4_entry_threshold_bps" not in context
 
 
 def test_non_filled_event_does_not_consume_pending_match_or_double_hedge(tmp_path) -> None:

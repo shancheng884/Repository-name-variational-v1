@@ -49,7 +49,7 @@ from paper_engine import (
     paper_var_spread_cost_usd,
 )
 from inventory_engine import DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER, PaperInventoryEngine
-from tools.lib.basis_store import read_basis_samples
+from tools.lib.basis_store import BasisSampleStore, read_basis_samples
 
 MODE_OBSERVE = "observe"
 MODE_DRY_RUN = "dry-run"
@@ -84,11 +84,13 @@ LIVE_INVENTORY_BASIS_V4_PROFILE_ETH_SHORT_20260724 = "eth_short_execution_calibr
 LIVE_INVENTORY_BASIS_V4_PROFILE_CHOICES = (
     LIVE_INVENTORY_BASIS_V4_PROFILE_ETH_SHORT_20260724,
 )
-LIVE_INVENTORY_BASIS_V4_WINDOWS_SECONDS = (3600, 21600, 86400, 604800)
+LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS = 604800
+LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS = 3600
 LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE = Decimal("97.5")
 LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS = 30
 LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE = Decimal("0.80")
 LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES = 100
+LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS = 172800
 LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS = Decimal("0.50")
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
@@ -1146,6 +1148,15 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_next_history_sample_at = 0.0
         self.live_inventory_basis_v4_history_ready = False
         self.live_inventory_basis_v4_history_reason = "not_loaded"
+        self.live_inventory_basis_v4_store = (
+            BasisSampleStore(
+                self.output_dir / "basis_samples",
+                config_hash=self.live_inventory_config_hash,
+                commit="live-runtime",
+            )
+            if self.live_inventory_basis_v4_mode
+            else None
+        )
         self._order_write_lock = asyncio.Lock()
         self._opportunity_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
@@ -2344,9 +2355,9 @@ class VariationalToLighterRuntime:
     def load_live_inventory_basis_v4_history(self, *, asset: str) -> dict[str, Any]:
         self.live_inventory_basis_v4_history.clear()
         self.live_inventory_basis_v4_history_ready = False
-        self.live_inventory_basis_v4_history_reason = "insufficient_multiscale_history"
+        self.live_inventory_basis_v4_history_reason = "insufficient_rolling_7d_anchor"
         now = datetime.now(timezone.utc).timestamp()
-        cutoff = now - max(LIVE_INVENTORY_BASIS_V4_WINDOWS_SECONDS)
+        cutoff = now - LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS
         next_sample_at = cutoff
         source_rows = read_basis_samples(
             self.output_dir / "basis_samples",
@@ -2377,9 +2388,12 @@ class VariationalToLighterRuntime:
         ):
             threshold, context = self.live_inventory_basis_v4_entry_threshold(now=now)
             self.live_inventory_basis_v4_history_ready = threshold is not None
-            self.live_inventory_basis_v4_history_reason = (
-                "ready" if threshold is not None else "insufficient_multiscale_history"
-            )
+            if threshold is not None:
+                self.live_inventory_basis_v4_history_reason = "ready"
+            elif not context.get("v4_anchor_ready"):
+                self.live_inventory_basis_v4_history_reason = "insufficient_rolling_7d_anchor"
+            else:
+                self.live_inventory_basis_v4_history_reason = "recent_1h_health_not_ready"
         else:
             context = {}
             self.live_inventory_basis_v4_history_reason = "history_latest_sample_stale"
@@ -2404,66 +2418,85 @@ class VariationalToLighterRuntime:
         *,
         now: float,
     ) -> tuple[Decimal | None, dict[str, Any]]:
-        mature_windows: list[int] = []
-        contexts: dict[int, tuple[int, float, float]] = {}
-        for window_seconds in LIVE_INVENTORY_BASIS_V4_WINDOWS_SECONDS:
-            cutoff = now - window_seconds
-            rows = [row for row in self.live_inventory_basis_v4_history if row[0] > cutoff]
-            coverage_seconds = max(0.0, now - rows[0][0]) if rows else 0.0
-            max_sample_gap_seconds = max(
-                (
-                    current[0] - previous[0]
-                    for previous, current in zip(rows, rows[1:])
-                ),
-                default=0.0,
-            )
-            contexts[window_seconds] = (
-                len(rows),
-                coverage_seconds,
-                max_sample_gap_seconds,
-            )
-            if (
-                len(rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
-                and Decimal(str(coverage_seconds))
-                >= Decimal(window_seconds) * LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
-                and max_sample_gap_seconds
-                <= LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
-            ):
-                mature_windows.append(window_seconds)
-        if not mature_windows:
-            full_history_max_gap_seconds = max(
-                (
-                    current[0] - previous[0]
-                    for previous, current in zip(
-                        self.live_inventory_basis_v4_history,
-                        list(self.live_inventory_basis_v4_history)[1:],
-                    )
-                ),
-                default=0.0,
-            )
-            return None, {
-                "v4_history_samples": len(self.live_inventory_basis_v4_history),
-                "v4_mature_windows": [],
-                "v4_history_max_sample_gap_seconds": f"{full_history_max_gap_seconds:.3f}",
-            }
-        baseline_window_seconds = max(mature_windows)
-        cutoff = now - baseline_window_seconds
-        values = [
-            edge_bps
-            for timestamp, edge_bps in self.live_inventory_basis_v4_history
-            if timestamp > cutoff
+        anchor_cutoff = now - LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS
+        anchor_rows = [
+            row for row in self.live_inventory_basis_v4_history if row[0] > anchor_cutoff
         ]
-        threshold = self.live_inventory_basis_v4_percentile(values)
-        count, coverage_seconds, max_sample_gap_seconds = contexts[
-            baseline_window_seconds
-        ]
-        return threshold, {
+        anchor_coverage_seconds = (
+            max(0.0, now - anchor_rows[0][0]) if anchor_rows else 0.0
+        )
+        anchor_max_gap_seconds = max(
+            (
+                current[0] - previous[0]
+                for previous, current in zip(anchor_rows, anchor_rows[1:])
+            ),
+            default=0.0,
+        )
+        anchor_effective_seconds = min(
+            len(anchor_rows) * LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
+            LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS,
+        )
+        anchor_ready = (
+            len(anchor_rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
+            and Decimal(str(anchor_coverage_seconds))
+            >= Decimal(LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS)
+            * LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
+            and anchor_effective_seconds
+            >= LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS
+        )
+
+        health_cutoff = now - LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS
+        health_rows = [row for row in anchor_rows if row[0] > health_cutoff]
+        health_coverage_seconds = (
+            max(0.0, now - health_rows[0][0]) if health_rows else 0.0
+        )
+        health_max_gap_seconds = max(
+            (
+                current[0] - previous[0]
+                for previous, current in zip(health_rows, health_rows[1:])
+            ),
+            default=0.0,
+        )
+        health_ready = (
+            len(health_rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
+            and Decimal(str(health_coverage_seconds))
+            >= Decimal(LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS)
+            * LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
+            and health_max_gap_seconds
+            <= LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
+        )
+        context = {
             "v4_history_samples": len(self.live_inventory_basis_v4_history),
-            "v4_mature_windows": mature_windows,
-            "v4_baseline_window_seconds": baseline_window_seconds,
-            "v4_baseline_count": count,
-            "v4_baseline_coverage_seconds": f"{coverage_seconds:.3f}",
-            "v4_baseline_max_sample_gap_seconds": f"{max_sample_gap_seconds:.3f}",
+            "v4_anchor_window_seconds": LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS,
+            "v4_anchor_count": len(anchor_rows),
+            "v4_anchor_coverage_seconds": f"{anchor_coverage_seconds:.3f}",
+            "v4_anchor_effective_seconds": anchor_effective_seconds,
+            "v4_anchor_min_effective_seconds": LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS,
+            "v4_anchor_max_sample_gap_seconds": f"{anchor_max_gap_seconds:.3f}",
+            "v4_anchor_ready": anchor_ready,
+            "v4_health_window_seconds": LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS,
+            "v4_health_count": len(health_rows),
+            "v4_health_coverage_seconds": f"{health_coverage_seconds:.3f}",
+            "v4_health_max_sample_gap_seconds": f"{health_max_gap_seconds:.3f}",
+            "v4_health_ready": health_ready,
+            # Compatibility fields used by the existing analyzer.
+            "v4_mature_windows": (
+                [LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS]
+                if anchor_ready and health_ready
+                else []
+            ),
+            "v4_baseline_window_seconds": LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS,
+            "v4_baseline_count": len(anchor_rows),
+            "v4_baseline_coverage_seconds": f"{anchor_coverage_seconds:.3f}",
+            "v4_baseline_max_sample_gap_seconds": f"{anchor_max_gap_seconds:.3f}",
+        }
+        if not anchor_ready or not health_ready:
+            return None, context
+
+        values = [edge_bps for _, edge_bps in anchor_rows]
+        threshold = self.live_inventory_basis_v4_percentile(values)
+        return threshold, {
+            **context,
             "v4_entry_percentile": decimal_to_str(
                 LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE
             ),
@@ -2475,27 +2508,20 @@ class VariationalToLighterRuntime:
         *,
         now: float,
         short_edge_bps: Decimal,
-    ) -> None:
+    ) -> bool:
         if now < self.live_inventory_basis_v4_next_history_sample_at:
-            return
-        if (
-            self.live_inventory_basis_v4_history
-            and now - self.live_inventory_basis_v4_history[-1][0]
-            > LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
-        ):
-            self.live_inventory_basis_v4_history.clear()
-            self.live_inventory_basis_v4_history_ready = False
-            self.live_inventory_basis_v4_history_reason = "history_sample_gap_rebuild_required"
+            return False
         self.live_inventory_basis_v4_history.append((now, short_edge_bps))
         self.live_inventory_basis_v4_next_history_sample_at = (
             now + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
         )
-        cutoff = now - max(LIVE_INVENTORY_BASIS_V4_WINDOWS_SECONDS)
+        cutoff = now - LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS
         while (
             self.live_inventory_basis_v4_history
             and self.live_inventory_basis_v4_history[0][0] <= cutoff
         ):
             self.live_inventory_basis_v4_history.popleft()
+        return True
 
     def live_inventory_basis_abs_entry_ok(self, *, direction: str, basis_bps: Decimal, threshold_bps: Decimal | None = None) -> bool:
         threshold = self.live_inventory_basis_min_abs_entry_bps if threshold_bps is None else threshold_bps
@@ -7233,6 +7259,7 @@ class VariationalToLighterRuntime:
         v4_now = datetime.now(timezone.utc).timestamp()
         v4_entry_threshold_bps = None
         v4_entry_context: dict[str, Any] = {}
+        v4_baseline_sample_due = False
         if v4_mode:
             v4_entry_threshold_bps, v4_entry_context = (
                 self.live_inventory_basis_v4_entry_threshold(now=v4_now)
@@ -7240,12 +7267,14 @@ class VariationalToLighterRuntime:
             if v4_entry_threshold_bps is not None:
                 self.live_inventory_basis_v4_history_ready = True
                 self.live_inventory_basis_v4_history_reason = "ready"
-            elif self.live_inventory_basis_v4_history_reason == "ready":
+            else:
                 self.live_inventory_basis_v4_history_ready = False
                 self.live_inventory_basis_v4_history_reason = (
-                    "insufficient_multiscale_history"
+                    "insufficient_rolling_7d_anchor"
+                    if not v4_entry_context.get("v4_anchor_ready")
+                    else "recent_1h_health_not_ready"
                 )
-            self.record_live_inventory_basis_v4_edge(
+            v4_baseline_sample_due = self.record_live_inventory_basis_v4_edge(
                 now=v4_now,
                 short_edge_bps=short_edge_bps,
             )
@@ -7485,6 +7514,25 @@ class VariationalToLighterRuntime:
         if size_ladder is not None:
             state_payload["basis_size_ladder"] = size_ladder
         await self.append_live_inventory_log("live_inventory_basis_state", state_payload)
+        if v4_mode and v4_baseline_sample_due and self.live_inventory_basis_v4_store is not None:
+            await asyncio.to_thread(
+                self.live_inventory_basis_v4_store.append,
+                {
+                    **state_payload,
+                    "event": "live_inventory_basis_state",
+                    "logged_at": datetime.fromtimestamp(
+                        v4_now, tz=timezone.utc
+                    ).isoformat(),
+                    "sample_kind": "baseline",
+                    "sample_quality": "valid",
+                    "record_kind": "basis_market_sample",
+                    "execution_mode": "live",
+                    "run_id": self.live_inventory_run_id,
+                    "strategy_version": self.live_inventory_strategy_version,
+                    "strategy_variant": self.live_inventory_strategy_variant,
+                    "asset": asset,
+                },
+            )
         if collect_only:
             return
         dynamic_entry_quality_buffer_bps = self.live_inventory_dynamic_entry_quality_buffer_bps(var_quote_age_seconds=var_quote_age_seconds)
@@ -11223,8 +11271,8 @@ class VariationalToLighterRuntime:
         await self.runtime.start()
         v4_history_task: asyncio.Task[dict[str, Any]] | None = None
         if self.live_inventory_basis_v4_mode:
-            # Read the on-disk baseline while exchange clients initialize. The
-            # first live sample still enforces the strict 60-second gap guard.
+            # Load the rolling anchor while exchange clients initialize. Recent
+            # continuity is checked separately and cannot replace the 7d anchor.
             v4_history_task = asyncio.create_task(
                 asyncio.to_thread(
                     self.load_live_inventory_basis_v4_history,

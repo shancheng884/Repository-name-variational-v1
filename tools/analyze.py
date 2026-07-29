@@ -104,6 +104,7 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     preflight_passed = sum(row.get("shadow_status") == "passed" for row in shadows)
     preflight_blocked = sum(row.get("shadow_status") == "blocked" for row in shadows)
     dynamic_floor_blocks = reasons["edge_bps_below_dynamic_live_inventory_entry"]
+    latest_state = state_rows[-1] if state_rows else {}
 
     if dynamic_floor_blocks:
         status = "ERROR_V4_IMMEDIATE_ARB_FLOOR_APPLIED"
@@ -119,10 +120,13 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         status = "REVIEW_PREFLIGHT_PASSED_WITHOUT_SUBMIT"
     elif threshold_crossings:
         status = "CANDIDATES_FILTERED_BY_EXPECTED_GUARDS"
+    elif latest_state.get("v4_anchor_ready") is False:
+        status = "WAITING_FOR_ROLLING_7D_ANCHOR"
+    elif latest_state.get("v4_health_ready") is False:
+        status = "WAITING_FOR_RECENT_HEALTH_WINDOW"
     else:
         status = "WAITING_FOR_THRESHOLD_CROSSING"
 
-    latest_state = state_rows[-1] if state_rows else {}
     return {
         "profile": (
             latest_state.get("basis_v4_profile")
@@ -153,6 +157,12 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "latest_window_max_gap_seconds": latest_state.get(
             "v4_baseline_max_sample_gap_seconds"
         ),
+        "anchor_ready": latest_state.get("v4_anchor_ready"),
+        "health_ready": latest_state.get("v4_health_ready"),
+        "health_coverage_seconds": latest_state.get("v4_health_coverage_seconds"),
+        "health_max_gap_seconds": latest_state.get(
+            "v4_health_max_sample_gap_seconds"
+        ),
         "status": status,
     }
 
@@ -181,6 +191,10 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"latest_threshold_bps={funnel['latest_threshold_bps']} "
         f"latest_window_seconds={funnel['latest_window_seconds']} "
         f"latest_window_max_gap_seconds={funnel['latest_window_max_gap_seconds']} "
+        f"anchor_ready={funnel['anchor_ready']} "
+        f"health_ready={funnel['health_ready']} "
+        f"health_coverage_seconds={funnel['health_coverage_seconds']} "
+        f"health_max_gap_seconds={funnel['health_max_gap_seconds']} "
         f"status={funnel['status']}"
     )
 
