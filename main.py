@@ -2165,13 +2165,49 @@ class VariationalToLighterRuntime:
         exit_var_price: Decimal,
         exit_lighter_price: Decimal,
     ) -> tuple[Decimal, Decimal, Decimal]:
+        return VariationalToLighterRuntime.live_inventory_pair_pnl_by_leg_qty(
+            direction=direction,
+            var_qty=qty,
+            lighter_qty=qty,
+            entry_var_price=entry_var_price,
+            entry_lighter_price=entry_lighter_price,
+            exit_var_price=exit_var_price,
+            exit_lighter_price=exit_lighter_price,
+        )
+
+    @staticmethod
+    def live_inventory_pair_pnl_by_leg_qty(
+        *,
+        direction: str,
+        var_qty: Decimal,
+        lighter_qty: Decimal,
+        entry_var_price: Decimal,
+        entry_lighter_price: Decimal,
+        exit_var_price: Decimal,
+        exit_lighter_price: Decimal,
+    ) -> tuple[Decimal, Decimal, Decimal]:
         if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
-            var_leg_pnl = (exit_var_price - entry_var_price) * qty
-            lighter_leg_pnl = (entry_lighter_price - exit_lighter_price) * qty
+            var_leg_pnl = (exit_var_price - entry_var_price) * var_qty
+            lighter_leg_pnl = (entry_lighter_price - exit_lighter_price) * lighter_qty
         else:
-            var_leg_pnl = (entry_var_price - exit_var_price) * qty
-            lighter_leg_pnl = (exit_lighter_price - entry_lighter_price) * qty
+            var_leg_pnl = (entry_var_price - exit_var_price) * var_qty
+            lighter_leg_pnl = (exit_lighter_price - entry_lighter_price) * lighter_qty
         return var_leg_pnl, lighter_leg_pnl, var_leg_pnl + lighter_leg_pnl
+
+    def live_inventory_common_order_qty(self, *, asset: str, qty: Decimal) -> Decimal:
+        var_quantum = VARIATIONAL_API_AMOUNT_QUANTUM_BY_ASSET.get(
+            str(asset or "").upper(),
+            VARIATIONAL_API_AMOUNT_QUANTUM,
+        )
+        base_amount_multiplier = int(getattr(self, "base_amount_multiplier", 0) or 0)
+        lighter_quantum = (
+            Decimal("1") / Decimal(base_amount_multiplier)
+            if base_amount_multiplier > 0
+            else var_quantum
+        )
+        common_quantum = max(var_quantum, lighter_quantum)
+        units = (qty / common_quantum).to_integral_value(rounding=ROUND_DOWN)
+        return units * common_quantum
 
     @staticmethod
     def live_inventory_price_drift_bps(actual: Decimal | None, estimated: Decimal | None) -> Decimal | None:
@@ -2915,6 +2951,10 @@ class VariationalToLighterRuntime:
             "qty": decimal_to_str(qty),
             "entry_var_fill_price": decimal_to_str(var_fill_price),
             "entry_lighter_fill_price": decimal_to_str(lighter_fill_price),
+            "entry_var_final_fill_qty": decimal_to_str(record.qty),
+            "entry_lighter_final_fill_qty": decimal_to_str(
+                lighter_record.lighter_filled_base_amount
+            ),
             "entry_var_price_source": "final_fill",
             "entry_lighter_price_source": "final_fill" if lighter_record.lighter_fill_price is not None else "estimated_snapshot",
             "entry_cost_status": "final_fills_confirmed" if lighter_record.lighter_fill_price is not None else "final_fills_pending",
@@ -3000,7 +3040,15 @@ class VariationalToLighterRuntime:
         if not pending:
             return
 
-        qty = to_decimal(pending.get("qty")) or Decimal("0")
+        planned_qty = to_decimal(pending.get("qty")) or Decimal("0")
+        entry_var_qty = to_decimal(pending.get("entry_var_final_fill_qty")) or planned_qty
+        exit_var_qty = to_decimal(pending.get("exit_var_final_fill_qty")) or planned_qty
+        entry_lighter_qty = to_decimal(pending.get("entry_lighter_final_fill_qty")) or planned_qty
+        exit_lighter_qty = to_decimal(payload.get("lighter_filled_base_amount")) or planned_qty
+        var_qty = min(entry_var_qty, exit_var_qty)
+        lighter_qty = min(entry_lighter_qty, exit_lighter_qty)
+        var_roundtrip_qty_match = entry_var_qty == exit_var_qty
+        lighter_roundtrip_qty_match = entry_lighter_qty == exit_lighter_qty
         entry_var_price = to_decimal(pending.get("entry_var_price"))
         entry_lighter_price = to_decimal(pending.get("entry_lighter_price"))
         exit_var_price = to_decimal(pending.get("exit_var_price"))
@@ -3016,15 +3064,16 @@ class VariationalToLighterRuntime:
             )
             return
 
-        var_leg_pnl, lighter_leg_pnl, actual_pnl = self.live_inventory_pair_pnl(
+        var_leg_pnl, lighter_leg_pnl, actual_pnl = self.live_inventory_pair_pnl_by_leg_qty(
             direction=str(pending.get("direction") or ""),
-            qty=qty,
+            var_qty=var_qty,
+            lighter_qty=lighter_qty,
             entry_var_price=entry_var_price,
             entry_lighter_price=entry_lighter_price,
             exit_var_price=exit_var_price,
             exit_lighter_price=exit_lighter_price,
         )
-        notional = qty * entry_var_price
+        notional = var_qty * entry_var_price
         actual_pnl_bps = actual_pnl / notional * Decimal("10000") if notional else None
         estimated_pnl = to_decimal(pending.get("estimated_pnl_usd")) or Decimal("0")
         estimated_pnl_bps = to_decimal(pending.get("estimated_pnl_bps"))
@@ -3075,7 +3124,22 @@ class VariationalToLighterRuntime:
             "live_inventory_actual_pnl",
             {
                 **pending,
-                "actual_pnl_status": "lighter_final_fill_confirmed",
+                "actual_pnl_status": (
+                    "lighter_final_fill_confirmed"
+                    if var_roundtrip_qty_match and lighter_roundtrip_qty_match
+                    else "leg_quantity_mismatch_requires_reconciliation"
+                ),
+                "planned_qty": decimal_to_str(planned_qty),
+                "entry_var_final_fill_qty": decimal_to_str(entry_var_qty),
+                "exit_var_final_fill_qty": decimal_to_str(exit_var_qty),
+                "actual_var_pnl_qty": decimal_to_str(var_qty),
+                "entry_lighter_final_fill_qty": decimal_to_str(entry_lighter_qty),
+                "exit_lighter_final_fill_qty": decimal_to_str(exit_lighter_qty),
+                "actual_lighter_pnl_qty": decimal_to_str(lighter_qty),
+                "var_roundtrip_qty_match": var_roundtrip_qty_match,
+                "lighter_roundtrip_qty_match": lighter_roundtrip_qty_match,
+                "cross_venue_entry_qty_delta": decimal_to_str(entry_var_qty - entry_lighter_qty),
+                "cross_venue_exit_qty_delta": decimal_to_str(exit_var_qty - exit_lighter_qty),
                 "exit_lighter_final_fill_price": decimal_to_str(exit_lighter_price),
                 "estimated_exit_lighter_price": decimal_to_str(estimated_exit_lighter_price),
                 "exit_lighter_slippage_bps": decimal_to_str(exit_lighter_slippage_bps),
@@ -3159,6 +3223,8 @@ class VariationalToLighterRuntime:
         pending = self.pending_live_inventory_final_pnl.get(key) or {}
         entry_var_price = pending.get("entry_var_final_fill_price")
         entry_lighter_price = pending.get("entry_lighter_final_fill_price")
+        entry_var_qty = pending.get("entry_var_final_fill_qty")
+        entry_lighter_qty = pending.get("entry_lighter_final_fill_qty")
         updated = False
         for lot in open_lots:
             if str(lot.get("lot_id")) != str(lot_id):
@@ -3178,6 +3244,12 @@ class VariationalToLighterRuntime:
             if entry_lighter_price is not None and lot.get("entry_lighter_price_source") != "final_fill":
                 lot["entry_lighter_price_source"] = "final_fill"
                 lot["entry_lighter_final_fill_at"] = pending.get("entry_lighter_final_fill_at")
+                updated = True
+            if entry_var_qty is not None and lot.get("entry_var_final_fill_qty") != entry_var_qty:
+                lot["entry_var_final_fill_qty"] = entry_var_qty
+                updated = True
+            if entry_lighter_qty is not None and lot.get("entry_lighter_final_fill_qty") != entry_lighter_qty:
+                lot["entry_lighter_final_fill_qty"] = entry_lighter_qty
                 updated = True
             cost_status = "final_fills_confirmed" if entry_var_price is not None and entry_lighter_price is not None else "final_fills_pending"
             if lot.get("entry_cost_status") != cost_status:
@@ -3206,18 +3278,22 @@ class VariationalToLighterRuntime:
             if payload.get("variational_filled_price") is not None and payload.get("synthetic_eager_fill") is False:
                 pending["entry_var_final_fill_price"] = payload.get("variational_filled_price")
                 pending["entry_var_final_fill_at"] = payload.get("variational_filled_at")
+                pending["entry_var_final_fill_qty"] = payload.get("qty")
             if payload.get("lighter_filled_price") is not None:
                 pending["entry_lighter_final_fill_price"] = payload.get("lighter_filled_price")
                 pending["entry_lighter_final_fill_at"] = payload.get("lighter_filled_at")
+                pending["entry_lighter_final_fill_qty"] = payload.get("lighter_filled_base_amount")
             if self.sync_live_inventory_open_lot_entry_cost(asset=asset, lot_id=lot_id):
                 await self.persist_live_inventory_memory(reason="entry_final_fill_cost_update")
         else:
             if payload.get("variational_filled_price") is not None and payload.get("synthetic_eager_fill") is False:
                 pending["exit_var_final_fill_price"] = payload.get("variational_filled_price")
                 pending["exit_var_final_fill_at"] = payload.get("variational_filled_at")
+                pending["exit_var_final_fill_qty"] = payload.get("qty")
             if payload.get("lighter_filled_price") is not None:
                 pending["exit_lighter_final_fill_price"] = payload.get("lighter_filled_price")
                 pending["exit_lighter_final_fill_at"] = payload.get("lighter_filled_at")
+                pending["exit_lighter_final_fill_qty"] = payload.get("lighter_filled_base_amount")
 
         await self.maybe_append_live_inventory_final_pnl(key)
 
@@ -3234,6 +3310,14 @@ class VariationalToLighterRuntime:
         exit_lighter_price = to_decimal(pending.get("exit_lighter_final_fill_price"))
         if None in {qty, entry_var_price, entry_lighter_price, exit_var_price, exit_lighter_price} or not direction:
             return
+        entry_var_qty = to_decimal(pending.get("entry_var_final_fill_qty")) or qty
+        exit_var_qty = to_decimal(pending.get("exit_var_final_fill_qty")) or qty
+        entry_lighter_qty = to_decimal(pending.get("entry_lighter_final_fill_qty")) or qty
+        exit_lighter_qty = to_decimal(pending.get("exit_lighter_final_fill_qty")) or qty
+        var_qty = min(entry_var_qty, exit_var_qty)
+        lighter_qty = min(entry_lighter_qty, exit_lighter_qty)
+        var_roundtrip_qty_match = entry_var_qty == exit_var_qty
+        lighter_roundtrip_qty_match = entry_lighter_qty == exit_lighter_qty
         entry_estimated_var_price = to_decimal(pending.get("entry_estimated_var_price"))
         entry_estimated_lighter_price = to_decimal(pending.get("entry_estimated_lighter_price"))
         exit_estimated_var_price = to_decimal(pending.get("exit_estimated_var_price"))
@@ -3273,15 +3357,16 @@ class VariationalToLighterRuntime:
         if entry_final_edge_bps is not None and exit_final_edge_bps is not None:
             final_spread_capture_bps = entry_final_edge_bps - exit_final_edge_bps
 
-        var_leg_pnl, lighter_leg_pnl, final_pnl = self.live_inventory_pair_pnl(
+        var_leg_pnl, lighter_leg_pnl, final_pnl = self.live_inventory_pair_pnl_by_leg_qty(
             direction=direction,
-            qty=qty or Decimal("0"),
+            var_qty=var_qty,
+            lighter_qty=lighter_qty,
             entry_var_price=entry_var_price or Decimal("0"),
             entry_lighter_price=entry_lighter_price or Decimal("0"),
             exit_var_price=exit_var_price or Decimal("0"),
             exit_lighter_price=exit_lighter_price or Decimal("0"),
         )
-        notional = (qty or Decimal("0")) * (entry_var_price or Decimal("0"))
+        notional = var_qty * (entry_var_price or Decimal("0"))
         final_pnl_bps = final_pnl / notional * Decimal("10000") if notional else None
         if not hasattr(self, "live_inventory_execution_loss_bps_samples"):
             self.live_inventory_execution_loss_bps_samples = deque(maxlen=20)
@@ -3292,7 +3377,22 @@ class VariationalToLighterRuntime:
             "live_inventory_final_pnl",
             {
                 **pending,
-                "final_pnl_status": "var_and_lighter_final_fills_confirmed",
+                "final_pnl_status": (
+                    "var_and_lighter_final_fills_confirmed"
+                    if var_roundtrip_qty_match and lighter_roundtrip_qty_match
+                    else "leg_quantity_mismatch_requires_reconciliation"
+                ),
+                "planned_qty": decimal_to_str(qty),
+                "entry_var_final_fill_qty": decimal_to_str(entry_var_qty),
+                "exit_var_final_fill_qty": decimal_to_str(exit_var_qty),
+                "final_var_pnl_qty": decimal_to_str(var_qty),
+                "entry_lighter_final_fill_qty": decimal_to_str(entry_lighter_qty),
+                "exit_lighter_final_fill_qty": decimal_to_str(exit_lighter_qty),
+                "final_lighter_pnl_qty": decimal_to_str(lighter_qty),
+                "var_roundtrip_qty_match": var_roundtrip_qty_match,
+                "lighter_roundtrip_qty_match": lighter_roundtrip_qty_match,
+                "cross_venue_entry_qty_delta": decimal_to_str(entry_var_qty - entry_lighter_qty),
+                "cross_venue_exit_qty_delta": decimal_to_str(exit_var_qty - exit_lighter_qty),
                 "final_var_leg_pnl_usd": decimal_to_str(var_leg_pnl),
                 "final_lighter_leg_pnl_usd": decimal_to_str(lighter_leg_pnl),
                 "final_pnl_usd": decimal_to_str(final_pnl),
@@ -8163,7 +8263,12 @@ class VariationalToLighterRuntime:
                 lighter_record = None
                 lighter_payload = None
                 if not self.live_inventory_dry_decisions:
-                    var_amount = variational_api_amount_to_str(qty, asset=asset)
+                    unquantized_qty = qty
+                    submitted_qty = self.live_inventory_common_order_qty(
+                        asset=asset,
+                        qty=unquantized_qty,
+                    )
+                    var_amount = variational_api_amount_to_str(submitted_qty, asset=asset)
                     submitted_qty = Decimal(var_amount)
                     if submitted_qty <= 0:
                         await self.block_live_inventory_entry(
@@ -8172,7 +8277,8 @@ class VariationalToLighterRuntime:
                             context={
                                 **state_payload,
                                 "direction": direction,
-                                "qty": decimal_to_str(qty),
+                                "qty": decimal_to_str(unquantized_qty),
+                                "common_order_qty": decimal_to_str(submitted_qty),
                                 "var_amount": var_amount,
                             },
                         )
@@ -8184,8 +8290,9 @@ class VariationalToLighterRuntime:
                             context={
                                 **state_payload,
                                 "direction": direction,
-                                "qty": decimal_to_str(qty),
+                                "qty": decimal_to_str(unquantized_qty),
                                 "submitted_qty": decimal_to_str(submitted_qty),
+                                "common_order_qty": decimal_to_str(submitted_qty),
                                 "var_amount": var_amount,
                                 "lighter_min_base_amount": decimal_to_str(self.lighter_min_base_amount),
                             },
@@ -9283,6 +9390,9 @@ class VariationalToLighterRuntime:
                     "basis_trace_id": lot.get("basis_trace_id"),
                     "direction": direction,
                     "qty": decimal_to_str(qty),
+                    "entry_var_final_fill_qty": lot.get("entry_var_final_fill_qty"),
+                    "entry_lighter_final_fill_qty": lot.get("entry_lighter_final_fill_qty"),
+                    "exit_var_final_fill_qty": decimal_to_str(qty),
                     "entry_var_price": decimal_to_str(entry_var_price),
                     "entry_lighter_price": decimal_to_str(entry_lighter_price),
                     "exit_var_price": decimal_to_str(var_exit_price),
@@ -9863,6 +9973,9 @@ class VariationalToLighterRuntime:
                     "lot_id": lot.get("lot_id"),
                     "direction": direction,
                     "qty": decimal_to_str(qty),
+                    "entry_var_final_fill_qty": lot.get("entry_var_final_fill_qty"),
+                    "entry_lighter_final_fill_qty": lot.get("entry_lighter_final_fill_qty"),
+                    "exit_var_final_fill_qty": decimal_to_str(qty),
                     "entry_var_price": decimal_to_str(entry_var_price),
                     "entry_lighter_price": decimal_to_str(entry_lighter_price),
                     "entry_cost_status": entry_cost_status,

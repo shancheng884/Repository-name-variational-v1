@@ -152,6 +152,19 @@ def test_variational_api_amount_is_quantized_to_min_qty_tick() -> None:
     assert variational_api_amount_to_str(Decimal("0.0000009")) == "0.000000"
 
 
+def test_live_inventory_common_order_qty_uses_coarser_lighter_step() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.base_amount_multiplier = 10_000
+
+    qty = runtime.live_inventory_common_order_qty(
+        asset="ETH",
+        qty=Decimal("0.01075"),
+    )
+
+    assert qty == Decimal("0.0107")
+    assert variational_api_amount_to_str(qty, asset="ETH") == "0.01070"
+
+
 def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path) -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
@@ -252,6 +265,7 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
                 "auto_live_role": "live_inventory_entry",
                 "lighter_filled_price": "110",
                 "lighter_filled_at": "2026-06-15T00:00:00.100000Z",
+                "lighter_filled_base_amount": "0.0002",
             }
         )
         await runtime.process_variational_trade_event(
@@ -279,6 +293,7 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
                 "auto_live_role": "live_inventory_exit",
                 "lighter_filled_price": "112",
                 "lighter_filled_at": "2026-06-15T00:00:10.100000Z",
+                "lighter_filled_base_amount": "0.0002",
             }
         )
         await runtime.process_variational_trade_event(
@@ -297,8 +312,12 @@ def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path
         final_rows = [row for row in rows if row["event"] == "live_inventory_final_pnl"]
         assert len(final_rows) == 1
         assert final_rows[0]["final_var_leg_pnl_usd"] == "-0.0057"
-        assert final_rows[0]["final_lighter_leg_pnl_usd"] == "-0.0006"
-        assert final_rows[0]["final_pnl_usd"] == "-0.0063"
+        assert final_rows[0]["final_lighter_leg_pnl_usd"] == "-0.0004"
+        assert final_rows[0]["final_pnl_usd"] == "-0.0061"
+        assert final_rows[0]["final_var_pnl_qty"] == "0.0003"
+        assert final_rows[0]["final_lighter_pnl_qty"] == "0.0002"
+        assert final_rows[0]["cross_venue_entry_qty_delta"] == "0.0001"
+        assert final_rows[0]["cross_venue_exit_qty_delta"] == "0.0001"
         assert Decimal(final_rows[0]["entry_var_fill_drift_bps"]) == Decimal("3000")
         assert Decimal(final_rows[0]["exit_var_fill_drift_bps"]) == Decimal("0")
         assert Decimal(final_rows[0]["entry_estimated_edge_bps"]) == Decimal("1000")
@@ -3056,6 +3075,49 @@ def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path) -> 
         assert state["reason"] == "actual_pnl_final_fill_update"
         assert "exit-1" not in runtime.pending_live_inventory_actual_pnl
         assert getattr(runtime, "live_inventory_calibration_halted_reason", None) is None
+
+    asyncio.run(run())
+
+
+def test_live_inventory_actual_pnl_uses_leg_specific_filled_qty(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.pending_live_inventory_actual_pnl["exit-qty"] = {
+            "asset": "ETH",
+            "lot_id": 1,
+            "direction": "short_var_long_lighter",
+            "qty": "0.01075",
+            "entry_var_final_fill_qty": "0.01075",
+            "exit_var_final_fill_qty": "0.01075",
+            "entry_lighter_final_fill_qty": "0.0107",
+            "entry_var_price": "1859.33",
+            "entry_lighter_price": "1861.33",
+            "exit_var_price": "1914.82",
+            "estimated_pnl_usd": "-0.003136",
+            "estimated_pnl_bps": "-1.568957260048286961082131736",
+        }
+
+        await runtime.maybe_append_live_inventory_actual_pnl(
+            {
+                "trade_key": "exit-qty",
+                "lighter_filled_price": "1916.531869158878504672897196",
+                "lighter_filled_base_amount": "0.0107",
+            }
+        )
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        row = rows[-1]
+        assert row["event"] == "live_inventory_actual_pnl"
+        assert row["actual_pnl_status"] == "lighter_final_fill_confirmed"
+        assert row["actual_var_pnl_qty"] == "0.01075"
+        assert row["actual_lighter_pnl_qty"] == "0.0107"
+        assert row["cross_venue_entry_qty_delta"] == "0.00005"
+        assert row["cross_venue_exit_qty_delta"] == "0.00005"
+        assert row["actual_var_leg_pnl_usd"] == "-0.5965175"
+        assert row["actual_lighter_leg_pnl_usd"] == "0.5906599999999999999999999972"
+        assert row["actual_pnl_usd"] == "-0.0058575000000000000000000028"
+        assert row["actual_pnl_bps"] == "-2.930537994493890584993170358"
 
     asyncio.run(run())
 
