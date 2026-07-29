@@ -105,13 +105,38 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     preflight_blocked = sum(row.get("shadow_status") == "blocked" for row in shadows)
     dynamic_floor_blocks = reasons["edge_bps_below_dynamic_live_inventory_entry"]
     latest_state = state_rows[-1] if state_rows else {}
+    exit_submit_rows = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_execution_ledger"
+        and row.get("phase") == "exit"
+        and row.get("execution_stage") == "submit_returned"
+    ]
+    latest_exit_submit = exit_submit_rows[-1] if exit_submit_rows else {}
+    cycle_reports = [
+        row for row in v4_rows if row.get("event") == "live_inventory_cycle_report"
+    ]
+    latest_cycle_report = cycle_reports[-1] if cycle_reports else {}
+    final_pnl_rows = [
+        row for row in v4_rows if row.get("event") == "live_inventory_final_pnl"
+    ]
+    latest_final_pnl = final_pnl_rows[-1] if final_pnl_rows else {}
 
     if dynamic_floor_blocks:
         status = "ERROR_V4_IMMEDIATE_ARB_FLOOR_APPLIED"
     elif events["live_inventory_manual_review_required"]:
         status = "ERROR_MANUAL_REVIEW_REQUIRED"
-    elif events["live_inventory_actual_pnl"]:
+    elif latest_cycle_report.get("report_status") == "requires_reconciliation":
+        status = "ERROR_RECONCILIATION_REQUIRED"
+    elif latest_cycle_report.get("report_status") == "completed":
         status = "CYCLE_COMPLETE"
+    elif (
+        latest_final_pnl.get("final_pnl_status")
+        == "var_and_lighter_final_fills_confirmed"
+    ):
+        status = "FINAL_FILLS_CONFIRMED_WAITING_FOR_REPORT"
+    elif latest_final_pnl:
+        status = "ERROR_FINAL_PNL_RECONCILIATION_REQUIRED"
     elif events["live_inventory_entered"]:
         status = "POSITION_OPEN"
     elif events["live_inventory_var_entry_submitted"]:
@@ -151,6 +176,21 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "entered": events["live_inventory_entered"],
         "exited": events["live_inventory_exited"],
         "actual_pnl": events["live_inventory_actual_pnl"],
+        "final_pnl": events["live_inventory_final_pnl"],
+        "cycle_reports": len(cycle_reports),
+        "exit_submit_mode": latest_exit_submit.get("submit_mode"),
+        "exit_pair_submit_elapsed_ms": latest_exit_submit.get(
+            "pair_submit_elapsed_ms"
+        ),
+        "exit_var_submit_ms": latest_exit_submit.get("var_submit_ms"),
+        "exit_lighter_submit_ms": latest_exit_submit.get("lighter_submit_ms"),
+        "cycle_report_status": latest_cycle_report.get("report_status"),
+        "cycle_final_pnl_bps": latest_cycle_report.get("final_pnl_bps"),
+        "cycle_final_pnl_usd": latest_cycle_report.get("final_pnl_usd"),
+        "cycle_exit_reason": latest_cycle_report.get("exit_reason"),
+        "cycle_holding_seconds": latest_cycle_report.get("holding_seconds"),
+        "cycle_mfe_pnl_bps": latest_cycle_report.get("shadow_mfe_pnl_bps"),
+        "cycle_mae_pnl_bps": latest_cycle_report.get("shadow_mae_pnl_bps"),
         "latest_edge_bps": latest_state.get("short_edge_bps"),
         "latest_threshold_bps": latest_state.get("v4_entry_threshold_bps"),
         "latest_window_seconds": latest_state.get("v4_baseline_window_seconds"),
@@ -184,7 +224,8 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"preflight_blocked={funnel['preflight_blocked']} "
         f"dynamic_floor_blocks={funnel['dynamic_floor_blocks']} "
         f"submits={funnel['submits']} entered={funnel['entered']} "
-        f"exited={funnel['exited']} actual_pnl={funnel['actual_pnl']}"
+        f"exited={funnel['exited']} actual_pnl={funnel['actual_pnl']} "
+        f"final_pnl={funnel['final_pnl']} cycle_reports={funnel['cycle_reports']}"
     )
     print(
         f"latest_edge_bps={funnel['latest_edge_bps']} "
@@ -197,6 +238,20 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"health_max_gap_seconds={funnel['health_max_gap_seconds']} "
         f"status={funnel['status']}"
     )
+    if funnel["exit_submit_mode"] or funnel["cycle_report_status"]:
+        print(
+            f"exit_submit_mode={funnel['exit_submit_mode']} "
+            f"pair_submit_ms={funnel['exit_pair_submit_elapsed_ms']} "
+            f"var_submit_ms={funnel['exit_var_submit_ms']} "
+            f"lighter_submit_ms={funnel['exit_lighter_submit_ms']} "
+            f"report_status={funnel['cycle_report_status']} "
+            f"final_pnl_bps={funnel['cycle_final_pnl_bps']} "
+            f"final_pnl_usd={funnel['cycle_final_pnl_usd']} "
+            f"exit_reason={funnel['cycle_exit_reason']} "
+            f"holding_seconds={funnel['cycle_holding_seconds']} "
+            f"mfe_bps={funnel['cycle_mfe_pnl_bps']} "
+            f"mae_bps={funnel['cycle_mae_pnl_bps']}"
+        )
 
 
 def print_execution_calibration(rows: list[dict[str, Any]]) -> None:

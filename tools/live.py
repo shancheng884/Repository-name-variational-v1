@@ -423,6 +423,8 @@ def build_main_command(
                 "1500",
                 "--live-inventory-max-lighter-book-age-seconds",
                 "2",
+                "--live-inventory-basis-size-ladder-notionals-usd",
+                "20,40,60",
             ]
         )
     elif reversion_mode:

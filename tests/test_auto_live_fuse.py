@@ -3339,3 +3339,198 @@ def test_live_inventory_state_asset_uses_allowed_single_asset(tmp_path) -> None:
         assert state["asset"] == "ETH"
 
     asyncio.run(run())
+
+
+def test_v4_exit_pair_submits_both_legs_concurrently(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_v4_mode = True
+        var_started = asyncio.Event()
+        lighter_started = asyncio.Event()
+
+        async def fake_send_variational_place_order(**_kwargs):
+            var_started.set()
+            await asyncio.wait_for(lighter_started.wait(), timeout=1)
+            return {"ok": True, "result": {"quoteId": "exit-var"}}
+
+        async def fake_place_lighter_order_from_plan(**kwargs):
+            assert kwargs["reduce_only"] is True
+            lighter_started.set()
+            await asyncio.wait_for(var_started.wait(), timeout=1)
+
+            class Record:
+                processing_stage = "live_submit_sent"
+
+            return Record(), {"trade_key": "exit-lighter"}
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+        original_append_live_inventory_log = runtime.append_live_inventory_log
+
+        async def guarded_append_live_inventory_log(event_type, payload):
+            if (
+                event_type == "live_inventory_execution_ledger"
+                and payload.get("execution_stage") == "submit_started"
+            ):
+                await asyncio.wait_for(var_started.wait(), timeout=1)
+                await asyncio.wait_for(lighter_started.wait(), timeout=1)
+            await original_append_live_inventory_log(event_type, payload)
+
+        runtime.append_live_inventory_log = guarded_append_live_inventory_log
+
+        result = await runtime.submit_live_inventory_exit_pair(
+            asset="ETH",
+            lot={"lot_id": 7, "basis_trace_id": "trace-7"},
+            direction="short_var_long_lighter",
+            exit_side="BUY",
+            qty=Decimal("0.01"),
+            var_amount="0.01",
+            var_exit_price=Decimal("1900"),
+            exit_lighter_depth={"estimated_fill_price": "1901"},
+        )
+
+        var_result, _, lighter_record, lighter_payload, _, var_exc, lighter_exc, context = result
+        assert var_started.is_set()
+        assert lighter_started.is_set()
+        assert var_result["ok"] is True
+        assert lighter_record is not None
+        assert lighter_payload["trade_key"] == "exit-lighter"
+        assert var_exc is None
+        assert lighter_exc is None
+        assert context["submit_mode"] == "concurrent"
+        assert context["var_submit_ok"] is True
+        assert context["lighter_submit_started"] is True
+
+        rows = [
+            json.loads(line)
+            for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()
+        ]
+        ledger = [row for row in rows if row["event"] == "live_inventory_execution_ledger"]
+        assert [row["execution_stage"] for row in ledger] == [
+            "submit_started",
+            "submit_returned",
+        ]
+
+    asyncio.run(run())
+
+
+def test_v4_exit_pair_preserves_one_leg_exception_outcome(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_v4_mode = True
+
+        async def fake_send_variational_place_order(**_kwargs):
+            raise RuntimeError("var timeout unknown")
+
+        async def fake_place_lighter_order_from_plan(**_kwargs):
+            class Record:
+                processing_stage = "live_submit_sent"
+
+            return Record(), {"trade_key": "exit-lighter"}
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+
+        result = await runtime.submit_live_inventory_exit_pair(
+            asset="ETH",
+            lot={"lot_id": 8},
+            direction="short_var_long_lighter",
+            exit_side="BUY",
+            qty=Decimal("0.01"),
+            var_amount="0.01",
+            var_exit_price=Decimal("1900"),
+            exit_lighter_depth=None,
+        )
+
+        assert result[0] is None
+        assert isinstance(result[5], RuntimeError)
+        assert result[2] is not None
+        assert result[7]["lighter_submit_started"] is True
+        assert result[7]["var_submit_exception"] == "var timeout unknown"
+
+    asyncio.run(run())
+
+
+def test_v4_completed_cycle_emits_report_and_stops(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_v4_mode = True
+        runtime.live_inventory_cycle_report_emitted = False
+        runtime.live_inventory_last_final_pnl_payload = None
+        runtime.live_inventory_exit_events_logged = {"9"}
+        runtime.live_inventory_open_lots = []
+        runtime.live_inventory_completed_cycles = 1
+        runtime.live_inventory_max_cycles = 1
+        runtime.stop_flag = False
+
+        async def fake_persist_live_inventory_memory(**_kwargs):
+            return None
+
+        runtime.persist_live_inventory_memory = fake_persist_live_inventory_memory
+        stopped = await runtime.maybe_auto_stop_completed_v4_cycle(
+            {
+                "asset": "ETH",
+                "lot_id": 9,
+                "final_pnl_status": "var_and_lighter_final_fills_confirmed",
+                "final_pnl_bps": "1.2",
+            }
+        )
+
+        assert stopped is True
+        assert runtime.stop_flag is True
+        assert runtime.live_inventory_cycle_report_emitted is True
+        rows = [
+            json.loads(line)
+            for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()
+        ]
+        assert rows[-1]["event"] == "live_inventory_cycle_report"
+        assert rows[-1]["report_status"] == "completed"
+        assert rows[-1]["auto_stop"] is True
+
+    asyncio.run(run())
+
+
+def test_v4_completed_cycle_waits_for_actual_pnl_queue(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_v4_mode = True
+        runtime.live_inventory_cycle_report_emitted = False
+        runtime.live_inventory_last_final_pnl_payload = None
+        runtime.live_inventory_exit_events_logged = {"9"}
+        runtime.live_inventory_open_lots = []
+        runtime.live_inventory_completed_cycles = 1
+        runtime.live_inventory_max_cycles = 1
+        runtime.pending_live_inventory_actual_pnl = {"exit-9": {"lot_id": 9}}
+        runtime.stop_flag = False
+
+        stopped = await runtime.maybe_auto_stop_completed_v4_cycle(
+            {
+                "asset": "ETH",
+                "lot_id": 9,
+                "final_pnl_status": "var_and_lighter_final_fills_confirmed",
+                "final_pnl_bps": "1.2",
+            }
+        )
+
+        assert stopped is False
+        assert runtime.stop_flag is False
+        assert runtime.live_inventory_cycle_report_emitted is False
+
+    asyncio.run(run())
+
+
+def test_v4_basis_state_logging_is_adaptive_but_keeps_crossings(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_last_basis_state_log_monotonic = 0.0
+    runtime.live_inventory_open_lots = []
+
+    assert runtime.should_log_live_inventory_basis_state(
+        {"short_edge_bps": "-10", "v4_entry_threshold_bps": "-8"}
+    )
+    assert not runtime.should_log_live_inventory_basis_state(
+        {"short_edge_bps": "-10", "v4_entry_threshold_bps": "-8"}
+    )
+    assert runtime.should_log_live_inventory_basis_state(
+        {"short_edge_bps": "-7", "v4_entry_threshold_bps": "-8"}
+    )

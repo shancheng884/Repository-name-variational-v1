@@ -101,6 +101,64 @@ def test_v4_live_funnel_distinguishes_anchor_and_recent_health_waits() -> None:
     assert health_wait["status"] == "WAITING_FOR_RECENT_HEALTH_WINDOW"
 
 
+def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
+    common = {
+        "run_id": "live-v4-cycle",
+        "strategy_version": "basis-v4-live-v1",
+        "asset": "ETH",
+    }
+    funnel = build_v4_live_funnel(
+        [
+            {
+                **common,
+                "event": "live_inventory_execution_ledger",
+                "phase": "exit",
+                "execution_stage": "submit_returned",
+                "submit_mode": "concurrent",
+                "pair_submit_elapsed_ms": "170.2",
+                "var_submit_ms": "160.1",
+                "lighter_submit_ms": "45.8",
+            },
+            {
+                **common,
+                "event": "live_inventory_cycle_report",
+                "report_status": "completed",
+                "final_pnl_bps": "1.2",
+                "final_pnl_usd": "0.0024",
+                "exit_reason": "v4_executable_net_target_reached",
+                "holding_seconds": 900,
+                "shadow_mfe_pnl_bps": "1.4",
+                "shadow_mae_pnl_bps": "-0.8",
+            },
+        ]
+    )
+
+    assert funnel is not None
+    assert funnel["status"] == "CYCLE_COMPLETE"
+    assert funnel["exit_submit_mode"] == "concurrent"
+    assert funnel["exit_pair_submit_elapsed_ms"] == "170.2"
+    assert funnel["cycle_report_status"] == "completed"
+    assert funnel["cycle_final_pnl_bps"] == "1.2"
+    assert funnel["cycle_mfe_pnl_bps"] == "1.4"
+
+
+def test_v4_live_funnel_does_not_call_reconciliation_cycle_complete() -> None:
+    funnel = build_v4_live_funnel(
+        [
+            {
+                "event": "live_inventory_cycle_report",
+                "run_id": "live-v4-reconcile",
+                "strategy_version": "basis-v4-live-v1",
+                "asset": "ETH",
+                "report_status": "requires_reconciliation",
+            }
+        ]
+    )
+
+    assert funnel is not None
+    assert funnel["status"] == "ERROR_RECONCILIATION_REQUIRED"
+
+
 def test_basis_v4_formal_profile_accepts_only_versioned_calibrated_eth_short_config() -> None:
     common = {
         "evaluation_interval_seconds": 1,
