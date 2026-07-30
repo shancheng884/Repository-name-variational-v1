@@ -29,6 +29,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
+from tools.lib.telegram_notifier import TelegramNotifier
 from variational.listener import (
     CommandBroker,
     HEARTBEAT_STALE_SECONDS,
@@ -1087,6 +1088,7 @@ class VariationalToLighterRuntime:
         file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
         self.logger.addHandler(file_handler)
         self.dashboard_console = Console()
+        self.telegram_notifier = TelegramNotifier.from_env(logger=self.logger)
 
         output_dir = self.output_dir
         self.runtime = VariationalRuntime(
@@ -6170,21 +6172,32 @@ class VariationalToLighterRuntime:
             await asyncio.to_thread(self._append_line, self.market_samples_file, line)
 
     async def append_live_inventory_log(self, event_type: str, payload: dict[str, Any]) -> None:
-        await self.append_order_log(
-            event_type,
-            {
-                "record_kind": "live_inventory",
-                "mode": self.mode,
-                "execution_mode": "dry_decision" if self.live_inventory_dry_decisions else "live",
-                "run_id": getattr(self, "live_inventory_run_id", "unknown"),
-                "schema_version": getattr(self, "live_inventory_schema_version", "1"),
-                "strategy_version": getattr(self, "live_inventory_strategy_version", "legacy"),
-                "strategy_variant": getattr(self, "live_inventory_strategy_variant", "legacy"),
-                "config_hash": getattr(self, "live_inventory_config_hash", None),
-                "cycle_id": payload.get("cycle_id", payload.get("lot_id")),
-                **payload,
-            },
-        )
+        enriched_payload = {
+            "record_kind": "live_inventory",
+            "mode": self.mode,
+            "execution_mode": "dry_decision" if self.live_inventory_dry_decisions else "live",
+            "run_id": getattr(self, "live_inventory_run_id", "unknown"),
+            "schema_version": getattr(self, "live_inventory_schema_version", "1"),
+            "strategy_version": getattr(self, "live_inventory_strategy_version", "legacy"),
+            "strategy_variant": getattr(self, "live_inventory_strategy_variant", "legacy"),
+            "config_hash": getattr(self, "live_inventory_config_hash", None),
+            "cycle_id": payload.get("cycle_id", payload.get("lot_id")),
+            **payload,
+        }
+        await self.append_order_log(event_type, enriched_payload)
+        notifier = getattr(self, "telegram_notifier", None)
+        if (
+            notifier is not None
+            and not getattr(self, "live_inventory_dry_decisions", False)
+        ):
+            try:
+                notifier.enqueue(event_type, enriched_payload)
+            except Exception as exc:
+                self.logger.warning(
+                    "telegram_notification_enqueue_failed event=%s error=%s",
+                    event_type,
+                    type(exc).__name__,
+                )
 
     def should_log_live_inventory_basis_state(self, payload: dict[str, Any]) -> bool:
         if not getattr(self, "live_inventory_basis_v4_mode", False):
@@ -12230,6 +12243,15 @@ class VariationalToLighterRuntime:
         self.log_startup_diagnostics(diagnostics)
         if diagnostics.blocking_errors:
             raise RuntimeError("Startup diagnostics failed")
+        notifier = getattr(self, "telegram_notifier", None)
+        if notifier is not None:
+            try:
+                await notifier.start()
+            except Exception as exc:
+                self.logger.warning(
+                    "telegram_notification_start_failed error=%s",
+                    type(exc).__name__,
+                )
         await self.append_live_inventory_run_config()
         await self.runtime.start()
         v4_history_task: asyncio.Task[dict[str, Any]] | None = None
@@ -12434,6 +12456,15 @@ class VariationalToLighterRuntime:
                 await self._var_command_ws.close()
             self._var_command_ws = None
 
+        notifier = getattr(self, "telegram_notifier", None)
+        if notifier is not None:
+            try:
+                await notifier.stop()
+            except Exception as exc:
+                self.logger.warning(
+                    "telegram_notification_stop_failed error=%s",
+                    type(exc).__name__,
+                )
         await self.runtime.stop()
 
 

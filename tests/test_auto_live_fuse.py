@@ -1399,6 +1399,12 @@ def _inventory_entry_snapshot() -> CrossSpreadSnapshot:
 
 def test_live_inventory_log_includes_run_id_and_config(tmp_path) -> None:
     runtime = _live_inventory_runtime(tmp_path)
+    telegram_events = []
+    runtime.telegram_notifier = SimpleNamespace(
+        enqueue=lambda event_type, payload: telegram_events.append(
+            (event_type, payload)
+        )
+    )
     runtime.live_inventory_run_id = "test-run-id"
     runtime.live_inventory_signal_mode = "basis"
     runtime.live_inventory_max_lots = 1
@@ -1419,6 +1425,32 @@ def test_live_inventory_log_includes_run_id_and_config(tmp_path) -> None:
     assert rows[0]["config"]["live_inventory_max_total_notional_usd"] == "10"
     assert rows[1]["event"] == "live_inventory_test_event"
     assert rows[1]["run_id"] == "test-run-id"
+    assert telegram_events[-1][0] == "live_inventory_test_event"
+    assert telegram_events[-1][1]["run_id"] == "test-run-id"
+
+
+def test_telegram_enqueue_failure_does_not_escape_live_log(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.telegram_notifier = SimpleNamespace(
+        enqueue=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("telegram unavailable")
+        )
+    )
+
+    asyncio.run(
+        runtime.append_live_inventory_log(
+            "live_inventory_entered",
+            {"asset": "ETH", "lot_id": 1},
+        )
+    )
+
+    rows = [
+        json.loads(line)
+        for line in runtime.orders_file.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert rows[-1]["event"] == "live_inventory_entered"
 
 
 def _eth_inventory_snapshot() -> CrossSpreadSnapshot:
