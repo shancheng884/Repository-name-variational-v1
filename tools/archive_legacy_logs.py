@@ -16,6 +16,8 @@ TARGETS = (
     "rest_events.jsonl",
     "ws_events.jsonl",
     "market_samples.jsonl",
+    "runtime.log",
+    "basis_collector.log",
 )
 
 
@@ -56,7 +58,19 @@ def main() -> int:
         for process in processes:
             print(process)
         return 2
-    candidates = [LOG_DIR / name for name in TARGETS if (LOG_DIR / name).exists() and (LOG_DIR / name).stat().st_size > 0]
+    candidates = [
+        LOG_DIR / name
+        for name in TARGETS
+        if (LOG_DIR / name).exists() and (LOG_DIR / name).stat().st_size > 0
+    ]
+    candidates.extend(
+        path
+        for path in sorted(LOG_DIR.glob("basis_collector.log.*"))
+        if path.is_file()
+        and path.suffix != ".gz"
+        and ".legacy-" not in path.name
+        and path.stat().st_size > 0
+    )
     for path in candidates:
         print(f"archive_candidate path={path} bytes={path.stat().st_size}")
     if not args.execute:

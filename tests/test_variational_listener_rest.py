@@ -2,7 +2,7 @@ import base64
 import asyncio
 import json
 
-from variational.listener import VariationalMonitor
+from variational.listener import EventSink, VariationalMonitor
 
 
 def test_listener_remembers_unknown_variational_rest_response() -> None:
@@ -27,3 +27,35 @@ def test_listener_remembers_unknown_variational_rest_response() -> None:
     assert monitor.recent_rest_responses[0]["result_len"] == 1
     assert "status" in monitor.recent_rest_responses[0]["first_result_keys"]
     assert monitor.snapshot()["recent_rest_responses"] == monitor.recent_rest_responses
+
+
+def test_trading_raw_event_policy_skips_market_noise_but_keeps_orders(
+    tmp_path,
+) -> None:
+    sink = EventSink(
+        output_dir=tmp_path,
+        raw_event_policy="trading",
+    )
+    quote = {
+        "kind": "rest_response",
+        "url": "https://omni.variational.io/api/quotes/indicative",
+        "body": "large quote body",
+    }
+    order = {
+        "kind": "rest_response",
+        "url": "https://omni.variational.io/api/orders/v2",
+        "body": '{"status":"filled"}',
+    }
+
+    asyncio.run(sink.handle("rest", json.dumps(quote)))
+    assert not (tmp_path / "rest_events.jsonl").exists()
+
+    asyncio.run(sink.handle("rest", json.dumps(order)))
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "rest_events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["payload"]["url"].endswith("/api/orders/v2")

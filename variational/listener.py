@@ -786,10 +786,14 @@ class EventSink:
         output_dir: Path | None,
         quiet: bool = False,
         monitor: VariationalMonitor | None = None,
+        raw_event_policy: str = "all",
     ) -> None:
+        if raw_event_policy not in {"all", "trading", "none"}:
+            raise ValueError("raw_event_policy must be all, trading, or none")
         self.output_dir = output_dir
         self.quiet = quiet
         self.monitor = monitor
+        self.raw_event_policy = raw_event_policy
         self._write_lock = asyncio.Lock()
         if self.output_dir is not None:
             self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -817,9 +821,24 @@ class EventSink:
                 for line in lines:
                     print(line, flush=True)
 
-        if self.output_dir is not None:
+        if self.output_dir is not None and self._should_persist_raw_event(channel, parsed):
             file_name = "ws_events.jsonl" if channel == "ws" else "rest_events.jsonl"
             await self._append_jsonl(self.output_dir / file_name, envelope)
+
+    def _should_persist_raw_event(self, channel: str, parsed: Any) -> bool:
+        if self.raw_event_policy == "none":
+            return False
+        if self.raw_event_policy == "all":
+            return True
+        if not isinstance(parsed, dict):
+            return False
+        url = str(parsed.get("url") or "")
+        if channel == "rest":
+            return classify_rest_endpoint(url) == ORDERS_V2_PATH
+        if channel != "ws" or classify_ws_stream(url) != WS_EVENTS_PATH:
+            return False
+        text = json.dumps(parsed, ensure_ascii=True).lower()
+        return any(keyword in text for keyword in TRADE_EVENT_KEYWORDS)
 
     async def _append_jsonl(self, path: Path, obj: dict[str, Any]) -> None:
         line = json.dumps(obj, ensure_ascii=True) + "\n"

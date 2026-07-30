@@ -121,11 +121,31 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         row for row in v4_rows if row.get("event") == "live_inventory_final_pnl"
     ]
     latest_final_pnl = final_pnl_rows[-1] if final_pnl_rows else {}
+    fuse_rows = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_runtime_fuse_triggered"
+    ]
+    stop_rows = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_runtime_stopped"
+    ]
+    latest_fuse = fuse_rows[-1] if fuse_rows else {}
+    latest_stop = stop_rows[-1] if stop_rows else {}
+    history_rows = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_basis_v4_history_loaded"
+    ]
+    anchor_context = latest_state or (history_rows[-1] if history_rows else {})
 
     if dynamic_floor_blocks:
         status = "ERROR_V4_IMMEDIATE_ARB_FLOOR_APPLIED"
     elif events["live_inventory_manual_review_required"]:
         status = "ERROR_MANUAL_REVIEW_REQUIRED"
+    elif latest_fuse:
+        status = "STOPPED_BY_RUNTIME_FUSE"
     elif latest_cycle_report.get("report_status") == "requires_reconciliation":
         status = "ERROR_RECONCILIATION_REQUIRED"
     elif latest_cycle_report.get("report_status") == "completed":
@@ -193,16 +213,38 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "cycle_mae_pnl_bps": latest_cycle_report.get("shadow_mae_pnl_bps"),
         "latest_edge_bps": latest_state.get("short_edge_bps"),
         "latest_threshold_bps": latest_state.get("v4_entry_threshold_bps"),
-        "latest_window_seconds": latest_state.get("v4_baseline_window_seconds"),
-        "latest_window_max_gap_seconds": latest_state.get(
+        "latest_window_seconds": anchor_context.get("v4_baseline_window_seconds"),
+        "latest_window_max_gap_seconds": anchor_context.get(
             "v4_baseline_max_sample_gap_seconds"
         ),
-        "anchor_ready": latest_state.get("v4_anchor_ready"),
-        "health_ready": latest_state.get("v4_health_ready"),
-        "health_coverage_seconds": latest_state.get("v4_health_coverage_seconds"),
-        "health_max_gap_seconds": latest_state.get(
+        "anchor_count": anchor_context.get("v4_anchor_count"),
+        "anchor_effective_seconds": anchor_context.get(
+            "v4_anchor_effective_seconds"
+        ),
+        "anchor_min_effective_seconds": anchor_context.get(
+            "v4_anchor_min_effective_seconds"
+        ),
+        "anchor_missing_effective_seconds": anchor_context.get(
+            "v4_anchor_missing_effective_seconds"
+        ),
+        "anchor_progress_pct": anchor_context.get("v4_anchor_progress_pct"),
+        "anchor_projected_ready_seconds": anchor_context.get(
+            "v4_anchor_projected_ready_seconds"
+        ),
+        "anchor_projected_ready_at": anchor_context.get(
+            "v4_anchor_projected_ready_at"
+        ),
+        "anchor_ready": anchor_context.get("v4_anchor_ready"),
+        "health_ready": anchor_context.get("v4_health_ready"),
+        "health_coverage_seconds": anchor_context.get("v4_health_coverage_seconds"),
+        "health_max_gap_seconds": anchor_context.get(
             "v4_health_max_sample_gap_seconds"
         ),
+        "quote_failures": events["live_inventory_basis_quote_failed"],
+        "runtime_fuses": len(fuse_rows),
+        "runtime_stop_reason": latest_stop.get("reason")
+        or latest_fuse.get("reason"),
+        "runtime_stopped_at": latest_stop.get("logged_at"),
         "status": status,
     }
 
@@ -238,6 +280,22 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"health_max_gap_seconds={funnel['health_max_gap_seconds']} "
         f"status={funnel['status']}"
     )
+    print(
+        f"anchor_count={funnel['anchor_count']} "
+        f"anchor_effective_seconds={funnel['anchor_effective_seconds']} "
+        f"anchor_min_effective_seconds={funnel['anchor_min_effective_seconds']} "
+        f"anchor_missing_seconds={funnel['anchor_missing_effective_seconds']} "
+        f"anchor_progress_pct={funnel['anchor_progress_pct']} "
+        f"projected_ready_seconds={funnel['anchor_projected_ready_seconds']} "
+        f"projected_ready_at={funnel['anchor_projected_ready_at']}"
+    )
+    if funnel["runtime_fuses"] or funnel["runtime_stop_reason"]:
+        print(
+            f"quote_failures={funnel['quote_failures']} "
+            f"runtime_fuses={funnel['runtime_fuses']} "
+            f"runtime_stop_reason={funnel['runtime_stop_reason']} "
+            f"runtime_stopped_at={funnel['runtime_stopped_at']}"
+        )
     if funnel["exit_submit_mode"] or funnel["cycle_report_status"]:
         print(
             f"exit_submit_mode={funnel['exit_submit_mode']} "
@@ -3179,6 +3237,8 @@ def main() -> int:
                 "live_inventory_entry_blocked",
                 "live_inventory_manual_review_required",
                 "live_inventory_basis_quote_failed",
+                "live_inventory_runtime_fuse_triggered",
+                "live_inventory_runtime_stopped",
                 "lighter_filled",
                 "variational_filled",
             ]

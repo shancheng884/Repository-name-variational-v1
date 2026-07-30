@@ -6,6 +6,7 @@ from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 from main import (
     AutoLivePositionState,
@@ -448,8 +449,9 @@ def test_reversion_execution_reserve_is_directional() -> None:
 def _v4_rolling_anchor_rows(
     now: float,
     recent_rows: list[tuple[float, Decimal]],
+    total_count: int = 5760,
 ) -> deque[tuple[float, Decimal]]:
-    older_count = 5760 - len(recent_rows)
+    older_count = total_count - len(recent_rows)
     older_rows = [
         (
             now - 604_700 + index * 30,
@@ -481,6 +483,31 @@ def test_v4_entry_threshold_uses_rolling_7d_anchor_with_recent_health() -> None:
     assert context["v4_baseline_count"] == 5760
     assert context["v4_anchor_effective_seconds"] == 172800
     assert Decimal("97") <= threshold < Decimal("99")
+
+
+def test_v4_entry_threshold_accepts_36h_effective_7d_anchor() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    now = 1_000_000.0
+    recent_rows = [
+        (now - 3000 + index * 30, Decimal(index))
+        for index in range(100)
+    ]
+    runtime.live_inventory_basis_v4_history = _v4_rolling_anchor_rows(
+        now,
+        recent_rows,
+        total_count=4320,
+    )
+
+    threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
+
+    assert threshold is not None
+    assert context["v4_anchor_ready"] is True
+    assert context["v4_health_ready"] is True
+    assert context["v4_anchor_effective_seconds"] == 129600
+    assert context["v4_anchor_min_effective_seconds"] == 129600
+    assert context["v4_anchor_missing_effective_seconds"] == 0
+    assert context["v4_anchor_progress_pct"] == "100.00"
+    assert context["v4_anchor_projected_ready_seconds"] == 0
 
 
 def test_v4_entry_threshold_keeps_7d_anchor_across_historical_gap() -> None:
@@ -600,6 +627,150 @@ def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> Non
     assert context["v4_baseline_window_seconds"] == 604800
     assert context["v4_anchor_effective_seconds"] == 172800
     assert context["v4_entry_threshold_bps"] == "97"
+
+
+def test_extension_disconnect_fuse_stops_flat_runtime_after_three_failures() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.live_inventory_extension_disconnect_failures = 0
+        runtime.live_inventory_extension_disconnect_fuse_triggered = False
+        runtime.live_inventory_open_lots = []
+        runtime.stop_flag = False
+        runtime.shutdown_reason = None
+        runtime.logger = logging.getLogger("test_extension_disconnect_fuse")
+        events: list[tuple[str, dict]] = []
+
+        async def capture(event: str, payload: dict) -> None:
+            events.append((event, payload))
+
+        runtime.append_live_inventory_log = capture
+        for _ in range(3):
+            await runtime.record_live_inventory_basis_quote_failure(
+                asset="ETH",
+                error="No extension command client connected.",
+                failure_kind="command_rejected",
+            )
+
+        assert runtime.stop_flag is True
+        assert runtime.shutdown_reason == "variational_extension_disconnected"
+        assert runtime.live_inventory_extension_disconnect_failures == 3
+        assert [event for event, _ in events].count(
+            "live_inventory_runtime_fuse_triggered"
+        ) == 1
+        failures = [
+            payload
+            for event, payload in events
+            if event == "live_inventory_basis_quote_failed"
+        ]
+        assert failures[-1]["extension_consecutive_failures"] == 3
+
+    asyncio.run(run())
+
+
+def test_non_extension_quote_failure_resets_disconnect_counter() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.live_inventory_extension_disconnect_failures = 2
+        runtime.live_inventory_extension_disconnect_fuse_triggered = False
+        runtime.live_inventory_open_lots = []
+        runtime.stop_flag = False
+        runtime.shutdown_reason = None
+        runtime.logger = logging.getLogger("test_extension_disconnect_reset")
+
+        async def ignore(_event: str, _payload: dict) -> None:
+            return None
+
+        runtime.append_live_inventory_log = ignore
+        await runtime.record_live_inventory_basis_quote_failure(
+            asset="ETH",
+            error="HTTP 503",
+            failure_kind="command_rejected",
+        )
+
+        assert runtime.live_inventory_extension_disconnect_failures == 0
+        assert runtime.stop_flag is False
+
+    asyncio.run(run())
+
+
+def test_extension_disconnect_fuse_requires_review_when_position_is_open() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.live_inventory_extension_disconnect_failures = 2
+        runtime.live_inventory_extension_disconnect_fuse_triggered = False
+        runtime.live_inventory_open_lots = [{"lot_id": 1, "asset": "ETH"}]
+        runtime.stop_flag = False
+        runtime.shutdown_reason = None
+        runtime.logger = logging.getLogger("test_open_extension_disconnect_fuse")
+        events: list[tuple[str, dict]] = []
+        reviews: list[dict] = []
+
+        async def capture(event: str, payload: dict) -> None:
+            events.append((event, payload))
+
+        async def require_review(**kwargs) -> None:
+            reviews.append(kwargs)
+            runtime.stop_flag = True
+
+        runtime.append_live_inventory_log = capture
+        runtime.require_live_inventory_manual_review = require_review
+
+        await runtime.record_live_inventory_basis_quote_failure(
+            asset="ETH",
+            error="No extension command client connected.",
+            failure_kind="command_rejected",
+        )
+
+        assert runtime.stop_flag is True
+        assert runtime.shutdown_reason == "variational_extension_disconnected"
+        assert reviews[0]["reason"] == "variational_extension_disconnected"
+        fuse = next(
+            payload
+            for event, payload in events
+            if event == "live_inventory_runtime_fuse_triggered"
+        )
+        assert fuse["action"] == "manual_exchange_review_required"
+        assert fuse["open_lots_total"] == 1
+
+    asyncio.run(run())
+
+
+def test_runtime_disk_guard_stops_flat_live_below_three_gb(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.output_dir = tmp_path
+        runtime.live_inventory_last_disk_check_monotonic = 0.0
+        runtime.live_inventory_last_disk_warning_monotonic = 0.0
+        runtime.live_inventory_open_lots = []
+        runtime.stop_flag = False
+        runtime.shutdown_reason = None
+        runtime.logger = logging.getLogger("test_runtime_disk_guard")
+        events: list[tuple[str, dict]] = []
+
+        async def capture(event: str, payload: dict) -> None:
+            events.append((event, payload))
+
+        runtime.append_live_inventory_log = capture
+        monkeypatch.setattr(
+            "main.shutil.disk_usage",
+            lambda _path: SimpleNamespace(free=2 * 1024**3),
+        )
+
+        await runtime.maybe_enforce_live_disk_guard(asset="ETH")
+
+        assert runtime.stop_flag is True
+        assert runtime.shutdown_reason == "disk_free_below_stop_threshold"
+        fuse = next(
+            payload
+            for event, payload in events
+            if event == "live_inventory_runtime_fuse_triggered"
+        )
+        assert fuse["action"] == "auto_stop_flat"
+
+    asyncio.run(run())
 
 
 def test_v4_history_loader_does_not_authorize_recent_1h_without_7d_anchor(

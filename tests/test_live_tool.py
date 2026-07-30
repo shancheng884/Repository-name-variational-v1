@@ -14,6 +14,15 @@ def test_multi_asset_collector_command_has_no_live_submit_path() -> None:
     assert "--lighter-prewarm-submit-ws" not in command
 
 
+def test_live_tool_disk_start_guard_requires_three_gb(monkeypatch) -> None:
+    class Usage:
+        free = 2 * 1024**3
+
+    monkeypatch.setattr(live.shutil, "disk_usage", lambda _path: Usage())
+
+    assert live.disk_start_allowed() is False
+
+
 def test_live_tool_adds_basis_addon_flags_for_three_lots() -> None:
     command = build_main_command(
         "SOL",

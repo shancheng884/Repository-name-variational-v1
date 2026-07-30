@@ -24,6 +24,7 @@ CALIBRATION_DIRECTIONS = {
 }
 LIVE_CONFIG = ROOT / "live_config.json"
 V4_PROFILE_ETH_SHORT_20260724 = "eth_short_execution_calibrated_20260724_n10"
+MIN_START_DISK_FREE_GB = 3.0
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,10 @@ def disk_warning() -> str:
     usage = shutil.disk_usage(ROOT)
     used_pct = usage.used / usage.total * 100
     return f"disk_used={used_pct:.0f}% disk_free={human_bytes(usage.free)} log_dir={human_bytes(dir_size_safe(LOG_DIR))}"
+
+
+def disk_start_allowed() -> bool:
+    return shutil.disk_usage(ROOT).free >= MIN_START_DISK_FREE_GB * 1024**3
 
 
 def dir_size_safe(path: Path) -> int:
@@ -612,6 +617,12 @@ def main() -> int:
     print(disk_warning())
     if not state_ok:
         print("REFUSE_START reason=local_live_state_not_flat")
+        return 2
+    if not args.dry_run and not disk_start_allowed():
+        print(
+            "REFUSE_START reason=disk_free_below_3gb "
+            "action=stop_processes_then_run_tools/archive_legacy_logs.py"
+        )
         return 2
 
     command = (

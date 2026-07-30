@@ -101,6 +101,51 @@ def test_v4_live_funnel_distinguishes_anchor_and_recent_health_waits() -> None:
     assert health_wait["status"] == "WAITING_FOR_RECENT_HEALTH_WINDOW"
 
 
+def test_v4_live_funnel_reports_anchor_progress_and_runtime_fuse() -> None:
+    common = {
+        "run_id": "live-v4-fuse",
+        "strategy_version": "basis-v4-live-v1",
+        "asset": "ETH",
+    }
+    funnel = build_v4_live_funnel(
+        [
+            {
+                **common,
+                "event": "live_inventory_basis_state",
+                "v4_anchor_ready": False,
+                "v4_health_ready": True,
+                "v4_anchor_count": 4000,
+                "v4_anchor_effective_seconds": 120000,
+                "v4_anchor_min_effective_seconds": 129600,
+                "v4_anchor_missing_effective_seconds": 9600,
+                "v4_anchor_progress_pct": "92.59",
+                "v4_anchor_projected_ready_seconds": 10800,
+                "v4_anchor_projected_ready_at": "2026-07-30T09:00:00+00:00",
+            },
+            {
+                **common,
+                "event": "live_inventory_runtime_fuse_triggered",
+                "reason": "variational_extension_disconnected",
+            },
+            {
+                **common,
+                "event": "live_inventory_runtime_stopped",
+                "logged_at": "2026-07-30T06:00:00+00:00",
+                "reason": "variational_extension_disconnected",
+            },
+        ]
+    )
+
+    assert funnel is not None
+    assert funnel["status"] == "STOPPED_BY_RUNTIME_FUSE"
+    assert funnel["anchor_count"] == 4000
+    assert funnel["anchor_missing_effective_seconds"] == 9600
+    assert funnel["anchor_projected_ready_seconds"] == 10800
+    assert funnel["runtime_fuses"] == 1
+    assert funnel["runtime_stop_reason"] == "variational_extension_disconnected"
+    assert funnel["runtime_stopped_at"] == "2026-07-30T06:00:00+00:00"
+
+
 def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
     common = {
         "run_id": "live-v4-cycle",

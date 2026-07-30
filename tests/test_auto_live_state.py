@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 from decimal import Decimal
+from types import SimpleNamespace
 
 from main import VariationalToLighterRuntime
 
@@ -162,6 +163,31 @@ def test_live_inventory_real_submit_allows_startup_when_state_flat(tmp_path, mon
 
     assert diagnostics.blocking_errors == []
     assert "live_inventory_real_submit_one_lot_enabled" in diagnostics.passed
+
+
+def test_live_startup_blocks_when_disk_free_is_below_three_gb(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LIGHTER_ACCOUNT_INDEX", "1")
+    monkeypatch.setenv("LIGHTER_API_KEY_INDEX", "1")
+    monkeypatch.setenv("LIGHTER_PRIVATE_KEY", "secret")
+    monkeypatch.setattr(
+        "main.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=2 * 1024**3),
+    )
+    runtime = _runtime(tmp_path)
+    runtime.auto_live_entry = False
+    runtime.live_inventory = True
+    runtime.live_inventory_dry_decisions = False
+    runtime.live_inventory_i_confirm_flat_start = True
+
+    diagnostics = runtime.run_startup_diagnostics()
+
+    assert any(
+        error.startswith("disk_free_below_live_start_threshold:")
+        for error in diagnostics.blocking_errors
+    )
 
 
 def test_live_inventory_dry_decisions_allow_startup_when_state_flat(tmp_path, monkeypatch) -> None:

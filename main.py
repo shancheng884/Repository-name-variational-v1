@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import signal
 import time
 import uuid
@@ -14,6 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
 from statistics import median
@@ -90,11 +92,17 @@ LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE = Decimal("97.5")
 LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS = 30
 LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE = Decimal("0.80")
 LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES = 100
-LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS = 172800
+LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS = 129600
 LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS = Decimal("0.50")
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
 LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS = 60
+LIVE_INVENTORY_EXTENSION_DISCONNECT_FAILURE_LIMIT = 3
+LIVE_RUNTIME_LOG_MAX_BYTES = 10 * 1024 * 1024
+LIVE_RUNTIME_LOG_BACKUP_COUNT = 5
+LIVE_DISK_WARN_FREE_GB = 5.0
+LIVE_DISK_STOP_FREE_GB = 3.0
+LIVE_DISK_CHECK_INTERVAL_SECONDS = 60.0
 
 STAGE_EVENT_RECEIVED = "event_received"
 STAGE_EVENT_FILTERED = "event_filtered"
@@ -218,6 +226,12 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return format(value, "f")
+
+
+def bounded_text(value: str, *, max_chars: int = 500) -> str:
+    if len(value) <= max_chars:
+        return value
+    return f"{value[:max_chars]}... [truncated original_chars={len(value)}]"
 
 
 def parse_decimal_csv(value: str | None) -> list[Decimal]:
@@ -777,9 +791,15 @@ class VariationalRuntime:
         command_port: int,
         output_dir: Path | None,
         quiet: bool,
+        raw_event_policy: str = "all",
     ) -> None:
         self.monitor = VariationalMonitor(trade_limit=500, snapshot_file=None)
-        self.sink = EventSink(output_dir=output_dir, quiet=quiet, monitor=self.monitor)
+        self.sink = EventSink(
+            output_dir=output_dir,
+            quiet=quiet,
+            monitor=self.monitor,
+            raw_event_policy=raw_event_policy,
+        )
         self.command_broker = CommandBroker(quiet=quiet)
         self.host = host
         self.ws_port = ws_port
@@ -1047,13 +1067,20 @@ class VariationalToLighterRuntime:
         self.lighter_prewarm_submit_ws = bool(args.lighter_prewarm_submit_ws)
 
         self.stop_flag = False
+        self.shutdown_reason: str | None = None
+        self.runtime_stop_event_emitted = False
         self.logger = logging.getLogger("var_lighter_runtime")
         self.logger.setLevel(logging.INFO)
         self.logger.handlers.clear()
         self.logger.propagate = False
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(self.app_log_file, encoding="utf-8")
+        file_handler = RotatingFileHandler(
+            self.app_log_file,
+            maxBytes=LIVE_RUNTIME_LOG_MAX_BYTES,
+            backupCount=LIVE_RUNTIME_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
         file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
         self.logger.addHandler(file_handler)
         self.dashboard_console = Console()
@@ -1066,6 +1093,7 @@ class VariationalToLighterRuntime:
             command_port=self.forwarder_command_port,
             output_dir=output_dir,
             quiet=True,
+            raw_event_policy="trading",
         )
 
         self.orders_file = output_dir / "order_metrics.jsonl" if output_dir else None
@@ -1153,6 +1181,13 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_next_history_sample_at = 0.0
         self.live_inventory_basis_v4_history_ready = False
         self.live_inventory_basis_v4_history_reason = "not_loaded"
+        self.live_inventory_basis_v4_projection_cached_at = 0.0
+        self.live_inventory_basis_v4_projection_cache: dict[str, Any] = {}
+        self.live_inventory_extension_disconnect_failures = 0
+        self.live_inventory_extension_disconnect_fuse_triggered = False
+        self.live_inventory_last_disk_check_monotonic = 0.0
+        self.live_inventory_last_disk_warning_monotonic = 0.0
+        self.live_inventory_last_snapshot_fetch_log_monotonic = 0.0
         self.live_inventory_last_basis_state_log_monotonic = 0.0
         self.live_inventory_cycle_report_emitted = False
         self.live_inventory_last_final_pnl_payload: dict[str, Any] | None = None
@@ -1927,7 +1962,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_completed_cycles = int(state.get("completed_cycles") or 0)
 
     def live_inventory_state_asset(self) -> str:
-        for lot in self.live_inventory_open_lots:
+        for lot in getattr(self, "live_inventory_open_lots", []) or []:
             if isinstance(lot, dict) and lot.get("asset"):
                 return str(lot.get("asset")).upper()
         if len(getattr(self, "live_allowed_assets", set()) or set()) == 1:
@@ -2035,6 +2070,8 @@ class VariationalToLighterRuntime:
             len(self.live_inventory_open_lots),
             self.live_inventory_completed_cycles,
         )
+        if getattr(self, "shutdown_reason", None) is None:
+            self.shutdown_reason = f"manual_review_required:{reason}"
         self.stop_flag = True
 
     async def block_live_inventory_entry(self, *, asset: str, reason: str, context: dict[str, Any]) -> None:
@@ -2432,6 +2469,63 @@ class VariationalToLighterRuntime:
         )
         return ordered[max(0, min(index, len(ordered) - 1))]
 
+    def live_inventory_basis_v4_anchor_projection(self, *, now: float) -> dict[str, Any]:
+        cached_at = float(
+            getattr(self, "live_inventory_basis_v4_projection_cached_at", 0.0)
+            or 0.0
+        )
+        cached = getattr(self, "live_inventory_basis_v4_projection_cache", {})
+        if cached and now - cached_at < 300.0:
+            return dict(cached)
+
+        rows = deque(
+            row
+            for row in self.live_inventory_basis_v4_history
+            if row[0] > now - LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS
+        )
+        projected_seconds: int | None = None
+        for elapsed in range(
+            0,
+            LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS
+            + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
+            LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
+        ):
+            future = now + elapsed
+            cutoff = future - LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS
+            while rows and rows[0][0] <= cutoff:
+                rows.popleft()
+            if elapsed:
+                rows.append((future, Decimal("0")))
+            coverage_seconds = max(0.0, future - rows[0][0]) if rows else 0.0
+            effective_seconds = min(
+                len(rows) * LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
+                LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS,
+            )
+            if (
+                len(rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
+                and Decimal(str(coverage_seconds))
+                >= Decimal(LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS)
+                * LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
+                and effective_seconds
+                >= LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS
+            ):
+                projected_seconds = elapsed
+                break
+
+        projected_at = (
+            datetime.fromtimestamp(now + projected_seconds, tz=timezone.utc).isoformat()
+            if projected_seconds is not None
+            else None
+        )
+        result = {
+            "v4_anchor_projected_ready_seconds": projected_seconds,
+            "v4_anchor_projected_ready_at": projected_at,
+            "v4_anchor_projection_assumption": "continuous_valid_30s_samples",
+        }
+        self.live_inventory_basis_v4_projection_cached_at = now
+        self.live_inventory_basis_v4_projection_cache = dict(result)
+        return result
+
     def load_live_inventory_basis_v4_history(self, *, asset: str) -> dict[str, Any]:
         self.live_inventory_basis_v4_history.clear()
         self.live_inventory_basis_v4_history_ready = False
@@ -2516,6 +2610,11 @@ class VariationalToLighterRuntime:
             len(anchor_rows) * LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
             LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS,
         )
+        anchor_missing_effective_seconds = max(
+            0,
+            LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS
+            - anchor_effective_seconds,
+        )
         anchor_ready = (
             len(anchor_rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
             and Decimal(str(anchor_coverage_seconds))
@@ -2552,6 +2651,8 @@ class VariationalToLighterRuntime:
             "v4_anchor_coverage_seconds": f"{anchor_coverage_seconds:.3f}",
             "v4_anchor_effective_seconds": anchor_effective_seconds,
             "v4_anchor_min_effective_seconds": LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS,
+            "v4_anchor_missing_effective_seconds": anchor_missing_effective_seconds,
+            "v4_anchor_progress_pct": f"{min(100.0, anchor_effective_seconds / LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS * 100):.2f}",
             "v4_anchor_max_sample_gap_seconds": f"{anchor_max_gap_seconds:.3f}",
             "v4_anchor_ready": anchor_ready,
             "v4_health_window_seconds": LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS,
@@ -2569,6 +2670,7 @@ class VariationalToLighterRuntime:
             "v4_baseline_count": len(anchor_rows),
             "v4_baseline_coverage_seconds": f"{anchor_coverage_seconds:.3f}",
             "v4_baseline_max_sample_gap_seconds": f"{anchor_max_gap_seconds:.3f}",
+            **self.live_inventory_basis_v4_anchor_projection(now=now),
         }
         if not anchor_ready or not health_ready:
             return None, context
@@ -2808,6 +2910,156 @@ class VariationalToLighterRuntime:
             )
         )
 
+    async def record_live_inventory_basis_quote_failure(
+        self,
+        *,
+        asset: str,
+        error: Any,
+        failure_kind: str,
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        error_text = bounded_text(str(error or "unknown"), max_chars=500)
+        extension_disconnected = (
+            "No extension command client connected" in error_text
+        )
+        if extension_disconnected:
+            self.live_inventory_extension_disconnect_failures = (
+                int(
+                    getattr(
+                        self,
+                        "live_inventory_extension_disconnect_failures",
+                        0,
+                    )
+                    or 0
+                )
+                + 1
+            )
+        else:
+            self.live_inventory_extension_disconnect_failures = 0
+        failure_count = self.live_inventory_extension_disconnect_failures
+        await self.append_live_inventory_log(
+            "live_inventory_basis_quote_failed",
+            {
+                "asset": asset,
+                "error": error_text,
+                "failure_kind": failure_kind,
+                "extension_disconnected": extension_disconnected,
+                "extension_consecutive_failures": failure_count,
+                "extension_failure_limit": LIVE_INVENTORY_EXTENSION_DISCONNECT_FAILURE_LIMIT,
+                "result_step": result.get("step") if isinstance(result, dict) else None,
+            },
+        )
+        if (
+            not extension_disconnected
+            or failure_count < LIVE_INVENTORY_EXTENSION_DISCONNECT_FAILURE_LIMIT
+            or getattr(
+                self,
+                "live_inventory_extension_disconnect_fuse_triggered",
+                False,
+            )
+        ):
+            return
+
+        self.live_inventory_extension_disconnect_fuse_triggered = True
+        self.shutdown_reason = "variational_extension_disconnected"
+        fuse_payload = {
+            "asset": asset,
+            "reason": self.shutdown_reason,
+            "extension_consecutive_failures": failure_count,
+            "extension_failure_limit": LIVE_INVENTORY_EXTENSION_DISCONNECT_FAILURE_LIMIT,
+            "open_lots_total": len(self.live_inventory_open_lots),
+            "action": (
+                "manual_exchange_review_required"
+                if self.live_inventory_open_lots
+                else "auto_stop_flat"
+            ),
+        }
+        await self.append_live_inventory_log(
+            "live_inventory_runtime_fuse_triggered",
+            fuse_payload,
+        )
+        self.logger.error(
+            "live_inventory_runtime_fuse_triggered asset=%s reason=%s failures=%s open_lots=%s",
+            asset,
+            self.shutdown_reason,
+            failure_count,
+            len(self.live_inventory_open_lots),
+        )
+        if self.live_inventory_open_lots:
+            await self.require_live_inventory_manual_review(
+                asset=asset,
+                reason=self.shutdown_reason,
+                context=fuse_payload,
+            )
+        else:
+            self.stop_flag = True
+
+    async def maybe_enforce_live_disk_guard(self, *, asset: str) -> None:
+        now = time.monotonic()
+        last = float(
+            getattr(self, "live_inventory_last_disk_check_monotonic", 0.0)
+            or 0.0
+        )
+        if now - last < LIVE_DISK_CHECK_INTERVAL_SECONDS:
+            return
+        self.live_inventory_last_disk_check_monotonic = now
+        free_gb = shutil.disk_usage(self.output_dir).free / (1024**3)
+        if free_gb >= LIVE_DISK_WARN_FREE_GB:
+            return
+        if free_gb >= LIVE_DISK_STOP_FREE_GB:
+            warning_last = float(
+                getattr(
+                    self,
+                    "live_inventory_last_disk_warning_monotonic",
+                    0.0,
+                )
+                or 0.0
+            )
+            if now - warning_last >= 3600.0 or warning_last == 0.0:
+                self.live_inventory_last_disk_warning_monotonic = now
+                self.logger.warning(
+                    "live_inventory_disk_free_warning asset=%s free_gb=%.3f",
+                    asset,
+                    free_gb,
+                )
+                await self.append_live_inventory_log(
+                    "live_inventory_disk_free_warning",
+                    {
+                        "asset": asset,
+                        "disk_free_gb": f"{free_gb:.3f}",
+                        "disk_stop_free_gb": LIVE_DISK_STOP_FREE_GB,
+                    },
+                )
+            return
+
+        if self.live_inventory_open_lots:
+            self.logger.error(
+                "live_inventory_disk_guard_deferred_until_flat asset=%s free_gb=%.3f open_lots=%s",
+                asset,
+                free_gb,
+                len(self.live_inventory_open_lots),
+            )
+            return
+        self.shutdown_reason = "disk_free_below_stop_threshold"
+        await self.append_live_inventory_log(
+            "live_inventory_runtime_fuse_triggered",
+            {
+                "asset": asset,
+                "reason": self.shutdown_reason,
+                "disk_free_gb": f"{free_gb:.3f}",
+                "disk_stop_free_gb": LIVE_DISK_STOP_FREE_GB,
+                "open_lots_total": 0,
+                "action": "auto_stop_flat",
+            },
+        )
+        self.logger.error(
+            "live_inventory_runtime_fuse_triggered asset=%s reason=%s free_gb=%.3f",
+            asset,
+            self.shutdown_reason,
+            free_gb,
+        )
+        self.stop_flag = True
+
     async def fetch_live_inventory_basis_quote(self, *, asset: str) -> tuple[dict[str, Any] | None, Decimal | None]:
         try:
             result, elapsed_ms = await self._timed_submit(
@@ -2821,26 +3073,32 @@ class VariationalToLighterRuntime:
                 )
             )
         except Exception as exc:
-            await self.append_live_inventory_log(
-                "live_inventory_basis_quote_failed",
-                {"asset": asset, "error": f"quote_request_exception:{type(exc).__name__}:{exc}"},
+            await self.record_live_inventory_basis_quote_failure(
+                asset=asset,
+                error=f"quote_request_exception:{type(exc).__name__}:{exc}",
+                failure_kind="request_exception",
             )
             return None, None
         if not result.get("ok"):
-            await self.append_live_inventory_log(
-                "live_inventory_basis_quote_failed",
-                {"asset": asset, "error": result.get("error") or result.get("step") or "unknown", "result": result},
+            await self.record_live_inventory_basis_quote_failure(
+                asset=asset,
+                error=result.get("error") or result.get("step") or "unknown",
+                failure_kind="command_rejected",
+                result=result,
             )
             return None, None
         payload = result.get("result") if isinstance(result.get("result"), dict) else result
         bid = to_decimal(payload.get("bid"))
         ask = to_decimal(payload.get("ask"))
         if bid is None or ask is None or bid <= 0 or ask <= 0:
-            await self.append_live_inventory_log(
-                "live_inventory_basis_quote_failed",
-                {"asset": asset, "error": "missing_or_invalid_bid_ask", "result": result},
+            await self.record_live_inventory_basis_quote_failure(
+                asset=asset,
+                error="missing_or_invalid_bid_ask",
+                failure_kind="invalid_quote",
+                result=result,
             )
             return None, None
+        self.live_inventory_extension_disconnect_failures = 0
         return payload, Decimal(str(elapsed_ms))
 
     async def try_auto_close_unhedged_live_inventory_leg(
@@ -4140,6 +4398,7 @@ class VariationalToLighterRuntime:
         if exc is None:
             return
         self.logger.exception("background_task_failed: %s", name, exc_info=exc)
+        self.shutdown_reason = f"background_task_failed:{name}:{type(exc).__name__}"
         self.stop_flag = True
 
     def run_startup_diagnostics(self) -> StartupDiagnostics:
@@ -4158,6 +4417,27 @@ class VariationalToLighterRuntime:
             passed.append(f"log_dir_ready={output_dir}")
         except Exception as exc:
             blocking_errors.append(f"log_dir_unavailable: {exc}")
+        else:
+            try:
+                disk_free_gb = shutil.disk_usage(output_dir).free / (1024**3)
+                passed.append(f"disk_free_gb={disk_free_gb:.3f}")
+                if self.is_live_mode() and disk_free_gb < LIVE_DISK_STOP_FREE_GB:
+                    blocking_errors.append(
+                        "disk_free_below_live_start_threshold: "
+                        f"free_gb={disk_free_gb:.3f} "
+                        f"required_gb={LIVE_DISK_STOP_FREE_GB:.3f}"
+                    )
+                elif disk_free_gb < LIVE_DISK_WARN_FREE_GB:
+                    warnings.append(
+                        "disk_free_below_warning_threshold: "
+                        f"free_gb={disk_free_gb:.3f} "
+                        f"warning_gb={LIVE_DISK_WARN_FREE_GB:.3f}"
+                    )
+            except Exception as exc:
+                if self.is_live_mode():
+                    blocking_errors.append(f"disk_free_check_failed: {exc}")
+                else:
+                    warnings.append(f"disk_free_check_failed: {exc}")
 
         passed.append(f"mode={self.mode}")
         passed.append(f"forwarder_ws=ws://{forwarder_host}:{forwarder_ws_port}")
@@ -4351,6 +4631,10 @@ class VariationalToLighterRuntime:
         signal.signal(signal.SIGTERM, self.shutdown)
 
     def shutdown(self, signum=None, frame=None) -> None:
+        if self.shutdown_reason is None:
+            self.shutdown_reason = (
+                f"signal_{signum}" if signum is not None else "shutdown_requested"
+            )
         self.stop_flag = True
 
     def initialize_lighter_client(self) -> Any:
@@ -5941,6 +6225,7 @@ class VariationalToLighterRuntime:
             report.get("lot_id"),
             report.get("final_pnl_bps"),
         )
+        self.shutdown_reason = "v4_cycle_completed"
         self.stop_flag = True
         return True
 
@@ -11407,10 +11692,33 @@ class VariationalToLighterRuntime:
         )
         try:
             while not self.stop_flag:
+                if self.is_live_inventory_enabled():
+                    disk_asset = (
+                        self.variational_ticker
+                        or self.ticker
+                        or next(iter(self.live_allowed_assets), "UNKNOWN")
+                    )
+                    await self.maybe_enforce_live_disk_guard(asset=disk_asset)
+                    if self.stop_flag:
+                        break
                 snapshot_timeout_seconds = getattr(self, "live_inventory_snapshot_timeout_seconds", 10.0)
                 try:
                     if self.is_live_inventory_enabled():
-                        self.logger.info("live_inventory_snapshot_fetch_started timeout_seconds=%s", snapshot_timeout_seconds)
+                        now = time.monotonic()
+                        last_snapshot_log = float(
+                            getattr(
+                                self,
+                                "live_inventory_last_snapshot_fetch_log_monotonic",
+                                0.0,
+                            )
+                            or 0.0
+                        )
+                        if now - last_snapshot_log >= 30.0:
+                            self.live_inventory_last_snapshot_fetch_log_monotonic = now
+                            self.logger.info(
+                                "live_inventory_snapshot_fetch_started timeout_seconds=%s",
+                                snapshot_timeout_seconds,
+                            )
                     snapshot = await asyncio.wait_for(
                         self.get_cross_spread_snapshot(),
                         snapshot_timeout_seconds,
@@ -11434,7 +11742,8 @@ class VariationalToLighterRuntime:
                     await asyncio.sleep(self.paper_interval_seconds)
                     continue
                 if snapshot is not None:
-                    await self.append_market_sample(snapshot)
+                    if not getattr(self, "live_inventory_basis_v4_mode", False):
+                        await self.append_market_sample(snapshot)
                     await self.maybe_run_paper_inventory(snapshot)
                     try:
                         await self.maybe_run_live_inventory(snapshot)
@@ -11988,6 +12297,36 @@ class VariationalToLighterRuntime:
             await asyncio.sleep(0.25)
 
     async def close(self) -> None:
+        if (
+            self.is_live_inventory_enabled()
+            and not getattr(self, "runtime_stop_event_emitted", False)
+        ):
+            self.runtime_stop_event_emitted = True
+            stop_reason = self.shutdown_reason or "runtime_close"
+            with contextlib.suppress(Exception):
+                await self.append_live_inventory_log(
+                    "live_inventory_runtime_stopped",
+                    {
+                        "asset": self.live_inventory_state_asset(),
+                        "reason": stop_reason,
+                        "state": (
+                            "open" if self.live_inventory_open_lots else "flat"
+                        ),
+                        "open_lots_total": len(self.live_inventory_open_lots),
+                        "completed_cycles": self.live_inventory_completed_cycles,
+                        "extension_consecutive_failures": getattr(
+                            self,
+                            "live_inventory_extension_disconnect_failures",
+                            0,
+                        ),
+                    },
+                )
+            self.logger.info(
+                "live_inventory_runtime_stopped reason=%s open_lots=%s completed_cycles=%s",
+                stop_reason,
+                len(self.live_inventory_open_lots),
+                self.live_inventory_completed_cycles,
+            )
         self.stop_flag = True
 
         external_reference_task = getattr(
