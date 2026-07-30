@@ -950,6 +950,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_reversion_mode = bool(args.live_inventory_basis_reversion)
         self.live_inventory_basis_v4_profile = str(args.live_inventory_basis_v4_profile or "")
         self.live_inventory_basis_v4_mode = bool(self.live_inventory_basis_v4_profile)
+        self.live_inventory_basis_v4_test_skip_recent_health = bool(
+            args.live_inventory_basis_v4_test_skip_recent_health
+        )
         self.live_inventory_accept_basis_v4_live = bool(
             args.live_inventory_i_accept_basis_v4_live
         )
@@ -1115,6 +1118,11 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
+            else "basis-v4-live-test-v1"
+            if (
+                self.live_inventory_basis_v4_mode
+                and self.live_inventory_basis_v4_test_skip_recent_health
+            )
             else "basis-v4-live-v1"
             if self.live_inventory_basis_v4_mode
             else "cost-calibrated-reversion-v3"
@@ -1126,6 +1134,11 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
+            else f"{self.live_inventory_basis_v4_profile}-test-health-bypass"
+            if (
+                self.live_inventory_basis_v4_mode
+                and self.live_inventory_basis_v4_test_skip_recent_health
+            )
             else self.live_inventory_basis_v4_profile
             if self.live_inventory_basis_v4_mode
             else "legacy-5m-reversion"
@@ -2636,7 +2649,7 @@ class VariationalToLighterRuntime:
             ),
             default=0.0,
         )
-        health_ready = (
+        health_ready_observed = (
             len(health_rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
             and Decimal(str(health_coverage_seconds))
             >= Decimal(LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS)
@@ -2644,6 +2657,14 @@ class VariationalToLighterRuntime:
             and health_max_gap_seconds
             <= LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
         )
+        health_gate_bypassed = bool(
+            getattr(
+                self,
+                "live_inventory_basis_v4_test_skip_recent_health",
+                False,
+            )
+        )
+        health_ready = health_ready_observed or health_gate_bypassed
         context = {
             "v4_history_samples": len(self.live_inventory_basis_v4_history),
             "v4_anchor_window_seconds": LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS,
@@ -2660,6 +2681,8 @@ class VariationalToLighterRuntime:
             "v4_health_coverage_seconds": f"{health_coverage_seconds:.3f}",
             "v4_health_max_sample_gap_seconds": f"{health_max_gap_seconds:.3f}",
             "v4_health_ready": health_ready,
+            "v4_health_ready_observed": health_ready_observed,
+            "v4_health_gate_bypassed": health_gate_bypassed,
             # Compatibility fields used by the existing analyzer.
             "v4_mature_windows": (
                 [LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS]
@@ -4505,6 +4528,14 @@ class VariationalToLighterRuntime:
                     )
             if self.live_inventory:
                 passed.append("live_inventory_enabled")
+                if getattr(
+                    self,
+                    "live_inventory_basis_v4_test_skip_recent_health",
+                    False,
+                ):
+                    warnings.append(
+                        "basis_v4_test_recent_health_gate_bypassed_real_orders_enabled"
+                    )
                 if self.live_inventory_dry_decisions:
                     passed.append("live_inventory_dry_decisions_only_no_orders")
                     if getattr(self, "live_inventory_collect_only", False):
@@ -6250,6 +6281,7 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_reversion_mode",
             "live_inventory_basis_v4_profile",
             "live_inventory_basis_v4_mode",
+            "live_inventory_basis_v4_test_skip_recent_health",
             "live_inventory_accept_basis_v4_live",
             "live_inventory_basis_reversion_min_deviation_bps",
             "live_inventory_basis_reversion_exit_deviation_bps",
@@ -6330,7 +6362,14 @@ class VariationalToLighterRuntime:
                     "asset": next(iter(self.live_allowed_assets), None),
                     "profile": self.live_inventory_basis_v4_profile,
                     "entry_anchor": "rolling_7d_p97_5",
-                    "recent_health_gate": "continuous_1h",
+                    "recent_health_gate": (
+                        "bypassed_for_bounded_test"
+                        if self.live_inventory_basis_v4_test_skip_recent_health
+                        else "continuous_1h"
+                    ),
+                    "test_skip_recent_health": (
+                        self.live_inventory_basis_v4_test_skip_recent_health
+                    ),
                     "entry_direction": DIRECTION_SHORT_VAR_LONG_LIGHTER,
                     "entry_submit_mode": "concurrent",
                     "exit_submit_mode": "concurrent",
@@ -12917,6 +12956,11 @@ def parse_args() -> argparse.Namespace:
         help="Acknowledge that the selected V4 profile submits real orders.",
     )
     parser.add_argument(
+        "--live-inventory-basis-v4-test-skip-recent-health",
+        action="store_true",
+        help="Bounded V4 real-order test only: bypass the recent 1h continuity gate while retaining the rolling 7d anchor.",
+    )
+    parser.add_argument(
         "--live-inventory-execution-calibration",
         action="store_true",
         help="Opt-in real execution-cost calibration. Uses the configured direction, bypasses alpha filters, and exits after a fixed short hold.",
@@ -13361,6 +13405,10 @@ def parse_args() -> argparse.Namespace:
                 parser.error("basis V4 profile requires max Variational quote age=1500ms")
             if args.live_inventory_max_lighter_book_age_seconds != 2:
                 parser.error("basis V4 profile requires max Lighter book age=2s")
+        elif args.live_inventory_basis_v4_test_skip_recent_health:
+            parser.error(
+                "--live-inventory-basis-v4-test-skip-recent-health requires a V4 profile"
+            )
         elif args.live_inventory_i_accept_basis_v4_live:
             parser.error(
                 "--live-inventory-i-accept-basis-v4-live requires a V4 profile"

@@ -558,6 +558,33 @@ def test_v4_entry_threshold_rejects_recent_health_gap_without_dropping_anchor() 
     assert len(runtime.live_inventory_basis_v4_history) == 5760
 
 
+def test_v4_test_mode_can_bypass_recent_health_without_dropping_anchor() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_test_skip_recent_health = True
+    now = 1_000_000.0
+    health_rows = [
+        (now - 3000 + index * 30, Decimal(index))
+        for index in range(50)
+    ] + [
+        (now - 1400 + index * 30, Decimal(index + 50))
+        for index in range(50)
+    ]
+    runtime.live_inventory_basis_v4_history = _v4_rolling_anchor_rows(
+        now,
+        health_rows,
+    )
+
+    threshold, context = runtime.live_inventory_basis_v4_entry_threshold(
+        now=now
+    )
+
+    assert threshold is not None
+    assert context["v4_anchor_ready"] is True
+    assert context["v4_health_ready_observed"] is False
+    assert context["v4_health_gate_bypassed"] is True
+    assert context["v4_health_ready"] is True
+
+
 def test_v4_history_gap_preserves_rolling_anchor_before_recording() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_basis_v4_history = deque(

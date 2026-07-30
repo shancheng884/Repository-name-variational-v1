@@ -236,6 +236,12 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         ),
         "anchor_ready": anchor_context.get("v4_anchor_ready"),
         "health_ready": anchor_context.get("v4_health_ready"),
+        "health_ready_observed": anchor_context.get(
+            "v4_health_ready_observed"
+        ),
+        "health_gate_bypassed": anchor_context.get(
+            "v4_health_gate_bypassed"
+        ),
         "health_coverage_seconds": anchor_context.get("v4_health_coverage_seconds"),
         "health_max_gap_seconds": anchor_context.get(
             "v4_health_max_sample_gap_seconds"
@@ -276,6 +282,8 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"latest_window_max_gap_seconds={funnel['latest_window_max_gap_seconds']} "
         f"anchor_ready={funnel['anchor_ready']} "
         f"health_ready={funnel['health_ready']} "
+        f"health_observed={funnel['health_ready_observed']} "
+        f"health_bypassed={funnel['health_gate_bypassed']} "
         f"health_coverage_seconds={funnel['health_coverage_seconds']} "
         f"health_max_gap_seconds={funnel['health_max_gap_seconds']} "
         f"status={funnel['status']}"

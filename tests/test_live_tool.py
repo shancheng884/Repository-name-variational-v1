@@ -179,6 +179,22 @@ def test_live_tool_v4_profile_is_bounded_and_passes_main_cli_guards(monkeypatch)
     assert "--live-inventory-i-accept-basis-addon-diagnostic" not in command
 
 
+def test_live_tool_v4_test_health_bypass_is_explicit_and_temporary(
+    monkeypatch,
+) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(v4_live_mode=True),
+        v4_test_skip_recent_health=True,
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_basis_v4_test_skip_recent_health is True
+    assert "--live-inventory-basis-v4-test-skip-recent-health" in command
+
+
 def test_live_tool_collect_only_disables_all_inventory_entries(monkeypatch) -> None:
     command = build_main_command("SOL", LiveConfig(max_total_lots=3), collect_only=True)
     monkeypatch.setattr("sys.argv", command[1:])
