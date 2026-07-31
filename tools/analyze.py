@@ -96,6 +96,14 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         for row in v4_rows
         if row.get("event") == "live_inventory_entry_blocked"
     )
+    exit_block_rows = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_exit_blocked"
+    ]
+    exit_block_reasons = Counter(
+        str(row.get("reason") or "unknown") for row in exit_block_rows
+    )
     shadows = [
         row
         for row in v4_rows
@@ -188,6 +196,10 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "threshold_crossings": threshold_crossings,
         "large_move_blocks": reasons["basis_sample_move_too_large"],
         "refreshed_edge_blocks": reasons["basis_entry_refreshed_edge_below_threshold"],
+        "exit_block_reasons": dict(exit_block_reasons),
+        "entry_cost_pending_exit_blocks": exit_block_reasons[
+            "entry_final_fill_cost_pending"
+        ],
         "preflight_reached": len(shadows),
         "preflight_passed": preflight_passed,
         "preflight_blocked": preflight_blocked,
@@ -317,6 +329,12 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
             f"holding_seconds={funnel['cycle_holding_seconds']} "
             f"mfe_bps={funnel['cycle_mfe_pnl_bps']} "
             f"mae_bps={funnel['cycle_mae_pnl_bps']}"
+        )
+    if funnel["exit_block_reasons"]:
+        print(
+            f"exit_block_reasons={funnel['exit_block_reasons']} "
+            "entry_cost_pending_blocks="
+            f"{funnel['entry_cost_pending_exit_blocks']}"
         )
 
 

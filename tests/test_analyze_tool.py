@@ -166,6 +166,11 @@ def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
             },
             {
                 **common,
+                "event": "live_inventory_exit_blocked",
+                "reason": "entry_final_fill_cost_pending",
+            },
+            {
+                **common,
                 "event": "live_inventory_cycle_report",
                 "report_status": "completed",
                 "final_pnl_bps": "1.2",
@@ -185,6 +190,10 @@ def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
     assert funnel["cycle_report_status"] == "completed"
     assert funnel["cycle_final_pnl_bps"] == "1.2"
     assert funnel["cycle_mfe_pnl_bps"] == "1.4"
+    assert funnel["entry_cost_pending_exit_blocks"] == 1
+    assert funnel["exit_block_reasons"] == {
+        "entry_final_fill_cost_pending": 1
+    }
 
 
 def test_v4_live_funnel_does_not_call_reconciliation_cycle_complete() -> None:

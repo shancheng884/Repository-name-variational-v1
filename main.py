@@ -3795,6 +3795,33 @@ class VariationalToLighterRuntime:
                 "entered_at": lot.get("entered_at"),
             }
         )
+        # Some entry paths already have both venue fills when the lot is
+        # created. Seed the final-fill ledger before syncing the open lot so
+        # that confirmed costs cannot be downgraded back to pending.
+        if lot.get("entry_var_price_source") == "final_fill":
+            pending.update(
+                {
+                    "entry_var_final_fill_price": lot.get("entry_var_fill_price"),
+                    "entry_var_final_fill_at": lot.get("entry_var_final_fill_at"),
+                    "entry_var_final_fill_qty": lot.get("entry_var_final_fill_qty")
+                    or lot.get("qty"),
+                }
+            )
+        if lot.get("entry_lighter_price_source") == "final_fill":
+            pending.update(
+                {
+                    "entry_lighter_final_fill_price": lot.get(
+                        "entry_lighter_fill_price"
+                    ),
+                    "entry_lighter_final_fill_at": lot.get(
+                        "entry_lighter_final_fill_at"
+                    ),
+                    "entry_lighter_final_fill_qty": lot.get(
+                        "entry_lighter_final_fill_qty"
+                    )
+                    or lot.get("qty"),
+                }
+            )
 
     def sync_live_inventory_open_lot_entry_cost(self, *, asset: str, lot_id: Any) -> bool:
         open_lots = getattr(self, "live_inventory_open_lots", [])
@@ -3832,7 +3859,20 @@ class VariationalToLighterRuntime:
             if entry_lighter_qty is not None and lot.get("entry_lighter_final_fill_qty") != entry_lighter_qty:
                 lot["entry_lighter_final_fill_qty"] = entry_lighter_qty
                 updated = True
-            cost_status = "final_fills_confirmed" if entry_var_price is not None and entry_lighter_price is not None else "final_fills_pending"
+            final_prices_available = (
+                entry_var_price is not None and entry_lighter_price is not None
+            )
+            final_sources_already_confirmed = (
+                lot.get("entry_var_price_source") == "final_fill"
+                and lot.get("entry_lighter_price_source") == "final_fill"
+                and to_decimal(lot.get("entry_var_fill_price")) is not None
+                and to_decimal(lot.get("entry_lighter_fill_price")) is not None
+            )
+            cost_status = (
+                "final_fills_confirmed"
+                if final_prices_available or final_sources_already_confirmed
+                else "final_fills_pending"
+            )
             if lot.get("entry_cost_status") != cost_status:
                 lot["entry_cost_status"] = cost_status
                 updated = True
@@ -3841,7 +3881,14 @@ class VariationalToLighterRuntime:
 
     @staticmethod
     def live_inventory_entry_cost_confirmed(lot: dict[str, Any]) -> bool:
-        return lot.get("entry_cost_status") == "final_fills_confirmed"
+        if lot.get("entry_cost_status") == "final_fills_confirmed":
+            return True
+        return (
+            lot.get("entry_var_price_source") == "final_fill"
+            and lot.get("entry_lighter_price_source") == "final_fill"
+            and to_decimal(lot.get("entry_var_fill_price")) is not None
+            and to_decimal(lot.get("entry_lighter_fill_price")) is not None
+        )
 
     async def maybe_append_live_inventory_final_pnl_from_fill(self, payload: dict[str, Any]) -> None:
         role = str(payload.get("auto_live_role") or "")

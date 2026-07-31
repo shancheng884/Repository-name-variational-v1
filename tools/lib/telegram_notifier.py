@@ -15,15 +15,21 @@ TELEGRAM_EVENT_TYPES = {
     "live_inventory_final_pnl",
     "live_inventory_entry_blocked",
     "live_inventory_v4_entry_blocked",
+    "live_inventory_exit_blocked",
     "live_inventory_manual_review_required",
     "live_inventory_runtime_fuse_triggered",
     "live_inventory_basis_quote_failed",
+}
+
+TELEGRAM_CRITICAL_EXIT_BLOCK_REASONS = {
+    "entry_final_fill_cost_pending",
 }
 
 TELEGRAM_THROTTLED_EVENT_TYPES = {
     "live_inventory_entry_blocked",
     "live_inventory_v4_entry_blocked",
     "live_inventory_basis_quote_failed",
+    "live_inventory_exit_blocked",
 }
 
 
@@ -113,6 +119,19 @@ def format_telegram_trade_message(
                 f"suppressed_repeats={_value(payload, 'telegram_suppressed_repeats')}",
             ]
         )
+    if event_type == "live_inventory_exit_blocked":
+        return "\n".join(
+            [
+                "[Var/Lighter] EXIT BLOCKED",
+                f"asset={asset} direction={direction}",
+                f"reason={_value(payload, 'reason')}",
+                f"pnl_bps={_value(payload, 'pnl_bps')}",
+                "target_bps="
+                f"{_value(payload, 'effective_min_exit_pnl_bps')}",
+                f"holding_seconds={_value(payload, 'holding_seconds')}",
+                f"suppressed_repeats={_value(payload, 'telegram_suppressed_repeats')}",
+            ]
+        )
     if event_type == "live_inventory_manual_review_required":
         return "\n".join(
             [
@@ -182,6 +201,12 @@ class TelegramNotifier:
 
     def enqueue(self, event_type: str, payload: dict[str, Any]) -> bool:
         if not self.enabled or event_type not in TELEGRAM_EVENT_TYPES:
+            return False
+        if (
+            event_type == "live_inventory_exit_blocked"
+            and str(payload.get("reason") or "")
+            not in TELEGRAM_CRITICAL_EXIT_BLOCK_REASONS
+        ):
             return False
         if event_type in TELEGRAM_THROTTLED_EVENT_TYPES:
             throttle_key = (

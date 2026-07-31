@@ -417,6 +417,48 @@ def test_live_inventory_blocks_spread_reverted_exit_until_entry_cost_confirmed(t
     asyncio.run(run())
 
 
+def test_confirmed_entry_fill_ledger_cannot_be_downgraded_to_pending(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    lot = {
+        "lot_id": 1,
+        "direction": "short_var_long_lighter",
+        "qty": "0.0105",
+        "entry_var_fill_price": "1900.25",
+        "entry_lighter_fill_price": "1901.10",
+        "entry_var_final_fill_qty": "0.0105",
+        "entry_lighter_final_fill_qty": "0.0105",
+        "entry_var_price_source": "final_fill",
+        "entry_lighter_price_source": "final_fill",
+        "entry_cost_status": "final_fills_confirmed",
+    }
+    runtime.live_inventory_open_lots = [lot]
+
+    runtime.remember_live_inventory_final_pnl_lot(asset="ETH", lot=lot)
+    updated = runtime.sync_live_inventory_open_lot_entry_cost(
+        asset="ETH",
+        lot_id=1,
+    )
+
+    pending = runtime.pending_live_inventory_final_pnl["ETH:1"]
+    assert pending["entry_var_final_fill_price"] == "1900.25"
+    assert pending["entry_lighter_final_fill_price"] == "1901.10"
+    assert lot["entry_cost_status"] == "final_fills_confirmed"
+    assert runtime.live_inventory_entry_cost_confirmed(lot) is True
+    assert updated is False
+
+
+def test_entry_cost_confirmation_accepts_consistent_final_fill_sources() -> None:
+    assert VariationalToLighterRuntime.live_inventory_entry_cost_confirmed(
+        {
+            "entry_cost_status": "final_fills_pending",
+            "entry_var_price_source": "final_fill",
+            "entry_lighter_price_source": "final_fill",
+            "entry_var_fill_price": "1900.25",
+            "entry_lighter_fill_price": "1901.10",
+        }
+    ) is True
+
+
 def test_reversion_signal_exit_floor_is_separate_from_normal_exit_floor() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_basis_min_signal_reverted_exit_pnl_bps = Decimal("3")

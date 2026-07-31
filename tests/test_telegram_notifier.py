@@ -89,6 +89,46 @@ def test_telegram_final_pnl_message_contains_final_values() -> None:
     assert "pnl_bps=5.0" in message
 
 
+def test_telegram_only_pushes_critical_exit_cost_block() -> None:
+    notifier = TelegramNotifier(
+        bot_token="secret-token",
+        chat_id="123",
+        logger=logging.getLogger("test_telegram"),
+        throttle_seconds=300,
+    )
+
+    assert notifier.enqueue(
+        "live_inventory_exit_blocked",
+        {
+            "asset": "ETH",
+            "reason": "basis_exit_refresh_pnl_below_threshold",
+        },
+    ) is False
+    assert notifier.enqueue(
+        "live_inventory_exit_blocked",
+        {
+            "asset": "ETH",
+            "direction": "short_var_long_lighter",
+            "reason": "entry_final_fill_cost_pending",
+            "pnl_bps": "4.37",
+            "effective_min_exit_pnl_bps": "1.50",
+        },
+    ) is True
+    assert notifier.enqueue(
+        "live_inventory_exit_blocked",
+        {
+            "asset": "ETH",
+            "reason": "entry_final_fill_cost_pending",
+        },
+    ) is False
+
+    event_type, payload = notifier.queue.get_nowait()
+    message = format_telegram_trade_message(event_type, payload)
+    assert "[Var/Lighter] EXIT BLOCKED" in message
+    assert "reason=entry_final_fill_cost_pending" in message
+    assert "pnl_bps=4.37" in message
+
+
 def test_telegram_worker_sends_queued_event_without_exposing_token(
     monkeypatch,
 ) -> None:
