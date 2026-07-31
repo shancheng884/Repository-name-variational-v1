@@ -149,7 +149,7 @@ def test_v4_live_funnel_reports_anchor_progress_and_runtime_fuse() -> None:
 def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
     common = {
         "run_id": "live-v4-cycle",
-        "strategy_version": "basis-v4-live-v1",
+        "strategy_version": "basis-v4-live-v2",
         "asset": "ETH",
     }
     funnel = build_v4_live_funnel(
@@ -171,11 +171,18 @@ def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
             },
             {
                 **common,
+                "event": "live_inventory_exit_blocked",
+                "reason": "v4_exit_confirmation_pending",
+            },
+            {
+                **common,
                 "event": "live_inventory_cycle_report",
                 "report_status": "completed",
                 "final_pnl_bps": "1.2",
                 "final_pnl_usd": "0.0024",
                 "exit_reason": "v4_executable_net_target_reached",
+                "v4_exit_shortfall_reserve_bps": "6.65",
+                "effective_min_exit_pnl_bps": "7.65",
                 "holding_seconds": 900,
                 "shadow_mfe_pnl_bps": "1.4",
                 "shadow_mae_pnl_bps": "-0.8",
@@ -189,10 +196,14 @@ def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
     assert funnel["exit_pair_submit_elapsed_ms"] == "170.2"
     assert funnel["cycle_report_status"] == "completed"
     assert funnel["cycle_final_pnl_bps"] == "1.2"
+    assert funnel["cycle_exit_shortfall_reserve_bps"] == "6.65"
+    assert funnel["cycle_effective_min_exit_pnl_bps"] == "7.65"
     assert funnel["cycle_mfe_pnl_bps"] == "1.4"
     assert funnel["entry_cost_pending_exit_blocks"] == 1
+    assert funnel["exit_confirmation_pending_blocks"] == 1
     assert funnel["exit_block_reasons"] == {
-        "entry_final_fill_cost_pending": 1
+        "entry_final_fill_cost_pending": 1,
+        "v4_exit_confirmation_pending": 1,
     }
 
 

@@ -71,8 +71,11 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     v4_rows = [
         row
         for row in rows
-        if row.get("strategy_version") == "basis-v4-live-v1"
+        if str(row.get("strategy_version") or "").startswith("basis-v4-live")
         or row.get("basis_v4_profile")
+        or str(row.get("entry_v4_profile") or "").startswith(
+            "eth_short_execution_calibrated_"
+        )
         or str(row.get("profile") or "").startswith("eth_short_execution_calibrated_")
     ]
     if not v4_rows:
@@ -200,6 +203,9 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "entry_cost_pending_exit_blocks": exit_block_reasons[
             "entry_final_fill_cost_pending"
         ],
+        "exit_confirmation_pending_blocks": exit_block_reasons[
+            "v4_exit_confirmation_pending"
+        ],
         "preflight_reached": len(shadows),
         "preflight_passed": preflight_passed,
         "preflight_blocked": preflight_blocked,
@@ -220,10 +226,22 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "cycle_final_pnl_bps": latest_cycle_report.get("final_pnl_bps"),
         "cycle_final_pnl_usd": latest_cycle_report.get("final_pnl_usd"),
         "cycle_exit_reason": latest_cycle_report.get("exit_reason"),
+        "cycle_exit_shortfall_reserve_bps": latest_cycle_report.get(
+            "v4_exit_shortfall_reserve_bps"
+        ),
+        "cycle_effective_min_exit_pnl_bps": latest_cycle_report.get(
+            "effective_min_exit_pnl_bps"
+        ),
         "cycle_holding_seconds": latest_cycle_report.get("holding_seconds"),
         "cycle_mfe_pnl_bps": latest_cycle_report.get("shadow_mfe_pnl_bps"),
         "cycle_mae_pnl_bps": latest_cycle_report.get("shadow_mae_pnl_bps"),
         "latest_edge_bps": latest_state.get("short_edge_bps"),
+        "latest_raw_threshold_bps": latest_state.get(
+            "v4_raw_entry_threshold_bps"
+        ),
+        "latest_entry_execution_reserve_bps": latest_state.get(
+            "v4_entry_execution_reserve_bps"
+        ),
         "latest_threshold_bps": latest_state.get("v4_entry_threshold_bps"),
         "latest_window_seconds": anchor_context.get("v4_baseline_window_seconds"),
         "latest_window_max_gap_seconds": anchor_context.get(
@@ -289,6 +307,8 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
     )
     print(
         f"latest_edge_bps={funnel['latest_edge_bps']} "
+        f"latest_raw_threshold_bps={funnel['latest_raw_threshold_bps']} "
+        f"entry_execution_reserve_bps={funnel['latest_entry_execution_reserve_bps']} "
         f"latest_threshold_bps={funnel['latest_threshold_bps']} "
         f"latest_window_seconds={funnel['latest_window_seconds']} "
         f"latest_window_max_gap_seconds={funnel['latest_window_max_gap_seconds']} "
@@ -326,6 +346,8 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
             f"final_pnl_bps={funnel['cycle_final_pnl_bps']} "
             f"final_pnl_usd={funnel['cycle_final_pnl_usd']} "
             f"exit_reason={funnel['cycle_exit_reason']} "
+            f"exit_shortfall_reserve_bps={funnel['cycle_exit_shortfall_reserve_bps']} "
+            f"effective_exit_target_bps={funnel['cycle_effective_min_exit_pnl_bps']} "
             f"holding_seconds={funnel['cycle_holding_seconds']} "
             f"mfe_bps={funnel['cycle_mfe_pnl_bps']} "
             f"mae_bps={funnel['cycle_mae_pnl_bps']}"
@@ -334,7 +356,9 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         print(
             f"exit_block_reasons={funnel['exit_block_reasons']} "
             "entry_cost_pending_blocks="
-            f"{funnel['entry_cost_pending_exit_blocks']}"
+            f"{funnel['entry_cost_pending_exit_blocks']} "
+            "exit_confirmation_pending_blocks="
+            f"{funnel['exit_confirmation_pending_blocks']}"
         )
 
 

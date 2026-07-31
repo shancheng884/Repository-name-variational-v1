@@ -421,6 +421,7 @@ def build_main_command(
                 "--live-inventory-basis-max-hold-action",
                 "exit",
                 "--live-inventory-basis-refresh-exit-quote-before-submit",
+                "--live-inventory-basis-dynamic-exit-buffer",
                 "--live-inventory-min-hold-samples",
                 "0",
                 "--live-inventory-max-hold-samples",

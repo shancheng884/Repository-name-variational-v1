@@ -425,6 +425,8 @@ def test_confirmed_entry_fill_ledger_cannot_be_downgraded_to_pending(tmp_path) -
         "qty": "0.0105",
         "entry_var_fill_price": "1900.25",
         "entry_lighter_fill_price": "1901.10",
+        "entry_estimated_var_price": "1900.00",
+        "entry_estimated_lighter_price": "1900.80",
         "entry_var_final_fill_qty": "0.0105",
         "entry_lighter_final_fill_qty": "0.0105",
         "entry_var_price_source": "final_fill",
@@ -442,6 +444,8 @@ def test_confirmed_entry_fill_ledger_cannot_be_downgraded_to_pending(tmp_path) -
     pending = runtime.pending_live_inventory_final_pnl["ETH:1"]
     assert pending["entry_var_final_fill_price"] == "1900.25"
     assert pending["entry_lighter_final_fill_price"] == "1901.10"
+    assert pending["entry_estimated_var_price"] == "1900.00"
+    assert pending["entry_estimated_lighter_price"] == "1900.80"
     assert lot["entry_cost_status"] == "final_fills_confirmed"
     assert runtime.live_inventory_entry_cost_confirmed(lot) is True
     assert updated is False
@@ -525,6 +529,120 @@ def test_v4_entry_threshold_uses_rolling_7d_anchor_with_recent_health() -> None:
     assert context["v4_baseline_count"] == 5760
     assert context["v4_anchor_effective_seconds"] == 172800
     assert Decimal("97") <= threshold < Decimal("99")
+
+
+def test_v4_entry_threshold_adds_recent_entry_capture_loss_reserve() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_execution_loss_bps_samples = deque(
+        [Decimal("0.64"), Decimal("3.19")],
+        maxlen=20,
+    )
+    now = 1_000_000.0
+    recent_rows = [
+        (now - 3000 + index * 30, Decimal(index))
+        for index in range(100)
+    ]
+    runtime.live_inventory_basis_v4_history = _v4_rolling_anchor_rows(
+        now,
+        recent_rows,
+    )
+
+    threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
+
+    assert context["v4_raw_entry_threshold_bps"] == "97"
+    assert context["v4_entry_execution_reserve_bps"] == "3.19"
+    assert threshold == Decimal("100.19")
+    assert context["v4_entry_threshold_bps"] == "100.19"
+
+
+def test_v4_exit_target_uses_larger_observed_shortfall_and_two_confirmations() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_dynamic_exit_buffer = True
+    runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
+        [Decimal("0.64"), Decimal("6.65")],
+        maxlen=20,
+    )
+    lot: dict[str, object] = {}
+
+    assert runtime.live_inventory_basis_v4_exit_shortfall_reserve_bps() == Decimal(
+        "6.65"
+    )
+    assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
+        "7.65"
+    )
+    assert runtime.live_inventory_basis_v4_confirm_exit_candidate(
+        lot,
+        eligible=True,
+    ) == (False, 1)
+    assert runtime.live_inventory_basis_v4_confirm_exit_candidate(
+        lot,
+        eligible=True,
+    ) == (True, 2)
+    assert runtime.live_inventory_basis_v4_confirm_exit_candidate(
+        lot,
+        eligible=False,
+    ) == (False, 0)
+    assert "v4_exit_confirmation_count" not in lot
+
+
+def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
+    tmp_path,
+) -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.orders_file = Path(tmp_path) / "order_metrics.jsonl"
+    runtime.logger = logging.getLogger("test_v4_execution_reserve_loader")
+    runtime.live_inventory_execution_loss_bps_samples = deque(maxlen=20)
+    runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(maxlen=20)
+    rows = [
+        {
+            "event": "live_inventory_final_pnl",
+            "strategy_version": "basis-v4-live-test-v1",
+            "asset": "ETH",
+            "direction": "short_var_long_lighter",
+            "final_pnl_status": "var_and_lighter_final_fills_confirmed",
+            "entry_edge_capture_loss_bps": "3.19",
+        },
+        {
+            "event": "live_inventory_actual_pnl",
+            "strategy_version": "basis-v4-live-test-v1",
+            "asset": "ETH",
+            "direction": "short_var_long_lighter",
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "estimated_pnl_bps": "5.19",
+            "actual_pnl_bps": "-1.46",
+        },
+        {
+            "event": "live_inventory_final_pnl",
+            "strategy_version": "execution-calibration-v1",
+            "asset": "ETH",
+            "direction": "short_var_long_lighter",
+            "final_pnl_status": "var_and_lighter_final_fills_confirmed",
+            "entry_edge_capture_loss_bps": "99",
+        },
+        {
+            "event": "live_inventory_actual_pnl",
+            "strategy_version": "basis-v4-live-v1",
+            "asset": "BTC",
+            "direction": "short_var_long_lighter",
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "estimated_pnl_bps": "99",
+            "actual_pnl_bps": "0",
+        },
+    ]
+    runtime.orders_file.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    runtime.load_recent_live_inventory_execution_loss_bps()
+    runtime.load_recent_live_inventory_exit_shortfall_bps()
+
+    assert list(runtime.live_inventory_execution_loss_bps_samples) == [
+        Decimal("3.19")
+    ]
+    assert list(runtime.live_inventory_exit_estimate_shortfall_bps_samples) == [
+        Decimal("6.65")
+    ]
 
 
 def test_v4_entry_threshold_accepts_36h_effective_7d_anchor() -> None:
