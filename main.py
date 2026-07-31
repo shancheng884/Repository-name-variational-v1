@@ -1200,6 +1200,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_projection_cache: dict[str, Any] = {}
         self.live_inventory_extension_disconnect_failures = 0
         self.live_inventory_extension_disconnect_fuse_triggered = False
+        self.live_inventory_last_fatal_quote_failure_kind: str | None = None
         self.live_inventory_last_disk_check_monotonic = 0.0
         self.live_inventory_last_disk_warning_monotonic = 0.0
         self.live_inventory_last_snapshot_fetch_log_monotonic = 0.0
@@ -2943,11 +2944,35 @@ class VariationalToLighterRuntime:
         failure_kind: str,
         result: dict[str, Any] | None = None,
     ) -> None:
-        error_text = bounded_text(str(error or "unknown"), max_chars=500)
+        raw_error_text = str(error or "unknown")
+        raw_error_lower = raw_error_text.lower()
         extension_disconnected = (
-            "No extension command client connected" in error_text
+            "no extension command client connected" in raw_error_lower
         )
-        if extension_disconnected:
+        html_response = (
+            "<!doctype html" in raw_error_lower
+            or "<html" in raw_error_lower
+        )
+        fatal_failure_kind = (
+            "variational_extension_disconnected"
+            if extension_disconnected
+            else "variational_html_response"
+            if html_response
+            else None
+        )
+        error_text = (
+            fatal_failure_kind
+            if fatal_failure_kind == "variational_html_response"
+            else bounded_text(raw_error_text, max_chars=500)
+        )
+        if fatal_failure_kind is not None:
+            previous_kind = getattr(
+                self,
+                "live_inventory_last_fatal_quote_failure_kind",
+                None,
+            )
+            if previous_kind not in {None, fatal_failure_kind}:
+                self.live_inventory_extension_disconnect_failures = 0
             self.live_inventory_extension_disconnect_failures = (
                 int(
                     getattr(
@@ -2959,23 +2984,30 @@ class VariationalToLighterRuntime:
                 )
                 + 1
             )
+            self.live_inventory_last_fatal_quote_failure_kind = (
+                fatal_failure_kind
+            )
         else:
             self.live_inventory_extension_disconnect_failures = 0
+            self.live_inventory_last_fatal_quote_failure_kind = None
         failure_count = self.live_inventory_extension_disconnect_failures
         await self.append_live_inventory_log(
             "live_inventory_basis_quote_failed",
             {
                 "asset": asset,
                 "error": error_text,
+                "error_original_chars": len(raw_error_text),
                 "failure_kind": failure_kind,
                 "extension_disconnected": extension_disconnected,
+                "html_response": html_response,
+                "fatal_quote_failure_kind": fatal_failure_kind,
                 "extension_consecutive_failures": failure_count,
                 "extension_failure_limit": LIVE_INVENTORY_EXTENSION_DISCONNECT_FAILURE_LIMIT,
                 "result_step": result.get("step") if isinstance(result, dict) else None,
             },
         )
         if (
-            not extension_disconnected
+            fatal_failure_kind is None
             or failure_count < LIVE_INVENTORY_EXTENSION_DISCONNECT_FAILURE_LIMIT
             or getattr(
                 self,
@@ -2986,12 +3018,13 @@ class VariationalToLighterRuntime:
             return
 
         self.live_inventory_extension_disconnect_fuse_triggered = True
-        self.shutdown_reason = "variational_extension_disconnected"
+        self.shutdown_reason = fatal_failure_kind
         fuse_payload = {
             "asset": asset,
             "reason": self.shutdown_reason,
             "extension_consecutive_failures": failure_count,
             "extension_failure_limit": LIVE_INVENTORY_EXTENSION_DISCONNECT_FAILURE_LIMIT,
+            "fatal_quote_failure_kind": fatal_failure_kind,
             "open_lots_total": len(self.live_inventory_open_lots),
             "action": (
                 "manual_exchange_review_required"
@@ -3603,44 +3636,108 @@ class VariationalToLighterRuntime:
                     ),
                 },
             )
-        await self.append_live_inventory_log(
-            "live_inventory_actual_pnl",
+        actual_pnl_payload = {
+            **pending,
+            "actual_pnl_status": (
+                "lighter_final_fill_confirmed"
+                if var_roundtrip_qty_match and lighter_roundtrip_qty_match
+                else "leg_quantity_mismatch_requires_reconciliation"
+            ),
+            "planned_qty": decimal_to_str(planned_qty),
+            "entry_var_final_fill_qty": decimal_to_str(entry_var_qty),
+            "exit_var_final_fill_qty": decimal_to_str(exit_var_qty),
+            "actual_var_pnl_qty": decimal_to_str(var_qty),
+            "entry_lighter_final_fill_qty": decimal_to_str(entry_lighter_qty),
+            "exit_lighter_final_fill_qty": decimal_to_str(exit_lighter_qty),
+            "actual_lighter_pnl_qty": decimal_to_str(lighter_qty),
+            "var_roundtrip_qty_match": var_roundtrip_qty_match,
+            "lighter_roundtrip_qty_match": lighter_roundtrip_qty_match,
+            "cross_venue_entry_qty_delta": decimal_to_str(
+                entry_var_qty - entry_lighter_qty
+            ),
+            "cross_venue_exit_qty_delta": decimal_to_str(
+                exit_var_qty - exit_lighter_qty
+            ),
+            "exit_lighter_final_fill_price": decimal_to_str(
+                exit_lighter_price
+            ),
+            "estimated_exit_lighter_price": decimal_to_str(
+                estimated_exit_lighter_price
+            ),
+            "exit_lighter_slippage_bps": decimal_to_str(
+                exit_lighter_slippage_bps
+            ),
+            "exit_lighter_slippage_exceeds_limit": bool(
+                exit_lighter_slippage_bps is not None
+                and exit_lighter_slippage_bps
+                > self.live_inventory_max_lighter_slippage_bps
+            ),
+            "max_lighter_slippage_bps": decimal_to_str(
+                self.live_inventory_max_lighter_slippage_bps
+            ),
+            "estimated_vs_actual_pnl_shortfall_usd": decimal_to_str(
+                pnl_shortfall_usd
+            ),
+            "estimated_vs_actual_pnl_shortfall_bps": decimal_to_str(
+                estimated_pnl_bps - actual_pnl_bps
+                if estimated_pnl_bps is not None
+                and actual_pnl_bps is not None
+                else None
+            ),
+            "exit_var_fill_to_lighter_fill_ms": var_fill_to_lighter_fill_ms,
+            "actual_var_leg_pnl_usd": decimal_to_str(var_leg_pnl),
+            "actual_lighter_leg_pnl_usd": decimal_to_str(lighter_leg_pnl),
+            "actual_pnl_usd": decimal_to_str(actual_pnl),
+            "actual_pnl_bps": decimal_to_str(actual_pnl_bps),
+            "exit_lighter_payload": payload,
+        }
+        final_key = self.live_inventory_final_pnl_key(
+            str(pending.get("asset") or ""),
+            pending.get("lot_id"),
+        )
+        final_pending = self.pending_live_inventory_final_pnl.setdefault(
+            final_key,
+            {},
+        )
+        final_pending.update(
             {
-                **pending,
-                "actual_pnl_status": (
-                    "lighter_final_fill_confirmed"
-                    if var_roundtrip_qty_match and lighter_roundtrip_qty_match
-                    else "leg_quantity_mismatch_requires_reconciliation"
+                **{
+                    key: value
+                    for key, value in pending.items()
+                    if key not in {"final_pnl_emitted"}
+                },
+                "asset": pending.get("asset"),
+                "lot_id": pending.get("lot_id"),
+                "direction": direction,
+                "qty": decimal_to_str(planned_qty),
+                "entry_var_final_fill_price": decimal_to_str(entry_var_price),
+                "entry_lighter_final_fill_price": decimal_to_str(
+                    entry_lighter_price
                 ),
-                "planned_qty": decimal_to_str(planned_qty),
+                "exit_var_final_fill_price": decimal_to_str(exit_var_price),
+                "exit_lighter_final_fill_price": decimal_to_str(
+                    exit_lighter_price
+                ),
                 "entry_var_final_fill_qty": decimal_to_str(entry_var_qty),
                 "exit_var_final_fill_qty": decimal_to_str(exit_var_qty),
-                "actual_var_pnl_qty": decimal_to_str(var_qty),
-                "entry_lighter_final_fill_qty": decimal_to_str(entry_lighter_qty),
-                "exit_lighter_final_fill_qty": decimal_to_str(exit_lighter_qty),
-                "actual_lighter_pnl_qty": decimal_to_str(lighter_qty),
-                "var_roundtrip_qty_match": var_roundtrip_qty_match,
-                "lighter_roundtrip_qty_match": lighter_roundtrip_qty_match,
-                "cross_venue_entry_qty_delta": decimal_to_str(entry_var_qty - entry_lighter_qty),
-                "cross_venue_exit_qty_delta": decimal_to_str(exit_var_qty - exit_lighter_qty),
-                "exit_lighter_final_fill_price": decimal_to_str(exit_lighter_price),
-                "estimated_exit_lighter_price": decimal_to_str(estimated_exit_lighter_price),
-                "exit_lighter_slippage_bps": decimal_to_str(exit_lighter_slippage_bps),
-                "exit_lighter_slippage_exceeds_limit": bool(
-                    exit_lighter_slippage_bps is not None and exit_lighter_slippage_bps > self.live_inventory_max_lighter_slippage_bps
+                "entry_lighter_final_fill_qty": decimal_to_str(
+                    entry_lighter_qty
                 ),
-                "max_lighter_slippage_bps": decimal_to_str(self.live_inventory_max_lighter_slippage_bps),
-                "estimated_vs_actual_pnl_shortfall_usd": decimal_to_str(pnl_shortfall_usd),
-                "estimated_vs_actual_pnl_shortfall_bps": decimal_to_str(
-                    estimated_pnl_bps - actual_pnl_bps if estimated_pnl_bps is not None and actual_pnl_bps is not None else None
+                "exit_lighter_final_fill_qty": decimal_to_str(
+                    exit_lighter_qty
                 ),
-                "exit_var_fill_to_lighter_fill_ms": var_fill_to_lighter_fill_ms,
-                "actual_var_leg_pnl_usd": decimal_to_str(var_leg_pnl),
-                "actual_lighter_leg_pnl_usd": decimal_to_str(lighter_leg_pnl),
-                "actual_pnl_usd": decimal_to_str(actual_pnl),
-                "actual_pnl_bps": decimal_to_str(actual_pnl_bps),
-                "exit_lighter_payload": payload,
-            },
+                "final_pnl_source": (
+                    "actual_pnl_confirmed_fill_reconciliation"
+                ),
+                "actual_pnl_status": actual_pnl_payload[
+                    "actual_pnl_status"
+                ],
+            }
+        )
+        await self.maybe_append_live_inventory_final_pnl(final_key)
+        await self.append_live_inventory_log(
+            "live_inventory_actual_pnl",
+            actual_pnl_payload,
         )
         await self.persist_live_inventory_memory(reason="actual_pnl_final_fill_update")
         await self.maybe_auto_stop_completed_v4_cycle()

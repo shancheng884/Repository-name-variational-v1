@@ -720,6 +720,53 @@ def test_non_extension_quote_failure_resets_disconnect_counter() -> None:
     asyncio.run(run())
 
 
+def test_html_quote_failure_is_normalized_and_fuses_flat_runtime() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(
+            VariationalToLighterRuntime
+        )
+        runtime.live_inventory_extension_disconnect_failures = 0
+        runtime.live_inventory_extension_disconnect_fuse_triggered = False
+        runtime.live_inventory_last_fatal_quote_failure_kind = None
+        runtime.live_inventory_open_lots = []
+        runtime.stop_flag = False
+        runtime.shutdown_reason = None
+        runtime.logger = logging.getLogger("test_html_quote_fuse")
+        events: list[tuple[str, dict]] = []
+
+        async def capture(event: str, payload: dict) -> None:
+            events.append((event, payload))
+
+        runtime.append_live_inventory_log = capture
+        html_error = (
+            "<!doctype html><html><style>"
+            + ("x" * 10_000)
+            + "</style></html>"
+        )
+        for _ in range(3):
+            await runtime.record_live_inventory_basis_quote_failure(
+                asset="ETH",
+                error=html_error,
+                failure_kind="command_rejected",
+            )
+
+        assert runtime.stop_flag is True
+        assert runtime.shutdown_reason == "variational_html_response"
+        failures = [
+            payload
+            for event, payload in events
+            if event == "live_inventory_basis_quote_failed"
+        ]
+        assert failures[-1]["error"] == "variational_html_response"
+        assert failures[-1]["error_original_chars"] == len(html_error)
+        assert failures[-1]["html_response"] is True
+        assert [event for event, _ in events].count(
+            "live_inventory_runtime_fuse_triggered"
+        ) == 1
+
+    asyncio.run(run())
+
+
 def test_extension_disconnect_fuse_requires_review_when_position_is_open() -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
@@ -3405,6 +3452,16 @@ def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path) -> 
         assert state["reason"] == "actual_pnl_final_fill_update"
         assert "exit-1" not in runtime.pending_live_inventory_actual_pnl
         assert getattr(runtime, "live_inventory_calibration_halted_reason", None) is None
+        final_rows = [
+            row
+            for row in rows
+            if row["event"] == "live_inventory_final_pnl"
+        ]
+        assert len(final_rows) == 1
+        assert final_rows[0]["final_pnl_source"] == (
+            "actual_pnl_confirmed_fill_reconciliation"
+        )
+        assert final_rows[0]["final_pnl_usd"] == "0.02509222"
 
     asyncio.run(run())
 
