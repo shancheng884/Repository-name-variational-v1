@@ -95,6 +95,16 @@ LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE = Decimal("0.80")
 LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES = 100
 LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS = 129600
 LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS = Decimal("0.50")
+LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES = 10
+LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_CAP_BPS = Decimal("3.00")
+LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
+    {
+        "basis-v4-live-v2",
+        "basis-v4-live-test-v2",
+        "basis-v4-live-v3",
+        "basis-v4-live-test-v3",
+    }
+)
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
 LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES = 2
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
@@ -1121,12 +1131,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
-            else "basis-v4-live-test-v2"
+            else "basis-v4-live-test-v3"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else "basis-v4-live-v2"
+            else "basis-v4-live-v3"
             if self.live_inventory_basis_v4_mode
             else "cost-calibrated-reversion-v3"
             if self.live_inventory_basis_reversion_mode
@@ -1137,12 +1147,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v2-test-health-bypass"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v3-test-health-bypass"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v2"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v3"
             if self.live_inventory_basis_v4_mode
             else "legacy-5m-reversion"
             if self.live_inventory_basis_reversion_mode
@@ -1353,8 +1363,8 @@ class VariationalToLighterRuntime:
                         row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if not str(row.get("strategy_version") or "").startswith(
-                        "basis-v4-live"
+                    if str(row.get("strategy_version") or "") not in (
+                        LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS
                     ):
                         continue
                     if str(row.get("asset") or "").upper() != "ETH":
@@ -1367,9 +1377,9 @@ class VariationalToLighterRuntime:
                     actual_bps = to_decimal(row.get("actual_pnl_bps"))
                     if estimated_bps is None or actual_bps is None:
                         continue
-                    shortfall = estimated_bps - actual_bps
-                    if shortfall > 0:
-                        samples.append(shortfall)
+                    # Zero-shortfall fills are real observations and must count
+                    # toward calibration maturity instead of biasing the sample.
+                    samples.append(max(estimated_bps - actual_bps, Decimal("0")))
         except OSError as exc:
             self.logger.warning("Could not load recent live inventory exit shortfall samples: %s", exc)
             return
@@ -1380,11 +1390,55 @@ class VariationalToLighterRuntime:
             return Decimal("0")
         return self.percentile_decimal(getattr(self, "live_inventory_exit_estimate_shortfall_bps_samples", []), 80) or Decimal("0")
 
-    def live_inventory_basis_v4_exit_shortfall_reserve_bps(self) -> Decimal:
-        return max(
-            LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS,
-            self.live_inventory_dynamic_exit_buffer_bps(),
+    def live_inventory_basis_v4_exit_calibration_context(self) -> dict[str, Any]:
+        samples = list(
+            getattr(self, "live_inventory_exit_estimate_shortfall_bps_samples", [])
         )
+        sample_count = len(samples)
+        raw_p80_bps = self.percentile_decimal(samples, 80) or Decimal("0")
+        ready = bool(
+            self.live_inventory_basis_dynamic_exit_buffer
+            and sample_count >= LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES
+        )
+        applied_dynamic_bps = (
+            min(raw_p80_bps, LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_CAP_BPS)
+            if ready
+            else Decimal("0")
+        )
+        reserve_bps = max(
+            LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS,
+            applied_dynamic_bps,
+        )
+        return {
+            "sample_count": sample_count,
+            "min_samples": LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES,
+            "ready": ready,
+            "raw_p80_bps": raw_p80_bps,
+            "cap_bps": LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_CAP_BPS,
+            "applied_dynamic_bps": applied_dynamic_bps,
+            "reserve_bps": reserve_bps,
+        }
+
+    def live_inventory_basis_v4_exit_calibration_payload(self) -> dict[str, Any]:
+        context = self.live_inventory_basis_v4_exit_calibration_context()
+        return {
+            "v4_exit_shortfall_sample_count": context["sample_count"],
+            "v4_exit_shortfall_min_samples": context["min_samples"],
+            "v4_exit_shortfall_calibration_ready": context["ready"],
+            "v4_exit_shortfall_raw_p80_bps": decimal_to_str(
+                context["raw_p80_bps"]
+            ),
+            "v4_exit_shortfall_cap_bps": decimal_to_str(context["cap_bps"]),
+            "v4_exit_shortfall_applied_dynamic_bps": decimal_to_str(
+                context["applied_dynamic_bps"]
+            ),
+            "v4_exit_shortfall_reserve_bps": decimal_to_str(
+                context["reserve_bps"]
+            ),
+        }
+
+    def live_inventory_basis_v4_exit_shortfall_reserve_bps(self) -> Decimal:
+        return self.live_inventory_basis_v4_exit_calibration_context()["reserve_bps"]
 
     def live_inventory_basis_v4_effective_exit_target_bps(self) -> Decimal:
         return (
@@ -6607,6 +6661,7 @@ class VariationalToLighterRuntime:
                     "observed_exit_shortfall_p80_bps": decimal_to_str(
                         self.live_inventory_dynamic_exit_buffer_bps()
                     ),
+                    **self.live_inventory_basis_v4_exit_calibration_payload(),
                     "entry_execution_reserve_p80_bps": decimal_to_str(
                         self.live_inventory_recent_execution_loss_buffer_bps()
                     ),
@@ -6614,7 +6669,7 @@ class VariationalToLighterRuntime:
                         LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
                     ),
                     "max_hold_seconds": LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS,
-                    "execution_policy": "adaptive_execution_v2",
+                    "execution_policy": "adaptive_execution_v3",
                     "shadow_features": [
                         "stablecoin_alignment",
                         "spread_regime",
@@ -9910,9 +9965,12 @@ class VariationalToLighterRuntime:
                 return
         selected_exit: dict[str, Any] | None = None
         dynamic_exit_buffer_bps = self.live_inventory_dynamic_exit_buffer_bps()
-        v4_exit_shortfall_reserve_bps = (
-            self.live_inventory_basis_v4_exit_shortfall_reserve_bps()
+        v4_exit_calibration_payload = (
+            self.live_inventory_basis_v4_exit_calibration_payload()
         )
+        v4_exit_shortfall_reserve_bps = to_decimal(
+            v4_exit_calibration_payload["v4_exit_shortfall_reserve_bps"]
+        ) or LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS
         for lot_index, candidate_lot in enumerate(self.live_inventory_open_lots):
             direction = str(candidate_lot.get("direction") or "")
             entered_sample_index = int(candidate_lot.get("entered_sample_index") or index)
@@ -10605,6 +10663,7 @@ class VariationalToLighterRuntime:
                     "v4_exit_shortfall_reserve_bps": decimal_to_str(
                         v4_exit_shortfall_reserve_bps
                     ),
+                    **v4_exit_calibration_payload,
                     **{
                         key: value
                         for key, value in exit_pair_context.items()
@@ -10646,6 +10705,7 @@ class VariationalToLighterRuntime:
                     "v4_exit_shortfall_reserve_bps": decimal_to_str(
                         v4_exit_shortfall_reserve_bps
                     ),
+                    **v4_exit_calibration_payload,
                     "exit_submit_mode": "concurrent" if v4_mode else "sequential",
                     **{
                         key: value
@@ -10694,6 +10754,7 @@ class VariationalToLighterRuntime:
                 "v4_exit_shortfall_reserve_bps": decimal_to_str(
                     v4_exit_shortfall_reserve_bps
                 ),
+                **v4_exit_calibration_payload,
                 "effective_min_exit_pnl_bps": decimal_to_str(effective_min_exit_pnl_bps),
                 "var_price": decimal_to_str(var_exit_price),
                 "lighter_price": decimal_to_str(lighter_exit_price),

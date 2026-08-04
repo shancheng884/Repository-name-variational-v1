@@ -555,7 +555,7 @@ def test_v4_entry_threshold_adds_recent_entry_capture_loss_reserve() -> None:
     assert context["v4_entry_threshold_bps"] == "100.19"
 
 
-def test_v4_exit_target_uses_larger_observed_shortfall_and_two_confirmations() -> None:
+def test_v4_exit_target_uses_floor_until_calibration_is_mature() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_basis_dynamic_exit_buffer = True
     runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
@@ -565,11 +565,15 @@ def test_v4_exit_target_uses_larger_observed_shortfall_and_two_confirmations() -
     lot: dict[str, object] = {}
 
     assert runtime.live_inventory_basis_v4_exit_shortfall_reserve_bps() == Decimal(
-        "6.65"
+        "0.50"
     )
     assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
-        "7.65"
+        "1.50"
     )
+    context = runtime.live_inventory_basis_v4_exit_calibration_context()
+    assert context["sample_count"] == 2
+    assert context["ready"] is False
+    assert context["raw_p80_bps"] == Decimal("6.65")
     assert runtime.live_inventory_basis_v4_confirm_exit_candidate(
         lot,
         eligible=True,
@@ -583,6 +587,28 @@ def test_v4_exit_target_uses_larger_observed_shortfall_and_two_confirmations() -
         eligible=False,
     ) == (False, 0)
     assert "v4_exit_confirmation_count" not in lot
+
+
+def test_v4_exit_target_caps_mature_observed_shortfall() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_dynamic_exit_buffer = True
+    runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
+        [Decimal("0.10")] * 7 + [Decimal("6.65")] * 3,
+        maxlen=20,
+    )
+
+    context = runtime.live_inventory_basis_v4_exit_calibration_context()
+
+    assert context["sample_count"] == 10
+    assert context["ready"] is True
+    assert context["raw_p80_bps"] == Decimal("6.65")
+    assert context["applied_dynamic_bps"] == Decimal("3.00")
+    assert runtime.live_inventory_basis_v4_exit_shortfall_reserve_bps() == Decimal(
+        "3.00"
+    )
+    assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
+        "4.00"
+    )
 
 
 def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
@@ -610,6 +636,24 @@ def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
             "actual_pnl_status": "lighter_final_fill_confirmed",
             "estimated_pnl_bps": "5.19",
             "actual_pnl_bps": "-1.46",
+        },
+        {
+            "event": "live_inventory_actual_pnl",
+            "strategy_version": "basis-v4-live-test-v2",
+            "asset": "ETH",
+            "direction": "short_var_long_lighter",
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "estimated_pnl_bps": "1.08",
+            "actual_pnl_bps": "1.08",
+        },
+        {
+            "event": "live_inventory_actual_pnl",
+            "strategy_version": "basis-v4-live-v3",
+            "asset": "ETH",
+            "direction": "short_var_long_lighter",
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "estimated_pnl_bps": "2.50",
+            "actual_pnl_bps": "0.50",
         },
         {
             "event": "live_inventory_final_pnl",
@@ -641,7 +685,8 @@ def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
         Decimal("3.19")
     ]
     assert list(runtime.live_inventory_exit_estimate_shortfall_bps_samples) == [
-        Decimal("6.65")
+        Decimal("0"),
+        Decimal("2.00"),
     ]
 
 

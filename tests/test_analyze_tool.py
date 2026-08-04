@@ -182,6 +182,12 @@ def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
                 "final_pnl_usd": "0.0024",
                 "exit_reason": "v4_executable_net_target_reached",
                 "v4_exit_shortfall_reserve_bps": "6.65",
+                "v4_exit_shortfall_sample_count": 10,
+                "v4_exit_shortfall_min_samples": 10,
+                "v4_exit_shortfall_calibration_ready": True,
+                "v4_exit_shortfall_raw_p80_bps": "6.65",
+                "v4_exit_shortfall_cap_bps": "3.00",
+                "v4_exit_shortfall_applied_dynamic_bps": "3.00",
                 "effective_min_exit_pnl_bps": "7.65",
                 "holding_seconds": 900,
                 "shadow_mfe_pnl_bps": "1.4",
@@ -199,6 +205,9 @@ def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
     assert funnel["cycle_exit_shortfall_reserve_bps"] == "6.65"
     assert funnel["cycle_effective_min_exit_pnl_bps"] == "7.65"
     assert funnel["cycle_mfe_pnl_bps"] == "1.4"
+    assert funnel["exit_shortfall_sample_count"] == 10
+    assert funnel["exit_shortfall_calibration_ready"] is True
+    assert funnel["exit_shortfall_applied_dynamic_bps"] == "3.00"
     assert funnel["entry_cost_pending_exit_blocks"] == 1
     assert funnel["exit_confirmation_pending_blocks"] == 1
     assert funnel["exit_block_reasons"] == {

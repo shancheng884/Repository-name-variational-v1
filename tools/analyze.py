@@ -128,6 +128,13 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         row for row in v4_rows if row.get("event") == "live_inventory_cycle_report"
     ]
     latest_cycle_report = cycle_reports[-1] if cycle_reports else {}
+    strategy_snapshots = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_strategy_snapshot"
+    ]
+    latest_strategy_snapshot = strategy_snapshots[-1] if strategy_snapshots else {}
+    exit_calibration = latest_cycle_report or latest_strategy_snapshot
     final_pnl_rows = [
         row for row in v4_rows if row.get("event") == "live_inventory_final_pnl"
     ]
@@ -235,6 +242,31 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "cycle_holding_seconds": latest_cycle_report.get("holding_seconds"),
         "cycle_mfe_pnl_bps": latest_cycle_report.get("shadow_mfe_pnl_bps"),
         "cycle_mae_pnl_bps": latest_cycle_report.get("shadow_mae_pnl_bps"),
+        "exit_shortfall_sample_count": exit_calibration.get(
+            "v4_exit_shortfall_sample_count"
+        ),
+        "exit_shortfall_min_samples": exit_calibration.get(
+            "v4_exit_shortfall_min_samples"
+        ),
+        "exit_shortfall_calibration_ready": exit_calibration.get(
+            "v4_exit_shortfall_calibration_ready"
+        ),
+        "exit_shortfall_raw_p80_bps": exit_calibration.get(
+            "v4_exit_shortfall_raw_p80_bps"
+        ),
+        "exit_shortfall_cap_bps": exit_calibration.get(
+            "v4_exit_shortfall_cap_bps"
+        ),
+        "exit_shortfall_applied_dynamic_bps": exit_calibration.get(
+            "v4_exit_shortfall_applied_dynamic_bps"
+        ),
+        "exit_shortfall_reserve_bps": exit_calibration.get(
+            "v4_exit_shortfall_reserve_bps"
+        ),
+        "effective_exit_target_bps": (
+            exit_calibration.get("effective_min_exit_pnl_bps")
+            or exit_calibration.get("quoted_exit_target_bps")
+        ),
         "latest_edge_bps": latest_state.get("short_edge_bps"),
         "latest_raw_threshold_bps": latest_state.get(
             "v4_raw_entry_threshold_bps"
@@ -329,6 +361,19 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"projected_ready_seconds={funnel['anchor_projected_ready_seconds']} "
         f"projected_ready_at={funnel['anchor_projected_ready_at']}"
     )
+    if funnel["exit_shortfall_sample_count"] is not None:
+        print(
+            "exit_calibration_samples="
+            f"{funnel['exit_shortfall_sample_count']} "
+            f"min_samples={funnel['exit_shortfall_min_samples']} "
+            f"ready={funnel['exit_shortfall_calibration_ready']} "
+            f"raw_p80_bps={funnel['exit_shortfall_raw_p80_bps']} "
+            f"applied_dynamic_bps="
+            f"{funnel['exit_shortfall_applied_dynamic_bps']} "
+            f"cap_bps={funnel['exit_shortfall_cap_bps']} "
+            f"reserve_bps={funnel['exit_shortfall_reserve_bps']} "
+            f"effective_target_bps={funnel['effective_exit_target_bps']}"
+        )
     if funnel["runtime_fuses"] or funnel["runtime_stop_reason"]:
         print(
             f"quote_failures={funnel['quote_failures']} "
