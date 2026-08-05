@@ -6632,7 +6632,7 @@ class VariationalToLighterRuntime:
             getattr(
                 self,
                 "live_inventory_basis_v4_cycle_cooldown_seconds",
-                180.0,
+                0.0,
             )
         )
         cooldown_remaining_seconds = (
@@ -13503,8 +13503,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--live-inventory-basis-v4-cycle-cooldown-seconds",
         type=float,
-        default=180.0,
-        help="Minimum delay after a reconciled V4 exit before another entry. Default: 180 seconds",
+        default=0.0,
+        help="Optional delay after a reconciled V4 exit before another entry. Default: 0 seconds",
     )
     parser.add_argument(
         "--live-inventory-execution-calibration",
