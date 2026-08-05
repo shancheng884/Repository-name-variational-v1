@@ -206,7 +206,7 @@ def test_live_tool_v4_batch_is_sequential_bounded_and_guarded(
         LiveConfig(
             v4_live_mode=True,
             max_cycles=9,
-            v4_test_max_run_loss_usd="0.05",
+            v4_test_max_run_loss_usd="0",
             v4_test_cycle_cooldown_seconds=0,
         ),
         v4_test_skip_recent_health=True,
@@ -219,7 +219,7 @@ def test_live_tool_v4_batch_is_sequential_bounded_and_guarded(
     assert args.live_inventory_max_lots == 1
     assert args.live_inventory_max_total_lots == 1
     assert args.live_inventory_basis_v4_test_skip_recent_health is True
-    assert args.live_inventory_basis_v4_max_run_loss_usd == 0.05
+    assert args.live_inventory_basis_v4_max_run_loss_usd == 0
     assert args.live_inventory_basis_v4_cycle_cooldown_seconds == 0
 
 

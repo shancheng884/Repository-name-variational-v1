@@ -6650,7 +6650,7 @@ class VariationalToLighterRuntime:
             "cycle_cooldown_seconds": cooldown_seconds,
             "cooldown_remaining_seconds": round(cooldown_remaining_seconds, 3),
         }
-        if run_pnl_usd <= -max_run_loss_usd:
+        if max_run_loss_usd > 0 and run_pnl_usd <= -max_run_loss_usd:
             return False, "v4_batch_max_run_loss_reached", context
         if pending_actual_pnl or unresolved_final_pnl:
             return False, "v4_batch_waiting_for_reconciliation", context
@@ -13497,8 +13497,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--live-inventory-basis-v4-max-run-loss-usd",
         type=float,
-        default=0.05,
-        help="Stop a bounded multi-cycle V4 test after this cumulative actual run loss. Default: 0.05 USD",
+        default=0.0,
+        help="Optional cumulative actual run-loss stop for a V4 batch. Zero disables it. Default: 0",
     )
     parser.add_argument(
         "--live-inventory-basis-v4-cycle-cooldown-seconds",
@@ -13929,8 +13929,8 @@ def parse_args() -> argparse.Namespace:
                 parser.error(
                     "multi-cycle basis V4 requires the explicit bounded-test health bypass"
                 )
-            if args.live_inventory_basis_v4_max_run_loss_usd <= 0:
-                parser.error("basis V4 max run loss must be > 0")
+            if args.live_inventory_basis_v4_max_run_loss_usd < 0:
+                parser.error("basis V4 max run loss must be >= 0")
             if args.live_inventory_basis_v4_cycle_cooldown_seconds < 0:
                 parser.error("basis V4 cycle cooldown must be >= 0")
             if (

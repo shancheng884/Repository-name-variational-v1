@@ -74,7 +74,7 @@ class LiveConfig:
     calibration_max_cycle_loss_usd: str = "0.10"
     calibration_max_roundtrip_cost_bps: str = "6.0"
     v4_live_mode: bool = False
-    v4_test_max_run_loss_usd: str = "0.05"
+    v4_test_max_run_loss_usd: str = "0"
     v4_test_cycle_cooldown_seconds: int = 0
     entry_lighter_fill_timeout_seconds: str = "3"
     snapshot_timeout_seconds: str = "10"
@@ -312,7 +312,10 @@ def load_config(path: Path) -> LiveConfig:
         calibration_max_cycle_loss_usd=_positive_decimal(raw, "calibration_max_cycle_loss_usd"),
         calibration_max_roundtrip_cost_bps=_positive_decimal(raw, "calibration_max_roundtrip_cost_bps"),
         v4_live_mode=bool(raw.get("v4_live_mode", DEFAULT_CONFIG.v4_live_mode)),
-        v4_test_max_run_loss_usd=_positive_decimal(raw, "v4_test_max_run_loss_usd"),
+        v4_test_max_run_loss_usd=_non_negative_decimal(
+            raw,
+            "v4_test_max_run_loss_usd",
+        ),
         v4_test_cycle_cooldown_seconds=_non_negative_int(
             raw,
             "v4_test_cycle_cooldown_seconds",

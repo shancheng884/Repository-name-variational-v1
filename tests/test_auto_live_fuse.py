@@ -4086,7 +4086,7 @@ def test_v4_batch_entry_gate_waits_for_reconciliation_and_cooldown(tmp_path) -> 
     assert reason == "ready"
 
 
-def test_v4_batch_entry_gate_stops_at_cumulative_actual_loss(tmp_path) -> None:
+def test_v4_batch_entry_gate_supports_optional_cumulative_loss_limit(tmp_path) -> None:
     runtime = _live_inventory_runtime(tmp_path)
     runtime.live_inventory_basis_v4_mode = True
     runtime.live_inventory_max_cycles = 5
@@ -4102,6 +4102,24 @@ def test_v4_batch_entry_gate_stops_at_cumulative_actual_loss(tmp_path) -> None:
     assert ready is False
     assert reason == "v4_batch_max_run_loss_reached"
     assert context["batch_run_pnl_usd"] == "-0.05"
+
+
+def test_v4_batch_entry_gate_disables_cumulative_loss_limit_at_zero(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_max_cycles = 9
+    runtime.live_inventory_basis_v4_max_run_loss_usd = Decimal("0")
+    runtime.live_inventory_basis_v4_cycle_cooldown_seconds = 0.0
+    runtime.live_inventory_v4_run_start_realized_pnl_usd = Decimal("1.00")
+    runtime.live_inventory_realized_pnl_usd = Decimal("-10.00")
+
+    ready, reason, context = runtime.live_inventory_v4_batch_entry_gate(
+        now_monotonic=300.0
+    )
+
+    assert ready is True
+    assert reason == "ready"
+    assert context["batch_max_run_loss_usd"] == "0"
 
 
 def test_v4_basis_state_logging_is_adaptive_but_keeps_crossings(tmp_path) -> None:
