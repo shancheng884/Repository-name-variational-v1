@@ -233,6 +233,42 @@ def test_v4_live_funnel_does_not_call_reconciliation_cycle_complete() -> None:
     assert funnel["status"] == "ERROR_RECONCILIATION_REQUIRED"
 
 
+def test_v4_live_funnel_reports_intermediate_batch_checkpoint() -> None:
+    common = {
+        "run_id": "live-v4-batch",
+        "strategy_version": "basis-v4-live-test-v3",
+        "asset": "ETH",
+    }
+    funnel = build_v4_live_funnel(
+        [
+            {**common, "event": "live_inventory_entered", "lot_id": 1},
+            {**common, "event": "live_inventory_exited", "lot_id": 1},
+            {
+                **common,
+                "event": "live_inventory_v4_cycle_checkpoint",
+                "lot_id": 1,
+                "completed_cycles": 1,
+                "max_cycles": 5,
+                "cumulative_run_pnl_usd": "0.003",
+            },
+            {
+                **common,
+                "event": "live_inventory_v4_batch_waiting",
+                "reason": "v4_batch_cycle_cooldown",
+                "cooldown_remaining_seconds": 120,
+                "batch_run_pnl_usd": "0.003",
+            },
+        ]
+    )
+
+    assert funnel is not None
+    assert funnel["status"] == "WAITING_FOR_NEXT_BATCH_CYCLE"
+    assert funnel["cycle_checkpoints"] == 1
+    assert funnel["completed_cycles"] == 1
+    assert funnel["max_cycles"] == 5
+    assert funnel["batch_wait_reason"] == "v4_batch_cycle_cooldown"
+
+
 def test_basis_v4_formal_profile_accepts_only_versioned_calibrated_eth_short_config() -> None:
     common = {
         "evaluation_interval_seconds": 1,

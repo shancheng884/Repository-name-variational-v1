@@ -965,6 +965,12 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_test_skip_recent_health = bool(
             args.live_inventory_basis_v4_test_skip_recent_health
         )
+        self.live_inventory_basis_v4_max_run_loss_usd = Decimal(
+            str(args.live_inventory_basis_v4_max_run_loss_usd)
+        )
+        self.live_inventory_basis_v4_cycle_cooldown_seconds = float(
+            args.live_inventory_basis_v4_cycle_cooldown_seconds
+        )
         self.live_inventory_accept_basis_v4_live = bool(
             args.live_inventory_i_accept_basis_v4_live
         )
@@ -1158,6 +1164,10 @@ class VariationalToLighterRuntime:
             if self.live_inventory_basis_reversion_mode
             else "legacy-basis"
         )
+        if self.live_inventory_basis_v4_mode and self.live_inventory_max_cycles > 1:
+            self.live_inventory_strategy_variant += (
+                f"-bounded-batch-{self.live_inventory_max_cycles}"
+            )
         strategy_config = {
             key: str(value)
             for key, value in vars(args).items()
@@ -1167,6 +1177,10 @@ class VariationalToLighterRuntime:
             json.dumps(strategy_config, ensure_ascii=True, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
         self.live_inventory_calibration_start_realized_pnl_usd = Decimal("0")
+        self.live_inventory_v4_run_start_realized_pnl_usd = Decimal("0")
+        self.live_inventory_v4_last_exit_monotonic = 0.0
+        self.live_inventory_v4_batch_halted_reason: str | None = None
+        self.live_inventory_v4_checkpointed_lot_ids: set[str] = set()
         self.live_inventory_calibration_last_exit_sample_index: int | None = None
         self.live_inventory_calibration_halted_reason: str | None = None
         self.pending_live_inventory_actual_pnl: dict[str, dict[str, Any]] = {}
@@ -3724,8 +3738,9 @@ class VariationalToLighterRuntime:
             if not hasattr(self, "live_inventory_exit_estimate_shortfall_bps_samples"):
                 self.live_inventory_exit_estimate_shortfall_bps_samples = deque(maxlen=20)
             shortfall_bps = estimated_pnl_bps - actual_pnl_bps
-            if shortfall_bps > 0:
-                self.live_inventory_exit_estimate_shortfall_bps_samples.append(shortfall_bps)
+            self.live_inventory_exit_estimate_shortfall_bps_samples.append(
+                max(shortfall_bps, Decimal("0"))
+            )
         direction = str(pending.get("direction") or "")
         if actual_pnl_bps is not None and direction in getattr(self, "live_inventory_actual_pnl_bps_by_direction", {}):
             self.live_inventory_actual_pnl_bps_by_direction[direction].append(actual_pnl_bps)
@@ -6484,11 +6499,13 @@ class VariationalToLighterRuntime:
         if (
             not getattr(self, "live_inventory_basis_v4_mode", False)
             or getattr(self, "live_inventory_dry_decisions", False)
-            or getattr(self, "live_inventory_cycle_report_emitted", False)
             or getattr(self, "live_inventory_open_lots", [])
-            or int(getattr(self, "live_inventory_completed_cycles", 0))
-            < int(getattr(self, "live_inventory_max_cycles", 1))
         ):
+            return False
+        completed_cycles = int(getattr(self, "live_inventory_completed_cycles", 0))
+        max_cycles = int(getattr(self, "live_inventory_max_cycles", 1))
+        final_cycle = completed_cycles >= max_cycles
+        if final_cycle and getattr(self, "live_inventory_cycle_report_emitted", False):
             return False
         final_payload = getattr(self, "live_inventory_last_final_pnl_payload", None)
         if not final_payload:
@@ -6500,6 +6517,8 @@ class VariationalToLighterRuntime:
             return False
         final_status = str(final_payload.get("final_pnl_status") or "")
         if final_status != "var_and_lighter_final_fills_confirmed":
+            if not final_cycle:
+                return False
             await self.append_live_inventory_log(
                 "live_inventory_cycle_report",
                 {
@@ -6510,6 +6529,42 @@ class VariationalToLighterRuntime:
                 },
             )
             self.live_inventory_cycle_report_emitted = True
+            return False
+
+        if not final_cycle:
+            checkpointed = getattr(
+                self,
+                "live_inventory_v4_checkpointed_lot_ids",
+                set(),
+            )
+            if lot_id not in checkpointed:
+                report = {
+                    **final_payload,
+                    "report_status": "completed",
+                    "auto_stop": False,
+                    "open_lots": 0,
+                    "pending_actual_pnl": 0,
+                    "completed_cycles": completed_cycles,
+                    "max_cycles": max_cycles,
+                    "next_cycle": completed_cycles + 1,
+                    "cumulative_run_pnl_usd": decimal_to_str(
+                        getattr(self, "live_inventory_realized_pnl_usd", Decimal("0"))
+                        - getattr(
+                            self,
+                            "live_inventory_v4_run_start_realized_pnl_usd",
+                            Decimal("0"),
+                        )
+                    ),
+                }
+                await self.append_live_inventory_log(
+                    "live_inventory_v4_cycle_checkpoint",
+                    report,
+                )
+                checkpointed.add(lot_id)
+                self.live_inventory_v4_checkpointed_lot_ids = checkpointed
+                await self.persist_live_inventory_memory(
+                    reason="v4_cycle_checkpoint_completed"
+                )
             return False
 
         report = {
@@ -6534,6 +6589,75 @@ class VariationalToLighterRuntime:
         self.stop_flag = True
         return True
 
+    def live_inventory_v4_batch_entry_gate(
+        self,
+        *,
+        now_monotonic: float | None = None,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        if (
+            not getattr(self, "live_inventory_basis_v4_mode", False)
+            or int(getattr(self, "live_inventory_max_cycles", 1)) <= 1
+        ):
+            return True, "ready", {}
+
+        run_pnl_usd = (
+            getattr(self, "live_inventory_realized_pnl_usd", Decimal("0"))
+            - getattr(
+                self,
+                "live_inventory_v4_run_start_realized_pnl_usd",
+                Decimal("0"),
+            )
+        )
+        max_run_loss_usd = getattr(
+            self,
+            "live_inventory_basis_v4_max_run_loss_usd",
+            Decimal("0.05"),
+        )
+        unresolved_final_pnl = sum(
+            not bool(payload.get("final_pnl_emitted"))
+            for payload in getattr(
+                self,
+                "pending_live_inventory_final_pnl",
+                {},
+            ).values()
+        )
+        pending_actual_pnl = len(
+            getattr(self, "pending_live_inventory_actual_pnl", {})
+        )
+        now = time.monotonic() if now_monotonic is None else now_monotonic
+        last_exit = float(
+            getattr(self, "live_inventory_v4_last_exit_monotonic", 0.0) or 0.0
+        )
+        cooldown_seconds = float(
+            getattr(
+                self,
+                "live_inventory_basis_v4_cycle_cooldown_seconds",
+                180.0,
+            )
+        )
+        cooldown_remaining_seconds = (
+            max(0.0, cooldown_seconds - (now - last_exit)) if last_exit else 0.0
+        )
+        context = {
+            "completed_cycles": int(
+                getattr(self, "live_inventory_completed_cycles", 0)
+            ),
+            "max_cycles": int(getattr(self, "live_inventory_max_cycles", 1)),
+            "batch_run_pnl_usd": decimal_to_str(run_pnl_usd),
+            "batch_max_run_loss_usd": decimal_to_str(max_run_loss_usd),
+            "pending_actual_pnl": pending_actual_pnl,
+            "unresolved_final_pnl": unresolved_final_pnl,
+            "cycle_cooldown_seconds": cooldown_seconds,
+            "cooldown_remaining_seconds": round(cooldown_remaining_seconds, 3),
+        }
+        if run_pnl_usd <= -max_run_loss_usd:
+            return False, "v4_batch_max_run_loss_reached", context
+        if pending_actual_pnl or unresolved_final_pnl:
+            return False, "v4_batch_waiting_for_reconciliation", context
+        if cooldown_remaining_seconds > 0:
+            return False, "v4_batch_cycle_cooldown", context
+        return True, "ready", context
+
     async def append_live_inventory_entry_shadow_candidate(self, payload: dict[str, Any]) -> None:
         await self.append_live_inventory_log("live_inventory_entry_shadow_candidate", payload)
 
@@ -6556,6 +6680,8 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_v4_profile",
             "live_inventory_basis_v4_mode",
             "live_inventory_basis_v4_test_skip_recent_health",
+            "live_inventory_basis_v4_max_run_loss_usd",
+            "live_inventory_basis_v4_cycle_cooldown_seconds",
             "live_inventory_accept_basis_v4_live",
             "live_inventory_basis_reversion_min_deviation_bps",
             "live_inventory_basis_reversion_exit_deviation_bps",
@@ -6652,6 +6778,13 @@ class VariationalToLighterRuntime:
                     ),
                     "max_total_lots": self.live_inventory_max_total_lots,
                     "max_cycles": self.live_inventory_max_cycles,
+                    "batch_mode": self.live_inventory_max_cycles > 1,
+                    "batch_max_run_loss_usd": decimal_to_str(
+                        self.live_inventory_basis_v4_max_run_loss_usd
+                    ),
+                    "batch_cycle_cooldown_seconds": (
+                        self.live_inventory_basis_v4_cycle_cooldown_seconds
+                    ),
                     "quoted_exit_target_bps": decimal_to_str(
                         self.live_inventory_basis_v4_effective_exit_target_bps()
                     ),
@@ -8157,6 +8290,40 @@ class VariationalToLighterRuntime:
                     },
                 )
             return
+        if v4_mode and not self.live_inventory_open_lots:
+            batch_ready, batch_reason, batch_context = (
+                self.live_inventory_v4_batch_entry_gate()
+            )
+            if not batch_ready:
+                if batch_reason == "v4_batch_max_run_loss_reached":
+                    if not self.live_inventory_v4_batch_halted_reason:
+                        self.live_inventory_v4_batch_halted_reason = batch_reason
+                        await self.append_live_inventory_log(
+                            "live_inventory_runtime_fuse_triggered",
+                            {
+                                "asset": asset,
+                                "sample_index": index,
+                                "reason": batch_reason,
+                                **batch_context,
+                            },
+                        )
+                        await self.persist_live_inventory_memory(
+                            reason=batch_reason
+                        )
+                    self.shutdown_reason = batch_reason
+                    self.stop_flag = True
+                    return
+                if index == 1 or index % 30 == 0:
+                    await self.append_live_inventory_log(
+                        "live_inventory_v4_batch_waiting",
+                        {
+                            "asset": asset,
+                            "sample_index": index,
+                            "reason": batch_reason,
+                            **batch_context,
+                        },
+                    )
+                return
         if calibration_mode and not self.live_inventory_open_lots:
             if not self.live_inventory_calibration_entry_time_allowed():
                 if index == 1 or index % 30 == 0:
@@ -10635,6 +10802,8 @@ class VariationalToLighterRuntime:
         self.live_inventory_open_lots.pop(lot_index)
         self.live_inventory_realized_pnl_usd += pnl
         self.live_inventory_completed_cycles += 1
+        if v4_mode:
+            self.live_inventory_v4_last_exit_monotonic = time.monotonic()
         if calibration_mode:
             self.live_inventory_calibration_last_exit_sample_index = index
         await self.persist_live_inventory_memory(reason="basis_dry_exit_decision" if self.live_inventory_dry_decisions else "basis_exit_submitted")
@@ -12667,6 +12836,7 @@ class VariationalToLighterRuntime:
         if self.is_live_inventory_enabled():
             self.sync_live_inventory_memory_from_state()
             self.live_inventory_calibration_start_realized_pnl_usd = self.live_inventory_realized_pnl_usd
+            self.live_inventory_v4_run_start_realized_pnl_usd = self.live_inventory_realized_pnl_usd
             if not self.live_inventory_dry_decisions:
                 await self.reconcile_live_inventory_startup_state()
 
@@ -13325,6 +13495,18 @@ def parse_args() -> argparse.Namespace:
         help="Bounded V4 real-order test only: bypass the recent 1h continuity gate while retaining the rolling 7d anchor.",
     )
     parser.add_argument(
+        "--live-inventory-basis-v4-max-run-loss-usd",
+        type=float,
+        default=0.05,
+        help="Stop a bounded multi-cycle V4 test after this cumulative actual run loss. Default: 0.05 USD",
+    )
+    parser.add_argument(
+        "--live-inventory-basis-v4-cycle-cooldown-seconds",
+        type=float,
+        default=180.0,
+        help="Minimum delay after a reconciled V4 exit before another entry. Default: 180 seconds",
+    )
+    parser.add_argument(
         "--live-inventory-execution-calibration",
         action="store_true",
         help="Opt-in real execution-cost calibration. Uses the configured direction, bypasses alpha filters, and exits after a fixed short hold.",
@@ -13736,12 +13918,21 @@ def parse_args() -> argparse.Namespace:
                 parser.error(
                     "basis V4 requires --live-inventory-i-accept-basis-v4-live"
                 )
+            if args.live_inventory_max_cycles < 1 or args.live_inventory_max_cycles > 10:
+                parser.error("basis V4 requires max_cycles between 1 and 10")
+            if args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 1:
+                parser.error("basis V4 requires one total lot")
             if (
-                args.live_inventory_max_cycles != 1
-                or args.live_inventory_max_lots != 1
-                or args.live_inventory_max_total_lots != 1
+                args.live_inventory_max_cycles > 1
+                and not args.live_inventory_basis_v4_test_skip_recent_health
             ):
-                parser.error("basis V4 requires max_cycles=1 and one total lot")
+                parser.error(
+                    "multi-cycle basis V4 requires the explicit bounded-test health bypass"
+                )
+            if args.live_inventory_basis_v4_max_run_loss_usd <= 0:
+                parser.error("basis V4 max run loss must be > 0")
+            if args.live_inventory_basis_v4_cycle_cooldown_seconds < 0:
+                parser.error("basis V4 cycle cooldown must be >= 0")
             if (
                 args.live_inventory_lot_notional_usd != 20
                 or args.live_inventory_max_total_notional_usd != 25

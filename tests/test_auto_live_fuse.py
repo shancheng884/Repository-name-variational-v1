@@ -4011,6 +4011,99 @@ def test_v4_completed_cycle_waits_for_actual_pnl_queue(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_v4_intermediate_cycle_checkpoints_without_stopping(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_v4_mode = True
+        runtime.live_inventory_cycle_report_emitted = False
+        runtime.live_inventory_last_final_pnl_payload = None
+        runtime.live_inventory_exit_events_logged = {"9"}
+        runtime.live_inventory_v4_checkpointed_lot_ids = set()
+        runtime.live_inventory_open_lots = []
+        runtime.live_inventory_completed_cycles = 1
+        runtime.live_inventory_max_cycles = 5
+        runtime.live_inventory_v4_run_start_realized_pnl_usd = Decimal("0")
+        runtime.live_inventory_realized_pnl_usd = Decimal("0.003")
+        runtime.stop_flag = False
+
+        async def fake_persist_live_inventory_memory(**_kwargs):
+            return None
+
+        runtime.persist_live_inventory_memory = fake_persist_live_inventory_memory
+        stopped = await runtime.maybe_auto_stop_completed_v4_cycle(
+            {
+                "asset": "ETH",
+                "lot_id": 9,
+                "final_pnl_status": "var_and_lighter_final_fills_confirmed",
+                "final_pnl_bps": "1.2",
+            }
+        )
+
+        assert stopped is False
+        assert runtime.stop_flag is False
+        assert runtime.live_inventory_cycle_report_emitted is False
+        rows = [
+            json.loads(line)
+            for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()
+        ]
+        assert rows[-1]["event"] == "live_inventory_v4_cycle_checkpoint"
+        assert rows[-1]["completed_cycles"] == 1
+        assert rows[-1]["next_cycle"] == 2
+        assert rows[-1]["cumulative_run_pnl_usd"] == "0.003"
+
+    asyncio.run(run())
+
+
+def test_v4_batch_entry_gate_waits_for_reconciliation_and_cooldown(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_max_cycles = 5
+    runtime.live_inventory_basis_v4_max_run_loss_usd = Decimal("0.05")
+    runtime.live_inventory_basis_v4_cycle_cooldown_seconds = 180.0
+    runtime.live_inventory_v4_run_start_realized_pnl_usd = Decimal("0")
+    runtime.live_inventory_realized_pnl_usd = Decimal("0.01")
+    runtime.live_inventory_v4_last_exit_monotonic = 100.0
+    runtime.pending_live_inventory_actual_pnl = {"trade": {}}
+
+    ready, reason, _ = runtime.live_inventory_v4_batch_entry_gate(
+        now_monotonic=200.0
+    )
+    assert ready is False
+    assert reason == "v4_batch_waiting_for_reconciliation"
+
+    runtime.pending_live_inventory_actual_pnl = {}
+    ready, reason, context = runtime.live_inventory_v4_batch_entry_gate(
+        now_monotonic=200.0
+    )
+    assert ready is False
+    assert reason == "v4_batch_cycle_cooldown"
+    assert context["cooldown_remaining_seconds"] == 80.0
+
+    ready, reason, _ = runtime.live_inventory_v4_batch_entry_gate(
+        now_monotonic=281.0
+    )
+    assert ready is True
+    assert reason == "ready"
+
+
+def test_v4_batch_entry_gate_stops_at_cumulative_actual_loss(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_max_cycles = 5
+    runtime.live_inventory_basis_v4_max_run_loss_usd = Decimal("0.05")
+    runtime.live_inventory_basis_v4_cycle_cooldown_seconds = 180.0
+    runtime.live_inventory_v4_run_start_realized_pnl_usd = Decimal("1.00")
+    runtime.live_inventory_realized_pnl_usd = Decimal("0.95")
+
+    ready, reason, context = runtime.live_inventory_v4_batch_entry_gate(
+        now_monotonic=300.0
+    )
+
+    assert ready is False
+    assert reason == "v4_batch_max_run_loss_reached"
+    assert context["batch_run_pnl_usd"] == "-0.05"
+
+
 def test_v4_basis_state_logging_is_adaptive_but_keeps_crossings(tmp_path) -> None:
     runtime = _live_inventory_runtime(tmp_path)
     runtime.live_inventory_basis_v4_mode = True

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from main import parse_args
 from tools import live
 from tools.live import LiveConfig, build_main_command, build_multi_asset_collector_command, validate_state
@@ -194,6 +196,44 @@ def test_live_tool_v4_test_health_bypass_is_explicit_and_temporary(
 
     assert args.live_inventory_basis_v4_test_skip_recent_health is True
     assert "--live-inventory-basis-v4-test-skip-recent-health" in command
+
+
+def test_live_tool_v4_batch_is_sequential_bounded_and_guarded(
+    monkeypatch,
+) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(
+            v4_live_mode=True,
+            max_cycles=9,
+            v4_test_max_run_loss_usd="0.05",
+            v4_test_cycle_cooldown_seconds=180,
+        ),
+        v4_test_skip_recent_health=True,
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_max_cycles == 9
+    assert args.live_inventory_max_lots == 1
+    assert args.live_inventory_max_total_lots == 1
+    assert args.live_inventory_basis_v4_test_skip_recent_health is True
+    assert args.live_inventory_basis_v4_max_run_loss_usd == 0.05
+    assert args.live_inventory_basis_v4_cycle_cooldown_seconds == 180
+
+
+def test_live_tool_v4_batch_requires_explicit_test_health_bypass(
+    monkeypatch,
+) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(v4_live_mode=True, max_cycles=9),
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    with pytest.raises(SystemExit):
+        parse_args()
 
 
 def test_live_tool_collect_only_disables_all_inventory_entries(monkeypatch) -> None:

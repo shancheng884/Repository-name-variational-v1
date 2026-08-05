@@ -128,6 +128,18 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         row for row in v4_rows if row.get("event") == "live_inventory_cycle_report"
     ]
     latest_cycle_report = cycle_reports[-1] if cycle_reports else {}
+    cycle_checkpoints = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_v4_cycle_checkpoint"
+    ]
+    latest_cycle_checkpoint = cycle_checkpoints[-1] if cycle_checkpoints else {}
+    batch_wait_rows = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_v4_batch_waiting"
+    ]
+    latest_batch_wait = batch_wait_rows[-1] if batch_wait_rows else {}
     strategy_snapshots = [
         row
         for row in v4_rows
@@ -175,8 +187,10 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         status = "FINAL_FILLS_CONFIRMED_WAITING_FOR_REPORT"
     elif latest_final_pnl:
         status = "ERROR_FINAL_PNL_RECONCILIATION_REQUIRED"
-    elif events["live_inventory_entered"]:
+    elif events["live_inventory_entered"] > events["live_inventory_exited"]:
         status = "POSITION_OPEN"
+    elif latest_batch_wait:
+        status = "WAITING_FOR_NEXT_BATCH_CYCLE"
     elif events["live_inventory_var_entry_submitted"]:
         status = "CANDIDATE_SUBMITTED"
     elif preflight_passed:
@@ -223,6 +237,26 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "actual_pnl": events["live_inventory_actual_pnl"],
         "final_pnl": events["live_inventory_final_pnl"],
         "cycle_reports": len(cycle_reports),
+        "cycle_checkpoints": len(cycle_checkpoints),
+        "completed_cycles": (
+            latest_cycle_report.get("completed_cycles")
+            or latest_cycle_checkpoint.get("completed_cycles")
+            or 0
+        ),
+        "max_cycles": (
+            latest_cycle_report.get("max_cycles")
+            or latest_cycle_checkpoint.get("max_cycles")
+            or latest_strategy_snapshot.get("max_cycles")
+            or 1
+        ),
+        "batch_wait_reason": latest_batch_wait.get("reason"),
+        "batch_cooldown_remaining_seconds": latest_batch_wait.get(
+            "cooldown_remaining_seconds"
+        ),
+        "batch_run_pnl_usd": (
+            latest_batch_wait.get("batch_run_pnl_usd")
+            or latest_cycle_checkpoint.get("cumulative_run_pnl_usd")
+        ),
         "exit_submit_mode": latest_exit_submit.get("submit_mode"),
         "exit_pair_submit_elapsed_ms": latest_exit_submit.get(
             "pair_submit_elapsed_ms"
@@ -335,8 +369,17 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"dynamic_floor_blocks={funnel['dynamic_floor_blocks']} "
         f"submits={funnel['submits']} entered={funnel['entered']} "
         f"exited={funnel['exited']} actual_pnl={funnel['actual_pnl']} "
-        f"final_pnl={funnel['final_pnl']} cycle_reports={funnel['cycle_reports']}"
+        f"final_pnl={funnel['final_pnl']} cycle_reports={funnel['cycle_reports']} "
+        f"cycle_checkpoints={funnel['cycle_checkpoints']} "
+        f"completed_cycles={funnel['completed_cycles']}/{funnel['max_cycles']}"
     )
+    if funnel["batch_wait_reason"]:
+        print(
+            f"batch_wait_reason={funnel['batch_wait_reason']} "
+            f"cooldown_remaining_seconds="
+            f"{funnel['batch_cooldown_remaining_seconds']} "
+            f"batch_run_pnl_usd={funnel['batch_run_pnl_usd']}"
+        )
     print(
         f"latest_edge_bps={funnel['latest_edge_bps']} "
         f"latest_raw_threshold_bps={funnel['latest_raw_threshold_bps']} "

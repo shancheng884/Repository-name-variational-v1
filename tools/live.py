@@ -74,6 +74,8 @@ class LiveConfig:
     calibration_max_cycle_loss_usd: str = "0.10"
     calibration_max_roundtrip_cost_bps: str = "6.0"
     v4_live_mode: bool = False
+    v4_test_max_run_loss_usd: str = "0.05"
+    v4_test_cycle_cooldown_seconds: int = 180
     entry_lighter_fill_timeout_seconds: str = "3"
     snapshot_timeout_seconds: str = "10"
     addon_min_basis_improvement_bps: str = "2.0"
@@ -137,7 +139,7 @@ def validate_state(
         config.calibration_max_cycles
         if config.calibration_mode
         else 1
-        if config.reversion_mode or config.v4_live_mode
+        if config.reversion_mode
         else config.max_cycles
     )
     if completed_cycles >= effective_max_cycles and not collect_only:
@@ -292,6 +294,12 @@ def load_config(path: Path) -> LiveConfig:
         calibration_max_cycle_loss_usd=_positive_decimal(raw, "calibration_max_cycle_loss_usd"),
         calibration_max_roundtrip_cost_bps=_positive_decimal(raw, "calibration_max_roundtrip_cost_bps"),
         v4_live_mode=bool(raw.get("v4_live_mode", DEFAULT_CONFIG.v4_live_mode)),
+        v4_test_max_run_loss_usd=_positive_decimal(raw, "v4_test_max_run_loss_usd"),
+        v4_test_cycle_cooldown_seconds=_positive_int(
+            raw,
+            "v4_test_cycle_cooldown_seconds",
+            max_value=3600,
+        ),
         entry_lighter_fill_timeout_seconds=_positive_decimal(raw, "entry_lighter_fill_timeout_seconds"),
         snapshot_timeout_seconds=_positive_decimal(raw, "snapshot_timeout_seconds"),
         addon_min_basis_improvement_bps=_positive_decimal(raw, "addon_min_basis_improvement_bps"),
@@ -315,7 +323,7 @@ def build_main_command(
         config.calibration_max_cycles
         if calibration_mode
         else 1
-        if reversion_mode or v4_live_mode
+        if reversion_mode
         else config.max_cycles
     )
     effective_max_lots = 1 if diagnostic_single_lot else config.max_lots
@@ -432,6 +440,10 @@ def build_main_command(
                 "2",
                 "--live-inventory-basis-size-ladder-notionals-usd",
                 "20,40,60",
+                "--live-inventory-basis-v4-max-run-loss-usd",
+                config.v4_test_max_run_loss_usd,
+                "--live-inventory-basis-v4-cycle-cooldown-seconds",
+                str(config.v4_test_cycle_cooldown_seconds),
             ]
         )
         if v4_test_skip_recent_health:
@@ -533,6 +545,14 @@ def main() -> int:
         help="Bounded V4 test only: bypass the recent 1h continuity gate for this run.",
     )
     parser.add_argument(
+        "--v4-test-max-cycles",
+        type=int,
+        choices=range(1, 11),
+        default=1,
+        metavar="1..10",
+        help="Bounded V4 test batch size. Values above 1 require --v4-test-skip-recent-health.",
+    )
+    parser.add_argument(
         "--calibration",
         action="store_true",
         help="Explicitly enable bounded real execution-cost calibration. This intentionally submits and closes small real positions.",
@@ -594,6 +614,7 @@ def main() -> int:
             calibration_mode=False,
             reversion_mode=False,
             v4_live_mode=True,
+            max_cycles=args.v4_test_max_cycles,
         )
     if args.calibration_direction is not None:
         config = replace(config, calibration_direction=args.calibration_direction)
@@ -608,6 +629,13 @@ def main() -> int:
         parser.error("--v4-live requires --asset ETH")
     if args.v4_test_skip_recent_health and not config.v4_live_mode:
         parser.error("--v4-test-skip-recent-health requires --v4-live")
+    if args.v4_test_max_cycles > 1 and not (
+        config.v4_live_mode and args.v4_test_skip_recent_health
+    ):
+        parser.error(
+            "--v4-test-max-cycles above 1 requires --v4-live and "
+            "--v4-test-skip-recent-health"
+        )
     if (
         args.calibration_direction is not None
         or args.calibration_weekdays_only is not None
@@ -653,7 +681,7 @@ def main() -> int:
         config.calibration_max_cycles
         if config.calibration_mode
         else 1
-        if config.reversion_mode or config.v4_live_mode
+        if config.reversion_mode
         else config.max_cycles
     )
     strategy_mode = (
