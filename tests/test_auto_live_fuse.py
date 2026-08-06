@@ -3986,7 +3986,7 @@ def test_v4_completed_cycle_emits_report_and_stops(tmp_path) -> None:
         runtime.live_inventory_basis_v4_mode = True
         runtime.live_inventory_cycle_report_emitted = False
         runtime.live_inventory_last_final_pnl_payload = None
-        runtime.live_inventory_exit_events_logged = {"9"}
+        runtime.live_inventory_exit_events_logged = {"9.0"}
         runtime.live_inventory_open_lots = []
         runtime.live_inventory_completed_cycles = 1
         runtime.live_inventory_max_cycles = 1
@@ -4056,6 +4056,18 @@ def test_v4_intermediate_cycle_checkpoints_without_stopping(tmp_path) -> None:
         runtime.live_inventory_last_final_pnl_payload = None
         runtime.live_inventory_exit_events_logged = {"9"}
         runtime.live_inventory_v4_checkpointed_lot_ids = set()
+        runtime.pending_live_inventory_final_pnl = {
+            "ETH:1.0": {
+                "asset": "eth",
+                "lot_id": "9.0",
+                "final_pnl_emitted": False,
+            },
+            "ETH:9": {
+                "asset": "ETH",
+                "lot_id": 9,
+                "final_pnl_emitted": True,
+            },
+        }
         runtime.live_inventory_open_lots = []
         runtime.live_inventory_completed_cycles = 1
         runtime.live_inventory_max_cycles = 5
@@ -4087,6 +4099,44 @@ def test_v4_intermediate_cycle_checkpoints_without_stopping(tmp_path) -> None:
         assert rows[-1]["completed_cycles"] == 1
         assert rows[-1]["next_cycle"] == 2
         assert rows[-1]["cumulative_run_pnl_usd"] == "0.003"
+        assert runtime.pending_live_inventory_final_pnl == {}
+
+    asyncio.run(run())
+
+
+def test_live_inventory_final_pnl_key_normalizes_numeric_lot_ids() -> None:
+    assert VariationalToLighterRuntime.live_inventory_final_pnl_key(
+        " eth ", 1
+    ) == "ETH:1"
+    assert VariationalToLighterRuntime.live_inventory_final_pnl_key(
+        "ETH", "1.0"
+    ) == "ETH:1"
+    assert VariationalToLighterRuntime.live_inventory_final_pnl_key(
+        "ETH", Decimal("1.00")
+    ) == "ETH:1"
+    assert VariationalToLighterRuntime.live_inventory_final_pnl_key(
+        "ETH", "lot-a"
+    ) == "ETH:lot-a"
+
+
+def test_v4_checkpointed_lot_ignores_late_duplicate_fill(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_v4_mode = True
+        runtime.live_inventory_v4_checkpointed_lot_ids = {"9"}
+        runtime.pending_live_inventory_final_pnl = {}
+
+        await runtime.maybe_append_live_inventory_final_pnl_from_fill(
+            {
+                "auto_live_role": "live_inventory_exit",
+                "auto_live_cycle_id": "9.0",
+                "asset": "ETH",
+                "qty": "0.01",
+                "lighter_filled_price": "1900",
+            }
+        )
+
+        assert runtime.pending_live_inventory_final_pnl == {}
 
     asyncio.run(run())
 

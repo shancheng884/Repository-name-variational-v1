@@ -14,7 +14,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
@@ -3929,8 +3929,44 @@ class VariationalToLighterRuntime:
         return trade_key not in self.pending_live_inventory_actual_pnl
 
     @staticmethod
+    def live_inventory_normalized_lot_id(lot_id: Any) -> str:
+        normalized_lot_id = str(lot_id).strip()
+        try:
+            numeric_lot_id = Decimal(normalized_lot_id)
+            if numeric_lot_id == numeric_lot_id.to_integral_value():
+                normalized_lot_id = str(int(numeric_lot_id))
+        except (InvalidOperation, ValueError):
+            pass
+        return normalized_lot_id
+
+    @staticmethod
     def live_inventory_final_pnl_key(asset: str, lot_id: Any) -> str:
-        return f"{str(asset).upper()}:{lot_id}"
+        return (
+            f"{str(asset).strip().upper()}:"
+            f"{VariationalToLighterRuntime.live_inventory_normalized_lot_id(lot_id)}"
+        )
+
+    def clear_finalized_live_inventory_final_pnl(
+        self,
+        *,
+        asset: str,
+        lot_id: Any,
+    ) -> None:
+        finalized_key = self.live_inventory_final_pnl_key(asset, lot_id)
+        stale_keys = []
+        for key, payload in getattr(
+            self,
+            "pending_live_inventory_final_pnl",
+            {},
+        ).items():
+            payload_key = self.live_inventory_final_pnl_key(
+                str(payload.get("asset") or asset),
+                payload.get("lot_id"),
+            )
+            if key == finalized_key or payload_key == finalized_key:
+                stale_keys.append(key)
+        for key in stale_keys:
+            self.pending_live_inventory_final_pnl.pop(key, None)
 
     def remember_live_inventory_final_pnl_lot(self, *, asset: str, lot: dict[str, Any]) -> None:
         lot_id = lot.get("lot_id")
@@ -4075,6 +4111,20 @@ class VariationalToLighterRuntime:
         lot_id = payload.get("auto_live_cycle_id")
         asset = str(payload.get("asset") or "")
         if lot_id is None or not asset:
+            return
+        normalized_lot_id = self.live_inventory_normalized_lot_id(lot_id)
+        checkpointed_lot_ids = {
+            self.live_inventory_normalized_lot_id(value)
+            for value in getattr(
+                self,
+                "live_inventory_v4_checkpointed_lot_ids",
+                set(),
+            )
+        }
+        if (
+            getattr(self, "live_inventory_basis_v4_mode", False)
+            and normalized_lot_id in checkpointed_lot_ids
+        ):
             return
 
         key = self.live_inventory_final_pnl_key(asset, lot_id)
@@ -6562,8 +6612,14 @@ class VariationalToLighterRuntime:
         final_payload = getattr(self, "live_inventory_last_final_pnl_payload", None)
         if not final_payload:
             return False
-        lot_id = str(final_payload.get("lot_id"))
-        if lot_id not in getattr(self, "live_inventory_exit_events_logged", set()):
+        lot_id = self.live_inventory_normalized_lot_id(
+            final_payload.get("lot_id")
+        )
+        exit_event_lot_ids = {
+            self.live_inventory_normalized_lot_id(value)
+            for value in getattr(self, "live_inventory_exit_events_logged", set())
+        }
+        if lot_id not in exit_event_lot_ids:
             return False
         if getattr(self, "pending_live_inventory_actual_pnl", {}):
             return False
@@ -6614,6 +6670,10 @@ class VariationalToLighterRuntime:
                 )
                 checkpointed.add(lot_id)
                 self.live_inventory_v4_checkpointed_lot_ids = checkpointed
+                self.clear_finalized_live_inventory_final_pnl(
+                    asset=str(final_payload.get("asset") or ""),
+                    lot_id=final_payload.get("lot_id"),
+                )
                 await self.persist_live_inventory_memory(
                     reason="v4_cycle_checkpoint_completed"
                 )
@@ -6665,14 +6725,16 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_v4_max_run_loss_usd",
             Decimal("0.05"),
         )
-        unresolved_final_pnl = sum(
-            not bool(payload.get("final_pnl_emitted"))
-            for payload in getattr(
+        unresolved_final_pnl_payloads = {
+            key: payload
+            for key, payload in getattr(
                 self,
                 "pending_live_inventory_final_pnl",
                 {},
-            ).values()
-        )
+            ).items()
+            if not bool(payload.get("final_pnl_emitted"))
+        }
+        unresolved_final_pnl = len(unresolved_final_pnl_payloads)
         pending_actual_pnl = len(
             getattr(self, "pending_live_inventory_actual_pnl", {})
         )
@@ -6699,6 +6761,7 @@ class VariationalToLighterRuntime:
             "batch_max_run_loss_usd": decimal_to_str(max_run_loss_usd),
             "pending_actual_pnl": pending_actual_pnl,
             "unresolved_final_pnl": unresolved_final_pnl,
+            "unresolved_final_pnl_keys": sorted(unresolved_final_pnl_payloads),
             "cycle_cooldown_seconds": cooldown_seconds,
             "cooldown_remaining_seconds": round(cooldown_remaining_seconds, 3),
         }
