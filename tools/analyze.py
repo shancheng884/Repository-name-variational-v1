@@ -308,6 +308,24 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "latest_entry_execution_reserve_bps": latest_state.get(
             "v4_entry_execution_reserve_bps"
         ),
+        "entry_capture_sample_count": latest_state.get(
+            "v4_entry_capture_sample_count"
+        ),
+        "entry_capture_min_samples": latest_state.get(
+            "v4_entry_capture_min_samples"
+        ),
+        "entry_capture_calibration_ready": latest_state.get(
+            "v4_entry_capture_calibration_ready"
+        ),
+        "entry_capture_raw_p80_bps": latest_state.get(
+            "v4_entry_capture_raw_p80_bps"
+        ),
+        "entry_capture_cap_bps": latest_state.get(
+            "v4_entry_capture_cap_bps"
+        ),
+        "entry_capture_applied_bps": latest_state.get(
+            "v4_entry_capture_applied_bps"
+        ),
         "latest_threshold_bps": latest_state.get("v4_entry_threshold_bps"),
         "latest_window_seconds": anchor_context.get("v4_baseline_window_seconds"),
         "latest_window_max_gap_seconds": anchor_context.get(
@@ -404,6 +422,16 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"projected_ready_seconds={funnel['anchor_projected_ready_seconds']} "
         f"projected_ready_at={funnel['anchor_projected_ready_at']}"
     )
+    if funnel["entry_capture_sample_count"] is not None:
+        print(
+            "entry_calibration_samples="
+            f"{funnel['entry_capture_sample_count']} "
+            f"min_samples={funnel['entry_capture_min_samples']} "
+            f"ready={funnel['entry_capture_calibration_ready']} "
+            f"raw_p80_bps={funnel['entry_capture_raw_p80_bps']} "
+            f"applied_bps={funnel['entry_capture_applied_bps']} "
+            f"cap_bps={funnel['entry_capture_cap_bps']}"
+        )
     if funnel["exit_shortfall_sample_count"] is not None:
         print(
             "exit_calibration_samples="

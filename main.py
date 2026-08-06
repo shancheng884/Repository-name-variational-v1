@@ -95,6 +95,8 @@ LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE = Decimal("0.80")
 LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES = 100
 LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS = 129600
 LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS = Decimal("0.50")
+LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_MIN_SAMPLES = 10
+LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_CAP_BPS = Decimal("3.00")
 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES = 10
 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_CAP_BPS = Decimal("3.00")
 LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
@@ -1344,8 +1346,10 @@ class VariationalToLighterRuntime:
                     if row.get("final_pnl_status") != "var_and_lighter_final_fills_confirmed":
                         continue
                     loss_bps = to_decimal(row.get("entry_edge_capture_loss_bps"))
-                    if loss_bps is not None and loss_bps > 0:
-                        samples.append(loss_bps)
+                    if loss_bps is not None:
+                        # Zero-loss fills are observations and must contribute to
+                        # calibration maturity instead of biasing P80 upward.
+                        samples.append(max(loss_bps, Decimal("0")))
         except OSError as exc:
             self.logger.warning("Could not load recent live inventory execution loss samples: %s", exc)
             return
@@ -1362,6 +1366,47 @@ class VariationalToLighterRuntime:
 
     def live_inventory_recent_execution_loss_buffer_bps(self) -> Decimal:
         return self.percentile_decimal(getattr(self, "live_inventory_execution_loss_bps_samples", []), 80) or Decimal("0")
+
+    def live_inventory_basis_v4_entry_calibration_context(self) -> dict[str, Any]:
+        samples = list(
+            getattr(self, "live_inventory_execution_loss_bps_samples", [])
+        )
+        sample_count = len(samples)
+        raw_p80_bps = self.percentile_decimal(samples, 80) or Decimal("0")
+        ready = sample_count >= LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_MIN_SAMPLES
+        applied_bps = (
+            min(raw_p80_bps, LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_CAP_BPS)
+            if ready
+            else Decimal("0")
+        )
+        return {
+            "sample_count": sample_count,
+            "min_samples": LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_MIN_SAMPLES,
+            "ready": ready,
+            "raw_p80_bps": raw_p80_bps,
+            "cap_bps": LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_CAP_BPS,
+            "applied_bps": applied_bps,
+        }
+
+    def live_inventory_basis_v4_entry_calibration_payload(self) -> dict[str, Any]:
+        context = self.live_inventory_basis_v4_entry_calibration_context()
+        return {
+            "v4_entry_capture_sample_count": context["sample_count"],
+            "v4_entry_capture_min_samples": context["min_samples"],
+            "v4_entry_capture_calibration_ready": context["ready"],
+            "v4_entry_capture_raw_p80_bps": decimal_to_str(
+                context["raw_p80_bps"]
+            ),
+            "v4_entry_capture_cap_bps": decimal_to_str(context["cap_bps"]),
+            "v4_entry_capture_applied_bps": decimal_to_str(
+                context["applied_bps"]
+            ),
+        }
+
+    def live_inventory_basis_v4_entry_execution_reserve_bps(self) -> Decimal:
+        return self.live_inventory_basis_v4_entry_calibration_context()[
+            "applied_bps"
+        ]
 
     def load_recent_live_inventory_exit_shortfall_bps(self) -> None:
         orders_file = getattr(self, "orders_file", None)
@@ -2821,7 +2866,7 @@ class VariationalToLighterRuntime:
         values = [edge_bps for _, edge_bps in anchor_rows]
         raw_threshold = self.live_inventory_basis_v4_percentile(values)
         entry_execution_reserve_bps = (
-            self.live_inventory_recent_execution_loss_buffer_bps()
+            self.live_inventory_basis_v4_entry_execution_reserve_bps()
         )
         threshold = raw_threshold + entry_execution_reserve_bps
         return threshold, {
@@ -2833,6 +2878,7 @@ class VariationalToLighterRuntime:
             "v4_entry_execution_reserve_bps": decimal_to_str(
                 entry_execution_reserve_bps
             ),
+            **self.live_inventory_basis_v4_entry_calibration_payload(),
             "v4_entry_threshold_bps": decimal_to_str(threshold),
         }
 
@@ -4130,8 +4176,14 @@ class VariationalToLighterRuntime:
         final_pnl_bps = final_pnl / notional * Decimal("10000") if notional else None
         if not hasattr(self, "live_inventory_execution_loss_bps_samples"):
             self.live_inventory_execution_loss_bps_samples = deque(maxlen=20)
-        if entry_edge_capture_loss_bps is not None and entry_edge_capture_loss_bps > 0:
-            self.live_inventory_execution_loss_bps_samples.append(entry_edge_capture_loss_bps)
+        if (
+            entry_edge_capture_loss_bps is not None
+            and var_roundtrip_qty_match
+            and lighter_roundtrip_qty_match
+        ):
+            self.live_inventory_execution_loss_bps_samples.append(
+                max(entry_edge_capture_loss_bps, Decimal("0"))
+            )
         pending["final_pnl_emitted"] = True
         final_pnl_payload = {
                 **pending,
@@ -6796,8 +6848,9 @@ class VariationalToLighterRuntime:
                     ),
                     **self.live_inventory_basis_v4_exit_calibration_payload(),
                     "entry_execution_reserve_p80_bps": decimal_to_str(
-                        self.live_inventory_recent_execution_loss_buffer_bps()
+                        self.live_inventory_basis_v4_entry_execution_reserve_bps()
                     ),
+                    **self.live_inventory_basis_v4_entry_calibration_payload(),
                     "exit_confirmation_samples": (
                         LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
                     ),

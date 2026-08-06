@@ -534,7 +534,7 @@ def test_v4_entry_threshold_uses_rolling_7d_anchor_with_recent_health() -> None:
 def test_v4_entry_threshold_adds_recent_entry_capture_loss_reserve() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_execution_loss_bps_samples = deque(
-        [Decimal("0.64"), Decimal("3.19")],
+        [Decimal("0.64")] * 2 + [Decimal("3.19")] * 8,
         maxlen=20,
     )
     now = 1_000_000.0
@@ -550,9 +550,37 @@ def test_v4_entry_threshold_adds_recent_entry_capture_loss_reserve() -> None:
     threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
 
     assert context["v4_raw_entry_threshold_bps"] == "97"
-    assert context["v4_entry_execution_reserve_bps"] == "3.19"
-    assert threshold == Decimal("100.19")
-    assert context["v4_entry_threshold_bps"] == "100.19"
+    assert context["v4_entry_capture_sample_count"] == 10
+    assert context["v4_entry_capture_calibration_ready"] is True
+    assert context["v4_entry_capture_raw_p80_bps"] == "3.19"
+    assert context["v4_entry_execution_reserve_bps"] == "3.00"
+    assert threshold == Decimal("100.00")
+    assert context["v4_entry_threshold_bps"] == "100.00"
+
+
+def test_v4_entry_threshold_ignores_immature_entry_capture_reserve() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_execution_loss_bps_samples = deque(
+        [Decimal("3.19"), Decimal("0")],
+        maxlen=20,
+    )
+    now = 1_000_000.0
+    recent_rows = [
+        (now - 3000 + index * 30, Decimal(index))
+        for index in range(100)
+    ]
+    runtime.live_inventory_basis_v4_history = _v4_rolling_anchor_rows(
+        now,
+        recent_rows,
+    )
+
+    threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
+
+    assert context["v4_entry_capture_sample_count"] == 2
+    assert context["v4_entry_capture_calibration_ready"] is False
+    assert context["v4_entry_capture_raw_p80_bps"] == "3.19"
+    assert context["v4_entry_execution_reserve_bps"] == "0"
+    assert threshold == Decimal("97")
 
 
 def test_v4_exit_target_uses_floor_until_calibration_is_mature() -> None:
@@ -622,6 +650,14 @@ def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
     rows = [
         {
             "event": "live_inventory_final_pnl",
+            "strategy_version": "basis-v4-live-v3",
+            "asset": "ETH",
+            "direction": "short_var_long_lighter",
+            "final_pnl_status": "var_and_lighter_final_fills_confirmed",
+            "entry_edge_capture_loss_bps": "-0.25",
+        },
+        {
+            "event": "live_inventory_final_pnl",
             "strategy_version": "basis-v4-live-test-v1",
             "asset": "ETH",
             "direction": "short_var_long_lighter",
@@ -682,7 +718,8 @@ def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
     runtime.load_recent_live_inventory_exit_shortfall_bps()
 
     assert list(runtime.live_inventory_execution_loss_bps_samples) == [
-        Decimal("3.19")
+        Decimal("0"),
+        Decimal("3.19"),
     ]
     assert list(runtime.live_inventory_exit_estimate_shortfall_bps_samples) == [
         Decimal("0"),

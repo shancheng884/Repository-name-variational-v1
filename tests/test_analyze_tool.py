@@ -35,6 +35,13 @@ def test_v4_live_funnel_flags_incompatible_immediate_arb_floor() -> None:
             "basis_v4_profile": "eth_short_execution_calibrated_20260724_n10",
             "short_edge_bps": "-5",
             "v4_entry_threshold_bps": "-6",
+            "v4_entry_execution_reserve_bps": "0",
+            "v4_entry_capture_sample_count": 2,
+            "v4_entry_capture_min_samples": 10,
+            "v4_entry_capture_calibration_ready": False,
+            "v4_entry_capture_raw_p80_bps": "3.19",
+            "v4_entry_capture_cap_bps": "3.00",
+            "v4_entry_capture_applied_bps": "0",
             "v4_baseline_window_seconds": 21600,
             "v4_baseline_max_sample_gap_seconds": "30.000",
             "v4_anchor_ready": True,
@@ -65,6 +72,10 @@ def test_v4_live_funnel_flags_incompatible_immediate_arb_floor() -> None:
     assert funnel["latest_window_max_gap_seconds"] == "30.000"
     assert funnel["anchor_ready"] is True
     assert funnel["health_ready"] is True
+    assert funnel["entry_capture_sample_count"] == 2
+    assert funnel["entry_capture_calibration_ready"] is False
+    assert funnel["entry_capture_raw_p80_bps"] == "3.19"
+    assert funnel["entry_capture_applied_bps"] == "0"
     assert funnel["status"] == "ERROR_V4_IMMEDIATE_ARB_FLOOR_APPLIED"
 
 
