@@ -350,6 +350,34 @@ def test_live_tool_reset_state_allows_next_reversion_cycle(tmp_path, monkeypatch
     assert "--live-inventory-reset-state-after-manual-flat" in command
 
 
+def test_live_tool_explicit_reset_allows_manual_review_to_reach_exchange_reconcile(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "manual_review_required",
+                "asset": "ETH",
+                "open_lots": [{"lot_id": 2, "qty": "0.0105"}],
+                "pending_actions": [{"lot_id": 2, "role": "live_inventory_entry_pending_var_fill"}],
+                "completed_cycles": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(live, "LIVE_STATE", state_path)
+
+    ok, message = validate_state(
+        LiveConfig(v4_live_mode=True),
+        reset_state_after_manual_flat=True,
+    )
+
+    assert ok is True
+    assert "state=manual_review_required" in message
+    assert "open_lots=1" in message
+    assert "pending_actions=1" in message
+    assert "exchange_reconcile_required=true" in message
+
+
 def test_live_tool_refuses_flat_state_when_cycle_cap_reached(tmp_path, monkeypatch) -> None:
     state_path = tmp_path / "live_inventory_state.json"
     state_path.write_text(

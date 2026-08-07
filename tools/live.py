@@ -129,6 +129,13 @@ def validate_state(
     except (TypeError, ValueError):
         completed_cycles = 0
 
+    if reset_state_after_manual_flat and not collect_only:
+        return (
+            True,
+            f"state={status} asset={asset} open_lots={len(open_lots)} "
+            f"pending_actions={len(pending_actions)} completed_cycles={completed_cycles} "
+            "reset_after_manual_flat_requested exchange_reconcile_required=true",
+        )
     if status != "flat":
         return False, f"state_not_flat status={status} asset={asset}"
     if open_lots:
@@ -143,12 +150,6 @@ def validate_state(
         else config.max_cycles
     )
     if completed_cycles >= effective_max_cycles and not collect_only:
-        if reset_state_after_manual_flat:
-            return (
-                True,
-                f"state=flat asset={asset} open_lots=0 pending_actions=0 completed_cycles={completed_cycles} "
-                f"max_cycles={effective_max_cycles} reset_after_manual_flat_requested",
-            )
         return (
             False,
             f"state_cycle_cap_reached asset={asset} completed_cycles={completed_cycles} max_cycles={effective_max_cycles} "
