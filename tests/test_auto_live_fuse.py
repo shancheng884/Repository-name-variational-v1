@@ -375,6 +375,275 @@ def test_extract_variational_position_qty_from_positions_result() -> None:
     assert VariationalToLighterRuntime.extract_variational_position_qty(result, asset="SOL") == Decimal("0")
 
 
+def test_extract_lighter_position_qty_uses_position_sign() -> None:
+    result = {
+        "code": 200,
+        "accounts": [
+            {
+                "positions": [
+                    {"symbol": "BTC", "sign": -1, "position": "0.001"},
+                    {"symbol": "ETH", "sign": 1, "position": "0.0210"},
+                ]
+            }
+        ],
+    }
+
+    assert VariationalToLighterRuntime.extract_lighter_position_qty(result, asset="ETH") == Decimal("0.0210")
+    assert VariationalToLighterRuntime.extract_lighter_position_qty(result, asset="BTC") == Decimal("-0.001")
+    assert VariationalToLighterRuntime.extract_lighter_position_qty(result, asset="SOL") == Decimal("0")
+
+
+def test_live_inventory_persists_pending_entry_submission(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = [
+            PendingLiveInventoryVarFillMatch(
+                asset="ETH",
+                side="sell",
+                qty=Decimal("0.0105"),
+                lot_id=2,
+                role="live_inventory_entry_pending_var_fill",
+                created_at_monotonic=time.monotonic(),
+                context={
+                    "direction": "short_var_long_lighter",
+                    "submitted_at": "2026-08-06T12:03:09Z",
+                    "rfq_id": "rfq-2",
+                    "lighter_started": True,
+                },
+            )
+        ]
+
+        await runtime.persist_live_inventory_memory(reason="basis_entry_submission_started")
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        assert state["status"] == "pending"
+        assert state["open_lots"] == []
+        assert state["pending_actions"] == [
+            {
+                "asset": "ETH",
+                "side": "sell",
+                "qty": "0.0105",
+                "lot_id": 2,
+                "role": "live_inventory_entry_pending_var_fill",
+                "direction": "short_var_long_lighter",
+                "submitted_at": "2026-08-06T12:03:09Z",
+                "rfq_id": "rfq-2",
+                "submitted_order_id": None,
+                "lighter_started": True,
+                "lighter_record_key": None,
+            }
+        ]
+
+    asyncio.run(run())
+
+
+def test_live_inventory_startup_reconcile_rejects_hidden_exchange_position(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_reconcile_on_start = True
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = []
+        runtime.stop_flag = False
+        runtime.shutdown_reason = None
+
+        async def fake_fetch_variational_positions():
+            return {
+                "ok": True,
+                "result": {
+                    "positions": [
+                        {"instrument": {"underlying": "ETH"}, "qty": "-0.0105"}
+                    ]
+                },
+            }
+
+        async def fake_fetch_lighter_account():
+            return {"code": 200, "accounts": [{"positions": []}]}
+
+        runtime.fetch_variational_positions = fake_fetch_variational_positions
+        runtime.fetch_lighter_account = fake_fetch_lighter_account
+
+        try:
+            await runtime.reconcile_live_inventory_startup_state()
+        except RuntimeError as exc:
+            assert "exchange position exists" in str(exc)
+        else:
+            raise AssertionError("startup reconcile should reject hidden exchange exposure")
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        assert state["status"] == "manual_review_required"
+        assert state["manual_review_reason"] == "startup_reconcile_local_flat_but_exchange_position_open"
+        assert state["manual_review_context"]["variational_position_qty"] == "-0.0105"
+        assert runtime.stop_flag is True
+
+    asyncio.run(run())
+
+
+def test_live_inventory_startup_reconcile_requires_both_exchange_qtys_to_match(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_reconcile_on_start = True
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = []
+        runtime.stop_flag = False
+        runtime.shutdown_reason = None
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 3,
+                "asset": "ETH",
+                "direction": "short_var_long_lighter",
+                "qty": "0.0105",
+            }
+        ]
+
+        async def fake_fetch_variational_positions():
+            return {
+                "ok": True,
+                "result": {
+                    "positions": [
+                        {"instrument": {"underlying": "ETH"}, "qty": "-0.0210"}
+                    ]
+                },
+            }
+
+        async def fake_fetch_lighter_account():
+            return {
+                "code": 200,
+                "accounts": [
+                    {"positions": [{"symbol": "ETH", "sign": 1, "position": "0.0210"}]}
+                ],
+            }
+
+        runtime.fetch_variational_positions = fake_fetch_variational_positions
+        runtime.fetch_lighter_account = fake_fetch_lighter_account
+
+        try:
+            await runtime.reconcile_live_inventory_startup_state()
+        except RuntimeError as exc:
+            assert "do not match local open lots" in str(exc)
+        else:
+            raise AssertionError("startup reconcile should reject doubled exchange exposure")
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        assert state["manual_review_reason"] == "startup_reconcile_exchange_position_mismatch"
+        assert state["manual_review_context"]["expected_open_qty"] == "0.0105"
+        assert state["manual_review_context"]["variational_position_qty"] == "-0.0210"
+        assert state["manual_review_context"]["lighter_position_qty"] == "0.0210"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_startup_reconcile_accepts_verified_flat_exchanges(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_reconcile_on_start = True
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = []
+
+        async def fake_fetch_variational_positions():
+            return {"ok": True, "result": {"positions": []}}
+
+        async def fake_fetch_lighter_account():
+            return {"code": 200, "accounts": [{"positions": []}]}
+
+        runtime.fetch_variational_positions = fake_fetch_variational_positions
+        runtime.fetch_lighter_account = fake_fetch_lighter_account
+
+        await runtime.reconcile_live_inventory_startup_state()
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert rows[-1]["event"] == "live_inventory_startup_reconcile_ok"
+        assert rows[-1]["status"] == "both_exchanges_flat"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_startup_reconcile_rejects_wrong_lighter_direction(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_reconcile_on_start = True
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = []
+        runtime.stop_flag = False
+        runtime.shutdown_reason = None
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 4,
+                "asset": "ETH",
+                "direction": "short_var_long_lighter",
+                "qty": "0.0105",
+            }
+        ]
+
+        async def fake_fetch_variational_positions():
+            return {
+                "ok": True,
+                "result": {"positions": [{"instrument": {"underlying": "ETH"}, "qty": "-0.0105"}]},
+            }
+
+        async def fake_fetch_lighter_account():
+            return {
+                "code": 200,
+                "accounts": [{"positions": [{"symbol": "ETH", "sign": -1, "position": "0.0105"}]}],
+            }
+
+        runtime.fetch_variational_positions = fake_fetch_variational_positions
+        runtime.fetch_lighter_account = fake_fetch_lighter_account
+
+        try:
+            await runtime.reconcile_live_inventory_startup_state()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("startup reconcile should reject an unhedged Lighter direction")
+
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        assert state["manual_review_reason"] == "startup_reconcile_exchange_position_mismatch"
+        assert state["manual_review_context"]["expected_lighter_sign"] == "1"
+        assert state["manual_review_context"]["lighter_position_qty"] == "-0.0105"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_startup_reconcile_accepts_matching_open_pair(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_reconcile_on_start = True
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = []
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 5,
+                "asset": "ETH",
+                "direction": "short_var_long_lighter",
+                "qty": "0.0105",
+            }
+        ]
+
+        async def fake_fetch_variational_positions():
+            return {
+                "ok": True,
+                "result": {"positions": [{"instrument": {"underlying": "ETH"}, "qty": "-0.0105"}]},
+            }
+
+        async def fake_fetch_lighter_account():
+            return {
+                "code": 200,
+                "accounts": [{"positions": [{"symbol": "ETH", "sign": 1, "position": "0.0105"}]}],
+            }
+
+        runtime.fetch_variational_positions = fake_fetch_variational_positions
+        runtime.fetch_lighter_account = fake_fetch_lighter_account
+
+        await runtime.reconcile_live_inventory_startup_state()
+
+        rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+        assert rows[-1]["event"] == "live_inventory_startup_reconcile_ok"
+        assert rows[-1]["status"] == "open_state_matches_both_exchanges"
+
+    asyncio.run(run())
+
+
 def test_live_inventory_blocks_spread_reverted_exit_until_entry_cost_confirmed(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)

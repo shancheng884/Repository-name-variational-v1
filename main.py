@@ -2147,6 +2147,83 @@ class VariationalToLighterRuntime:
             return next(iter(self.live_allowed_assets)).upper()
         return "BTC"
 
+    def pending_live_inventory_actions_payload(self) -> list[dict[str, Any]]:
+        actions: list[dict[str, Any]] = []
+        for item in getattr(self, "pending_live_inventory_var_fill_matches", []) or []:
+            context = item.context if isinstance(item.context, dict) else {}
+            actions.append(
+                {
+                    "asset": item.asset.upper(),
+                    "side": item.side.lower(),
+                    "qty": decimal_to_str(item.qty),
+                    "lot_id": item.lot_id,
+                    "role": item.role,
+                    "direction": context.get("direction"),
+                    "submitted_at": context.get("submitted_at"),
+                    "rfq_id": context.get("rfq_id"),
+                    "submitted_order_id": context.get("submitted_order_id"),
+                    "lighter_started": bool(context.get("lighter_started")),
+                    "lighter_record_key": context.get("lighter_record_key"),
+                }
+            )
+        return actions
+
+    @staticmethod
+    def live_inventory_position_qty_tolerance(expected_qty: Decimal) -> Decimal:
+        return max(Decimal("0.00000001"), abs(expected_qty) * Decimal("0.0001"))
+
+    async def fetch_lighter_account(self) -> dict[str, Any]:
+        if self.account_index is None:
+            raise RuntimeError("LIGHTER_ACCOUNT_INDEX is not loaded")
+        client = self.initialize_lighter_client()
+        from lighter import AccountApi
+
+        result = await AccountApi(client.api_client).account(
+            by="index",
+            value=str(self.account_index),
+            _request_timeout=10.0,
+        )
+        if hasattr(result, "to_dict"):
+            result = result.to_dict()
+        elif hasattr(result, "model_dump"):
+            result = result.model_dump(mode="json")
+        if not isinstance(result, dict):
+            raise RuntimeError("Lighter account response is not an object")
+        if result.get("code") not in {None, 0, 200}:
+            raise RuntimeError(
+                f"Lighter account request failed: code={result.get('code')} message={result.get('message')}"
+            )
+        return result
+
+    @staticmethod
+    def extract_lighter_position_qty(account_result: dict[str, Any] | None, *, asset: str) -> Decimal | None:
+        if not isinstance(account_result, dict):
+            return None
+        accounts = account_result.get("accounts")
+        if not isinstance(accounts, list):
+            return None
+        asset = asset.upper()
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            positions = account.get("positions")
+            if not isinstance(positions, list):
+                continue
+            for position in positions:
+                if not isinstance(position, dict):
+                    continue
+                symbol = str(position.get("symbol") or "").upper()
+                if symbol != asset and not symbol.startswith(f"{asset}-"):
+                    continue
+                qty = to_decimal(position.get("position"))
+                if qty is None:
+                    return None
+                sign = to_decimal(position.get("sign"))
+                if sign is not None and sign != 0:
+                    return abs(qty) * (Decimal("1") if sign > 0 else Decimal("-1"))
+                return qty
+        return Decimal("0")
+
     async def reconcile_live_inventory_startup_state(self) -> None:
         if not self.live_inventory_reconcile_on_start:
             await self.append_live_inventory_log(
@@ -2154,55 +2231,140 @@ class VariationalToLighterRuntime:
                 {"reason": "disabled_by_config", "open_lots_total": len(self.live_inventory_open_lots)},
             )
             return
-        if not self.live_inventory_open_lots:
-            await self.append_live_inventory_log("live_inventory_startup_reconcile_ok", {"status": "flat_state"})
-            return
         asset = self.live_inventory_state_asset()
-        positions_result = None
-        position_qty = None
+        variational_positions_result = None
+        variational_position_qty = None
+        lighter_account_result = None
+        lighter_position_qty = None
+        reconciliation_errors: dict[str, str] = {}
         try:
-            positions_result = await self.fetch_variational_positions()
-            position_qty = self.extract_variational_position_qty(positions_result, asset=asset)
-        except Exception as exc:
-            await self.require_live_inventory_manual_review(
+            variational_positions_result = await self.fetch_variational_positions()
+            if (
+                not isinstance(variational_positions_result, dict)
+                or variational_positions_result.get("ok") is False
+            ):
+                raise RuntimeError(f"invalid response: {variational_positions_result}")
+            variational_position_qty = self.extract_variational_position_qty(
+                variational_positions_result,
                 asset=asset,
-                reason="startup_reconcile_variational_position_check_failed",
-                context={"error": str(exc), "open_lots": self.live_inventory_open_lots},
             )
-            raise RuntimeError("Live inventory startup reconcile failed: could not check Variational position") from exc
-        expected_qty = sum((to_decimal(lot.get("qty")) or Decimal("0")) for lot in self.live_inventory_open_lots)
-        if position_qty is None or abs(position_qty) <= Decimal("0"):
+        except Exception as exc:
+            reconciliation_errors["variational"] = str(exc)
+        try:
+            lighter_account_result = await self.fetch_lighter_account()
+            lighter_position_qty = self.extract_lighter_position_qty(
+                lighter_account_result,
+                asset=asset,
+            )
+        except Exception as exc:
+            reconciliation_errors["lighter"] = str(exc)
+
+        if reconciliation_errors or variational_position_qty is None or lighter_position_qty is None:
             await self.require_live_inventory_manual_review(
                 asset=asset,
-                reason="startup_reconcile_open_state_but_variational_flat",
+                reason="startup_reconcile_exchange_position_check_failed",
+                context={
+                    "errors": reconciliation_errors,
+                    "open_lots": self.live_inventory_open_lots,
+                    "variational_position_qty": decimal_to_str(variational_position_qty),
+                    "lighter_position_qty": decimal_to_str(lighter_position_qty),
+                    "action": "confirm both exchange positions manually before restart",
+                },
+            )
+            raise RuntimeError("Live inventory startup reconcile failed: could not verify both exchange positions")
+
+        expected_qty = sum((to_decimal(lot.get("qty")) or Decimal("0")) for lot in self.live_inventory_open_lots)
+        tolerance = self.live_inventory_position_qty_tolerance(expected_qty)
+        var_abs = abs(variational_position_qty)
+        lighter_abs = abs(lighter_position_qty)
+
+        if not self.live_inventory_open_lots:
+            if var_abs > tolerance or lighter_abs > tolerance:
+                await self.require_live_inventory_manual_review(
+                    asset=asset,
+                    reason="startup_reconcile_local_flat_but_exchange_position_open",
+                    context={
+                        "variational_position_qty": decimal_to_str(variational_position_qty),
+                        "lighter_position_qty": decimal_to_str(lighter_position_qty),
+                        "qty_tolerance": decimal_to_str(tolerance),
+                        "variational_positions_result": variational_positions_result,
+                        "lighter_account_result": lighter_account_result,
+                        "action": "do not start; inspect and flatten both venues manually",
+                    },
+                )
+                raise RuntimeError("Live inventory startup reconcile failed: exchange position exists while local state is flat")
+            await self.append_live_inventory_log(
+                "live_inventory_startup_reconcile_ok",
+                {
+                    "status": "both_exchanges_flat",
+                    "asset": asset,
+                    "variational_position_qty": decimal_to_str(variational_position_qty),
+                    "lighter_position_qty": decimal_to_str(lighter_position_qty),
+                },
+            )
+            return
+
+        open_directions = {
+            str(lot.get("direction") or "")
+            for lot in self.live_inventory_open_lots
+        }
+        expected_direction = next(iter(open_directions)) if len(open_directions) == 1 else None
+        expected_lighter_sign = (
+            Decimal("1")
+            if expected_direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
+            else Decimal("-1")
+            if expected_direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+            else None
+        )
+        lighter_direction_matches = (
+            expected_lighter_sign is not None
+            and lighter_position_qty * expected_lighter_sign > 0
+        )
+        if (
+            expected_qty <= 0
+            or expected_direction is None
+            or abs(var_abs - expected_qty) > tolerance
+            or abs(lighter_abs - expected_qty) > tolerance
+            or not lighter_direction_matches
+        ):
+            await self.require_live_inventory_manual_review(
+                asset=asset,
+                reason="startup_reconcile_exchange_position_mismatch",
                 context={
                     "open_lots": self.live_inventory_open_lots,
                     "expected_open_qty": decimal_to_str(expected_qty),
-                    "variational_position_qty": decimal_to_str(position_qty),
-                    "variational_positions_result": positions_result,
-                    "action": "confirm exchange state, then use --live-inventory-reset-state-after-manual-flat only if truly flat",
+                    "expected_direction": expected_direction,
+                    "expected_lighter_sign": decimal_to_str(expected_lighter_sign),
+                    "variational_position_qty": decimal_to_str(variational_position_qty),
+                    "lighter_position_qty": decimal_to_str(lighter_position_qty),
+                    "qty_tolerance": decimal_to_str(tolerance),
+                    "variational_positions_result": variational_positions_result,
+                    "lighter_account_result": lighter_account_result,
+                    "action": "confirm both exchange positions and local lots before resuming",
                 },
             )
-            raise RuntimeError("Live inventory startup reconcile failed: state has open lots but Variational is flat")
+            raise RuntimeError("Live inventory startup reconcile failed: exchange quantities do not match local open lots")
         await self.append_live_inventory_log(
             "live_inventory_startup_reconcile_ok",
             {
-                "status": "open_state_position_detected",
+                "status": "open_state_matches_both_exchanges",
                 "asset": asset,
                 "open_lots_total": len(self.live_inventory_open_lots),
                 "expected_open_qty": decimal_to_str(expected_qty),
-                "variational_position_qty": decimal_to_str(position_qty),
+                "variational_position_qty": decimal_to_str(variational_position_qty),
+                "lighter_position_qty": decimal_to_str(lighter_position_qty),
             },
         )
 
     async def persist_live_inventory_memory(self, *, reason: str) -> None:
+        pending_actions = self.pending_live_inventory_actions_payload()
         await self.write_live_inventory_state_async(
             {
-                "status": "open" if self.live_inventory_open_lots else "flat",
+                "status": "open" if self.live_inventory_open_lots else "pending" if pending_actions else "flat",
                 "asset": self.live_inventory_state_asset(),
                 "next_lot_id": self.live_inventory_next_lot_id,
                 "open_lots": self.live_inventory_open_lots,
-                "pending_actions": [],
+                "pending_actions": pending_actions,
                 "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
                 "completed_cycles": self.live_inventory_completed_cycles,
                 "reason": reason,
@@ -2216,13 +2378,14 @@ class VariationalToLighterRuntime:
         reason: str,
         context: dict[str, Any] | None = None,
     ) -> None:
+        pending_actions = self.pending_live_inventory_actions_payload()
         await self.write_live_inventory_state_async(
             {
                 "status": "manual_review_required",
                 "asset": asset,
                 "next_lot_id": self.live_inventory_next_lot_id,
                 "open_lots": self.live_inventory_open_lots,
-                "pending_actions": [],
+                "pending_actions": pending_actions,
                 "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
                 "completed_cycles": self.live_inventory_completed_cycles,
                 "manual_review_reason": reason,
@@ -9973,6 +10136,11 @@ class VariationalToLighterRuntime:
                         context=pending_context,
                     )
                     self.add_pending_live_inventory_var_fill_match(pending_match)
+                    # Persist intent before either real leg is submitted. A crash
+                    # from this point onward must never restart from local-flat.
+                    await self.persist_live_inventory_memory(
+                        reason="basis_entry_submission_started",
+                    )
                     if self.live_inventory_basis_entry_mode == LIVE_INVENTORY_ENTRY_MODE_VAR_FIRST:
                         try:
                             var_result, var_submit_ms = await self._timed_submit(
@@ -10100,6 +10268,7 @@ class VariationalToLighterRuntime:
                     var_payload = var_result.get("result") if isinstance(var_result.get("result"), dict) else var_result
                     pending_context.update(
                         {
+                            "submitted_at": utc_now(),
                             "var_result": var_result,
                             "rfq_id": var_payload.get("rfqId") or var_payload.get("rfq_id"),
                             "submitted_order_id": var_payload.get("orderId") or var_payload.get("order_id"),
@@ -12977,6 +13146,26 @@ class VariationalToLighterRuntime:
             await asyncio.sleep(0.25)
 
     async def close(self) -> None:
+        pending_entry_actions = [
+            action
+            for action in self.pending_live_inventory_actions_payload()
+            if action.get("role")
+            in {
+                "live_inventory_entry_pending_lighter",
+                "live_inventory_entry_pending_var_fill",
+            }
+        ]
+        if self.is_live_inventory_enabled() and pending_entry_actions:
+            with contextlib.suppress(Exception):
+                await self.require_live_inventory_manual_review(
+                    asset=str(pending_entry_actions[0].get("asset") or self.live_inventory_state_asset()),
+                    reason="runtime_stopped_with_unresolved_entry_submission",
+                    context={
+                        "shutdown_reason": self.shutdown_reason or "runtime_close",
+                        "pending_actions": pending_entry_actions,
+                        "action": "verify both exchange positions before any restart",
+                    },
+                )
         if (
             self.is_live_inventory_enabled()
             and not getattr(self, "runtime_stop_event_emitted", False)
@@ -13708,7 +13897,7 @@ def parse_args() -> argparse.Namespace:
         "--live-inventory-reconcile-on-start",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="On live-inventory startup, verify persisted open state against Variational position before trading. Default: enabled",
+        help="On live-inventory startup, verify local state against both Variational and Lighter positions before trading. Default: enabled",
     )
     parser.add_argument("--live-inventory-basis-latency-buffer-p90-ms", type=float, default=700.0)
     parser.add_argument("--live-inventory-basis-latency-buffer-bps", type=float, default=1.0)
