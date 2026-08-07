@@ -1183,6 +1183,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_last_exit_monotonic = 0.0
         self.live_inventory_v4_batch_halted_reason: str | None = None
         self.live_inventory_v4_checkpointed_lot_ids: set[str] = set()
+        self.live_inventory_v4_exit_reconciliation_lot_ids: set[str] = set()
         self.live_inventory_calibration_last_exit_sample_index: int | None = None
         self.live_inventory_calibration_halted_reason: str | None = None
         self.pending_live_inventory_actual_pnl: dict[str, dict[str, Any]] = {}
@@ -4131,9 +4132,111 @@ class VariationalToLighterRuntime:
         for key in stale_keys:
             self.pending_live_inventory_final_pnl.pop(key, None)
 
+    def clear_completed_live_inventory_cycle_reconciliation(
+        self,
+        *,
+        asset: str,
+        lot_id: Any,
+    ) -> dict[str, int]:
+        normalized_lot_id = self.live_inventory_normalized_lot_id(lot_id)
+        asset = asset.upper()
+
+        pending_actual = getattr(self, "pending_live_inventory_actual_pnl", {})
+        stale_actual_keys = [
+            key
+            for key, payload in pending_actual.items()
+            if self.live_inventory_normalized_lot_id(payload.get("lot_id"))
+            == normalized_lot_id
+            and str(payload.get("asset") or asset).upper() == asset
+        ]
+        for key in stale_actual_keys:
+            pending_actual.pop(key, None)
+
+        final_before = len(getattr(self, "pending_live_inventory_final_pnl", {}))
+        self.clear_finalized_live_inventory_final_pnl(
+            asset=asset,
+            lot_id=lot_id,
+        )
+        final_after = len(getattr(self, "pending_live_inventory_final_pnl", {}))
+
+        pending_matches = getattr(self, "pending_live_inventory_var_fill_matches", [])
+        retained_matches = [
+            item
+            for item in pending_matches
+            if not (
+                item.asset.upper() == asset
+                and self.live_inventory_normalized_lot_id(item.lot_id)
+                == normalized_lot_id
+            )
+        ]
+        self.pending_live_inventory_var_fill_matches = retained_matches
+        return {
+            "pending_actual_pnl": len(stale_actual_keys),
+            "pending_final_pnl": final_before - final_after,
+            "pending_var_fill_matches": len(pending_matches) - len(retained_matches),
+        }
+
+    def prune_checkpointed_live_inventory_reconciliation(self) -> dict[str, int]:
+        checkpointed_lot_ids = {
+            self.live_inventory_normalized_lot_id(value)
+            for value in getattr(
+                self,
+                "live_inventory_v4_checkpointed_lot_ids",
+                set(),
+            )
+        }
+        cleanup = {
+            "pending_actual_pnl": 0,
+            "pending_final_pnl": 0,
+            "pending_var_fill_matches": 0,
+        }
+        if not checkpointed_lot_ids:
+            return cleanup
+
+        assets_by_lot: dict[str, set[str]] = {}
+        for payload in getattr(self, "pending_live_inventory_actual_pnl", {}).values():
+            normalized = self.live_inventory_normalized_lot_id(payload.get("lot_id"))
+            if normalized in checkpointed_lot_ids:
+                assets_by_lot.setdefault(normalized, set()).add(
+                    str(payload.get("asset") or self.live_inventory_state_asset()).upper()
+                )
+        for payload in getattr(self, "pending_live_inventory_final_pnl", {}).values():
+            normalized = self.live_inventory_normalized_lot_id(payload.get("lot_id"))
+            if normalized in checkpointed_lot_ids:
+                assets_by_lot.setdefault(normalized, set()).add(
+                    str(payload.get("asset") or self.live_inventory_state_asset()).upper()
+                )
+        for item in getattr(self, "pending_live_inventory_var_fill_matches", []):
+            normalized = self.live_inventory_normalized_lot_id(item.lot_id)
+            if normalized in checkpointed_lot_ids:
+                assets_by_lot.setdefault(normalized, set()).add(item.asset.upper())
+
+        for normalized_lot_id, assets in assets_by_lot.items():
+            for asset in assets:
+                removed = self.clear_completed_live_inventory_cycle_reconciliation(
+                    asset=asset,
+                    lot_id=normalized_lot_id,
+                )
+                for key, count in removed.items():
+                    cleanup[key] += count
+        return cleanup
+
     def remember_live_inventory_final_pnl_lot(self, *, asset: str, lot: dict[str, Any]) -> None:
         lot_id = lot.get("lot_id")
         if lot_id is None:
+            return
+        if (
+            getattr(self, "live_inventory_basis_v4_mode", False)
+            and self.live_inventory_normalized_lot_id(lot_id)
+            in {
+                self.live_inventory_normalized_lot_id(value)
+                for value in getattr(
+                    self,
+                    "live_inventory_v4_checkpointed_lot_ids",
+                    set(),
+                )
+            }
+        ):
             return
         key = self.live_inventory_final_pnl_key(asset, lot_id)
         pending = self.pending_live_inventory_final_pnl.setdefault(key, {})
@@ -4319,6 +4422,20 @@ class VariationalToLighterRuntime:
     async def maybe_append_live_inventory_final_pnl(self, key: str) -> None:
         pending = self.pending_live_inventory_final_pnl.get(key)
         if not pending or pending.get("final_pnl_emitted"):
+            return
+        if (
+            getattr(self, "live_inventory_basis_v4_mode", False)
+            and self.live_inventory_normalized_lot_id(pending.get("lot_id"))
+            in {
+                self.live_inventory_normalized_lot_id(value)
+                for value in getattr(
+                    self,
+                    "live_inventory_v4_checkpointed_lot_ids",
+                    set(),
+                )
+            }
+        ):
+            self.pending_live_inventory_final_pnl.pop(key, None)
             return
 
         qty = to_decimal(pending.get("qty"))
@@ -6765,6 +6882,11 @@ class VariationalToLighterRuntime:
             not getattr(self, "live_inventory_basis_v4_mode", False)
             or getattr(self, "live_inventory_dry_decisions", False)
             or getattr(self, "live_inventory_open_lots", [])
+            or getattr(
+                self,
+                "live_inventory_v4_exit_reconciliation_lot_ids",
+                set(),
+            )
         ):
             return False
         completed_cycles = int(getattr(self, "live_inventory_completed_cycles", 0))
@@ -6809,6 +6931,14 @@ class VariationalToLighterRuntime:
                 set(),
             )
             if lot_id not in checkpointed:
+                checkpointed.add(lot_id)
+                self.live_inventory_v4_checkpointed_lot_ids = checkpointed
+                reconciliation_cleanup = (
+                    self.clear_completed_live_inventory_cycle_reconciliation(
+                        asset=str(final_payload.get("asset") or ""),
+                        lot_id=final_payload.get("lot_id"),
+                    )
+                )
                 report = {
                     **final_payload,
                     "report_status": "completed",
@@ -6826,22 +6956,23 @@ class VariationalToLighterRuntime:
                             Decimal("0"),
                         )
                     ),
+                    "reconciliation_cleanup": reconciliation_cleanup,
                 }
                 await self.append_live_inventory_log(
                     "live_inventory_v4_cycle_checkpoint",
                     report,
-                )
-                checkpointed.add(lot_id)
-                self.live_inventory_v4_checkpointed_lot_ids = checkpointed
-                self.clear_finalized_live_inventory_final_pnl(
-                    asset=str(final_payload.get("asset") or ""),
-                    lot_id=final_payload.get("lot_id"),
                 )
                 await self.persist_live_inventory_memory(
                     reason="v4_cycle_checkpoint_completed"
                 )
             return False
 
+        reconciliation_cleanup = (
+            self.clear_completed_live_inventory_cycle_reconciliation(
+                asset=str(final_payload.get("asset") or ""),
+                lot_id=final_payload.get("lot_id"),
+            )
+        )
         report = {
             **final_payload,
             "report_status": "completed",
@@ -6850,6 +6981,7 @@ class VariationalToLighterRuntime:
             "pending_actual_pnl": len(getattr(self, "pending_live_inventory_actual_pnl", {})),
             "completed_cycles": self.live_inventory_completed_cycles,
             "max_cycles": self.live_inventory_max_cycles,
+            "reconciliation_cleanup": reconciliation_cleanup,
         }
         await self.append_live_inventory_log("live_inventory_cycle_report", report)
         self.live_inventory_cycle_report_emitted = True
@@ -6888,6 +7020,9 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_v4_max_run_loss_usd",
             Decimal("0.05"),
         )
+        reconciliation_cleanup = (
+            self.prune_checkpointed_live_inventory_reconciliation()
+        )
         unresolved_final_pnl_payloads = {
             key: payload
             for key, payload in getattr(
@@ -6925,6 +7060,7 @@ class VariationalToLighterRuntime:
             "pending_actual_pnl": pending_actual_pnl,
             "unresolved_final_pnl": unresolved_final_pnl,
             "unresolved_final_pnl_keys": sorted(unresolved_final_pnl_payloads),
+            "reconciliation_cleanup": reconciliation_cleanup,
             "cycle_cooldown_seconds": cooldown_seconds,
             "cooldown_remaining_seconds": round(cooldown_remaining_seconds, 3),
         }
@@ -8573,6 +8709,23 @@ class VariationalToLighterRuntime:
             batch_ready, batch_reason, batch_context = (
                 self.live_inventory_v4_batch_entry_gate()
             )
+            reconciliation_cleanup = batch_context.get(
+                "reconciliation_cleanup",
+                {},
+            )
+            if sum(int(value or 0) for value in reconciliation_cleanup.values()):
+                await self.append_live_inventory_log(
+                    "live_inventory_v4_reconciliation_auto_pruned",
+                    {
+                        "asset": asset,
+                        "sample_index": index,
+                        "completed_cycles": self.live_inventory_completed_cycles,
+                        "cleanup": reconciliation_cleanup,
+                    },
+                )
+                await self.persist_live_inventory_memory(
+                    reason="v4_checkpointed_reconciliation_auto_pruned"
+                )
             if not batch_ready:
                 if batch_reason == "v4_batch_max_run_loss_reached":
                     if not self.live_inventory_v4_batch_halted_reason:
@@ -11084,6 +11237,13 @@ class VariationalToLighterRuntime:
                     },
                 )
                 return
+        normalized_exit_lot_id = self.live_inventory_normalized_lot_id(
+            lot.get("lot_id")
+        )
+        if v4_mode and not self.live_inventory_dry_decisions:
+            self.live_inventory_v4_exit_reconciliation_lot_ids.add(
+                normalized_exit_lot_id
+            )
         self.live_inventory_open_lots.pop(lot_index)
         self.live_inventory_realized_pnl_usd += pnl
         self.live_inventory_completed_cycles += 1
@@ -11132,7 +11292,6 @@ class VariationalToLighterRuntime:
                     },
                 }
             )
-            await self.maybe_append_live_inventory_final_pnl(final_key)
         actual_pnl_status = "dry_decision" if self.live_inventory_dry_decisions else "pending_lighter_final_fill"
         if not self.live_inventory_dry_decisions and lighter_payload:
             actual_pnl_finalized = await self.register_live_inventory_actual_pnl(
@@ -11176,6 +11335,13 @@ class VariationalToLighterRuntime:
             )
             if actual_pnl_finalized:
                 actual_pnl_status = "lighter_final_fill_confirmed"
+        if not self.live_inventory_dry_decisions:
+            # Register the actual-PnL work before allowing a confirmed final
+            # fill to checkpoint the cycle.
+            self.live_inventory_v4_exit_reconciliation_lot_ids.discard(
+                normalized_exit_lot_id
+            )
+            await self.maybe_append_live_inventory_final_pnl(final_key)
         await self.append_live_inventory_log(
             "live_inventory_dry_exited" if self.live_inventory_dry_decisions else "live_inventory_exited",
             {

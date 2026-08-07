@@ -4410,6 +4410,89 @@ def test_v4_checkpointed_lot_ignores_late_duplicate_fill(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_v4_batch_gate_prunes_checkpointed_cycle_reconciliation(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_max_cycles = 9
+    runtime.live_inventory_basis_v4_max_run_loss_usd = Decimal("0")
+    runtime.live_inventory_basis_v4_cycle_cooldown_seconds = 0.0
+    runtime.live_inventory_v4_run_start_realized_pnl_usd = Decimal("0")
+    runtime.live_inventory_realized_pnl_usd = Decimal("-0.006")
+    runtime.live_inventory_v4_checkpointed_lot_ids = {"1"}
+    runtime.pending_live_inventory_actual_pnl = {
+        "late-exit": {"asset": "ETH", "lot_id": "1.0"},
+    }
+    runtime.pending_live_inventory_final_pnl = {
+        "ETH:1.0": {
+            "asset": "ETH",
+            "lot_id": 1,
+            "final_pnl_emitted": False,
+        },
+    }
+    runtime.pending_live_inventory_var_fill_matches = [
+        PendingLiveInventoryVarFillMatch(
+            asset="ETH",
+            side="sell",
+            qty=Decimal("0.01"),
+            lot_id=1,
+            role="live_inventory_entry_pending_var_fill",
+            created_at_monotonic=time.monotonic(),
+        ),
+        PendingLiveInventoryVarFillMatch(
+            asset="ETH",
+            side="buy",
+            qty=Decimal("0.01"),
+            lot_id=1,
+            role="live_inventory_exit",
+            created_at_monotonic=time.monotonic(),
+        ),
+    ]
+
+    ready, reason, context = runtime.live_inventory_v4_batch_entry_gate(
+        now_monotonic=300.0
+    )
+
+    assert ready is True
+    assert reason == "ready"
+    assert context["pending_actual_pnl"] == 0
+    assert context["unresolved_final_pnl"] == 0
+    assert context["reconciliation_cleanup"] == {
+        "pending_actual_pnl": 1,
+        "pending_final_pnl": 1,
+        "pending_var_fill_matches": 2,
+    }
+    assert runtime.pending_live_inventory_actual_pnl == {}
+    assert runtime.pending_live_inventory_final_pnl == {}
+    assert runtime.pending_live_inventory_var_fill_matches == []
+    assert runtime.pending_live_inventory_actions_payload() == []
+
+
+def test_v4_cycle_checkpoint_waits_for_exit_registration(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_v4_mode = True
+        runtime.live_inventory_open_lots = []
+        runtime.live_inventory_completed_cycles = 1
+        runtime.live_inventory_max_cycles = 9
+        runtime.live_inventory_exit_events_logged = {"1"}
+        runtime.live_inventory_v4_exit_reconciliation_lot_ids = {"1"}
+        runtime.stop_flag = False
+
+        stopped = await runtime.maybe_auto_stop_completed_v4_cycle(
+            {
+                "asset": "ETH",
+                "lot_id": 1,
+                "final_pnl_status": "var_and_lighter_final_fills_confirmed",
+                "final_pnl_bps": "1.2",
+            }
+        )
+
+        assert stopped is False
+        assert getattr(runtime, "live_inventory_v4_checkpointed_lot_ids", set()) == set()
+
+    asyncio.run(run())
+
+
 def test_v4_batch_entry_gate_waits_for_reconciliation_and_cooldown(tmp_path) -> None:
     runtime = _live_inventory_runtime(tmp_path)
     runtime.live_inventory_basis_v4_mode = True
