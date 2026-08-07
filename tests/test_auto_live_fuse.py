@@ -3347,6 +3347,47 @@ def test_live_inventory_basis_pending_entry_before_timeout_does_not_stop(tmp_pat
     asyncio.run(run())
 
 
+def test_v4_pending_entry_reconciles_before_cycle_and_batch_gates(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_v4_mode = True
+        runtime.live_inventory_completed_cycles = 1
+        runtime.live_inventory_max_cycles = 1
+        runtime.auto_live_match_window_seconds = 30
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = [
+            PendingLiveInventoryVarFillMatch(
+                asset="ETH",
+                side="sell",
+                qty=Decimal("0.01"),
+                lot_id=2,
+                role="live_inventory_entry_pending_var_fill",
+                created_at_monotonic=time.monotonic(),
+            )
+        ]
+        calls: list[str] = []
+
+        async def fake_reconcile_pending_entry(*, asset: str) -> bool:
+            calls.append(asset)
+            return True
+
+        def refuse_batch_gate(**_kwargs):
+            raise AssertionError(
+                "batch gate ran before pending entry reconciliation"
+            )
+
+        runtime.maybe_timeout_pending_live_inventory_var_entry = (
+            fake_reconcile_pending_entry
+        )
+        runtime.live_inventory_v4_batch_entry_gate = refuse_batch_gate
+
+        await runtime.maybe_run_live_inventory_basis(_eth_inventory_snapshot())
+
+        assert calls == ["ETH"]
+
+    asyncio.run(run())
+
+
 def test_live_inventory_entry_blocks_below_lighter_min_base_before_submit(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)

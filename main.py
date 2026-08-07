@@ -8689,6 +8689,34 @@ class VariationalToLighterRuntime:
             return
         self.live_inventory_sample_index += 1
         index = self.live_inventory_sample_index
+        pending_entry_roles = {
+            "live_inventory_entry_pending_lighter",
+            "live_inventory_entry_pending_var_fill",
+        }
+        if (
+            not collect_only
+            and not self.live_inventory_open_lots
+            and self.has_pending_live_inventory_var_fill_match(
+                asset=asset,
+                roles=pending_entry_roles,
+            )
+        ):
+            # A submitted entry may already exist on both exchanges. Resolve
+            # it before cycle caps or batch-PnL gates can block the loop.
+            if await self.maybe_timeout_pending_live_inventory_var_entry(
+                asset=asset
+            ):
+                return
+            await self.append_live_inventory_log(
+                "live_inventory_entry_blocked",
+                {
+                    "asset": asset,
+                    "sample_index": index,
+                    "reason": "basis_var_entry_pending_fill",
+                    "reconciliation_priority": "before_batch_gates",
+                },
+            )
+            return
         if (
             not collect_only
             and self.live_inventory_completed_cycles >= self.live_inventory_max_cycles
