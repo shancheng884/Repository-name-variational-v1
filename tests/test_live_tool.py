@@ -205,8 +205,8 @@ def test_live_tool_v4_batch_is_sequential_bounded_and_guarded(
         "ETH",
         LiveConfig(
             v4_live_mode=True,
-            max_cycles=9,
-            v4_test_max_run_loss_usd="0",
+            max_cycles=3,
+            v4_test_max_run_loss_usd="0.025",
             v4_test_cycle_cooldown_seconds=0,
         ),
         v4_test_skip_recent_health=True,
@@ -215,11 +215,11 @@ def test_live_tool_v4_batch_is_sequential_bounded_and_guarded(
 
     args = parse_args()
 
-    assert args.live_inventory_max_cycles == 9
+    assert args.live_inventory_max_cycles == 3
     assert args.live_inventory_max_lots == 1
     assert args.live_inventory_max_total_lots == 1
     assert args.live_inventory_basis_v4_test_skip_recent_health is True
-    assert args.live_inventory_basis_v4_max_run_loss_usd == 0
+    assert args.live_inventory_basis_v4_max_run_loss_usd == 0.025
     assert args.live_inventory_basis_v4_cycle_cooldown_seconds == 0
 
 
@@ -228,7 +228,35 @@ def test_live_tool_v4_batch_requires_explicit_test_health_bypass(
 ) -> None:
     command = build_main_command(
         "ETH",
-        LiveConfig(v4_live_mode=True, max_cycles=9),
+        LiveConfig(v4_live_mode=True, max_cycles=3),
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_live_tool_v4_batch_requires_positive_loss_limit(monkeypatch) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(
+            v4_live_mode=True,
+            max_cycles=3,
+            v4_test_max_run_loss_usd="0",
+        ),
+        v4_test_skip_recent_health=True,
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_live_tool_v4_batch_rejects_more_than_three_cycles(monkeypatch) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(v4_live_mode=True, max_cycles=4),
+        v4_test_skip_recent_health=True,
     )
     monkeypatch.setattr("sys.argv", command[1:])
 

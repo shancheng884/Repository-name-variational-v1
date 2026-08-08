@@ -791,13 +791,13 @@ def test_v4_entry_threshold_uses_rolling_7d_anchor_with_recent_health() -> None:
 
     threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
 
-    assert threshold == Decimal("97")
+    assert threshold == Decimal("98.50")
     assert context["v4_anchor_ready"] is True
     assert context["v4_health_ready"] is True
     assert context["v4_baseline_window_seconds"] == 604800
     assert context["v4_baseline_count"] == 5760
     assert context["v4_anchor_effective_seconds"] == 172800
-    assert Decimal("97") <= threshold < Decimal("99")
+    assert Decimal("98") <= threshold < Decimal("99")
 
 
 def test_v4_entry_threshold_adds_recent_entry_capture_loss_reserve() -> None:
@@ -822,12 +822,13 @@ def test_v4_entry_threshold_adds_recent_entry_capture_loss_reserve() -> None:
     assert context["v4_entry_capture_sample_count"] == 10
     assert context["v4_entry_capture_calibration_ready"] is True
     assert context["v4_entry_capture_raw_p80_bps"] == "3.19"
-    assert context["v4_entry_execution_reserve_bps"] == "3.00"
-    assert threshold == Decimal("100.00")
-    assert context["v4_entry_threshold_bps"] == "100.00"
+    assert context["v4_entry_capture_calibration_weight"] == "0"
+    assert context["v4_entry_execution_reserve_bps"] == "1.50"
+    assert threshold == Decimal("98.50")
+    assert context["v4_entry_threshold_bps"] == "98.50"
 
 
-def test_v4_entry_threshold_ignores_immature_entry_capture_reserve() -> None:
+def test_v4_entry_threshold_uses_prior_for_immature_entry_capture_reserve() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_execution_loss_bps_samples = deque(
         [Decimal("3.19"), Decimal("0")],
@@ -848,8 +849,88 @@ def test_v4_entry_threshold_ignores_immature_entry_capture_reserve() -> None:
     assert context["v4_entry_capture_sample_count"] == 2
     assert context["v4_entry_capture_calibration_ready"] is False
     assert context["v4_entry_capture_raw_p80_bps"] == "3.19"
-    assert context["v4_entry_execution_reserve_bps"] == "0"
-    assert threshold == Decimal("97")
+    assert context["v4_entry_capture_prior_bps"] == "1.50"
+    assert context["v4_entry_execution_reserve_bps"] == "1.50"
+    assert threshold == Decimal("98.50")
+
+
+def test_v4_entry_capture_reserve_blends_prior_until_twenty_samples() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_execution_loss_bps_samples = deque(
+        [Decimal("3.00")] * 15,
+        maxlen=20,
+    )
+
+    context = runtime.live_inventory_basis_v4_entry_calibration_context()
+
+    assert context["ready"] is True
+    assert context["fully_mature"] is False
+    assert context["calibration_weight"] == Decimal("0.5")
+    assert context["applied_bps"] == Decimal("2.250")
+
+
+def test_v4_fast_1d_threshold_can_raise_rolling_7d_entry_gate() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    now = 1_000_000.0
+    recent_rows = [
+        (
+            now - 21_600 + index * 30,
+            Decimal("20") if index >= 677 else Decimal("0"),
+        )
+        for index in range(721)
+    ]
+    older_rows = [
+        (
+            now - 604_700 + index * 30,
+            Decimal(index % 10),
+        )
+        for index in range(5760 - len(recent_rows))
+    ]
+    runtime.live_inventory_basis_v4_history = deque([*older_rows, *recent_rows])
+
+    threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
+
+    assert context["v4_fast_ready"] is True
+    assert context["v4_fast_threshold_applied"] is True
+    assert Decimal(context["v4_fast_threshold_bps"]) > Decimal(
+        context["v4_7d_entry_threshold_bps"]
+    )
+    assert threshold == Decimal(context["v4_fast_threshold_bps"]) + Decimal(
+        "1.50"
+    )
+
+
+def test_v4_entry_threshold_cache_refreshes_on_baseline_cadence() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    now = 1_000_000.0
+    recent_rows = [
+        (now - 3000 + index * 30, Decimal(index))
+        for index in range(100)
+    ]
+    runtime.live_inventory_basis_v4_history = _v4_rolling_anchor_rows(
+        now,
+        recent_rows,
+    )
+
+    first_threshold, first_context = (
+        runtime.live_inventory_basis_v4_entry_threshold(now=now)
+    )
+    runtime.live_inventory_basis_v4_history.append(
+        (now + 1, Decimal("1000"))
+    )
+    cached_threshold, cached_context = (
+        runtime.live_inventory_basis_v4_entry_threshold(now=now + 1)
+    )
+    refreshed_threshold, refreshed_context = (
+        runtime.live_inventory_basis_v4_entry_threshold(now=now + 31)
+    )
+
+    assert cached_threshold == first_threshold
+    assert cached_context["v4_history_samples"] == first_context["v4_history_samples"]
+    assert refreshed_context["v4_history_samples"] == (
+        first_context["v4_history_samples"] + 1
+    )
+    assert refreshed_threshold is not None
 
 
 def test_v4_exit_target_uses_floor_until_calibration_is_mature() -> None:
@@ -1164,7 +1245,7 @@ def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> Non
     assert context["v4_health_ready"] is True
     assert context["v4_baseline_window_seconds"] == 604800
     assert context["v4_anchor_effective_seconds"] == 172800
-    assert context["v4_entry_threshold_bps"] == "97"
+    assert context["v4_entry_threshold_bps"] == "98.50"
 
 
 def test_extension_disconnect_fuse_stops_flat_runtime_after_three_failures() -> None:
@@ -1282,6 +1363,9 @@ def test_extension_disconnect_fuse_requires_review_when_position_is_open() -> No
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
         runtime.live_inventory_extension_disconnect_failures = 2
+        runtime.live_inventory_extension_failure_started_monotonic = (
+            time.monotonic() - 61
+        )
         runtime.live_inventory_extension_disconnect_fuse_triggered = False
         runtime.live_inventory_open_lots = [{"lot_id": 1, "asset": "ETH"}]
         runtime.stop_flag = False
@@ -1316,6 +1400,38 @@ def test_extension_disconnect_fuse_requires_review_when_position_is_open() -> No
         )
         assert fuse["action"] == "manual_exchange_review_required"
         assert fuse["open_lots_total"] == 1
+
+    asyncio.run(run())
+
+
+def test_extension_disconnect_fuse_grants_open_position_recovery_window() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.live_inventory_extension_disconnect_failures = 2
+        runtime.live_inventory_extension_failure_started_monotonic = time.monotonic()
+        runtime.live_inventory_extension_disconnect_fuse_triggered = False
+        runtime.live_inventory_open_lots = [{"lot_id": 1, "asset": "ETH"}]
+        runtime.stop_flag = False
+        runtime.shutdown_reason = None
+        runtime.logger = logging.getLogger("test_open_extension_disconnect_grace")
+        events: list[tuple[str, dict]] = []
+
+        async def capture(event: str, payload: dict) -> None:
+            events.append((event, payload))
+
+        runtime.append_live_inventory_log = capture
+        await runtime.record_live_inventory_basis_quote_failure(
+            asset="ETH",
+            error="No extension command client connected.",
+            failure_kind="command_rejected",
+        )
+
+        assert runtime.stop_flag is False
+        assert runtime.shutdown_reason is None
+        assert not any(
+            event == "live_inventory_runtime_fuse_triggered"
+            for event, _ in events
+        )
 
     asyncio.run(run())
 
@@ -4582,6 +4698,132 @@ def test_v4_batch_entry_gate_supports_optional_cumulative_loss_limit(tmp_path) -
     assert ready is False
     assert reason == "v4_batch_max_run_loss_reached"
     assert context["batch_run_pnl_usd"] == "-0.05"
+
+
+def test_v4_stop_loss_halts_the_remaining_batch(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_max_cycles = 3
+    runtime.live_inventory_basis_v4_max_run_loss_usd = Decimal("0.025")
+    runtime.live_inventory_basis_v4_cycle_cooldown_seconds = 0.0
+    runtime.live_inventory_v4_run_start_realized_pnl_usd = Decimal("0")
+    runtime.live_inventory_realized_pnl_usd = Decimal("-0.005")
+    runtime.live_inventory_v4_batch_halted_reason = None
+
+    runtime.require_live_inventory_basis_v4_rearm(
+        exit_reason="max_unrealized_loss_bps",
+        entry_threshold_bps=Decimal("-7.5"),
+    )
+    ready, reason, context = runtime.live_inventory_v4_batch_entry_gate(
+        now_monotonic=300.0
+    )
+
+    assert ready is False
+    assert reason == "v4_batch_halted_after_stop_loss"
+    assert context["v4_episode_state"] == "halted"
+
+
+def test_v4_max_hold_exit_enforces_thirty_minute_cooldown(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_max_cycles = 3
+    runtime.live_inventory_basis_v4_max_run_loss_usd = Decimal("0.025")
+    runtime.live_inventory_basis_v4_cycle_cooldown_seconds = 0.0
+    runtime.live_inventory_v4_run_start_realized_pnl_usd = Decimal("0")
+    runtime.live_inventory_v4_last_exit_monotonic = 100.0
+    runtime.live_inventory_v4_last_exit_reason = "v4_max_hold_timeout"
+
+    ready, reason, context = runtime.live_inventory_v4_batch_entry_gate(
+        now_monotonic=200.0
+    )
+
+    assert ready is False
+    assert reason == "v4_batch_cycle_cooldown"
+    assert context["cycle_cooldown_seconds"] == 1800.0
+    assert context["cooldown_remaining_seconds"] == 1700.0
+
+
+def test_v4_max_hold_cooldown_survives_process_restart(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_max_cycles = 3
+    runtime.live_inventory_basis_v4_max_run_loss_usd = Decimal("0.025")
+    runtime.live_inventory_basis_v4_cycle_cooldown_seconds = 0.0
+    runtime.live_inventory_v4_run_start_realized_pnl_usd = Decimal("0")
+    runtime.live_inventory_v4_last_exit_monotonic = 0.0
+    runtime.live_inventory_v4_last_exit_reason = "v4_max_hold_timeout"
+    runtime.live_inventory_v4_last_exit_at = datetime.now(timezone.utc).isoformat()
+
+    ready, reason, context = runtime.live_inventory_v4_batch_entry_gate()
+
+    assert ready is False
+    assert reason == "v4_batch_cycle_cooldown"
+    assert 1799.0 <= context["cooldown_remaining_seconds"] <= 1800.0
+
+
+def test_v4_episode_rearms_only_after_three_confirmed_resets() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_open_lots = []
+    runtime.live_inventory_v4_episode_id = "episode-1"
+    runtime.live_inventory_v4_next_tranche_index = 2
+    runtime.live_inventory_v4_batch_halted_reason = None
+    runtime.require_live_inventory_basis_v4_rearm(
+        exit_reason="v4_executable_net_target_reached",
+        entry_threshold_bps=Decimal("-7.5"),
+    )
+
+    rearmed, _ = runtime.live_inventory_basis_v4_update_rearm(
+        short_edge_bps=Decimal("-7.9"),
+        entry_threshold_bps=Decimal("-7.5"),
+    )
+    assert rearmed is False
+    assert runtime.live_inventory_v4_rearm_confirmation_count == 0
+
+    for expected_count in (1, 2):
+        rearmed, _ = runtime.live_inventory_basis_v4_update_rearm(
+            short_edge_bps=Decimal("-8.1"),
+            entry_threshold_bps=Decimal("-7.5"),
+        )
+        assert rearmed is False
+        assert runtime.live_inventory_v4_rearm_confirmation_count == expected_count
+
+    rearmed, context = runtime.live_inventory_basis_v4_update_rearm(
+        short_edge_bps=Decimal("-8.2"),
+        entry_threshold_bps=Decimal("-7.5"),
+    )
+
+    assert rearmed is True
+    assert runtime.live_inventory_v4_rearm_required is False
+    assert runtime.live_inventory_v4_episode_id is None
+    assert runtime.live_inventory_v4_next_tranche_index == 1
+    assert context["v4_episode_state"] == "armed"
+
+
+def test_v4_episode_state_survives_restart_for_future_tranches() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.load_live_inventory_state = lambda: {
+        "open_lots": [],
+        "next_lot_id": 4,
+        "realized_pnl_usd": "0.01",
+        "completed_cycles": 2,
+        "v4_episode_id": "episode-2",
+        "v4_next_tranche_index": 3,
+        "v4_rearm_required": True,
+        "v4_rearm_confirmation_count": 2,
+        "v4_rearm_reason": "v4_executable_net_target_reached",
+        "v4_rearm_threshold_bps": "-7.5",
+        "v4_last_exit_reason": "v4_executable_net_target_reached",
+        "v4_last_exit_at": "2026-08-08T00:00:00+00:00",
+    }
+
+    runtime.sync_live_inventory_memory_from_state()
+
+    assert runtime.live_inventory_v4_episode_id == "episode-2"
+    assert runtime.live_inventory_v4_next_tranche_index == 3
+    assert runtime.live_inventory_v4_rearm_required is True
+    assert runtime.live_inventory_v4_rearm_confirmation_count == 2
+    assert runtime.live_inventory_v4_rearm_threshold_bps == Decimal("-7.5")
 
 
 def test_v4_batch_entry_gate_disables_cumulative_loss_limit_at_zero(tmp_path) -> None:

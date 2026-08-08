@@ -140,6 +140,11 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         if row.get("event") == "live_inventory_v4_batch_waiting"
     ]
     latest_batch_wait = batch_wait_rows[-1] if batch_wait_rows else {}
+    batch_wait_active = bool(
+        latest_batch_wait
+        and str(latest_batch_wait.get("logged_at") or "")
+        >= str(latest_state.get("logged_at") or "")
+    )
     strategy_snapshots = [
         row
         for row in v4_rows
@@ -189,8 +194,10 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         status = "ERROR_FINAL_PNL_RECONCILIATION_REQUIRED"
     elif events["live_inventory_entered"] > events["live_inventory_exited"]:
         status = "POSITION_OPEN"
-    elif latest_batch_wait:
+    elif batch_wait_active:
         status = "WAITING_FOR_NEXT_BATCH_CYCLE"
+    elif latest_state.get("v4_rearm_required") is True:
+        status = "WAITING_FOR_EPISODE_REARM"
     elif events["live_inventory_var_entry_submitted"]:
         status = "CANDIDATE_SUBMITTED"
     elif preflight_passed:
@@ -314,8 +321,14 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "entry_capture_min_samples": latest_state.get(
             "v4_entry_capture_min_samples"
         ),
+        "entry_capture_full_samples": latest_state.get(
+            "v4_entry_capture_full_samples"
+        ),
         "entry_capture_calibration_ready": latest_state.get(
             "v4_entry_capture_calibration_ready"
+        ),
+        "entry_capture_fully_mature": latest_state.get(
+            "v4_entry_capture_fully_mature"
         ),
         "entry_capture_raw_p80_bps": latest_state.get(
             "v4_entry_capture_raw_p80_bps"
@@ -326,7 +339,40 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "entry_capture_applied_bps": latest_state.get(
             "v4_entry_capture_applied_bps"
         ),
+        "entry_capture_prior_bps": latest_state.get(
+            "v4_entry_capture_prior_bps"
+        ),
+        "entry_capture_calibration_weight": latest_state.get(
+            "v4_entry_capture_calibration_weight"
+        ),
         "latest_threshold_bps": latest_state.get("v4_entry_threshold_bps"),
+        "seven_day_threshold_bps": latest_state.get(
+            "v4_7d_entry_threshold_bps"
+        ),
+        "fast_threshold_applied": latest_state.get(
+            "v4_fast_threshold_applied"
+        ),
+        "fast_ready": latest_state.get("v4_fast_ready"),
+        "fast_threshold_bps": latest_state.get("v4_fast_threshold_bps"),
+        "fast_median_bps": latest_state.get("v4_fast_median_bps"),
+        "mid_ready": latest_state.get("v4_mid_ready"),
+        "mid_threshold_bps": latest_state.get("v4_mid_threshold_bps"),
+        "mid_median_bps": latest_state.get("v4_mid_median_bps"),
+        "long_ready": latest_state.get("v4_long_ready"),
+        "long_threshold_bps": latest_state.get("v4_long_threshold_bps"),
+        "long_median_bps": latest_state.get("v4_long_median_bps"),
+        "episode_state": latest_state.get("v4_episode_state"),
+        "episode_id": latest_state.get("v4_episode_id"),
+        "rearm_required": latest_state.get("v4_rearm_required"),
+        "rearm_confirmation_count": latest_state.get(
+            "v4_rearm_confirmation_count"
+        ),
+        "rearm_confirm_samples": latest_state.get(
+            "v4_rearm_confirm_samples"
+        ),
+        "rearm_reset_threshold_bps": latest_state.get(
+            "v4_rearm_reset_threshold_bps"
+        ),
         "latest_window_seconds": anchor_context.get("v4_baseline_window_seconds"),
         "latest_window_max_gap_seconds": anchor_context.get(
             "v4_baseline_max_sample_gap_seconds"
@@ -414,6 +460,24 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"status={funnel['status']}"
     )
     print(
+        f"multi_window_7d_p97_5={funnel['seven_day_threshold_bps']} "
+        f"fast_1d_p95={funnel['fast_threshold_bps']} "
+        f"fast_ready={funnel['fast_ready']} "
+        f"fast_applied={funnel['fast_threshold_applied']} "
+        f"mid_15d_p97_5={funnel['mid_threshold_bps']} "
+        f"mid_ready={funnel['mid_ready']} "
+        f"long_30d_p97_5={funnel['long_threshold_bps']} "
+        f"long_ready={funnel['long_ready']}"
+    )
+    print(
+        f"episode_state={funnel['episode_state']} "
+        f"episode_id={funnel['episode_id']} "
+        f"rearm_required={funnel['rearm_required']} "
+        f"rearm_progress={funnel['rearm_confirmation_count']}/"
+        f"{funnel['rearm_confirm_samples']} "
+        f"rearm_reset_threshold_bps={funnel['rearm_reset_threshold_bps']}"
+    )
+    print(
         f"anchor_count={funnel['anchor_count']} "
         f"anchor_effective_seconds={funnel['anchor_effective_seconds']} "
         f"anchor_min_effective_seconds={funnel['anchor_min_effective_seconds']} "
@@ -427,8 +491,12 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
             "entry_calibration_samples="
             f"{funnel['entry_capture_sample_count']} "
             f"min_samples={funnel['entry_capture_min_samples']} "
+            f"full_samples={funnel['entry_capture_full_samples']} "
             f"ready={funnel['entry_capture_calibration_ready']} "
+            f"fully_mature={funnel['entry_capture_fully_mature']} "
             f"raw_p80_bps={funnel['entry_capture_raw_p80_bps']} "
+            f"prior_bps={funnel['entry_capture_prior_bps']} "
+            f"weight={funnel['entry_capture_calibration_weight']} "
             f"applied_bps={funnel['entry_capture_applied_bps']} "
             f"cap_bps={funnel['entry_capture_cap_bps']}"
         )

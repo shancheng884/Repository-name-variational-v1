@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -74,7 +75,7 @@ class LiveConfig:
     calibration_max_cycle_loss_usd: str = "0.10"
     calibration_max_roundtrip_cost_bps: str = "6.0"
     v4_live_mode: bool = False
-    v4_test_max_run_loss_usd: str = "0"
+    v4_test_max_run_loss_usd: str = "0.025"
     v4_test_cycle_cooldown_seconds: int = 0
     entry_lighter_fill_timeout_seconds: str = "3"
     snapshot_timeout_seconds: str = "10"
@@ -559,7 +560,7 @@ def main() -> int:
     parser.add_argument(
         "--v4-live",
         action="store_true",
-        help="Enable the immutable, one-cycle ETH V4 live profile.",
+        help="Enable the bounded ETH V4 live profile.",
     )
     parser.add_argument(
         "--v4-test-skip-recent-health",
@@ -569,9 +570,9 @@ def main() -> int:
     parser.add_argument(
         "--v4-test-max-cycles",
         type=int,
-        choices=range(1, 11),
+        choices=range(1, 4),
         default=1,
-        metavar="1..10",
+        metavar="1..3",
         help="Bounded V4 test batch size. Values above 1 require --v4-test-skip-recent-health.",
     )
     parser.add_argument(
@@ -658,6 +659,13 @@ def main() -> int:
             "--v4-test-max-cycles above 1 requires --v4-live and "
             "--v4-test-skip-recent-health"
         )
+    if args.v4_test_max_cycles > 3:
+        parser.error("--v4-test-max-cycles cannot exceed 3")
+    if (
+        args.v4_test_max_cycles > 1
+        and Decimal(config.v4_test_max_run_loss_usd) <= 0
+    ):
+        parser.error("multi-cycle V4 requires v4_test_max_run_loss_usd > 0")
     if (
         args.calibration_direction is not None
         or args.calibration_weekdays_only is not None

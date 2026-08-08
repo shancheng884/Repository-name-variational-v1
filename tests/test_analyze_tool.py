@@ -112,6 +112,77 @@ def test_v4_live_funnel_distinguishes_anchor_and_recent_health_waits() -> None:
     assert health_wait["status"] == "WAITING_FOR_RECENT_HEALTH_WINDOW"
 
 
+def test_v4_live_funnel_reports_multi_window_and_episode_rearm() -> None:
+    funnel = build_v4_live_funnel(
+        [
+            {
+                "run_id": "live-v4-rearm",
+                "strategy_version": "basis-v4-live-v4",
+                "event": "live_inventory_basis_state",
+                "logged_at": "2026-08-08T01:00:00+00:00",
+                "asset": "ETH",
+                "basis_v4_profile": "eth_short_execution_calibrated_20260724_n10",
+                "short_edge_bps": "-8.2",
+                "v4_entry_threshold_bps": "-7.5",
+                "v4_7d_entry_threshold_bps": "-8.0",
+                "v4_fast_ready": True,
+                "v4_fast_threshold_bps": "-7.5",
+                "v4_fast_threshold_applied": True,
+                "v4_mid_ready": False,
+                "v4_mid_threshold_bps": "-8.3",
+                "v4_long_ready": False,
+                "v4_long_threshold_bps": "-8.4",
+                "v4_anchor_ready": True,
+                "v4_health_ready": True,
+                "v4_rearm_required": True,
+                "v4_episode_state": "disarmed",
+                "v4_episode_id": "episode-1",
+                "v4_rearm_confirmation_count": 2,
+                "v4_rearm_confirm_samples": 3,
+                "v4_rearm_reset_threshold_bps": "-8.0",
+            }
+        ]
+    )
+
+    assert funnel is not None
+    assert funnel["status"] == "WAITING_FOR_EPISODE_REARM"
+    assert funnel["seven_day_threshold_bps"] == "-8.0"
+    assert funnel["fast_threshold_bps"] == "-7.5"
+    assert funnel["fast_threshold_applied"] is True
+    assert funnel["episode_state"] == "disarmed"
+    assert funnel["rearm_confirmation_count"] == 2
+
+
+def test_v4_live_funnel_ignores_stale_batch_wait_after_sampling_resumes() -> None:
+    common = {
+        "run_id": "live-v4-resumed",
+        "strategy_version": "basis-v4-live-v4",
+        "asset": "ETH",
+    }
+    funnel = build_v4_live_funnel(
+        [
+            {
+                **common,
+                "event": "live_inventory_v4_batch_waiting",
+                "logged_at": "2026-08-08T00:00:00+00:00",
+                "reason": "v4_batch_cycle_cooldown",
+            },
+            {
+                **common,
+                "event": "live_inventory_basis_state",
+                "logged_at": "2026-08-08T00:31:00+00:00",
+                "v4_anchor_ready": True,
+                "v4_health_ready": True,
+                "short_edge_bps": "-9",
+                "v4_entry_threshold_bps": "-7",
+            },
+        ]
+    )
+
+    assert funnel is not None
+    assert funnel["status"] == "WAITING_FOR_THRESHOLD_CROSSING"
+
+
 def test_v4_live_funnel_reports_anchor_progress_and_runtime_fuse() -> None:
     common = {
         "run_id": "live-v4-fuse",

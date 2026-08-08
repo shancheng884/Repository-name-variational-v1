@@ -88,14 +88,21 @@ LIVE_INVENTORY_BASIS_V4_PROFILE_CHOICES = (
     LIVE_INVENTORY_BASIS_V4_PROFILE_ETH_SHORT_20260724,
 )
 LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS = 604800
+LIVE_INVENTORY_BASIS_V4_FAST_WINDOW_SECONDS = 86400
+LIVE_INVENTORY_BASIS_V4_MID_WINDOW_SECONDS = 15 * 86400
+LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS = 30 * 86400
 LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS = 3600
 LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE = Decimal("97.5")
+LIVE_INVENTORY_BASIS_V4_FAST_ENTRY_PERCENTILE = Decimal("95")
 LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS = 30
 LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE = Decimal("0.80")
 LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES = 100
 LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS = 129600
+LIVE_INVENTORY_BASIS_V4_FAST_MIN_EFFECTIVE_SECONDS = 21600
 LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS = Decimal("0.50")
 LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_MIN_SAMPLES = 10
+LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_FULL_SAMPLES = 20
+LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_PRIOR_BPS = Decimal("1.50")
 LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_CAP_BPS = Decimal("3.00")
 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES = 10
 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_CAP_BPS = Decimal("3.00")
@@ -105,13 +112,23 @@ LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
         "basis-v4-live-test-v2",
         "basis-v4-live-v3",
         "basis-v4-live-test-v3",
+        "basis-v4-live-v4",
+        "basis-v4-live-test-v4",
     }
 )
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
 LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES = 2
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
 LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS = 60
+LIVE_INVENTORY_BASIS_V4_REARM_BUFFER_BPS = Decimal("0.50")
+LIVE_INVENTORY_BASIS_V4_REARM_CONFIRM_SAMPLES = 3
+LIVE_INVENTORY_BASIS_V4_MAX_HOLD_COOLDOWN_SECONDS = 1800
+LIVE_INVENTORY_BASIS_V4_THRESHOLD_CACHE_SECONDS = 30
+# The 15d/30d windows are diagnostic context only. Refreshing them daily keeps
+# their full-history sort out of the order-decision path.
+LIVE_INVENTORY_BASIS_V4_SHADOW_CACHE_SECONDS = 86400
 LIVE_INVENTORY_EXTENSION_DISCONNECT_FAILURE_LIMIT = 3
+LIVE_INVENTORY_EXTENSION_OPEN_POSITION_GRACE_SECONDS = 60.0
 LIVE_RUNTIME_LOG_MAX_BYTES = 10 * 1024 * 1024
 LIVE_RUNTIME_LOG_BACKUP_COUNT = 5
 LIVE_DISK_WARN_FREE_GB = 5.0
@@ -1139,12 +1156,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
-            else "basis-v4-live-test-v3"
+            else "basis-v4-live-test-v4"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else "basis-v4-live-v3"
+            else "basis-v4-live-v4"
             if self.live_inventory_basis_v4_mode
             else "cost-calibrated-reversion-v3"
             if self.live_inventory_basis_reversion_mode
@@ -1155,12 +1172,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v3-test-health-bypass"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v4-test-health-bypass"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v3"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v4"
             if self.live_inventory_basis_v4_mode
             else "legacy-5m-reversion"
             if self.live_inventory_basis_reversion_mode
@@ -1182,6 +1199,14 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_run_start_realized_pnl_usd = Decimal("0")
         self.live_inventory_v4_last_exit_monotonic = 0.0
         self.live_inventory_v4_batch_halted_reason: str | None = None
+        self.live_inventory_v4_episode_id: str | None = None
+        self.live_inventory_v4_next_tranche_index = 1
+        self.live_inventory_v4_rearm_required = False
+        self.live_inventory_v4_rearm_confirmation_count = 0
+        self.live_inventory_v4_rearm_reason: str | None = None
+        self.live_inventory_v4_rearm_threshold_bps: Decimal | None = None
+        self.live_inventory_v4_last_exit_reason: str | None = None
+        self.live_inventory_v4_last_exit_at: str | None = None
         self.live_inventory_v4_checkpointed_lot_ids: set[str] = set()
         self.live_inventory_v4_exit_reconciliation_lot_ids: set[str] = set()
         self.live_inventory_calibration_last_exit_sample_index: int | None = None
@@ -1226,7 +1251,15 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_history_reason = "not_loaded"
         self.live_inventory_basis_v4_projection_cached_at = 0.0
         self.live_inventory_basis_v4_projection_cache: dict[str, Any] = {}
+        self.live_inventory_basis_v4_threshold_cached_at = 0.0
+        self.live_inventory_basis_v4_threshold_cache: tuple[
+            Decimal | None,
+            dict[str, Any],
+        ] | None = None
+        self.live_inventory_basis_v4_shadow_cached_at = 0.0
+        self.live_inventory_basis_v4_shadow_cache: dict[str, Any] = {}
         self.live_inventory_extension_disconnect_failures = 0
+        self.live_inventory_extension_failure_started_monotonic = 0.0
         self.live_inventory_extension_disconnect_fuse_triggered = False
         self.live_inventory_last_fatal_quote_failure_kind: str | None = None
         self.live_inventory_last_disk_check_monotonic = 0.0
@@ -1375,16 +1408,40 @@ class VariationalToLighterRuntime:
         sample_count = len(samples)
         raw_p80_bps = self.percentile_decimal(samples, 80) or Decimal("0")
         ready = sample_count >= LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_MIN_SAMPLES
-        applied_bps = (
-            min(raw_p80_bps, LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_CAP_BPS)
-            if ready
-            else Decimal("0")
+        fully_mature = (
+            sample_count >= LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_FULL_SAMPLES
         )
+        capped_raw_p80_bps = min(
+            raw_p80_bps,
+            LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_CAP_BPS,
+        )
+        if not ready:
+            applied_bps = LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_PRIOR_BPS
+            calibration_weight = Decimal("0")
+        elif fully_mature:
+            applied_bps = capped_raw_p80_bps
+            calibration_weight = Decimal("1")
+        else:
+            calibration_weight = Decimal(
+                sample_count - LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_MIN_SAMPLES
+            ) / Decimal(
+                LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_FULL_SAMPLES
+                - LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_MIN_SAMPLES
+            )
+            applied_bps = (
+                LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_PRIOR_BPS
+                * (Decimal("1") - calibration_weight)
+                + capped_raw_p80_bps * calibration_weight
+            )
         return {
             "sample_count": sample_count,
             "min_samples": LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_MIN_SAMPLES,
+            "full_samples": LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_FULL_SAMPLES,
             "ready": ready,
+            "fully_mature": fully_mature,
             "raw_p80_bps": raw_p80_bps,
+            "prior_bps": LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_PRIOR_BPS,
+            "calibration_weight": calibration_weight,
             "cap_bps": LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_CAP_BPS,
             "applied_bps": applied_bps,
         }
@@ -1394,9 +1451,17 @@ class VariationalToLighterRuntime:
         return {
             "v4_entry_capture_sample_count": context["sample_count"],
             "v4_entry_capture_min_samples": context["min_samples"],
+            "v4_entry_capture_full_samples": context["full_samples"],
             "v4_entry_capture_calibration_ready": context["ready"],
+            "v4_entry_capture_fully_mature": context["fully_mature"],
             "v4_entry_capture_raw_p80_bps": decimal_to_str(
                 context["raw_p80_bps"]
+            ),
+            "v4_entry_capture_prior_bps": decimal_to_str(
+                context["prior_bps"]
+            ),
+            "v4_entry_capture_calibration_weight": decimal_to_str(
+                context["calibration_weight"]
             ),
             "v4_entry_capture_cap_bps": decimal_to_str(context["cap_bps"]),
             "v4_entry_capture_applied_bps": decimal_to_str(
@@ -2139,6 +2204,87 @@ class VariationalToLighterRuntime:
         self.live_inventory_next_lot_id = int(state.get("next_lot_id") or 1)
         self.live_inventory_realized_pnl_usd = to_decimal(state.get("realized_pnl_usd")) or Decimal("0")
         self.live_inventory_completed_cycles = int(state.get("completed_cycles") or 0)
+        self.live_inventory_v4_episode_id = state.get("v4_episode_id") or None
+        self.live_inventory_v4_next_tranche_index = int(
+            state.get("v4_next_tranche_index") or 1
+        )
+        self.live_inventory_v4_rearm_required = bool(
+            state.get("v4_rearm_required", False)
+        )
+        self.live_inventory_v4_rearm_confirmation_count = int(
+            state.get("v4_rearm_confirmation_count") or 0
+        )
+        self.live_inventory_v4_rearm_reason = state.get("v4_rearm_reason") or None
+        self.live_inventory_v4_rearm_threshold_bps = to_decimal(
+            state.get("v4_rearm_threshold_bps")
+        )
+        self.live_inventory_v4_last_exit_reason = (
+            state.get("v4_last_exit_reason") or None
+        )
+        self.live_inventory_v4_last_exit_at = state.get("v4_last_exit_at") or None
+        self.live_inventory_v4_batch_halted_reason = (
+            state.get("v4_batch_halted_reason") or None
+        )
+
+    def live_inventory_v4_episode_payload(self) -> dict[str, Any]:
+        if not getattr(self, "live_inventory_basis_v4_mode", False):
+            return {}
+        rearm_required = bool(
+            getattr(self, "live_inventory_v4_rearm_required", False)
+        )
+        batch_halted_reason = getattr(
+            self,
+            "live_inventory_v4_batch_halted_reason",
+            None,
+        )
+        if getattr(self, "live_inventory_open_lots", []):
+            episode_state = "active"
+        elif batch_halted_reason:
+            episode_state = "halted"
+        elif rearm_required:
+            episode_state = "disarmed"
+        else:
+            episode_state = "armed"
+        return {
+            "v4_episode_state": episode_state,
+            "v4_episode_id": getattr(self, "live_inventory_v4_episode_id", None),
+            "v4_next_tranche_index": int(
+                getattr(self, "live_inventory_v4_next_tranche_index", 1)
+            ),
+            "v4_rearm_required": rearm_required,
+            "v4_rearm_confirmation_count": (
+                int(
+                    getattr(
+                        self,
+                        "live_inventory_v4_rearm_confirmation_count",
+                        0,
+                    )
+                )
+            ),
+            "v4_rearm_confirm_samples": LIVE_INVENTORY_BASIS_V4_REARM_CONFIRM_SAMPLES,
+            "v4_rearm_buffer_bps": decimal_to_str(
+                LIVE_INVENTORY_BASIS_V4_REARM_BUFFER_BPS
+            ),
+            "v4_rearm_reason": getattr(
+                self,
+                "live_inventory_v4_rearm_reason",
+                None,
+            ),
+            "v4_rearm_threshold_bps": decimal_to_str(
+                getattr(self, "live_inventory_v4_rearm_threshold_bps", None)
+            ),
+            "v4_last_exit_reason": getattr(
+                self,
+                "live_inventory_v4_last_exit_reason",
+                None,
+            ),
+            "v4_last_exit_at": getattr(
+                self,
+                "live_inventory_v4_last_exit_at",
+                None,
+            ),
+            "v4_batch_halted_reason": batch_halted_reason,
+        }
 
     def live_inventory_state_asset(self) -> str:
         for lot in getattr(self, "live_inventory_open_lots", []) or []:
@@ -2369,6 +2515,7 @@ class VariationalToLighterRuntime:
                 "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
                 "completed_cycles": self.live_inventory_completed_cycles,
                 "reason": reason,
+                **self.live_inventory_v4_episode_payload(),
             }
         )
 
@@ -2392,6 +2539,7 @@ class VariationalToLighterRuntime:
                 "manual_review_reason": reason,
                 "manual_review_context": context or {},
                 "action": "stop_live_inventory_until_manual_flat_confirmed",
+                **self.live_inventory_v4_episode_payload(),
             }
         )
         await self.append_live_inventory_log(
@@ -2428,6 +2576,7 @@ class VariationalToLighterRuntime:
                 "completed_cycles": self.live_inventory_completed_cycles,
                 "last_blocked_reason": reason,
                 "last_blocked_context": context,
+                **self.live_inventory_v4_episode_payload(),
             }
         )
         await self.append_live_inventory_log(
@@ -2811,6 +2960,68 @@ class VariationalToLighterRuntime:
         )
         return ordered[max(0, min(index, len(ordered) - 1))]
 
+    def live_inventory_basis_v4_window_stats(
+        self,
+        *,
+        now: float,
+        window_seconds: int,
+        percentile: Decimal,
+        min_effective_seconds: int,
+        min_coverage_seconds: int,
+        require_contiguous: bool,
+    ) -> dict[str, Any]:
+        cutoff = now - window_seconds
+        rows = []
+        for row in reversed(self.live_inventory_basis_v4_history):
+            if row[0] <= cutoff:
+                break
+            rows.append(row)
+        rows.reverse()
+        values = [value for _, value in rows]
+        coverage_seconds = max(0.0, now - rows[0][0]) if rows else 0.0
+        effective_seconds = min(
+            len(rows) * LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
+            window_seconds,
+        )
+        max_gap_seconds = max(
+            (
+                current[0] - previous[0]
+                for previous, current in zip(rows, rows[1:])
+            ),
+            default=0.0,
+        )
+        median_bps = median(values) if values else None
+        mad_bps = (
+            median([abs(value - median_bps) for value in values])
+            if median_bps is not None
+            else None
+        )
+        threshold_bps = self.live_inventory_basis_v4_percentile(
+            values,
+            percentile,
+        )
+        ready = bool(
+            len(rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
+            and effective_seconds >= min_effective_seconds
+            and coverage_seconds >= min_coverage_seconds
+            and (
+                not require_contiguous
+                or max_gap_seconds <= LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
+            )
+        )
+        return {
+            "window_seconds": window_seconds,
+            "count": len(rows),
+            "coverage_seconds": f"{coverage_seconds:.3f}",
+            "effective_seconds": effective_seconds,
+            "max_sample_gap_seconds": f"{max_gap_seconds:.3f}",
+            "percentile": decimal_to_str(percentile),
+            "threshold_bps": decimal_to_str(threshold_bps),
+            "median_bps": decimal_to_str(median_bps),
+            "mad_bps": decimal_to_str(mad_bps),
+            "ready": ready,
+        }
+
     def live_inventory_basis_v4_anchor_projection(self, *, now: float) -> dict[str, Any]:
         cached_at = float(
             getattr(self, "live_inventory_basis_v4_projection_cached_at", 0.0)
@@ -2872,8 +3083,12 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_history.clear()
         self.live_inventory_basis_v4_history_ready = False
         self.live_inventory_basis_v4_history_reason = "insufficient_rolling_7d_anchor"
+        self.live_inventory_basis_v4_threshold_cached_at = 0.0
+        self.live_inventory_basis_v4_threshold_cache = None
+        self.live_inventory_basis_v4_shadow_cached_at = 0.0
+        self.live_inventory_basis_v4_shadow_cache = {}
         now = datetime.now(timezone.utc).timestamp()
-        cutoff = now - LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS
+        cutoff = now - LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS
         next_sample_at = cutoff
         source_rows = read_basis_samples(
             self.output_dir / "basis_samples",
@@ -2934,10 +3149,43 @@ class VariationalToLighterRuntime:
         *,
         now: float,
     ) -> tuple[Decimal | None, dict[str, Any]]:
+        cached = getattr(
+            self,
+            "live_inventory_basis_v4_threshold_cache",
+            None,
+        )
+        cached_at = float(
+            getattr(
+                self,
+                "live_inventory_basis_v4_threshold_cached_at",
+                0.0,
+            )
+            or 0.0
+        )
+        if (
+            cached is not None
+            and now - cached_at < LIVE_INVENTORY_BASIS_V4_THRESHOLD_CACHE_SECONDS
+        ):
+            return cached[0], dict(cached[1])
+
+        def finish(
+            threshold_bps: Decimal | None,
+            threshold_context: dict[str, Any],
+        ) -> tuple[Decimal | None, dict[str, Any]]:
+            self.live_inventory_basis_v4_threshold_cached_at = now
+            self.live_inventory_basis_v4_threshold_cache = (
+                threshold_bps,
+                dict(threshold_context),
+            )
+            return threshold_bps, threshold_context
+
         anchor_cutoff = now - LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS
-        anchor_rows = [
-            row for row in self.live_inventory_basis_v4_history if row[0] > anchor_cutoff
-        ]
+        anchor_rows = []
+        for row in reversed(self.live_inventory_basis_v4_history):
+            if row[0] <= anchor_cutoff:
+                break
+            anchor_rows.append(row)
+        anchor_rows.reverse()
         anchor_coverage_seconds = (
             max(0.0, now - anchor_rows[0][0]) if anchor_rows else 0.0
         )
@@ -2994,6 +3242,58 @@ class VariationalToLighterRuntime:
             )
         )
         health_ready = health_ready_observed or health_gate_bypassed
+        fast_context = self.live_inventory_basis_v4_window_stats(
+            now=now,
+            window_seconds=LIVE_INVENTORY_BASIS_V4_FAST_WINDOW_SECONDS,
+            percentile=LIVE_INVENTORY_BASIS_V4_FAST_ENTRY_PERCENTILE,
+            min_effective_seconds=LIVE_INVENTORY_BASIS_V4_FAST_MIN_EFFECTIVE_SECONDS,
+            min_coverage_seconds=LIVE_INVENTORY_BASIS_V4_FAST_MIN_EFFECTIVE_SECONDS,
+            require_contiguous=True,
+        )
+        shadow_cached_at = float(
+            getattr(self, "live_inventory_basis_v4_shadow_cached_at", 0.0)
+            or 0.0
+        )
+        shadow_cache = getattr(
+            self,
+            "live_inventory_basis_v4_shadow_cache",
+            {},
+        )
+        if (
+            shadow_cache
+            and now - shadow_cached_at
+            < LIVE_INVENTORY_BASIS_V4_SHADOW_CACHE_SECONDS
+        ):
+            mid_context = dict(shadow_cache["mid"])
+            long_context = dict(shadow_cache["long"])
+        else:
+            mid_context = self.live_inventory_basis_v4_window_stats(
+                now=now,
+                window_seconds=LIVE_INVENTORY_BASIS_V4_MID_WINDOW_SECONDS,
+                percentile=LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE,
+                min_effective_seconds=5 * 86400,
+                min_coverage_seconds=int(
+                    LIVE_INVENTORY_BASIS_V4_MID_WINDOW_SECONDS
+                    * float(LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE)
+                ),
+                require_contiguous=False,
+            )
+            long_context = self.live_inventory_basis_v4_window_stats(
+                now=now,
+                window_seconds=LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS,
+                percentile=LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE,
+                min_effective_seconds=10 * 86400,
+                min_coverage_seconds=int(
+                    LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS
+                    * float(LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE)
+                ),
+                require_contiguous=False,
+            )
+            self.live_inventory_basis_v4_shadow_cached_at = now
+            self.live_inventory_basis_v4_shadow_cache = {
+                "mid": dict(mid_context),
+                "long": dict(long_context),
+            }
         context = {
             "v4_history_samples": len(self.live_inventory_basis_v4_history),
             "v4_anchor_window_seconds": LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS,
@@ -3012,6 +3312,18 @@ class VariationalToLighterRuntime:
             "v4_health_ready": health_ready,
             "v4_health_ready_observed": health_ready_observed,
             "v4_health_gate_bypassed": health_gate_bypassed,
+            **{
+                f"v4_fast_{key}": value
+                for key, value in fast_context.items()
+            },
+            **{
+                f"v4_mid_{key}": value
+                for key, value in mid_context.items()
+            },
+            **{
+                f"v4_long_{key}": value
+                for key, value in long_context.items()
+            },
             # Compatibility fields used by the existing analyzer.
             "v4_mature_windows": (
                 [LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS]
@@ -3025,18 +3337,32 @@ class VariationalToLighterRuntime:
             **self.live_inventory_basis_v4_anchor_projection(now=now),
         }
         if not anchor_ready or not health_ready:
-            return None, context
+            return finish(None, context)
 
         values = [edge_bps for _, edge_bps in anchor_rows]
-        raw_threshold = self.live_inventory_basis_v4_percentile(values)
+        anchor_threshold = self.live_inventory_basis_v4_percentile(values)
+        if anchor_threshold is None:
+            return finish(None, context)
+        fast_threshold = to_decimal(fast_context.get("threshold_bps"))
+        raw_threshold = (
+            max(anchor_threshold, fast_threshold)
+            if fast_context["ready"] and fast_threshold is not None
+            else anchor_threshold
+        )
         entry_execution_reserve_bps = (
             self.live_inventory_basis_v4_entry_execution_reserve_bps()
         )
         threshold = raw_threshold + entry_execution_reserve_bps
-        return threshold, {
+        return finish(threshold, {
             **context,
             "v4_entry_percentile": decimal_to_str(
                 LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE
+            ),
+            "v4_7d_entry_threshold_bps": decimal_to_str(anchor_threshold),
+            "v4_fast_threshold_applied": bool(
+                fast_context["ready"]
+                and fast_threshold is not None
+                and fast_threshold > anchor_threshold
             ),
             "v4_raw_entry_threshold_bps": decimal_to_str(raw_threshold),
             "v4_entry_execution_reserve_bps": decimal_to_str(
@@ -3044,7 +3370,7 @@ class VariationalToLighterRuntime:
             ),
             **self.live_inventory_basis_v4_entry_calibration_payload(),
             "v4_entry_threshold_bps": decimal_to_str(threshold),
-        }
+        })
 
     def record_live_inventory_basis_v4_edge(
         self,
@@ -3058,13 +3384,84 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_next_history_sample_at = (
             now + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
         )
-        cutoff = now - LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS
+        cutoff = now - LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS
         while (
             self.live_inventory_basis_v4_history
             and self.live_inventory_basis_v4_history[0][0] <= cutoff
         ):
             self.live_inventory_basis_v4_history.popleft()
         return True
+
+    def live_inventory_basis_v4_update_rearm(
+        self,
+        *,
+        short_edge_bps: Decimal,
+        entry_threshold_bps: Decimal | None,
+    ) -> tuple[bool, dict[str, Any]]:
+        required = bool(
+            getattr(self, "live_inventory_v4_rearm_required", False)
+        )
+        threshold = (
+            entry_threshold_bps
+            if entry_threshold_bps is not None
+            else getattr(
+                self,
+                "live_inventory_v4_rearm_threshold_bps",
+                None,
+            )
+        )
+        reset_threshold = (
+            threshold - LIVE_INVENTORY_BASIS_V4_REARM_BUFFER_BPS
+            if threshold is not None
+            else None
+        )
+        if not required or getattr(self, "live_inventory_open_lots", []):
+            return False, {
+                **self.live_inventory_v4_episode_payload(),
+                "v4_rearm_reset_threshold_bps": decimal_to_str(reset_threshold),
+                "v4_rearm_signal_below_reset": False,
+            }
+        below_reset = bool(
+            reset_threshold is not None and short_edge_bps <= reset_threshold
+        )
+        if below_reset:
+            self.live_inventory_v4_rearm_confirmation_count += 1
+        else:
+            self.live_inventory_v4_rearm_confirmation_count = 0
+        rearmed = (
+            self.live_inventory_v4_rearm_confirmation_count
+            >= LIVE_INVENTORY_BASIS_V4_REARM_CONFIRM_SAMPLES
+        )
+        if rearmed:
+            self.live_inventory_v4_rearm_required = False
+            self.live_inventory_v4_rearm_confirmation_count = 0
+            self.live_inventory_v4_rearm_reason = None
+            self.live_inventory_v4_rearm_threshold_bps = None
+            self.live_inventory_v4_episode_id = None
+            self.live_inventory_v4_next_tranche_index = 1
+        return rearmed, {
+            **self.live_inventory_v4_episode_payload(),
+            "v4_rearm_reset_threshold_bps": decimal_to_str(reset_threshold),
+            "v4_rearm_signal_below_reset": below_reset,
+        }
+
+    def require_live_inventory_basis_v4_rearm(
+        self,
+        *,
+        exit_reason: str,
+        entry_threshold_bps: Decimal | None,
+    ) -> None:
+        self.live_inventory_v4_rearm_required = True
+        self.live_inventory_v4_rearm_confirmation_count = 0
+        self.live_inventory_v4_rearm_reason = exit_reason
+        self.live_inventory_v4_rearm_threshold_bps = entry_threshold_bps
+        self.live_inventory_v4_last_exit_reason = exit_reason
+        self.live_inventory_v4_last_exit_at = utc_now()
+        self.live_inventory_v4_next_tranche_index = 1
+        if exit_reason == "max_unrealized_loss_bps":
+            self.live_inventory_v4_batch_halted_reason = (
+                "v4_batch_halted_after_stop_loss"
+            )
 
     def live_inventory_basis_abs_entry_ok(self, *, direction: str, basis_bps: Decimal, threshold_bps: Decimal | None = None) -> bool:
         threshold = self.live_inventory_basis_min_abs_entry_bps if threshold_bps is None else threshold_bps
@@ -3308,6 +3705,11 @@ class VariationalToLighterRuntime:
             )
             if previous_kind not in {None, fatal_failure_kind}:
                 self.live_inventory_extension_disconnect_failures = 0
+                self.live_inventory_extension_failure_started_monotonic = 0.0
+            if self.live_inventory_extension_disconnect_failures == 0:
+                self.live_inventory_extension_failure_started_monotonic = (
+                    time.monotonic()
+                )
             self.live_inventory_extension_disconnect_failures = (
                 int(
                     getattr(
@@ -3324,8 +3726,21 @@ class VariationalToLighterRuntime:
             )
         else:
             self.live_inventory_extension_disconnect_failures = 0
+            self.live_inventory_extension_failure_started_monotonic = 0.0
             self.live_inventory_last_fatal_quote_failure_kind = None
         failure_count = self.live_inventory_extension_disconnect_failures
+        failure_elapsed_seconds = max(
+            0.0,
+            time.monotonic()
+            - float(
+                getattr(
+                    self,
+                    "live_inventory_extension_failure_started_monotonic",
+                    0.0,
+                )
+                or 0.0
+            ),
+        )
         await self.append_live_inventory_log(
             "live_inventory_basis_quote_failed",
             {
@@ -3338,6 +3753,13 @@ class VariationalToLighterRuntime:
                 "fatal_quote_failure_kind": fatal_failure_kind,
                 "extension_consecutive_failures": failure_count,
                 "extension_failure_limit": LIVE_INVENTORY_EXTENSION_DISCONNECT_FAILURE_LIMIT,
+                "extension_failure_elapsed_seconds": round(
+                    failure_elapsed_seconds,
+                    3,
+                ),
+                "open_position_grace_seconds": (
+                    LIVE_INVENTORY_EXTENSION_OPEN_POSITION_GRACE_SECONDS
+                ),
                 "result_step": result.get("step") if isinstance(result, dict) else None,
             },
         )
@@ -3349,6 +3771,11 @@ class VariationalToLighterRuntime:
                 "live_inventory_extension_disconnect_fuse_triggered",
                 False,
             )
+            or (
+                bool(self.live_inventory_open_lots)
+                and failure_elapsed_seconds
+                < LIVE_INVENTORY_EXTENSION_OPEN_POSITION_GRACE_SECONDS
+            )
         ):
             return
 
@@ -3359,6 +3786,13 @@ class VariationalToLighterRuntime:
             "reason": self.shutdown_reason,
             "extension_consecutive_failures": failure_count,
             "extension_failure_limit": LIVE_INVENTORY_EXTENSION_DISCONNECT_FAILURE_LIMIT,
+            "extension_failure_elapsed_seconds": round(
+                failure_elapsed_seconds,
+                3,
+            ),
+            "open_position_grace_seconds": (
+                LIVE_INVENTORY_EXTENSION_OPEN_POSITION_GRACE_SECONDS
+            ),
             "fatal_quote_failure_kind": fatal_failure_kind,
             "open_lots_total": len(self.live_inventory_open_lots),
             "action": (
@@ -3492,6 +3926,7 @@ class VariationalToLighterRuntime:
             )
             return None, None
         self.live_inventory_extension_disconnect_failures = 0
+        self.live_inventory_extension_failure_started_monotonic = 0.0
         return payload, Decimal(str(elapsed_ms))
 
     async def try_auto_close_unhedged_live_inventory_leg(
@@ -3772,6 +4207,8 @@ class VariationalToLighterRuntime:
         lot = {
             "lot_id": lot_id,
             "basis_trace_id": context.get("basis_trace_id"),
+            "episode_id": context.get("episode_id"),
+            "tranche_index": int(context.get("tranche_index") or 1),
             "signal_mode": LIVE_INVENTORY_SIGNAL_BASIS,
             "direction": direction,
             "qty": decimal_to_str(qty),
@@ -3821,6 +4258,20 @@ class VariationalToLighterRuntime:
             "status": "open",
         }
         self.live_inventory_open_lots.append(lot)
+        if getattr(self, "live_inventory_basis_v4_mode", False):
+            self.live_inventory_v4_episode_id = lot.get("episode_id") or (
+                getattr(self, "live_inventory_v4_episode_id", None)
+            )
+            self.live_inventory_v4_next_tranche_index = max(
+                int(
+                    getattr(
+                        self,
+                        "live_inventory_v4_next_tranche_index",
+                        1,
+                    )
+                ),
+                int(lot.get("tranche_index") or 1) + 1,
+            )
         self.remember_live_inventory_final_pnl_lot(asset=asset, lot=lot)
         self.sync_live_inventory_open_lot_entry_cost(asset=asset, lot_id=lot_id)
         await self.persist_live_inventory_memory(reason="basis_entry_lighter_submitted_after_var_fill")
@@ -3831,6 +4282,8 @@ class VariationalToLighterRuntime:
                 "sample_index": context.get("sample_index"),
                 "lot_id": lot_id,
                 "basis_trace_id": context.get("basis_trace_id"),
+                "episode_id": lot.get("episode_id"),
+                "tranche_index": lot.get("tranche_index"),
                 "direction": direction,
                 "qty": decimal_to_str(qty),
                 "edge_bps": context.get("edge_bps"),
@@ -7047,8 +7500,32 @@ class VariationalToLighterRuntime:
                 0.0,
             )
         )
+        last_exit_reason = getattr(
+            self,
+            "live_inventory_v4_last_exit_reason",
+            None,
+        )
+        if last_exit_reason == "v4_max_hold_timeout":
+            cooldown_seconds = max(
+                cooldown_seconds,
+                float(LIVE_INVENTORY_BASIS_V4_MAX_HOLD_COOLDOWN_SECONDS),
+            )
+        last_exit_elapsed_seconds: float | None = (
+            max(0.0, now - last_exit) if last_exit else None
+        )
+        if last_exit_elapsed_seconds is None:
+            last_exit_at = self._parse_iso_ts(
+                getattr(self, "live_inventory_v4_last_exit_at", None)
+            )
+            if last_exit_at is not None:
+                last_exit_elapsed_seconds = max(
+                    0.0,
+                    (datetime.now(timezone.utc) - last_exit_at).total_seconds(),
+                )
         cooldown_remaining_seconds = (
-            max(0.0, cooldown_seconds - (now - last_exit)) if last_exit else 0.0
+            max(0.0, cooldown_seconds - last_exit_elapsed_seconds)
+            if last_exit_elapsed_seconds is not None
+            else 0.0
         )
         context = {
             "completed_cycles": int(
@@ -7063,7 +7540,28 @@ class VariationalToLighterRuntime:
             "reconciliation_cleanup": reconciliation_cleanup,
             "cycle_cooldown_seconds": cooldown_seconds,
             "cooldown_remaining_seconds": round(cooldown_remaining_seconds, 3),
+            "last_exit_reason": last_exit_reason,
+            "last_exit_elapsed_seconds": (
+                None
+                if last_exit_elapsed_seconds is None
+                else round(last_exit_elapsed_seconds, 3)
+            ),
+            "v4_episode_state": self.live_inventory_v4_episode_payload().get(
+                "v4_episode_state"
+            ),
+            "v4_rearm_required": getattr(
+                self,
+                "live_inventory_v4_rearm_required",
+                False,
+            ),
         }
+        halted_reason = getattr(
+            self,
+            "live_inventory_v4_batch_halted_reason",
+            None,
+        )
+        if halted_reason:
+            return False, halted_reason, context
         if max_run_loss_usd > 0 and run_pnl_usd <= -max_run_loss_usd:
             return False, "v4_batch_max_run_loss_reached", context
         if pending_actual_pnl or unresolved_final_pnl:
@@ -8755,7 +9253,10 @@ class VariationalToLighterRuntime:
                     reason="v4_checkpointed_reconciliation_auto_pruned"
                 )
             if not batch_ready:
-                if batch_reason == "v4_batch_max_run_loss_reached":
+                if batch_reason in {
+                    "v4_batch_max_run_loss_reached",
+                    "v4_batch_halted_after_stop_loss",
+                }:
                     if not self.live_inventory_v4_batch_halted_reason:
                         self.live_inventory_v4_batch_halted_reason = batch_reason
                         await self.append_live_inventory_log(
@@ -8905,6 +9406,7 @@ class VariationalToLighterRuntime:
         v4_now = datetime.now(timezone.utc).timestamp()
         v4_entry_threshold_bps = None
         v4_entry_context: dict[str, Any] = {}
+        v4_rearm_context: dict[str, Any] = {}
         v4_baseline_sample_due = False
         if v4_mode:
             v4_entry_threshold_bps, v4_entry_context = (
@@ -8924,6 +9426,29 @@ class VariationalToLighterRuntime:
                 now=v4_now,
                 short_edge_bps=short_edge_bps,
             )
+            rearmed, v4_rearm_context = (
+                self.live_inventory_basis_v4_update_rearm(
+                    short_edge_bps=short_edge_bps,
+                    entry_threshold_bps=v4_entry_threshold_bps,
+                )
+            )
+            v4_entry_context = {**v4_entry_context, **v4_rearm_context}
+            if rearmed:
+                await self.append_live_inventory_log(
+                    "live_inventory_v4_episode_rearmed",
+                    {
+                        "asset": asset,
+                        "sample_index": index,
+                        "short_edge_bps": decimal_to_str(short_edge_bps),
+                        "v4_entry_threshold_bps": decimal_to_str(
+                            v4_entry_threshold_bps
+                        ),
+                        **v4_rearm_context,
+                    },
+                )
+                await self.persist_live_inventory_memory(
+                    reason="v4_episode_rearmed"
+                )
         reversion_now = time.monotonic()
         reversion_long_medians = self.live_inventory_basis_reversion_medians(
             now=reversion_now,
@@ -9339,6 +9864,19 @@ class VariationalToLighterRuntime:
                                     "reason": self.live_inventory_basis_v4_history_reason,
                                     "direction": direction,
                                     **v4_entry_context,
+                                },
+                            )
+                        continue
+                    if self.live_inventory_v4_rearm_required:
+                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                        if index == 1 or index % 30 == 0:
+                            await self.append_live_inventory_log(
+                                "live_inventory_v4_entry_blocked",
+                                {
+                                    **state_payload,
+                                    "reason": "v4_waiting_for_episode_rearm",
+                                    "direction": direction,
+                                    **v4_rearm_context,
                                 },
                             )
                         continue
@@ -9944,6 +10482,19 @@ class VariationalToLighterRuntime:
                 qty = self.live_inventory_lot_notional_usd / var_price
                 lot_id = self.live_inventory_next_lot_id
                 basis_trace_id = f"{self.live_inventory_run_id}:basis:{lot_id}:{uuid.uuid4().hex[:8]}"
+                if v4_mode and self.live_inventory_v4_episode_id is None:
+                    self.live_inventory_v4_episode_id = (
+                        f"{self.live_inventory_run_id}:episode:"
+                        f"{self.live_inventory_completed_cycles + 1}:"
+                        f"{uuid.uuid4().hex[:8]}"
+                    )
+                    self.live_inventory_v4_next_tranche_index = 1
+                episode_id = (
+                    self.live_inventory_v4_episode_id if v4_mode else None
+                )
+                tranche_index = (
+                    self.live_inventory_v4_next_tranche_index if v4_mode else 1
+                )
                 var_side = self._auto_live_direction_to_var_side(direction)
                 reject_cooldown_key = (asset.upper(), var_side.lower())
                 reject_cooldown_until = self.live_inventory_var_reject_cooldown_until.get(reject_cooldown_key)
@@ -10244,6 +10795,8 @@ class VariationalToLighterRuntime:
                         "signal_mode": LIVE_INVENTORY_SIGNAL_BASIS,
                         "sample_index": index,
                         "basis_trace_id": basis_trace_id,
+                        "episode_id": episode_id,
+                        "tranche_index": tranche_index,
                         "direction": direction,
                         "qty": decimal_to_str(qty),
                         "var_side": var_side,
@@ -10467,6 +11020,8 @@ class VariationalToLighterRuntime:
                 lot = {
                     "lot_id": lot_id,
                     "basis_trace_id": basis_trace_id,
+                    "episode_id": episode_id,
+                    "tranche_index": tranche_index,
                     "signal_mode": LIVE_INVENTORY_SIGNAL_BASIS,
                     "direction": direction,
                     "qty": decimal_to_str(qty),
@@ -10547,6 +11102,11 @@ class VariationalToLighterRuntime:
                     "status": "dry_open" if self.live_inventory_dry_decisions else "open",
                 }
                 self.live_inventory_next_lot_id += 1
+                if v4_mode:
+                    self.live_inventory_v4_next_tranche_index = max(
+                        self.live_inventory_v4_next_tranche_index,
+                        tranche_index + 1,
+                    )
                 self.live_inventory_basis_entry_confirm_counts.clear()
                 self.live_inventory_open_lots.append(lot)
                 if not self.live_inventory_dry_decisions:
@@ -10559,6 +11119,8 @@ class VariationalToLighterRuntime:
                         **state_payload,
                         "lot_id": lot_id,
                         "basis_trace_id": basis_trace_id,
+                        "episode_id": episode_id,
+                        "tranche_index": tranche_index,
                         "direction": direction,
                         "qty": lot["qty"],
                         "edge_bps": decimal_to_str(edge_bps),
@@ -10904,6 +11466,8 @@ class VariationalToLighterRuntime:
             if calibration_mode and should_timeout_exit
             else "v4_executable_net_target_reached"
             if v4_mode and should_exit
+            else "max_unrealized_loss_bps"
+            if should_stop
             else "v4_max_hold_timeout"
             if v4_mode and should_timeout_exit
             else "profit_take"
@@ -10912,8 +11476,6 @@ class VariationalToLighterRuntime:
             if signal_exit_watch_timeout_ok
             else "signal_reverted"
             if should_exit
-            else "max_unrealized_loss_bps"
-            if should_stop
             else "max_hold_samples"
         )
         var_submit_ms = None
@@ -11274,9 +11836,15 @@ class VariationalToLighterRuntime:
             )
         self.live_inventory_open_lots.pop(lot_index)
         self.live_inventory_realized_pnl_usd += pnl
-        self.live_inventory_completed_cycles += 1
-        if v4_mode:
+        episode_completed = not self.live_inventory_open_lots
+        if not v4_mode or episode_completed:
+            self.live_inventory_completed_cycles += 1
+        if v4_mode and episode_completed:
             self.live_inventory_v4_last_exit_monotonic = time.monotonic()
+            self.require_live_inventory_basis_v4_rearm(
+                exit_reason=exit_reason,
+                entry_threshold_bps=v4_entry_threshold_bps,
+            )
         if calibration_mode:
             self.live_inventory_calibration_last_exit_sample_index = index
         await self.persist_live_inventory_memory(reason="basis_dry_exit_decision" if self.live_inventory_dry_decisions else "basis_exit_submitted")
@@ -14417,8 +14985,8 @@ def parse_args() -> argparse.Namespace:
                 parser.error(
                     "basis V4 requires --live-inventory-i-accept-basis-v4-live"
                 )
-            if args.live_inventory_max_cycles < 1 or args.live_inventory_max_cycles > 10:
-                parser.error("basis V4 requires max_cycles between 1 and 10")
+            if args.live_inventory_max_cycles < 1 or args.live_inventory_max_cycles > 3:
+                parser.error("basis V4 requires max_cycles between 1 and 3")
             if args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 1:
                 parser.error("basis V4 requires one total lot")
             if (
@@ -14430,6 +14998,11 @@ def parse_args() -> argparse.Namespace:
                 )
             if args.live_inventory_basis_v4_max_run_loss_usd < 0:
                 parser.error("basis V4 max run loss must be >= 0")
+            if (
+                args.live_inventory_max_cycles > 1
+                and args.live_inventory_basis_v4_max_run_loss_usd <= 0
+            ):
+                parser.error("multi-cycle basis V4 requires a positive max run loss")
             if args.live_inventory_basis_v4_cycle_cooldown_seconds < 0:
                 parser.error("basis V4 cycle cooldown must be >= 0")
             if (

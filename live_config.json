@@ -44,6 +44,8 @@
   "calibration_max_cycle_loss_usd": "0.10",
   "calibration_max_roundtrip_cost_bps": "6.0",
   "v4_live_mode": false,
+  "v4_test_max_run_loss_usd": "0.025",
+  "v4_test_cycle_cooldown_seconds": 0,
   "entry_lighter_fill_timeout_seconds": "3",
   "snapshot_timeout_seconds": "10",
   "addon_min_basis_improvement_bps": "2.0"
