@@ -105,6 +105,8 @@ LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_FULL_SAMPLES = 20
 LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_PRIOR_BPS = Decimal("1.50")
 LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_CAP_BPS = Decimal("3.00")
 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES = 10
+LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_FULL_SAMPLES = 20
+LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS = Decimal("3.50")
 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_CAP_BPS = Decimal("3.00")
 LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
     {
@@ -114,6 +116,8 @@ LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
         "basis-v4-live-test-v3",
         "basis-v4-live-v4",
         "basis-v4-live-test-v4",
+        "basis-v4-live-v5",
+        "basis-v4-live-test-v5",
     }
 )
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
@@ -1156,12 +1160,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
-            else "basis-v4-live-test-v4"
+            else "basis-v4-live-test-v5"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else "basis-v4-live-v4"
+            else "basis-v4-live-v5"
             if self.live_inventory_basis_v4_mode
             else "cost-calibrated-reversion-v3"
             if self.live_inventory_basis_reversion_mode
@@ -1172,12 +1176,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v4-test-health-bypass"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v5-test-health-bypass"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v4"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v5"
             if self.live_inventory_basis_v4_mode
             else "legacy-5m-reversion"
             if self.live_inventory_basis_reversion_mode
@@ -1521,15 +1525,40 @@ class VariationalToLighterRuntime:
         )
         sample_count = len(samples)
         raw_p80_bps = self.percentile_decimal(samples, 80) or Decimal("0")
+        enabled = bool(self.live_inventory_basis_dynamic_exit_buffer)
         ready = bool(
-            self.live_inventory_basis_dynamic_exit_buffer
+            enabled
             and sample_count >= LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES
         )
-        applied_dynamic_bps = (
-            min(raw_p80_bps, LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_CAP_BPS)
-            if ready
-            else Decimal("0")
+        fully_mature = bool(
+            enabled
+            and sample_count >= LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_FULL_SAMPLES
         )
+        capped_raw_p80_bps = min(
+            raw_p80_bps,
+            LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_CAP_BPS,
+        )
+        if not enabled:
+            applied_dynamic_bps = Decimal("0")
+            calibration_weight = Decimal("0")
+        elif not ready:
+            applied_dynamic_bps = LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS
+            calibration_weight = Decimal("0")
+        elif fully_mature:
+            applied_dynamic_bps = capped_raw_p80_bps
+            calibration_weight = Decimal("1")
+        else:
+            calibration_weight = Decimal(
+                sample_count - LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES
+            ) / Decimal(
+                LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_FULL_SAMPLES
+                - LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES
+            )
+            applied_dynamic_bps = (
+                LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS
+                * (Decimal("1") - calibration_weight)
+                + capped_raw_p80_bps * calibration_weight
+            )
         reserve_bps = max(
             LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS,
             applied_dynamic_bps,
@@ -1537,8 +1566,12 @@ class VariationalToLighterRuntime:
         return {
             "sample_count": sample_count,
             "min_samples": LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES,
+            "full_samples": LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_FULL_SAMPLES,
             "ready": ready,
+            "fully_mature": fully_mature,
             "raw_p80_bps": raw_p80_bps,
+            "prior_bps": LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS,
+            "calibration_weight": calibration_weight,
             "cap_bps": LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_CAP_BPS,
             "applied_dynamic_bps": applied_dynamic_bps,
             "reserve_bps": reserve_bps,
@@ -1549,9 +1582,17 @@ class VariationalToLighterRuntime:
         return {
             "v4_exit_shortfall_sample_count": context["sample_count"],
             "v4_exit_shortfall_min_samples": context["min_samples"],
+            "v4_exit_shortfall_full_samples": context["full_samples"],
             "v4_exit_shortfall_calibration_ready": context["ready"],
+            "v4_exit_shortfall_fully_mature": context["fully_mature"],
             "v4_exit_shortfall_raw_p80_bps": decimal_to_str(
                 context["raw_p80_bps"]
+            ),
+            "v4_exit_shortfall_prior_bps": decimal_to_str(
+                context["prior_bps"]
+            ),
+            "v4_exit_shortfall_calibration_weight": decimal_to_str(
+                context["calibration_weight"]
             ),
             "v4_exit_shortfall_cap_bps": decimal_to_str(context["cap_bps"]),
             "v4_exit_shortfall_applied_dynamic_bps": decimal_to_str(

@@ -351,6 +351,42 @@ def test_v4_live_funnel_reports_intermediate_batch_checkpoint() -> None:
     assert funnel["batch_wait_reason"] == "v4_batch_cycle_cooldown"
 
 
+def test_v4_live_funnel_checkpoint_resolves_final_fill_wait_status() -> None:
+    common = {
+        "run_id": "live-v4-resolved-final-fill",
+        "strategy_version": "basis-v4-live-test-v5",
+        "asset": "ETH",
+    }
+    funnel = build_v4_live_funnel(
+        [
+            {**common, "event": "live_inventory_entered", "logged_at": "2026-08-12T00:00:00+00:00"},
+            {
+                **common,
+                "event": "live_inventory_final_pnl",
+                "logged_at": "2026-08-12T00:10:00+00:00",
+                "final_pnl_status": "var_and_lighter_final_fills_confirmed",
+            },
+            {**common, "event": "live_inventory_exited", "logged_at": "2026-08-12T00:10:01+00:00"},
+            {
+                **common,
+                "event": "live_inventory_v4_cycle_checkpoint",
+                "logged_at": "2026-08-12T00:10:02+00:00",
+                "completed_cycles": 1,
+                "max_cycles": 3,
+            },
+            {
+                **common,
+                "event": "live_inventory_basis_state",
+                "logged_at": "2026-08-12T00:10:03+00:00",
+                "v4_rearm_required": True,
+            },
+        ]
+    )
+
+    assert funnel is not None
+    assert funnel["status"] == "WAITING_FOR_EPISODE_REARM"
+
+
 def test_basis_v4_formal_profile_accepts_only_versioned_calibrated_eth_short_config() -> None:
     common = {
         "evaluation_interval_seconds": 1,

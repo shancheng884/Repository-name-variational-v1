@@ -933,7 +933,7 @@ def test_v4_entry_threshold_cache_refreshes_on_baseline_cadence() -> None:
     assert refreshed_threshold is not None
 
 
-def test_v4_exit_target_uses_floor_until_calibration_is_mature() -> None:
+def test_v4_exit_target_uses_conservative_prior_until_calibration_is_ready() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_basis_dynamic_exit_buffer = True
     runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
@@ -943,15 +943,18 @@ def test_v4_exit_target_uses_floor_until_calibration_is_mature() -> None:
     lot: dict[str, object] = {}
 
     assert runtime.live_inventory_basis_v4_exit_shortfall_reserve_bps() == Decimal(
-        "0.50"
+        "3.50"
     )
     assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
-        "1.50"
+        "4.50"
     )
     context = runtime.live_inventory_basis_v4_exit_calibration_context()
     assert context["sample_count"] == 2
     assert context["ready"] is False
+    assert context["fully_mature"] is False
     assert context["raw_p80_bps"] == Decimal("6.65")
+    assert context["prior_bps"] == Decimal("3.50")
+    assert context["calibration_weight"] == Decimal("0")
     assert runtime.live_inventory_basis_v4_confirm_exit_candidate(
         lot,
         eligible=True,
@@ -967,23 +970,46 @@ def test_v4_exit_target_uses_floor_until_calibration_is_mature() -> None:
     assert "v4_exit_confirmation_count" not in lot
 
 
-def test_v4_exit_target_caps_mature_observed_shortfall() -> None:
+def test_v4_exit_target_blends_prior_until_twenty_samples() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_basis_dynamic_exit_buffer = True
     runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
-        [Decimal("0.10")] * 7 + [Decimal("6.65")] * 3,
+        [Decimal("0.10")] * 10 + [Decimal("6.65")] * 5,
         maxlen=20,
     )
 
     context = runtime.live_inventory_basis_v4_exit_calibration_context()
 
-    assert context["sample_count"] == 10
+    assert context["sample_count"] == 15
     assert context["ready"] is True
+    assert context["fully_mature"] is False
     assert context["raw_p80_bps"] == Decimal("6.65")
-    assert context["applied_dynamic_bps"] == Decimal("3.00")
+    assert context["calibration_weight"] == Decimal("0.5")
+    assert context["applied_dynamic_bps"] == Decimal("3.250")
     assert runtime.live_inventory_basis_v4_exit_shortfall_reserve_bps() == Decimal(
-        "3.00"
+        "3.250"
     )
+    assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
+        "4.250"
+    )
+
+
+def test_v4_exit_target_caps_observed_shortfall_after_twenty_samples() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_dynamic_exit_buffer = True
+    runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
+        [Decimal("0.10")] * 14 + [Decimal("6.65")] * 6,
+        maxlen=20,
+    )
+
+    context = runtime.live_inventory_basis_v4_exit_calibration_context()
+
+    assert context["sample_count"] == 20
+    assert context["ready"] is True
+    assert context["fully_mature"] is True
+    assert context["raw_p80_bps"] == Decimal("6.65")
+    assert context["calibration_weight"] == Decimal("1")
+    assert context["applied_dynamic_bps"] == Decimal("3.00")
     assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
         "4.00"
     )

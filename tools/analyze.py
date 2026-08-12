@@ -156,6 +156,14 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         row for row in v4_rows if row.get("event") == "live_inventory_final_pnl"
     ]
     latest_final_pnl = final_pnl_rows[-1] if final_pnl_rows else {}
+    final_pnl_resolved = bool(
+        latest_final_pnl
+        and max(
+            str(latest_cycle_report.get("logged_at") or ""),
+            str(latest_cycle_checkpoint.get("logged_at") or ""),
+        )
+        >= str(latest_final_pnl.get("logged_at") or "")
+    )
     fuse_rows = [
         row
         for row in v4_rows
@@ -186,11 +194,12 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     elif latest_cycle_report.get("report_status") == "completed":
         status = "CYCLE_COMPLETE"
     elif (
-        latest_final_pnl.get("final_pnl_status")
+        not final_pnl_resolved
+        and latest_final_pnl.get("final_pnl_status")
         == "var_and_lighter_final_fills_confirmed"
     ):
         status = "FINAL_FILLS_CONFIRMED_WAITING_FOR_REPORT"
-    elif latest_final_pnl:
+    elif latest_final_pnl and not final_pnl_resolved:
         status = "ERROR_FINAL_PNL_RECONCILIATION_REQUIRED"
     elif events["live_inventory_entered"] > events["live_inventory_exited"]:
         status = "POSITION_OPEN"
@@ -289,8 +298,14 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "exit_shortfall_min_samples": exit_calibration.get(
             "v4_exit_shortfall_min_samples"
         ),
+        "exit_shortfall_full_samples": exit_calibration.get(
+            "v4_exit_shortfall_full_samples"
+        ),
         "exit_shortfall_calibration_ready": exit_calibration.get(
             "v4_exit_shortfall_calibration_ready"
+        ),
+        "exit_shortfall_fully_mature": exit_calibration.get(
+            "v4_exit_shortfall_fully_mature"
         ),
         "exit_shortfall_raw_p80_bps": exit_calibration.get(
             "v4_exit_shortfall_raw_p80_bps"
@@ -300,6 +315,12 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         ),
         "exit_shortfall_applied_dynamic_bps": exit_calibration.get(
             "v4_exit_shortfall_applied_dynamic_bps"
+        ),
+        "exit_shortfall_prior_bps": exit_calibration.get(
+            "v4_exit_shortfall_prior_bps"
+        ),
+        "exit_shortfall_calibration_weight": exit_calibration.get(
+            "v4_exit_shortfall_calibration_weight"
         ),
         "exit_shortfall_reserve_bps": exit_calibration.get(
             "v4_exit_shortfall_reserve_bps"
@@ -505,8 +526,12 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
             "exit_calibration_samples="
             f"{funnel['exit_shortfall_sample_count']} "
             f"min_samples={funnel['exit_shortfall_min_samples']} "
+            f"full_samples={funnel['exit_shortfall_full_samples']} "
             f"ready={funnel['exit_shortfall_calibration_ready']} "
+            f"fully_mature={funnel['exit_shortfall_fully_mature']} "
             f"raw_p80_bps={funnel['exit_shortfall_raw_p80_bps']} "
+            f"prior_bps={funnel['exit_shortfall_prior_bps']} "
+            f"weight={funnel['exit_shortfall_calibration_weight']} "
             f"applied_dynamic_bps="
             f"{funnel['exit_shortfall_applied_dynamic_bps']} "
             f"cap_bps={funnel['exit_shortfall_cap_bps']} "
