@@ -692,7 +692,8 @@ def main() -> int:
     if not args.dry_run and not disk_start_allowed():
         print(
             "REFUSE_START reason=disk_free_below_3gb "
-            "action=stop_processes_then_run_tools/archive_legacy_logs.py"
+            "action=stop_processes_then_run_tools/compact_order_metrics.py_"
+            "and_tools/archive_legacy_logs.py"
         )
         return 2
 

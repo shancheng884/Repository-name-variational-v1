@@ -1247,6 +1247,8 @@ class VariationalToLighterRuntime:
         self.live_inventory_external_reference_task: asyncio.Task[None] | None = None
         self.live_inventory_size_ladder_shadow_task: asyncio.Task[None] | None = None
         self.live_inventory_size_ladder_shadow_last_monotonic = 0.0
+        self.live_inventory_negative_direction_shadow_last_monotonic = 0.0
+        self.live_inventory_last_basis_state_crossing = False
         self.live_inventory_stablecoin_basis_bps_samples: deque[Decimal] = deque(maxlen=500)
         self.live_inventory_basis_reversion_history: deque[tuple[float, float | None, float | None]] = deque()
         self.live_inventory_basis_v4_history: deque[tuple[float, Decimal]] = deque()
@@ -3696,7 +3698,8 @@ class VariationalToLighterRuntime:
             )
             or 0.0
         )
-        if now - last < 30.0 or (task is not None and not task.done()):
+        interval = 60.0 if getattr(self, "live_inventory_open_lots", []) else 300.0
+        if now - last < interval or (task is not None and not task.done()):
             return
         self.live_inventory_size_ladder_shadow_last_monotonic = now
         self.live_inventory_size_ladder_shadow_task = asyncio.create_task(
@@ -7356,14 +7359,42 @@ class VariationalToLighterRuntime:
             return True
         edge = to_decimal(payload.get("short_edge_bps"))
         threshold = to_decimal(payload.get("v4_entry_threshold_bps"))
-        if edge is not None and threshold is not None and edge >= threshold:
-            return True
+        crossing = bool(
+            edge is not None and threshold is not None and edge >= threshold
+        )
+        previous_crossing = bool(
+            getattr(self, "live_inventory_last_basis_state_crossing", False)
+        )
+        self.live_inventory_last_basis_state_crossing = crossing
         now = time.monotonic()
-        interval = 5.0 if getattr(self, "live_inventory_open_lots", []) else 30.0
+        if crossing and not previous_crossing:
+            self.live_inventory_last_basis_state_log_monotonic = now
+            return True
+        interval = (
+            5.0
+            if crossing or getattr(self, "live_inventory_open_lots", [])
+            else 30.0
+        )
         last = float(getattr(self, "live_inventory_last_basis_state_log_monotonic", 0.0) or 0.0)
         if now - last < interval:
             return False
         self.live_inventory_last_basis_state_log_monotonic = now
+        return True
+
+    def should_log_live_inventory_negative_direction_shadow(self) -> bool:
+        now = time.monotonic()
+        interval = 60.0 if getattr(self, "live_inventory_open_lots", []) else 300.0
+        last = float(
+            getattr(
+                self,
+                "live_inventory_negative_direction_shadow_last_monotonic",
+                0.0,
+            )
+            or 0.0
+        )
+        if now - last < interval:
+            return False
+        self.live_inventory_negative_direction_shadow_last_monotonic = now
         return True
 
     async def maybe_auto_stop_completed_v4_cycle(
@@ -10135,7 +10166,10 @@ class VariationalToLighterRuntime:
                         basis_sample_move_bps=basis_sample_move_bps,
                         roundtrip_bps=roundtrip_bps,
                     )
-                if is_negative_direction:
+                if (
+                    is_negative_direction
+                    and self.should_log_live_inventory_negative_direction_shadow()
+                ):
                     await self.append_live_inventory_log(
                         "live_inventory_negative_direction_shadow_candidate",
                         {

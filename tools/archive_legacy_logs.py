@@ -12,7 +12,6 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = ROOT / "log"
 TARGETS = (
-    "order_metrics.jsonl",
     "rest_events.jsonl",
     "ws_events.jsonl",
     "market_samples.jsonl",
@@ -73,6 +72,7 @@ def main() -> int:
     )
     for path in candidates:
         print(f"archive_candidate path={path} bytes={path.stat().st_size}")
+    print("order_metrics_action=use_tools/compact_order_metrics.py")
     if not args.execute:
         print("DRY_RUN add --execute only after process/state/venue checks and stopping the collector")
         return 0

@@ -4885,3 +4885,17 @@ def test_v4_basis_state_logging_is_adaptive_but_keeps_crossings(tmp_path) -> Non
     assert runtime.should_log_live_inventory_basis_state(
         {"short_edge_bps": "-7", "v4_entry_threshold_bps": "-8"}
     )
+    assert not runtime.should_log_live_inventory_basis_state(
+        {"short_edge_bps": "-7", "v4_entry_threshold_bps": "-8"}
+    )
+
+
+def test_v4_negative_direction_shadow_logging_is_throttled(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_open_lots = []
+    runtime.live_inventory_negative_direction_shadow_last_monotonic = 0.0
+
+    assert runtime.should_log_live_inventory_negative_direction_shadow()
+    assert not runtime.should_log_live_inventory_negative_direction_shadow()
+    runtime.live_inventory_negative_direction_shadow_last_monotonic -= 301
+    assert runtime.should_log_live_inventory_negative_direction_shadow()
