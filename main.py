@@ -4229,6 +4229,7 @@ class VariationalToLighterRuntime:
                 lot_id=lot_id,
                 close_var=True,
                 close_lighter=True,
+                force=True,
             )
             await self.require_live_inventory_manual_review(
                 asset=asset,

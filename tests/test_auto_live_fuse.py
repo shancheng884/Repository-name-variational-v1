@@ -2097,6 +2097,88 @@ def _inventory_entry_snapshot() -> CrossSpreadSnapshot:
     )
 
 
+def test_entry_slippage_limit_forces_reduce_only_cleanup_after_both_fills(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_entry_lighter_fill_timeout_seconds = 3.0
+        runtime.live_inventory_max_lighter_slippage_bps = Decimal("6")
+        runtime.records = {}
+
+        lighter_record = OrderLifecycle(
+            trade_key="lighter-entry",
+            trade_id="lighter-entry",
+            side="sell",
+            qty=Decimal("0.01040"),
+            asset="ETH",
+            mode="live",
+            last_variational_status="submitted",
+            lighter_fill_price=Decimal("1911.40"),
+        )
+        lighter_record.processing_stage = "lighter_filled"
+        runtime.records[lighter_record.trade_key] = lighter_record
+        var_record = OrderLifecycle(
+            trade_key="var-entry",
+            trade_id="var-entry",
+            side="sell",
+            qty=Decimal("0.01040"),
+            asset="ETH",
+            mode="live",
+            last_variational_status="filled",
+            var_fill_price=Decimal("1909.33"),
+        )
+        match = PendingLiveInventoryVarFillMatch(
+            asset="ETH",
+            side="sell",
+            qty=Decimal("0.01040"),
+            lot_id=1,
+            role="live_inventory_entry_pending_var_fill",
+            created_at_monotonic=time.monotonic(),
+            context={
+                "direction": "short_var_long_lighter",
+                "var_side": "SELL",
+                "lighter_price": "1910.07",
+                "lighter_record_key": lighter_record.trade_key,
+                "lighter_submitted_before_var_fill": True,
+            },
+        )
+        cleanup_calls: list[dict] = []
+        reviews: list[dict] = []
+
+        async def fake_wait_for_lighter_final_fill(*_args, **_kwargs):
+            return True
+
+        async def fake_cleanup(**kwargs):
+            cleanup_calls.append(kwargs)
+            return {"enabled": True, "force": kwargs["force"]}
+
+        async def fake_manual_review(**kwargs):
+            reviews.append(kwargs)
+
+        runtime.wait_for_lighter_final_fill = fake_wait_for_lighter_final_fill
+        runtime.try_auto_close_unhedged_live_inventory_leg = fake_cleanup
+        runtime.require_live_inventory_manual_review = fake_manual_review
+
+        await runtime.complete_live_inventory_entry_after_var_fill(
+            match=match,
+            record=var_record,
+            fill_payload={},
+        )
+
+        assert len(cleanup_calls) == 1
+        assert cleanup_calls[0]["close_var"] is True
+        assert cleanup_calls[0]["close_lighter"] is True
+        assert cleanup_calls[0]["force"] is True
+        assert reviews[0]["reason"] == (
+            "basis_entry_lighter_actual_slippage_exceeds_limit"
+        )
+        assert reviews[0]["context"]["auto_close_unhedged"]["enabled"] is True
+        assert runtime.live_inventory_open_lots == []
+
+    asyncio.run(run())
+
+
 def test_live_inventory_log_includes_run_id_and_config(tmp_path) -> None:
     runtime = _live_inventory_runtime(tmp_path)
     telegram_events = []
