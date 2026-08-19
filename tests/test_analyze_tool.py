@@ -273,6 +273,7 @@ def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
                 "effective_min_exit_pnl_bps": "7.65",
                 "holding_seconds": 900,
                 "shadow_mfe_pnl_bps": "1.4",
+                "executable_exit_mfe_pnl_bps": "1.1",
                 "shadow_mae_pnl_bps": "-0.8",
             },
         ]
@@ -287,6 +288,7 @@ def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
     assert funnel["cycle_exit_shortfall_reserve_bps"] == "6.65"
     assert funnel["cycle_effective_min_exit_pnl_bps"] == "7.65"
     assert funnel["cycle_mfe_pnl_bps"] == "1.4"
+    assert funnel["cycle_executable_mfe_pnl_bps"] == "1.1"
     assert funnel["exit_shortfall_sample_count"] == 10
     assert funnel["exit_shortfall_calibration_ready"] is True
     assert funnel["exit_shortfall_applied_dynamic_bps"] == "3.00"

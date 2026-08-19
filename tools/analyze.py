@@ -291,6 +291,9 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         ),
         "cycle_holding_seconds": latest_cycle_report.get("holding_seconds"),
         "cycle_mfe_pnl_bps": latest_cycle_report.get("shadow_mfe_pnl_bps"),
+        "cycle_executable_mfe_pnl_bps": latest_cycle_report.get(
+            "executable_exit_mfe_pnl_bps"
+        ),
         "cycle_mae_pnl_bps": latest_cycle_report.get("shadow_mae_pnl_bps"),
         "exit_shortfall_sample_count": exit_calibration.get(
             "v4_exit_shortfall_sample_count"
@@ -559,6 +562,7 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
             f"effective_exit_target_bps={funnel['cycle_effective_min_exit_pnl_bps']} "
             f"holding_seconds={funnel['cycle_holding_seconds']} "
             f"mfe_bps={funnel['cycle_mfe_pnl_bps']} "
+            f"executable_mfe_bps={funnel['cycle_executable_mfe_pnl_bps']} "
             f"mae_bps={funnel['cycle_mae_pnl_bps']}"
         )
     if funnel["exit_block_reasons"]:

@@ -3239,6 +3239,201 @@ def test_live_inventory_basis_refresh_exit_quote_blocks_stale_profitable_exit(tm
     asyncio.run(run())
 
 
+def test_live_inventory_basis_refreshed_exit_context_uses_lighter_depth(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+
+        async def fake_fetch_live_inventory_basis_quote(**_kwargs):
+            return {"quoteId": "refresh-1", "bid": "99.8", "ask": "99.9"}, Decimal(
+                "12"
+            )
+
+        async def fake_get_lighter_best_bid_ask():
+            return Decimal("100.2"), Decimal("100.3")
+
+        async def fake_live_inventory_lighter_depth_context(**_kwargs):
+            return {
+                "estimated_fill_price": "100.1",
+                "reference_price": "100.2",
+                "slippage_bps": "1.0",
+            }
+
+        runtime.fetch_live_inventory_basis_quote = (
+            fake_fetch_live_inventory_basis_quote
+        )
+        runtime.get_lighter_best_bid_ask = fake_get_lighter_best_bid_ask
+        runtime.live_inventory_lighter_depth_context = (
+            fake_live_inventory_lighter_depth_context
+        )
+
+        context = await runtime.live_inventory_basis_refreshed_exit_context(
+            asset="ETH",
+            direction="short_var_long_lighter",
+            qty=Decimal("0.01"),
+            entry_var_price=Decimal("100"),
+            entry_lighter_price=Decimal("100"),
+            exit_lighter_side="SELL",
+        )
+
+        assert context["reason"] is None
+        assert context["refreshed_pnl_bps"] == Decimal("30.000")
+        assert context["executable_pnl_bps"] == Decimal("20.000")
+        assert context["executable_lighter_exit_price"] == Decimal("100.1")
+        assert context["refresh_quote_ms"] == Decimal("12")
+
+    asyncio.run(run())
+
+
+def test_v4_fast_refresh_requires_two_consecutive_executable_quotes(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        lot: dict[str, object] = {}
+        contexts = [
+            {
+                "reason": None,
+                "refresh_quote_ms": Decimal("10"),
+                "refreshed_pnl_bps": Decimal("4.4"),
+                "executable_pnl_bps": Decimal("4.3"),
+                "exit_lighter_depth": {"slippage_bps": "0.2"},
+            },
+            {
+                "reason": None,
+                "refresh_quote_ms": Decimal("11"),
+                "refreshed_pnl_bps": Decimal("5.0"),
+                "executable_pnl_bps": Decimal("4.8"),
+                "exit_lighter_depth": {"slippage_bps": "0.2"},
+                "refreshed_var_exit_price": Decimal("99.9"),
+                "executable_lighter_exit_price": Decimal("100.2"),
+                "executable_pnl": Decimal("0.003"),
+            },
+            {
+                "reason": None,
+                "refresh_quote_ms": Decimal("9"),
+                "refreshed_pnl_bps": Decimal("5.1"),
+                "executable_pnl_bps": Decimal("4.9"),
+                "exit_lighter_depth": {"slippage_bps": "0.2"},
+                "refreshed_var_exit_price": Decimal("99.9"),
+                "executable_lighter_exit_price": Decimal("100.2"),
+                "executable_pnl": Decimal("0.0031"),
+            },
+        ]
+
+        async def fake_refreshed_exit_context(**_kwargs):
+            return contexts.pop(0)
+
+        runtime.live_inventory_basis_refreshed_exit_context = (
+            fake_refreshed_exit_context
+        )
+
+        result = await runtime.live_inventory_basis_v4_fast_refresh_exit_context(
+            asset="ETH",
+            lot=lot,
+            direction="short_var_long_lighter",
+            qty=Decimal("0.01"),
+            entry_var_price=Decimal("100"),
+            entry_lighter_price=Decimal("100"),
+            exit_lighter_side="SELL",
+            effective_min_exit_pnl_bps=Decimal("4.5"),
+        )
+
+        assert result["confirmed"] is True
+        assert result["attempts"] == 3
+        assert result["confirmation_count"] == 2
+        assert result["observations"][0]["confirmation_count"] == 0
+        assert result["observations"][1]["confirmation_count"] == 1
+        assert result["observations"][2]["confirmation_count"] == 2
+        assert result["selected_context"]["executable_pnl_bps"] == Decimal(
+            "4.9"
+        )
+        assert lot["executable_exit_mfe_pnl_bps"] == "4.9"
+
+    asyncio.run(run())
+
+
+def test_v4_fast_refresh_exhausts_without_consecutive_confirmation(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        lot: dict[str, object] = {}
+        executable_values = iter((Decimal("4.8"), Decimal("4.4"), Decimal("4.9")))
+
+        async def fake_refreshed_exit_context(**_kwargs):
+            executable_pnl_bps = next(executable_values)
+            return {
+                "reason": None,
+                "refresh_quote_ms": Decimal("10"),
+                "refreshed_pnl_bps": Decimal("5.0"),
+                "executable_pnl_bps": executable_pnl_bps,
+                "exit_lighter_depth": {"slippage_bps": "0.2"},
+            }
+
+        runtime.live_inventory_basis_refreshed_exit_context = (
+            fake_refreshed_exit_context
+        )
+
+        result = await runtime.live_inventory_basis_v4_fast_refresh_exit_context(
+            asset="ETH",
+            lot=lot,
+            direction="short_var_long_lighter",
+            qty=Decimal("0.01"),
+            entry_var_price=Decimal("100"),
+            entry_lighter_price=Decimal("100"),
+            exit_lighter_side="SELL",
+            effective_min_exit_pnl_bps=Decimal("4.5"),
+        )
+
+        assert result["confirmed"] is False
+        assert result["attempts"] == 3
+        assert result["confirmation_count"] == 1
+        assert result["last_block_reason"] == "v4_exit_confirmation_pending"
+        assert result["max_executable_pnl_bps"] == Decimal("4.9")
+
+    asyncio.run(run())
+
+
+def test_v4_fast_refresh_does_not_retry_unavailable_quote(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        calls = 0
+
+        async def fake_refreshed_exit_context(**_kwargs):
+            nonlocal calls
+            calls += 1
+            return {
+                "reason": "basis_exit_refresh_quote_unavailable",
+                "refresh_quote_ms": None,
+            }
+
+        runtime.live_inventory_basis_refreshed_exit_context = (
+            fake_refreshed_exit_context
+        )
+
+        result = await runtime.live_inventory_basis_v4_fast_refresh_exit_context(
+            asset="ETH",
+            lot={},
+            direction="short_var_long_lighter",
+            qty=Decimal("0.01"),
+            entry_var_price=Decimal("100"),
+            entry_lighter_price=Decimal("100"),
+            exit_lighter_side="SELL",
+            effective_min_exit_pnl_bps=Decimal("4.5"),
+        )
+
+        assert result["confirmed"] is False
+        assert result["attempts"] == 1
+        assert result["last_block_reason"] == (
+            "basis_exit_refresh_quote_unavailable"
+        )
+        assert calls == 1
+
+    asyncio.run(run())
+
+
 def test_live_inventory_basis_pending_entry_timeout_requires_manual_review(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)

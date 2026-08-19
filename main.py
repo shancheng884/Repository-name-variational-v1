@@ -118,10 +118,14 @@ LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
         "basis-v4-live-test-v4",
         "basis-v4-live-v5",
         "basis-v4-live-test-v5",
+        "basis-v4-live-v6",
+        "basis-v4-live-test-v6",
     }
 )
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
 LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES = 2
+LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_ATTEMPTS = 3
+LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_INTERVAL_SECONDS = 0.20
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
 LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS = 60
 LIVE_INVENTORY_BASIS_V4_REARM_BUFFER_BPS = Decimal("0.50")
@@ -1160,12 +1164,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
-            else "basis-v4-live-test-v5"
+            else "basis-v4-live-test-v6"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else "basis-v4-live-v5"
+            else "basis-v4-live-v6"
             if self.live_inventory_basis_v4_mode
             else "cost-calibrated-reversion-v3"
             if self.live_inventory_basis_reversion_mode
@@ -1176,12 +1180,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v5-test-health-bypass"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v6-test-health-bypass"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v5"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v6"
             if self.live_inventory_basis_v4_mode
             else "legacy-5m-reversion"
             if self.live_inventory_basis_reversion_mode
@@ -3543,6 +3547,208 @@ class VariationalToLighterRuntime:
             if slippage_bps is not None and slippage_bps < 0:
                 slippage_bps = Decimal("0")
         return {**depth, "slippage_bps": decimal_to_str(slippage_bps)}
+
+    async def live_inventory_basis_refreshed_exit_context(
+        self,
+        *,
+        asset: str,
+        direction: str,
+        qty: Decimal,
+        entry_var_price: Decimal,
+        entry_lighter_price: Decimal,
+        exit_lighter_side: str,
+    ) -> dict[str, Any]:
+        refreshed_quote, refresh_quote_ms = await self.fetch_live_inventory_basis_quote(
+            asset=asset
+        )
+        refreshed_var_bid = (
+            to_decimal(refreshed_quote.get("bid")) if refreshed_quote else None
+        )
+        refreshed_var_ask = (
+            to_decimal(refreshed_quote.get("ask")) if refreshed_quote else None
+        )
+        lighter_best_bid, lighter_best_ask = await self.get_lighter_best_bid_ask()
+        if (
+            refreshed_var_bid is None
+            or refreshed_var_ask is None
+            or lighter_best_bid is None
+            or lighter_best_ask is None
+        ):
+            return {
+                "reason": "basis_exit_refresh_quote_unavailable",
+                "refresh_quote_ms": refresh_quote_ms,
+            }
+
+        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+            refreshed_var_exit_price = refreshed_var_bid
+            refreshed_lighter_top_price = lighter_best_ask
+        else:
+            refreshed_var_exit_price = refreshed_var_ask
+            refreshed_lighter_top_price = lighter_best_bid
+        _, _, refreshed_pnl = self.live_inventory_pair_pnl(
+            direction=direction,
+            qty=qty,
+            entry_var_price=entry_var_price,
+            entry_lighter_price=entry_lighter_price,
+            exit_var_price=refreshed_var_exit_price,
+            exit_lighter_price=refreshed_lighter_top_price,
+        )
+        notional = qty * entry_var_price
+        refreshed_pnl_bps = (
+            refreshed_pnl / notional * Decimal("10000") if notional else None
+        )
+        exit_lighter_depth = await self.live_inventory_lighter_depth_context(
+            lighter_side=exit_lighter_side,
+            qty=qty,
+        )
+        depth_exit_price = to_decimal(exit_lighter_depth.get("estimated_fill_price"))
+        if depth_exit_price is None:
+            return {
+                "reason": "basis_exit_lighter_depth_insufficient",
+                "refresh_quote_ms": refresh_quote_ms,
+                "refreshed_var_exit_price": refreshed_var_exit_price,
+                "refreshed_pnl_bps": refreshed_pnl_bps,
+                "exit_lighter_depth": exit_lighter_depth,
+            }
+        _, _, executable_pnl = self.live_inventory_pair_pnl(
+            direction=direction,
+            qty=qty,
+            entry_var_price=entry_var_price,
+            entry_lighter_price=entry_lighter_price,
+            exit_var_price=refreshed_var_exit_price,
+            exit_lighter_price=depth_exit_price,
+        )
+        executable_pnl_bps = (
+            executable_pnl / notional * Decimal("10000") if notional else None
+        )
+        return {
+            "reason": None,
+            "refresh_quote_ms": refresh_quote_ms,
+            "refreshed_var_exit_price": refreshed_var_exit_price,
+            "refreshed_lighter_top_price": refreshed_lighter_top_price,
+            "refreshed_pnl_bps": refreshed_pnl_bps,
+            "exit_lighter_depth": exit_lighter_depth,
+            "executable_lighter_exit_price": depth_exit_price,
+            "executable_pnl": executable_pnl,
+            "executable_pnl_bps": executable_pnl_bps,
+        }
+
+    async def live_inventory_basis_v4_fast_refresh_exit_context(
+        self,
+        *,
+        asset: str,
+        lot: dict[str, Any],
+        direction: str,
+        qty: Decimal,
+        entry_var_price: Decimal,
+        entry_lighter_price: Decimal,
+        exit_lighter_side: str,
+        effective_min_exit_pnl_bps: Decimal,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        observations: list[dict[str, Any]] = []
+        selected_context: dict[str, Any] | None = None
+        last_block_reason = "v4_exit_confirmation_pending"
+        max_refreshed_pnl_bps: Decimal | None = None
+        max_executable_pnl_bps: Decimal | None = None
+        confirmation_count = int(lot.get("v4_exit_confirmation_count") or 0)
+
+        for attempt in range(
+            1, LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_ATTEMPTS + 1
+        ):
+            context = await self.live_inventory_basis_refreshed_exit_context(
+                asset=asset,
+                direction=direction,
+                qty=qty,
+                entry_var_price=entry_var_price,
+                entry_lighter_price=entry_lighter_price,
+                exit_lighter_side=exit_lighter_side,
+            )
+            refreshed_pnl_bps = to_decimal(context.get("refreshed_pnl_bps"))
+            executable_pnl_bps = to_decimal(context.get("executable_pnl_bps"))
+            if refreshed_pnl_bps is not None:
+                max_refreshed_pnl_bps = (
+                    refreshed_pnl_bps
+                    if max_refreshed_pnl_bps is None
+                    else max(max_refreshed_pnl_bps, refreshed_pnl_bps)
+                )
+            if executable_pnl_bps is not None:
+                max_executable_pnl_bps = (
+                    executable_pnl_bps
+                    if max_executable_pnl_bps is None
+                    else max(max_executable_pnl_bps, executable_pnl_bps)
+                )
+                prior_executable_mfe = to_decimal(
+                    lot.get("executable_exit_mfe_pnl_bps")
+                )
+                lot["executable_exit_mfe_pnl_bps"] = decimal_to_str(
+                    executable_pnl_bps
+                    if prior_executable_mfe is None
+                    else max(prior_executable_mfe, executable_pnl_bps)
+                )
+
+            observation_reason = context.get("reason")
+            eligible = False
+            if observation_reason is not None:
+                last_block_reason = str(observation_reason)
+            elif (
+                refreshed_pnl_bps is None
+                or refreshed_pnl_bps < effective_min_exit_pnl_bps
+            ):
+                last_block_reason = "basis_exit_refresh_pnl_below_threshold"
+            elif (
+                executable_pnl_bps is None
+                or executable_pnl_bps < effective_min_exit_pnl_bps
+            ):
+                last_block_reason = "basis_exit_lighter_depth_pnl_below_threshold"
+            else:
+                eligible = True
+                last_block_reason = "v4_exit_confirmation_pending"
+
+            confirmed, confirmation_count = (
+                self.live_inventory_basis_v4_confirm_exit_candidate(
+                    lot,
+                    eligible=eligible,
+                )
+            )
+            observations.append(
+                {
+                    "attempt": attempt,
+                    "reason": None if confirmed else last_block_reason,
+                    "refresh_quote_ms": decimal_to_str(
+                        to_decimal(context.get("refresh_quote_ms"))
+                    ),
+                    "refreshed_pnl_bps": decimal_to_str(refreshed_pnl_bps),
+                    "executable_pnl_bps": decimal_to_str(executable_pnl_bps),
+                    "lighter_slippage_bps": (
+                        context.get("exit_lighter_depth") or {}
+                    ).get("slippage_bps"),
+                    "confirmation_count": confirmation_count,
+                }
+            )
+            if confirmed:
+                selected_context = context
+                break
+            # Do not amplify an exchange/extension failure into the runtime
+            # fuse by issuing the remaining burst requests immediately.
+            if observation_reason is not None:
+                break
+            if attempt < LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_ATTEMPTS:
+                await asyncio.sleep(
+                    LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_INTERVAL_SECONDS
+                )
+
+        return {
+            "confirmed": selected_context is not None,
+            "selected_context": selected_context,
+            "observations": observations,
+            "attempts": len(observations),
+            "window_ms": Decimal(str((time.monotonic() - started) * 1000)),
+            "last_block_reason": last_block_reason,
+            "max_refreshed_pnl_bps": max_refreshed_pnl_bps,
+            "max_executable_pnl_bps": max_executable_pnl_bps,
+            "confirmation_count": confirmation_count,
+        }
 
     async def live_inventory_basis_size_ladder_context(
         self,
@@ -7758,6 +7964,15 @@ class VariationalToLighterRuntime:
                     "entry_direction": DIRECTION_SHORT_VAR_LONG_LIGHTER,
                     "entry_submit_mode": "concurrent",
                     "exit_submit_mode": "concurrent",
+                    "exit_fast_refresh_attempts": (
+                        LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_ATTEMPTS
+                    ),
+                    "exit_fast_refresh_interval_seconds": (
+                        LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_INTERVAL_SECONDS
+                    ),
+                    "exit_fast_refresh_confirmation_samples": (
+                        LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
+                    ),
                     "lot_notional_usd": decimal_to_str(
                         self.live_inventory_lot_notional_usd
                     ),
@@ -11574,49 +11789,203 @@ class VariationalToLighterRuntime:
                     },
                 )
                 return
-            if (
-                (should_exit or (v4_mode and should_timeout_exit))
+            exit_side = self._opposite_var_side(str(lot.get("entry_var_side") or self._auto_live_direction_to_var_side(direction)))
+            exit_lighter_side = "BUY" if exit_side.strip().upper() == "SELL" else "SELL"
+            use_fast_refresh_window = bool(
+                v4_mode
+                and should_exit
+                and not should_stop
+                and not should_timeout_exit
                 and self.live_inventory_basis_refresh_exit_quote_before_submit
-            ):
-                refreshed_quote, refreshed_quote_ms = await self.fetch_live_inventory_basis_quote(asset=asset)
-                refreshed_var_bid = to_decimal(refreshed_quote.get("bid")) if refreshed_quote else None
-                refreshed_var_ask = to_decimal(refreshed_quote.get("ask")) if refreshed_quote else None
-                lighter_best_bid, lighter_best_ask = await self.get_lighter_best_bid_ask()
-                if refreshed_var_bid is None or refreshed_var_ask is None or lighter_best_bid is None or lighter_best_ask is None:
-                    lot.pop("v4_exit_confirmation_count", None)
+            )
+            if use_fast_refresh_window:
+                fast_refresh = (
+                    await self.live_inventory_basis_v4_fast_refresh_exit_context(
+                        asset=asset,
+                        lot=lot,
+                        direction=direction,
+                        qty=qty,
+                        entry_var_price=entry_var_price,
+                        entry_lighter_price=entry_lighter_price,
+                        exit_lighter_side=exit_lighter_side,
+                        effective_min_exit_pnl_bps=effective_min_exit_pnl_bps,
+                    )
+                )
+                if not fast_refresh["confirmed"]:
                     await self.append_live_inventory_log(
                         "live_inventory_exit_blocked",
                         {
                             **state_payload,
                             "lot_id": lot.get("lot_id"),
                             "direction": direction,
-                            "reason": "basis_exit_refresh_quote_unavailable",
-                            "refresh_quote_ms": decimal_to_str(refreshed_quote_ms),
+                            "reason": fast_refresh["last_block_reason"],
+                            "fast_refresh_exhausted": True,
+                            "fast_refresh_attempts": fast_refresh["attempts"],
+                            "fast_refresh_window_ms": decimal_to_str(
+                                fast_refresh["window_ms"]
+                            ),
+                            "fast_refresh_observations": fast_refresh[
+                                "observations"
+                            ],
+                            "pnl_bps": decimal_to_str(pnl_bps),
+                            "max_refreshed_pnl_bps": decimal_to_str(
+                                fast_refresh["max_refreshed_pnl_bps"]
+                            ),
+                            "max_executable_pnl_bps": decimal_to_str(
+                                fast_refresh["max_executable_pnl_bps"]
+                            ),
+                            "effective_min_exit_pnl_bps": decimal_to_str(
+                                effective_min_exit_pnl_bps
+                            ),
+                            "v4_exit_confirmation_count": fast_refresh[
+                                "confirmation_count"
+                            ],
+                            "v4_exit_confirmation_required": (
+                                LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
+                            ),
                         },
                     )
                     return
-                if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
-                    refreshed_var_exit_price = refreshed_var_bid
-                    refreshed_lighter_exit_price = lighter_best_ask
-                else:
-                    refreshed_var_exit_price = refreshed_var_ask
-                    refreshed_lighter_exit_price = lighter_best_bid
-                _, _, refreshed_pnl = self.live_inventory_pair_pnl(
-                    direction=direction,
-                    qty=qty,
-                    entry_var_price=entry_var_price,
-                    entry_lighter_price=entry_lighter_price,
-                    exit_var_price=refreshed_var_exit_price,
-                    exit_lighter_price=refreshed_lighter_exit_price,
+                refresh_context = fast_refresh["selected_context"]
+                var_exit_price = refresh_context["refreshed_var_exit_price"]
+                lighter_exit_price = refresh_context[
+                    "executable_lighter_exit_price"
+                ]
+                exit_lighter_depth = refresh_context["exit_lighter_depth"]
+                pnl = refresh_context["executable_pnl"]
+                pnl_bps = to_decimal(refresh_context.get("executable_pnl_bps"))
+                await self.append_live_inventory_log(
+                    "live_inventory_v4_exit_fast_refresh_confirmed",
+                    {
+                        **state_payload,
+                        "lot_id": lot.get("lot_id"),
+                        "direction": direction,
+                        "fast_refresh_attempts": fast_refresh["attempts"],
+                        "fast_refresh_window_ms": decimal_to_str(
+                            fast_refresh["window_ms"]
+                        ),
+                        "fast_refresh_observations": fast_refresh[
+                            "observations"
+                        ],
+                        "executable_pnl_bps": decimal_to_str(pnl_bps),
+                        "effective_min_exit_pnl_bps": decimal_to_str(
+                            effective_min_exit_pnl_bps
+                        ),
+                    },
                 )
-                notional = qty * entry_var_price
-                refreshed_pnl_bps = refreshed_pnl / notional * Decimal("10000") if notional else None
+            else:
+                refresh_context: dict[str, Any] | None = None
                 if (
-                    should_exit
-                    and (
+                    (should_exit or (v4_mode and should_timeout_exit))
+                    and self.live_inventory_basis_refresh_exit_quote_before_submit
+                ):
+                    refresh_context = (
+                        await self.live_inventory_basis_refreshed_exit_context(
+                            asset=asset,
+                            direction=direction,
+                            qty=qty,
+                            entry_var_price=entry_var_price,
+                            entry_lighter_price=entry_lighter_price,
+                            exit_lighter_side=exit_lighter_side,
+                        )
+                    )
+                    refresh_reason = refresh_context.get("reason")
+                    refreshed_pnl_bps = to_decimal(
+                        refresh_context.get("refreshed_pnl_bps")
+                    )
+                    if refresh_reason is not None:
+                        lot.pop("v4_exit_confirmation_count", None)
+                        await self.append_live_inventory_log(
+                            "live_inventory_exit_blocked",
+                            {
+                                **state_payload,
+                                "lot_id": lot.get("lot_id"),
+                                "direction": direction,
+                                "reason": refresh_reason,
+                                "refresh_quote_ms": decimal_to_str(
+                                    to_decimal(
+                                        refresh_context.get("refresh_quote_ms")
+                                    )
+                                ),
+                                "exit_lighter_depth": refresh_context.get(
+                                    "exit_lighter_depth"
+                                ),
+                            },
+                        )
+                        return
+                    if should_exit and (
                         refreshed_pnl_bps is None
                         or refreshed_pnl_bps < effective_min_exit_pnl_bps
+                    ):
+                        lot.pop("v4_exit_confirmation_count", None)
+                        await self.append_live_inventory_log(
+                            "live_inventory_exit_blocked",
+                            {
+                                **state_payload,
+                                "lot_id": lot.get("lot_id"),
+                                "direction": direction,
+                                "reason": "basis_exit_refresh_pnl_below_threshold",
+                                "pnl_bps": decimal_to_str(pnl_bps),
+                                "refreshed_pnl_bps": decimal_to_str(
+                                    refreshed_pnl_bps
+                                ),
+                                "effective_min_exit_pnl_bps": decimal_to_str(
+                                    effective_min_exit_pnl_bps
+                                ),
+                                "refresh_quote_ms": decimal_to_str(
+                                    to_decimal(
+                                        refresh_context.get("refresh_quote_ms")
+                                    )
+                                ),
+                            },
+                        )
+                        return
+                    var_exit_price = refresh_context["refreshed_var_exit_price"]
+                    exit_lighter_depth = refresh_context["exit_lighter_depth"]
+                    lighter_exit_price = refresh_context[
+                        "executable_lighter_exit_price"
+                    ]
+                    pnl = refresh_context["executable_pnl"]
+                    pnl_bps = to_decimal(refresh_context.get("executable_pnl_bps"))
+                else:
+                    exit_lighter_depth = (
+                        await self.live_inventory_lighter_depth_context(
+                            lighter_side=exit_lighter_side,
+                            qty=qty,
+                        )
                     )
+                    depth_exit_price = to_decimal(
+                        exit_lighter_depth.get("estimated_fill_price")
+                    )
+                    if depth_exit_price is None:
+                        lot.pop("v4_exit_confirmation_count", None)
+                        await self.append_live_inventory_log(
+                            "live_inventory_exit_blocked",
+                            {
+                                **state_payload,
+                                "lot_id": lot.get("lot_id"),
+                                "direction": direction,
+                                "reason": "basis_exit_lighter_depth_insufficient",
+                                "exit_lighter_side": exit_lighter_side,
+                                "exit_lighter_depth": exit_lighter_depth,
+                            },
+                        )
+                        return
+                    lighter_exit_price = depth_exit_price
+                    _, _, pnl = self.live_inventory_pair_pnl(
+                        direction=direction,
+                        qty=qty,
+                        entry_var_price=entry_var_price,
+                        entry_lighter_price=entry_lighter_price,
+                        exit_var_price=var_exit_price,
+                        exit_lighter_price=lighter_exit_price,
+                    )
+                    notional = qty * entry_var_price
+                    pnl_bps = (
+                        pnl / notional * Decimal("10000") if notional else None
+                    )
+                if should_exit and not should_stop and not should_timeout_exit and (
+                    pnl_bps is None or pnl_bps < effective_min_exit_pnl_bps
                 ):
                     lot.pop("v4_exit_confirmation_count", None)
                     await self.append_live_inventory_log(
@@ -11625,94 +11994,50 @@ class VariationalToLighterRuntime:
                             **state_payload,
                             "lot_id": lot.get("lot_id"),
                             "direction": direction,
-                            "reason": "basis_exit_refresh_pnl_below_threshold",
-                            "pnl_bps": decimal_to_str(pnl_bps),
-                            "refreshed_pnl_bps": decimal_to_str(refreshed_pnl_bps),
-                            "effective_min_exit_pnl_bps": decimal_to_str(effective_min_exit_pnl_bps),
-                            "refresh_quote_ms": decimal_to_str(refreshed_quote_ms),
-                        },
-                    )
-                    return
-                var_exit_price = refreshed_var_exit_price
-                lighter_exit_price = refreshed_lighter_exit_price
-                pnl = refreshed_pnl
-                pnl_bps = refreshed_pnl_bps
-            exit_side = self._opposite_var_side(str(lot.get("entry_var_side") or self._auto_live_direction_to_var_side(direction)))
-            exit_lighter_side = "BUY" if exit_side.strip().upper() == "SELL" else "SELL"
-            exit_lighter_depth = await self.live_inventory_lighter_depth_context(lighter_side=exit_lighter_side, qty=qty)
-            depth_exit_price = to_decimal(exit_lighter_depth.get("estimated_fill_price"))
-            if depth_exit_price is None:
-                lot.pop("v4_exit_confirmation_count", None)
-                await self.append_live_inventory_log(
-                    "live_inventory_exit_blocked",
-                    {
-                        **state_payload,
-                        "lot_id": lot.get("lot_id"),
-                        "direction": direction,
-                        "reason": "basis_exit_lighter_depth_insufficient",
-                        "exit_lighter_side": exit_lighter_side,
-                        "exit_lighter_depth": exit_lighter_depth,
-                    },
-                )
-                return
-            lighter_exit_price = depth_exit_price
-            _, _, pnl = self.live_inventory_pair_pnl(
-                direction=direction,
-                qty=qty,
-                entry_var_price=entry_var_price,
-                entry_lighter_price=entry_lighter_price,
-                exit_var_price=var_exit_price,
-                exit_lighter_price=lighter_exit_price,
-            )
-            notional = qty * entry_var_price
-            pnl_bps = pnl / notional * Decimal("10000") if notional else None
-            if should_exit and not should_stop and not should_timeout_exit and (
-                pnl_bps is None or pnl_bps < effective_min_exit_pnl_bps
-            ):
-                lot.pop("v4_exit_confirmation_count", None)
-                await self.append_live_inventory_log(
-                    "live_inventory_exit_blocked",
-                    {
-                        **state_payload,
-                        "lot_id": lot.get("lot_id"),
-                        "direction": direction,
-                        "reason": "basis_exit_lighter_depth_pnl_below_threshold",
-                        "exit_lighter_side": exit_lighter_side,
-                        "exit_lighter_depth": exit_lighter_depth,
-                        "pnl_bps": decimal_to_str(pnl_bps),
-                        "effective_min_exit_pnl_bps": decimal_to_str(effective_min_exit_pnl_bps),
-                    },
-                )
-                return
-            if v4_mode and should_exit and not should_stop and not should_timeout_exit:
-                exit_confirmed, confirmation_count = (
-                    self.live_inventory_basis_v4_confirm_exit_candidate(
-                        lot,
-                        eligible=True,
-                    )
-                )
-                if not exit_confirmed:
-                    await self.append_live_inventory_log(
-                        "live_inventory_exit_blocked",
-                        {
-                            **state_payload,
-                            "lot_id": lot.get("lot_id"),
-                            "direction": direction,
-                            "reason": "v4_exit_confirmation_pending",
+                            "reason": "basis_exit_lighter_depth_pnl_below_threshold",
+                            "exit_lighter_side": exit_lighter_side,
+                            "exit_lighter_depth": exit_lighter_depth,
                             "pnl_bps": decimal_to_str(pnl_bps),
                             "effective_min_exit_pnl_bps": decimal_to_str(
                                 effective_min_exit_pnl_bps
                             ),
-                            "v4_exit_confirmation_count": confirmation_count,
-                            "v4_exit_confirmation_required": (
-                                LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
-                            ),
-                            "v4_exit_shortfall_reserve_bps": decimal_to_str(
-                                v4_exit_shortfall_reserve_bps
-                            ),
                         },
                     )
                     return
+                if (
+                    v4_mode
+                    and should_exit
+                    and not should_stop
+                    and not should_timeout_exit
+                ):
+                    exit_confirmed, confirmation_count = (
+                        self.live_inventory_basis_v4_confirm_exit_candidate(
+                            lot,
+                            eligible=True,
+                        )
+                    )
+                    if not exit_confirmed:
+                        await self.append_live_inventory_log(
+                            "live_inventory_exit_blocked",
+                            {
+                                **state_payload,
+                                "lot_id": lot.get("lot_id"),
+                                "direction": direction,
+                                "reason": "v4_exit_confirmation_pending",
+                                "pnl_bps": decimal_to_str(pnl_bps),
+                                "effective_min_exit_pnl_bps": decimal_to_str(
+                                    effective_min_exit_pnl_bps
+                                ),
+                                "v4_exit_confirmation_count": confirmation_count,
+                                "v4_exit_confirmation_required": (
+                                    LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
+                                ),
+                                "v4_exit_shortfall_reserve_bps": decimal_to_str(
+                                    v4_exit_shortfall_reserve_bps
+                                ),
+                            },
+                        )
+                        return
             var_amount = variational_api_amount_to_str(qty, asset=asset)
             self.add_pending_live_inventory_var_fill_match(
                 PendingLiveInventoryVarFillMatch(
@@ -11933,6 +12258,9 @@ class VariationalToLighterRuntime:
                     "holding_samples": holding_samples,
                     "holding_seconds": holding_seconds,
                     "shadow_mfe_pnl_bps": shadow_mfe_pnl_bps,
+                    "executable_exit_mfe_pnl_bps": lot.get(
+                        "executable_exit_mfe_pnl_bps"
+                    ),
                     "shadow_mae_pnl_bps": shadow_mae_pnl_bps,
                     "shadow_convergence_velocity_bps_per_minute": (
                         shadow_convergence_velocity_bps_per_minute
@@ -12026,6 +12354,9 @@ class VariationalToLighterRuntime:
                 "holding_samples": holding_samples,
                 "holding_seconds": holding_seconds,
                 "shadow_mfe_pnl_bps": shadow_mfe_pnl_bps,
+                "executable_exit_mfe_pnl_bps": lot.get(
+                    "executable_exit_mfe_pnl_bps"
+                ),
                 "shadow_mae_pnl_bps": shadow_mae_pnl_bps,
                 "shadow_convergence_velocity_bps_per_minute": (
                     shadow_convergence_velocity_bps_per_minute
