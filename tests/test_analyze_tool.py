@@ -270,6 +270,7 @@ def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
                 "v4_exit_shortfall_raw_p80_bps": "6.65",
                 "v4_exit_shortfall_cap_bps": "3.00",
                 "v4_exit_shortfall_applied_dynamic_bps": "3.00",
+                "v4_exit_shortfall_stage_floor_bps": "1.50",
                 "effective_min_exit_pnl_bps": "7.65",
                 "holding_seconds": 900,
                 "shadow_mfe_pnl_bps": "1.4",

@@ -970,7 +970,7 @@ def test_v4_exit_target_uses_conservative_prior_until_calibration_is_ready() -> 
     assert "v4_exit_confirmation_count" not in lot
 
 
-def test_v4_exit_target_blends_prior_until_twenty_samples() -> None:
+def test_v4_exit_target_uses_observed_shortfall_after_ten_samples() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_basis_dynamic_exit_buffer = True
     runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
@@ -984,13 +984,33 @@ def test_v4_exit_target_blends_prior_until_twenty_samples() -> None:
     assert context["ready"] is True
     assert context["fully_mature"] is False
     assert context["raw_p80_bps"] == Decimal("6.65")
-    assert context["calibration_weight"] == Decimal("0.5")
-    assert context["applied_dynamic_bps"] == Decimal("3.250")
+    assert context["calibration_weight"] == Decimal("1")
+    assert context["stage_floor_bps"] == Decimal("1.50")
+    assert context["applied_dynamic_bps"] == Decimal("3.00")
     assert runtime.live_inventory_basis_v4_exit_shortfall_reserve_bps() == Decimal(
-        "3.250"
+        "3.00"
     )
     assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
-        "4.250"
+        "4.00"
+    )
+
+
+def test_v4_exit_target_uses_early_ready_floor_for_low_shortfall() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_dynamic_exit_buffer = True
+    runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
+        [Decimal("0")] * 10,
+        maxlen=20,
+    )
+
+    context = runtime.live_inventory_basis_v4_exit_calibration_context()
+
+    assert context["ready"] is True
+    assert context["fully_mature"] is False
+    assert context["stage_floor_bps"] == Decimal("1.50")
+    assert context["applied_dynamic_bps"] == Decimal("1.50")
+    assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
+        "2.50"
     )
 
 
@@ -1009,9 +1029,28 @@ def test_v4_exit_target_caps_observed_shortfall_after_twenty_samples() -> None:
     assert context["fully_mature"] is True
     assert context["raw_p80_bps"] == Decimal("6.65")
     assert context["calibration_weight"] == Decimal("1")
+    assert context["stage_floor_bps"] == Decimal("0.50")
     assert context["applied_dynamic_bps"] == Decimal("3.00")
     assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
         "4.00"
+    )
+
+
+def test_v4_exit_target_uses_mature_floor_for_low_shortfall() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_dynamic_exit_buffer = True
+    runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
+        [Decimal("0")] * 20,
+        maxlen=20,
+    )
+
+    context = runtime.live_inventory_basis_v4_exit_calibration_context()
+
+    assert context["fully_mature"] is True
+    assert context["stage_floor_bps"] == Decimal("0.50")
+    assert context["applied_dynamic_bps"] == Decimal("0")
+    assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
+        "1.50"
     )
 
 
@@ -3360,7 +3399,16 @@ def test_v4_fast_refresh_exhausts_without_consecutive_confirmation(
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
         lot: dict[str, object] = {}
-        executable_values = iter((Decimal("4.8"), Decimal("4.4"), Decimal("4.9")))
+        executable_values = iter(
+            (
+                Decimal("4.8"),
+                Decimal("4.4"),
+                Decimal("4.9"),
+                Decimal("4.4"),
+                Decimal("4.8"),
+                Decimal("4.4"),
+            )
+        )
 
         async def fake_refreshed_exit_context(**_kwargs):
             executable_pnl_bps = next(executable_values)
@@ -3388,9 +3436,11 @@ def test_v4_fast_refresh_exhausts_without_consecutive_confirmation(
         )
 
         assert result["confirmed"] is False
-        assert result["attempts"] == 3
-        assert result["confirmation_count"] == 1
-        assert result["last_block_reason"] == "v4_exit_confirmation_pending"
+        assert result["attempts"] == 6
+        assert result["confirmation_count"] == 0
+        assert result["last_block_reason"] == (
+            "basis_exit_lighter_depth_pnl_below_threshold"
+        )
         assert result["max_executable_pnl_bps"] == Decimal("4.9")
 
     asyncio.run(run())
