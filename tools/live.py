@@ -336,6 +336,7 @@ def build_main_command(
     reset_state_after_manual_flat: bool = False,
     collect_only: bool = False,
     v4_test_skip_recent_health: bool = False,
+    v4_shadow_gradient: bool = False,
 ) -> list[str]:
     reversion_mode = config.reversion_mode
     calibration_mode = config.calibration_mode
@@ -473,6 +474,8 @@ def build_main_command(
             command.append(
                 "--live-inventory-basis-v4-test-skip-recent-health"
             )
+        if v4_shadow_gradient:
+            command.append("--live-inventory-basis-v4-shadow-gradient")
     elif reversion_mode:
         command.extend(
             [
@@ -568,6 +571,11 @@ def main() -> int:
         help="Bounded V4 test only: bypass the recent 1h continuity gate for this run.",
     )
     parser.add_argument(
+        "--v4-shadow-gradient",
+        action="store_true",
+        help="Enable a read-only second-tranche V4 shadow diagnostic. No additional real order is submitted.",
+    )
+    parser.add_argument(
         "--v4-test-max-cycles",
         type=int,
         choices=range(1, 4),
@@ -652,6 +660,8 @@ def main() -> int:
         parser.error("--v4-live requires --asset ETH")
     if args.v4_test_skip_recent_health and not config.v4_live_mode:
         parser.error("--v4-test-skip-recent-health requires --v4-live")
+    if args.v4_shadow_gradient and not config.v4_live_mode:
+        parser.error("--v4-shadow-gradient requires --v4-live")
     if args.v4_test_max_cycles > 1 and not (
         config.v4_live_mode and args.v4_test_skip_recent_health
     ):
@@ -706,6 +716,7 @@ def main() -> int:
             reset_state_after_manual_flat=args.reset_state_after_manual_flat,
             collect_only=args.collect_only,
             v4_test_skip_recent_health=args.v4_test_skip_recent_health,
+            v4_shadow_gradient=args.v4_shadow_gradient,
         )
     )
     effective_max_cycles = (

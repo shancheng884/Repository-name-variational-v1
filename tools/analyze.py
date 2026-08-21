@@ -151,6 +151,19 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         if row.get("event") == "live_inventory_strategy_snapshot"
     ]
     latest_strategy_snapshot = strategy_snapshots[-1] if strategy_snapshots else {}
+    shadow_gradient_entries = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_v4_shadow_tranche_entered"
+    ]
+    shadow_gradient_exits = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_v4_shadow_tranche_exited"
+    ]
+    latest_shadow_gradient_exit = (
+        shadow_gradient_exits[-1] if shadow_gradient_exits else {}
+    )
     exit_calibration = latest_cycle_report or latest_strategy_snapshot
     final_pnl_rows = [
         row for row in v4_rows if row.get("event") == "live_inventory_final_pnl"
@@ -264,6 +277,27 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
             or latest_cycle_checkpoint.get("max_cycles")
             or latest_strategy_snapshot.get("max_cycles")
             or 1
+        ),
+        "shadow_gradient_enabled": latest_strategy_snapshot.get(
+            "shadow_gradient_enabled"
+        ),
+        "shadow_gradient_entries": len(shadow_gradient_entries),
+        "shadow_gradient_exits": len(shadow_gradient_exits),
+        "shadow_gradient_active": bool(
+            len(shadow_gradient_entries) > len(shadow_gradient_exits)
+        ),
+        "shadow_gradient_last_reason": latest_shadow_gradient_exit.get("reason"),
+        "shadow_gradient_last_pnl_bps": latest_shadow_gradient_exit.get(
+            "shadow_pnl_bps"
+        ),
+        "shadow_gradient_last_holding_seconds": latest_shadow_gradient_exit.get(
+            "holding_seconds"
+        ),
+        "shadow_gradient_last_mfe_bps": latest_shadow_gradient_exit.get(
+            "shadow_mfe_pnl_bps"
+        ),
+        "shadow_gradient_last_mae_bps": latest_shadow_gradient_exit.get(
+            "shadow_mae_pnl_bps"
         ),
         "batch_wait_reason": latest_batch_wait.get("reason"),
         "batch_cooldown_remaining_seconds": latest_batch_wait.get(
@@ -503,6 +537,18 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"rearm_progress={funnel['rearm_confirmation_count']}/"
         f"{funnel['rearm_confirm_samples']} "
         f"rearm_reset_threshold_bps={funnel['rearm_reset_threshold_bps']}"
+    )
+    print(
+        f"shadow_gradient_enabled={funnel['shadow_gradient_enabled']} "
+        f"shadow_entries={funnel['shadow_gradient_entries']} "
+        f"shadow_exits={funnel['shadow_gradient_exits']} "
+        f"shadow_active={funnel['shadow_gradient_active']} "
+        f"shadow_last_reason={funnel['shadow_gradient_last_reason']} "
+        f"shadow_last_pnl_bps={funnel['shadow_gradient_last_pnl_bps']} "
+        f"shadow_last_holding_seconds="
+        f"{funnel['shadow_gradient_last_holding_seconds']} "
+        f"shadow_last_mfe_bps={funnel['shadow_gradient_last_mfe_bps']} "
+        f"shadow_last_mae_bps={funnel['shadow_gradient_last_mae_bps']}"
     )
     print(
         f"anchor_count={funnel['anchor_count']} "

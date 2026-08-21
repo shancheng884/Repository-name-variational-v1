@@ -79,6 +79,46 @@ def test_v4_live_funnel_flags_incompatible_immediate_arb_floor() -> None:
     assert funnel["status"] == "ERROR_V4_IMMEDIATE_ARB_FLOOR_APPLIED"
 
 
+def test_v4_live_funnel_reports_shadow_gradient_result() -> None:
+    common = {
+        "run_id": "live-v4-shadow-gradient",
+        "strategy_version": "basis-v4-live-test-v9",
+        "asset": "ETH",
+    }
+    funnel = build_v4_live_funnel(
+        [
+            {
+                **common,
+                "event": "live_inventory_strategy_snapshot",
+                "profile": "eth_short_execution_calibrated_20260724_n10",
+                "shadow_gradient_enabled": True,
+            },
+            {
+                **common,
+                "event": "live_inventory_v4_shadow_tranche_entered",
+                "episode_id": "episode-1",
+            },
+            {
+                **common,
+                "event": "live_inventory_v4_shadow_tranche_exited",
+                "episode_id": "episode-1",
+                "reason": "shadow_v4_executable_net_target_reached",
+                "shadow_pnl_bps": "3.80",
+                "holding_seconds": 90.0,
+                "shadow_mfe_pnl_bps": "4.10",
+                "shadow_mae_pnl_bps": "-1.20",
+            },
+        ]
+    )
+
+    assert funnel is not None
+    assert funnel["shadow_gradient_enabled"] is True
+    assert funnel["shadow_gradient_entries"] == 1
+    assert funnel["shadow_gradient_exits"] == 1
+    assert funnel["shadow_gradient_active"] is False
+    assert funnel["shadow_gradient_last_pnl_bps"] == "3.80"
+
+
 def test_v4_live_funnel_distinguishes_anchor_and_recent_health_waits() -> None:
     common = {
         "run_id": "live-v4-wait-test",

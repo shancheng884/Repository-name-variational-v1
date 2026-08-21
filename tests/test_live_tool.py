@@ -198,6 +198,23 @@ def test_live_tool_v4_test_health_bypass_is_explicit_and_temporary(
     assert "--live-inventory-basis-v4-test-skip-recent-health" in command
 
 
+def test_live_tool_v4_shadow_gradient_remains_one_real_lot(monkeypatch) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(v4_live_mode=True),
+        v4_shadow_gradient=True,
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_basis_v4_shadow_gradient is True
+    assert args.live_inventory_max_lots == 1
+    assert args.live_inventory_max_total_lots == 1
+    assert args.live_inventory_max_total_notional_usd == 25
+    assert "--live-inventory-i-accept-basis-addon-diagnostic" not in command
+
+
 def test_live_tool_v4_batch_is_sequential_bounded_and_guarded(
     monkeypatch,
 ) -> None:

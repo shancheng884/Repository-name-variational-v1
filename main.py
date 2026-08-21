@@ -125,6 +125,8 @@ LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
         "basis-v4-live-test-v7",
         "basis-v4-live-v8",
         "basis-v4-live-test-v8",
+        "basis-v4-live-v9",
+        "basis-v4-live-test-v9",
     }
 )
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
@@ -133,6 +135,8 @@ LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MARGIN_BPS = Decimal("1.00")
 LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_ATTEMPTS = 6
 LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_INTERVAL_SECONDS = 0.20
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
+LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_INDEX = 2
+LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS = Decimal("2.00")
 LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS = 60
 LIVE_INVENTORY_BASIS_V4_REARM_BUFFER_BPS = Decimal("0.50")
 LIVE_INVENTORY_BASIS_V4_REARM_CONFIRM_SAMPLES = 3
@@ -998,6 +1002,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_test_skip_recent_health = bool(
             args.live_inventory_basis_v4_test_skip_recent_health
         )
+        self.live_inventory_basis_v4_shadow_gradient = bool(
+            args.live_inventory_basis_v4_shadow_gradient
+        )
         self.live_inventory_basis_v4_max_run_loss_usd = Decimal(
             str(args.live_inventory_basis_v4_max_run_loss_usd)
         )
@@ -1170,12 +1177,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
-            else "basis-v4-live-test-v8"
+            else "basis-v4-live-test-v9"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else "basis-v4-live-v8"
+            else "basis-v4-live-v9"
             if self.live_inventory_basis_v4_mode
             else "cost-calibrated-reversion-v3"
             if self.live_inventory_basis_reversion_mode
@@ -1186,12 +1193,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v8-test-health-bypass"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v9-test-health-bypass"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v8"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v9"
             if self.live_inventory_basis_v4_mode
             else "legacy-5m-reversion"
             if self.live_inventory_basis_reversion_mode
@@ -1215,6 +1222,8 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_batch_halted_reason: str | None = None
         self.live_inventory_v4_episode_id: str | None = None
         self.live_inventory_v4_next_tranche_index = 1
+        self.live_inventory_v4_shadow_tranche: dict[str, Any] | None = None
+        self.live_inventory_v4_shadow_completed_episode_id: str | None = None
         self.live_inventory_v4_rearm_required = False
         self.live_inventory_v4_rearm_confirmation_count = 0
         self.live_inventory_v4_rearm_reason: str | None = None
@@ -2285,6 +2294,13 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_batch_halted_reason = (
             state.get("v4_batch_halted_reason") or None
         )
+        shadow_tranche = state.get("v4_shadow_tranche")
+        self.live_inventory_v4_shadow_tranche = (
+            shadow_tranche if isinstance(shadow_tranche, dict) else None
+        )
+        self.live_inventory_v4_shadow_completed_episode_id = (
+            state.get("v4_shadow_completed_episode_id") or None
+        )
 
     def live_inventory_v4_episode_payload(self) -> dict[str, Any]:
         if not getattr(self, "live_inventory_basis_v4_mode", False):
@@ -2310,6 +2326,16 @@ class VariationalToLighterRuntime:
             "v4_episode_id": getattr(self, "live_inventory_v4_episode_id", None),
             "v4_next_tranche_index": int(
                 getattr(self, "live_inventory_v4_next_tranche_index", 1)
+            ),
+            "v4_shadow_gradient_enabled": bool(
+                getattr(self, "live_inventory_basis_v4_shadow_gradient", False)
+            ),
+            "v4_shadow_tranche_active": bool(
+                getattr(self, "live_inventory_v4_shadow_tranche", None)
+            ),
+            "v4_shadow_tranche_index": LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_INDEX,
+            "v4_shadow_tranche_improvement_bps": decimal_to_str(
+                LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
             ),
             "v4_rearm_required": rearm_required,
             "v4_rearm_confirmation_count": (
@@ -2576,6 +2602,16 @@ class VariationalToLighterRuntime:
                 "completed_cycles": self.live_inventory_completed_cycles,
                 "reason": reason,
                 **self.live_inventory_v4_episode_payload(),
+                "v4_shadow_tranche": getattr(
+                    self, "live_inventory_v4_shadow_tranche", None
+                ),
+                "v4_shadow_completed_episode_id": (
+                    getattr(
+                        self,
+                        "live_inventory_v4_shadow_completed_episode_id",
+                        None,
+                    )
+                ),
             }
         )
 
@@ -2872,6 +2908,231 @@ class VariationalToLighterRuntime:
             var_leg_pnl = (entry_var_price - exit_var_price) * var_qty
             lighter_leg_pnl = (exit_lighter_price - entry_lighter_price) * lighter_qty
         return var_leg_pnl, lighter_leg_pnl, var_leg_pnl + lighter_leg_pnl
+
+    def live_inventory_basis_v4_shadow_tranche_pnl(
+        self,
+        *,
+        shadow: dict[str, Any],
+        exit_var_price: Decimal,
+        exit_lighter_price: Decimal,
+    ) -> tuple[Decimal | None, Decimal | None]:
+        qty = to_decimal(shadow.get("qty"))
+        entry_var_price = to_decimal(shadow.get("entry_var_price"))
+        entry_lighter_price = to_decimal(shadow.get("entry_lighter_price"))
+        if (
+            qty is None
+            or qty <= 0
+            or entry_var_price is None
+            or entry_var_price <= 0
+            or entry_lighter_price is None
+        ):
+            return None, None
+        _, _, pnl = self.live_inventory_pair_pnl(
+            direction=str(shadow.get("direction") or ""),
+            qty=qty,
+            entry_var_price=entry_var_price,
+            entry_lighter_price=entry_lighter_price,
+            exit_var_price=exit_var_price,
+            exit_lighter_price=exit_lighter_price,
+        )
+        notional = qty * entry_var_price
+        pnl_bps = pnl / notional * Decimal("10000") if notional else None
+        return pnl, pnl_bps
+
+    async def close_live_inventory_basis_v4_shadow_tranche(
+        self,
+        *,
+        asset: str,
+        reason: str,
+        exit_var_price: Decimal,
+        exit_lighter_price: Decimal,
+        confirmation_mode: str | None = None,
+    ) -> bool:
+        shadow = getattr(self, "live_inventory_v4_shadow_tranche", None)
+        if not isinstance(shadow, dict):
+            return False
+        pnl, pnl_bps = self.live_inventory_basis_v4_shadow_tranche_pnl(
+            shadow=shadow,
+            exit_var_price=exit_var_price,
+            exit_lighter_price=exit_lighter_price,
+        )
+        entered_at = self._parse_iso_ts(str(shadow.get("entered_at") or ""))
+        holding_seconds = (
+            max(0.0, (datetime.now(timezone.utc) - entered_at).total_seconds())
+            if entered_at is not None
+            else None
+        )
+        episode_id = str(shadow.get("episode_id") or "") or None
+        await self.append_live_inventory_log(
+            "live_inventory_v4_shadow_tranche_exited",
+            {
+                "asset": asset,
+                "episode_id": episode_id,
+                "tranche_index": shadow.get("tranche_index"),
+                "direction": shadow.get("direction"),
+                "reason": reason,
+                "exit_confirmation_mode": confirmation_mode,
+                "qty": shadow.get("qty"),
+                "notional_usd": shadow.get("notional_usd"),
+                "entry_basis_bps": shadow.get("entry_basis_bps"),
+                "entry_edge_bps": shadow.get("entry_edge_bps"),
+                "exit_var_price": decimal_to_str(exit_var_price),
+                "exit_lighter_price": decimal_to_str(exit_lighter_price),
+                "shadow_pnl_usd": decimal_to_str(pnl),
+                "shadow_pnl_bps": decimal_to_str(pnl_bps),
+                "holding_seconds": holding_seconds,
+                "shadow_mfe_pnl_bps": shadow.get("mfe_pnl_bps"),
+                "shadow_mae_pnl_bps": shadow.get("mae_pnl_bps"),
+                "effective_min_exit_pnl_bps": decimal_to_str(
+                    self.live_inventory_basis_v4_effective_exit_target_bps()
+                ),
+                "real_orders_submitted": 0,
+            },
+        )
+        self.live_inventory_v4_shadow_completed_episode_id = episode_id
+        self.live_inventory_v4_shadow_tranche = None
+        await self.persist_live_inventory_memory(reason=f"v4_shadow_tranche_{reason}")
+        return True
+
+    async def maybe_update_live_inventory_basis_v4_shadow_gradient(
+        self,
+        *,
+        asset: str,
+        sample_index: int,
+        basis_bps: Decimal,
+        short_edge_bps: Decimal,
+        entry_threshold_bps: Decimal | None,
+        var_bid: Decimal,
+        var_ask: Decimal,
+        lighter_buy_price: Decimal,
+        lighter_sell_price: Decimal,
+        warm: bool,
+        var_quote_age_ok: bool,
+        lighter_book_age_ok: bool,
+        basis_sample_move_ok: bool,
+    ) -> None:
+        if not getattr(self, "live_inventory_basis_v4_shadow_gradient", False):
+            return
+        shadow = getattr(self, "live_inventory_v4_shadow_tranche", None)
+        if isinstance(shadow, dict):
+            if not var_quote_age_ok or not lighter_book_age_ok:
+                shadow["exit_confirmation_count"] = 0
+                return
+            _, pnl_bps = self.live_inventory_basis_v4_shadow_tranche_pnl(
+                shadow=shadow,
+                exit_var_price=var_ask,
+                exit_lighter_price=lighter_sell_price,
+            )
+            if pnl_bps is None:
+                return
+            prior_mfe = to_decimal(shadow.get("mfe_pnl_bps"))
+            prior_mae = to_decimal(shadow.get("mae_pnl_bps"))
+            shadow["mfe_pnl_bps"] = decimal_to_str(
+                pnl_bps if prior_mfe is None else max(prior_mfe, pnl_bps)
+            )
+            shadow["mae_pnl_bps"] = decimal_to_str(
+                pnl_bps if prior_mae is None else min(prior_mae, pnl_bps)
+            )
+            shadow["last_pnl_bps"] = decimal_to_str(pnl_bps)
+            target_bps = self.live_inventory_basis_v4_effective_exit_target_bps()
+            strong_threshold_bps = (
+                target_bps + LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MARGIN_BPS
+            )
+            entered_at = self._parse_iso_ts(str(shadow.get("entered_at") or ""))
+            holding_seconds = (
+                max(0.0, (datetime.now(timezone.utc) - entered_at).total_seconds())
+                if entered_at is not None
+                else 0.0
+            )
+            reason = None
+            confirmation_mode = None
+            if pnl_bps <= -self.live_inventory_max_unrealized_loss_bps:
+                reason = "shadow_max_unrealized_loss_bps"
+            elif holding_seconds >= LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS:
+                reason = "shadow_v4_max_hold_timeout"
+            elif pnl_bps >= strong_threshold_bps:
+                reason = "shadow_v4_executable_net_target_reached"
+                confirmation_mode = "strong_single"
+            elif pnl_bps >= target_bps:
+                confirmation_count = int(shadow.get("exit_confirmation_count") or 0) + 1
+                shadow["exit_confirmation_count"] = confirmation_count
+                if confirmation_count >= LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES:
+                    reason = "shadow_v4_executable_net_target_reached"
+                    confirmation_mode = "consecutive"
+            else:
+                shadow["exit_confirmation_count"] = 0
+            if reason is not None:
+                await self.close_live_inventory_basis_v4_shadow_tranche(
+                    asset=asset,
+                    reason=reason,
+                    exit_var_price=var_ask,
+                    exit_lighter_price=lighter_sell_price,
+                    confirmation_mode=confirmation_mode,
+                )
+            return
+
+        if len(getattr(self, "live_inventory_open_lots", [])) != 1:
+            return
+        real_lot = self.live_inventory_open_lots[0]
+        episode_id = str(real_lot.get("episode_id") or "") or None
+        if (
+            episode_id is None
+            or episode_id
+            == getattr(self, "live_inventory_v4_shadow_completed_episode_id", None)
+            or str(real_lot.get("direction") or "")
+            != DIRECTION_SHORT_VAR_LONG_LIGHTER
+            or real_lot.get("entry_kind") != "basis_v4_eth_short_p97_5"
+            or not self.live_inventory_entry_cost_confirmed(real_lot)
+            or getattr(self, "pending_live_inventory_var_fill_matches", [])
+        ):
+            return
+        real_entry_basis_bps = to_decimal(real_lot.get("entry_basis_bps"))
+        addon_threshold_bps = (
+            real_entry_basis_bps + LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
+            if real_entry_basis_bps is not None
+            else None
+        )
+        if (
+            addon_threshold_bps is None
+            or basis_bps < addon_threshold_bps
+            or entry_threshold_bps is None
+            or short_edge_bps <= entry_threshold_bps
+            or not warm
+            or not var_quote_age_ok
+            or not lighter_book_age_ok
+            or not basis_sample_move_ok
+        ):
+            return
+        qty = self.live_inventory_lot_notional_usd / var_bid
+        self.live_inventory_v4_shadow_tranche = {
+            "episode_id": episode_id,
+            "tranche_index": LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_INDEX,
+            "direction": DIRECTION_SHORT_VAR_LONG_LIGHTER,
+            "qty": decimal_to_str(qty),
+            "notional_usd": decimal_to_str(self.live_inventory_lot_notional_usd),
+            "entry_var_price": decimal_to_str(var_bid),
+            "entry_lighter_price": decimal_to_str(lighter_buy_price),
+            "entry_basis_bps": decimal_to_str(basis_bps),
+            "entry_edge_bps": decimal_to_str(short_edge_bps),
+            "entry_threshold_bps": decimal_to_str(entry_threshold_bps),
+            "addon_threshold_bps": decimal_to_str(addon_threshold_bps),
+            "entered_at": utc_now(),
+            "entered_sample_index": sample_index,
+            "exit_confirmation_count": 0,
+        }
+        await self.append_live_inventory_log(
+            "live_inventory_v4_shadow_tranche_entered",
+            {
+                "asset": asset,
+                **self.live_inventory_v4_shadow_tranche,
+                "basis_improvement_bps": decimal_to_str(
+                    basis_bps - real_entry_basis_bps
+                ),
+                "real_lot_id": real_lot.get("lot_id"),
+                "real_orders_submitted": 0,
+            },
+        )
+        await self.persist_live_inventory_memory(reason="v4_shadow_tranche_entered")
 
     def live_inventory_common_order_qty(self, *, asset: str, qty: Decimal) -> Decimal:
         var_quantum = VARIATIONAL_API_AMOUNT_QUANTUM_BY_ASSET.get(
@@ -3499,6 +3760,8 @@ class VariationalToLighterRuntime:
             self.live_inventory_v4_rearm_threshold_bps = None
             self.live_inventory_v4_episode_id = None
             self.live_inventory_v4_next_tranche_index = 1
+            self.live_inventory_v4_shadow_tranche = None
+            self.live_inventory_v4_shadow_completed_episode_id = None
         return rearmed, {
             **self.live_inventory_v4_episode_payload(),
             "v4_rearm_reset_threshold_bps": decimal_to_str(reset_threshold),
@@ -7905,6 +8168,7 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_v4_profile",
             "live_inventory_basis_v4_mode",
             "live_inventory_basis_v4_test_skip_recent_health",
+            "live_inventory_basis_v4_shadow_gradient",
             "live_inventory_basis_v4_max_run_loss_usd",
             "live_inventory_basis_v4_cycle_cooldown_seconds",
             "live_inventory_accept_basis_v4_live",
@@ -8014,6 +8278,16 @@ class VariationalToLighterRuntime:
                         self.live_inventory_lot_notional_usd
                     ),
                     "max_total_lots": self.live_inventory_max_total_lots,
+                    "shadow_gradient_enabled": (
+                        self.live_inventory_basis_v4_shadow_gradient
+                    ),
+                    "shadow_gradient_real_order_lots": 1,
+                    "shadow_gradient_tranche_index": (
+                        LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_INDEX
+                    ),
+                    "shadow_gradient_improvement_bps": decimal_to_str(
+                        LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
+                    ),
                     "max_cycles": self.live_inventory_max_cycles,
                     "batch_mode": self.live_inventory_max_cycles > 1,
                     "batch_max_run_loss_usd": decimal_to_str(
@@ -8049,6 +8323,7 @@ class VariationalToLighterRuntime:
                         "convergence_velocity",
                         "external_eth_reference",
                         "size_ladder_20_40_60_usd",
+                        "shadow_gradient_second_tranche",
                     ],
                 },
             )
@@ -10042,6 +10317,22 @@ class VariationalToLighterRuntime:
                     "asset": asset,
                 },
             )
+        if v4_mode:
+            await self.maybe_update_live_inventory_basis_v4_shadow_gradient(
+                asset=asset,
+                sample_index=index,
+                basis_bps=basis_bps,
+                short_edge_bps=short_edge_bps,
+                entry_threshold_bps=v4_entry_threshold_bps,
+                var_bid=var_bid,
+                var_ask=var_ask,
+                lighter_buy_price=lighter_buy_price,
+                lighter_sell_price=lighter_sell_price,
+                warm=warm,
+                var_quote_age_ok=var_quote_age_ok,
+                lighter_book_age_ok=lighter_book_age_ok,
+                basis_sample_move_ok=basis_sample_move_ok,
+            )
         if collect_only:
             return
         dynamic_entry_quality_buffer_bps = self.live_inventory_dynamic_entry_quality_buffer_bps(var_quote_age_seconds=var_quote_age_seconds)
@@ -10817,6 +11108,8 @@ class VariationalToLighterRuntime:
                         f"{uuid.uuid4().hex[:8]}"
                     )
                     self.live_inventory_v4_next_tranche_index = 1
+                    self.live_inventory_v4_shadow_tranche = None
+                    self.live_inventory_v4_shadow_completed_episode_id = None
                 episode_id = (
                     self.live_inventory_v4_episode_id if v4_mode else None
                 )
@@ -12272,6 +12565,13 @@ class VariationalToLighterRuntime:
                     },
                 )
                 return
+        if v4_mode:
+            await self.close_live_inventory_basis_v4_shadow_tranche(
+                asset=asset,
+                reason="real_episode_completed",
+                exit_var_price=var_exit_price,
+                exit_lighter_price=lighter_exit_price,
+            )
         normalized_exit_lot_id = self.live_inventory_normalized_lot_id(
             lot.get("lot_id")
         )
@@ -15016,6 +15316,11 @@ def parse_args() -> argparse.Namespace:
         help="Bounded V4 real-order test only: bypass the recent 1h continuity gate while retaining the rolling 7d anchor.",
     )
     parser.add_argument(
+        "--live-inventory-basis-v4-shadow-gradient",
+        action="store_true",
+        help="Record a read-only second V4 tranche after a 2 bps improvement. This never submits an additional order.",
+    )
+    parser.add_argument(
         "--live-inventory-basis-v4-max-run-loss-usd",
         type=float,
         default=0.0,
@@ -15489,6 +15794,10 @@ def parse_args() -> argparse.Namespace:
         elif args.live_inventory_basis_v4_test_skip_recent_health:
             parser.error(
                 "--live-inventory-basis-v4-test-skip-recent-health requires a V4 profile"
+            )
+        elif args.live_inventory_basis_v4_shadow_gradient:
+            parser.error(
+                "--live-inventory-basis-v4-shadow-gradient requires a V4 profile"
             )
         elif args.live_inventory_i_accept_basis_v4_live:
             parser.error(

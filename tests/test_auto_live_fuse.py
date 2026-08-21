@@ -2136,6 +2136,198 @@ def _inventory_entry_snapshot() -> CrossSpreadSnapshot:
     )
 
 
+def test_v4_shadow_gradient_enters_and_strong_single_exits_without_real_order(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_basis_v4_mode = True
+        runtime.live_inventory_basis_v4_shadow_gradient = True
+        runtime.live_inventory_v4_episode_id = "episode-1"
+        runtime.live_inventory_v4_next_tranche_index = 2
+        runtime.live_inventory_v4_shadow_tranche = None
+        runtime.live_inventory_v4_shadow_completed_episode_id = None
+        runtime.pending_live_inventory_var_fill_matches = []
+        runtime.live_inventory_basis_v4_effective_exit_target_bps = (
+            lambda: Decimal("2.50")
+        )
+        runtime.live_inventory_open_lots = [
+            {
+                "asset": "ETH",
+                "lot_id": 1,
+                "episode_id": "episode-1",
+                "direction": "short_var_long_lighter",
+                "entry_kind": "basis_v4_eth_short_p97_5",
+                "entry_basis_bps": "10.00",
+                "entry_cost_status": "final_fills_confirmed",
+            }
+        ]
+
+        await runtime.maybe_update_live_inventory_basis_v4_shadow_gradient(
+            asset="ETH",
+            sample_index=10,
+            basis_bps=Decimal("12.10"),
+            short_edge_bps=Decimal("5.00"),
+            entry_threshold_bps=Decimal("4.00"),
+            var_bid=Decimal("100.00"),
+            var_ask=Decimal("100.01"),
+            lighter_buy_price=Decimal("100.00"),
+            lighter_sell_price=Decimal("99.99"),
+            warm=True,
+            var_quote_age_ok=True,
+            lighter_book_age_ok=True,
+            basis_sample_move_ok=True,
+        )
+
+        assert runtime.live_inventory_v4_shadow_tranche is not None
+        assert runtime.live_inventory_v4_shadow_tranche["tranche_index"] == 2
+        assert len(runtime.live_inventory_open_lots) == 1
+        assert runtime.live_inventory_next_lot_id == 1
+
+        await runtime.maybe_update_live_inventory_basis_v4_shadow_gradient(
+            asset="ETH",
+            sample_index=11,
+            basis_bps=Decimal("12.00"),
+            short_edge_bps=Decimal("5.00"),
+            entry_threshold_bps=Decimal("4.00"),
+            var_bid=Decimal("99.98"),
+            var_ask=Decimal("99.99"),
+            lighter_buy_price=Decimal("100.04"),
+            lighter_sell_price=Decimal("100.03"),
+            warm=True,
+            var_quote_age_ok=True,
+            lighter_book_age_ok=True,
+            basis_sample_move_ok=True,
+        )
+
+        assert runtime.live_inventory_v4_shadow_tranche is None
+        assert runtime.live_inventory_v4_shadow_completed_episode_id == "episode-1"
+        rows = [json.loads(line) for line in runtime.orders_file.read_text().splitlines()]
+        assert [row["event"] for row in rows] == [
+            "live_inventory_v4_shadow_tranche_entered",
+            "live_inventory_v4_shadow_tranche_exited",
+        ]
+        assert rows[-1]["exit_confirmation_mode"] == "strong_single"
+        assert rows[-1]["real_orders_submitted"] == 0
+
+    asyncio.run(run())
+
+
+def test_v4_shadow_gradient_normal_exit_requires_two_fresh_samples(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_basis_v4_mode = True
+        runtime.live_inventory_basis_v4_shadow_gradient = True
+        runtime.live_inventory_v4_shadow_completed_episode_id = None
+        runtime.pending_live_inventory_var_fill_matches = []
+        runtime.live_inventory_basis_v4_effective_exit_target_bps = (
+            lambda: Decimal("2.50")
+        )
+        runtime.live_inventory_open_lots = []
+        runtime.live_inventory_v4_shadow_tranche = {
+            "episode_id": "episode-1",
+            "tranche_index": 2,
+            "direction": "short_var_long_lighter",
+            "qty": "0.2",
+            "notional_usd": "20",
+            "entry_var_price": "100",
+            "entry_lighter_price": "100",
+            "entered_at": datetime.now(timezone.utc).isoformat(),
+            "exit_confirmation_count": 0,
+        }
+        kwargs = {
+            "asset": "ETH",
+            "basis_bps": Decimal("12"),
+            "short_edge_bps": Decimal("5"),
+            "entry_threshold_bps": Decimal("4"),
+            "var_bid": Decimal("99.99"),
+            "var_ask": Decimal("99.99"),
+            "lighter_buy_price": Decimal("100.02"),
+            "lighter_sell_price": Decimal("100.02"),
+            "warm": True,
+            "basis_sample_move_ok": True,
+        }
+
+        await runtime.maybe_update_live_inventory_basis_v4_shadow_gradient(
+            sample_index=1,
+            var_quote_age_ok=True,
+            lighter_book_age_ok=True,
+            **kwargs,
+        )
+        assert runtime.live_inventory_v4_shadow_tranche is not None
+        assert runtime.live_inventory_v4_shadow_tranche["exit_confirmation_count"] == 1
+
+        await runtime.maybe_update_live_inventory_basis_v4_shadow_gradient(
+            sample_index=2,
+            var_quote_age_ok=False,
+            lighter_book_age_ok=True,
+            **kwargs,
+        )
+        assert runtime.live_inventory_v4_shadow_tranche is not None
+        assert runtime.live_inventory_v4_shadow_tranche["exit_confirmation_count"] == 0
+
+        await runtime.maybe_update_live_inventory_basis_v4_shadow_gradient(
+            sample_index=3,
+            var_quote_age_ok=True,
+            lighter_book_age_ok=True,
+            **kwargs,
+        )
+        await runtime.maybe_update_live_inventory_basis_v4_shadow_gradient(
+            sample_index=4,
+            var_quote_age_ok=True,
+            lighter_book_age_ok=True,
+            **kwargs,
+        )
+        assert runtime.live_inventory_v4_shadow_tranche is None
+
+    asyncio.run(run())
+
+
+def test_v4_shadow_gradient_requires_full_two_bps_improvement(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_basis_v4_mode = True
+        runtime.live_inventory_basis_v4_shadow_gradient = True
+        runtime.live_inventory_v4_shadow_tranche = None
+        runtime.live_inventory_v4_shadow_completed_episode_id = None
+        runtime.pending_live_inventory_var_fill_matches = []
+        runtime.live_inventory_open_lots = [
+            {
+                "asset": "ETH",
+                "lot_id": 1,
+                "episode_id": "episode-1",
+                "direction": "short_var_long_lighter",
+                "entry_kind": "basis_v4_eth_short_p97_5",
+                "entry_basis_bps": "10.00",
+                "entry_cost_status": "final_fills_confirmed",
+            }
+        ]
+
+        await runtime.maybe_update_live_inventory_basis_v4_shadow_gradient(
+            asset="ETH",
+            sample_index=10,
+            basis_bps=Decimal("11.99"),
+            short_edge_bps=Decimal("5.00"),
+            entry_threshold_bps=Decimal("4.00"),
+            var_bid=Decimal("100.00"),
+            var_ask=Decimal("100.01"),
+            lighter_buy_price=Decimal("100.00"),
+            lighter_sell_price=Decimal("99.99"),
+            warm=True,
+            var_quote_age_ok=True,
+            lighter_book_age_ok=True,
+            basis_sample_move_ok=True,
+        )
+
+        assert runtime.live_inventory_v4_shadow_tranche is None
+        assert not runtime.orders_file.exists()
+
+    asyncio.run(run())
+
+
 def test_entry_slippage_limit_forces_reduce_only_cleanup_after_both_fills(
     tmp_path,
 ) -> None:
