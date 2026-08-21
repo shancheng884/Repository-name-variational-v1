@@ -961,13 +961,13 @@ def test_v4_exit_target_uses_conservative_prior_until_calibration_is_ready() -> 
     ) == (False, 1)
     assert runtime.live_inventory_basis_v4_confirm_exit_candidate(
         lot,
-        eligible=True,
-    ) == (True, 2)
+        eligible=False,
+    ) == (False, 1)
     assert runtime.live_inventory_basis_v4_confirm_exit_candidate(
         lot,
-        eligible=False,
-    ) == (False, 0)
-    assert "v4_exit_confirmation_count" not in lot
+        eligible=True,
+    ) == (True, 2)
+    assert lot["v4_exit_confirmation_window"] == [True, False, True]
 
 
 def test_v4_exit_target_uses_observed_shortfall_after_ten_samples() -> None:
@@ -1062,6 +1062,7 @@ def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
     runtime.logger = logging.getLogger("test_v4_execution_reserve_loader")
     runtime.live_inventory_execution_loss_bps_samples = deque(maxlen=20)
     runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(maxlen=20)
+    runtime.live_inventory_strong_single_shortfall_bps_samples = deque(maxlen=20)
     rows = [
         {
             "event": "live_inventory_final_pnl",
@@ -1105,6 +1106,7 @@ def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
             "actual_pnl_status": "lighter_final_fill_confirmed",
             "estimated_pnl_bps": "2.50",
             "actual_pnl_bps": "0.50",
+            "exit_confirmation_mode": "strong_single",
         },
         {
             "event": "live_inventory_final_pnl",
@@ -1139,6 +1141,9 @@ def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
     assert list(runtime.live_inventory_exit_estimate_shortfall_bps_samples) == [
         Decimal("0"),
         Decimal("2.00"),
+    ]
+    assert list(runtime.live_inventory_strong_single_shortfall_bps_samples) == [
+        Decimal("2.00")
     ]
 
 
@@ -2136,7 +2141,7 @@ def _inventory_entry_snapshot() -> CrossSpreadSnapshot:
     )
 
 
-def test_v4_shadow_gradient_enters_and_strong_single_exits_without_real_order(
+def test_v4_shadow_gradient_enters_and_guarded_strong_single_exits_without_real_order(
     tmp_path,
 ) -> None:
     async def run() -> None:
@@ -2151,6 +2156,10 @@ def test_v4_shadow_gradient_enters_and_strong_single_exits_without_real_order(
         runtime.pending_live_inventory_var_fill_matches = []
         runtime.live_inventory_basis_v4_effective_exit_target_bps = (
             lambda: Decimal("2.50")
+        )
+        runtime.live_inventory_strong_single_shortfall_bps_samples = deque(
+            [Decimal("0")] * 3,
+            maxlen=20,
         )
         runtime.live_inventory_open_lots = [
             {
@@ -2191,10 +2200,28 @@ def test_v4_shadow_gradient_enters_and_strong_single_exits_without_real_order(
             basis_bps=Decimal("12.00"),
             short_edge_bps=Decimal("5.00"),
             entry_threshold_bps=Decimal("4.00"),
-            var_bid=Decimal("99.98"),
+            var_bid=Decimal("99.99"),
             var_ask=Decimal("99.99"),
-            lighter_buy_price=Decimal("100.04"),
-            lighter_sell_price=Decimal("100.03"),
+            lighter_buy_price=Decimal("100.014"),
+            lighter_sell_price=Decimal("100.014"),
+            warm=True,
+            var_quote_age_ok=True,
+            lighter_book_age_ok=True,
+            basis_sample_move_ok=True,
+        )
+
+        assert runtime.live_inventory_v4_shadow_tranche is not None
+
+        await runtime.maybe_update_live_inventory_basis_v4_shadow_gradient(
+            asset="ETH",
+            sample_index=12,
+            basis_bps=Decimal("12.00"),
+            short_edge_bps=Decimal("5.00"),
+            entry_threshold_bps=Decimal("4.00"),
+            var_bid=Decimal("99.99"),
+            var_ask=Decimal("99.99"),
+            lighter_buy_price=Decimal("100.025"),
+            lighter_sell_price=Decimal("100.025"),
             warm=True,
             var_quote_age_ok=True,
             lighter_book_age_ok=True,
@@ -2235,7 +2262,7 @@ def test_v4_shadow_gradient_normal_exit_requires_two_fresh_samples(tmp_path) -> 
             "entry_var_price": "100",
             "entry_lighter_price": "100",
             "entered_at": datetime.now(timezone.utc).isoformat(),
-            "exit_confirmation_count": 0,
+            "v4_exit_confirmation_count": 0,
         }
         kwargs = {
             "asset": "ETH",
@@ -2257,7 +2284,9 @@ def test_v4_shadow_gradient_normal_exit_requires_two_fresh_samples(tmp_path) -> 
             **kwargs,
         )
         assert runtime.live_inventory_v4_shadow_tranche is not None
-        assert runtime.live_inventory_v4_shadow_tranche["exit_confirmation_count"] == 1
+        assert runtime.live_inventory_v4_shadow_tranche[
+            "v4_exit_confirmation_count"
+        ] == 1
 
         await runtime.maybe_update_live_inventory_basis_v4_shadow_gradient(
             sample_index=2,
@@ -2266,7 +2295,9 @@ def test_v4_shadow_gradient_normal_exit_requires_two_fresh_samples(tmp_path) -> 
             **kwargs,
         )
         assert runtime.live_inventory_v4_shadow_tranche is not None
-        assert runtime.live_inventory_v4_shadow_tranche["exit_confirmation_count"] == 0
+        assert runtime.live_inventory_v4_shadow_tranche.get(
+            "v4_exit_confirmation_count", 0
+        ) == 0
 
         await runtime.maybe_update_live_inventory_basis_v4_shadow_gradient(
             sample_index=3,
@@ -3517,25 +3548,26 @@ def test_live_inventory_basis_refreshed_exit_context_uses_lighter_depth(
     asyncio.run(run())
 
 
-def test_v4_fast_refresh_requires_two_consecutive_executable_quotes(
+def test_v4_fast_refresh_accepts_latest_and_two_of_three_executable_quotes(
     tmp_path,
 ) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_v4_strong_single_enabled = False
         lot: dict[str, object] = {}
         contexts = [
             {
                 "reason": None,
                 "refresh_quote_ms": Decimal("10"),
-                "refreshed_pnl_bps": Decimal("4.4"),
-                "executable_pnl_bps": Decimal("4.3"),
+                "refreshed_pnl_bps": Decimal("4.8"),
+                "executable_pnl_bps": Decimal("4.8"),
                 "exit_lighter_depth": {"slippage_bps": "0.2"},
             },
             {
                 "reason": None,
                 "refresh_quote_ms": Decimal("11"),
                 "refreshed_pnl_bps": Decimal("5.0"),
-                "executable_pnl_bps": Decimal("4.8"),
+                "executable_pnl_bps": Decimal("4.4"),
                 "exit_lighter_depth": {"slippage_bps": "0.2"},
                 "refreshed_var_exit_price": Decimal("99.9"),
                 "executable_lighter_exit_price": Decimal("100.2"),
@@ -3574,9 +3606,10 @@ def test_v4_fast_refresh_requires_two_consecutive_executable_quotes(
         assert result["confirmed"] is True
         assert result["attempts"] == 3
         assert result["confirmation_count"] == 2
-        assert result["observations"][0]["confirmation_count"] == 0
+        assert result["observations"][0]["confirmation_count"] == 1
         assert result["observations"][1]["confirmation_count"] == 1
         assert result["observations"][2]["confirmation_count"] == 2
+        assert result["confirmation_mode"] == "two_of_three"
         assert result["selected_context"]["executable_pnl_bps"] == Decimal(
             "4.9"
         )
@@ -3590,17 +3623,28 @@ def test_v4_fast_refresh_accepts_strong_single_executable_quote(
 ) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_dynamic_exit_buffer = True
+        runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
+            [Decimal("3.00")] * 20,
+            maxlen=20,
+        )
+        runtime.live_inventory_strong_single_shortfall_bps_samples = deque(
+            [Decimal("3.00")] * 3,
+            maxlen=20,
+        )
         lot: dict[str, object] = {}
         calls = 0
+        executable_values = iter((Decimal("2.40"), Decimal("3.50")))
 
         async def fake_refreshed_exit_context(**_kwargs):
             nonlocal calls
             calls += 1
+            executable_pnl_bps = next(executable_values)
             return {
                 "reason": None,
                 "refresh_quote_ms": Decimal("42"),
-                "refreshed_pnl_bps": Decimal("3.78"),
-                "executable_pnl_bps": Decimal("3.78"),
+                "refreshed_pnl_bps": executable_pnl_bps,
+                "executable_pnl_bps": executable_pnl_bps,
                 "exit_lighter_depth": {"slippage_bps": "0"},
                 "refreshed_var_exit_price": Decimal("99.9"),
                 "executable_lighter_exit_price": Decimal("100.2"),
@@ -3623,17 +3667,74 @@ def test_v4_fast_refresh_accepts_strong_single_executable_quote(
         )
 
         assert result["confirmed"] is True
-        assert result["attempts"] == 1
+        assert result["attempts"] == 2
         assert result["confirmation_count"] == 1
         assert result["confirmation_mode"] == "strong_single"
         assert result["strong_single_threshold_bps"] == Decimal("3.50")
-        assert result["observations"][0]["confirmation_mode"] == "strong_single"
-        assert calls == 1
+        assert result["observations"][1]["confirmation_mode"] == "strong_single"
+        assert result["observations"][1]["strong_single_stable"] is True
+        assert calls == 2
 
     asyncio.run(run())
 
 
-def test_v4_fast_refresh_exhausts_without_consecutive_confirmation(
+def test_v4_fast_refresh_rejects_unstable_strong_single_spike(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_dynamic_exit_buffer = True
+        runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
+            [Decimal("3.00")] * 20,
+            maxlen=20,
+        )
+        runtime.live_inventory_strong_single_shortfall_bps_samples = deque(
+            [Decimal("3.00")] * 3,
+            maxlen=20,
+        )
+        executable_values = iter(
+            (
+                Decimal("2.40"),
+                Decimal("5.00"),
+                Decimal("1.00"),
+                Decimal("1.10"),
+                Decimal("1.20"),
+                Decimal("1.30"),
+            )
+        )
+
+        async def fake_refreshed_exit_context(**_kwargs):
+            executable_pnl_bps = next(executable_values)
+            return {
+                "reason": None,
+                "refresh_quote_ms": Decimal("42"),
+                "refreshed_pnl_bps": executable_pnl_bps,
+                "executable_pnl_bps": executable_pnl_bps,
+                "exit_lighter_depth": {"slippage_bps": "0"},
+            }
+
+        runtime.live_inventory_basis_refreshed_exit_context = (
+            fake_refreshed_exit_context
+        )
+
+        result = await runtime.live_inventory_basis_v4_fast_refresh_exit_context(
+            asset="ETH",
+            lot={},
+            direction="short_var_long_lighter",
+            qty=Decimal("0.01"),
+            entry_var_price=Decimal("100"),
+            entry_lighter_price=Decimal("100"),
+            exit_lighter_side="SELL",
+            effective_min_exit_pnl_bps=Decimal("2.50"),
+        )
+
+        assert result["confirmed"] is False
+        assert result["attempts"] == 6
+        assert result["max_executable_pnl_bps"] == Decimal("5.00")
+        assert result["observations"][1]["strong_single_stable"] is False
+
+    asyncio.run(run())
+
+
+def test_v4_fast_refresh_exhausts_with_only_one_eligible_quote_per_window(
     tmp_path,
 ) -> None:
     async def run() -> None:
@@ -3643,9 +3744,9 @@ def test_v4_fast_refresh_exhausts_without_consecutive_confirmation(
             (
                 Decimal("4.8"),
                 Decimal("4.4"),
-                Decimal("4.9"),
                 Decimal("4.4"),
                 Decimal("4.8"),
+                Decimal("4.4"),
                 Decimal("4.4"),
             )
         )
@@ -3677,11 +3778,11 @@ def test_v4_fast_refresh_exhausts_without_consecutive_confirmation(
 
         assert result["confirmed"] is False
         assert result["attempts"] == 6
-        assert result["confirmation_count"] == 0
+        assert result["confirmation_count"] == 1
         assert result["last_block_reason"] == (
             "basis_exit_lighter_depth_pnl_below_threshold"
         )
-        assert result["max_executable_pnl_bps"] == Decimal("4.9")
+        assert result["max_executable_pnl_bps"] == Decimal("4.8")
 
     asyncio.run(run())
 
@@ -4766,6 +4867,62 @@ def test_live_inventory_actual_pnl_uses_leg_specific_filled_qty(tmp_path) -> Non
         assert row["actual_lighter_leg_pnl_usd"] == "0.5906599999999999999999999972"
         assert row["actual_pnl_usd"] == "-0.0058575000000000000000000028"
         assert row["actual_pnl_bps"] == "-2.930537994493890584993170358"
+
+    asyncio.run(run())
+
+
+def test_v4_strong_single_actual_loss_auto_disables_mode(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_basis_v4_mode = True
+        runtime.live_inventory_v4_strong_single_enabled = True
+        runtime.live_inventory_v4_strong_single_disabled_reason = None
+        runtime.live_inventory_v4_strong_single_disabled_at = None
+        runtime.live_inventory_strong_single_shortfall_bps_samples = deque(
+            maxlen=20
+        )
+        runtime.pending_live_inventory_actual_pnl["exit-strong-loss"] = {
+            "asset": "ETH",
+            "lot_id": 1,
+            "direction": "short_var_long_lighter",
+            "qty": "1",
+            "entry_var_price": "100",
+            "entry_lighter_price": "100",
+            "exit_var_price": "99.95",
+            "estimated_exit_lighter_price": "100.05",
+            "estimated_pnl_usd": "0.10",
+            "estimated_pnl_bps": "10",
+            "effective_min_exit_pnl_bps": "4",
+            "exit_confirmation_mode": "strong_single",
+        }
+
+        await runtime.maybe_append_live_inventory_actual_pnl(
+            {
+                "trade_key": "exit-strong-loss",
+                "lighter_filled_price": "99.90",
+                "lighter_filled_base_amount": "1",
+            }
+        )
+
+        rows = [
+            json.loads(line)
+            for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()
+        ]
+        disabled = [
+            row
+            for row in rows
+            if row["event"] == "live_inventory_v4_strong_single_auto_disabled"
+        ]
+        assert runtime.live_inventory_v4_strong_single_enabled is False
+        assert runtime.live_inventory_v4_strong_single_disabled_reason == (
+            "estimated_profitable_actual_loss"
+        )
+        assert len(disabled) == 1
+        assert disabled[0]["action"] == "fallback_to_latest_and_2_of_3"
+        assert disabled[0]["actual_pnl_bps"] == "-5.0000"
+        state = json.loads(runtime.live_inventory_state_file.read_text())
+        assert state["v4_strong_single_enabled"] is False
 
     asyncio.run(run())
 

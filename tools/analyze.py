@@ -299,6 +299,30 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "shadow_gradient_last_mae_bps": latest_shadow_gradient_exit.get(
             "shadow_mae_pnl_bps"
         ),
+        "exit_confirmation_policy": latest_state.get(
+            "v4_exit_confirmation_policy"
+        ),
+        "strong_single_enabled": latest_state.get(
+            "v4_strong_single_enabled"
+        ),
+        "strong_single_disabled_reason": latest_state.get(
+            "v4_strong_single_disabled_reason"
+        ),
+        "strong_single_auto_disables": events[
+            "live_inventory_v4_strong_single_auto_disabled"
+        ],
+        "strong_single_shortfall_sample_count": latest_state.get(
+            "v4_strong_single_shortfall_sample_count"
+        ),
+        "strong_single_shortfall_raw_p80_bps": latest_state.get(
+            "v4_strong_single_shortfall_raw_p80_bps"
+        ),
+        "strong_single_shortfall_reserve_bps": latest_state.get(
+            "v4_strong_single_shortfall_reserve_bps"
+        ),
+        "strong_single_threshold_bps": latest_state.get(
+            "v4_strong_single_threshold_bps"
+        ),
         "batch_wait_reason": latest_batch_wait.get("reason"),
         "batch_cooldown_remaining_seconds": latest_batch_wait.get(
             "cooldown_remaining_seconds"
@@ -549,6 +573,22 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"{funnel['shadow_gradient_last_holding_seconds']} "
         f"shadow_last_mfe_bps={funnel['shadow_gradient_last_mfe_bps']} "
         f"shadow_last_mae_bps={funnel['shadow_gradient_last_mae_bps']}"
+    )
+    print(
+        f"exit_confirmation_policy={funnel['exit_confirmation_policy']} "
+        f"strong_single_enabled={funnel['strong_single_enabled']} "
+        f"strong_single_disabled_reason="
+        f"{funnel['strong_single_disabled_reason']} "
+        f"strong_single_auto_disables="
+        f"{funnel['strong_single_auto_disables']} "
+        f"strong_single_samples="
+        f"{funnel['strong_single_shortfall_sample_count']} "
+        f"strong_single_raw_p80_bps="
+        f"{funnel['strong_single_shortfall_raw_p80_bps']} "
+        f"strong_single_reserve_bps="
+        f"{funnel['strong_single_shortfall_reserve_bps']} "
+        f"strong_single_threshold_bps="
+        f"{funnel['strong_single_threshold_bps']}"
     )
     print(
         f"anchor_count={funnel['anchor_count']} "

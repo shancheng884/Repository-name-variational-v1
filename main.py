@@ -127,11 +127,21 @@ LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
         "basis-v4-live-test-v8",
         "basis-v4-live-v9",
         "basis-v4-live-test-v9",
+        "basis-v4-live-v10",
+        "basis-v4-live-test-v10",
     }
 )
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
 LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES = 2
+LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_WINDOW_SAMPLES = 3
 LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MARGIN_BPS = Decimal("1.00")
+LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_STABILITY_SAMPLES = 2
+LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MAX_RANGE_BPS = Decimal("1.50")
+LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MAX_REFRESH_MS = Decimal("100")
+LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MAX_DEPTH_SLIPPAGE_BPS = Decimal("1.00")
+LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SHORTFALL_MIN_SAMPLES = 3
+LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SHORTFALL_PRIOR_BPS = Decimal("6.00")
+LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SHORTFALL_CAP_BPS = Decimal("12.00")
 LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_ATTEMPTS = 6
 LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_INTERVAL_SECONDS = 0.20
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
@@ -1177,12 +1187,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
-            else "basis-v4-live-test-v9"
+            else "basis-v4-live-test-v10"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else "basis-v4-live-v9"
+            else "basis-v4-live-v10"
             if self.live_inventory_basis_v4_mode
             else "cost-calibrated-reversion-v3"
             if self.live_inventory_basis_reversion_mode
@@ -1193,12 +1203,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v9-test-health-bypass"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v10-test-health-bypass"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v9"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v10"
             if self.live_inventory_basis_v4_mode
             else "legacy-5m-reversion"
             if self.live_inventory_basis_reversion_mode
@@ -1224,6 +1234,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_next_tranche_index = 1
         self.live_inventory_v4_shadow_tranche: dict[str, Any] | None = None
         self.live_inventory_v4_shadow_completed_episode_id: str | None = None
+        self.live_inventory_v4_strong_single_enabled = True
+        self.live_inventory_v4_strong_single_disabled_reason: str | None = None
+        self.live_inventory_v4_strong_single_disabled_at: str | None = None
         self.live_inventory_v4_rearm_required = False
         self.live_inventory_v4_rearm_confirmation_count = 0
         self.live_inventory_v4_rearm_reason: str | None = None
@@ -1238,6 +1251,7 @@ class VariationalToLighterRuntime:
         self.pending_live_inventory_final_pnl: dict[str, dict[str, Any]] = {}
         self.live_inventory_execution_loss_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_exit_estimate_shortfall_bps_samples: deque[Decimal] = deque(maxlen=20)
+        self.live_inventory_strong_single_shortfall_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_exit_fill_latency_ms_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_basis_var_spread_bps_samples: deque[Decimal] = deque(maxlen=200)
         self.live_inventory_basis_lighter_spread_bps_samples: deque[Decimal] = deque(maxlen=200)
@@ -1504,6 +1518,19 @@ class VariationalToLighterRuntime:
         if orders_file is None or not orders_file.exists():
             return
         samples: deque[Decimal] = deque(maxlen=self.live_inventory_exit_estimate_shortfall_bps_samples.maxlen)
+        strong_single_target = getattr(
+            self,
+            "live_inventory_strong_single_shortfall_bps_samples",
+            None,
+        )
+        if strong_single_target is None:
+            strong_single_target = deque(maxlen=20)
+            self.live_inventory_strong_single_shortfall_bps_samples = (
+                strong_single_target
+            )
+        strong_single_samples: deque[Decimal] = deque(
+            maxlen=strong_single_target.maxlen
+        )
         try:
             with orders_file.open("r", encoding="utf-8") as handle:
                 for line in handle:
@@ -1529,11 +1556,20 @@ class VariationalToLighterRuntime:
                         continue
                     # Zero-shortfall fills are real observations and must count
                     # toward calibration maturity instead of biasing the sample.
-                    samples.append(max(estimated_bps - actual_bps, Decimal("0")))
+                    shortfall_bps = max(
+                        estimated_bps - actual_bps,
+                        Decimal("0"),
+                    )
+                    samples.append(shortfall_bps)
+                    if row.get("exit_confirmation_mode") == "strong_single":
+                        strong_single_samples.append(shortfall_bps)
         except OSError as exc:
             self.logger.warning("Could not load recent live inventory exit shortfall samples: %s", exc)
             return
         self.live_inventory_exit_estimate_shortfall_bps_samples.extend(samples)
+        self.live_inventory_strong_single_shortfall_bps_samples.extend(
+            strong_single_samples
+        )
 
     def live_inventory_dynamic_exit_buffer_bps(self) -> Decimal:
         if not self.live_inventory_basis_dynamic_exit_buffer:
@@ -1546,7 +1582,9 @@ class VariationalToLighterRuntime:
         )
         sample_count = len(samples)
         raw_p80_bps = self.percentile_decimal(samples, 80) or Decimal("0")
-        enabled = bool(self.live_inventory_basis_dynamic_exit_buffer)
+        enabled = bool(
+            getattr(self, "live_inventory_basis_dynamic_exit_buffer", False)
+        )
         ready = bool(
             enabled
             and sample_count >= LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES
@@ -1640,21 +1678,87 @@ class VariationalToLighterRuntime:
             + self.live_inventory_basis_v4_exit_shortfall_reserve_bps()
         )
 
+    def live_inventory_basis_v4_strong_single_context(
+        self,
+        *,
+        effective_min_exit_pnl_bps: Decimal,
+    ) -> dict[str, Any]:
+        samples = list(
+            getattr(
+                self,
+                "live_inventory_strong_single_shortfall_bps_samples",
+                [],
+            )
+        )
+        sample_count = len(samples)
+        raw_p80_bps = self.percentile_decimal(samples, 80) or Decimal("0")
+        ready = sample_count >= LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SHORTFALL_MIN_SAMPLES
+        mode_reserve_bps = (
+            min(
+                raw_p80_bps,
+                LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SHORTFALL_CAP_BPS,
+            )
+            if ready
+            else LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SHORTFALL_PRIOR_BPS
+        )
+        general_reserve_bps = self.live_inventory_basis_v4_exit_shortfall_reserve_bps()
+        incremental_reserve_bps = max(
+            mode_reserve_bps - general_reserve_bps,
+            Decimal("0"),
+        )
+        threshold_bps = (
+            effective_min_exit_pnl_bps
+            + incremental_reserve_bps
+            + LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MARGIN_BPS
+        )
+        return {
+            "enabled": bool(
+                getattr(self, "live_inventory_v4_strong_single_enabled", True)
+            ),
+            "disabled_reason": getattr(
+                self,
+                "live_inventory_v4_strong_single_disabled_reason",
+                None,
+            ),
+            "sample_count": sample_count,
+            "min_samples": LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SHORTFALL_MIN_SAMPLES,
+            "ready": ready,
+            "raw_p80_bps": raw_p80_bps,
+            "prior_bps": LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SHORTFALL_PRIOR_BPS,
+            "cap_bps": LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SHORTFALL_CAP_BPS,
+            "mode_reserve_bps": mode_reserve_bps,
+            "incremental_reserve_bps": incremental_reserve_bps,
+            "threshold_bps": threshold_bps,
+        }
+
     @staticmethod
     def live_inventory_basis_v4_confirm_exit_candidate(
         lot: dict[str, Any],
         *,
         eligible: bool,
     ) -> tuple[bool, int]:
-        if not eligible:
-            lot.pop("v4_exit_confirmation_count", None)
-            return False, 0
-        confirmation_count = int(lot.get("v4_exit_confirmation_count") or 0) + 1
+        window = list(lot.get("v4_exit_confirmation_window") or [])
+        window.append(bool(eligible))
+        window = window[-LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_WINDOW_SAMPLES:]
+        confirmation_count = sum(1 for value in window if value)
+        lot["v4_exit_confirmation_window"] = window
         lot["v4_exit_confirmation_count"] = confirmation_count
         return (
-            confirmation_count >= LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES,
+            bool(
+                eligible
+                and confirmation_count
+                >= LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
+            ),
             confirmation_count,
         )
+
+    @staticmethod
+    def live_inventory_basis_v4_reset_exit_confirmation(
+        lot: dict[str, Any],
+    ) -> None:
+        lot.pop("v4_exit_confirmation_count", None)
+        lot.pop("v4_exit_confirmation_window", None)
+        lot.pop("v4_exit_strong_stability_values", None)
 
     def load_recent_live_inventory_actual_pnl_stats(self) -> None:
         orders_file = getattr(self, "orders_file", None)
@@ -2301,10 +2405,25 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_shadow_completed_episode_id = (
             state.get("v4_shadow_completed_episode_id") or None
         )
+        if "v4_strong_single_enabled" in state:
+            self.live_inventory_v4_strong_single_enabled = bool(
+                state.get("v4_strong_single_enabled")
+            )
+        self.live_inventory_v4_strong_single_disabled_reason = (
+            state.get("v4_strong_single_disabled_reason") or None
+        )
+        self.live_inventory_v4_strong_single_disabled_at = (
+            state.get("v4_strong_single_disabled_at") or None
+        )
 
     def live_inventory_v4_episode_payload(self) -> dict[str, Any]:
         if not getattr(self, "live_inventory_basis_v4_mode", False):
             return {}
+        strong_single_context = self.live_inventory_basis_v4_strong_single_context(
+            effective_min_exit_pnl_bps=(
+                self.live_inventory_basis_v4_effective_exit_target_bps()
+            )
+        )
         rearm_required = bool(
             getattr(self, "live_inventory_v4_rearm_required", False)
         )
@@ -2336,6 +2455,42 @@ class VariationalToLighterRuntime:
             "v4_shadow_tranche_index": LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_INDEX,
             "v4_shadow_tranche_improvement_bps": decimal_to_str(
                 LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
+            ),
+            "v4_exit_confirmation_policy": "latest_and_2_of_3",
+            "v4_exit_confirmation_required": (
+                LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
+            ),
+            "v4_exit_confirmation_window": (
+                LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_WINDOW_SAMPLES
+            ),
+            "v4_strong_single_enabled": bool(
+                getattr(self, "live_inventory_v4_strong_single_enabled", True)
+            ),
+            "v4_strong_single_disabled_reason": getattr(
+                self,
+                "live_inventory_v4_strong_single_disabled_reason",
+                None,
+            ),
+            "v4_strong_single_disabled_at": getattr(
+                self,
+                "live_inventory_v4_strong_single_disabled_at",
+                None,
+            ),
+            "v4_strong_single_shortfall_sample_count": strong_single_context[
+                "sample_count"
+            ],
+            "v4_strong_single_shortfall_min_samples": strong_single_context[
+                "min_samples"
+            ],
+            "v4_strong_single_shortfall_ready": strong_single_context["ready"],
+            "v4_strong_single_shortfall_raw_p80_bps": decimal_to_str(
+                strong_single_context["raw_p80_bps"]
+            ),
+            "v4_strong_single_shortfall_reserve_bps": decimal_to_str(
+                strong_single_context["mode_reserve_bps"]
+            ),
+            "v4_strong_single_threshold_bps": decimal_to_str(
+                strong_single_context["threshold_bps"]
             ),
             "v4_rearm_required": rearm_required,
             "v4_rearm_confirmation_count": (
@@ -3016,7 +3171,7 @@ class VariationalToLighterRuntime:
         shadow = getattr(self, "live_inventory_v4_shadow_tranche", None)
         if isinstance(shadow, dict):
             if not var_quote_age_ok or not lighter_book_age_ok:
-                shadow["exit_confirmation_count"] = 0
+                self.live_inventory_basis_v4_reset_exit_confirmation(shadow)
                 return
             _, pnl_bps = self.live_inventory_basis_v4_shadow_tranche_pnl(
                 shadow=shadow,
@@ -3035,8 +3190,44 @@ class VariationalToLighterRuntime:
             )
             shadow["last_pnl_bps"] = decimal_to_str(pnl_bps)
             target_bps = self.live_inventory_basis_v4_effective_exit_target_bps()
-            strong_threshold_bps = (
-                target_bps + LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MARGIN_BPS
+            strong_context = self.live_inventory_basis_v4_strong_single_context(
+                effective_min_exit_pnl_bps=target_bps
+            )
+            strong_threshold_bps = strong_context["threshold_bps"]
+            strong_values = [
+                value
+                for value in (
+                    to_decimal(item)
+                    for item in list(
+                        shadow.get("v4_exit_strong_stability_values") or []
+                    )
+                )
+                if value is not None
+            ]
+            strong_values.append(pnl_bps)
+            strong_values = strong_values[
+                -LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_STABILITY_SAMPLES:
+            ]
+            shadow["v4_exit_strong_stability_values"] = [
+                decimal_to_str(value) for value in strong_values
+            ]
+            strong_range_bps = (
+                max(strong_values) - min(strong_values)
+                if len(strong_values)
+                >= LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_STABILITY_SAMPLES
+                else None
+            )
+            normal_confirmed, _ = self.live_inventory_basis_v4_confirm_exit_candidate(
+                shadow,
+                eligible=pnl_bps >= target_bps,
+            )
+            strong_confirmed = bool(
+                not normal_confirmed
+                and strong_context["enabled"]
+                and pnl_bps >= strong_threshold_bps
+                and strong_range_bps is not None
+                and strong_range_bps
+                <= LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MAX_RANGE_BPS
             )
             entered_at = self._parse_iso_ts(str(shadow.get("entered_at") or ""))
             holding_seconds = (
@@ -3050,17 +3241,12 @@ class VariationalToLighterRuntime:
                 reason = "shadow_max_unrealized_loss_bps"
             elif holding_seconds >= LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS:
                 reason = "shadow_v4_max_hold_timeout"
-            elif pnl_bps >= strong_threshold_bps:
+            elif strong_confirmed:
                 reason = "shadow_v4_executable_net_target_reached"
                 confirmation_mode = "strong_single"
-            elif pnl_bps >= target_bps:
-                confirmation_count = int(shadow.get("exit_confirmation_count") or 0) + 1
-                shadow["exit_confirmation_count"] = confirmation_count
-                if confirmation_count >= LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES:
-                    reason = "shadow_v4_executable_net_target_reached"
-                    confirmation_mode = "consecutive"
-            else:
-                shadow["exit_confirmation_count"] = 0
+            elif normal_confirmed:
+                reason = "shadow_v4_executable_net_target_reached"
+                confirmation_mode = "two_of_three"
             if reason is not None:
                 await self.close_live_inventory_basis_v4_shadow_tranche(
                     asset=asset,
@@ -3118,7 +3304,7 @@ class VariationalToLighterRuntime:
             "addon_threshold_bps": decimal_to_str(addon_threshold_bps),
             "entered_at": utc_now(),
             "entered_sample_index": sample_index,
-            "exit_confirmation_count": 0,
+            "v4_exit_confirmation_count": 0,
         }
         await self.append_live_inventory_log(
             "live_inventory_v4_shadow_tranche_entered",
@@ -3929,10 +4115,20 @@ class VariationalToLighterRuntime:
         max_executable_pnl_bps: Decimal | None = None
         confirmation_count = int(lot.get("v4_exit_confirmation_count") or 0)
         confirmation_mode: str | None = None
-        strong_single_threshold_bps = (
-            effective_min_exit_pnl_bps
-            + LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MARGIN_BPS
+        strong_single_context = self.live_inventory_basis_v4_strong_single_context(
+            effective_min_exit_pnl_bps=effective_min_exit_pnl_bps
         )
+        strong_single_threshold_bps = strong_single_context["threshold_bps"]
+        strong_stability_values = [
+            value
+            for value in (
+                to_decimal(item)
+                for item in list(
+                    lot.get("v4_exit_strong_stability_values") or []
+                )
+            )
+            if value is not None
+        ][-LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_STABILITY_SAMPLES:]
 
         for attempt in range(
             1, LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_ATTEMPTS + 1
@@ -3986,6 +4182,40 @@ class VariationalToLighterRuntime:
                 eligible = True
                 last_block_reason = "v4_exit_confirmation_pending"
 
+            refresh_quote_ms = to_decimal(context.get("refresh_quote_ms"))
+            lighter_slippage_bps = to_decimal(
+                (context.get("exit_lighter_depth") or {}).get("slippage_bps")
+            )
+            if observation_reason is None and executable_pnl_bps is not None:
+                strong_stability_values.append(executable_pnl_bps)
+                strong_stability_values = strong_stability_values[
+                    -LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_STABILITY_SAMPLES:
+                ]
+                lot["v4_exit_strong_stability_values"] = [
+                    decimal_to_str(value) for value in strong_stability_values
+                ]
+            strong_single_range_bps = (
+                max(strong_stability_values) - min(strong_stability_values)
+                if len(strong_stability_values)
+                >= LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_STABILITY_SAMPLES
+                else None
+            )
+            strong_single_stable = bool(
+                strong_single_range_bps is not None
+                and strong_single_range_bps
+                <= LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MAX_RANGE_BPS
+            )
+            strong_single_latency_ok = bool(
+                refresh_quote_ms is not None
+                and refresh_quote_ms
+                <= LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MAX_REFRESH_MS
+            )
+            strong_single_depth_ok = bool(
+                lighter_slippage_bps is not None
+                and lighter_slippage_bps
+                <= LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MAX_DEPTH_SLIPPAGE_BPS
+            )
+
             confirmed, confirmation_count = (
                 self.live_inventory_basis_v4_confirm_exit_candidate(
                     lot,
@@ -3993,31 +4223,50 @@ class VariationalToLighterRuntime:
                 )
             )
             strong_single_confirmed = bool(
-                eligible
+                not confirmed
+                and strong_single_context["enabled"]
+                and eligible
                 and executable_pnl_bps is not None
                 and executable_pnl_bps >= strong_single_threshold_bps
+                and strong_single_stable
+                and strong_single_latency_ok
+                and strong_single_depth_ok
             )
             if strong_single_confirmed:
                 confirmed = True
                 confirmation_mode = "strong_single"
             elif confirmed:
-                confirmation_mode = "consecutive"
+                confirmation_mode = "two_of_three"
             observations.append(
                 {
                     "attempt": attempt,
                     "reason": None if confirmed else last_block_reason,
-                    "refresh_quote_ms": decimal_to_str(
-                        to_decimal(context.get("refresh_quote_ms"))
-                    ),
+                    "refresh_quote_ms": decimal_to_str(refresh_quote_ms),
                     "refreshed_pnl_bps": decimal_to_str(refreshed_pnl_bps),
                     "executable_pnl_bps": decimal_to_str(executable_pnl_bps),
-                    "lighter_slippage_bps": (
-                        context.get("exit_lighter_depth") or {}
-                    ).get("slippage_bps"),
+                    "lighter_slippage_bps": decimal_to_str(
+                        lighter_slippage_bps
+                    ),
                     "confirmation_count": confirmation_count,
+                    "confirmation_window": list(
+                        lot.get("v4_exit_confirmation_window") or []
+                    ),
                     "strong_single_threshold_bps": decimal_to_str(
                         strong_single_threshold_bps
                     ),
+                    "strong_single_enabled": strong_single_context["enabled"],
+                    "strong_single_sample_count": strong_single_context[
+                        "sample_count"
+                    ],
+                    "strong_single_shortfall_reserve_bps": decimal_to_str(
+                        strong_single_context["mode_reserve_bps"]
+                    ),
+                    "strong_single_range_bps": decimal_to_str(
+                        strong_single_range_bps
+                    ),
+                    "strong_single_stable": strong_single_stable,
+                    "strong_single_latency_ok": strong_single_latency_ok,
+                    "strong_single_depth_ok": strong_single_depth_ok,
                     "confirmation_mode": confirmation_mode if confirmed else None,
                 }
             )
@@ -4045,6 +4294,7 @@ class VariationalToLighterRuntime:
             "confirmation_count": confirmation_count,
             "confirmation_mode": confirmation_mode,
             "strong_single_threshold_bps": strong_single_threshold_bps,
+            "strong_single_context": strong_single_context,
         }
 
     async def live_inventory_basis_size_ladder_context(
@@ -4952,6 +5202,17 @@ class VariationalToLighterRuntime:
             self.live_inventory_exit_estimate_shortfall_bps_samples.append(
                 max(shortfall_bps, Decimal("0"))
             )
+            if pending.get("exit_confirmation_mode") == "strong_single":
+                if not hasattr(
+                    self,
+                    "live_inventory_strong_single_shortfall_bps_samples",
+                ):
+                    self.live_inventory_strong_single_shortfall_bps_samples = (
+                        deque(maxlen=20)
+                    )
+                self.live_inventory_strong_single_shortfall_bps_samples.append(
+                    max(shortfall_bps, Decimal("0"))
+                )
         direction = str(pending.get("direction") or "")
         if actual_pnl_bps is not None and direction in getattr(self, "live_inventory_actual_pnl_bps_by_direction", {}):
             self.live_inventory_actual_pnl_bps_by_direction[direction].append(actual_pnl_bps)
@@ -5078,6 +5339,51 @@ class VariationalToLighterRuntime:
             "live_inventory_actual_pnl",
             actual_pnl_payload,
         )
+        effective_target_bps = to_decimal(
+            pending.get("effective_min_exit_pnl_bps")
+        )
+        strong_single_adverse_fill = bool(
+            pending.get("exit_confirmation_mode") == "strong_single"
+            and estimated_pnl_bps is not None
+            and effective_target_bps is not None
+            and estimated_pnl_bps >= effective_target_bps
+            and actual_pnl_bps is not None
+            and actual_pnl_bps < 0
+        )
+        if (
+            strong_single_adverse_fill
+            and getattr(self, "live_inventory_v4_strong_single_enabled", True)
+        ):
+            self.live_inventory_v4_strong_single_enabled = False
+            self.live_inventory_v4_strong_single_disabled_reason = (
+                "estimated_profitable_actual_loss"
+            )
+            self.live_inventory_v4_strong_single_disabled_at = utc_now()
+            strong_context = (
+                self.live_inventory_basis_v4_strong_single_context(
+                    effective_min_exit_pnl_bps=effective_target_bps
+                )
+            )
+            await self.append_live_inventory_log(
+                "live_inventory_v4_strong_single_auto_disabled",
+                {
+                    **actual_pnl_payload,
+                    "reason": self.live_inventory_v4_strong_single_disabled_reason,
+                    "action": "fallback_to_latest_and_2_of_3",
+                    "strong_single_disabled_at": (
+                        self.live_inventory_v4_strong_single_disabled_at
+                    ),
+                    "strong_single_shortfall_sample_count": strong_context[
+                        "sample_count"
+                    ],
+                    "strong_single_shortfall_raw_p80_bps": decimal_to_str(
+                        strong_context["raw_p80_bps"]
+                    ),
+                    "strong_single_shortfall_reserve_bps": decimal_to_str(
+                        strong_context["mode_reserve_bps"]
+                    ),
+                },
+            )
         await self.persist_live_inventory_memory(reason="actual_pnl_final_fill_update")
         await self.maybe_auto_stop_completed_v4_cycle()
 
@@ -11927,7 +12233,9 @@ class VariationalToLighterRuntime:
                 )
                 should_exit = raw_should_exit and var_quote_age_ok and lighter_book_age_ok
                 if not should_exit:
-                    candidate_lot.pop("v4_exit_confirmation_count", None)
+                    self.live_inventory_basis_v4_reset_exit_confirmation(
+                        candidate_lot
+                    )
                 should_timeout = (
                     holding_seconds >= LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS
                 )
@@ -12174,6 +12482,13 @@ class VariationalToLighterRuntime:
                             "v4_exit_confirmation_required": (
                                 LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
                             ),
+                            "v4_exit_confirmation_window": (
+                                LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_WINDOW_SAMPLES
+                            ),
+                            "v4_exit_confirmation_policy": "latest_and_2_of_3",
+                            "strong_single_context": fast_refresh[
+                                "strong_single_context"
+                            ],
                         },
                     )
                     return
@@ -12204,6 +12519,10 @@ class VariationalToLighterRuntime:
                         "strong_single_threshold_bps": decimal_to_str(
                             fast_refresh["strong_single_threshold_bps"]
                         ),
+                        "strong_single_context": fast_refresh[
+                            "strong_single_context"
+                        ],
+                        "v4_exit_confirmation_policy": "latest_and_2_of_3",
                         "effective_min_exit_pnl_bps": decimal_to_str(
                             effective_min_exit_pnl_bps
                         ),
@@ -12230,7 +12549,7 @@ class VariationalToLighterRuntime:
                         refresh_context.get("refreshed_pnl_bps")
                     )
                     if refresh_reason is not None:
-                        lot.pop("v4_exit_confirmation_count", None)
+                        self.live_inventory_basis_v4_reset_exit_confirmation(lot)
                         await self.append_live_inventory_log(
                             "live_inventory_exit_blocked",
                             {
@@ -12253,7 +12572,7 @@ class VariationalToLighterRuntime:
                         refreshed_pnl_bps is None
                         or refreshed_pnl_bps < effective_min_exit_pnl_bps
                     ):
-                        lot.pop("v4_exit_confirmation_count", None)
+                        self.live_inventory_basis_v4_reset_exit_confirmation(lot)
                         await self.append_live_inventory_log(
                             "live_inventory_exit_blocked",
                             {
@@ -12294,7 +12613,7 @@ class VariationalToLighterRuntime:
                         exit_lighter_depth.get("estimated_fill_price")
                     )
                     if depth_exit_price is None:
-                        lot.pop("v4_exit_confirmation_count", None)
+                        self.live_inventory_basis_v4_reset_exit_confirmation(lot)
                         await self.append_live_inventory_log(
                             "live_inventory_exit_blocked",
                             {
@@ -12323,7 +12642,7 @@ class VariationalToLighterRuntime:
                 if should_exit and not should_stop and not should_timeout_exit and (
                     pnl_bps is None or pnl_bps < effective_min_exit_pnl_bps
                 ):
-                    lot.pop("v4_exit_confirmation_count", None)
+                    self.live_inventory_basis_v4_reset_exit_confirmation(lot)
                     await self.append_live_inventory_log(
                         "live_inventory_exit_blocked",
                         {
@@ -12374,7 +12693,7 @@ class VariationalToLighterRuntime:
                             },
                         )
                         return
-                    exit_confirmation_mode = "consecutive"
+                    exit_confirmation_mode = "two_of_three"
             var_amount = variational_api_amount_to_str(qty, asset=asset)
             self.add_pending_live_inventory_var_fill_match(
                 PendingLiveInventoryVarFillMatch(

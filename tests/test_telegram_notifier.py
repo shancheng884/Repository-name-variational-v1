@@ -89,6 +89,26 @@ def test_telegram_final_pnl_message_contains_final_values() -> None:
     assert "pnl_bps=5.0" in message
 
 
+def test_telegram_strong_single_fallback_message_contains_action() -> None:
+    message = format_telegram_trade_message(
+        "live_inventory_v4_strong_single_auto_disabled",
+        {
+            "asset": "ETH",
+            "direction": "short_var_long_lighter",
+            "reason": "estimated_profitable_actual_loss",
+            "actual_pnl_bps": "-2.50",
+            "strong_single_shortfall_reserve_bps": "6.00",
+            "action": "fallback_to_latest_and_2_of_3",
+            "run_id": "live-1",
+        },
+    )
+
+    assert "[Var/Lighter] EXIT MODE FALLBACK" in message
+    assert "actual_pnl_bps=-2.50" in message
+    assert "strong_reserve_bps=6.00" in message
+    assert "action=fallback_to_latest_and_2_of_3" in message
+
+
 def test_telegram_only_pushes_critical_exit_cost_block() -> None:
     notifier = TelegramNotifier(
         bot_token="secret-token",

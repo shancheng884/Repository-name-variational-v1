@@ -95,6 +95,24 @@ def test_v4_live_funnel_reports_shadow_gradient_result() -> None:
             },
             {
                 **common,
+                "event": "live_inventory_basis_state",
+                "v4_exit_confirmation_policy": "latest_and_2_of_3",
+                "v4_strong_single_enabled": False,
+                "v4_strong_single_disabled_reason": (
+                    "estimated_profitable_actual_loss"
+                ),
+                "v4_strong_single_shortfall_sample_count": 4,
+                "v4_strong_single_shortfall_raw_p80_bps": "11.68",
+                "v4_strong_single_shortfall_reserve_bps": "11.68",
+                "v4_strong_single_threshold_bps": "13.68",
+            },
+            {
+                **common,
+                "event": "live_inventory_v4_strong_single_auto_disabled",
+                "reason": "estimated_profitable_actual_loss",
+            },
+            {
+                **common,
                 "event": "live_inventory_v4_shadow_tranche_entered",
                 "episode_id": "episode-1",
             },
@@ -117,6 +135,10 @@ def test_v4_live_funnel_reports_shadow_gradient_result() -> None:
     assert funnel["shadow_gradient_exits"] == 1
     assert funnel["shadow_gradient_active"] is False
     assert funnel["shadow_gradient_last_pnl_bps"] == "3.80"
+    assert funnel["exit_confirmation_policy"] == "latest_and_2_of_3"
+    assert funnel["strong_single_enabled"] is False
+    assert funnel["strong_single_auto_disables"] == 1
+    assert funnel["strong_single_shortfall_raw_p80_bps"] == "11.68"
 
 
 def test_v4_live_funnel_distinguishes_anchor_and_recent_health_waits() -> None:

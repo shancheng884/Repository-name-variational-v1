@@ -34,6 +34,22 @@ python tools/analyze.py
 
 This reads `log/order_metrics.jsonl`, `log/runtime.log`, and `log/live_inventory_state.json`. It does not start live, stop live, submit orders, or modify state.
 
+## V4 Exit Confirmation
+
+V4 uses the latest executable quote plus two qualifying observations in the
+latest three-sample window. A guarded strong-single exit is allowed only when
+its mode-specific shortfall reserve, short-window stability, quote latency, and
+Lighter depth checks all pass. If a strong-single exit is estimated profitable
+but its confirmed final PnL is negative, strong-single is disabled for the rest
+of that run and exits fall back to the latest-and-two-of-three policy.
+
+Inspect the active policy and automatic fallback state with:
+
+```bash
+python tools/analyze.py --tail 30000 --asset ETH | grep -E \
+'^(process=|state=|exit_confirmation_policy=|exit_submit_mode=|exit_block_reasons=|operational_readiness=)'
+```
+
 ## Notes
 
 `main.py` remains the trading engine. `tools/live.py` is only a safety wrapper around the existing live command, and `tools/analyze.py` is only an offline live-log analyzer.

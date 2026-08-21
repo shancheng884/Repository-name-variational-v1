@@ -19,6 +19,7 @@ TELEGRAM_EVENT_TYPES = {
     "live_inventory_manual_review_required",
     "live_inventory_runtime_fuse_triggered",
     "live_inventory_basis_quote_failed",
+    "live_inventory_v4_strong_single_auto_disabled",
 }
 
 TELEGRAM_CRITICAL_EXIT_BLOCK_REASONS = {
@@ -148,6 +149,19 @@ def format_telegram_trade_message(
                 f"asset={asset} reason={_value(payload, 'reason')}",
                 f"action={_value(payload, 'action')}",
                 f"open_lots={_value(payload, 'open_lots_total')}",
+                f"run_id={run_id}",
+            ]
+        )
+    if event_type == "live_inventory_v4_strong_single_auto_disabled":
+        return "\n".join(
+            [
+                "[Var/Lighter] EXIT MODE FALLBACK",
+                f"asset={asset} direction={direction}",
+                f"reason={_value(payload, 'reason')}",
+                f"actual_pnl_bps={_value(payload, 'actual_pnl_bps')}",
+                "strong_reserve_bps="
+                f"{_value(payload, 'strong_single_shortfall_reserve_bps')}",
+                f"action={_value(payload, 'action')}",
                 f"run_id={run_id}",
             ]
         )
