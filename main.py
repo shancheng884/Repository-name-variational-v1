@@ -129,6 +129,8 @@ LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
         "basis-v4-live-test-v9",
         "basis-v4-live-v10",
         "basis-v4-live-test-v10",
+        "basis-v4-live-v11",
+        "basis-v4-live-test-v11",
     }
 )
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
@@ -285,6 +287,14 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return format(value, "f")
+
+
+def json_log_default(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return decimal_to_str(value)
+    raise TypeError(
+        f"Object of type {type(value).__name__} is not JSON serializable"
+    )
 
 
 def bounded_text(value: str, *, max_chars: int = 500) -> str:
@@ -1192,7 +1202,7 @@ class VariationalToLighterRuntime:
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else "basis-v4-live-v10"
+            else "basis-v4-live-v11"
             if self.live_inventory_basis_v4_mode
             else "cost-calibrated-reversion-v3"
             if self.live_inventory_basis_reversion_mode
@@ -1203,12 +1213,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v10-test-health-bypass"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v11-test-health-bypass"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v10"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v11"
             if self.live_inventory_basis_v4_mode
             else "legacy-5m-reversion"
             if self.live_inventory_basis_reversion_mode
@@ -8085,7 +8095,11 @@ class VariationalToLighterRuntime:
             "stage_flow_text": self._fmt_stage_history(stage_history, limit=20),
             **payload,
         }
-        line = json.dumps(row, ensure_ascii=True) + "\n"
+        line = json.dumps(
+            row,
+            ensure_ascii=True,
+            default=json_log_default,
+        ) + "\n"
         async with self._order_write_lock:
             await asyncio.to_thread(self.orders_file.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(self._append_line, self.orders_file, line)
@@ -8098,7 +8112,11 @@ class VariationalToLighterRuntime:
             "logged_at": utc_now(),
             **payload,
         }
-        line = json.dumps(row, ensure_ascii=True) + "\n"
+        line = json.dumps(
+            row,
+            ensure_ascii=True,
+            default=json_log_default,
+        ) + "\n"
         async with self._opportunity_write_lock:
             await asyncio.to_thread(self.opportunities_file.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(self._append_line, self.opportunities_file, line)
@@ -8131,7 +8149,11 @@ class VariationalToLighterRuntime:
             "long_sample_count_5m": snapshot.long_sample_count_5m,
             "short_sample_count_5m": snapshot.short_sample_count_5m,
         }
-        line = json.dumps(row, ensure_ascii=True) + "\n"
+        line = json.dumps(
+            row,
+            ensure_ascii=True,
+            default=json_log_default,
+        ) + "\n"
         async with self._opportunity_write_lock:
             await asyncio.to_thread(self.market_samples_file.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(self._append_line, self.market_samples_file, line)
@@ -8637,7 +8659,11 @@ class VariationalToLighterRuntime:
     async def append_inventory_paper_log(self, payload: dict[str, Any]) -> None:
         if self.inventory_paper_file is None:
             return
-        line = json.dumps({"logged_at": utc_now(), **payload}, ensure_ascii=True) + "\n"
+        line = json.dumps(
+            {"logged_at": utc_now(), **payload},
+            ensure_ascii=True,
+            default=json_log_default,
+        ) + "\n"
         async with self._opportunity_write_lock:
             await asyncio.to_thread(self.inventory_paper_file.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(self._append_line, self.inventory_paper_file, line)

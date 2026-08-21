@@ -166,6 +166,34 @@ def test_live_inventory_common_order_qty_uses_coarser_lighter_step() -> None:
     assert variational_api_amount_to_str(qty, asset="ETH") == "0.01070"
 
 
+def test_live_inventory_log_serializes_nested_decimal_diagnostics(tmp_path) -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.mode = "live"
+        runtime.live_inventory_dry_decisions = False
+        runtime.live_inventory_run_id = "live-test"
+        runtime.orders_file = tmp_path / "order_metrics.jsonl"
+        runtime._order_write_lock = asyncio.Lock()
+
+        await runtime.append_live_inventory_log(
+            "live_inventory_exit_blocked",
+            {
+                "asset": "ETH",
+                "strong_single_context": {
+                    "raw_p80_bps": Decimal("11.685"),
+                    "samples": [Decimal("3.1"), Decimal("4.2")],
+                },
+            },
+        )
+
+        row = json.loads(runtime.orders_file.read_text(encoding="utf-8"))
+        context = row["strong_single_context"]
+        assert context["raw_p80_bps"] == "11.685"
+        assert context["samples"] == ["3.1", "4.2"]
+
+    asyncio.run(run())
+
+
 def test_live_inventory_final_pnl_waits_for_var_and_lighter_final_fills(tmp_path) -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
