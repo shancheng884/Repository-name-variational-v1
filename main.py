@@ -123,10 +123,13 @@ LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
         "basis-v4-live-test-v6",
         "basis-v4-live-v7",
         "basis-v4-live-test-v7",
+        "basis-v4-live-v8",
+        "basis-v4-live-test-v8",
     }
 )
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
 LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES = 2
+LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MARGIN_BPS = Decimal("1.00")
 LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_ATTEMPTS = 6
 LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_INTERVAL_SECONDS = 0.20
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
@@ -1167,12 +1170,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
-            else "basis-v4-live-test-v7"
+            else "basis-v4-live-test-v8"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else "basis-v4-live-v7"
+            else "basis-v4-live-v8"
             if self.live_inventory_basis_v4_mode
             else "cost-calibrated-reversion-v3"
             if self.live_inventory_basis_reversion_mode
@@ -1183,12 +1186,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v7-test-health-bypass"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v8-test-health-bypass"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v7"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v8"
             if self.live_inventory_basis_v4_mode
             else "legacy-5m-reversion"
             if self.live_inventory_basis_reversion_mode
@@ -3662,6 +3665,11 @@ class VariationalToLighterRuntime:
         max_refreshed_pnl_bps: Decimal | None = None
         max_executable_pnl_bps: Decimal | None = None
         confirmation_count = int(lot.get("v4_exit_confirmation_count") or 0)
+        confirmation_mode: str | None = None
+        strong_single_threshold_bps = (
+            effective_min_exit_pnl_bps
+            + LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MARGIN_BPS
+        )
 
         for attempt in range(
             1, LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_ATTEMPTS + 1
@@ -3721,6 +3729,16 @@ class VariationalToLighterRuntime:
                     eligible=eligible,
                 )
             )
+            strong_single_confirmed = bool(
+                eligible
+                and executable_pnl_bps is not None
+                and executable_pnl_bps >= strong_single_threshold_bps
+            )
+            if strong_single_confirmed:
+                confirmed = True
+                confirmation_mode = "strong_single"
+            elif confirmed:
+                confirmation_mode = "consecutive"
             observations.append(
                 {
                     "attempt": attempt,
@@ -3734,6 +3752,10 @@ class VariationalToLighterRuntime:
                         context.get("exit_lighter_depth") or {}
                     ).get("slippage_bps"),
                     "confirmation_count": confirmation_count,
+                    "strong_single_threshold_bps": decimal_to_str(
+                        strong_single_threshold_bps
+                    ),
+                    "confirmation_mode": confirmation_mode if confirmed else None,
                 }
             )
             if confirmed:
@@ -3758,6 +3780,8 @@ class VariationalToLighterRuntime:
             "max_refreshed_pnl_bps": max_refreshed_pnl_bps,
             "max_executable_pnl_bps": max_executable_pnl_bps,
             "confirmation_count": confirmation_count,
+            "confirmation_mode": confirmation_mode,
+            "strong_single_threshold_bps": strong_single_threshold_bps,
         }
 
     async def live_inventory_basis_size_ladder_context(
@@ -7983,6 +8007,9 @@ class VariationalToLighterRuntime:
                     "exit_fast_refresh_confirmation_samples": (
                         LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
                     ),
+                    "exit_strong_single_margin_bps": decimal_to_str(
+                        LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MARGIN_BPS
+                    ),
                     "lot_notional_usd": decimal_to_str(
                         self.live_inventory_lot_notional_usd
                     ),
@@ -11782,6 +11809,7 @@ class VariationalToLighterRuntime:
         var_submit_ms = None
         lighter_submit_ms = None
         lighter_payload = None
+        exit_confirmation_mode = None
         exit_var_order_quote: dict[str, Any] = {}
         exit_lighter_depth: dict[str, Any] | None = None
         if not self.live_inventory_dry_decisions:
@@ -11857,6 +11885,7 @@ class VariationalToLighterRuntime:
                     )
                     return
                 refresh_context = fast_refresh["selected_context"]
+                exit_confirmation_mode = fast_refresh["confirmation_mode"]
                 var_exit_price = refresh_context["refreshed_var_exit_price"]
                 lighter_exit_price = refresh_context[
                     "executable_lighter_exit_price"
@@ -11878,6 +11907,10 @@ class VariationalToLighterRuntime:
                             "observations"
                         ],
                         "executable_pnl_bps": decimal_to_str(pnl_bps),
+                        "exit_confirmation_mode": exit_confirmation_mode,
+                        "strong_single_threshold_bps": decimal_to_str(
+                            fast_refresh["strong_single_threshold_bps"]
+                        ),
                         "effective_min_exit_pnl_bps": decimal_to_str(
                             effective_min_exit_pnl_bps
                         ),
@@ -12048,6 +12081,7 @@ class VariationalToLighterRuntime:
                             },
                         )
                         return
+                    exit_confirmation_mode = "consecutive"
             var_amount = variational_api_amount_to_str(qty, asset=asset)
             self.add_pending_live_inventory_var_fill_match(
                 PendingLiveInventoryVarFillMatch(
@@ -12281,6 +12315,7 @@ class VariationalToLighterRuntime:
                     "exit_var_order_quote_execution_price": exit_var_order_quote.get("quote_execution_price"),
                     "exit_lighter_depth": exit_lighter_depth,
                     "exit_submit_mode": "concurrent" if v4_mode else "sequential",
+                    "exit_confirmation_mode": exit_confirmation_mode,
                     "effective_min_exit_pnl_bps": decimal_to_str(
                         effective_min_exit_pnl_bps
                     ),
@@ -12330,6 +12365,7 @@ class VariationalToLighterRuntime:
                     ),
                     **v4_exit_calibration_payload,
                     "exit_submit_mode": "concurrent" if v4_mode else "sequential",
+                    "exit_confirmation_mode": exit_confirmation_mode,
                     **{
                         key: value
                         for key, value in exit_pair_context.items()
@@ -12394,6 +12430,7 @@ class VariationalToLighterRuntime:
                 "exit_lighter_depth": exit_lighter_depth,
                 "actual_pnl_status": actual_pnl_status,
                 "exit_submit_mode": "concurrent" if v4_mode else "sequential",
+                "exit_confirmation_mode": exit_confirmation_mode,
                 "var_submit_ms": var_submit_ms,
                 "lighter_submit_ms": lighter_submit_ms,
                 "pair_submit_started_at": exit_pair_context.get("pair_submit_started_at"),

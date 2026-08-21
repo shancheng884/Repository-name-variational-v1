@@ -3393,6 +3393,54 @@ def test_v4_fast_refresh_requires_two_consecutive_executable_quotes(
     asyncio.run(run())
 
 
+def test_v4_fast_refresh_accepts_strong_single_executable_quote(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        lot: dict[str, object] = {}
+        calls = 0
+
+        async def fake_refreshed_exit_context(**_kwargs):
+            nonlocal calls
+            calls += 1
+            return {
+                "reason": None,
+                "refresh_quote_ms": Decimal("42"),
+                "refreshed_pnl_bps": Decimal("3.78"),
+                "executable_pnl_bps": Decimal("3.78"),
+                "exit_lighter_depth": {"slippage_bps": "0"},
+                "refreshed_var_exit_price": Decimal("99.9"),
+                "executable_lighter_exit_price": Decimal("100.2"),
+                "executable_pnl": Decimal("0.00378"),
+            }
+
+        runtime.live_inventory_basis_refreshed_exit_context = (
+            fake_refreshed_exit_context
+        )
+
+        result = await runtime.live_inventory_basis_v4_fast_refresh_exit_context(
+            asset="ETH",
+            lot=lot,
+            direction="short_var_long_lighter",
+            qty=Decimal("0.01"),
+            entry_var_price=Decimal("100"),
+            entry_lighter_price=Decimal("100"),
+            exit_lighter_side="SELL",
+            effective_min_exit_pnl_bps=Decimal("2.50"),
+        )
+
+        assert result["confirmed"] is True
+        assert result["attempts"] == 1
+        assert result["confirmation_count"] == 1
+        assert result["confirmation_mode"] == "strong_single"
+        assert result["strong_single_threshold_bps"] == Decimal("3.50")
+        assert result["observations"][0]["confirmation_mode"] == "strong_single"
+        assert calls == 1
+
+    asyncio.run(run())
+
+
 def test_v4_fast_refresh_exhausts_without_consecutive_confirmation(
     tmp_path,
 ) -> None:
