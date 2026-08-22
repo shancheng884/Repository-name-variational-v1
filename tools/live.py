@@ -336,6 +336,7 @@ def build_main_command(
     reset_state_after_manual_flat: bool = False,
     collect_only: bool = False,
     v4_test_skip_recent_health: bool = False,
+    v4_test_allow_weekend: bool = False,
     v4_shadow_gradient: bool = False,
 ) -> list[str]:
     reversion_mode = config.reversion_mode
@@ -474,6 +475,8 @@ def build_main_command(
             command.append(
                 "--live-inventory-basis-v4-test-skip-recent-health"
             )
+        if v4_test_allow_weekend:
+            command.append("--live-inventory-basis-v4-test-allow-weekend")
         if v4_shadow_gradient:
             command.append("--live-inventory-basis-v4-shadow-gradient")
     elif reversion_mode:
@@ -571,6 +574,11 @@ def main() -> int:
         help="Bounded V4 test only: bypass the recent 1h continuity gate for this run.",
     )
     parser.add_argument(
+        "--v4-test-allow-weekend",
+        action="store_true",
+        help="Bounded V4 test only: allow new real entries on UTC weekends.",
+    )
+    parser.add_argument(
         "--v4-shadow-gradient",
         action="store_true",
         help="Enable a read-only second-tranche V4 shadow diagnostic. No additional real order is submitted.",
@@ -660,6 +668,13 @@ def main() -> int:
         parser.error("--v4-live requires --asset ETH")
     if args.v4_test_skip_recent_health and not config.v4_live_mode:
         parser.error("--v4-test-skip-recent-health requires --v4-live")
+    if args.v4_test_allow_weekend and not (
+        config.v4_live_mode and args.v4_test_skip_recent_health
+    ):
+        parser.error(
+            "--v4-test-allow-weekend requires --v4-live and "
+            "--v4-test-skip-recent-health"
+        )
     if args.v4_shadow_gradient and not config.v4_live_mode:
         parser.error("--v4-shadow-gradient requires --v4-live")
     if args.v4_test_max_cycles > 1 and not (
@@ -716,6 +731,7 @@ def main() -> int:
             reset_state_after_manual_flat=args.reset_state_after_manual_flat,
             collect_only=args.collect_only,
             v4_test_skip_recent_health=args.v4_test_skip_recent_health,
+            v4_test_allow_weekend=args.v4_test_allow_weekend,
             v4_shadow_gradient=args.v4_shadow_gradient,
         )
     )
@@ -732,7 +748,9 @@ def main() -> int:
         else "execution_calibration"
         if config.calibration_mode
         else (
-            "basis_v4_live_test_health_bypass"
+            "basis_v4_live_test_health_weekend_bypass"
+            if args.v4_test_allow_weekend
+            else "basis_v4_live_test_health_bypass"
             if args.v4_test_skip_recent_health
             else "basis_v4_live"
         )

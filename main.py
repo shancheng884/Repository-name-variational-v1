@@ -1022,6 +1022,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_test_skip_recent_health = bool(
             args.live_inventory_basis_v4_test_skip_recent_health
         )
+        self.live_inventory_basis_v4_test_allow_weekend = bool(
+            args.live_inventory_basis_v4_test_allow_weekend
+        )
         self.live_inventory_basis_v4_shadow_gradient = bool(
             args.live_inventory_basis_v4_shadow_gradient
         )
@@ -1197,7 +1200,7 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
-            else "basis-v4-live-test-v10"
+            else "basis-v4-live-test-v11"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
@@ -1213,6 +1216,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v11-test-health-weekend-bypass"
+            if (
+                self.live_inventory_basis_v4_mode
+                and self.live_inventory_basis_v4_test_skip_recent_health
+                and self.live_inventory_basis_v4_test_allow_weekend
+            )
             else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v11-test-health-bypass"
             if (
                 self.live_inventory_basis_v4_mode
@@ -1855,6 +1864,15 @@ class VariationalToLighterRuntime:
         now_utc: datetime | None = None,
     ) -> bool:
         if not getattr(self, "live_inventory_calibration_weekdays_only", False):
+            return True
+        current = now_utc or datetime.now(timezone.utc)
+        return current.astimezone(timezone.utc).weekday() < 5
+
+    def live_inventory_basis_v4_entry_time_allowed(
+        self,
+        now_utc: datetime | None = None,
+    ) -> bool:
+        if getattr(self, "live_inventory_basis_v4_test_allow_weekend", False):
             return True
         current = now_utc or datetime.now(timezone.utc)
         return current.astimezone(timezone.utc).weekday() < 5
@@ -6513,6 +6531,14 @@ class VariationalToLighterRuntime:
                     warnings.append(
                         "basis_v4_test_recent_health_gate_bypassed_real_orders_enabled"
                     )
+                if getattr(
+                    self,
+                    "live_inventory_basis_v4_test_allow_weekend",
+                    False,
+                ):
+                    warnings.append(
+                        "basis_v4_test_weekend_gate_bypassed_real_orders_enabled"
+                    )
                 if self.live_inventory_dry_decisions:
                     passed.append("live_inventory_dry_decisions_only_no_orders")
                     if getattr(self, "live_inventory_collect_only", False):
@@ -8496,6 +8522,7 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_v4_profile",
             "live_inventory_basis_v4_mode",
             "live_inventory_basis_v4_test_skip_recent_health",
+            "live_inventory_basis_v4_test_allow_weekend",
             "live_inventory_basis_v4_shadow_gradient",
             "live_inventory_basis_v4_max_run_loss_usd",
             "live_inventory_basis_v4_cycle_cooldown_seconds",
@@ -8586,6 +8613,14 @@ class VariationalToLighterRuntime:
                     ),
                     "test_skip_recent_health": (
                         self.live_inventory_basis_v4_test_skip_recent_health
+                    ),
+                    "weekend_entry_gate": (
+                        "bypassed_for_bounded_test"
+                        if self.live_inventory_basis_v4_test_allow_weekend
+                        else "utc_weekdays_only"
+                    ),
+                    "test_allow_weekend": (
+                        self.live_inventory_basis_v4_test_allow_weekend
                     ),
                     "entry_direction": DIRECTION_SHORT_VAR_LONG_LIGHTER,
                     "entry_submit_mode": "concurrent",
@@ -10269,7 +10304,11 @@ class VariationalToLighterRuntime:
                 < self.live_inventory_calibration_entry_cooldown_samples
             ):
                 return
-        if v4_mode and not self.live_inventory_open_lots and datetime.now(timezone.utc).weekday() >= 5:
+        if (
+            v4_mode
+            and not self.live_inventory_open_lots
+            and not self.live_inventory_basis_v4_entry_time_allowed()
+        ):
             if index == 1 or index % 30 == 0:
                 await self.append_live_inventory_log(
                     "live_inventory_v4_entry_blocked",
@@ -15661,6 +15700,11 @@ def parse_args() -> argparse.Namespace:
         help="Bounded V4 real-order test only: bypass the recent 1h continuity gate while retaining the rolling 7d anchor.",
     )
     parser.add_argument(
+        "--live-inventory-basis-v4-test-allow-weekend",
+        action="store_true",
+        help="Bounded V4 real-order test only: allow new entries on UTC weekends.",
+    )
+    parser.add_argument(
         "--live-inventory-basis-v4-shadow-gradient",
         action="store_true",
         help="Record a read-only second V4 tranche after a 2 bps improvement. This never submits an additional order.",
@@ -16091,6 +16135,13 @@ def parse_args() -> argparse.Namespace:
                 )
             if args.live_inventory_max_cycles < 1 or args.live_inventory_max_cycles > 3:
                 parser.error("basis V4 requires max_cycles between 1 and 3")
+            if (
+                args.live_inventory_basis_v4_test_allow_weekend
+                and not args.live_inventory_basis_v4_test_skip_recent_health
+            ):
+                parser.error(
+                    "basis V4 weekend bypass requires the explicit bounded-test health bypass"
+                )
             if args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 1:
                 parser.error("basis V4 requires one total lot")
             if (
@@ -16139,6 +16190,10 @@ def parse_args() -> argparse.Namespace:
         elif args.live_inventory_basis_v4_test_skip_recent_health:
             parser.error(
                 "--live-inventory-basis-v4-test-skip-recent-health requires a V4 profile"
+            )
+        elif args.live_inventory_basis_v4_test_allow_weekend:
+            parser.error(
+                "--live-inventory-basis-v4-test-allow-weekend requires a V4 profile"
             )
         elif args.live_inventory_basis_v4_shadow_gradient:
             parser.error(

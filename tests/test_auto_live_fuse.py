@@ -5020,6 +5020,17 @@ def test_execution_calibration_weekday_gate_uses_utc(tmp_path) -> None:
     )
 
 
+def test_v4_weekend_gate_requires_explicit_test_bypass(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    weekend = datetime(2026, 8, 22, 0, 0, tzinfo=timezone.utc)
+
+    runtime.live_inventory_basis_v4_test_allow_weekend = False
+    assert not runtime.live_inventory_basis_v4_entry_time_allowed(weekend)
+
+    runtime.live_inventory_basis_v4_test_allow_weekend = True
+    assert runtime.live_inventory_basis_v4_entry_time_allowed(weekend)
+
+
 def test_register_actual_pnl_replays_fill_that_arrived_before_pending(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)

@@ -198,6 +198,40 @@ def test_live_tool_v4_test_health_bypass_is_explicit_and_temporary(
     assert "--live-inventory-basis-v4-test-skip-recent-health" in command
 
 
+def test_live_tool_v4_weekend_bypass_is_explicit_and_bounded(
+    monkeypatch,
+) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(v4_live_mode=True),
+        v4_test_skip_recent_health=True,
+        v4_test_allow_weekend=True,
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_basis_v4_test_skip_recent_health is True
+    assert args.live_inventory_basis_v4_test_allow_weekend is True
+    assert "--live-inventory-basis-v4-test-allow-weekend" in command
+    assert args.live_inventory_max_lots == 1
+    assert args.live_inventory_max_total_lots == 1
+
+
+def test_live_tool_v4_weekend_bypass_requires_health_test_mode(
+    monkeypatch,
+) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(v4_live_mode=True),
+        v4_test_allow_weekend=True,
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
 def test_live_tool_v4_shadow_gradient_remains_one_real_lot(monkeypatch) -> None:
     command = build_main_command(
         "ETH",

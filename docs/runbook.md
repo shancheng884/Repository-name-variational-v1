@@ -50,6 +50,11 @@ python tools/analyze.py --tail 30000 --asset ETH | grep -E \
 '^(process=|state=|exit_confirmation_policy=|exit_submit_mode=|exit_block_reasons=|operational_readiness=)'
 ```
 
+V4 blocks new UTC-weekend entries by default. A bounded weekend test must use
+both `--v4-test-skip-recent-health` and `--v4-test-allow-weekend`. Never add the
+weekend flag to the default daily command; it enables real orders and is logged
+as a test bypass.
+
 ## Notes
 
 `main.py` remains the trading engine. `tools/live.py` is only a safety wrapper around the existing live command, and `tools/analyze.py` is only an offline live-log analyzer.
