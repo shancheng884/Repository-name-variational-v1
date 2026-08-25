@@ -506,7 +506,9 @@ def print_report(report: Report, *, last_cycles: int) -> None:
     print(f"期间收益率={percent(return_pct)}")
     print(f"简单年化={percent(annualized_pct)}")
     reliability = (
-        "样本不足30天_仅供观察"
+        "无法计算_缺少有效本金或统计时长"
+        if annualized_pct is None
+        else "样本不足30天_仅供观察"
         if elapsed_days is not None and elapsed_days < 30
         else "可观察"
         if elapsed_days is not None

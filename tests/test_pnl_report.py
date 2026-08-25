@@ -13,6 +13,7 @@ from tools.pnl_report import (
     build_report,
     deduplicated_actual_pnl,
     latest_pnl_telegram_payload,
+    print_report,
     previous_flat_snapshot,
 )
 
@@ -121,6 +122,32 @@ def test_build_report_falls_back_to_first_complete_snapshot_capital() -> None:
         2026, 8, 25, tzinfo=timezone.utc
     )
     assert len(report.cycles) == 1
+
+
+def test_print_report_marks_annualized_unavailable_without_capital(
+    capsys,
+) -> None:
+    report = build_report(
+        [
+            {
+                "event": "live_inventory_actual_pnl",
+                "run_id": "run-1",
+                "asset": "ETH",
+                "lot_id": 1,
+                "actual_pnl_status": "lighter_final_fill_confirmed",
+                "actual_pnl_usd": "0.01",
+                "logged_at": "2026-08-25T01:00:00+00:00",
+            }
+        ],
+        since=None,
+        capital_usd=None,
+    )
+
+    print_report(report, last_cycles=1)
+
+    output = capsys.readouterr().out
+    assert "简单年化=-" in output
+    assert "年化可信度=无法计算_缺少有效本金或统计时长" in output
 
 
 def test_previous_flat_snapshot_ignores_entry_snapshot() -> None:
