@@ -616,6 +616,19 @@ def elapsed_iso_ms(start_iso: str | None, end_iso: str | None) -> Decimal | None
     return None
 
 
+def parse_utc_iso(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def normalize_variational_status(status: str) -> str:
     lowered = status.strip().lower()
     if lowered in {"confirmed", "fill", "filled", "executed", "execution", "cleared"}:
@@ -1340,6 +1353,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_calibration_halted_reason: str | None = None
         self.pending_live_inventory_actual_pnl: dict[str, dict[str, Any]] = {}
         self.pending_live_inventory_final_pnl: dict[str, dict[str, Any]] = {}
+        self.live_inventory_last_actual_pnl_payload: dict[str, Any] | None = None
+        self.live_inventory_pnl_account_baseline_equity_usd: Decimal | None = None
+        self.live_inventory_pnl_account_baseline_at: str | None = None
         self.live_inventory_execution_loss_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_exit_estimate_shortfall_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_strong_single_shortfall_bps_samples: deque[Decimal] = deque(maxlen=20)
@@ -2771,6 +2787,10 @@ class VariationalToLighterRuntime:
             if variational_equity is not None and lighter_equity is not None
             else None
         )
+        open_lots_total = len(
+            getattr(self, "live_inventory_open_lots", []) or []
+        )
+        captured_at = utc_now()
         await self.append_live_inventory_log(
             "live_inventory_account_snapshot",
             {
@@ -2778,13 +2798,12 @@ class VariationalToLighterRuntime:
                 "lot_id": lot_id,
                 "snapshot_stage": stage,
                 "snapshot_requested_at": requested_at,
-                "snapshot_captured_at": utc_now(),
+                "snapshot_captured_at": captured_at,
                 "snapshot_settle_seconds": settle_seconds,
                 "snapshot_status": "complete" if not errors else "partial",
                 "snapshot_errors": errors,
-                "open_lots_total": len(
-                    getattr(self, "live_inventory_open_lots", []) or []
-                ),
+                "open_lots_total": open_lots_total,
+                "account_snapshot_flat": open_lots_total == 0,
                 "variational_balance_usd": decimal_to_str(
                     to_decimal(variational_metrics.get("balance_usd"))
                 ),
@@ -2820,6 +2839,172 @@ class VariationalToLighterRuntime:
                 "combined_equity_usd": decimal_to_str(total_equity),
             },
         )
+        if stage == "startup_flat" and total_equity is not None:
+            self.live_inventory_pnl_account_baseline_equity_usd = total_equity
+            self.live_inventory_pnl_account_baseline_at = captured_at
+        if stage == "exit_confirmed_flat":
+            await self.append_live_inventory_log(
+                "live_inventory_pnl_summary",
+                self.live_inventory_pnl_summary_payload(
+                    asset=asset,
+                    lot_id=lot_id,
+                    variational_equity_usd=variational_equity,
+                    lighter_equity_usd=lighter_equity,
+                    combined_equity_usd=total_equity,
+                    captured_at=captured_at,
+                    account_snapshot_flat=open_lots_total == 0,
+                ),
+            )
+
+    def live_inventory_pnl_summary_payload(
+        self,
+        *,
+        asset: str,
+        lot_id: Any,
+        variational_equity_usd: Decimal | None,
+        lighter_equity_usd: Decimal | None,
+        combined_equity_usd: Decimal | None,
+        captured_at: str,
+        account_snapshot_flat: bool = True,
+    ) -> dict[str, Any]:
+        actual_payload = getattr(
+            self,
+            "live_inventory_last_actual_pnl_payload",
+            None,
+        ) or {}
+        actual_lot_id = self.live_inventory_normalized_lot_id(
+            actual_payload.get("lot_id")
+        )
+        expected_lot_id = self.live_inventory_normalized_lot_id(lot_id)
+        cycle_actual_pnl = (
+            to_decimal(actual_payload.get("actual_pnl_usd"))
+            if actual_lot_id == expected_lot_id
+            and actual_payload.get("actual_pnl_status")
+            == "lighter_final_fill_confirmed"
+            else None
+        )
+        realized_pnl = to_decimal(
+            getattr(self, "live_inventory_realized_pnl_usd", None)
+        )
+        run_start_pnl = to_decimal(
+            getattr(
+                self,
+                "live_inventory_v4_run_start_realized_pnl_usd",
+                None,
+            )
+        )
+        run_actual_pnl = (
+            realized_pnl - run_start_pnl
+            if realized_pnl is not None and run_start_pnl is not None
+            else cycle_actual_pnl
+        )
+        baseline_equity = to_decimal(
+            getattr(
+                self,
+                "live_inventory_pnl_account_baseline_equity_usd",
+                None,
+            )
+        )
+        account_net_change = (
+            combined_equity_usd - baseline_equity
+            if account_snapshot_flat
+            and combined_equity_usd is not None
+            and baseline_equity is not None
+            else None
+        )
+        configured_capital = to_decimal(os.getenv("PNL_REPORT_CAPITAL_USD"))
+        if configured_capital is not None and configured_capital > 0:
+            capital_usd = configured_capital
+            capital_source = "PNL_REPORT_CAPITAL_USD"
+        else:
+            capital_usd = baseline_equity
+            capital_source = (
+                "startup_flat_combined_equity"
+                if baseline_equity is not None
+                else "unavailable"
+            )
+        pnl_for_return = (
+            account_net_change
+            if account_net_change is not None
+            else run_actual_pnl
+        )
+        pnl_source = (
+            "account_equity_delta"
+            if account_net_change is not None
+            else "confirmed_pair_fills"
+        )
+        return_pct = (
+            pnl_for_return / capital_usd * Decimal("100")
+            if pnl_for_return is not None
+            and capital_usd is not None
+            and capital_usd > 0
+            else None
+        )
+        started_at = getattr(
+            self,
+            "live_inventory_pnl_account_baseline_at",
+            None,
+        )
+        started = parse_utc_iso(started_at)
+        finished = parse_utc_iso(captured_at)
+        elapsed_days = (
+            Decimal(str((finished - started).total_seconds()))
+            / Decimal("86400")
+            if started is not None and finished is not None and finished > started
+            else None
+        )
+        annualized_pct = (
+            return_pct * Decimal("365") / elapsed_days
+            if return_pct is not None
+            and elapsed_days is not None
+            and elapsed_days > 0
+            else None
+        )
+        return {
+            "asset": asset.upper(),
+            "lot_id": lot_id,
+            "summary_status": (
+                "complete"
+                if account_snapshot_flat
+                and combined_equity_usd is not None
+                and cycle_actual_pnl is not None
+                else "partial"
+            ),
+            "account_snapshot_flat": account_snapshot_flat,
+            "cycle_actual_pnl_usd": decimal_to_str(cycle_actual_pnl),
+            "run_actual_pnl_usd": decimal_to_str(run_actual_pnl),
+            "completed_cycles": getattr(
+                self,
+                "live_inventory_completed_cycles",
+                None,
+            ),
+            "variational_equity_usd": decimal_to_str(
+                variational_equity_usd
+            ),
+            "lighter_equity_usd": decimal_to_str(lighter_equity_usd),
+            "combined_equity_usd": decimal_to_str(combined_equity_usd),
+            "account_baseline_equity_usd": decimal_to_str(baseline_equity),
+            "account_net_change_usd": decimal_to_str(account_net_change),
+            "account_minus_fill_pnl_usd": decimal_to_str(
+                account_net_change - run_actual_pnl
+                if account_net_change is not None and run_actual_pnl is not None
+                else None
+            ),
+            "capital_usd": decimal_to_str(capital_usd),
+            "capital_source": capital_source,
+            "return_pnl_source": pnl_source,
+            "return_pct": decimal_to_str(return_pct),
+            "elapsed_days": decimal_to_str(elapsed_days),
+            "annualized_simple_pct": decimal_to_str(annualized_pct),
+            "annualized_reliability": (
+                "sample_under_30_days"
+                if elapsed_days is not None and elapsed_days < 30
+                else "observable"
+                if elapsed_days is not None
+                else "unavailable"
+            ),
+            "summary_captured_at": captured_at,
+        }
 
     def schedule_live_inventory_account_snapshot(
         self,
@@ -2833,7 +3018,7 @@ class VariationalToLighterRuntime:
                 stage=stage,
                 asset=asset,
                 lot_id=lot_id,
-                settle_seconds=2.0,
+                settle_seconds=(2.0 if stage == "entry_confirmed" else 0.5),
             ),
             name=f"live_inventory_account_snapshot:{stage}:{lot_id}",
         )
@@ -5693,6 +5878,7 @@ class VariationalToLighterRuntime:
             "actual_pnl_bps": decimal_to_str(actual_pnl_bps),
             "exit_lighter_payload": payload,
         }
+        self.live_inventory_last_actual_pnl_payload = actual_pnl_payload
         final_key = self.live_inventory_final_pnl_key(
             str(pending.get("asset") or ""),
             pending.get("lot_id"),

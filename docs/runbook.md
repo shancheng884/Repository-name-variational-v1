@@ -41,6 +41,12 @@ seconds after every confirmed entry and exit. The snapshot uses Variational
 `balance + upnl` and Lighter `collateral`; failures are logged as partial
 snapshots and never stop trading.
 
+Telegram receives an account snapshot after startup/entry and one `PNL SUMMARY`
+after every confirmed exit. The exit summary includes cycle PnL, current-run
+PnL, both venue equities, account net change, return, and simple annualized
+return. Account-equity change is the preferred return numerator; confirmed
+pair-fill PnL is used only when the account snapshot is incomplete.
+
 Show confirmed pair-fill PnL, both venue balances, account-equity change, and
 simple annualized return:
 

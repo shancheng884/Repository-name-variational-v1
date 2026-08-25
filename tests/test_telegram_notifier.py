@@ -110,6 +110,48 @@ def test_telegram_account_snapshot_contains_both_venues() -> None:
     assert "combined_equity_usd=35.10" in message
 
 
+def test_telegram_pnl_summary_contains_profit_and_annualized_return() -> None:
+    message = format_telegram_trade_message(
+        "live_inventory_pnl_summary",
+        {
+            "asset": "ETH",
+            "lot_id": 3,
+            "cycle_actual_pnl_usd": "0.005",
+            "run_actual_pnl_usd": "0.012",
+            "account_net_change_usd": "0.010",
+            "variational_equity_usd": "14.85",
+            "lighter_equity_usd": "20.25",
+            "combined_equity_usd": "35.10",
+            "capital_usd": "35.00",
+            "return_pct": "0.02857",
+            "annualized_simple_pct": "10.43",
+            "annualized_reliability": "sample_under_30_days",
+            "summary_status": "complete",
+            "return_pnl_source": "account_equity_delta",
+        },
+    )
+
+    assert "[Var/Lighter] PNL SUMMARY" in message
+    assert "cycle_actual_pnl_usd=0.005" in message
+    assert "run_actual_pnl_usd=0.012" in message
+    assert "account_net_change_usd=0.010" in message
+    assert "annualized_simple_pct=10.43" in message
+    assert "return_source=account_equity_delta" in message
+
+
+def test_telegram_skips_duplicate_exit_account_snapshot() -> None:
+    notifier = TelegramNotifier(
+        bot_token="secret-token",
+        chat_id="123",
+        logger=logging.getLogger("test_telegram"),
+    )
+
+    assert notifier.enqueue(
+        "live_inventory_account_snapshot",
+        {"snapshot_stage": "exit_confirmed_flat"},
+    ) is False
+
+
 def test_telegram_strong_single_fallback_message_contains_action() -> None:
     message = format_telegram_trade_message(
         "live_inventory_v4_strong_single_auto_disabled",

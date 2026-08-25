@@ -21,6 +21,7 @@ TELEGRAM_EVENT_TYPES = {
     "live_inventory_basis_quote_failed",
     "live_inventory_v4_strong_single_auto_disabled",
     "live_inventory_account_snapshot",
+    "live_inventory_pnl_summary",
 }
 
 TELEGRAM_CRITICAL_EXIT_BLOCK_REASONS = {
@@ -109,6 +110,35 @@ def format_telegram_trade_message(
                 f"{_value(payload, 'lighter_equity_usd')}",
                 "combined_equity_usd="
                 f"{_value(payload, 'combined_equity_usd')}",
+            ]
+        )
+    if event_type == "live_inventory_pnl_summary":
+        return "\n".join(
+            [
+                "[Var/Lighter] PNL SUMMARY",
+                f"asset={asset} lot={lot_id} status={_value(payload, 'summary_status')}",
+                "cycle_actual_pnl_usd="
+                f"{_value(payload, 'cycle_actual_pnl_usd')}",
+                f"run_actual_pnl_usd={_value(payload, 'run_actual_pnl_usd')}",
+                "account_net_change_usd="
+                f"{_value(payload, 'account_net_change_usd')}",
+                "account_minus_fill_pnl_usd="
+                f"{_value(payload, 'account_minus_fill_pnl_usd')}",
+                "variational_equity_usd="
+                f"{_value(payload, 'variational_equity_usd')}",
+                "lighter_equity_usd="
+                f"{_value(payload, 'lighter_equity_usd')}",
+                "combined_equity_usd="
+                f"{_value(payload, 'combined_equity_usd')}",
+                f"capital_usd={_value(payload, 'capital_usd')}",
+                f"completed_cycles={_value(payload, 'completed_cycles')}",
+                f"return_pct={_value(payload, 'return_pct')}",
+                "return_source="
+                f"{_value(payload, 'return_pnl_source')}",
+                "annualized_simple_pct="
+                f"{_value(payload, 'annualized_simple_pct')}",
+                "annualized_reliability="
+                f"{_value(payload, 'annualized_reliability')}",
             ]
         )
     if event_type in {
@@ -230,6 +260,11 @@ class TelegramNotifier:
 
     def enqueue(self, event_type: str, payload: dict[str, Any]) -> bool:
         if not self.enabled or event_type not in TELEGRAM_EVENT_TYPES:
+            return False
+        if (
+            event_type == "live_inventory_account_snapshot"
+            and payload.get("snapshot_stage") == "exit_confirmed_flat"
+        ):
             return False
         if (
             event_type == "live_inventory_exit_blocked"
