@@ -115,11 +115,13 @@ def test_v4_live_funnel_reports_shadow_gradient_result() -> None:
                 **common,
                 "event": "live_inventory_v4_shadow_tranche_entered",
                 "episode_id": "episode-1",
+                "basis_improvement_trigger_bps": "1.00",
             },
             {
                 **common,
                 "event": "live_inventory_v4_shadow_tranche_exited",
                 "episode_id": "episode-1",
+                "basis_improvement_trigger_bps": "1.00",
                 "reason": "shadow_v4_executable_net_target_reached",
                 "shadow_pnl_bps": "3.80",
                 "holding_seconds": 90.0,
@@ -135,6 +137,16 @@ def test_v4_live_funnel_reports_shadow_gradient_result() -> None:
     assert funnel["shadow_gradient_exits"] == 1
     assert funnel["shadow_gradient_active"] is False
     assert funnel["shadow_gradient_last_pnl_bps"] == "3.80"
+    assert funnel["shadow_gradient_levels"] == {
+        "1.00": {
+            "entries": 1,
+            "exits": 1,
+            "wins": 1,
+            "active": False,
+            "win_rate": 1.0,
+            "avg_pnl_bps": "3.80",
+        }
+    }
     assert funnel["exit_confirmation_policy"] == "latest_and_2_of_3"
     assert funnel["strong_single_enabled"] is False
     assert funnel["strong_single_auto_disables"] == 1

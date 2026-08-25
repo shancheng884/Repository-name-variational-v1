@@ -5,6 +5,9 @@ deployment on Robinhood Chain. It is research-only:
 
 - It tails Variational quotes already written by the live V4 process under
   `log/basis_samples/ETH/`.
+- It also tails `log/order_metrics.jsonl` and takes a fresh Robinhood public
+  book snapshot at entry-candidate, entry-confirmed, exit-confirmed, and final
+  PnL events. Event rows use `sample_kind=trade_event`.
 - It connects only to the public Robinhood Lighter REST market-data API.
 - It does not bind the Variational forwarder ports, request extra Variational
   quotes, import private keys, submit orders, or modify live inventory state.
@@ -17,10 +20,17 @@ The default executable depth ladder is USD 20, 40, and 60. Each sample records
 both trade directions, normalized Variational prices when present, source and
 book ages, nonce continuity, and depth prices.
 
+Trade-event snapshots preserve the source event, run, episode, lot, direction,
+and available Variational price/PnL fields. Cross-venue edge fields remain null
+when an event does not contain enough Variational price data; the collector does
+not substitute a later quote. Baseline and event snapshots are research data
+only and never feed the live entry or exit path.
+
 The official browser WebSocket currently rejects an unauthenticated bare
 Python handshake at its WAF boundary. The sidecar therefore requests one full
-public REST order-book snapshot per new Variational baseline sample. It does
-not poll continuously or reuse browser cookies. This is sufficient for the
+public REST order-book snapshot per new Variational baseline sample, plus one
+forced snapshot for each selected trade event. It does not poll continuously or
+reuse browser cookies. This is sufficient for the
 first-stage baseline comparison; any later execution integration must obtain a
 supported direct streaming connection before real orders are considered.
 

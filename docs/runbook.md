@@ -97,3 +97,17 @@ it tails the live process's persisted Variational samples and opens only a
 public Robinhood Lighter market-data connection. It does not use the extension
 command port or any trading credentials. See
 `docs/robinhood_lighter_basis_collector.md` for startup and verification.
+### V4 parallel shadow-gradient research
+
+`--v4-shadow-gradient` does not submit a second real order. During each real
+one-lot episode it independently simulates alternative USD 20 second-tranche
+entries after basis improvement of `+0.5`, `+1.0`, `+1.5`, and `+2.0` bps.
+Each alternative has its own entry price, exit confirmation state, MFE/MAE, and
+PnL. The alternatives are not summed into an USD 80 position.
+
+Use the following analyzer line to compare the alternatives after several real
+cycles:
+
+```bash
+python tools/analyze.py --tail 50000 --asset ETH | grep '^shadow_gradient_levels='
+```

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from tools.robinhood_basis_collector import (
     CurrentDayJsonlFollower,
+    FixedJsonlFollower,
     RobinhoodBasisCollector,
     parse_args,
 )
@@ -38,6 +39,22 @@ def test_follower_seek_to_end_only_emits_new_rows(tmp_path) -> None:
     assert follower.read_new() == [{"event": "new"}]
 
 
+def test_fixed_follower_only_emits_complete_appended_rows(tmp_path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_text('{"event":"old"}\n', encoding="utf-8")
+    follower = FixedJsonlFollower(path)
+    follower.seek_to_end()
+    with path.open("ab") as handle:
+        handle.write(b'{"event":"new"')
+
+    assert follower.read_new() == []
+
+    with path.open("ab") as handle:
+        handle.write(b'}\n')
+
+    assert follower.read_new() == [{"event": "new"}]
+
+
 def test_collector_builds_depth_ladder_without_credentials(tmp_path) -> None:
     async def run() -> None:
         args = parse_args(
@@ -51,7 +68,7 @@ def test_collector_builds_depth_ladder_without_credentials(tmp_path) -> None:
         collector = RobinhoodBasisCollector(args)
         collector.books.by_asset["ETH"] = SimpleNamespace(market_id=0)
 
-        async def fake_snapshot(_asset, notional):
+        async def fake_snapshot(_asset, notional, *, force_refresh=False):
             price_offset = notional / Decimal("10000")
             return {
                 "bid": Decimal("1999.9"),
@@ -98,6 +115,90 @@ def test_collector_builds_depth_ladder_without_credentials(tmp_path) -> None:
         assert Decimal(row["short_edge_bps"]) > 0
 
     asyncio.run(run())
+
+
+def test_collector_builds_forced_trade_event_snapshot(tmp_path) -> None:
+    async def run() -> None:
+        args = parse_args(
+            [
+                "--source-root",
+                str(tmp_path / "source"),
+                "--output-dir",
+                str(tmp_path / "output"),
+            ]
+        )
+        collector = RobinhoodBasisCollector(args)
+        collector.books.by_asset["ETH"] = SimpleNamespace(market_id=0)
+        force_values = []
+
+        async def fake_snapshot(_asset, notional, *, force_refresh=False):
+            force_values.append(force_refresh)
+            return {
+                "bid": Decimal("1999.9"),
+                "ask": Decimal("2000.1"),
+                "sell_price": Decimal("1999.9") - notional / Decimal("10000"),
+                "buy_price": Decimal("2000.1") + notional / Decimal("10000"),
+                "nonce": None,
+                "book_age_seconds": 0.01,
+                "continuity_ok": True,
+                "cold": False,
+                "sequence_gaps": 0,
+                "transport": "rest_snapshot",
+            }
+
+        collector.books.snapshot = fake_snapshot
+        row, error = await collector.build_event_row(
+            {
+                "event": "live_inventory_entered",
+                "logged_at": "2026-08-25T00:00:00+00:00",
+                "run_id": "live-run",
+                "asset": "ETH",
+                "lot_id": 1,
+                "entry_var_price": "2001",
+                "entry_lighter_price": "2000",
+            },
+            now=datetime(2026, 8, 25, 0, 0, 1, tzinfo=timezone.utc),
+        )
+
+        assert error is None
+        assert row is not None
+        assert row["sample_kind"] == "trade_event"
+        assert row["source_event"] == "live_inventory_entered"
+        assert row["source_lot_id"] == 1
+        assert row["private_credentials_loaded"] is False
+        assert Decimal(row["short_edge_bps"]) > 0
+        assert force_values == [True, False, False]
+
+    asyncio.run(run())
+
+
+def test_trade_event_filter_skips_blocked_entry_candidates(tmp_path) -> None:
+    args = parse_args(
+        [
+            "--source-root",
+            str(tmp_path / "source"),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    )
+    collector = RobinhoodBasisCollector(args)
+
+    assert collector._event_is_eligible(
+        {
+            "event": "live_inventory_entry_shadow_candidate",
+            "asset": "ETH",
+            "shadow_status": "passed",
+        },
+        "ETH",
+    )
+    assert not collector._event_is_eligible(
+        {
+            "event": "live_inventory_entry_shadow_candidate",
+            "asset": "ETH",
+            "shadow_status": "blocked",
+        },
+        "ETH",
+    )
 
 
 def test_collector_rejects_stale_source_sample(tmp_path) -> None:

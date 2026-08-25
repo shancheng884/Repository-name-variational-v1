@@ -2219,6 +2219,12 @@ def test_v4_shadow_gradient_enters_and_guarded_strong_single_exits_without_real_
 
         assert runtime.live_inventory_v4_shadow_tranche is not None
         assert runtime.live_inventory_v4_shadow_tranche["tranche_index"] == 2
+        assert set(runtime.live_inventory_v4_shadow_tranches) == {
+            "0.50",
+            "1.00",
+            "1.50",
+            "2.00",
+        }
         assert len(runtime.live_inventory_open_lots) == 1
         assert runtime.live_inventory_next_lot_id == 1
 
@@ -2257,14 +2263,26 @@ def test_v4_shadow_gradient_enters_and_guarded_strong_single_exits_without_real_
         )
 
         assert runtime.live_inventory_v4_shadow_tranche is None
+        assert runtime.live_inventory_v4_shadow_tranches == {}
         assert runtime.live_inventory_v4_shadow_completed_episode_id == "episode-1"
         rows = [json.loads(line) for line in runtime.orders_file.read_text().splitlines()]
-        assert [row["event"] for row in rows] == [
-            "live_inventory_v4_shadow_tranche_entered",
-            "live_inventory_v4_shadow_tranche_exited",
-        ]
-        assert rows[-1]["exit_confirmation_mode"] == "strong_single"
-        assert rows[-1]["real_orders_submitted"] == 0
+        assert [row["event"] for row in rows].count(
+            "live_inventory_v4_shadow_tranche_entered"
+        ) == 4
+        assert [row["event"] for row in rows].count(
+            "live_inventory_v4_shadow_tranche_exited"
+        ) == 4
+        assert {
+            row["basis_improvement_trigger_bps"]
+            for row in rows
+            if row["event"] == "live_inventory_v4_shadow_tranche_entered"
+        } == {"0.50", "1.00", "1.50", "2.00"}
+        assert all(
+            row["exit_confirmation_mode"] == "strong_single"
+            and row["real_orders_submitted"] == 0
+            for row in rows
+            if row["event"] == "live_inventory_v4_shadow_tranche_exited"
+        )
 
     asyncio.run(run())
 
@@ -2344,7 +2362,7 @@ def test_v4_shadow_gradient_normal_exit_requires_two_fresh_samples(tmp_path) -> 
     asyncio.run(run())
 
 
-def test_v4_shadow_gradient_requires_full_two_bps_improvement(tmp_path) -> None:
+def test_v4_shadow_gradient_enters_lower_levels_before_full_two_bps(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
         runtime.live_allowed_assets = {"ETH"}
@@ -2382,7 +2400,15 @@ def test_v4_shadow_gradient_requires_full_two_bps_improvement(tmp_path) -> None:
         )
 
         assert runtime.live_inventory_v4_shadow_tranche is None
-        assert not runtime.orders_file.exists()
+        assert set(runtime.live_inventory_v4_shadow_tranches) == {
+            "0.50",
+            "1.00",
+            "1.50",
+        }
+        rows = [json.loads(line) for line in runtime.orders_file.read_text().splitlines()]
+        assert {
+            row["basis_improvement_trigger_bps"] for row in rows
+        } == {"0.50", "1.00", "1.50"}
 
     asyncio.run(run())
 

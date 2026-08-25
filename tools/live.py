@@ -581,7 +581,7 @@ def main() -> int:
     parser.add_argument(
         "--v4-shadow-gradient",
         action="store_true",
-        help="Enable a read-only second-tranche V4 shadow diagnostic. No additional real order is submitted.",
+        help="Compare read-only second-tranche entries at +0.5/+1.0/+1.5/+2.0 bps. No additional real order is submitted.",
     )
     parser.add_argument(
         "--v4-test-max-cycles",

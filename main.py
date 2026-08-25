@@ -149,6 +149,12 @@ LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_INTERVAL_SECONDS = 0.20
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
 LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_INDEX = 2
 LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS = Decimal("2.00")
+LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_LEVELS_BPS = (
+    Decimal("0.50"),
+    Decimal("1.00"),
+    Decimal("1.50"),
+    Decimal("2.00"),
+)
 LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS = 60
 LIVE_INVENTORY_BASIS_V4_REARM_BUFFER_BPS = Decimal("0.50")
 LIVE_INVENTORY_BASIS_V4_REARM_CONFIRM_SAMPLES = 3
@@ -1200,12 +1206,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
-            else "basis-v4-live-test-v11"
+            else "basis-v4-live-test-v12"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else "basis-v4-live-v11"
+            else "basis-v4-live-v12"
             if self.live_inventory_basis_v4_mode
             else "cost-calibrated-reversion-v3"
             if self.live_inventory_basis_reversion_mode
@@ -1216,18 +1222,18 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else f"{self.live_inventory_calibration_direction}-fixed-hold"
             if self.live_inventory_execution_calibration
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v11-test-health-weekend-bypass"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v12-test-health-weekend-bypass"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
                 and self.live_inventory_basis_v4_test_allow_weekend
             )
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v11-test-health-bypass"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v12-test-health-bypass"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_test_skip_recent_health
             )
-            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v11"
+            else f"{self.live_inventory_basis_v4_profile}-adaptive-execution-v12"
             if self.live_inventory_basis_v4_mode
             else "legacy-5m-reversion"
             if self.live_inventory_basis_reversion_mode
@@ -1252,6 +1258,8 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_episode_id: str | None = None
         self.live_inventory_v4_next_tranche_index = 1
         self.live_inventory_v4_shadow_tranche: dict[str, Any] | None = None
+        self.live_inventory_v4_shadow_tranches: dict[str, dict[str, Any]] = {}
+        self.live_inventory_v4_shadow_completed_keys: set[str] = set()
         self.live_inventory_v4_shadow_completed_episode_id: str | None = None
         self.live_inventory_v4_strong_single_enabled = True
         self.live_inventory_v4_strong_single_disabled_reason: str | None = None
@@ -2430,9 +2438,35 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_shadow_tranche = (
             shadow_tranche if isinstance(shadow_tranche, dict) else None
         )
+        shadow_tranches = state.get("v4_shadow_tranches")
+        self.live_inventory_v4_shadow_tranches = (
+            {
+                str(key): value
+                for key, value in shadow_tranches.items()
+                if isinstance(value, dict)
+            }
+            if isinstance(shadow_tranches, dict)
+            else {}
+        )
+        self.live_inventory_v4_shadow_completed_keys = {
+            str(value)
+            for value in list(state.get("v4_shadow_completed_keys") or [])
+            if value
+        }
+        self.live_inventory_basis_v4_shadow_tranches_state()
         self.live_inventory_v4_shadow_completed_episode_id = (
             state.get("v4_shadow_completed_episode_id") or None
         )
+        if self.live_inventory_v4_shadow_completed_episode_id:
+            legacy_level = self.live_inventory_basis_v4_shadow_level_key(
+                LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
+            )
+            self.live_inventory_v4_shadow_completed_keys.add(
+                self.live_inventory_basis_v4_shadow_completion_key(
+                    self.live_inventory_v4_shadow_completed_episode_id,
+                    legacy_level,
+                )
+            )
         if "v4_strong_single_enabled" in state:
             self.live_inventory_v4_strong_single_enabled = bool(
                 state.get("v4_strong_single_enabled")
@@ -2478,12 +2512,20 @@ class VariationalToLighterRuntime:
                 getattr(self, "live_inventory_basis_v4_shadow_gradient", False)
             ),
             "v4_shadow_tranche_active": bool(
-                getattr(self, "live_inventory_v4_shadow_tranche", None)
+                self.live_inventory_basis_v4_shadow_tranches_state()
+            ),
+            "v4_shadow_active_levels_bps": sorted(
+                self.live_inventory_basis_v4_shadow_tranches_state(),
+                key=Decimal,
             ),
             "v4_shadow_tranche_index": LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_INDEX,
             "v4_shadow_tranche_improvement_bps": decimal_to_str(
                 LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
             ),
+            "v4_shadow_tranche_improvement_levels_bps": [
+                decimal_to_str(value)
+                for value in LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_LEVELS_BPS
+            ],
             "v4_exit_confirmation_policy": "latest_and_2_of_3",
             "v4_exit_confirmation_required": (
                 LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
@@ -2787,6 +2829,10 @@ class VariationalToLighterRuntime:
                 **self.live_inventory_v4_episode_payload(),
                 "v4_shadow_tranche": getattr(
                     self, "live_inventory_v4_shadow_tranche", None
+                ),
+                "v4_shadow_tranches": self.live_inventory_basis_v4_shadow_tranches_state(),
+                "v4_shadow_completed_keys": sorted(
+                    getattr(self, "live_inventory_v4_shadow_completed_keys", set())
                 ),
                 "v4_shadow_completed_episode_id": (
                     getattr(
@@ -3092,6 +3138,46 @@ class VariationalToLighterRuntime:
             lighter_leg_pnl = (exit_lighter_price - entry_lighter_price) * lighter_qty
         return var_leg_pnl, lighter_leg_pnl, var_leg_pnl + lighter_leg_pnl
 
+    @staticmethod
+    def live_inventory_basis_v4_shadow_level_key(value: Decimal) -> str:
+        return decimal_to_str(value.quantize(Decimal("0.00"))) or "0.00"
+
+    def live_inventory_basis_v4_shadow_tranches_state(
+        self,
+    ) -> dict[str, dict[str, Any]]:
+        tranches = getattr(self, "live_inventory_v4_shadow_tranches", None)
+        if not isinstance(tranches, dict):
+            tranches = {}
+        legacy = getattr(self, "live_inventory_v4_shadow_tranche", None)
+        if isinstance(legacy, dict):
+            improvement = (
+                to_decimal(legacy.get("basis_improvement_trigger_bps"))
+                or LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
+            )
+            tranches.setdefault(
+                self.live_inventory_basis_v4_shadow_level_key(improvement),
+                legacy,
+            )
+        self.live_inventory_v4_shadow_tranches = tranches
+        legacy_key = self.live_inventory_basis_v4_shadow_level_key(
+            LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
+        )
+        self.live_inventory_v4_shadow_tranche = tranches.get(legacy_key)
+        return tranches
+
+    @staticmethod
+    def live_inventory_basis_v4_shadow_completion_key(
+        episode_id: str,
+        level_key: str,
+    ) -> str:
+        return f"{episode_id}:{level_key}"
+
+    def reset_live_inventory_basis_v4_shadow_gradient(self) -> None:
+        self.live_inventory_v4_shadow_tranche = None
+        self.live_inventory_v4_shadow_tranches = {}
+        self.live_inventory_v4_shadow_completed_keys = set()
+        self.live_inventory_v4_shadow_completed_episode_id = None
+
     def live_inventory_basis_v4_shadow_tranche_pnl(
         self,
         *,
@@ -3130,8 +3216,16 @@ class VariationalToLighterRuntime:
         exit_var_price: Decimal,
         exit_lighter_price: Decimal,
         confirmation_mode: str | None = None,
+        level_key: str | None = None,
     ) -> bool:
-        shadow = getattr(self, "live_inventory_v4_shadow_tranche", None)
+        tranches = self.live_inventory_basis_v4_shadow_tranches_state()
+        if level_key is None:
+            level_key = self.live_inventory_basis_v4_shadow_level_key(
+                LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
+            )
+            if level_key not in tranches and len(tranches) == 1:
+                level_key = next(iter(tranches))
+        shadow = tranches.get(level_key)
         if not isinstance(shadow, dict):
             return False
         pnl, pnl_bps = self.live_inventory_basis_v4_shadow_tranche_pnl(
@@ -3152,6 +3246,9 @@ class VariationalToLighterRuntime:
                 "asset": asset,
                 "episode_id": episode_id,
                 "tranche_index": shadow.get("tranche_index"),
+                "basis_improvement_trigger_bps": shadow.get(
+                    "basis_improvement_trigger_bps"
+                ),
                 "direction": shadow.get("direction"),
                 "reason": reason,
                 "exit_confirmation_mode": confirmation_mode,
@@ -3172,10 +3269,51 @@ class VariationalToLighterRuntime:
                 "real_orders_submitted": 0,
             },
         )
-        self.live_inventory_v4_shadow_completed_episode_id = episode_id
-        self.live_inventory_v4_shadow_tranche = None
+        if episode_id:
+            completed = getattr(
+                self, "live_inventory_v4_shadow_completed_keys", set()
+            )
+            if not isinstance(completed, set):
+                completed = set(completed or [])
+            completed.add(
+                self.live_inventory_basis_v4_shadow_completion_key(
+                    episode_id,
+                    level_key,
+                )
+            )
+            self.live_inventory_v4_shadow_completed_keys = completed
+        tranches.pop(level_key, None)
+        self.live_inventory_v4_shadow_tranches = tranches
+        legacy_key = self.live_inventory_basis_v4_shadow_level_key(
+            LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
+        )
+        self.live_inventory_v4_shadow_tranche = tranches.get(legacy_key)
+        if level_key == legacy_key:
+            self.live_inventory_v4_shadow_completed_episode_id = episode_id
         await self.persist_live_inventory_memory(reason=f"v4_shadow_tranche_{reason}")
         return True
+
+    async def close_all_live_inventory_basis_v4_shadow_tranches(
+        self,
+        *,
+        asset: str,
+        reason: str,
+        exit_var_price: Decimal,
+        exit_lighter_price: Decimal,
+    ) -> bool:
+        closed = False
+        for level_key in list(self.live_inventory_basis_v4_shadow_tranches_state()):
+            closed = (
+                await self.close_live_inventory_basis_v4_shadow_tranche(
+                    asset=asset,
+                    reason=reason,
+                    exit_var_price=exit_var_price,
+                    exit_lighter_price=exit_lighter_price,
+                    level_key=level_key,
+                )
+                or closed
+            )
+        return closed
 
     async def maybe_update_live_inventory_basis_v4_shadow_gradient(
         self,
@@ -3196,94 +3334,96 @@ class VariationalToLighterRuntime:
     ) -> None:
         if not getattr(self, "live_inventory_basis_v4_shadow_gradient", False):
             return
-        shadow = getattr(self, "live_inventory_v4_shadow_tranche", None)
-        if isinstance(shadow, dict):
+        tranches = self.live_inventory_basis_v4_shadow_tranches_state()
+        if tranches:
             if not var_quote_age_ok or not lighter_book_age_ok:
-                self.live_inventory_basis_v4_reset_exit_confirmation(shadow)
+                for shadow in tranches.values():
+                    self.live_inventory_basis_v4_reset_exit_confirmation(shadow)
                 return
-            _, pnl_bps = self.live_inventory_basis_v4_shadow_tranche_pnl(
-                shadow=shadow,
-                exit_var_price=var_ask,
-                exit_lighter_price=lighter_sell_price,
-            )
-            if pnl_bps is None:
-                return
-            prior_mfe = to_decimal(shadow.get("mfe_pnl_bps"))
-            prior_mae = to_decimal(shadow.get("mae_pnl_bps"))
-            shadow["mfe_pnl_bps"] = decimal_to_str(
-                pnl_bps if prior_mfe is None else max(prior_mfe, pnl_bps)
-            )
-            shadow["mae_pnl_bps"] = decimal_to_str(
-                pnl_bps if prior_mae is None else min(prior_mae, pnl_bps)
-            )
-            shadow["last_pnl_bps"] = decimal_to_str(pnl_bps)
-            target_bps = self.live_inventory_basis_v4_effective_exit_target_bps()
-            strong_context = self.live_inventory_basis_v4_strong_single_context(
-                effective_min_exit_pnl_bps=target_bps
-            )
-            strong_threshold_bps = strong_context["threshold_bps"]
-            strong_values = [
-                value
-                for value in (
-                    to_decimal(item)
-                    for item in list(
-                        shadow.get("v4_exit_strong_stability_values") or []
-                    )
-                )
-                if value is not None
-            ]
-            strong_values.append(pnl_bps)
-            strong_values = strong_values[
-                -LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_STABILITY_SAMPLES:
-            ]
-            shadow["v4_exit_strong_stability_values"] = [
-                decimal_to_str(value) for value in strong_values
-            ]
-            strong_range_bps = (
-                max(strong_values) - min(strong_values)
-                if len(strong_values)
-                >= LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_STABILITY_SAMPLES
-                else None
-            )
-            normal_confirmed, _ = self.live_inventory_basis_v4_confirm_exit_candidate(
-                shadow,
-                eligible=pnl_bps >= target_bps,
-            )
-            strong_confirmed = bool(
-                not normal_confirmed
-                and strong_context["enabled"]
-                and pnl_bps >= strong_threshold_bps
-                and strong_range_bps is not None
-                and strong_range_bps
-                <= LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MAX_RANGE_BPS
-            )
-            entered_at = self._parse_iso_ts(str(shadow.get("entered_at") or ""))
-            holding_seconds = (
-                max(0.0, (datetime.now(timezone.utc) - entered_at).total_seconds())
-                if entered_at is not None
-                else 0.0
-            )
-            reason = None
-            confirmation_mode = None
-            if pnl_bps <= -self.live_inventory_max_unrealized_loss_bps:
-                reason = "shadow_max_unrealized_loss_bps"
-            elif holding_seconds >= LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS:
-                reason = "shadow_v4_max_hold_timeout"
-            elif strong_confirmed:
-                reason = "shadow_v4_executable_net_target_reached"
-                confirmation_mode = "strong_single"
-            elif normal_confirmed:
-                reason = "shadow_v4_executable_net_target_reached"
-                confirmation_mode = "two_of_three"
-            if reason is not None:
-                await self.close_live_inventory_basis_v4_shadow_tranche(
-                    asset=asset,
-                    reason=reason,
+            for level_key, shadow in list(tranches.items()):
+                _, pnl_bps = self.live_inventory_basis_v4_shadow_tranche_pnl(
+                    shadow=shadow,
                     exit_var_price=var_ask,
                     exit_lighter_price=lighter_sell_price,
-                    confirmation_mode=confirmation_mode,
                 )
-            return
+                if pnl_bps is None:
+                    continue
+                prior_mfe = to_decimal(shadow.get("mfe_pnl_bps"))
+                prior_mae = to_decimal(shadow.get("mae_pnl_bps"))
+                shadow["mfe_pnl_bps"] = decimal_to_str(
+                    pnl_bps if prior_mfe is None else max(prior_mfe, pnl_bps)
+                )
+                shadow["mae_pnl_bps"] = decimal_to_str(
+                    pnl_bps if prior_mae is None else min(prior_mae, pnl_bps)
+                )
+                shadow["last_pnl_bps"] = decimal_to_str(pnl_bps)
+                target_bps = self.live_inventory_basis_v4_effective_exit_target_bps()
+                strong_context = self.live_inventory_basis_v4_strong_single_context(
+                    effective_min_exit_pnl_bps=target_bps
+                )
+                strong_threshold_bps = strong_context["threshold_bps"]
+                strong_values = [
+                    value
+                    for value in (
+                        to_decimal(item)
+                        for item in list(
+                            shadow.get("v4_exit_strong_stability_values") or []
+                        )
+                    )
+                    if value is not None
+                ]
+                strong_values.append(pnl_bps)
+                strong_values = strong_values[
+                    -LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_STABILITY_SAMPLES:
+                ]
+                shadow["v4_exit_strong_stability_values"] = [
+                    decimal_to_str(value) for value in strong_values
+                ]
+                strong_range_bps = (
+                    max(strong_values) - min(strong_values)
+                    if len(strong_values)
+                    >= LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_STABILITY_SAMPLES
+                    else None
+                )
+                normal_confirmed, _ = self.live_inventory_basis_v4_confirm_exit_candidate(
+                    shadow,
+                    eligible=pnl_bps >= target_bps,
+                )
+                strong_confirmed = bool(
+                    not normal_confirmed
+                    and strong_context["enabled"]
+                    and pnl_bps >= strong_threshold_bps
+                    and strong_range_bps is not None
+                    and strong_range_bps
+                    <= LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MAX_RANGE_BPS
+                )
+                entered_at = self._parse_iso_ts(str(shadow.get("entered_at") or ""))
+                holding_seconds = (
+                    max(0.0, (datetime.now(timezone.utc) - entered_at).total_seconds())
+                    if entered_at is not None
+                    else 0.0
+                )
+                reason = None
+                confirmation_mode = None
+                if pnl_bps <= -self.live_inventory_max_unrealized_loss_bps:
+                    reason = "shadow_max_unrealized_loss_bps"
+                elif holding_seconds >= LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS:
+                    reason = "shadow_v4_max_hold_timeout"
+                elif strong_confirmed:
+                    reason = "shadow_v4_executable_net_target_reached"
+                    confirmation_mode = "strong_single"
+                elif normal_confirmed:
+                    reason = "shadow_v4_executable_net_target_reached"
+                    confirmation_mode = "two_of_three"
+                if reason is not None:
+                    await self.close_live_inventory_basis_v4_shadow_tranche(
+                        asset=asset,
+                        reason=reason,
+                        exit_var_price=var_ask,
+                        exit_lighter_price=lighter_sell_price,
+                        confirmation_mode=confirmation_mode,
+                        level_key=level_key,
+                    )
 
         if len(getattr(self, "live_inventory_open_lots", [])) != 1:
             return
@@ -3291,8 +3431,6 @@ class VariationalToLighterRuntime:
         episode_id = str(real_lot.get("episode_id") or "") or None
         if (
             episode_id is None
-            or episode_id
-            == getattr(self, "live_inventory_v4_shadow_completed_episode_id", None)
             or str(real_lot.get("direction") or "")
             != DIRECTION_SHORT_VAR_LONG_LIGHTER
             or real_lot.get("entry_kind") != "basis_v4_eth_short_p97_5"
@@ -3300,16 +3438,8 @@ class VariationalToLighterRuntime:
             or getattr(self, "pending_live_inventory_var_fill_matches", [])
         ):
             return
-        real_entry_basis_bps = to_decimal(real_lot.get("entry_basis_bps"))
-        addon_threshold_bps = (
-            real_entry_basis_bps + LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
-            if real_entry_basis_bps is not None
-            else None
-        )
         if (
-            addon_threshold_bps is None
-            or basis_bps < addon_threshold_bps
-            or entry_threshold_bps is None
+            entry_threshold_bps is None
             or short_edge_bps <= entry_threshold_bps
             or not warm
             or not var_quote_age_ok
@@ -3317,36 +3447,66 @@ class VariationalToLighterRuntime:
             or not basis_sample_move_ok
         ):
             return
-        qty = self.live_inventory_lot_notional_usd / var_bid
-        self.live_inventory_v4_shadow_tranche = {
-            "episode_id": episode_id,
-            "tranche_index": LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_INDEX,
-            "direction": DIRECTION_SHORT_VAR_LONG_LIGHTER,
-            "qty": decimal_to_str(qty),
-            "notional_usd": decimal_to_str(self.live_inventory_lot_notional_usd),
-            "entry_var_price": decimal_to_str(var_bid),
-            "entry_lighter_price": decimal_to_str(lighter_buy_price),
-            "entry_basis_bps": decimal_to_str(basis_bps),
-            "entry_edge_bps": decimal_to_str(short_edge_bps),
-            "entry_threshold_bps": decimal_to_str(entry_threshold_bps),
-            "addon_threshold_bps": decimal_to_str(addon_threshold_bps),
-            "entered_at": utc_now(),
-            "entered_sample_index": sample_index,
-            "v4_exit_confirmation_count": 0,
-        }
-        await self.append_live_inventory_log(
-            "live_inventory_v4_shadow_tranche_entered",
-            {
-                "asset": asset,
-                **self.live_inventory_v4_shadow_tranche,
-                "basis_improvement_bps": decimal_to_str(
-                    basis_bps - real_entry_basis_bps
-                ),
-                "real_lot_id": real_lot.get("lot_id"),
-                "real_orders_submitted": 0,
-            },
+        real_entry_basis_bps = to_decimal(real_lot.get("entry_basis_bps"))
+        if real_entry_basis_bps is None:
+            return
+        completed = getattr(self, "live_inventory_v4_shadow_completed_keys", set())
+        if not isinstance(completed, set):
+            completed = set(completed or [])
+        entered = False
+        tranches = self.live_inventory_basis_v4_shadow_tranches_state()
+        for improvement_bps in LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_LEVELS_BPS:
+            level_key = self.live_inventory_basis_v4_shadow_level_key(improvement_bps)
+            completion_key = self.live_inventory_basis_v4_shadow_completion_key(
+                episode_id,
+                level_key,
+            )
+            addon_threshold_bps = real_entry_basis_bps + improvement_bps
+            if (
+                level_key in tranches
+                or completion_key in completed
+                or basis_bps < addon_threshold_bps
+            ):
+                continue
+            qty = self.live_inventory_lot_notional_usd / var_bid
+            shadow = {
+                "episode_id": episode_id,
+                "tranche_index": LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_INDEX,
+                "basis_improvement_trigger_bps": decimal_to_str(improvement_bps),
+                "direction": DIRECTION_SHORT_VAR_LONG_LIGHTER,
+                "qty": decimal_to_str(qty),
+                "notional_usd": decimal_to_str(self.live_inventory_lot_notional_usd),
+                "entry_var_price": decimal_to_str(var_bid),
+                "entry_lighter_price": decimal_to_str(lighter_buy_price),
+                "entry_basis_bps": decimal_to_str(basis_bps),
+                "entry_edge_bps": decimal_to_str(short_edge_bps),
+                "entry_threshold_bps": decimal_to_str(entry_threshold_bps),
+                "addon_threshold_bps": decimal_to_str(addon_threshold_bps),
+                "entered_at": utc_now(),
+                "entered_sample_index": sample_index,
+                "v4_exit_confirmation_count": 0,
+            }
+            tranches[level_key] = shadow
+            await self.append_live_inventory_log(
+                "live_inventory_v4_shadow_tranche_entered",
+                {
+                    "asset": asset,
+                    **shadow,
+                    "basis_improvement_bps": decimal_to_str(
+                        basis_bps - real_entry_basis_bps
+                    ),
+                    "real_lot_id": real_lot.get("lot_id"),
+                    "real_orders_submitted": 0,
+                },
+            )
+            entered = True
+        self.live_inventory_v4_shadow_tranches = tranches
+        legacy_key = self.live_inventory_basis_v4_shadow_level_key(
+            LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
         )
-        await self.persist_live_inventory_memory(reason="v4_shadow_tranche_entered")
+        self.live_inventory_v4_shadow_tranche = tranches.get(legacy_key)
+        if entered:
+            await self.persist_live_inventory_memory(reason="v4_shadow_tranches_entered")
 
     def live_inventory_common_order_qty(self, *, asset: str, qty: Decimal) -> Decimal:
         var_quantum = VARIATIONAL_API_AMOUNT_QUANTUM_BY_ASSET.get(
@@ -3974,8 +4134,7 @@ class VariationalToLighterRuntime:
             self.live_inventory_v4_rearm_threshold_bps = None
             self.live_inventory_v4_episode_id = None
             self.live_inventory_v4_next_tranche_index = 1
-            self.live_inventory_v4_shadow_tranche = None
-            self.live_inventory_v4_shadow_completed_episode_id = None
+            self.reset_live_inventory_basis_v4_shadow_gradient()
         return rearmed, {
             **self.live_inventory_v4_episode_payload(),
             "v4_rearm_reset_threshold_bps": decimal_to_str(reset_threshold),
@@ -8651,6 +8810,10 @@ class VariationalToLighterRuntime:
                     "shadow_gradient_improvement_bps": decimal_to_str(
                         LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
                     ),
+                    "shadow_gradient_improvement_levels_bps": [
+                        decimal_to_str(value)
+                        for value in LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_LEVELS_BPS
+                    ],
                     "max_cycles": self.live_inventory_max_cycles,
                     "batch_mode": self.live_inventory_max_cycles > 1,
                     "batch_max_run_loss_usd": decimal_to_str(
@@ -8686,7 +8849,7 @@ class VariationalToLighterRuntime:
                         "convergence_velocity",
                         "external_eth_reference",
                         "size_ladder_20_40_60_usd",
-                        "shadow_gradient_second_tranche",
+                        "shadow_gradient_parallel_second_tranche_thresholds",
                     ],
                 },
             )
@@ -11479,8 +11642,7 @@ class VariationalToLighterRuntime:
                         f"{uuid.uuid4().hex[:8]}"
                     )
                     self.live_inventory_v4_next_tranche_index = 1
-                    self.live_inventory_v4_shadow_tranche = None
-                    self.live_inventory_v4_shadow_completed_episode_id = None
+                    self.reset_live_inventory_basis_v4_shadow_gradient()
                 episode_id = (
                     self.live_inventory_v4_episode_id if v4_mode else None
                 )
@@ -12950,7 +13112,7 @@ class VariationalToLighterRuntime:
                 )
                 return
         if v4_mode:
-            await self.close_live_inventory_basis_v4_shadow_tranche(
+            await self.close_all_live_inventory_basis_v4_shadow_tranches(
                 asset=asset,
                 reason="real_episode_completed",
                 exit_var_price=var_exit_price,
@@ -15707,7 +15869,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--live-inventory-basis-v4-shadow-gradient",
         action="store_true",
-        help="Record a read-only second V4 tranche after a 2 bps improvement. This never submits an additional order.",
+        help="Compare read-only second-tranche entries at +0.5/+1.0/+1.5/+2.0 bps. This never submits an additional order.",
     )
     parser.add_argument(
         "--live-inventory-basis-v4-max-run-loss-usd",

@@ -164,6 +164,43 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     latest_shadow_gradient_exit = (
         shadow_gradient_exits[-1] if shadow_gradient_exits else {}
     )
+    shadow_gradient_levels: dict[str, dict[str, Any]] = {}
+    for row in shadow_gradient_entries:
+        level = str(row.get("basis_improvement_trigger_bps") or "2.00")
+        stats = shadow_gradient_levels.setdefault(
+            level,
+            {"entries": 0, "exits": 0, "wins": 0, "pnl_bps": []},
+        )
+        stats["entries"] += 1
+    for row in shadow_gradient_exits:
+        level = str(row.get("basis_improvement_trigger_bps") or "2.00")
+        stats = shadow_gradient_levels.setdefault(
+            level,
+            {"entries": 0, "exits": 0, "wins": 0, "pnl_bps": []},
+        )
+        stats["exits"] += 1
+        pnl_bps = to_decimal(row.get("shadow_pnl_bps"))
+        if pnl_bps is not None:
+            stats["pnl_bps"].append(pnl_bps)
+            if pnl_bps > 0:
+                stats["wins"] += 1
+    shadow_gradient_level_summary = {}
+    for level, stats in sorted(
+        shadow_gradient_levels.items(),
+        key=lambda item: to_decimal(item[0]) or Decimal("0"),
+    ):
+        pnl_values = stats.pop("pnl_bps")
+        exits = stats["exits"]
+        shadow_gradient_level_summary[level] = {
+            **stats,
+            "active": stats["entries"] > exits,
+            "win_rate": (stats["wins"] / exits if exits else None),
+            "avg_pnl_bps": (
+                fmt_decimal(sum(pnl_values) / len(pnl_values))
+                if pnl_values
+                else None
+            ),
+        }
     exit_calibration = latest_cycle_report or latest_strategy_snapshot
     final_pnl_rows = [
         row for row in v4_rows if row.get("event") == "live_inventory_final_pnl"
@@ -299,6 +336,7 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "shadow_gradient_last_mae_bps": latest_shadow_gradient_exit.get(
             "shadow_mae_pnl_bps"
         ),
+        "shadow_gradient_levels": shadow_gradient_level_summary,
         "exit_confirmation_policy": latest_state.get(
             "v4_exit_confirmation_policy"
         ),
@@ -574,6 +612,16 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"shadow_last_mfe_bps={funnel['shadow_gradient_last_mfe_bps']} "
         f"shadow_last_mae_bps={funnel['shadow_gradient_last_mae_bps']}"
     )
+    level_parts = []
+    for level, stats in funnel["shadow_gradient_levels"].items():
+        win_rate = stats["win_rate"]
+        level_parts.append(
+            f"{level}:entries={stats['entries']},exits={stats['exits']},"
+            f"active={stats['active']},win_rate="
+            f"{('-' if win_rate is None else f'{win_rate:.3f}')},"
+            f"avg_bps={stats['avg_pnl_bps']}"
+        )
+    print(f"shadow_gradient_levels={'|'.join(level_parts) or '-'}")
     print(
         f"exit_confirmation_policy={funnel['exit_confirmation_policy']} "
         f"strong_single_enabled={funnel['strong_single_enabled']} "
