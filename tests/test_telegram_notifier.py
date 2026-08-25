@@ -134,10 +134,35 @@ def test_telegram_pnl_summary_contains_profit_and_annualized_return() -> None:
     assert "[Var/Lighter] 平仓收益汇总" in message
     assert "本轮实际盈亏：0.005 U" in message
     assert "本次运行累计盈亏：0.012 U" in message
-    assert "账户权益净变化：0.010 U" in message
+    assert "账户权益净变化：0.01 U" in message
     assert "简单年化收益率：10.43%" in message
     assert "收益口径：账户权益净变化" in message
     assert "年化说明：样本不足30天，仅供参考" in message
+
+
+def test_telegram_pnl_summary_formats_long_decimals_and_missing_values() -> None:
+    message = format_telegram_trade_message(
+        "live_inventory_pnl_summary",
+        {
+            "asset": "ETH",
+            "lot_id": 3,
+            "summary_status": "partial",
+            "cycle_actual_pnl_usd": "0.0045270000000000000000000009",
+            "run_actual_pnl_usd": "0.0246960000000000000000000009",
+            "return_pnl_source": "confirmed_pair_fills",
+            "annualized_reliability": "unavailable",
+        },
+    )
+
+    assert "本轮实际盈亏：0.004527 U" in message
+    assert "本次运行累计盈亏：0.024696 U" in message
+    assert "账户权益净变化：暂不可用" in message
+    assert "双边总权益：暂不可用" in message
+    assert "本次运行收益率：暂不可用" in message
+    assert "简单年化收益率：暂不可用" in message
+    assert "年化说明：暂不可计算" in message
+    assert "- U" not in message
+    assert "-%" not in message
 
 
 def test_telegram_skips_duplicate_exit_account_snapshot() -> None:

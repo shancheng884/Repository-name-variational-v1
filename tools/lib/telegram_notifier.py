@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import time
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import requests
@@ -55,6 +56,26 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _localized_number(value: Any, *, places: int) -> str | None:
+    if value in (None, "", "-"):
+        return None
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return str(value)
+    return f"{number:.{places}f}".rstrip("0").rstrip(".")
+
+
+def _localized_money(payload: dict[str, Any], key: str) -> str:
+    value = _localized_number(_value(payload, key), places=6)
+    return f"{value} U" if value is not None else "暂不可用"
+
+
+def _localized_percent(payload: dict[str, Any], key: str) -> str:
+    value = _localized_number(_value(payload, key), places=4)
+    return f"{value}%" if value is not None else "暂不可用"
 
 
 def format_telegram_trade_message(
@@ -137,19 +158,20 @@ def format_telegram_trade_message(
             [
                 "[Var/Lighter] 平仓收益汇总",
                 f"资产：{asset}｜批次：{lot_id}｜状态：{status}",
-                f"本轮实际盈亏：{_value(payload, 'cycle_actual_pnl_usd')} U",
-                f"本次运行累计盈亏：{_value(payload, 'run_actual_pnl_usd')} U",
-                f"账户权益净变化：{_value(payload, 'account_net_change_usd')} U",
+                f"本轮实际盈亏：{_localized_money(payload, 'cycle_actual_pnl_usd')}",
+                f"本次运行累计盈亏：{_localized_money(payload, 'run_actual_pnl_usd')}",
+                f"账户权益净变化：{_localized_money(payload, 'account_net_change_usd')}",
                 "权益变化与成交盈亏差额："
-                f"{_value(payload, 'account_minus_fill_pnl_usd')} U",
-                f"Variational 权益：{_value(payload, 'variational_equity_usd')} U",
-                f"Lighter 权益：{_value(payload, 'lighter_equity_usd')} U",
-                f"双边总权益：{_value(payload, 'combined_equity_usd')} U",
-                f"统计本金：{_value(payload, 'capital_usd')} U",
+                f"{_localized_money(payload, 'account_minus_fill_pnl_usd')}",
+                f"Variational 权益：{_localized_money(payload, 'variational_equity_usd')}",
+                f"Lighter 权益：{_localized_money(payload, 'lighter_equity_usd')}",
+                f"双边总权益：{_localized_money(payload, 'combined_equity_usd')}",
+                f"统计本金：{_localized_money(payload, 'capital_usd')}",
                 f"已完成轮数：{_value(payload, 'completed_cycles')}",
-                f"本次运行收益率：{_value(payload, 'return_pct')}%",
+                f"本次运行收益率：{_localized_percent(payload, 'return_pct')}",
                 f"收益口径：{return_source}",
-                f"简单年化收益率：{_value(payload, 'annualized_simple_pct')}%",
+                "简单年化收益率："
+                f"{_localized_percent(payload, 'annualized_simple_pct')}",
                 f"年化说明：{reliability}",
             ]
         )

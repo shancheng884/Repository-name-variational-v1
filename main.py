@@ -2997,7 +2997,9 @@ class VariationalToLighterRuntime:
             "elapsed_days": decimal_to_str(elapsed_days),
             "annualized_simple_pct": decimal_to_str(annualized_pct),
             "annualized_reliability": (
-                "sample_under_30_days"
+                "unavailable"
+                if annualized_pct is None
+                else "sample_under_30_days"
                 if elapsed_days is not None and elapsed_days < 30
                 else "observable"
                 if elapsed_days is not None
