@@ -113,32 +113,44 @@ def format_telegram_trade_message(
             ]
         )
     if event_type == "live_inventory_pnl_summary":
+        status = {
+            "complete": "完整",
+            "partial": "部分数据",
+            "test": "测试",
+        }.get(str(_value(payload, "summary_status")), _value(payload, "summary_status"))
+        return_source = {
+            "account_equity_delta": "账户权益净变化",
+            "confirmed_pair_fills": "已确认双边成交盈亏",
+        }.get(
+            str(_value(payload, "return_pnl_source")),
+            _value(payload, "return_pnl_source"),
+        )
+        reliability = {
+            "sample_under_30_days": "样本不足30天，仅供参考",
+            "observable": "样本期已满30天",
+            "unavailable": "暂不可计算",
+        }.get(
+            str(_value(payload, "annualized_reliability")),
+            _value(payload, "annualized_reliability"),
+        )
         return "\n".join(
             [
-                "[Var/Lighter] PNL SUMMARY",
-                f"asset={asset} lot={lot_id} status={_value(payload, 'summary_status')}",
-                "cycle_actual_pnl_usd="
-                f"{_value(payload, 'cycle_actual_pnl_usd')}",
-                f"run_actual_pnl_usd={_value(payload, 'run_actual_pnl_usd')}",
-                "account_net_change_usd="
-                f"{_value(payload, 'account_net_change_usd')}",
-                "account_minus_fill_pnl_usd="
-                f"{_value(payload, 'account_minus_fill_pnl_usd')}",
-                "variational_equity_usd="
-                f"{_value(payload, 'variational_equity_usd')}",
-                "lighter_equity_usd="
-                f"{_value(payload, 'lighter_equity_usd')}",
-                "combined_equity_usd="
-                f"{_value(payload, 'combined_equity_usd')}",
-                f"capital_usd={_value(payload, 'capital_usd')}",
-                f"completed_cycles={_value(payload, 'completed_cycles')}",
-                f"return_pct={_value(payload, 'return_pct')}",
-                "return_source="
-                f"{_value(payload, 'return_pnl_source')}",
-                "annualized_simple_pct="
-                f"{_value(payload, 'annualized_simple_pct')}",
-                "annualized_reliability="
-                f"{_value(payload, 'annualized_reliability')}",
+                "[Var/Lighter] 平仓收益汇总",
+                f"资产：{asset}｜批次：{lot_id}｜状态：{status}",
+                f"本轮实际盈亏：{_value(payload, 'cycle_actual_pnl_usd')} U",
+                f"本次运行累计盈亏：{_value(payload, 'run_actual_pnl_usd')} U",
+                f"账户权益净变化：{_value(payload, 'account_net_change_usd')} U",
+                "权益变化与成交盈亏差额："
+                f"{_value(payload, 'account_minus_fill_pnl_usd')} U",
+                f"Variational 权益：{_value(payload, 'variational_equity_usd')} U",
+                f"Lighter 权益：{_value(payload, 'lighter_equity_usd')} U",
+                f"双边总权益：{_value(payload, 'combined_equity_usd')} U",
+                f"统计本金：{_value(payload, 'capital_usd')} U",
+                f"已完成轮数：{_value(payload, 'completed_cycles')}",
+                f"本次运行收益率：{_value(payload, 'return_pct')}%",
+                f"收益口径：{return_source}",
+                f"简单年化收益率：{_value(payload, 'annualized_simple_pct')}%",
+                f"年化说明：{reliability}",
             ]
         )
     if event_type in {

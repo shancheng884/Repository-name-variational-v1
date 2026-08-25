@@ -131,12 +131,13 @@ def test_telegram_pnl_summary_contains_profit_and_annualized_return() -> None:
         },
     )
 
-    assert "[Var/Lighter] PNL SUMMARY" in message
-    assert "cycle_actual_pnl_usd=0.005" in message
-    assert "run_actual_pnl_usd=0.012" in message
-    assert "account_net_change_usd=0.010" in message
-    assert "annualized_simple_pct=10.43" in message
-    assert "return_source=account_equity_delta" in message
+    assert "[Var/Lighter] 平仓收益汇总" in message
+    assert "本轮实际盈亏：0.005 U" in message
+    assert "本次运行累计盈亏：0.012 U" in message
+    assert "账户权益净变化：0.010 U" in message
+    assert "简单年化收益率：10.43%" in message
+    assert "收益口径：账户权益净变化" in message
+    assert "年化说明：样本不足30天，仅供参考" in message
 
 
 def test_telegram_skips_duplicate_exit_account_snapshot() -> None:
