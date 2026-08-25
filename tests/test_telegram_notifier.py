@@ -89,6 +89,27 @@ def test_telegram_final_pnl_message_contains_final_values() -> None:
     assert "pnl_bps=5.0" in message
 
 
+def test_telegram_account_snapshot_contains_both_venues() -> None:
+    message = format_telegram_trade_message(
+        "live_inventory_account_snapshot",
+        {
+            "asset": "ETH",
+            "lot_id": 2,
+            "snapshot_stage": "exit_confirmed_flat",
+            "snapshot_status": "complete",
+            "variational_equity_usd": "14.85",
+            "lighter_equity_usd": "20.25",
+            "combined_equity_usd": "35.10",
+        },
+    )
+
+    assert "[Var/Lighter] ACCOUNT SNAPSHOT" in message
+    assert "stage=exit_confirmed_flat" in message
+    assert "variational_equity_usd=14.85" in message
+    assert "lighter_equity_usd=20.25" in message
+    assert "combined_equity_usd=35.10" in message
+
+
 def test_telegram_strong_single_fallback_message_contains_action() -> None:
     message = format_telegram_trade_message(
         "live_inventory_v4_strong_single_auto_disabled",

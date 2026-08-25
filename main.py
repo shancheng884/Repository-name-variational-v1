@@ -295,6 +295,70 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     return format(value, "f")
 
 
+def extract_variational_account_metrics(payload: Any) -> dict[str, Decimal | str | None]:
+    if not isinstance(payload, dict):
+        return {
+            "balance_usd": None,
+            "upnl_usd": None,
+            "equity_usd": None,
+            "equity_formula": None,
+        }
+    result = payload.get("result")
+    if isinstance(result, dict):
+        payload = result
+    pool = payload.get("pool_portfolio_result")
+    if isinstance(pool, dict):
+        payload = pool
+    balance = to_decimal(payload.get("balance"))
+    upnl = to_decimal(payload.get("upnl"))
+    if balance is None:
+        equity = None
+        formula = None
+    elif upnl is None:
+        equity = balance
+        formula = "balance"
+    else:
+        equity = balance + upnl
+        formula = "balance_plus_upnl"
+    return {
+        "balance_usd": balance,
+        "upnl_usd": upnl,
+        "equity_usd": equity,
+        "equity_formula": formula,
+    }
+
+
+def extract_lighter_account_metrics(payload: Any) -> dict[str, Decimal | str | None]:
+    if not isinstance(payload, dict):
+        return {
+            "collateral_usd": None,
+            "available_balance_usd": None,
+            "total_asset_value_usd": None,
+            "equity_usd": None,
+            "equity_formula": None,
+        }
+    accounts = payload.get("accounts")
+    account = accounts[0] if isinstance(accounts, list) and accounts else None
+    if not isinstance(account, dict):
+        return {
+            "collateral_usd": None,
+            "available_balance_usd": None,
+            "total_asset_value_usd": None,
+            "equity_usd": None,
+            "equity_formula": None,
+        }
+    collateral = to_decimal(account.get("collateral"))
+    available = to_decimal(account.get("available_balance"))
+    total_asset_value = to_decimal(account.get("total_asset_value"))
+    return {
+        "collateral_usd": collateral,
+        "available_balance_usd": available,
+        "total_asset_value_usd": total_asset_value,
+        "equity_usd": collateral,
+        "equity_formula": "collateral" if collateral is not None else None,
+    }
+
+
 def json_log_default(value: Any) -> Any:
     if isinstance(value, Decimal):
         return decimal_to_str(value)
@@ -1416,6 +1480,7 @@ class VariationalToLighterRuntime:
         self.auto_live_task: asyncio.Task[None] | None = None
         self.dashboard_task: asyncio.Task[None] | None = None
         self.watchdog_task: asyncio.Task[None] | None = None
+        self.live_inventory_account_snapshot_tasks: set[asyncio.Task[None]] = set()
 
     @staticmethod
     def now_iso() -> str:
@@ -2653,6 +2718,146 @@ class VariationalToLighterRuntime:
             )
         return result
 
+    async def capture_live_inventory_account_snapshot(
+        self,
+        *,
+        stage: str,
+        asset: str,
+        lot_id: Any = None,
+        lighter_account_result: dict[str, Any] | None = None,
+        settle_seconds: float = 0.0,
+    ) -> None:
+        requested_at = utc_now()
+        if settle_seconds > 0:
+            await asyncio.sleep(settle_seconds)
+        errors: dict[str, str] = {}
+        monitor = getattr(getattr(self, "runtime", None), "monitor", None)
+        monitor_lock = getattr(monitor, "_lock", None)
+        if monitor_lock is not None:
+            async with monitor_lock:
+                portfolio_summary = dict(
+                    getattr(monitor, "portfolio_summary", {}) or {}
+                )
+        else:
+            portfolio_summary = getattr(monitor, "portfolio_summary", {})
+        if not isinstance(portfolio_summary, dict):
+            portfolio_summary = {}
+        variational_metrics = extract_variational_account_metrics(
+            portfolio_summary
+        )
+        if variational_metrics.get("equity_usd") is None:
+            errors["variational"] = "portfolio_summary_balance_missing"
+
+        if lighter_account_result is None:
+            try:
+                lighter_account_result = await self.fetch_lighter_account()
+            except Exception as exc:
+                errors["lighter"] = f"{type(exc).__name__}:{exc}"
+        lighter_metrics = extract_lighter_account_metrics(
+            lighter_account_result
+        )
+        if (
+            lighter_metrics.get("equity_usd") is None
+            and "lighter" not in errors
+        ):
+            errors["lighter"] = "account_collateral_missing"
+
+        variational_equity = to_decimal(
+            variational_metrics.get("equity_usd")
+        )
+        lighter_equity = to_decimal(lighter_metrics.get("equity_usd"))
+        total_equity = (
+            variational_equity + lighter_equity
+            if variational_equity is not None and lighter_equity is not None
+            else None
+        )
+        await self.append_live_inventory_log(
+            "live_inventory_account_snapshot",
+            {
+                "asset": asset.upper(),
+                "lot_id": lot_id,
+                "snapshot_stage": stage,
+                "snapshot_requested_at": requested_at,
+                "snapshot_captured_at": utc_now(),
+                "snapshot_settle_seconds": settle_seconds,
+                "snapshot_status": "complete" if not errors else "partial",
+                "snapshot_errors": errors,
+                "open_lots_total": len(
+                    getattr(self, "live_inventory_open_lots", []) or []
+                ),
+                "variational_balance_usd": decimal_to_str(
+                    to_decimal(variational_metrics.get("balance_usd"))
+                ),
+                "variational_upnl_usd": decimal_to_str(
+                    to_decimal(variational_metrics.get("upnl_usd"))
+                ),
+                "variational_equity_usd": decimal_to_str(
+                    variational_equity
+                ),
+                "variational_equity_formula": variational_metrics.get(
+                    "equity_formula"
+                ),
+                "variational_published_at": portfolio_summary.get(
+                    "published_at"
+                ),
+                "lighter_collateral_usd": decimal_to_str(
+                    to_decimal(lighter_metrics.get("collateral_usd"))
+                ),
+                "lighter_available_balance_usd": decimal_to_str(
+                    to_decimal(
+                        lighter_metrics.get("available_balance_usd")
+                    )
+                ),
+                "lighter_total_asset_value_usd": decimal_to_str(
+                    to_decimal(
+                        lighter_metrics.get("total_asset_value_usd")
+                    )
+                ),
+                "lighter_equity_usd": decimal_to_str(lighter_equity),
+                "lighter_equity_formula": lighter_metrics.get(
+                    "equity_formula"
+                ),
+                "combined_equity_usd": decimal_to_str(total_equity),
+            },
+        )
+
+    def schedule_live_inventory_account_snapshot(
+        self,
+        *,
+        stage: str,
+        asset: str,
+        lot_id: Any = None,
+    ) -> None:
+        task = asyncio.create_task(
+            self.capture_live_inventory_account_snapshot(
+                stage=stage,
+                asset=asset,
+                lot_id=lot_id,
+                settle_seconds=2.0,
+            ),
+            name=f"live_inventory_account_snapshot:{stage}:{lot_id}",
+        )
+        tasks = getattr(self, "live_inventory_account_snapshot_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self.live_inventory_account_snapshot_tasks = tasks
+        tasks.add(task)
+
+        def account_snapshot_done(completed: asyncio.Task[None]) -> None:
+            tasks.discard(completed)
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                self.logger.warning(
+                    "live_inventory_account_snapshot_failed stage=%s lot_id=%s error=%s",
+                    stage,
+                    lot_id,
+                    type(error).__name__,
+                )
+
+        task.add_done_callback(account_snapshot_done)
+
     @staticmethod
     def extract_lighter_position_qty(account_result: dict[str, Any] | None, *, asset: str) -> Decimal | None:
         if not isinstance(account_result, dict):
@@ -2751,6 +2956,11 @@ class VariationalToLighterRuntime:
                     },
                 )
                 raise RuntimeError("Live inventory startup reconcile failed: exchange position exists while local state is flat")
+            await self.capture_live_inventory_account_snapshot(
+                stage="startup_flat",
+                asset=asset,
+                lighter_account_result=lighter_account_result,
+            )
             await self.append_live_inventory_log(
                 "live_inventory_startup_reconcile_ok",
                 {
@@ -2802,6 +3012,11 @@ class VariationalToLighterRuntime:
                 },
             )
             raise RuntimeError("Live inventory startup reconcile failed: exchange quantities do not match local open lots")
+        await self.capture_live_inventory_account_snapshot(
+            stage="startup_open",
+            asset=asset,
+            lighter_account_result=lighter_account_result,
+        )
         await self.append_live_inventory_log(
             "live_inventory_startup_reconcile_ok",
             {
@@ -8370,6 +8585,22 @@ class VariationalToLighterRuntime:
                     event_type,
                     type(exc).__name__,
                 )
+        if (
+            not getattr(self, "live_inventory_dry_decisions", False)
+            and event_type
+            in {"live_inventory_entered", "live_inventory_exited"}
+        ):
+            self.schedule_live_inventory_account_snapshot(
+                stage=(
+                    "entry_confirmed"
+                    if event_type == "live_inventory_entered"
+                    else "exit_confirmed_flat"
+                ),
+                asset=str(
+                    payload.get("asset") or self.live_inventory_state_asset()
+                ),
+                lot_id=payload.get("lot_id"),
+            )
 
     def should_log_live_inventory_basis_state(self, payload: dict[str, Any]) -> bool:
         if not getattr(self, "live_inventory_basis_v4_mode", False):
@@ -15259,6 +15490,31 @@ class VariationalToLighterRuntime:
                 self.live_inventory_completed_cycles,
             )
         self.stop_flag = True
+
+        account_snapshot_tasks = list(
+            getattr(self, "live_inventory_account_snapshot_tasks", set())
+        )
+        if account_snapshot_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *account_snapshot_tasks,
+                        return_exceptions=True,
+                    ),
+                    timeout=12.0,
+                )
+            except TimeoutError:
+                self.logger.warning(
+                    "live_inventory_account_snapshot_flush_timeout pending=%s",
+                    sum(not task.done() for task in account_snapshot_tasks),
+                )
+                for task in account_snapshot_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    *account_snapshot_tasks,
+                    return_exceptions=True,
+                )
 
         external_reference_task = getattr(
             self,

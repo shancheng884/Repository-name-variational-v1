@@ -20,6 +20,7 @@ TELEGRAM_EVENT_TYPES = {
     "live_inventory_runtime_fuse_triggered",
     "live_inventory_basis_quote_failed",
     "live_inventory_v4_strong_single_auto_disabled",
+    "live_inventory_account_snapshot",
 }
 
 TELEGRAM_CRITICAL_EXIT_BLOCK_REASONS = {
@@ -94,6 +95,20 @@ def format_telegram_trade_message(
                 f"pnl_usd={_value(payload, 'final_pnl_usd')}",
                 f"pnl_bps={_value(payload, 'final_pnl_bps')}",
                 f"spread_capture_bps={_value(payload, 'final_spread_capture_bps')}",
+            ]
+        )
+    if event_type == "live_inventory_account_snapshot":
+        return "\n".join(
+            [
+                "[Var/Lighter] ACCOUNT SNAPSHOT",
+                f"asset={asset} stage={_value(payload, 'snapshot_stage')}",
+                f"lot={lot_id} status={_value(payload, 'snapshot_status')}",
+                "variational_equity_usd="
+                f"{_value(payload, 'variational_equity_usd')}",
+                "lighter_equity_usd="
+                f"{_value(payload, 'lighter_equity_usd')}",
+                "combined_equity_usd="
+                f"{_value(payload, 'combined_equity_usd')}",
             ]
         )
     if event_type in {

@@ -34,6 +34,31 @@ python tools/analyze.py
 
 This reads `log/order_metrics.jsonl`, `log/runtime.log`, and `log/live_inventory_state.json`. It does not start live, stop live, submit orders, or modify state.
 
+## Profit And Account Equity Report
+
+The live process records a non-blocking account snapshot at startup and two
+seconds after every confirmed entry and exit. The snapshot uses Variational
+`balance + upnl` and Lighter `collateral`; failures are logged as partial
+snapshots and never stop trading.
+
+Show confirmed pair-fill PnL, both venue balances, account-equity change, and
+simple annualized return:
+
+```bash
+python tools/pnl_report.py --asset ETH --capital-usd 35
+```
+
+`--capital-usd` is the amount of capital allocated to this strategy across
+both venues, not one leg's order notional. It can be saved outside the command
+as `PNL_REPORT_CAPITAL_USD` in `.env`. If neither is provided, the report uses
+the first complete flat account snapshot. Use `--since YYYY-MM-DD` to limit the
+reporting period.
+
+The confirmed pair-fill PnL is calculated from both venues' final fill prices.
+It does not separately deduct fees or funding. Account-equity change includes
+fees, funding, deposits, withdrawals, and any other account activity, so the
+report keeps these two figures separate.
+
 ## V4 Exit Confirmation
 
 V4 uses the latest executable quote plus two qualifying observations in the
