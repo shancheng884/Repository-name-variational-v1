@@ -12,6 +12,7 @@ from main import (
 from tools.pnl_report import (
     build_report,
     deduplicated_actual_pnl,
+    latest_pnl_telegram_payload,
     previous_flat_snapshot,
 )
 
@@ -141,6 +142,72 @@ def test_previous_flat_snapshot_ignores_entry_snapshot() -> None:
     baseline = previous_flat_snapshot(snapshots, snapshots[-1])
 
     assert baseline is snapshots[0]
+
+
+def test_latest_pnl_telegram_payload_uses_latest_confirmed_cycle() -> None:
+    rows = [
+        {
+            "event": "live_inventory_run_config",
+            "run_id": "run-1",
+            "asset": "ETH",
+            "logged_at": "2026-08-25T00:00:00+00:00",
+        },
+        {
+            "event": "live_inventory_account_snapshot",
+            "run_id": "run-1",
+            "asset": "ETH",
+            "snapshot_stage": "startup_flat",
+            "snapshot_status": "complete",
+            "combined_equity_usd": "35.00",
+            "snapshot_captured_at": "2026-08-25T00:00:01+00:00",
+            "logged_at": "2026-08-25T00:00:01+00:00",
+        },
+        {
+            "event": "live_inventory_actual_pnl",
+            "run_id": "run-1",
+            "asset": "ETH",
+            "lot_id": 1,
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "actual_pnl_usd": "0.04",
+            "logged_at": "2026-08-25T01:00:00+00:00",
+        },
+        {
+            "event": "live_inventory_actual_pnl",
+            "run_id": "run-1",
+            "asset": "ETH",
+            "lot_id": 2,
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "actual_pnl_usd": "0.06",
+            "logged_at": "2026-08-25T02:00:00+00:00",
+        },
+        {
+            "event": "live_inventory_account_snapshot",
+            "run_id": "run-1",
+            "asset": "ETH",
+            "lot_id": 2,
+            "snapshot_stage": "exit_confirmed_flat",
+            "snapshot_status": "complete",
+            "account_snapshot_flat": True,
+            "variational_equity_usd": "14.90",
+            "lighter_equity_usd": "20.20",
+            "combined_equity_usd": "35.10",
+            "snapshot_captured_at": "2026-08-25T02:00:01+00:00",
+            "logged_at": "2026-08-25T02:00:01+00:00",
+        },
+    ]
+    report = build_report(rows, since=None, capital_usd=None)
+
+    payload = latest_pnl_telegram_payload(rows, report, asset="ETH")
+
+    assert payload is not None
+    assert payload["lot_id"] == 2
+    assert payload["summary_status"] == "complete"
+    assert payload["cycle_actual_pnl_usd"] == "0.06"
+    assert payload["run_actual_pnl_usd"] == "0.10"
+    assert payload["account_net_change_usd"] == "0.10"
+    assert payload["combined_equity_usd"] == "35.10"
+    assert payload["completed_cycles"] == 2
+    assert payload["return_pnl_source"] == "account_equity_delta"
 
 
 def test_account_snapshot_logs_normalized_equity_without_raw_account(

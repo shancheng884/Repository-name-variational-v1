@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -13,6 +15,15 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tools.lib.telegram_notifier import (  # noqa: E402
+    TelegramNotifier,
+    format_telegram_trade_message,
+)
+
+
 ORDER_METRICS = ROOT / "log" / "order_metrics.jsonl"
 RELEVANT_EVENTS = {
     "live_inventory_run_config",
@@ -169,6 +180,182 @@ def previous_flat_snapshot(
         )
     ]
     return candidates[-1] if candidates else None
+
+
+def decimal_text(value: Decimal | None) -> str | None:
+    return str(value) if value is not None else None
+
+
+def latest_pnl_telegram_payload(
+    rows: list[dict[str, Any]],
+    report: Report,
+    *,
+    asset: str,
+) -> dict[str, Any] | None:
+    if not report.cycles:
+        return None
+    cycle = report.cycles[-1]
+    cycle_key = row_key(cycle)
+    run_id = cycle_key[0]
+    cycle_time = parse_time(cycle.get("logged_at"))
+    run_cycles = [
+        row
+        for row in report.cycles
+        if row_key(row)[0] == run_id
+        and (
+            cycle_time is None
+            or parse_time(row.get("logged_at")) is None
+            or parse_time(row.get("logged_at")) <= cycle_time
+        )
+    ]
+    run_actual_pnl = sum(
+        (
+            to_decimal(row.get("actual_pnl_usd")) or Decimal("0")
+            for row in run_cycles
+        ),
+        Decimal("0"),
+    )
+    cycle_actual_pnl = to_decimal(cycle.get("actual_pnl_usd"))
+    exit_snapshot = snapshot_for_cycle(
+        report.snapshots,
+        cycle_key,
+        "exit_confirmed_flat",
+    )
+    exit_time = (
+        parse_time(exit_snapshot.get("snapshot_captured_at"))
+        if exit_snapshot
+        else cycle_time
+    )
+    run_start_snapshots = [
+        row
+        for row in report.snapshots
+        if str(row.get("run_id") or "unknown") == run_id
+        and row.get("snapshot_stage") == "startup_flat"
+        and (
+            exit_time is None
+            or parse_time(row.get("snapshot_captured_at")) is None
+            or parse_time(row.get("snapshot_captured_at")) < exit_time
+        )
+    ]
+    baseline_snapshot = (
+        run_start_snapshots[-1]
+        if run_start_snapshots
+        else previous_flat_snapshot(report.snapshots, exit_snapshot)
+        if exit_snapshot
+        else None
+    )
+    baseline_equity = to_decimal(
+        baseline_snapshot.get("combined_equity_usd")
+        if baseline_snapshot
+        else None
+    )
+    combined_equity = to_decimal(
+        exit_snapshot.get("combined_equity_usd") if exit_snapshot else None
+    )
+    account_snapshot_flat = bool(
+        exit_snapshot
+        and exit_snapshot.get("account_snapshot_flat", True)
+    )
+    account_net_change = (
+        combined_equity - baseline_equity
+        if account_snapshot_flat
+        and combined_equity is not None
+        and baseline_equity is not None
+        else None
+    )
+    capital_usd = (
+        report.capital_usd
+        if report.capital_source == "--capital-usd"
+        else baseline_equity or report.capital_usd
+    )
+    pnl_for_return = (
+        account_net_change
+        if account_net_change is not None
+        else run_actual_pnl
+    )
+    return_pct = (
+        pnl_for_return / capital_usd * Decimal("100")
+        if capital_usd is not None and capital_usd > 0
+        else None
+    )
+    baseline_time = (
+        parse_time(baseline_snapshot.get("snapshot_captured_at"))
+        if baseline_snapshot
+        else None
+    )
+    if baseline_time is None:
+        run_configs = [
+            parse_time(row.get("logged_at"))
+            for row in rows
+            if row.get("event") == "live_inventory_run_config"
+            and str(row.get("run_id") or "unknown") == run_id
+        ]
+        baseline_time = next(
+            (value for value in reversed(run_configs) if value is not None),
+            None,
+        )
+    elapsed_days = (
+        Decimal(str((exit_time - baseline_time).total_seconds()))
+        / Decimal("86400")
+        if baseline_time is not None
+        and exit_time is not None
+        and exit_time > baseline_time
+        else None
+    )
+    annualized_pct = (
+        return_pct * Decimal("365") / elapsed_days
+        if return_pct is not None
+        and elapsed_days is not None
+        and elapsed_days > 0
+        else None
+    )
+    return {
+        "asset": asset.upper(),
+        "lot_id": cycle.get("lot_id"),
+        "summary_status": (
+            "complete"
+            if exit_snapshot is not None
+            and account_snapshot_flat
+            and baseline_equity is not None
+            and cycle_actual_pnl is not None
+            else "partial"
+        ),
+        "cycle_actual_pnl_usd": decimal_text(cycle_actual_pnl),
+        "run_actual_pnl_usd": decimal_text(run_actual_pnl),
+        "account_net_change_usd": decimal_text(account_net_change),
+        "account_minus_fill_pnl_usd": decimal_text(
+            account_net_change - run_actual_pnl
+            if account_net_change is not None
+            else None
+        ),
+        "variational_equity_usd": (
+            exit_snapshot.get("variational_equity_usd")
+            if exit_snapshot
+            else None
+        ),
+        "lighter_equity_usd": (
+            exit_snapshot.get("lighter_equity_usd")
+            if exit_snapshot
+            else None
+        ),
+        "combined_equity_usd": decimal_text(combined_equity),
+        "capital_usd": decimal_text(capital_usd),
+        "completed_cycles": len(run_cycles),
+        "return_pct": decimal_text(return_pct),
+        "return_pnl_source": (
+            "account_equity_delta"
+            if account_net_change is not None
+            else "confirmed_pair_fills"
+        ),
+        "annualized_simple_pct": decimal_text(annualized_pct),
+        "annualized_reliability": (
+            "sample_under_30_days"
+            if elapsed_days is not None and elapsed_days < 30
+            else "observable"
+            if elapsed_days is not None
+            else "unavailable"
+        ),
+    }
 
 
 def money(value: Decimal | None) -> str:
@@ -468,6 +655,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--capital-usd", type=Decimal)
     parser.add_argument("--last", type=int, default=10)
     parser.add_argument("--path", type=Path, default=ORDER_METRICS)
+    parser.add_argument(
+        "--telegram-latest",
+        action="store_true",
+        help="Send the latest confirmed close as a Chinese Telegram summary.",
+    )
     return parser
 
 
@@ -482,6 +674,25 @@ def main() -> int:
     rows = load_rows(args.path, asset=args.asset.upper())
     report = build_report(rows, since=since, capital_usd=capital_usd)
     print_report(report, last_cycles=args.last)
+    if args.telegram_latest:
+        payload = latest_pnl_telegram_payload(
+            rows,
+            report,
+            asset=args.asset,
+        )
+        if payload is None:
+            raise SystemExit("telegram_latest=FAILED no_confirmed_close")
+        notifier = TelegramNotifier.from_env(
+            logger=logging.getLogger("pnl_report.telegram")
+        )
+        message = format_telegram_trade_message(
+            "live_inventory_pnl_summary",
+            payload,
+        )
+        ok, detail = notifier.send_now(message)
+        print(f"telegram_latest={'PASS' if ok else 'FAILED'} {detail}")
+        if not ok:
+            return 1
     return 0
 
 

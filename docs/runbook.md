@@ -65,6 +65,15 @@ It does not separately deduct fees or funding. Account-equity change includes
 fees, funding, deposits, withdrawals, and any other account activity, so the
 report keeps these two figures separate.
 
+Resend the latest confirmed close to the configured Telegram chat in the
+Chinese PnL-summary format:
+
+```bash
+python tools/pnl_report.py --asset ETH --telegram-latest
+```
+
+This command only reads logs and sends a message. It never submits orders.
+
 ## V4 Exit Confirmation
 
 V4 uses the latest executable quote plus two qualifying observations in the
