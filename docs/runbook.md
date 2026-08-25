@@ -89,3 +89,11 @@ Other stopped-process logs can be previewed and archived separately:
 python tools/archive_legacy_logs.py
 python tools/archive_legacy_logs.py --execute
 ```
+
+## Robinhood Chain Lighter Research Sidecar
+
+The Robinhood Chain Lighter basis collector can run alongside live V4 because
+it tails the live process's persisted Variational samples and opens only a
+public Robinhood Lighter market-data connection. It does not use the extension
+command port or any trading credentials. See
+`docs/robinhood_lighter_basis_collector.md` for startup and verification.
