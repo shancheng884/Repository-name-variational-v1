@@ -159,7 +159,7 @@ def format_telegram_trade_message(
                 "[Var/Lighter] 平仓收益汇总",
                 f"资产：{asset}｜批次：{lot_id}｜状态：{status}",
                 f"本轮实际盈亏：{_localized_money(payload, 'cycle_actual_pnl_usd')}",
-                f"本次运行累计盈亏：{_localized_money(payload, 'run_actual_pnl_usd')}",
+                f"本统计周期累计盈亏：{_localized_money(payload, 'run_actual_pnl_usd')}",
                 f"账户权益净变化：{_localized_money(payload, 'account_net_change_usd')}",
                 "权益变化与成交盈亏差额："
                 f"{_localized_money(payload, 'account_minus_fill_pnl_usd')}",
@@ -168,7 +168,7 @@ def format_telegram_trade_message(
                 f"双边总权益：{_localized_money(payload, 'combined_equity_usd')}",
                 f"统计本金：{_localized_money(payload, 'capital_usd')}",
                 f"已完成轮数：{_value(payload, 'completed_cycles')}",
-                f"本次运行收益率：{_localized_percent(payload, 'return_pct')}",
+                f"本统计周期收益率：{_localized_percent(payload, 'return_pct')}",
                 f"收益口径：{return_source}",
                 "简单年化收益率："
                 f"{_localized_percent(payload, 'annualized_simple_pct')}",

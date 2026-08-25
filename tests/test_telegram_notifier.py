@@ -133,7 +133,7 @@ def test_telegram_pnl_summary_contains_profit_and_annualized_return() -> None:
 
     assert "[Var/Lighter] 平仓收益汇总" in message
     assert "本轮实际盈亏：0.005 U" in message
-    assert "本次运行累计盈亏：0.012 U" in message
+    assert "本统计周期累计盈亏：0.012 U" in message
     assert "账户权益净变化：0.01 U" in message
     assert "简单年化收益率：10.43%" in message
     assert "收益口径：账户权益净变化" in message
@@ -155,10 +155,10 @@ def test_telegram_pnl_summary_formats_long_decimals_and_missing_values() -> None
     )
 
     assert "本轮实际盈亏：0.004527 U" in message
-    assert "本次运行累计盈亏：0.024696 U" in message
+    assert "本统计周期累计盈亏：0.024696 U" in message
     assert "账户权益净变化：暂不可用" in message
     assert "双边总权益：暂不可用" in message
-    assert "本次运行收益率：暂不可用" in message
+    assert "本统计周期收益率：暂不可用" in message
     assert "简单年化收益率：暂不可用" in message
     assert "年化说明：暂不可计算" in message
     assert "- U" not in message

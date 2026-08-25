@@ -22,9 +22,17 @@ from tools.lib.telegram_notifier import (  # noqa: E402
     TelegramNotifier,
     format_telegram_trade_message,
 )
+from tools.lib.pnl_baseline import (  # noqa: E402
+    PNL_BASELINE_FILE_NAME,
+    load_pnl_baseline,
+    new_pnl_baseline,
+    write_pnl_baseline,
+)
 
 
 ORDER_METRICS = ROOT / "log" / "order_metrics.jsonl"
+LIVE_INVENTORY_STATE = ROOT / "log" / "live_inventory_state.json"
+PNL_BASELINE = ROOT / "log" / PNL_BASELINE_FILE_NAME
 RELEVANT_EVENTS = {
     "live_inventory_run_config",
     "live_inventory_actual_pnl",
@@ -92,6 +100,42 @@ def load_rows(path: Path, *, asset: str) -> list[dict[str, Any]]:
                 continue
             rows.append(row)
     return rows
+
+
+def reset_pnl_reporting_baseline(
+    *,
+    asset: str,
+    state_path: Path = LIVE_INVENTORY_STATE,
+    baseline_path: Path = PNL_BASELINE,
+    started_at: str | None = None,
+) -> dict[str, Any]:
+    if not state_path.exists():
+        raise RuntimeError("live_inventory_state_missing")
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"live_inventory_state_invalid:{exc}") from exc
+    if not isinstance(state, dict):
+        raise RuntimeError("live_inventory_state_not_object")
+    open_lots = state.get("open_lots")
+    pending_actions = state.get("pending_actions")
+    if (
+        str(state.get("status") or "").strip() != "flat"
+        or (isinstance(open_lots, list) and open_lots)
+        or (isinstance(pending_actions, list) and pending_actions)
+    ):
+        raise RuntimeError("local_live_inventory_state_not_flat")
+    baseline = new_pnl_baseline(
+        asset=asset,
+        realized_pnl_usd=state.get("realized_pnl_usd") or "0",
+        completed_cycles=state.get("completed_cycles") or 0,
+        started_at=started_at,
+    )
+    write_pnl_baseline(baseline_path, baseline)
+    loaded = load_pnl_baseline(baseline_path)
+    if loaded is None:
+        raise RuntimeError("pnl_baseline_write_failed")
+    return loaded
 
 
 def row_key(row: dict[str, Any]) -> tuple[str, str, str]:
@@ -191,6 +235,7 @@ def latest_pnl_telegram_payload(
     report: Report,
     *,
     asset: str,
+    tracking_baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if not report.cycles:
         return None
@@ -198,16 +243,20 @@ def latest_pnl_telegram_payload(
     cycle_key = row_key(cycle)
     run_id = cycle_key[0]
     cycle_time = parse_time(cycle.get("logged_at"))
-    run_cycles = [
-        row
-        for row in report.cycles
-        if row_key(row)[0] == run_id
-        and (
-            cycle_time is None
-            or parse_time(row.get("logged_at")) is None
-            or parse_time(row.get("logged_at")) <= cycle_time
-        )
-    ]
+    run_cycles = (
+        list(report.cycles)
+        if tracking_baseline is not None
+        else [
+            row
+            for row in report.cycles
+            if row_key(row)[0] == run_id
+            and (
+                cycle_time is None
+                or parse_time(row.get("logged_at")) is None
+                or parse_time(row.get("logged_at")) <= cycle_time
+            )
+        ]
+    )
     run_actual_pnl = sum(
         (
             to_decimal(row.get("actual_pnl_usd")) or Decimal("0")
@@ -245,7 +294,9 @@ def latest_pnl_telegram_payload(
         else None
     )
     baseline_equity = to_decimal(
-        baseline_snapshot.get("combined_equity_usd")
+        tracking_baseline.get("account_baseline_equity_usd")
+        if tracking_baseline is not None
+        else baseline_snapshot.get("combined_equity_usd")
         if baseline_snapshot
         else None
     )
@@ -279,7 +330,10 @@ def latest_pnl_telegram_payload(
         else None
     )
     baseline_time = (
-        parse_time(baseline_snapshot.get("snapshot_captured_at"))
+        parse_time(tracking_baseline.get("account_baseline_at"))
+        or parse_time(tracking_baseline.get("started_at"))
+        if tracking_baseline is not None
+        else parse_time(baseline_snapshot.get("snapshot_captured_at"))
         if baseline_snapshot
         else None
     )
@@ -664,17 +718,48 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Send the latest confirmed close as a Chinese Telegram summary.",
     )
+    parser.add_argument(
+        "--reset-baseline",
+        action="store_true",
+        help="Start a new persistent PnL period while local state is flat.",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.reset_baseline:
+        try:
+            baseline = reset_pnl_reporting_baseline(asset=args.asset)
+        except RuntimeError as exc:
+            raise SystemExit(f"reset_baseline=FAILED {exc}") from exc
+        print("reset_baseline=PASS")
+        print(f"asset={baseline.get('asset')}")
+        print(f"started_at={baseline.get('started_at')}")
+        print("next_startup_account_snapshot_required=true")
+        return 0
+    tracking_baseline = load_pnl_baseline(PNL_BASELINE)
+    if tracking_baseline is not None and str(
+        tracking_baseline.get("asset") or ""
+    ).upper() != args.asset.upper():
+        tracking_baseline = None
+    if args.since:
+        tracking_baseline = None
     capital_usd = args.capital_usd
     if capital_usd is None:
         capital_usd = to_decimal(os.getenv("PNL_REPORT_CAPITAL_USD"))
+    if capital_usd is None and tracking_baseline is not None:
+        capital_usd = to_decimal(
+            tracking_baseline.get("account_baseline_equity_usd")
+        )
     if capital_usd is not None and capital_usd <= 0:
         raise SystemExit("--capital-usd must be greater than zero")
     since = parse_since(args.since)
+    if since is None and tracking_baseline is not None:
+        since = parse_time(
+            tracking_baseline.get("account_baseline_at")
+            or tracking_baseline.get("started_at")
+        )
     rows = load_rows(args.path, asset=args.asset.upper())
     report = build_report(rows, since=since, capital_usd=capital_usd)
     print_report(report, last_cycles=args.last)
@@ -683,6 +768,7 @@ def main() -> int:
             rows,
             report,
             asset=args.asset,
+            tracking_baseline=tracking_baseline,
         )
         if payload is None:
             raise SystemExit("telegram_latest=FAILED no_confirmed_close")

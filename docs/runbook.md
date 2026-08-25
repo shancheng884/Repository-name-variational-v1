@@ -74,6 +74,18 @@ python tools/pnl_report.py --asset ETH --telegram-latest
 
 This command only reads logs and sends a message. It never submits orders.
 
+Start a new persistent PnL reporting period, excluding all older trades:
+
+```bash
+python tools/pnl_report.py --asset ETH --reset-baseline
+```
+
+Run the reset only while the strategy is stopped and local state is flat. The
+next startup records the initial combined account equity. Confirmed PnL,
+completed cycles, return, and simple annualized return then accumulate from
+that checkpoint across later strategy restarts. Historical logs are retained
+for audit but excluded from the default report.
+
 ## V4 Exit Confirmation
 
 V4 uses the latest executable quote plus two qualifying observations in the

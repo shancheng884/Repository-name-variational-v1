@@ -30,6 +30,12 @@ from rich.panel import Panel
 from rich.table import Table
 
 from tools.lib.telegram_notifier import TelegramNotifier
+from tools.lib.pnl_baseline import (
+    PNL_BASELINE_FILE_NAME,
+    load_pnl_baseline,
+    record_pnl_cycle,
+    set_pnl_account_baseline,
+)
 from variational.listener import (
     CommandBroker,
     HEARTBEAT_STALE_SECONDS,
@@ -1271,6 +1277,9 @@ class VariationalToLighterRuntime:
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
         self.auto_live_state_file = output_dir / AUTO_LIVE_STATE_FILE.name if output_dir else None
         self.live_inventory_state_file = output_dir / LIVE_INVENTORY_STATE_FILE.name if output_dir else None
+        self.live_inventory_pnl_baseline_file = (
+            output_dir / PNL_BASELINE_FILE_NAME if output_dir else None
+        )
         self.live_inventory_sample_index = 0
         self.live_inventory_next_lot_id = 1
         self.live_inventory_open_lots: list[dict[str, Any]] = []
@@ -1356,6 +1365,11 @@ class VariationalToLighterRuntime:
         self.live_inventory_last_actual_pnl_payload: dict[str, Any] | None = None
         self.live_inventory_pnl_account_baseline_equity_usd: Decimal | None = None
         self.live_inventory_pnl_account_baseline_at: str | None = None
+        self.live_inventory_pnl_tracking_started_at: str | None = None
+        self.live_inventory_pnl_tracking_realized_baseline_usd: Decimal | None = None
+        self.live_inventory_pnl_tracking_completed_cycles_baseline: int | None = None
+        self.live_inventory_pnl_tracking_confirmed_pnl_usd: Decimal | None = None
+        self.live_inventory_pnl_tracking_completed_cycles: int | None = None
         self.live_inventory_execution_loss_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_exit_estimate_shortfall_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_strong_single_shortfall_bps_samples: deque[Decimal] = deque(maxlen=20)
@@ -2538,6 +2552,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_shadow_completed_episode_id = (
             state.get("v4_shadow_completed_episode_id") or None
         )
+
         if self.live_inventory_v4_shadow_completed_episode_id:
             legacy_level = self.live_inventory_basis_v4_shadow_level_key(
                 LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_BPS
@@ -2557,6 +2572,46 @@ class VariationalToLighterRuntime:
         )
         self.live_inventory_v4_strong_single_disabled_at = (
             state.get("v4_strong_single_disabled_at") or None
+        )
+
+    def sync_live_inventory_pnl_tracking_baseline(self) -> None:
+        baseline_file = getattr(
+            self,
+            "live_inventory_pnl_baseline_file",
+            None,
+        )
+        if baseline_file is None:
+            return
+        baseline = load_pnl_baseline(baseline_file)
+        if baseline is None:
+            return
+        baseline_asset = str(baseline.get("asset") or "").upper()
+        state_asset = self.live_inventory_state_asset().upper()
+        if baseline_asset and state_asset and baseline_asset != state_asset:
+            return
+        self.live_inventory_pnl_tracking_started_at = (
+            baseline.get("started_at") or None
+        )
+        self.live_inventory_pnl_tracking_realized_baseline_usd = to_decimal(
+            baseline.get("realized_pnl_baseline_usd")
+        )
+        completed_baseline = baseline.get("completed_cycles_baseline")
+        self.live_inventory_pnl_tracking_completed_cycles_baseline = (
+            int(completed_baseline)
+            if completed_baseline is not None
+            else None
+        )
+        self.live_inventory_pnl_tracking_confirmed_pnl_usd = to_decimal(
+            baseline.get("confirmed_pnl_usd")
+        )
+        self.live_inventory_pnl_tracking_completed_cycles = int(
+            baseline.get("tracked_completed_cycles") or 0
+        )
+        self.live_inventory_pnl_account_baseline_equity_usd = to_decimal(
+            baseline.get("account_baseline_equity_usd")
+        )
+        self.live_inventory_pnl_account_baseline_at = (
+            baseline.get("account_baseline_at") or None
         )
 
     def live_inventory_v4_episode_payload(self) -> dict[str, Any]:
@@ -2840,8 +2895,28 @@ class VariationalToLighterRuntime:
             },
         )
         if stage == "startup_flat" and total_equity is not None:
-            self.live_inventory_pnl_account_baseline_equity_usd = total_equity
-            self.live_inventory_pnl_account_baseline_at = captured_at
+            baseline_file = getattr(
+                self,
+                "live_inventory_pnl_baseline_file",
+                None,
+            )
+            tracking_baseline = (
+                load_pnl_baseline(baseline_file)
+                if baseline_file is not None
+                else None
+            )
+            if tracking_baseline is not None:
+                set_pnl_account_baseline(
+                    baseline_file,
+                    combined_equity_usd=total_equity,
+                    captured_at=captured_at,
+                )
+                self.sync_live_inventory_pnl_tracking_baseline()
+            else:
+                self.live_inventory_pnl_account_baseline_equity_usd = (
+                    total_equity
+                )
+                self.live_inventory_pnl_account_baseline_at = captured_at
         if stage == "exit_confirmed_flat":
             await self.append_live_inventory_log(
                 "live_inventory_pnl_summary",
@@ -2883,6 +2958,20 @@ class VariationalToLighterRuntime:
             == "lighter_final_fill_confirmed"
             else None
         )
+        baseline_file = getattr(
+            self,
+            "live_inventory_pnl_baseline_file",
+            None,
+        )
+        if baseline_file is not None and cycle_actual_pnl is not None:
+            record_pnl_cycle(
+                baseline_file,
+                run_id=str(getattr(self, "live_inventory_run_id", "unknown")),
+                asset=asset,
+                lot_id=lot_id,
+                actual_pnl_usd=cycle_actual_pnl,
+            )
+            self.sync_live_inventory_pnl_tracking_baseline()
         realized_pnl = to_decimal(
             getattr(self, "live_inventory_realized_pnl_usd", None)
         )
@@ -2893,8 +2982,28 @@ class VariationalToLighterRuntime:
                 None,
             )
         )
+        tracking_start_pnl = to_decimal(
+            getattr(
+                self,
+                "live_inventory_pnl_tracking_realized_baseline_usd",
+                None,
+            )
+        )
         run_actual_pnl = (
-            realized_pnl - run_start_pnl
+            getattr(
+                self,
+                "live_inventory_pnl_tracking_confirmed_pnl_usd",
+                None,
+            )
+            if getattr(
+                self,
+                "live_inventory_pnl_tracking_confirmed_pnl_usd",
+                None,
+            )
+            is not None
+            else realized_pnl - tracking_start_pnl
+            if realized_pnl is not None and tracking_start_pnl is not None
+            else realized_pnl - run_start_pnl
             if realized_pnl is not None and run_start_pnl is not None
             else cycle_actual_pnl
         )
@@ -2940,10 +3049,17 @@ class VariationalToLighterRuntime:
             and capital_usd > 0
             else None
         )
-        started_at = getattr(
-            self,
-            "live_inventory_pnl_account_baseline_at",
-            None,
+        started_at = (
+            getattr(
+                self,
+                "live_inventory_pnl_account_baseline_at",
+                None,
+            )
+            or getattr(
+                self,
+                "live_inventory_pnl_tracking_started_at",
+                None,
+            )
         )
         started = parse_utc_iso(started_at)
         finished = parse_utc_iso(captured_at)
@@ -2967,16 +3083,30 @@ class VariationalToLighterRuntime:
                 "complete"
                 if account_snapshot_flat
                 and combined_equity_usd is not None
+                and baseline_equity is not None
                 and cycle_actual_pnl is not None
                 else "partial"
             ),
             "account_snapshot_flat": account_snapshot_flat,
             "cycle_actual_pnl_usd": decimal_to_str(cycle_actual_pnl),
             "run_actual_pnl_usd": decimal_to_str(run_actual_pnl),
-            "completed_cycles": getattr(
-                self,
-                "live_inventory_completed_cycles",
-                None,
+            "completed_cycles": (
+                getattr(
+                    self,
+                    "live_inventory_pnl_tracking_completed_cycles",
+                    None,
+                )
+                if getattr(
+                    self,
+                    "live_inventory_pnl_tracking_completed_cycles",
+                    None,
+                )
+                is not None
+                else getattr(
+                    self,
+                    "live_inventory_completed_cycles",
+                    None,
+                )
             ),
             "variational_equity_usd": decimal_to_str(
                 variational_equity_usd
@@ -15601,6 +15731,7 @@ class VariationalToLighterRuntime:
             )
         if self.is_live_inventory_enabled():
             self.sync_live_inventory_memory_from_state()
+            self.sync_live_inventory_pnl_tracking_baseline()
             self.live_inventory_calibration_start_realized_pnl_usd = self.live_inventory_realized_pnl_usd
             self.live_inventory_v4_run_start_realized_pnl_usd = self.live_inventory_realized_pnl_usd
             if not self.live_inventory_dry_decisions:

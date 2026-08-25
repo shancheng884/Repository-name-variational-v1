@@ -15,7 +15,9 @@ from tools.pnl_report import (
     latest_pnl_telegram_payload,
     print_report,
     previous_flat_snapshot,
+    reset_pnl_reporting_baseline,
 )
+from tools.lib.pnl_baseline import load_pnl_baseline, record_pnl_cycle
 
 
 def test_extract_variational_account_metrics_adds_upnl() -> None:
@@ -83,6 +85,111 @@ def test_deduplicated_actual_pnl_requires_confirmed_fill() -> None:
 
     assert len(selected) == 1
     assert selected[0]["actual_pnl_usd"] == "0.20"
+
+
+def test_reset_pnl_reporting_baseline_starts_empty_period(tmp_path) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    baseline_path = tmp_path / "pnl_reporting_baseline.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "flat",
+                "open_lots": [],
+                "pending_actions": [],
+                "realized_pnl_usd": "-0.081547",
+                "completed_cycles": 29,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    baseline = reset_pnl_reporting_baseline(
+        asset="ETH",
+        state_path=state_path,
+        baseline_path=baseline_path,
+        started_at="2026-08-26T00:00:00+00:00",
+    )
+
+    assert baseline["started_at"] == "2026-08-26T00:00:00+00:00"
+    assert baseline["realized_pnl_baseline_usd"] == "-0.081547"
+    assert baseline["completed_cycles_baseline"] == 29
+    assert baseline["confirmed_pnl_usd"] == "0"
+    assert baseline["tracked_completed_cycles"] == 0
+    assert baseline["account_baseline_equity_usd"] is None
+
+
+def test_reset_pnl_reporting_baseline_refuses_open_state(tmp_path) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "open",
+                "open_lots": [{"lot_id": 1}],
+                "pending_actions": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        reset_pnl_reporting_baseline(
+            asset="ETH",
+            state_path=state_path,
+            baseline_path=tmp_path / "pnl_reporting_baseline.json",
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "local_live_inventory_state_not_flat"
+    else:
+        raise AssertionError("open state must refuse PnL baseline reset")
+
+
+def test_pnl_baseline_records_cycles_once_across_runs(tmp_path) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    baseline_path = tmp_path / "pnl_reporting_baseline.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "flat",
+                "open_lots": [],
+                "pending_actions": [],
+                "realized_pnl_usd": "0",
+                "completed_cycles": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    reset_pnl_reporting_baseline(
+        asset="ETH",
+        state_path=state_path,
+        baseline_path=baseline_path,
+    )
+
+    record_pnl_cycle(
+        baseline_path,
+        run_id="run-1",
+        asset="ETH",
+        lot_id=1,
+        actual_pnl_usd="0.01",
+    )
+    record_pnl_cycle(
+        baseline_path,
+        run_id="run-1",
+        asset="ETH",
+        lot_id=1,
+        actual_pnl_usd="0.01",
+    )
+    record_pnl_cycle(
+        baseline_path,
+        run_id="run-2",
+        asset="ETH",
+        lot_id=1,
+        actual_pnl_usd="-0.004",
+    )
+
+    baseline = load_pnl_baseline(baseline_path)
+    assert baseline is not None
+    assert baseline["confirmed_pnl_usd"] == "0.006"
+    assert baseline["tracked_completed_cycles"] == 2
 
 
 def test_build_report_falls_back_to_first_complete_snapshot_capital() -> None:
@@ -237,6 +344,54 @@ def test_latest_pnl_telegram_payload_uses_latest_confirmed_cycle() -> None:
     assert payload["return_pnl_source"] == "account_equity_delta"
 
 
+def test_latest_pnl_telegram_payload_accumulates_tracking_period() -> None:
+    rows = [
+        {
+            "event": "live_inventory_actual_pnl",
+            "run_id": "run-1",
+            "asset": "ETH",
+            "lot_id": 1,
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "actual_pnl_usd": "0.01",
+            "logged_at": "2026-08-26T01:00:00+00:00",
+        },
+        {
+            "event": "live_inventory_actual_pnl",
+            "run_id": "run-2",
+            "asset": "ETH",
+            "lot_id": 1,
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "actual_pnl_usd": "-0.004",
+            "logged_at": "2026-08-27T01:00:00+00:00",
+        },
+    ]
+    tracking_baseline = {
+        "asset": "ETH",
+        "started_at": "2026-08-26T00:00:00+00:00",
+        "account_baseline_equity_usd": None,
+        "account_baseline_at": None,
+    }
+    report = build_report(
+        rows,
+        since=datetime(2026, 8, 26, tzinfo=timezone.utc),
+        capital_usd=Decimal("35"),
+    )
+
+    payload = latest_pnl_telegram_payload(
+        rows,
+        report,
+        asset="ETH",
+        tracking_baseline=tracking_baseline,
+    )
+
+    assert payload is not None
+    assert payload["cycle_actual_pnl_usd"] == "-0.004"
+    assert payload["run_actual_pnl_usd"] == "0.006"
+    assert payload["completed_cycles"] == 2
+    assert payload["return_pnl_source"] == "confirmed_pair_fills"
+    assert Decimal(payload["return_pct"]) > 0
+
+
 def test_account_snapshot_logs_normalized_equity_without_raw_account(
     tmp_path,
 ) -> None:
@@ -340,3 +495,77 @@ def test_live_pnl_summary_uses_account_change_for_annualized_return(
     assert non_flat_payload["summary_status"] == "partial"
     assert non_flat_payload["account_net_change_usd"] is None
     assert non_flat_payload["return_pnl_source"] == "confirmed_pair_fills"
+
+
+def test_live_pnl_summary_persists_tracking_across_runs(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("PNL_REPORT_CAPITAL_USD", raising=False)
+    state_path = tmp_path / "live_inventory_state.json"
+    baseline_path = tmp_path / "pnl_reporting_baseline.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "flat",
+                "open_lots": [],
+                "pending_actions": [],
+                "realized_pnl_usd": "0",
+                "completed_cycles": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    reset_pnl_reporting_baseline(
+        asset="ETH",
+        state_path=state_path,
+        baseline_path=baseline_path,
+        started_at="2026-08-25T00:00:00+00:00",
+    )
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_pnl_baseline_file = baseline_path
+    runtime.live_allowed_assets = {"ETH"}
+    runtime.live_inventory_open_lots = []
+    runtime.live_inventory_realized_pnl_usd = Decimal("0")
+    runtime.live_inventory_v4_run_start_realized_pnl_usd = Decimal("0")
+    runtime.live_inventory_completed_cycles = 0
+    runtime.live_inventory_pnl_account_baseline_equity_usd = None
+    runtime.live_inventory_pnl_account_baseline_at = None
+    runtime.live_inventory_pnl_tracking_confirmed_pnl_usd = None
+    runtime.live_inventory_pnl_tracking_completed_cycles = None
+    runtime.sync_live_inventory_pnl_tracking_baseline()
+
+    runtime.live_inventory_run_id = "run-1"
+    runtime.live_inventory_last_actual_pnl_payload = {
+        "lot_id": 1,
+        "actual_pnl_status": "lighter_final_fill_confirmed",
+        "actual_pnl_usd": "0.01",
+    }
+    first = runtime.live_inventory_pnl_summary_payload(
+        asset="ETH",
+        lot_id=1,
+        variational_equity_usd=None,
+        lighter_equity_usd=None,
+        combined_equity_usd=None,
+        captured_at="2026-08-26T00:00:00+00:00",
+    )
+
+    runtime.live_inventory_run_id = "run-2"
+    runtime.live_inventory_last_actual_pnl_payload = {
+        "lot_id": 1,
+        "actual_pnl_status": "lighter_final_fill_confirmed",
+        "actual_pnl_usd": "-0.004",
+    }
+    second = runtime.live_inventory_pnl_summary_payload(
+        asset="ETH",
+        lot_id=1,
+        variational_equity_usd=None,
+        lighter_equity_usd=None,
+        combined_equity_usd=None,
+        captured_at="2026-08-27T00:00:00+00:00",
+    )
+
+    assert first["run_actual_pnl_usd"] == "0.01"
+    assert first["completed_cycles"] == 1
+    assert second["run_actual_pnl_usd"] == "0.006"
+    assert second["completed_cycles"] == 2
