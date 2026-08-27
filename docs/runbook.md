@@ -102,10 +102,9 @@ python tools/analyze.py --tail 30000 --asset ETH | grep -E \
 '^(process=|state=|exit_confirmation_policy=|exit_submit_mode=|exit_block_reasons=|operational_readiness=)'
 ```
 
-V4 blocks new UTC-weekend entries by default. A bounded weekend test must use
-both `--v4-test-skip-recent-health` and `--v4-test-allow-weekend`. Never add the
-weekend flag to the default daily command; it enables real orders and is logged
-as a test bypass.
+V4 trades continuously on UTC weekends. The same multi-window threshold logic
+applies, with a conservative six-hour boundary transition at weekend start and
+end. The legacy weekend flag is not needed in new commands.
 
 ## Notes
 
@@ -163,3 +162,84 @@ cycles:
 ```bash
 python tools/analyze.py --tail 50000 --asset ETH | grep '^shadow_gradient_levels='
 ```
+
+### Five-tier real gradient and account risk
+
+`--v4-real-gradient` is an explicit real-order mode. It uses five dynamic
+historical-percentile tiers. Each order remains fixed at USD 20. Tier N permits
+cumulative one-sided notional up to N times the smaller venue equity, capped at
+5x per venue. Every child order requires a fresh quote and confirmation of the
+previous pair of fills. There is no fixed delay between children. Each venue
+uses a rolling 60-second request window with normal capacity reserved below the
+hard capacity so reduce-only exits remain available. It is mutually exclusive
+with `--v4-shadow-gradient`.
+
+Every candidate entry is checked against fresh account data. The hard leverage
+limit is 5x on each venue independently, not 5x on combined gross notional.
+Operational actions use maintenance-margin usage: 40% warns, 50% blocks new
+entries, 60% reduces one child lot, and 75% requests emergency exit. An equity
+imbalance near 20% warns and near 30% blocks entries because the smaller venue
+limits paired capacity. After balances recover, fresh account data restores
+entry permission automatically. Account risk is refreshed every 5 seconds
+while a position is open and every 15 seconds while flat. If a venue omits
+maintenance-margin data, the engine uses a conservative venue-specific fallback
+rate instead of disabling the risk ladder.
+
+When several confirmed child lots jointly reach the executable net target, the
+engine quantity-weights their entry fills and submits one total reduce-only
+order to each venue. All component IDs remain in the audit payload. If the live
+edge falls to a lower tier before the whole basket reaches target, partial
+de-tiering may remove the newest, highest-tier excess lots only when the removed
+basket itself reaches the normal net target and removed realized plus remaining
+executable unrealized PnL is not negative.
+
+V4 has no time-driven exit and does not relax its profit target based on holding
+time. Executable profit, the independent unrealized-loss fuse, and account-risk
+actions are the only exit triggers. The V4 launcher uses a wider 50 bps
+unrealized-loss fuse; this is a last-resort strategy anomaly guard, not the
+normal exit condition.
+
+Variational account data must have a valid `published_at` no older than 60
+seconds. A stale snapshot is logged as partial, is excluded from account PnL and
+capital baselines, and pauses new entries/add-ons without forcing an open
+position to close.
+
+External deposits and withdrawals are detected again after every complete,
+confirmed flat exit snapshot, not only at startup. The current cycle PnL is
+recorded before unexplained equity change is classified as external cash flow.
+
+V4 trades continuously across UTC weekends. A simple six-hour boundary marker
+keeps the multi-window threshold conservative around weekend start and end.
+The old weekend test flag remains accepted only for command compatibility.
+
+Before increasing either venue to USD 100, stop the strategy and confirm both
+venues are flat. Make both deposits, then reset the PnL baseline once so the
+cash inflow is not counted as strategy profit:
+
+```bash
+python tools/pnl_report.py --asset ETH --reset-baseline
+```
+
+Start the five-tier mode only after the new startup account snapshot shows
+both venue equities near USD 100:
+
+```bash
+python tools/live.py --asset ETH --v4-live --v4-real-gradient \
+  --v4-test-skip-recent-health --v4-test-max-cycles 3 \
+  --reset-state-after-manual-flat
+```
+# Automatic margin rebalance
+
+The implementation contract and safety state machine are documented in
+`docs/automatic_margin_rebalance.md`. Execution remains disabled until both
+venue adapters have verified official transfer and finality paths.
+
+Validate the five percentile tiers on a chronological holdout:
+
+```bash
+python tools/validate_gradient_tiers.py --asset ETH
+```
+
+The first 70% of samples fits thresholds; the final 30% reports crossings and
+six-hour 1/2/4 bps reversion hit rates. The tool is offline and never feeds its
+output into the live process.

@@ -249,6 +249,28 @@ def test_live_tool_v4_shadow_gradient_remains_one_real_lot(monkeypatch) -> None:
     assert "--live-inventory-i-accept-basis-addon-diagnostic" not in command
 
 
+def test_live_tool_v4_real_gradient_enables_five_dynamic_tiers(monkeypatch) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(v4_live_mode=True),
+        v4_real_gradient=True,
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_basis_v4_real_gradient is True
+    assert args.live_inventory_max_lots == 0
+    assert args.live_inventory_max_total_lots == 0
+    assert args.live_inventory_max_total_notional_usd == 0
+    assert args.live_inventory_max_venue_leverage == 5
+    assert args.live_inventory_margin_block_entry_pct == 50
+    assert args.live_inventory_max_unrealized_loss_bps == 50
+    assert "--live-inventory-i-accept-basis-addon-diagnostic" in command
+    assert args.live_inventory_equity_balance_warning_ratio == 0.82
+    assert args.live_inventory_equity_balance_block_ratio == 0.74
+
+
 def test_live_tool_v4_batch_is_sequential_bounded_and_guarded(
     monkeypatch,
 ) -> None:

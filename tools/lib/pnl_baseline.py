@@ -57,6 +57,8 @@ def new_pnl_baseline(
         "counted_cycle_keys": [],
         "account_baseline_equity_usd": None,
         "account_baseline_at": None,
+        "external_cashflow_usd": "0",
+        "external_cashflow_events": [],
     }
 
 
@@ -108,6 +110,42 @@ def record_pnl_cycle(
         )
         + 1,
         "counted_cycle_keys": [*counted, cycle_key][-1000:],
+    }
+    write_pnl_baseline(path, updated)
+    return load_pnl_baseline(path)
+
+
+def record_external_cashflow(
+    path: Path,
+    *,
+    amount_usd: Any,
+    observed_at: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    baseline = load_pnl_baseline(path)
+    if baseline is None:
+        return None
+    try:
+        amount = Decimal(str(amount_usd))
+        cumulative = Decimal(str(baseline.get("external_cashflow_usd") or "0"))
+    except (InvalidOperation, TypeError, ValueError):
+        return baseline
+    events = [
+        value
+        for value in list(baseline.get("external_cashflow_events") or [])
+        if isinstance(value, dict)
+    ]
+    updated = {
+        **baseline,
+        "external_cashflow_usd": str(cumulative + amount),
+        "external_cashflow_events": [
+            *events,
+            {
+                "amount_usd": str(amount),
+                "observed_at": observed_at,
+                "reason": reason,
+            },
+        ][-100:],
     }
     write_pnl_baseline(path, updated)
     return load_pnl_baseline(path)

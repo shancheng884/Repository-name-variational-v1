@@ -22,10 +22,10 @@ def test_telegram_entry_message_contains_execution_details() -> None:
         },
     )
 
-    assert "[Var/Lighter] OPEN" in message
-    assert "asset=ETH direction=short_var_long_lighter" in message
-    assert "edge_bps=-7.1" in message
-    assert "run_id=" not in message
+    assert "[Var/Lighter] 开仓确认" in message
+    assert "资产：ETH｜方向：做空 Variational / 做多 Lighter" in message
+    assert "开仓价差：-7.1 bps" in message
+    assert "运行编号" not in message
 
 
 def test_telegram_pushes_final_pnl_and_throttles_repeated_failures() -> None:
@@ -84,9 +84,9 @@ def test_telegram_final_pnl_message_contains_final_values() -> None:
         },
     )
 
-    assert "[Var/Lighter] FINAL PNL" in message
-    assert "pnl_usd=0.01" in message
-    assert "pnl_bps=5.0" in message
+    assert "[Var/Lighter] 最终成交盈亏" in message
+    assert "实际盈亏：0.01 U" in message
+    assert "实际收益：5.0 bps" in message
 
 
 def test_telegram_account_snapshot_contains_both_venues() -> None:
@@ -103,11 +103,11 @@ def test_telegram_account_snapshot_contains_both_venues() -> None:
         },
     )
 
-    assert "[Var/Lighter] ACCOUNT SNAPSHOT" in message
-    assert "stage=exit_confirmed_flat" in message
-    assert "variational_equity_usd=14.85" in message
-    assert "lighter_equity_usd=20.25" in message
-    assert "combined_equity_usd=35.10" in message
+    assert "[Var/Lighter] 账户权益快照" in message
+    assert "阶段：平仓确认" in message
+    assert "Variational 权益：14.85 U" in message
+    assert "Lighter 权益：20.25 U" in message
+    assert "双边总权益：35.10 U" in message
 
 
 def test_telegram_pnl_summary_contains_profit_and_annualized_return() -> None:
@@ -192,10 +192,53 @@ def test_telegram_strong_single_fallback_message_contains_action() -> None:
         },
     )
 
-    assert "[Var/Lighter] EXIT MODE FALLBACK" in message
-    assert "actual_pnl_bps=-2.50" in message
-    assert "strong_reserve_bps=6.00" in message
-    assert "action=fallback_to_latest_and_2_of_3" in message
+    assert "[Var/Lighter] 平仓确认模式已降级" in message
+    assert "实际收益：-2.50 bps" in message
+    assert "强单次确认预留：6.00 bps" in message
+    assert "动作：fallback_to_latest_and_2_of_3" in message
+
+
+def test_telegram_account_risk_alert_is_chinese() -> None:
+    message = format_telegram_trade_message(
+        "live_inventory_account_risk_alert",
+        {
+            "asset": "ETH",
+            "risk_reason": "venue_equity_imbalance_warning",
+            "risk_action": "warning",
+            "variational_equity_usd": "100",
+            "lighter_equity_usd": "70",
+            "equity_balance_ratio": "0.70",
+            "max_projected_venue_leverage": "2.0",
+            "max_maintenance_margin_usage_pct": "35",
+        },
+    )
+
+    assert "[Var/Lighter] 账户风险提醒" in message
+    assert "双边权益不均衡" in message
+    assert "动作：仅提醒" in message
+    assert "最高单边预计杠杆：2.0x / 5x" in message
+
+
+def test_telegram_account_risk_throttle_distinguishes_risk_reasons() -> None:
+    notifier = TelegramNotifier(
+        bot_token="secret-token",
+        chat_id="123",
+        logger=logging.getLogger("test_telegram"),
+        throttle_seconds=300,
+    )
+
+    assert notifier.enqueue(
+        "live_inventory_account_risk_alert",
+        {"asset": "ETH", "risk_reason": "venue_equity_imbalance_warning"},
+    ) is True
+    assert notifier.enqueue(
+        "live_inventory_account_risk_alert",
+        {"asset": "ETH", "risk_reason": "venue_equity_imbalance_warning"},
+    ) is False
+    assert notifier.enqueue(
+        "live_inventory_account_risk_alert",
+        {"asset": "ETH", "risk_reason": "maintenance_margin_usage_warning"},
+    ) is True
 
 
 def test_telegram_only_pushes_critical_exit_cost_block() -> None:
@@ -233,9 +276,9 @@ def test_telegram_only_pushes_critical_exit_cost_block() -> None:
 
     event_type, payload = notifier.queue.get_nowait()
     message = format_telegram_trade_message(event_type, payload)
-    assert "[Var/Lighter] EXIT BLOCKED" in message
-    assert "reason=entry_final_fill_cost_pending" in message
-    assert "pnl_bps=4.37" in message
+    assert "[Var/Lighter] 平仓条件未满足" in message
+    assert "原因：entry_final_fill_cost_pending" in message
+    assert "当前预计收益：4.37 bps" in message
 
 
 def test_telegram_worker_sends_queued_event_without_exposing_token(

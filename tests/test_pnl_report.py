@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from main import (
     VariationalToLighterRuntime,
+    account_risk_context,
     extract_lighter_account_metrics,
     extract_variational_account_metrics,
 )
@@ -17,7 +18,11 @@ from tools.pnl_report import (
     previous_flat_snapshot,
     reset_pnl_reporting_baseline,
 )
-from tools.lib.pnl_baseline import load_pnl_baseline, record_pnl_cycle
+from tools.lib.pnl_baseline import (
+    load_pnl_baseline,
+    record_external_cashflow,
+    record_pnl_cycle,
+)
 
 
 def test_extract_variational_account_metrics_adds_upnl() -> None:
@@ -36,7 +41,7 @@ def test_extract_variational_account_metrics_adds_upnl() -> None:
     assert metrics["equity_formula"] == "balance_plus_upnl"
 
 
-def test_extract_lighter_account_metrics_uses_collateral() -> None:
+def test_extract_lighter_account_metrics_uses_total_asset_value() -> None:
     metrics = extract_lighter_account_metrics(
         {
             "accounts": [
@@ -44,6 +49,8 @@ def test_extract_lighter_account_metrics_uses_collateral() -> None:
                     "collateral": "20.25",
                     "available_balance": "19.00",
                     "total_asset_value": "20.50",
+                    "cross_initial_margin_requirement": "4.10",
+                    "cross_maintenance_margin_requirement": "2.05",
                 }
             ]
         }
@@ -52,7 +59,53 @@ def test_extract_lighter_account_metrics_uses_collateral() -> None:
     assert metrics["collateral_usd"] == Decimal("20.25")
     assert metrics["available_balance_usd"] == Decimal("19.00")
     assert metrics["total_asset_value_usd"] == Decimal("20.50")
-    assert metrics["equity_usd"] == Decimal("20.25")
+    assert metrics["equity_usd"] == Decimal("20.50")
+    assert metrics["equity_formula"] == "total_asset_value"
+    assert metrics["initial_margin_usage_pct"] == Decimal("20")
+    assert metrics["maintenance_margin_usage_pct"] == Decimal("10")
+
+
+def test_account_risk_context_enforces_per_venue_leverage_and_balance() -> None:
+    context = account_risk_context(
+        variational_metrics={"equity_usd": Decimal("100")},
+        lighter_metrics={"equity_usd": Decimal("40")},
+        current_notional_usd=Decimal("180"),
+        proposed_notional_usd=Decimal("220"),
+        max_venue_leverage=Decimal("5"),
+        margin_warning_pct=Decimal("40"),
+        margin_block_entry_pct=Decimal("50"),
+        margin_reduce_pct=Decimal("60"),
+        margin_emergency_pct=Decimal("75"),
+        balance_warning_ratio=Decimal("0.80"),
+        balance_block_ratio=Decimal("0.50"),
+    )
+
+    assert context["risk_action"] == "block_entry"
+    assert context["risk_reason"] == "venue_leverage_exceeds_hard_entry_limit"
+    assert context["lighter_projected_leverage"] == "5.5"
+
+
+def test_account_risk_context_builds_manual_rebalance_plan() -> None:
+    context = account_risk_context(
+        variational_metrics={"equity_usd": Decimal("100")},
+        lighter_metrics={"equity_usd": Decimal("70")},
+        current_notional_usd=Decimal("20"),
+        proposed_notional_usd=Decimal("40"),
+        max_venue_leverage=Decimal("5"),
+        margin_warning_pct=Decimal("40"),
+        margin_block_entry_pct=Decimal("50"),
+        margin_reduce_pct=Decimal("60"),
+        margin_emergency_pct=Decimal("75"),
+        balance_warning_ratio=Decimal("0.82"),
+        balance_block_ratio=Decimal("0.74"),
+    )
+
+    assert context["risk_action"] == "block_entry"
+    assert context["risk_reason"] == "venue_equity_imbalance_blocks_entry"
+    assert context["rebalance_from_venue"] == "variational"
+    assert context["rebalance_to_venue"] == "lighter"
+    assert context["rebalance_suggested_amount_usd"] == "12.2375"
+    assert context["rebalance_target_imbalance_pct"] == "6.5"
 
 
 def test_deduplicated_actual_pnl_requires_confirmed_fill() -> None:
@@ -190,6 +243,41 @@ def test_pnl_baseline_records_cycles_once_across_runs(tmp_path) -> None:
     assert baseline is not None
     assert baseline["confirmed_pnl_usd"] == "0.006"
     assert baseline["tracked_completed_cycles"] == 2
+
+
+def test_pnl_baseline_records_external_cashflow_separately(tmp_path) -> None:
+    baseline_path = tmp_path / "pnl_reporting_baseline.json"
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "flat",
+                "open_lots": [],
+                "pending_actions": [],
+                "realized_pnl_usd": "0",
+                "completed_cycles": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    reset_pnl_reporting_baseline(
+        asset="ETH",
+        state_path=state_path,
+        baseline_path=baseline_path,
+        started_at="2026-08-26T00:00:00+00:00",
+    )
+
+    record_external_cashflow(
+        baseline_path,
+        amount_usd="170",
+        observed_at="2026-08-27T00:00:00+00:00",
+        reason="test_deposit",
+    )
+
+    baseline = load_pnl_baseline(baseline_path)
+    assert baseline is not None
+    assert baseline["external_cashflow_usd"] == "170"
+    assert baseline["external_cashflow_events"][-1]["reason"] == "test_deposit"
 
 
 def test_build_report_falls_back_to_first_complete_snapshot_capital() -> None:
@@ -416,7 +504,7 @@ def test_account_snapshot_logs_normalized_equity_without_raw_account(
                 portfolio_summary={
                     "balance": "14.80",
                     "upnl": "0.05",
-                    "published_at": "2026-08-25T00:00:00+00:00",
+                    "published_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
         )
@@ -437,10 +525,86 @@ def test_account_snapshot_logs_normalized_equity_without_raw_account(
 
         row = json.loads(runtime.orders_file.read_text(encoding="utf-8"))
         assert row["snapshot_status"] == "complete"
+        assert row["variational_snapshot_fresh"] is True
         assert row["variational_equity_usd"] == "14.85"
         assert row["lighter_equity_usd"] == "20.25"
         assert row["combined_equity_usd"] == "35.10"
         assert "must-not-be-logged" not in json.dumps(row)
+
+    asyncio.run(run())
+
+
+def test_exit_flat_snapshot_detects_runtime_deposit_after_cycle_pnl(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        baseline_path = tmp_path / "pnl_reporting_baseline.json"
+        baseline_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "asset": "ETH",
+                    "started_at": "2026-08-27T00:00:00+00:00",
+                    "realized_pnl_baseline_usd": "0",
+                    "completed_cycles_baseline": 0,
+                    "confirmed_pnl_usd": "0",
+                    "tracked_completed_cycles": 0,
+                    "counted_cycle_keys": [],
+                    "account_baseline_equity_usd": "100",
+                    "account_baseline_at": "2026-08-27T00:00:00+00:00",
+                    "external_cashflow_usd": "0",
+                    "external_cashflow_events": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.mode = "live"
+        runtime.live_inventory_dry_decisions = False
+        runtime.live_inventory_run_id = "run-deposit"
+        runtime.live_inventory_schema_version = "2"
+        runtime.live_inventory_strategy_version = "test"
+        runtime.live_inventory_strategy_variant = "test"
+        runtime.live_inventory_config_hash = "test"
+        runtime.live_inventory_open_lots = []
+        runtime.live_inventory_realized_pnl_usd = Decimal("2")
+        runtime.live_inventory_v4_run_start_realized_pnl_usd = Decimal("0")
+        runtime.live_inventory_completed_cycles = 1
+        runtime.live_inventory_pnl_baseline_file = baseline_path
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_last_actual_pnl_payload = {
+            "lot_id": 7,
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "actual_pnl_usd": "2",
+        }
+        runtime.orders_file = tmp_path / "order_metrics.jsonl"
+        runtime._order_write_lock = asyncio.Lock()
+        runtime.telegram_notifier = None
+        runtime.runtime = SimpleNamespace(
+            monitor=SimpleNamespace(
+                _lock=asyncio.Lock(),
+                portfolio_summary={
+                    "balance": "50",
+                    "upnl": "0",
+                    "published_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        )
+        runtime.sync_live_inventory_pnl_tracking_baseline()
+
+        await runtime.capture_live_inventory_account_snapshot(
+            stage="exit_confirmed_flat",
+            asset="ETH",
+            lot_id=7,
+            lighter_account_result={"accounts": [{"collateral": "72"}]},
+        )
+
+        baseline = load_pnl_baseline(baseline_path)
+        assert baseline["confirmed_pnl_usd"] == "2"
+        assert baseline["external_cashflow_usd"] == "20"
+        assert baseline["external_cashflow_events"][-1]["reason"] == (
+            "runtime_flat_unexplained_equity_change"
+        )
 
     asyncio.run(run())
 

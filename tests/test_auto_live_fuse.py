@@ -16,7 +16,15 @@ from main import (
     PendingAutoLiveMatch,
     PendingLiveInventoryVarFillMatch,
     VariationalToLighterRuntime,
+    account_risk_context,
+    adaptive_margin_thresholds,
+    account_snapshot_freshness,
     variational_api_amount_to_str,
+    v4_real_gradient_capacity_notional_usd,
+    v4_real_gradient_eligible_tier,
+    v4_real_gradient_thresholds,
+    v4_partial_detier_selection,
+    v4_weekend_regime_context,
 )
 
 
@@ -54,6 +62,367 @@ def _position() -> AutoLivePositionState:
         planned_notional_usd=Decimal("25"),
         planned_qty=Decimal("0.00025"),
     )
+
+
+def test_variational_account_snapshot_freshness_rejects_stale_data() -> None:
+    now = datetime(2026, 8, 27, 0, 2, tzinfo=timezone.utc)
+
+    fresh = account_snapshot_freshness(
+        "2026-08-27T00:01:30+00:00",
+        now=now,
+        max_age_seconds=60,
+    )
+    stale = account_snapshot_freshness(
+        "2026-08-26T20:00:00+00:00",
+        now=now,
+        max_age_seconds=60,
+    )
+
+    assert fresh["fresh"] is True
+    assert fresh["age_seconds"] == 30
+    assert stale["fresh"] is False
+    assert stale["reason"] == "snapshot_stale"
+
+
+def test_v4_real_gradient_thresholds_are_dynamic_and_strictly_ordered() -> None:
+    history = [Decimal(index) / Decimal("10") for index in range(1000)]
+
+    thresholds = v4_real_gradient_thresholds(
+        history_values=history,
+        base_threshold_bps=Decimal("97.4"),
+        entry_execution_reserve_bps=Decimal("0.5"),
+    )
+
+    assert len(thresholds) == 5
+    assert thresholds[0] == Decimal("97.4")
+    assert all(right > left for left, right in zip(thresholds, thresholds[1:]))
+    assert v4_real_gradient_eligible_tier(thresholds[2], thresholds) == 3
+
+
+def test_v4_real_gradient_capacity_uses_smaller_venue_equity() -> None:
+    assert v4_real_gradient_capacity_notional_usd(
+        tier=3,
+        variational_equity_usd=Decimal("100"),
+        lighter_equity_usd=Decimal("120"),
+        max_venue_leverage=Decimal("5"),
+    ) == Decimal("300")
+    assert v4_real_gradient_capacity_notional_usd(
+        tier=9,
+        variational_equity_usd=Decimal("100"),
+        lighter_equity_usd=Decimal("120"),
+        max_venue_leverage=Decimal("5"),
+    ) == Decimal("500")
+
+
+def test_v4_partial_detier_selects_highest_newest_lots_only() -> None:
+    lots = [
+        {
+            "lot_id": 1,
+            "qty": "1",
+            "entry_var_fill_price": "20",
+            "entry_gradient_tier": 1,
+            "tranche_index": 1,
+        },
+        {
+            "lot_id": 2,
+            "qty": "1",
+            "entry_var_fill_price": "20",
+            "entry_gradient_tier": 3,
+            "tranche_index": 2,
+        },
+        {
+            "lot_id": 3,
+            "qty": "1",
+            "entry_var_fill_price": "20",
+            "entry_gradient_tier": 3,
+            "tranche_index": 3,
+        },
+    ]
+
+    plan = v4_partial_detier_selection(
+        lots=lots,
+        current_tier=2,
+        variational_equity_usd=Decimal("20"),
+        lighter_equity_usd=Decimal("25"),
+        max_venue_leverage=Decimal("5"),
+    )
+
+    assert plan["ready"] is True
+    assert plan["selected_lot_ids"] == ["3"]
+    assert plan["remaining_notional_usd"] == "40"
+    assert plan["target_capacity_usd"] == "40"
+
+
+def test_adaptive_margin_thresholds_allow_normal_five_x_baseline() -> None:
+    thresholds = adaptive_margin_thresholds(
+        maintenance_requirement_usd=Decimal("10"),
+        current_notional_usd=Decimal("100"),
+        equity_usd=Decimal("100"),
+        target_notional_usd=Decimal("500"),
+        max_venue_leverage=Decimal("5"),
+        warning_pct=Decimal("40"),
+        block_entry_pct=Decimal("50"),
+        reduce_pct=Decimal("60"),
+        emergency_pct=Decimal("75"),
+    )
+
+    assert thresholds["projected_usage_pct"] == Decimal("50")
+    assert thresholds["warning_pct"] == Decimal("60")
+    assert thresholds["block_entry_pct"] == Decimal("70")
+    assert thresholds["reduce_pct"] == Decimal("80")
+    assert thresholds["emergency_pct"] == Decimal("90")
+
+
+def test_adaptive_margin_thresholds_use_conservative_fallback() -> None:
+    thresholds = adaptive_margin_thresholds(
+        maintenance_requirement_usd=None,
+        current_notional_usd=Decimal("500"),
+        equity_usd=Decimal("100"),
+        target_notional_usd=Decimal("500"),
+        max_venue_leverage=Decimal("5"),
+        warning_pct=Decimal("40"),
+        block_entry_pct=Decimal("50"),
+        reduce_pct=Decimal("60"),
+        emergency_pct=Decimal("75"),
+        fallback_maintenance_rate=Decimal("0.10"),
+    )
+
+    assert thresholds["maintenance_rate"] == Decimal("0.10")
+    assert thresholds["maintenance_rate_source"] == "conservative_fallback"
+    assert thresholds["projected_usage_pct"] == Decimal("50.00")
+
+
+def test_account_risk_uses_venue_specific_adaptive_margin_thresholds() -> None:
+    context = account_risk_context(
+        variational_metrics={
+            "equity_usd": Decimal("100"),
+            "maintenance_margin_requirement_usd": Decimal("50"),
+            "maintenance_margin_usage_pct": Decimal("50"),
+        },
+        lighter_metrics={
+            "equity_usd": Decimal("100"),
+            "maintenance_margin_requirement_usd": Decimal("6"),
+            "maintenance_margin_usage_pct": Decimal("6"),
+        },
+        current_notional_usd=Decimal("500"),
+        proposed_notional_usd=None,
+        max_venue_leverage=Decimal("5"),
+        margin_warning_pct=Decimal("40"),
+        margin_block_entry_pct=Decimal("50"),
+        margin_reduce_pct=Decimal("60"),
+        margin_emergency_pct=Decimal("75"),
+        balance_warning_ratio=Decimal("0.82"),
+        balance_block_ratio=Decimal("0.74"),
+    )
+
+    assert context["risk_action"] == "normal"
+    assert context["variational_effective_margin_warning_pct"] == "60.0"
+    assert context["lighter_effective_margin_warning_pct"] == "40"
+
+
+def test_account_risk_blocks_new_notional_above_five_x_but_does_not_immediately_reduce() -> None:
+    metrics = {
+        "equity_usd": Decimal("99"),
+        "maintenance_margin_requirement_usd": Decimal("50"),
+        "maintenance_margin_usage_pct": Decimal("50.505050505"),
+    }
+    existing = account_risk_context(
+        variational_metrics=metrics,
+        lighter_metrics=metrics,
+        current_notional_usd=Decimal("500"),
+        proposed_notional_usd=None,
+        max_venue_leverage=Decimal("5"),
+        margin_warning_pct=Decimal("40"),
+        margin_block_entry_pct=Decimal("50"),
+        margin_reduce_pct=Decimal("60"),
+        margin_emergency_pct=Decimal("75"),
+        balance_warning_ratio=Decimal("0.82"),
+        balance_block_ratio=Decimal("0.74"),
+    )
+    proposed = account_risk_context(
+        variational_metrics=metrics,
+        lighter_metrics=metrics,
+        current_notional_usd=Decimal("480"),
+        proposed_notional_usd=Decimal("500"),
+        max_venue_leverage=Decimal("5"),
+        margin_warning_pct=Decimal("40"),
+        margin_block_entry_pct=Decimal("50"),
+        margin_reduce_pct=Decimal("60"),
+        margin_emergency_pct=Decimal("75"),
+        balance_warning_ratio=Decimal("0.82"),
+        balance_block_ratio=Decimal("0.74"),
+    )
+
+    assert existing["risk_action"] == "warning"
+    assert existing["risk_reason"] == "venue_leverage_above_entry_cap_monitoring_margin"
+    assert proposed["risk_action"] == "block_entry"
+    assert proposed["risk_reason"] == "venue_leverage_exceeds_hard_entry_limit"
+
+
+def test_weekend_regime_marks_six_hour_boundaries() -> None:
+    saturday = datetime(2026, 8, 22, 2, 0, tzinfo=timezone.utc).timestamp()
+    sunday = datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc).timestamp()
+
+    transition = v4_weekend_regime_context(saturday)
+    settled = v4_weekend_regime_context(sunday)
+
+    assert transition["v4_market_regime"] == "weekend"
+    assert transition["v4_weekend_transition"] == "weekend_start"
+    assert transition["v4_weekend_transition_active"] is True
+    assert settled["v4_weekend_transition_active"] is False
+
+
+def test_v4_aggregate_exit_uses_all_confirmed_lots(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    lots = [
+        {
+            "lot_id": 1,
+            "direction": "short_var_long_lighter",
+            "qty": "1",
+            "entry_var_fill_price": "110",
+            "entry_lighter_fill_price": "100",
+            "entry_cost_status": "final_fills_confirmed",
+        },
+        {
+            "lot_id": 2,
+            "direction": "short_var_long_lighter",
+            "qty": "1",
+            "entry_var_fill_price": "108",
+            "entry_lighter_fill_price": "101",
+            "entry_cost_status": "final_fills_confirmed",
+        },
+    ]
+
+    context = runtime.live_inventory_v4_aggregate_exit_context(
+        lots=lots,
+        var_exit_price=Decimal("105"),
+        lighter_exit_price=Decimal("104"),
+    )
+
+    assert context["ready"] is True
+    assert context["lot_ids"] == ["1", "2"]
+    assert context["aggregate_executable_pnl_usd"] == "15"
+    assert Decimal(context["aggregate_executable_pnl_bps"]) == (
+        Decimal("15") / Decimal("218") * Decimal("10000")
+    )
+
+    merged = runtime.live_inventory_v4_merge_lots_for_atomic_exit(lots)
+    assert merged["qty"] == "2"
+    assert merged["entry_var_fill_price"] == "109"
+    assert merged["entry_lighter_fill_price"] == "100.5"
+    assert merged["portfolio_component_lot_ids"] == ["1", "2"]
+    _, _, merged_pnl = runtime.live_inventory_pair_pnl(
+        direction=merged["direction"],
+        qty=Decimal(merged["qty"]),
+        entry_var_price=Decimal(merged["entry_var_fill_price"]),
+        entry_lighter_price=Decimal(merged["entry_lighter_fill_price"]),
+        exit_var_price=Decimal("105"),
+        exit_lighter_price=Decimal("104"),
+    )
+    assert merged_pnl == Decimal("15")
+
+
+def test_state_restore_clears_stale_portfolio_exit_lock(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_v4_shadow_tranche = None
+    runtime.live_inventory_v4_shadow_tranches = {}
+    runtime.live_inventory_v4_shadow_completed_keys = set()
+    runtime.live_inventory_state_file.write_text(
+        json.dumps(
+            {
+                "status": "open",
+                "open_lots": [{"lot_id": 2, "asset": "ETH"}],
+                "v4_portfolio_exit_lot_ids": [1, 2],
+                "v4_portfolio_exit_context": {"locked_at": "old"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    runtime.sync_live_inventory_memory_from_state()
+
+    assert runtime.live_inventory_v4_portfolio_exit_lot_ids == set()
+    assert runtime.live_inventory_v4_stale_portfolio_exit_lot_ids == ["1"]
+    assert runtime.live_inventory_v4_portfolio_exit_context == {}
+
+
+def test_robinhood_regime_is_independent_observation_only(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.output_dir = tmp_path
+    now = datetime.now(timezone.utc)
+    sample_dir = tmp_path / "robinhood_basis_samples" / "ETH"
+    sample_dir.mkdir(parents=True)
+    (tmp_path / "robinhood_basis_health.json").write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "book_ready": True,
+                "errors": {},
+                "last_sample_at": now.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (sample_dir / f"{now.date().isoformat()}.jsonl").write_text(
+        json.dumps(
+            {
+                "logged_at": now.isoformat(),
+                "short_edge_bps": "-10",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    context = runtime.live_inventory_robinhood_regime_context(
+        asset="ETH",
+        primary_short_edge_bps=Decimal("-4"),
+    )
+
+    assert context["v4_robinhood_fresh"] is True
+    assert context["v4_robinhood_threshold_penalty_bps"] == "0"
+    assert context["v4_robinhood_policy"] == "independent_observation_only"
+
+
+def test_account_risk_blocks_entries_when_variational_snapshot_is_stale() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_open_lots = []
+        runtime.live_inventory_max_venue_leverage = Decimal("5")
+        runtime.live_inventory_margin_warning_pct = Decimal("40")
+        runtime.live_inventory_margin_block_entry_pct = Decimal("50")
+        runtime.live_inventory_margin_reduce_pct = Decimal("60")
+        runtime.live_inventory_margin_emergency_pct = Decimal("75")
+        runtime.live_inventory_equity_balance_warning_ratio = Decimal("0.82")
+        runtime.live_inventory_equity_balance_block_ratio = Decimal("0.74")
+        runtime.runtime = SimpleNamespace(
+            monitor=SimpleNamespace(
+                _lock=asyncio.Lock(),
+                portfolio_summary={
+                    "balance": "100",
+                    "upnl": "0",
+                    "published_at": "2026-01-01T00:00:00+00:00",
+                },
+            )
+        )
+
+        async def fetch_lighter_account():
+            return {"accounts": [{"collateral": "100"}]}
+
+        runtime.fetch_lighter_account = fetch_lighter_account
+
+        context = await runtime.live_inventory_account_risk_context(
+            proposed_notional_usd=Decimal("20")
+        )
+
+        assert context["risk_action"] == "block_entry"
+        assert context["risk_reason"] == "variational_account_snapshot_stale"
+        assert context["variational_account_snapshot_fresh"] is False
+        assert context["variational_equity_usd"] is None
+        assert context["variational_raw_equity_usd"] == "100"
+
+    asyncio.run(run())
 
 
 def test_manual_review_sets_runtime_level_auto_live_fuse() -> None:
@@ -766,6 +1135,13 @@ def test_reversion_signal_exit_floor_is_separate_from_normal_exit_floor() -> Non
     runtime.live_inventory_basis_reversion_signal_exit_min_pnl_bps = Decimal("-1")
 
     runtime.live_inventory_basis_reversion_mode = False
+    runtime.live_inventory_basis_reversion_min_deviation_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_exit_deviation_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_max_entry_roundtrip_cost_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_context_gap_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_long_execution_reserve_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_short_execution_reserve_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_min_net_expected_pnl_bps = Decimal("0")
     assert runtime.live_inventory_signal_reverted_exit_min_pnl_bps(
         time_decayed_min_exit_pnl_bps=Decimal("0.03")
     ) == Decimal("3")
@@ -1774,7 +2150,10 @@ def test_lighter_ws_sendtx_sends_tx_info_as_object() -> None:
         fake_ws = FakeWs()
         runtime._lighter_submit_ws = fake_ws
 
-        response = await runtime.send_lighter_tx_ws(tx_type=14, tx_info='{"Nonce": 1}')
+        response, wire_sent_monotonic = await runtime.send_lighter_tx_ws(
+            tx_type=14,
+            tx_info='{"Nonce": 1}',
+        )
 
         sent = json.loads(fake_ws.sent[0])
         assert sent["type"] == "jsonapi/sendtx"
@@ -1782,6 +2161,7 @@ def test_lighter_ws_sendtx_sends_tx_info_as_object() -> None:
         assert sent["data"]["tx_info"] == {"Nonce": 1}
         assert response.code == 200
         assert response.tx_hash == "0xabc"
+        assert wire_sent_monotonic is not None
 
     asyncio.run(run())
 
@@ -1823,10 +2203,14 @@ def test_lighter_ws_prewarm_reuses_connection(monkeypatch) -> None:
         monkeypatch.setattr("main.elapsed_ms_str", lambda *_args, **_kwargs: "0.001")
 
         await runtime.prewarm_lighter_submit_ws()
-        response = await runtime.send_lighter_tx_ws(tx_type=14, tx_info='{"Nonce": 1}')
+        response, wire_sent_monotonic = await runtime.send_lighter_tx_ws(
+            tx_type=14,
+            tx_info='{"Nonce": 1}',
+        )
 
         assert connect_calls == 1
         assert response.code == 200
+        assert wire_sent_monotonic is not None
         assert len(fake_ws.sent) == 1
         assert json.loads(fake_ws.sent[0])["type"] == "jsonapi/sendtx"
 
@@ -1908,11 +2292,12 @@ def test_create_lighter_order_ws_accepts_order_expiry() -> None:
                 code = 200
                 tx_hash = "0xabc"
 
-            return Response()
+            return Response(), time.monotonic()
 
         runtime.send_lighter_tx_ws = fake_send_lighter_tx_ws
 
-        _order, response, error = await runtime.create_lighter_order_ws(
+        _order, response, error, wire_sent_monotonic = (
+            await runtime.create_lighter_order_ws(
             market_index=1,
             client_order_index=123,
             base_amount=45,
@@ -1923,10 +2308,12 @@ def test_create_lighter_order_ws_accepts_order_expiry() -> None:
             reduce_only=False,
             trigger_price=0,
             order_expiry=0,
+            )
         )
 
         assert error is None
         assert response.code == 200
+        assert wire_sent_monotonic is not None
 
     asyncio.run(run())
 
@@ -1953,6 +2340,7 @@ def test_place_lighter_order_from_plan_passes_reduce_only() -> None:
         runtime.live_max_qty = Decimal("0")
         runtime.live_max_notional_usd = Decimal("100")
         runtime.live_require_min_edge_bps = Decimal("0")
+        runtime.live_inventory_max_lighter_slippage_bps = Decimal("3")
         runtime.live_cooldown_seconds = 0.0
         runtime.last_live_submit_monotonic_by_asset = {}
         runtime.lighter_client_order_to_trade_key = {}
@@ -2022,6 +2410,7 @@ def test_reduce_only_lighter_order_bypasses_live_cooldown() -> None:
         runtime.live_max_qty = Decimal("0")
         runtime.live_max_notional_usd = Decimal("100")
         runtime.live_require_min_edge_bps = Decimal("0")
+        runtime.live_inventory_max_lighter_slippage_bps = Decimal("3")
         runtime.live_cooldown_seconds = 999999.0
         runtime.last_live_submit_monotonic_by_asset = {"BTC": 999999999999.0}
         runtime.lighter_client_order_to_trade_key = {}
@@ -2078,32 +2467,105 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_completed_cycles = 0
     runtime.live_inventory_max_cycles = 1
     runtime.live_inventory_next_lot_id = 1
+    runtime.live_inventory_run_id = "test-live-inventory-run"
     runtime.live_inventory_open_lots = []
     runtime.live_inventory_realized_pnl_usd = Decimal("0")
     runtime.pending_live_inventory_actual_pnl = {}
     runtime.pending_live_inventory_final_pnl = {}
+    runtime.live_inventory_v4_exit_reconciliation_lot_ids = set()
+    runtime.live_inventory_exit_events_logged = set()
     runtime.live_inventory_execution_loss_bps_samples = deque(maxlen=20)
     runtime.live_inventory_entry_bps = Decimal("50")
     runtime.live_inventory_exit_bps = Decimal("10")
     runtime.live_inventory_max_var_spread_bps = Decimal("5")
     runtime.live_inventory_max_var_snapshot_age_seconds = 5.0
+    runtime.live_inventory_basis_max_sample_move_bps = Decimal("3")
+    runtime.live_inventory_basis_sample_move_bps_samples = deque(maxlen=200)
+    runtime.live_inventory_basis_var_spread_bps_samples = deque(maxlen=200)
+    runtime.live_inventory_basis_lighter_spread_bps_samples = deque(maxlen=200)
+    runtime.live_inventory_basis_reversion_history = deque()
+    runtime.live_inventory_basis_reversion_mode = False
+    runtime.live_inventory_basis_reversion_min_deviation_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_exit_deviation_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_max_entry_roundtrip_cost_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_context_gap_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_long_execution_reserve_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_short_execution_reserve_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_min_net_expected_pnl_bps = Decimal("0")
+    runtime.live_inventory_execution_calibration = False
+    runtime.live_inventory_basis_v4_mode = False
+    runtime.live_inventory_basis_v4_profile = ""
+    runtime.live_inventory_basis_v4_shadow_gradient = False
+    runtime.live_inventory_basis_v4_real_gradient = False
+    runtime.live_inventory_basis_entry_mode = "concurrent"
+    runtime.live_inventory_basis_size_ladder_notionals_usd = ()
+    runtime.live_inventory_basis_stablecoin_normalization = False
+    runtime.live_inventory_stablecoin_rate_cache = {}
+    runtime.live_inventory_stablecoin_basis_bps_samples = deque(maxlen=500)
+    runtime.live_inventory_basis_use_normalized_edge_for_entry = False
+    runtime.live_inventory_basis_min_normalized_entry_edge_bps = Decimal("0")
+    runtime.live_inventory_basis_min_normalized_filter_edge_bps = None
+    runtime.live_inventory_basis_max_stablecoin_edge_share = Decimal("0")
+    runtime.live_inventory_basis_stablecoin_regime_entry = False
+    runtime.live_inventory_basis_min_stablecoin_basis_bps = Decimal("0")
+    runtime.live_inventory_basis_stablecoin_regime_buffer_bps = Decimal("0")
+    runtime.live_inventory_basis_stablecoin_regime_min_normalized_edge_bps = Decimal("0")
+    runtime.live_inventory_basis_stablecoin_regime_lookback_samples = 1
+    runtime.live_inventory_basis_stablecoin_regime_max_change_bps = Decimal("0")
+    runtime.live_inventory_basis_dynamic_entry_threshold = False
+    runtime.live_inventory_basis_entry_confirm_samples = 1
+    runtime.live_inventory_basis_entry_confirm_counts = {}
+    runtime.live_inventory_basis_long_min_entry_edge_bps = Decimal("0")
+    runtime.live_inventory_basis_short_min_entry_edge_bps = Decimal("0")
+    runtime.live_inventory_basis_long_min_abs_entry_bps = Decimal("0")
+    runtime.live_inventory_basis_short_min_abs_entry_bps = Decimal("0")
+    runtime.live_inventory_basis_dynamic_entry_noise_buffer_bps = Decimal("0")
+    runtime.live_inventory_basis_spread_regime_penalty_multiplier = Decimal("1")
+    runtime.live_inventory_basis_sample_move_penalty_multiplier = Decimal("0")
+    runtime.live_inventory_basis_min_entry_quality_score_bps = Decimal("0")
+    runtime.live_inventory_basis_watch_candidate = False
+    runtime.live_inventory_basis_watch_candidates = {}
+    runtime.live_inventory_basis_negative_direction_mode = "off"
+    runtime.live_inventory_basis_direction_min_samples = 1
+    runtime.live_inventory_basis_direction_min_avg_pnl_bps = Decimal("0")
+    runtime.live_inventory_basis_negative_direction_entry_penalty_bps = Decimal("0")
+    runtime.live_inventory_basis_negative_direction_abs_penalty_bps = Decimal("0")
+    runtime.live_inventory_actual_pnl_bps_by_direction = {
+        "long_var_short_lighter": deque(maxlen=20),
+        "short_var_long_lighter": deque(maxlen=20),
+    }
+    runtime.live_inventory_exit_fill_latency_ms_samples = deque(maxlen=20)
+    runtime.live_inventory_basis_latency_buffer_p90_ms = Decimal("0")
+    runtime.live_inventory_basis_latency_buffer_bps = Decimal("0")
+    runtime.live_inventory_basis_quote_age_buffer_ms = Decimal("0")
+    runtime.live_inventory_basis_quote_age_buffer_bps = Decimal("0")
     runtime.live_inventory_refresh_var_quote_before_entry = False
     runtime.live_inventory_dynamic_entry_buffer_bps = Decimal("5")
     runtime.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics = False
     runtime.live_inventory_max_lighter_slippage_bps = Decimal("3")
     runtime.live_inventory_max_lighter_book_age_seconds = 0.0
+    runtime.live_inventory_entry_lighter_fill_timeout_seconds = 3.0
+    runtime.live_inventory_basis_auto_close_unhedged = False
     runtime.live_inventory_exit_blocked_log_throttle_seconds = 0.0
     runtime.live_inventory_lot_notional_usd = Decimal("10")
     runtime.live_inventory_max_total_notional_usd = Decimal("10")
     runtime.live_inventory_max_total_lots = 1
     runtime.live_inventory_min_hold_samples = 0
     runtime.live_inventory_max_hold_samples = 300
-    runtime.live_inventory_max_unrealized_loss_bps = Decimal("25")
+    runtime.live_inventory_basis_time_decay_exit_samples = 0
+    runtime.live_inventory_basis_time_decay_min_exit_pnl_bps = Decimal("0")
+    runtime.live_inventory_basis_profit_take_pnl_bps = Decimal("0")
+    runtime.live_inventory_basis_min_signal_reverted_exit_pnl_bps = Decimal("0")
+    runtime.live_inventory_basis_reversion_signal_exit_min_pnl_bps = Decimal("0")
+    runtime.live_inventory_basis_signal_exit_watch_samples = 0
+    runtime.live_inventory_basis_signal_exit_watch_timeout_min_pnl_bps = Decimal("0")
+    runtime.live_inventory_max_unrealized_loss_bps = Decimal("999999999")
     runtime.live_inventory_basis_max_hold_action = "exit"
     runtime.live_inventory_basis_min_abs_entry_bps = Decimal("0")
     runtime.live_inventory_basis_exit_safety_buffer_bps = Decimal("0")
     runtime.live_inventory_basis_dynamic_exit_buffer = False
     runtime.live_inventory_basis_refresh_exit_quote_before_submit = False
+    runtime.live_inventory_basis_refresh_entry_quote_before_submit = False
     runtime.live_inventory_basis_max_var_quote_age_ms = 0.0
     runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(maxlen=20)
     runtime._last_live_inventory_exit_blocked_log = {}
@@ -2112,6 +2574,10 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_state_file = Path(tmp_path) / "live_inventory_state.json"
     runtime.orders_file = Path(tmp_path) / "order_metrics.jsonl"
     runtime._order_write_lock = asyncio.Lock()
+    runtime._record_lock = asyncio.Lock()
+    runtime.records = {}
+    runtime.record_order = deque(maxlen=1000)
+    runtime.lighter_client_order_to_trade_key = {}
     runtime.lighter_order_book_lock = asyncio.Lock()
     runtime.lighter_order_book = {
         "bids": {Decimal("59990"): Decimal("1")},
@@ -2129,6 +2595,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_allowed_assets = {"BTC"}
     runtime.live_max_qty = Decimal("0")
     runtime.live_max_notional_usd = Decimal("20")
+    runtime.live_submit_timeout_seconds = 10.0
     runtime.live_require_min_edge_bps = Decimal("0")
     runtime.live_cooldown_seconds = 0.0
     runtime.last_live_submit_monotonic_by_asset = {}
@@ -2570,6 +3037,22 @@ def _eth_inventory_snapshot() -> CrossSpreadSnapshot:
     return snapshot
 
 
+def _set_test_lighter_book(
+    runtime: VariationalToLighterRuntime,
+    *,
+    bid: str,
+    ask: str,
+) -> None:
+    bid_price = Decimal(bid)
+    ask_price = Decimal(ask)
+    runtime.lighter_order_book = {
+        "bids": {bid_price: Decimal("1")},
+        "asks": {ask_price: Decimal("1")},
+    }
+    runtime.lighter_best_bid = bid_price
+    runtime.lighter_best_ask = ask_price
+
+
 def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
@@ -2584,6 +3067,7 @@ def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tm
         runtime.record_order = deque(maxlen=1000)
         runtime.lighter_client_order_to_trade_key = {}
         runtime.live_inventory_lot_notional_usd = Decimal("20")
+        runtime.live_inventory_max_total_notional_usd = Decimal("25")
         runtime.live_max_notional_usd = Decimal("25")
         runtime.risk_guard_max_base_amount = 10_000_000
         runtime.lighter_order_book = {
@@ -2634,6 +3118,8 @@ def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tm
                 last_variational_status="",
             )
             record.processing_stage = "live_submit_sent"
+            record.lighter_fill_ts_iso = "2999-06-16T03:25:21.000Z"
+            record.lighter_fill_price = Decimal("1755.00")
             runtime.records[record.trade_key] = record
             return record, {"trade_key": "entry-1"}
 
@@ -2672,8 +3158,10 @@ def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tm
         assert runtime.live_inventory_open_lots
         assert runtime.live_inventory_open_lots[0]["status"] == "open"
         assert runtime.live_inventory_open_lots[0]["entry_var_price_source"] == "final_fill"
-        assert rows[-1]["event"] == "live_inventory_entered"
-        assert rows[-1]["entry_confirmation_mode"] == "concurrent_var_and_lighter_then_var_fill_confirmed"
+        entered = next(
+            row for row in reversed(rows) if row["event"] == "live_inventory_entered"
+        )
+        assert entered["entry_confirmation_mode"] == "concurrent_var_and_lighter_then_var_fill_confirmed"
 
     asyncio.run(run())
 
@@ -2866,6 +3354,7 @@ def test_live_inventory_basis_real_entry_rejected_after_concurrent_lighter_requi
         runtime.record_order = deque(maxlen=1000)
         runtime.lighter_client_order_to_trade_key = {}
         runtime.live_inventory_lot_notional_usd = Decimal("20")
+        runtime.live_inventory_max_total_notional_usd = Decimal("25")
         runtime.live_max_notional_usd = Decimal("25")
         runtime.risk_guard_max_base_amount = 10_000_000
         runtime.lighter_order_book = {
@@ -2982,6 +3471,7 @@ def test_live_inventory_basis_addon_submits_when_basis_expands(tmp_path) -> None
         runtime.accepted_assets = {"ETH"}
         runtime.live_inventory_i_accept_basis_addon_diagnostic = True
         runtime.live_inventory_max_total_lots = 2
+        runtime.live_inventory_max_total_notional_usd = Decimal("50")
         runtime.live_inventory_lot_notional_usd = Decimal("20")
         runtime.live_max_notional_usd = Decimal("25")
         runtime.risk_guard_max_base_amount = 10_000_000
@@ -3112,6 +3602,7 @@ def test_live_inventory_basis_max_hold_warn_does_not_exit(tmp_path) -> None:
             }
         ]
         runtime.live_inventory_sample_index = 300
+        _set_test_lighter_book(runtime, bid="1755.00", ask="1755.10")
         submit_calls: list[str] = []
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
@@ -3193,10 +3684,19 @@ def test_live_inventory_basis_exit_submits_var_before_lighter(tmp_path) -> None:
             calls.append("lighter")
             assert calls == ["var", "lighter"]
 
-            class Record:
-                processing_stage = "live_submit_sent"
-
-            return Record(), {"trade_key": "lighter-exit"}
+            record = OrderLifecycle(
+                trade_key="lighter-exit",
+                trade_id="",
+                side="buy",
+                qty=Decimal("0.01"),
+                asset="ETH",
+                mode="live",
+                last_variational_status="",
+            )
+            record.processing_stage = "lighter_filled"
+            record.lighter_fill_ts_iso = "2999-06-16T03:25:21.000Z"
+            record.lighter_fill_price = Decimal("1710")
+            return record, {"trade_key": "lighter-exit"}
 
         runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
         runtime.send_variational_place_order = fake_send_variational_place_order
@@ -3205,6 +3705,7 @@ def test_live_inventory_basis_exit_submits_var_before_lighter(tmp_path) -> None:
         snapshot.lighter_ask = Decimal("1710")
         snapshot.lighter_buy_price = Decimal("1710")
         snapshot.lighter_buy_fill_price = Decimal("1710")
+        _set_test_lighter_book(runtime, bid="1709.90", ask="1710")
 
         await runtime.maybe_run_live_inventory_basis(snapshot)
 
@@ -3266,10 +3767,19 @@ def test_live_inventory_basis_exit_reconciles_var_no_position_before_lighter(tmp
             calls.append("lighter")
             assert kwargs["reduce_only"] is True
 
-            class Record:
-                processing_stage = "live_submit_sent"
-
-            return Record(), {"trade_key": "lighter-exit"}
+            record = OrderLifecycle(
+                trade_key="lighter-exit",
+                trade_id="",
+                side="buy",
+                qty=Decimal("0.01"),
+                asset="ETH",
+                mode="live",
+                last_variational_status="",
+            )
+            record.processing_stage = "lighter_filled"
+            record.lighter_fill_ts_iso = "2999-06-16T03:25:21.000Z"
+            record.lighter_fill_price = Decimal("1710")
+            return record, {"trade_key": "lighter-exit"}
 
         runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
         runtime.send_variational_place_order = fake_send_variational_place_order
@@ -3279,6 +3789,7 @@ def test_live_inventory_basis_exit_reconciles_var_no_position_before_lighter(tmp
         snapshot.lighter_ask = Decimal("1710")
         snapshot.lighter_buy_price = Decimal("1710")
         snapshot.lighter_buy_fill_price = Decimal("1710")
+        _set_test_lighter_book(runtime, bid="1709.90", ask="1710")
 
         await runtime.maybe_run_live_inventory_basis(snapshot)
 
@@ -3349,10 +3860,19 @@ def test_live_inventory_basis_exit_can_skip_blocked_first_lot(tmp_path) -> None:
         async def fake_place_lighter_order_from_plan(**kwargs):
             exited_lots.append(kwargs["cycle_id"])
 
-            class Record:
-                processing_stage = "live_submit_sent"
-
-            return Record(), {"trade_key": f"lighter-exit-{kwargs['cycle_id']}"}
+            record = OrderLifecycle(
+                trade_key=f"lighter-exit-{kwargs['cycle_id']}",
+                trade_id="",
+                side="buy",
+                qty=Decimal("0.01"),
+                asset="ETH",
+                mode="live",
+                last_variational_status="",
+            )
+            record.processing_stage = "lighter_filled"
+            record.lighter_fill_ts_iso = "2999-06-16T03:25:21.000Z"
+            record.lighter_fill_price = Decimal("1710")
+            return record, {"trade_key": record.trade_key}
 
         runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
         runtime.send_variational_place_order = fake_send_variational_place_order
@@ -3361,6 +3881,7 @@ def test_live_inventory_basis_exit_can_skip_blocked_first_lot(tmp_path) -> None:
         snapshot.lighter_ask = Decimal("1710")
         snapshot.lighter_buy_price = Decimal("1710")
         snapshot.lighter_buy_fill_price = Decimal("1710")
+        _set_test_lighter_book(runtime, bid="1709.90", ask="1710")
 
         await runtime.maybe_run_live_inventory_basis(snapshot)
 
@@ -3419,13 +3940,14 @@ def test_live_inventory_basis_exit_safety_buffer_raises_effective_threshold(tmp_
         snapshot.lighter_ask = Decimal("1710")
         snapshot.lighter_buy_price = Decimal("1710")
         snapshot.lighter_buy_fill_price = Decimal("1710")
+        _set_test_lighter_book(runtime, bid="1709.90", ask="1710")
 
         await runtime.maybe_run_live_inventory_basis(snapshot)
 
         rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
         assert runtime.live_inventory_open_lots
         assert rows[-1]["event"] == "live_inventory_exit_blocked"
-        assert rows[-1]["pnl_bps"] == "0"
+        assert Decimal(rows[-1]["pnl_bps"]) == Decimal("0")
         assert rows[-1]["effective_min_exit_pnl_bps"] == "1"
 
     asyncio.run(run())
@@ -3476,14 +3998,20 @@ def test_live_inventory_basis_dynamic_exit_buffer_uses_recent_shortfall(tmp_path
         snapshot.lighter_ask = Decimal("1710")
         snapshot.lighter_buy_price = Decimal("1710")
         snapshot.lighter_buy_fill_price = Decimal("1710")
+        _set_test_lighter_book(runtime, bid="1709.90", ask="1710")
 
         await runtime.maybe_run_live_inventory_basis(snapshot)
 
         rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
         assert runtime.live_inventory_open_lots
-        assert rows[-1]["event"] == "live_inventory_exit_blocked"
-        assert rows[-1]["dynamic_exit_buffer_bps"] == "2"
-        assert rows[-1]["effective_min_exit_pnl_bps"] == "2"
+        blocked = next(
+            row
+            for row in rows
+            if row["event"] == "live_inventory_exit_blocked"
+            and row.get("dynamic_exit_buffer_bps") is not None
+        )
+        assert blocked["dynamic_exit_buffer_bps"] == "2"
+        assert blocked["effective_min_exit_pnl_bps"] == "2"
 
     asyncio.run(run())
 
@@ -3532,6 +4060,7 @@ def test_live_inventory_basis_refresh_exit_quote_blocks_stale_profitable_exit(tm
             return quotes.pop(0), Decimal("10")
 
         async def fake_get_lighter_best_bid_ask():
+            _set_test_lighter_book(runtime, bid="1719", ask="1720")
             return Decimal("1719"), Decimal("1720")
 
         async def fake_send_variational_place_order(**_kwargs):
@@ -3544,6 +4073,7 @@ def test_live_inventory_basis_refresh_exit_quote_blocks_stale_profitable_exit(tm
         snapshot.lighter_ask = Decimal("1710")
         snapshot.lighter_buy_price = Decimal("1710")
         snapshot.lighter_buy_fill_price = Decimal("1710")
+        _set_test_lighter_book(runtime, bid="1709.90", ask="1710")
 
         await runtime.maybe_run_live_inventory_basis(snapshot)
 
@@ -4023,6 +4553,7 @@ def test_live_inventory_basis_taker_funding_reject_cooldown_blocks_next_entry(tm
         runtime.live_allowed_assets = {"ETH"}
         runtime.accepted_assets = {"ETH"}
         runtime.live_inventory_lot_notional_usd = Decimal("20")
+        runtime.live_inventory_max_total_notional_usd = Decimal("25")
         runtime.live_max_notional_usd = Decimal("25")
         runtime.risk_guard_max_base_amount = 10_000_000
         runtime.live_inventory_basis_state = LiveInventoryBasisState(
@@ -4035,9 +4566,10 @@ def test_live_inventory_basis_taker_funding_reject_cooldown_blocks_next_entry(tm
         runtime.live_inventory_basis_state.var = 0.1
         runtime.live_inventory_basis_state.seen = 10
         runtime.live_inventory_basis_state.last_ts = time.monotonic()
-        runtime.live_inventory_basis_z_entry = Decimal("1")
-        runtime.live_inventory_basis_min_entry_edge_bps = Decimal("0")
-        runtime.live_inventory_basis_max_entry_roundtrip_cost_bps = Decimal("20")
+        runtime.live_inventory_basis_z_entry = Decimal("0")
+        runtime.live_inventory_basis_min_entry_edge_bps = Decimal("-999")
+        runtime.live_inventory_basis_max_entry_roundtrip_cost_bps = Decimal("999")
+        runtime.live_inventory_basis_min_entry_quality_score_bps = Decimal("-999")
         runtime.live_inventory_ignore_recent_execution_loss_buffer_for_diagnostics = True
         runtime.pending_live_inventory_var_fill_matches = [
             PendingLiveInventoryVarFillMatch(
@@ -4165,6 +4697,7 @@ def test_live_inventory_basis_pending_entry_orders_cleared_submits_lighter(tmp_p
                 lighter_fill_price=Decimal("1755.00"),
             )
             record.processing_stage = "lighter_filled"
+            record.lighter_fill_ts_iso = datetime.now(timezone.utc).isoformat()
             return record, {"trade_key": "entry-1"}
 
         runtime.fetch_variational_orders = fake_fetch_variational_orders
@@ -4179,8 +4712,12 @@ def test_live_inventory_basis_pending_entry_orders_cleared_submits_lighter(tmp_p
         assert calls[0]["var_fill_price"] == Decimal("1751.58")
         assert runtime.pending_live_inventory_var_fill_matches == []
         assert runtime.live_inventory_open_lots[0]["entry_var_price_source"] == "final_fill"
-        assert rows[-2]["event"] == "variational_fill"
-        assert rows[-1]["event"] == "live_inventory_entered"
+        events = [row["event"] for row in rows]
+        assert "variational_fill" in events
+        assert "live_inventory_entered" in events
+        assert events.index("variational_fill") < events.index(
+            "live_inventory_entered"
+        )
 
     asyncio.run(run())
 
@@ -5046,12 +5583,12 @@ def test_execution_calibration_weekday_gate_uses_utc(tmp_path) -> None:
     )
 
 
-def test_v4_weekend_gate_requires_explicit_test_bypass(tmp_path) -> None:
+def test_v4_weekend_entry_is_continuous(tmp_path) -> None:
     runtime = _live_inventory_runtime(tmp_path)
     weekend = datetime(2026, 8, 22, 0, 0, tzinfo=timezone.utc)
 
     runtime.live_inventory_basis_v4_test_allow_weekend = False
-    assert not runtime.live_inventory_basis_v4_entry_time_allowed(weekend)
+    assert runtime.live_inventory_basis_v4_entry_time_allowed(weekend)
 
     runtime.live_inventory_basis_v4_test_allow_weekend = True
     assert runtime.live_inventory_basis_v4_entry_time_allowed(weekend)

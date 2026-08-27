@@ -307,11 +307,21 @@ def latest_pnl_telegram_payload(
         exit_snapshot
         and exit_snapshot.get("account_snapshot_flat", True)
     )
-    account_net_change = (
+    external_cashflow = to_decimal(
+        tracking_baseline.get("external_cashflow_usd")
+        if tracking_baseline is not None
+        else None
+    ) or Decimal("0")
+    account_raw_change = (
         combined_equity - baseline_equity
         if account_snapshot_flat
         and combined_equity is not None
         and baseline_equity is not None
+        else None
+    )
+    account_net_change = (
+        account_raw_change - external_cashflow
+        if account_raw_change is not None
         else None
     )
     capital_usd = (
@@ -376,6 +386,8 @@ def latest_pnl_telegram_payload(
         ),
         "cycle_actual_pnl_usd": decimal_text(cycle_actual_pnl),
         "run_actual_pnl_usd": decimal_text(run_actual_pnl),
+        "account_raw_change_usd": decimal_text(account_raw_change),
+        "external_cashflow_usd": decimal_text(external_cashflow),
         "account_net_change_usd": decimal_text(account_net_change),
         "account_minus_fill_pnl_usd": decimal_text(
             account_net_change - run_actual_pnl

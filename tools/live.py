@@ -79,7 +79,7 @@ class LiveConfig:
     v4_test_cycle_cooldown_seconds: int = 0
     entry_lighter_fill_timeout_seconds: str = "3"
     snapshot_timeout_seconds: str = "10"
-    addon_min_basis_improvement_bps: str = "2.0"
+    addon_min_basis_improvement_bps: str = "1.5"
 
 
 DEFAULT_CONFIG = LiveConfig()
@@ -338,12 +338,24 @@ def build_main_command(
     v4_test_skip_recent_health: bool = False,
     v4_test_allow_weekend: bool = False,
     v4_shadow_gradient: bool = False,
+    v4_real_gradient: bool = False,
 ) -> list[str]:
     reversion_mode = config.reversion_mode
     calibration_mode = config.calibration_mode
     v4_live_mode = config.v4_live_mode
-    diagnostic_single_lot = reversion_mode or calibration_mode or v4_live_mode or collect_only
-    effective_max_total_notional_usd = "25" if diagnostic_single_lot else config.max_total_inventory_notional_usd
+    diagnostic_single_lot = (
+        reversion_mode
+        or calibration_mode
+        or (v4_live_mode and not v4_real_gradient)
+        or collect_only
+    )
+    effective_max_total_notional_usd = (
+        "0"
+        if v4_live_mode and v4_real_gradient
+        else "25"
+        if diagnostic_single_lot
+        else config.max_total_inventory_notional_usd
+    )
     effective_max_cycles = (
         config.calibration_max_cycles
         if calibration_mode
@@ -351,8 +363,20 @@ def build_main_command(
         if reversion_mode
         else config.max_cycles
     )
-    effective_max_lots = 1 if diagnostic_single_lot else config.max_lots
-    effective_max_total_lots = 1 if diagnostic_single_lot else config.max_total_lots
+    effective_max_lots = (
+        0
+        if v4_live_mode and v4_real_gradient
+        else 1
+        if diagnostic_single_lot
+        else config.max_lots
+    )
+    effective_max_total_lots = (
+        0
+        if v4_real_gradient
+        else 1
+        if diagnostic_single_lot
+        else config.max_total_lots
+    )
     effective_min_entry_edge_bps = "0" if diagnostic_single_lot else config.min_entry_edge_bps
     effective_min_abs_entry_bps = "0" if diagnostic_single_lot else config.min_abs_entry_bps
     effective_max_entry_roundtrip_cost_bps = (
@@ -393,6 +417,20 @@ def build_main_command(
         str(effective_max_lots),
         "--live-inventory-max-total-lots",
         str(effective_max_total_lots),
+        "--live-inventory-max-venue-leverage",
+        "5",
+        "--live-inventory-margin-warning-pct",
+        "40",
+        "--live-inventory-margin-block-entry-pct",
+        "50",
+        "--live-inventory-margin-reduce-pct",
+        "60",
+        "--live-inventory-margin-emergency-pct",
+        "75",
+        "--live-inventory-equity-balance-warning-ratio",
+        "0.82",
+        "--live-inventory-equity-balance-block-ratio",
+        "0.74",
         "--live-inventory-max-lighter-slippage-bps",
         config.max_lighter_slippage_bps,
         "--live-inventory-lighter-submit-slippage-bps",
@@ -455,6 +493,8 @@ def build_main_command(
                 "exit",
                 "--live-inventory-basis-refresh-exit-quote-before-submit",
                 "--live-inventory-basis-dynamic-exit-buffer",
+                "--live-inventory-max-unrealized-loss-bps",
+                "50",
                 "--live-inventory-min-hold-samples",
                 "0",
                 "--live-inventory-max-hold-samples",
@@ -479,6 +519,8 @@ def build_main_command(
             command.append("--live-inventory-basis-v4-test-allow-weekend")
         if v4_shadow_gradient:
             command.append("--live-inventory-basis-v4-shadow-gradient")
+        if v4_real_gradient:
+            command.append("--live-inventory-basis-v4-real-gradient")
     elif reversion_mode:
         command.extend(
             [
@@ -543,7 +585,7 @@ def build_main_command(
         )
         if config.calibration_weekdays_only:
             command.append("--live-inventory-calibration-weekdays-only")
-    if effective_max_total_lots > 1:
+    if v4_real_gradient or effective_max_total_lots > 1:
         command.extend(
             [
                 "--live-inventory-i-accept-basis-addon-diagnostic",
@@ -576,12 +618,17 @@ def main() -> int:
     parser.add_argument(
         "--v4-test-allow-weekend",
         action="store_true",
-        help="Bounded V4 test only: allow new real entries on UTC weekends.",
+        help="Deprecated compatibility flag; V4 now trades continuously.",
     )
     parser.add_argument(
         "--v4-shadow-gradient",
         action="store_true",
         help="Compare read-only second-tranche entries at +0.5/+1.0/+1.5/+2.0 bps. No additional real order is submitted.",
+    )
+    parser.add_argument(
+        "--v4-real-gradient",
+        action="store_true",
+        help="Enable five dynamic V4 leverage tiers using confirmed 20 USD child orders.",
     )
     parser.add_argument(
         "--v4-test-max-cycles",
@@ -677,6 +724,10 @@ def main() -> int:
         )
     if args.v4_shadow_gradient and not config.v4_live_mode:
         parser.error("--v4-shadow-gradient requires --v4-live")
+    if args.v4_real_gradient and not config.v4_live_mode:
+        parser.error("--v4-real-gradient requires --v4-live")
+    if args.v4_real_gradient and args.v4_shadow_gradient:
+        parser.error("use only one of --v4-real-gradient or --v4-shadow-gradient")
     if args.v4_test_max_cycles > 1 and not (
         config.v4_live_mode and args.v4_test_skip_recent_health
     ):
@@ -733,6 +784,7 @@ def main() -> int:
             v4_test_skip_recent_health=args.v4_test_skip_recent_health,
             v4_test_allow_weekend=args.v4_test_allow_weekend,
             v4_shadow_gradient=args.v4_shadow_gradient,
+            v4_real_gradient=args.v4_real_gradient,
         )
     )
     effective_max_cycles = (

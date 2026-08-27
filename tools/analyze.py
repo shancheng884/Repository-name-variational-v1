@@ -151,6 +151,35 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         if row.get("event") == "live_inventory_strategy_snapshot"
     ]
     latest_strategy_snapshot = strategy_snapshots[-1] if strategy_snapshots else {}
+    account_snapshots = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_account_snapshot"
+    ]
+    latest_account_snapshot = account_snapshots[-1] if account_snapshots else {}
+    portfolio_exit_locks = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_v4_portfolio_exit_locked"
+    ]
+    latest_portfolio_exit_lock = (
+        portfolio_exit_locks[-1] if portfolio_exit_locks else {}
+    )
+    partial_detier_locks = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_v4_partial_detier_exit_locked"
+    ]
+    account_risk_rows = [
+        row
+        for row in v4_rows
+        if row.get("event")
+        in {
+            "live_inventory_account_risk_alert",
+            "live_inventory_account_risk_recovered",
+        }
+    ]
+    latest_account_risk = account_risk_rows[-1] if account_risk_rows else {}
     shadow_gradient_entries = [
         row
         for row in v4_rows
@@ -318,6 +347,100 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "shadow_gradient_enabled": latest_strategy_snapshot.get(
             "shadow_gradient_enabled"
         ),
+        "real_gradient_enabled": latest_strategy_snapshot.get(
+            "real_gradient_enabled"
+        ),
+        "real_gradient_tiers": latest_strategy_snapshot.get(
+            "real_gradient_tiers"
+        ),
+        "real_gradient_tier_percentiles": latest_strategy_snapshot.get(
+            "real_gradient_tier_percentiles"
+        ),
+        "real_gradient_tier_thresholds_bps": latest_state.get(
+            "v4_real_gradient_tier_thresholds_bps"
+        ),
+        "max_venue_leverage": latest_strategy_snapshot.get(
+            "max_venue_leverage"
+        ),
+        "variational_snapshot_fresh": latest_account_snapshot.get(
+            "variational_snapshot_fresh"
+        ),
+        "variational_snapshot_age_seconds": latest_account_snapshot.get(
+            "variational_snapshot_age_seconds"
+        ),
+        "portfolio_exit_locks": len(portfolio_exit_locks),
+        "portfolio_exit_last_lot_ids": latest_portfolio_exit_lock.get("lot_ids"),
+        "portfolio_exit_last_pnl_bps": latest_portfolio_exit_lock.get(
+            "aggregate_executable_pnl_bps"
+        ),
+        "portfolio_exit_last_target_bps": latest_portfolio_exit_lock.get(
+            "effective_min_exit_pnl_bps"
+        ),
+        "partial_detier_locks": len(partial_detier_locks),
+        "robinhood_status": latest_state.get("v4_robinhood_status"),
+        "robinhood_fresh": latest_state.get("v4_robinhood_fresh"),
+        "robinhood_sample_age_seconds": latest_state.get(
+            "v4_robinhood_sample_age_seconds"
+        ),
+        "robinhood_threshold_penalty_bps": latest_state.get(
+            "v4_robinhood_threshold_penalty_bps"
+        ),
+        "variational_order_rate_used_60s": latest_state.get(
+            "variational_order_rate_used_60s"
+        ),
+        "variational_order_rate_limits_60s": (
+            latest_state.get("variational_order_rate_normal_limit_60s"),
+            latest_state.get("variational_order_rate_hard_limit_60s"),
+        ),
+        "lighter_order_rate_used_60s": latest_state.get(
+            "lighter_order_rate_used_60s"
+        ),
+        "lighter_order_rate_limits_60s": (
+            latest_state.get("lighter_order_rate_normal_limit_60s"),
+            latest_state.get("lighter_order_rate_hard_limit_60s"),
+        ),
+        "weekend_market_regime": latest_state.get("v4_market_regime"),
+        "weekend_transition": latest_state.get("v4_weekend_transition"),
+        "weekend_transition_active": latest_state.get(
+            "v4_weekend_transition_active"
+        ),
+        "account_risk_event": latest_account_risk.get("event"),
+        "account_risk_action": latest_account_risk.get("risk_action"),
+        "account_risk_reason": latest_account_risk.get("risk_reason"),
+        "variational_margin_thresholds": {
+            "usage": latest_account_risk.get(
+                "variational_effective_margin_usage_pct"
+            ),
+            "warning": latest_account_risk.get(
+                "variational_effective_margin_warning_pct"
+            ),
+            "block": latest_account_risk.get(
+                "variational_effective_margin_block_entry_pct"
+            ),
+            "reduce": latest_account_risk.get(
+                "variational_effective_margin_reduce_pct"
+            ),
+            "emergency": latest_account_risk.get(
+                "variational_effective_margin_emergency_pct"
+            ),
+        },
+        "lighter_margin_thresholds": {
+            "usage": latest_account_risk.get(
+                "lighter_effective_margin_usage_pct"
+            ),
+            "warning": latest_account_risk.get(
+                "lighter_effective_margin_warning_pct"
+            ),
+            "block": latest_account_risk.get(
+                "lighter_effective_margin_block_entry_pct"
+            ),
+            "reduce": latest_account_risk.get(
+                "lighter_effective_margin_reduce_pct"
+            ),
+            "emergency": latest_account_risk.get(
+                "lighter_effective_margin_emergency_pct"
+            ),
+        },
         "shadow_gradient_entries": len(shadow_gradient_entries),
         "shadow_gradient_exits": len(shadow_gradient_exits),
         "shadow_gradient_active": bool(
@@ -599,6 +722,53 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"rearm_progress={funnel['rearm_confirmation_count']}/"
         f"{funnel['rearm_confirm_samples']} "
         f"rearm_reset_threshold_bps={funnel['rearm_reset_threshold_bps']}"
+    )
+    print(
+        f"real_gradient_enabled={funnel['real_gradient_enabled']} "
+        f"real_gradient_tiers={funnel['real_gradient_tiers']} "
+        f"real_gradient_percentiles={funnel['real_gradient_tier_percentiles']} "
+        f"real_gradient_thresholds_bps={funnel['real_gradient_tier_thresholds_bps']} "
+        f"max_venue_leverage={funnel['max_venue_leverage']}"
+    )
+    print(
+        f"variational_snapshot_fresh={funnel['variational_snapshot_fresh']} "
+        f"variational_snapshot_age_seconds="
+        f"{funnel['variational_snapshot_age_seconds']}"
+    )
+    print(
+        f"portfolio_exit_locks={funnel['portfolio_exit_locks']} "
+        f"portfolio_exit_last_lot_ids={funnel['portfolio_exit_last_lot_ids']} "
+        f"portfolio_exit_last_pnl_bps={funnel['portfolio_exit_last_pnl_bps']} "
+        f"portfolio_exit_last_target_bps="
+        f"{funnel['portfolio_exit_last_target_bps']} "
+        f"partial_detier_locks={funnel['partial_detier_locks']}"
+    )
+    print(
+        f"robinhood_status={funnel['robinhood_status']} "
+        f"robinhood_fresh={funnel['robinhood_fresh']} "
+        f"robinhood_sample_age_seconds="
+        f"{funnel['robinhood_sample_age_seconds']} "
+        f"robinhood_threshold_penalty_bps="
+        f"{funnel['robinhood_threshold_penalty_bps']}"
+    )
+    print(
+        f"order_rate_60s=variational:{funnel['variational_order_rate_used_60s']}"
+        f"/{funnel['variational_order_rate_limits_60s']} "
+        f"lighter:{funnel['lighter_order_rate_used_60s']}"
+        f"/{funnel['lighter_order_rate_limits_60s']}"
+    )
+    print(
+        f"weekend_market_regime={funnel['weekend_market_regime']} "
+        f"weekend_transition={funnel['weekend_transition']} "
+        f"weekend_transition_active={funnel['weekend_transition_active']}"
+    )
+    print(
+        f"account_risk_event={funnel['account_risk_event']} "
+        f"account_risk_action={funnel['account_risk_action']} "
+        f"account_risk_reason={funnel['account_risk_reason']} "
+        f"variational_margin_thresholds="
+        f"{funnel['variational_margin_thresholds']} "
+        f"lighter_margin_thresholds={funnel['lighter_margin_thresholds']}"
     )
     print(
         f"shadow_gradient_enabled={funnel['shadow_gradient_enabled']} "
