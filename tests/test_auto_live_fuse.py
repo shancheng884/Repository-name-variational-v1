@@ -1037,6 +1037,13 @@ def test_live_inventory_startup_reconcile_accepts_matching_open_pair(tmp_path) -
         rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
         assert rows[-1]["event"] == "live_inventory_startup_reconcile_ok"
         assert rows[-1]["status"] == "open_state_matches_both_exchanges"
+        state = json.loads(
+            runtime.live_inventory_state_file.read_text(encoding="utf-8")
+        )
+        assert state["status"] == "open"
+        assert state["open_lots"] == runtime.live_inventory_open_lots
+        assert state["pending_actions"] == []
+        assert state["reason"] == "startup_open_state_reconciled"
 
     asyncio.run(run())
 

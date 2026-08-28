@@ -4435,6 +4435,12 @@ class VariationalToLighterRuntime:
                 "lighter_position_qty": decimal_to_str(lighter_position_qty),
             },
         )
+        # A verified resume supersedes a stale manual-review marker from a
+        # transient data outage. Persist immediately so operators and future
+        # restarts see the same open state that this runtime is managing.
+        await self.persist_live_inventory_memory(
+            reason="startup_open_state_reconciled"
+        )
 
     async def persist_live_inventory_memory(self, *, reason: str) -> None:
         pending_actions = self.pending_live_inventory_actions_payload()
