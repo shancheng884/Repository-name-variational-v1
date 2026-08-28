@@ -8566,7 +8566,12 @@ class VariationalToLighterRuntime:
                     open_lots = state.get("open_lots") if isinstance(state.get("open_lots"), list) else []
                     recoverable_open_manual_review = (
                         state_status == "manual_review_required"
-                        and manual_reason == "startup_reconcile_open_state_but_variational_flat"
+                        and manual_reason
+                        in {
+                            "variational_extension_disconnected",
+                            "variational_html_response",
+                            "startup_reconcile_open_state_but_variational_flat",
+                        }
                         and bool(open_lots)
                     )
                     if (state_status == "open" and open_lots) or recoverable_open_manual_review:

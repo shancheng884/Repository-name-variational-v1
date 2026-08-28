@@ -117,6 +117,7 @@ def validate_state(
     reset_state_after_manual_flat: bool = False,
     collect_only: bool = False,
     close_open_position: bool = False,
+    resume_open_position: bool = False,
 ) -> tuple[bool, str]:
     state = read_json(LIVE_STATE)
     if not state:
@@ -148,6 +149,36 @@ def validate_state(
             f"state=open asset={asset} open_lots={len(open_lots)} "
             f"pending_actions=0 completed_cycles={completed_cycles} "
             "operator_exit_requested exchange_reconcile_required=true",
+        )
+
+    if resume_open_position:
+        manual_reason = str(state.get("manual_review_reason") or "")
+        recoverable_manual_reasons = {
+            "variational_extension_disconnected",
+            "variational_html_response",
+            "startup_reconcile_open_state_but_variational_flat",
+        }
+        state_is_resumable = status == "open" or (
+            status == "manual_review_required"
+            and manual_reason in recoverable_manual_reasons
+        )
+        if not state_is_resumable:
+            return (
+                False,
+                f"resume_refuses_state status={status} reason={manual_reason or '-'} asset={asset}",
+            )
+        if not open_lots:
+            return False, f"resume_requires_open_lots asset={asset}"
+        if pending_actions:
+            return (
+                False,
+                f"resume_refuses_pending_actions count={len(pending_actions)} asset={asset}",
+            )
+        return (
+            True,
+            f"state={status} asset={asset} open_lots={len(open_lots)} "
+            f"pending_actions=0 completed_cycles={completed_cycles} "
+            "resume_requested strict_exchange_reconcile_required=true",
         )
 
     if reset_state_after_manual_flat and not collect_only:
@@ -360,6 +391,7 @@ def build_main_command(
     v4_shadow_gradient: bool = False,
     v4_real_gradient: bool = False,
     close_open_position: bool = False,
+    resume_open_position: bool = False,
 ) -> list[str]:
     reversion_mode = config.reversion_mode
     calibration_mode = config.calibration_mode
@@ -489,6 +521,8 @@ def build_main_command(
     command.append(
         "--live-inventory-force-close-open-state"
         if close_open_position
+        else "--live-inventory-i-accept-open-state-resume"
+        if resume_open_position
         else "--live-inventory-i-confirm-flat-start"
     )
     if collect_only:
@@ -661,6 +695,14 @@ def main() -> int:
         help="One-shot: reconcile the saved open position, close all recorded lots with concurrent reduce-only orders, confirm final fills, and stop.",
     )
     parser.add_argument(
+        "--resume-open-position",
+        action="store_true",
+        help=(
+            "Resume a saved open position after a transient Variational data outage. "
+            "Startup strictly reconciles both venue positions before management resumes."
+        ),
+    )
+    parser.add_argument(
         "--v4-test-max-cycles",
         type=int,
         choices=range(1, 4),
@@ -728,6 +770,19 @@ def main() -> int:
         parser.error(
             "--close-open-position cannot be combined with reset, collect-only, "
             "reversion, calibration, or gradient flags"
+        )
+    if args.resume_open_position and not args.v4_live:
+        parser.error("--resume-open-position requires --v4-live")
+    if args.resume_open_position and (
+        args.close_open_position
+        or args.reset_state_after_manual_flat
+        or args.collect_only
+        or args.reversion
+        or args.calibration
+    ):
+        parser.error(
+            "--resume-open-position cannot be combined with close, reset, "
+            "collect-only, reversion, or calibration modes"
         )
     if args.reversion:
         config = replace(
@@ -804,6 +859,7 @@ def main() -> int:
         reset_state_after_manual_flat=args.reset_state_after_manual_flat,
         collect_only=args.collect_only,
         close_open_position=args.close_open_position,
+        resume_open_position=args.resume_open_position,
     )
     print(state_message)
     print(disk_warning())
@@ -831,6 +887,7 @@ def main() -> int:
             v4_shadow_gradient=args.v4_shadow_gradient,
             v4_real_gradient=args.v4_real_gradient,
             close_open_position=args.close_open_position,
+            resume_open_position=args.resume_open_position,
         )
     )
     effective_max_cycles = (
