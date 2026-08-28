@@ -877,6 +877,18 @@ def v4_real_gradient_lot_groups(
     return [(tier, groups[tier]) for tier in sorted(groups, reverse=True)]
 
 
+def maintenance_drain_uses_individual_legacy_exits(
+    *,
+    requested: bool,
+    lots: Iterable[dict[str, Any]],
+) -> bool:
+    """Keep unlabeled pre-gradient lots independent during a maintenance drain."""
+    return bool(
+        requested
+        and any(lot.get("entry_gradient_tier") is None for lot in lots)
+    )
+
+
 def live_inventory_state_status(
     *,
     open_lots: Iterable[Any],
@@ -15215,6 +15227,16 @@ class VariationalToLighterRuntime:
             and self.live_inventory_basis_v4_real_gradient
             and len(self.live_inventory_open_lots) > 1
             and not portfolio_exit_lot_ids
+            and not maintenance_drain_uses_individual_legacy_exits(
+                requested=bool(
+                    getattr(
+                        self,
+                        "live_inventory_maintenance_drain_requested",
+                        False,
+                    )
+                ),
+                lots=self.live_inventory_open_lots,
+            )
             and not self.pending_live_inventory_var_fill_matches
             and not self.live_inventory_v4_exit_reconciliation_lot_ids
             and not getattr(

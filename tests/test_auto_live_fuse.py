@@ -21,6 +21,7 @@ from main import (
     adaptive_margin_thresholds,
     account_snapshot_freshness,
     live_inventory_state_status,
+    maintenance_drain_uses_individual_legacy_exits,
     maintenance_control_targets_runtime,
     variational_api_amount_to_str,
     v4_real_gradient_capacity_notional_usd,
@@ -293,6 +294,24 @@ def test_v4_real_gradient_lot_groups_never_mix_tier_pnl() -> None:
         (3, [2, 4]),
         (1, [1, 3]),
     ]
+
+
+def test_maintenance_drain_keeps_unlabeled_legacy_lots_independent() -> None:
+    assert maintenance_drain_uses_individual_legacy_exits(
+        requested=True,
+        lots=[
+            {"lot_id": 1, "entry_gradient_tier": None},
+            {"lot_id": 2, "entry_gradient_tier": None},
+        ],
+    ) is True
+    assert maintenance_drain_uses_individual_legacy_exits(
+        requested=False,
+        lots=[{"lot_id": 1, "entry_gradient_tier": None}],
+    ) is False
+    assert maintenance_drain_uses_individual_legacy_exits(
+        requested=True,
+        lots=[{"lot_id": 1, "entry_gradient_tier": 3}],
+    ) is False
 
 
 def test_adaptive_margin_thresholds_allow_normal_five_x_baseline() -> None:
