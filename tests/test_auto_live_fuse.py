@@ -3145,6 +3145,12 @@ def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tm
         assert runtime.live_inventory_open_lots == []
         assert len(runtime.pending_live_inventory_var_fill_matches) == 1
         assert runtime.pending_live_inventory_var_fill_matches[0].role == "live_inventory_entry_pending_var_fill"
+        runtime.pending_live_inventory_var_fill_matches[0].context.update(
+            {
+                "entry_gradient_tier": 3,
+                "entry_gradient_capacity_notional_usd": "294.66",
+            }
+        )
         assert rows[-1]["event"] == "live_inventory_var_entry_submitted"
         assert rows[-1]["entry_confirmation_mode"] == "concurrent_var_and_lighter_pending_var_fill"
 
@@ -3165,9 +3171,18 @@ def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tm
         assert runtime.live_inventory_open_lots
         assert runtime.live_inventory_open_lots[0]["status"] == "open"
         assert runtime.live_inventory_open_lots[0]["entry_var_price_source"] == "final_fill"
+        assert runtime.live_inventory_open_lots[0]["entry_gradient_tier"] == 3
+        assert (
+            runtime.live_inventory_open_lots[0][
+                "entry_gradient_capacity_notional_usd"
+            ]
+            == "294.66"
+        )
         entered = next(
             row for row in reversed(rows) if row["event"] == "live_inventory_entered"
         )
+        assert entered["entry_gradient_tier"] == 3
+        assert entered["entry_gradient_capacity_notional_usd"] == "294.66"
         assert entered["entry_confirmation_mode"] == "concurrent_var_and_lighter_then_var_fill_confirmed"
 
     asyncio.run(run())

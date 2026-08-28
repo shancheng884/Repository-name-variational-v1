@@ -7035,6 +7035,10 @@ class VariationalToLighterRuntime:
             "entry_reversion_deviation_bps": context.get("entry_reversion_deviation_bps"),
             "entry_v4_profile": context.get("entry_v4_profile"),
             "entry_v4_threshold_bps": context.get("entry_v4_threshold_bps"),
+            "entry_gradient_tier": context.get("entry_gradient_tier"),
+            "entry_gradient_capacity_notional_usd": context.get(
+                "entry_gradient_capacity_notional_usd"
+            ),
             "entry_v4_baseline_window_seconds": context.get(
                 "entry_v4_baseline_window_seconds"
             ),
@@ -7097,6 +7101,10 @@ class VariationalToLighterRuntime:
                 "entry_reversion_median_60m_bps": context.get("entry_reversion_median_60m_bps"),
                 "entry_reversion_deviation_bps": context.get("entry_reversion_deviation_bps"),
                 "entry_kind": lot["entry_kind"],
+                "entry_gradient_tier": lot.get("entry_gradient_tier"),
+                "entry_gradient_capacity_notional_usd": lot.get(
+                    "entry_gradient_capacity_notional_usd"
+                ),
                 "var_price": decimal_to_str(var_fill_price),
                 "lighter_price": decimal_to_str(lighter_fill_price),
                 "estimated_entry_lighter_price": decimal_to_str(estimated_entry_lighter_price),
@@ -14091,6 +14099,16 @@ class VariationalToLighterRuntime:
                         ),
                         "entry_v4_threshold_bps": (
                             decimal_to_str(v4_entry_threshold_bps) if v4_mode else None
+                        ),
+                        "entry_gradient_tier": (
+                            real_gradient_tier
+                            if self.live_inventory_basis_v4_real_gradient
+                            else None
+                        ),
+                        "entry_gradient_capacity_notional_usd": (
+                            decimal_to_str(gradient_capacity_usd)
+                            if self.live_inventory_basis_v4_real_gradient
+                            else None
                         ),
                         "entry_v4_baseline_window_seconds": (
                             v4_entry_context.get("v4_baseline_window_seconds")
