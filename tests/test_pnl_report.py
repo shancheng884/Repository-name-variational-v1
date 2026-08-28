@@ -12,11 +12,14 @@ from main import (
 )
 from tools.pnl_report import (
     build_report,
+    daily_pnl_breakdown,
     deduplicated_actual_pnl,
     latest_pnl_telegram_payload,
+    parse_since,
     print_report,
     previous_flat_snapshot,
     reset_pnl_reporting_baseline,
+    reporting_period_since,
 )
 from tools.lib.pnl_baseline import (
     load_pnl_baseline,
@@ -169,6 +172,8 @@ def test_reset_pnl_reporting_baseline_starts_empty_period(tmp_path) -> None:
     assert baseline["confirmed_pnl_usd"] == "0"
     assert baseline["tracked_completed_cycles"] == 0
     assert baseline["account_baseline_equity_usd"] is None
+    assert baseline["reporting_timezone"] == "Asia/Shanghai"
+    assert baseline["current_beijing_day"] == "2026-08-26"
 
 
 def test_reset_pnl_reporting_baseline_refuses_open_state(tmp_path) -> None:
@@ -243,6 +248,126 @@ def test_pnl_baseline_records_cycles_once_across_runs(tmp_path) -> None:
     assert baseline is not None
     assert baseline["confirmed_pnl_usd"] == "0.006"
     assert baseline["tracked_completed_cycles"] == 2
+
+
+def test_pnl_baseline_rolls_at_beijing_midnight(tmp_path) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    baseline_path = tmp_path / "pnl_reporting_baseline.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "flat",
+                "open_lots": [],
+                "pending_actions": [],
+                "realized_pnl_usd": "0",
+                "completed_cycles": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    reset_pnl_reporting_baseline(
+        asset="ETH",
+        state_path=state_path,
+        baseline_path=baseline_path,
+        started_at="2026-08-27T15:00:00+00:00",
+    )
+
+    record_pnl_cycle(
+        baseline_path,
+        run_id="run-1",
+        asset="ETH",
+        lot_id=1,
+        actual_pnl_usd="0.01",
+        observed_at="2026-08-27T15:59:59+00:00",
+    )
+    record_pnl_cycle(
+        baseline_path,
+        run_id="run-1",
+        asset="ETH",
+        lot_id=2,
+        actual_pnl_usd="0.02",
+        observed_at="2026-08-27T16:00:01+00:00",
+    )
+
+    baseline = load_pnl_baseline(baseline_path)
+    assert baseline is not None
+    assert baseline["confirmed_pnl_usd"] == "0.03"
+    assert baseline["current_beijing_day"] == "2026-08-28"
+    assert baseline["daily_confirmed_pnl_usd"] == "0.02"
+    assert baseline["daily_tracked_completed_cycles"] == 1
+
+
+def test_parse_since_date_uses_beijing_midnight() -> None:
+    assert parse_since("2026-08-28") == datetime(
+        2026,
+        8,
+        27,
+        16,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+
+def test_reporting_period_uses_30_or_90_beijing_days() -> None:
+    now = datetime(2026, 8, 28, 4, 0, tzinfo=timezone.utc)
+
+    assert reporting_period_since("1m", now=now) == datetime(
+        2026,
+        7,
+        29,
+        16,
+        0,
+        tzinfo=timezone.utc,
+    )
+    assert reporting_period_since("3m", now=now) == datetime(
+        2026,
+        5,
+        30,
+        16,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+
+def test_daily_breakdown_includes_zero_trade_beijing_days() -> None:
+    rows = [
+        {
+            "event": "live_inventory_actual_pnl",
+            "run_id": "run-1",
+            "asset": "ETH",
+            "lot_id": 1,
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "actual_pnl_usd": "0.03",
+            "logged_at": "2026-08-26T15:30:00+00:00",
+        },
+        {
+            "event": "live_inventory_actual_pnl",
+            "run_id": "run-1",
+            "asset": "ETH",
+            "lot_id": 2,
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "actual_pnl_usd": "-0.01",
+            "logged_at": "2026-08-28T01:00:00+00:00",
+        },
+    ]
+    report = build_report(
+        rows,
+        since=datetime(2026, 8, 25, 16, 0, tzinfo=timezone.utc),
+        capital_usd=Decimal("100"),
+    )
+
+    daily = daily_pnl_breakdown(report)
+
+    assert [item["beijing_day"] for item in daily] == [
+        "2026-08-26",
+        "2026-08-27",
+        "2026-08-28",
+    ]
+    assert [item["actual_pnl_usd"] for item in daily] == [
+        Decimal("0.03"),
+        Decimal("0"),
+        Decimal("-0.01"),
+    ]
 
 
 def test_pnl_baseline_records_external_cashflow_separately(tmp_path) -> None:
@@ -426,6 +551,9 @@ def test_latest_pnl_telegram_payload_uses_latest_confirmed_cycle() -> None:
     assert payload["summary_status"] == "complete"
     assert payload["cycle_actual_pnl_usd"] == "0.06"
     assert payload["run_actual_pnl_usd"] == "0.10"
+    assert payload["beijing_day"] == "2026-08-25"
+    assert payload["beijing_day_actual_pnl_usd"] == "0.10"
+    assert payload["beijing_day_completed_cycles"] == 2
     assert payload["account_net_change_usd"] == "0.10"
     assert payload["combined_equity_usd"] == "35.10"
     assert payload["completed_cycles"] == 2
@@ -475,6 +603,8 @@ def test_latest_pnl_telegram_payload_accumulates_tracking_period() -> None:
     assert payload is not None
     assert payload["cycle_actual_pnl_usd"] == "-0.004"
     assert payload["run_actual_pnl_usd"] == "0.006"
+    assert payload["beijing_day_actual_pnl_usd"] == "-0.004"
+    assert payload["beijing_day_completed_cycles"] == 1
     assert payload["completed_cycles"] == 2
     assert payload["return_pnl_source"] == "confirmed_pair_fills"
     assert Decimal(payload["return_pct"]) > 0

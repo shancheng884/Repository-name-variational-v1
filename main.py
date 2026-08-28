@@ -32,6 +32,9 @@ from rich.table import Table
 from tools.lib.telegram_notifier import TelegramNotifier
 from tools.lib.pnl_baseline import (
     PNL_BASELINE_FILE_NAME,
+    PNL_REPORTING_TIMEZONE,
+    beijing_calendar_days,
+    beijing_day,
     load_pnl_baseline,
     record_external_cashflow,
     record_pnl_cycle,
@@ -173,6 +176,8 @@ LIVE_INVENTORY_VARIATIONAL_ACCOUNT_MAX_AGE_SECONDS = 60.0
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS = 5
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_CHILD_LOTS = 25
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MIN_TIER_SPACING_BPS = Decimal("0.25")
+LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_SAMPLES = 2
+LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_WINDOW_SAMPLES = 3
 LIVE_INVENTORY_BASIS_V4_WEEKEND_TRANSITION_SECONDS = 6 * 3600
 LIVE_INVENTORY_EQUITY_REBALANCE_TARGET_IMBALANCE_PCT = Decimal("6.5")
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_PERCENTILES = (
@@ -746,7 +751,16 @@ def v4_real_gradient_thresholds(
     history_values: list[Decimal],
     base_threshold_bps: Decimal,
     entry_execution_reserve_bps: Decimal,
+    actual_market_noise_bps: Decimal | None = None,
+    incremental_depth_cost_bps: Decimal | None = None,
+    recent_pair_execution_error_bps: Decimal | None = None,
 ) -> list[Decimal]:
+    spacing_bps = max(
+        LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MIN_TIER_SPACING_BPS,
+        abs(actual_market_noise_bps or Decimal("0")),
+        abs(incremental_depth_cost_bps or Decimal("0")),
+        abs(recent_pair_execution_error_bps or Decimal("0")),
+    )
     thresholds = [base_threshold_bps]
     for percentile in LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_PERCENTILES[1:]:
         historical = VariationalToLighterRuntime.live_inventory_basis_v4_percentile(
@@ -756,13 +770,12 @@ def v4_real_gradient_thresholds(
         candidate = (
             historical + entry_execution_reserve_bps
             if historical is not None
-            else thresholds[-1] + LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MIN_TIER_SPACING_BPS
+            else thresholds[-1] + spacing_bps
         )
         thresholds.append(
             max(
                 candidate,
-                thresholds[-1]
-                + LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MIN_TIER_SPACING_BPS,
+                thresholds[-1] + spacing_bps,
             )
         )
     return thresholds
@@ -775,26 +788,106 @@ def v4_real_gradient_eligible_tier(
     return sum(1 for threshold in thresholds_bps if edge_bps >= threshold)
 
 
+def v4_real_gradient_confirmed_tier(
+    tier_window: Iterable[int],
+    *,
+    latest_tier: int,
+) -> int:
+    """Return the highest tier crossed by the latest and 2 of 3 samples."""
+    values = [max(0, int(value)) for value in tier_window]
+    if not values or latest_tier <= 0:
+        return 0
+    return max(
+        (
+            tier
+            for tier in range(1, latest_tier + 1)
+            if sum(1 for value in values if value >= tier)
+            >= LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_SAMPLES
+        ),
+        default=0,
+    )
+
+
+def v4_real_gradient_slot_caps(
+    *,
+    variational_equity_usd: Decimal | None,
+    lighter_equity_usd: Decimal | None,
+    child_notional_usd: Decimal,
+    max_venue_leverage: Decimal,
+    tier_count: int = LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS,
+) -> list[int] | None:
+    """Build cumulative child-order slots without weakening the 5x hard cap."""
+    if (
+        variational_equity_usd is None
+        or lighter_equity_usd is None
+        or variational_equity_usd <= 0
+        or lighter_equity_usd <= 0
+        or child_notional_usd <= 0
+        or max_venue_leverage <= 0
+        or tier_count <= 0
+    ):
+        return None
+    smaller_equity = min(variational_equity_usd, lighter_equity_usd)
+    hard_slots = int(
+        (smaller_equity * max_venue_leverage / child_notional_usd).to_integral_value(
+            rounding=ROUND_DOWN
+        )
+    )
+    return [
+        min(
+            hard_slots,
+            int(
+                (
+                    smaller_equity * Decimal(tier) / child_notional_usd
+                ).to_integral_value(rounding=ROUND_HALF_UP)
+            ),
+        )
+        for tier in range(1, tier_count + 1)
+    ]
+
+
 def v4_real_gradient_capacity_notional_usd(
     *,
     tier: int,
     variational_equity_usd: Decimal | None,
     lighter_equity_usd: Decimal | None,
     max_venue_leverage: Decimal,
+    child_notional_usd: Decimal = Decimal("20"),
 ) -> Decimal | None:
-    if (
-        tier <= 0
-        or variational_equity_usd is None
-        or lighter_equity_usd is None
-        or variational_equity_usd <= 0
-        or lighter_equity_usd <= 0
-    ):
+    if tier <= 0:
         return None
-    smaller_equity = min(variational_equity_usd, lighter_equity_usd)
-    return min(
-        smaller_equity * Decimal(tier),
-        smaller_equity * max_venue_leverage,
+    caps = v4_real_gradient_slot_caps(
+        variational_equity_usd=variational_equity_usd,
+        lighter_equity_usd=lighter_equity_usd,
+        child_notional_usd=child_notional_usd,
+        max_venue_leverage=max_venue_leverage,
     )
+    if caps is None:
+        return None
+    return Decimal(caps[min(tier, len(caps)) - 1]) * child_notional_usd
+
+
+def v4_real_gradient_lot_groups(
+    lots: Iterable[dict[str, Any]],
+) -> list[tuple[int, list[dict[str, Any]]]]:
+    """Group lots by their own entry tier, ordered from highest risk down."""
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for lot in lots:
+        tier = max(1, int(lot.get("entry_gradient_tier") or 1))
+        groups.setdefault(tier, []).append(lot)
+    return [(tier, groups[tier]) for tier in sorted(groups, reverse=True)]
+
+
+def live_inventory_state_status(
+    *,
+    open_lots: Iterable[Any],
+    pending_actions: Iterable[Any],
+) -> str:
+    if any(True for _ in open_lots):
+        return "open"
+    if any(True for _ in pending_actions):
+        return "pending"
+    return "flat"
 
 
 def v4_partial_detier_selection(
@@ -805,12 +898,6 @@ def v4_partial_detier_selection(
     lighter_equity_usd: Decimal | None,
     max_venue_leverage: Decimal,
 ) -> dict[str, Any]:
-    capacity = v4_real_gradient_capacity_notional_usd(
-        tier=current_tier,
-        variational_equity_usd=variational_equity_usd,
-        lighter_equity_usd=lighter_equity_usd,
-        max_venue_leverage=max_venue_leverage,
-    )
     notionals: list[tuple[dict[str, Any], Decimal]] = []
     for lot in lots:
         qty = to_decimal(lot.get("qty"))
@@ -819,34 +906,36 @@ def v4_partial_detier_selection(
             return {"ready": False, "reason": "invalid_lot_notional"}
         notionals.append((lot, qty * entry_price))
     current_notional = sum((value for _, value in notionals), Decimal("0"))
-    if current_tier <= 0 or capacity is None or current_notional <= capacity:
-        return {
-            "ready": False,
-            "reason": "no_excess_tier_notional",
-            "current_notional_usd": decimal_to_str(current_notional),
-            "target_capacity_usd": decimal_to_str(capacity),
-        }
-    ordered = sorted(
-        notionals,
-        key=lambda item: (
-            int(item[0].get("entry_gradient_tier") or 0),
-            int(item[0].get("tranche_index") or 0),
-            str(item[0].get("entered_at") or ""),
-        ),
+    tiers = sorted(
+        {
+            max(1, int(lot.get("entry_gradient_tier") or 1))
+            for lot, _ in notionals
+        },
         reverse=True,
     )
-    selected: list[dict[str, Any]] = []
-    selected_notional = Decimal("0")
-    remaining_notional = current_notional
-    for lot, notional in ordered:
-        if remaining_notional <= capacity:
-            break
-        selected.append(lot)
-        selected_notional += notional
-        remaining_notional -= notional
+    if not tiers:
+        return {
+            "ready": False,
+            "reason": "no_gradient_tier_lots",
+            "current_notional_usd": decimal_to_str(current_notional),
+        }
+    selected_tier = tiers[0]
+    selected = [
+        lot
+        for lot, _ in notionals
+        if max(1, int(lot.get("entry_gradient_tier") or 1)) == selected_tier
+    ]
+    selected_notional = sum(
+        (notional for lot, notional in notionals if lot in selected),
+        Decimal("0"),
+    )
+    remaining_notional = current_notional - selected_notional
     return {
-        "ready": bool(selected and len(selected) < len(lots)),
-        "reason": None if selected and len(selected) < len(lots) else "would_close_entire_basket",
+        "ready": bool(selected),
+        "reason": None if selected else "no_gradient_tier_lots",
+        "selected_gradient_tier": selected_tier,
+        "current_market_tier": current_tier,
+        "tier_independent_exit": True,
         "selected_lot_ids": [
             str(lot.get("lot_id")) for lot in selected
         ],
@@ -858,7 +947,6 @@ def v4_partial_detier_selection(
         "current_notional_usd": decimal_to_str(current_notional),
         "selected_notional_usd": decimal_to_str(selected_notional),
         "remaining_notional_usd": decimal_to_str(remaining_notional),
-        "target_capacity_usd": decimal_to_str(capacity),
         "current_tier": current_tier,
     }
 
@@ -2037,6 +2125,20 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_partial_detier_confirmations: deque[bool] = deque(
             maxlen=LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_WINDOW_SAMPLES
         )
+        self.live_inventory_v4_gradient_entry_tier_window: deque[int] = deque(
+            maxlen=LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_WINDOW_SAMPLES
+        )
+        self.live_inventory_v4_gradient_tier_exit_confirmations: dict[
+            int, deque[bool]
+        ] = {}
+        self.live_inventory_basis_v4_tier_independent_exit = True
+        self.live_inventory_v4_gradient_tier_states: dict[int, dict[str, Any]] = {
+            tier: {"armed": True, "reset_seen": False}
+            for tier in range(
+                1,
+                LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
+            )
+        }
         self.live_inventory_v4_portfolio_exit_context: dict[str, Any] = {}
         self.live_inventory_calibration_last_exit_sample_index: int | None = None
         self.live_inventory_calibration_halted_reason: str | None = None
@@ -2050,6 +2152,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_pnl_tracking_completed_cycles_baseline: int | None = None
         self.live_inventory_pnl_tracking_confirmed_pnl_usd: Decimal | None = None
         self.live_inventory_pnl_tracking_completed_cycles: int | None = None
+        self.live_inventory_pnl_beijing_day: str | None = None
+        self.live_inventory_pnl_daily_confirmed_pnl_usd: Decimal | None = None
+        self.live_inventory_pnl_daily_completed_cycles: int | None = None
         self.live_inventory_execution_loss_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_exit_estimate_shortfall_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_strong_single_shortfall_bps_samples: deque[Decimal] = deque(maxlen=20)
@@ -2081,6 +2186,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_external_reference_task: asyncio.Task[None] | None = None
         self.live_inventory_size_ladder_shadow_task: asyncio.Task[None] | None = None
         self.live_inventory_size_ladder_shadow_last_monotonic = 0.0
+        self.live_inventory_latest_basis_size_ladder: list[dict[str, Any]] = []
         self.live_inventory_negative_direction_shadow_last_monotonic = 0.0
         self.live_inventory_last_basis_state_crossing = False
         self.live_inventory_stablecoin_basis_bps_samples: deque[Decimal] = deque(maxlen=500)
@@ -3278,6 +3384,35 @@ class VariationalToLighterRuntime:
         )
         if not self.live_inventory_v4_portfolio_exit_lot_ids:
             self.live_inventory_v4_portfolio_exit_context = {}
+        persisted_tier_states = state.get("v4_gradient_tier_states")
+        if isinstance(persisted_tier_states, dict):
+            self.live_inventory_v4_gradient_tier_states = {
+                tier: {
+                    "armed": bool(
+                        (persisted_tier_states.get(str(tier)) or {}).get(
+                            "armed",
+                            True,
+                        )
+                    ),
+                    "reset_seen": bool(
+                        (persisted_tier_states.get(str(tier)) or {}).get(
+                            "reset_seen",
+                            False,
+                        )
+                    ),
+                    **{
+                        key: value
+                        for key, value in (
+                            persisted_tier_states.get(str(tier)) or {}
+                        ).items()
+                        if key in {"closed_at", "rearmed_at"}
+                    },
+                }
+                for tier in range(
+                    1,
+                    LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
+                )
+            }
 
     def sync_live_inventory_pnl_tracking_baseline(self) -> None:
         baseline_file = getattr(
@@ -3311,6 +3446,15 @@ class VariationalToLighterRuntime:
         )
         self.live_inventory_pnl_tracking_completed_cycles = int(
             baseline.get("tracked_completed_cycles") or 0
+        )
+        self.live_inventory_pnl_beijing_day = (
+            baseline.get("current_beijing_day") or None
+        )
+        self.live_inventory_pnl_daily_confirmed_pnl_usd = to_decimal(
+            baseline.get("daily_confirmed_pnl_usd")
+        )
+        self.live_inventory_pnl_daily_completed_cycles = int(
+            baseline.get("daily_tracked_completed_cycles") or 0
         )
         self.live_inventory_pnl_account_baseline_equity_usd = to_decimal(
             baseline.get("account_baseline_equity_usd")
@@ -3383,6 +3527,14 @@ class VariationalToLighterRuntime:
             "v4_portfolio_exit_context": dict(
                 getattr(self, "live_inventory_v4_portfolio_exit_context", {})
             ),
+            "v4_gradient_tier_states": {
+                str(tier): dict(value)
+                for tier, value in getattr(
+                    self,
+                    "live_inventory_v4_gradient_tier_states",
+                    {},
+                ).items()
+            },
             "v4_strong_single_enabled": bool(
                 getattr(self, "live_inventory_v4_strong_single_enabled", True)
             ),
@@ -3917,6 +4069,9 @@ class VariationalToLighterRuntime:
                             asset=asset,
                             lot_id=lot_id,
                             actual_pnl_usd=actual_payload.get("actual_pnl_usd"),
+                            observed_at=(
+                                actual_payload.get("logged_at") or captured_at
+                            ),
                         )
                         tracking_baseline = (
                             load_pnl_baseline(baseline_file)
@@ -4043,6 +4198,7 @@ class VariationalToLighterRuntime:
                 asset=asset,
                 lot_id=lot_id,
                 actual_pnl_usd=cycle_actual_pnl,
+                observed_at=(actual_payload.get("logged_at") or captured_at),
             )
             self.sync_live_inventory_pnl_tracking_baseline()
         realized_pnl = to_decimal(
@@ -4078,6 +4234,20 @@ class VariationalToLighterRuntime:
             if realized_pnl is not None and tracking_start_pnl is not None
             else realized_pnl - run_start_pnl
             if realized_pnl is not None and run_start_pnl is not None
+            else cycle_actual_pnl
+        )
+        daily_actual_pnl = (
+            getattr(
+                self,
+                "live_inventory_pnl_daily_confirmed_pnl_usd",
+                None,
+            )
+            if getattr(
+                self,
+                "live_inventory_pnl_daily_confirmed_pnl_usd",
+                None,
+            )
+            is not None
             else cycle_actual_pnl
         )
         baseline_equity = to_decimal(
@@ -4137,6 +4307,13 @@ class VariationalToLighterRuntime:
             and capital_usd > 0
             else None
         )
+        daily_return_pct = (
+            daily_actual_pnl / capital_usd * Decimal("100")
+            if daily_actual_pnl is not None
+            and capital_usd is not None
+            and capital_usd > 0
+            else None
+        )
         started_at = (
             getattr(
                 self,
@@ -4151,18 +4328,19 @@ class VariationalToLighterRuntime:
         )
         started = parse_utc_iso(started_at)
         finished = parse_utc_iso(captured_at)
-        elapsed_days = (
-            Decimal(str((finished - started).total_seconds()))
-            / Decimal("86400")
-            if started is not None and finished is not None and finished > started
-            else None
-        )
+        covered_beijing_days = beijing_calendar_days(started, finished)
+        elapsed_days = covered_beijing_days
         annualized_pct = (
             return_pct * Decimal("365") / elapsed_days
             if return_pct is not None
             and elapsed_days is not None
             and elapsed_days > 0
             else None
+        )
+        latest_risk = getattr(
+            self,
+            "live_inventory_account_risk_latest_context",
+            {},
         )
         return {
             "asset": asset.upper(),
@@ -4177,7 +4355,33 @@ class VariationalToLighterRuntime:
             ),
             "account_snapshot_flat": account_snapshot_flat,
             "cycle_actual_pnl_usd": decimal_to_str(cycle_actual_pnl),
+            "cycle_actual_pnl_bps": actual_payload.get("actual_pnl_bps"),
+            "exit_gradient_tier": actual_payload.get("exit_gradient_tier"),
+            "market_gradient_tier": actual_payload.get(
+                "market_gradient_tier"
+            ),
+            "closed_child_lots": actual_payload.get(
+                "portfolio_component_lot_count"
+            ),
+            "remaining_child_lots": actual_payload.get(
+                "remaining_child_lots"
+            ),
+            "remaining_notional_usd": actual_payload.get(
+                "remaining_notional_usd"
+            ),
             "run_actual_pnl_usd": decimal_to_str(run_actual_pnl),
+            "beijing_day": (
+                getattr(self, "live_inventory_pnl_beijing_day", None)
+                or beijing_day(finished)
+            ),
+            "reporting_timezone": PNL_REPORTING_TIMEZONE,
+            "beijing_day_actual_pnl_usd": decimal_to_str(daily_actual_pnl),
+            "beijing_day_return_pct": decimal_to_str(daily_return_pct),
+            "beijing_day_completed_cycles": getattr(
+                self,
+                "live_inventory_pnl_daily_completed_cycles",
+                None,
+            ),
             "completed_cycles": (
                 getattr(
                     self,
@@ -4215,6 +4419,9 @@ class VariationalToLighterRuntime:
             "return_pnl_source": pnl_source,
             "return_pct": decimal_to_str(return_pct),
             "elapsed_days": decimal_to_str(elapsed_days),
+            "covered_beijing_days": decimal_to_str(
+                covered_beijing_days
+            ),
             "annualized_simple_pct": decimal_to_str(annualized_pct),
             "annualized_reliability": (
                 "unavailable"
@@ -4226,6 +4433,15 @@ class VariationalToLighterRuntime:
                 else "unavailable"
             ),
             "summary_captured_at": captured_at,
+            "variational_margin_usage_pct": latest_risk.get(
+                "variational_maintenance_margin_usage_pct"
+            ),
+            "lighter_margin_usage_pct": latest_risk.get(
+                "lighter_maintenance_margin_usage_pct"
+            ),
+            "max_projected_venue_leverage": latest_risk.get(
+                "max_projected_venue_leverage"
+            ),
         }
 
     def schedule_live_inventory_account_snapshot(
@@ -4446,7 +4662,10 @@ class VariationalToLighterRuntime:
         pending_actions = self.pending_live_inventory_actions_payload()
         await self.write_live_inventory_state_async(
             {
-                "status": "open" if self.live_inventory_open_lots else "pending" if pending_actions else "flat",
+                "status": live_inventory_state_status(
+                    open_lots=self.live_inventory_open_lots,
+                    pending_actions=pending_actions,
+                ),
                 "asset": self.live_inventory_state_asset(),
                 "next_lot_id": self.live_inventory_next_lot_id,
                 "open_lots": self.live_inventory_open_lots,
@@ -4518,13 +4737,17 @@ class VariationalToLighterRuntime:
         self.stop_flag = True
 
     async def block_live_inventory_entry(self, *, asset: str, reason: str, context: dict[str, Any]) -> None:
+        pending_actions = self.pending_live_inventory_actions_payload()
         await self.write_live_inventory_state_async(
             {
-                "status": "flat",
+                "status": live_inventory_state_status(
+                    open_lots=self.live_inventory_open_lots,
+                    pending_actions=pending_actions,
+                ),
                 "asset": asset,
                 "next_lot_id": self.live_inventory_next_lot_id,
                 "open_lots": self.live_inventory_open_lots,
-                "pending_actions": [],
+                "pending_actions": pending_actions,
                 "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
                 "completed_cycles": self.live_inventory_completed_cycles,
                 "last_blocked_reason": reason,
@@ -4694,7 +4917,10 @@ class VariationalToLighterRuntime:
             await self.persist_live_inventory_memory(reason=f"basis_var_entry_order_{status}")
             await self.write_live_inventory_state_async(
                 {
-                    "status": "flat",
+                    "status": live_inventory_state_status(
+                        open_lots=self.live_inventory_open_lots,
+                        pending_actions=[],
+                    ),
                     "asset": item.asset.upper(),
                     "next_lot_id": self.live_inventory_next_lot_id,
                     "open_lots": self.live_inventory_open_lots,
@@ -5846,10 +6072,54 @@ class VariationalToLighterRuntime:
             self.live_inventory_basis_v4_entry_execution_reserve_bps()
         )
         threshold = raw_threshold + entry_execution_reserve_bps
+        market_noise_bps = self.percentile_decimal(
+            [
+                abs(value)
+                for value in getattr(
+                    self,
+                    "live_inventory_basis_sample_move_bps_samples",
+                    [],
+                )
+            ],
+            80,
+        )
+        ladder_slippages = [
+            value
+            for item in getattr(
+                self,
+                "live_inventory_latest_basis_size_ladder",
+                [],
+            )
+            if (
+                value := to_decimal(
+                    (item.get("short_entry_lighter_depth") or {}).get(
+                        "slippage_bps"
+                    )
+                )
+            )
+            is not None
+        ]
+        incremental_depth_cost_bps = max(
+            (
+                abs(right - left)
+                for left, right in zip(
+                    ladder_slippages,
+                    ladder_slippages[1:],
+                )
+            ),
+            default=Decimal("0"),
+        )
+        recent_pair_execution_error_bps = self.percentile_decimal(
+            getattr(self, "live_inventory_execution_loss_bps_samples", []),
+            80,
+        )
         gradient_thresholds = v4_real_gradient_thresholds(
             history_values=values,
             base_threshold_bps=threshold,
             entry_execution_reserve_bps=entry_execution_reserve_bps,
+            actual_market_noise_bps=market_noise_bps,
+            incremental_depth_cost_bps=incremental_depth_cost_bps,
+            recent_pair_execution_error_bps=recent_pair_execution_error_bps,
         )
         return finish(threshold, {
             **context,
@@ -5876,6 +6146,15 @@ class VariationalToLighterRuntime:
             "v4_real_gradient_tier_thresholds_bps": [
                 decimal_to_str(value) for value in gradient_thresholds
             ],
+            "v4_real_gradient_market_noise_bps": decimal_to_str(
+                market_noise_bps
+            ),
+            "v4_real_gradient_incremental_depth_cost_bps": decimal_to_str(
+                incremental_depth_cost_bps
+            ),
+            "v4_real_gradient_pair_execution_error_bps": decimal_to_str(
+                recent_pair_execution_error_bps
+            ),
         })
 
     def record_live_inventory_basis_v4_edge(
@@ -5945,11 +6224,90 @@ class VariationalToLighterRuntime:
             self.live_inventory_v4_rearm_threshold_bps = None
             self.live_inventory_v4_episode_id = None
             self.live_inventory_v4_next_tranche_index = 1
+            self.live_inventory_v4_gradient_tier_states = {
+                tier: {"armed": True, "reset_seen": False}
+                for tier in range(
+                    1,
+                    LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
+                )
+            }
+            tier_window = getattr(
+                self,
+                "live_inventory_v4_gradient_entry_tier_window",
+                None,
+            )
+            if isinstance(tier_window, deque):
+                tier_window.clear()
             self.reset_live_inventory_basis_v4_shadow_gradient()
         return rearmed, {
             **self.live_inventory_v4_episode_payload(),
             "v4_rearm_reset_threshold_bps": decimal_to_str(reset_threshold),
             "v4_rearm_signal_below_reset": below_reset,
+        }
+
+    def live_inventory_basis_v4_active_gradient_tier(
+        self,
+        *,
+        raw_tier: int,
+        edge_bps: Decimal,
+        thresholds_bps: list[Decimal],
+    ) -> int:
+        window = getattr(
+            self,
+            "live_inventory_v4_gradient_entry_tier_window",
+            None,
+        )
+        if not isinstance(window, deque):
+            window = deque(
+                maxlen=(
+                    LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_WINDOW_SAMPLES
+                )
+            )
+            self.live_inventory_v4_gradient_entry_tier_window = window
+        window.append(max(0, int(raw_tier)))
+        confirmed_tier = v4_real_gradient_confirmed_tier(
+            window,
+            latest_tier=raw_tier,
+        )
+        states = getattr(self, "live_inventory_v4_gradient_tier_states", None)
+        if not isinstance(states, dict):
+            states = {}
+            self.live_inventory_v4_gradient_tier_states = states
+        active_tier = 0
+        for tier, threshold in enumerate(thresholds_bps, start=1):
+            state = states.setdefault(
+                tier,
+                {"armed": True, "reset_seen": False},
+            )
+            if not state.get("armed", True):
+                if edge_bps < threshold:
+                    state["reset_seen"] = True
+                if state.get("reset_seen") and confirmed_tier >= tier:
+                    state["armed"] = True
+                    state["reset_seen"] = False
+                    state["rearmed_at"] = utc_now()
+            if state.get("armed", True) and confirmed_tier >= tier:
+                active_tier = tier
+        return active_tier
+
+    def mark_live_inventory_gradient_tier_closed(
+        self,
+        *,
+        tier: int | None,
+        edge_bps: Decimal,
+        thresholds_bps: list[Decimal],
+    ) -> None:
+        if tier is None or tier <= 0 or tier > len(thresholds_bps):
+            return
+        states = getattr(self, "live_inventory_v4_gradient_tier_states", None)
+        if not isinstance(states, dict):
+            states = {}
+            self.live_inventory_v4_gradient_tier_states = states
+        threshold = thresholds_bps[tier - 1]
+        states[tier] = {
+            "armed": False,
+            "reset_seen": edge_bps < threshold,
+            "closed_at": utc_now(),
         }
 
     def require_live_inventory_basis_v4_rearm(
@@ -6408,6 +6766,7 @@ class VariationalToLighterRuntime:
                 var_ask=var_ask,
                 stablecoin_context=stablecoin_context,
             )
+            self.live_inventory_latest_basis_size_ladder = list(ladder)
             await self.append_live_inventory_log(
                 "live_inventory_size_ladder_shadow",
                 {
@@ -7039,6 +7398,9 @@ class VariationalToLighterRuntime:
             "entry_gradient_capacity_notional_usd": context.get(
                 "entry_gradient_capacity_notional_usd"
             ),
+            "entry_gradient_capacity_child_lots": context.get(
+                "entry_gradient_capacity_child_lots"
+            ),
             "entry_v4_baseline_window_seconds": context.get(
                 "entry_v4_baseline_window_seconds"
             ),
@@ -7104,6 +7466,9 @@ class VariationalToLighterRuntime:
                 "entry_gradient_tier": lot.get("entry_gradient_tier"),
                 "entry_gradient_capacity_notional_usd": lot.get(
                     "entry_gradient_capacity_notional_usd"
+                ),
+                "entry_gradient_capacity_child_lots": lot.get(
+                    "entry_gradient_capacity_child_lots"
                 ),
                 "var_price": decimal_to_str(var_fill_price),
                 "lighter_price": decimal_to_str(lighter_fill_price),
@@ -8184,6 +8549,13 @@ class VariationalToLighterRuntime:
         if not isinstance(state, dict):
             return {"status": "unknown", "reason": "state_file_not_object"}
         status = str(state.get("status", "")).strip() or "unknown"
+        open_lots = state.get("open_lots") or []
+        pending_actions = state.get("pending_actions") or []
+        if status in {"flat", "open", "pending"}:
+            status = live_inventory_state_status(
+                open_lots=open_lots,
+                pending_actions=pending_actions,
+            )
         return {**state, "status": status}
 
     def write_live_inventory_state(self, state: dict[str, Any]) -> None:
@@ -8551,20 +8923,37 @@ class VariationalToLighterRuntime:
                     passed.append("live_inventory_flat_start_manually_confirmed")
                     state = self.load_live_inventory_state()
                     state_status = clean_state_value(state.get("status")) or "unknown"
+                    open_lots = (
+                        state.get("open_lots")
+                        if isinstance(state.get("open_lots"), list)
+                        else []
+                    )
+                    pending_actions = (
+                        state.get("pending_actions")
+                        if isinstance(state.get("pending_actions"), list)
+                        else []
+                    )
                     if self.live_inventory_reset_state_after_manual_flat:
-                        self.write_live_inventory_state(
-                            {
-                                "status": "flat",
-                                "asset": self.live_inventory_state_asset(),
-                                "next_lot_id": 1,
-                                "open_lots": [],
-                                "pending_actions": [],
-                                "realized_pnl_usd": "0",
-                                "completed_cycles": 0,
-                                "reason": "manual_flat_start_reset",
-                            }
-                        )
-                        passed.append("live_inventory_state_reset_after_manual_flat")
+                        if open_lots or pending_actions:
+                            blocking_errors.append(
+                                "live_inventory_state_reset_refuses_positions_or_actions: "
+                                + self.live_inventory_state_summary(state)
+                                + f" pending_actions={len(pending_actions)}"
+                            )
+                        else:
+                            self.write_live_inventory_state(
+                                {
+                                    "status": "flat",
+                                    "asset": self.live_inventory_state_asset(),
+                                    "next_lot_id": 1,
+                                    "open_lots": [],
+                                    "pending_actions": [],
+                                    "realized_pnl_usd": "0",
+                                    "completed_cycles": 0,
+                                    "reason": "manual_flat_start_reset",
+                                }
+                            )
+                            passed.append("live_inventory_state_reset_after_manual_flat")
                     elif state_status == "flat":
                         passed.append("live_inventory_state_flat")
                     else:
@@ -10714,7 +11103,16 @@ class VariationalToLighterRuntime:
                         for value in LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_PERCENTILES
                     ],
                     "real_gradient_child_order_serialization": (
-                        "previous_pair_final_fills_confirmed"
+                        "fresh_quote_previous_pair_final_fills_confirmed_rolling_rate_limit"
+                    ),
+                    "real_gradient_capacity_mode": (
+                        "dynamic_20usd_child_slots_from_fresh_smaller_equity"
+                    ),
+                    "real_gradient_exit_mode": (
+                        "independent_tier_group_net_profit_no_cross_tier_subsidy"
+                    ),
+                    "real_gradient_entry_confirmation": (
+                        "latest_and_2_of_3"
                     ),
                     "max_venue_leverage": decimal_to_str(
                         self.live_inventory_max_venue_leverage
@@ -12682,6 +13080,36 @@ class VariationalToLighterRuntime:
                 else None
             ),
         )
+        real_gradient_thresholds = [
+            value
+            for value in (
+                to_decimal(item)
+                for item in list(
+                    v4_entry_context.get(
+                        "v4_real_gradient_tier_thresholds_bps"
+                    )
+                    or []
+                )
+            )
+            if value is not None
+        ]
+        raw_real_gradient_tier = (
+            v4_real_gradient_eligible_tier(
+                short_edge_bps,
+                real_gradient_thresholds,
+            )
+            if self.live_inventory_basis_v4_real_gradient
+            else 0
+        )
+        real_gradient_tier = (
+            self.live_inventory_basis_v4_active_gradient_tier(
+                raw_tier=raw_real_gradient_tier,
+                edge_bps=short_edge_bps,
+                thresholds_bps=real_gradient_thresholds,
+            )
+            if self.live_inventory_basis_v4_real_gradient
+            else 0
+        )
         variational_rate = self.live_inventory_order_limiter(
             "variational"
         ).snapshot()
@@ -12767,6 +13195,8 @@ class VariationalToLighterRuntime:
             "stablecoin_regime_recent_change_bps": long_stablecoin_regime_context.get("stablecoin_regime_recent_change_bps"),
             "stablecoin_regime_required_raw_edge_bps": long_stablecoin_regime_context.get("stablecoin_regime_required_raw_edge_bps"),
             "open_lots_total": len(self.live_inventory_open_lots),
+            "v4_real_gradient_market_tier": raw_real_gradient_tier,
+            "v4_real_gradient_active_tier": real_gradient_tier,
             "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
             "completed_cycles": self.live_inventory_completed_cycles,
             "basis_collect_only": collect_only,
@@ -12842,28 +13272,8 @@ class VariationalToLighterRuntime:
             return
         dynamic_entry_quality_buffer_bps = self.live_inventory_dynamic_entry_quality_buffer_bps(var_quote_age_seconds=var_quote_age_seconds)
         addon_direction: str | None = None
-        real_gradient_thresholds = [
-            value
-            for value in (
-                to_decimal(item)
-                for item in list(
-                    v4_entry_context.get(
-                        "v4_real_gradient_tier_thresholds_bps"
-                    )
-                    or []
-                )
-            )
-            if value is not None
-        ]
-        real_gradient_tier = (
-            v4_real_gradient_eligible_tier(
-                short_edge_bps,
-                real_gradient_thresholds,
-            )
-            if self.live_inventory_basis_v4_real_gradient
-            else 0
-        )
         gradient_capacity_usd: Decimal | None = None
+        gradient_capacity_child_lots: int | None = None
         if (
             self.live_inventory_open_lots
             and self.live_inventory_i_accept_basis_addon_diagnostic
@@ -13049,7 +13459,7 @@ class VariationalToLighterRuntime:
                         continue
                     direction_signal = short_edge_bps - v4_entry_threshold_bps
                     if self.live_inventory_basis_v4_real_gradient:
-                        real_gradient_tier = v4_real_gradient_eligible_tier(
+                        raw_real_gradient_tier = v4_real_gradient_eligible_tier(
                             short_edge_bps,
                             real_gradient_thresholds,
                         )
@@ -13601,9 +14011,15 @@ class VariationalToLighterRuntime:
                         }
                     elif v4_mode:
                         if self.live_inventory_basis_v4_real_gradient:
-                            real_gradient_tier = v4_real_gradient_eligible_tier(
-                                edge_bps,
-                                real_gradient_thresholds,
+                            refreshed_raw_gradient_tier = (
+                                v4_real_gradient_eligible_tier(
+                                    edge_bps,
+                                    real_gradient_thresholds,
+                                )
+                            )
+                            real_gradient_tier = min(
+                                real_gradient_tier,
+                                refreshed_raw_gradient_tier,
                             )
                         entry_quality_score_bps = edge_bps - min_entry_edge_bps
                         entry_quality_context = {
@@ -13695,16 +14111,30 @@ class VariationalToLighterRuntime:
                         lighter_equity = to_decimal(
                             account_risk.get("lighter_equity_usd")
                         )
-                        gradient_capacity_usd = v4_real_gradient_capacity_notional_usd(
-                            tier=real_gradient_tier,
+                        gradient_slot_caps = v4_real_gradient_slot_caps(
                             variational_equity_usd=var_equity,
                             lighter_equity_usd=lighter_equity,
+                            child_notional_usd=self.live_inventory_lot_notional_usd,
                             max_venue_leverage=self.live_inventory_max_venue_leverage,
                         )
+                        gradient_capacity_child_lots = (
+                            gradient_slot_caps[real_gradient_tier - 1]
+                            if gradient_slot_caps is not None
+                            and real_gradient_tier > 0
+                            else None
+                        )
+                        gradient_capacity_usd = (
+                            Decimal(gradient_capacity_child_lots)
+                            * self.live_inventory_lot_notional_usd
+                            if gradient_capacity_child_lots is not None
+                            else None
+                        )
+                        proposed_child_lots = len(self.live_inventory_open_lots) + 1
                         if (
                             real_gradient_tier <= 0
                             or gradient_capacity_usd is None
-                            or proposed_total_notional_usd > gradient_capacity_usd
+                            or gradient_capacity_child_lots is None
+                            or proposed_child_lots > gradient_capacity_child_lots
                         ):
                             self.live_inventory_basis_entry_confirm_counts.clear()
                             await self.block_live_inventory_entry(
@@ -13725,6 +14155,14 @@ class VariationalToLighterRuntime:
                                     ),
                                     "proposed_total_notional_usd": decimal_to_str(
                                         proposed_total_notional_usd
+                                    ),
+                                    "open_child_lots": len(
+                                        self.live_inventory_open_lots
+                                    ),
+                                    "proposed_child_lots": proposed_child_lots,
+                                    "gradient_slot_caps": gradient_slot_caps,
+                                    "gradient_capacity_child_lots": (
+                                        gradient_capacity_child_lots
                                     ),
                                     "gradient_capacity_notional_usd": decimal_to_str(
                                         gradient_capacity_usd
@@ -14373,6 +14811,11 @@ class VariationalToLighterRuntime:
                         if self.live_inventory_basis_v4_real_gradient
                         else None
                     ),
+                    "entry_gradient_capacity_child_lots": (
+                        gradient_capacity_child_lots
+                        if self.live_inventory_basis_v4_real_gradient
+                        else None
+                    ),
                     "entry_v4_baseline_window_seconds": (
                         v4_entry_context.get("v4_baseline_window_seconds")
                         if v4_mode
@@ -14408,6 +14851,9 @@ class VariationalToLighterRuntime:
                         "gradient_capacity_notional_usd": lot.get(
                             "entry_gradient_capacity_notional_usd"
                         ),
+                        "gradient_capacity_child_lots": lot.get(
+                            "entry_gradient_capacity_child_lots"
+                        ),
                         "direction": direction,
                         "qty": lot["qty"],
                         "edge_bps": decimal_to_str(edge_bps),
@@ -14415,6 +14861,11 @@ class VariationalToLighterRuntime:
                         "var_submit_ms": var_submit_ms,
                         "lighter_submit_ms": lighter_submit_ms,
                         "entry_kind": lot["entry_kind"],
+                        "open_child_lots": len(self.live_inventory_open_lots),
+                        "open_notional_usd": decimal_to_str(
+                            self.live_inventory_open_notional_usd()
+                        ),
+                        **account_risk,
                         "entry_reversion_median_5m_bps": lot.get("entry_reversion_median_5m_bps"),
                         "entry_reversion_median_30m_bps": lot.get("entry_reversion_median_30m_bps"),
                         "entry_reversion_median_60m_bps": lot.get("entry_reversion_median_60m_bps"),
@@ -14490,6 +14941,163 @@ class VariationalToLighterRuntime:
         if (
             v4_mode
             and self.live_inventory_basis_v4_real_gradient
+            and len(self.live_inventory_open_lots) > 1
+            and not portfolio_exit_lot_ids
+            and not self.pending_live_inventory_var_fill_matches
+            and not self.live_inventory_v4_exit_reconciliation_lot_ids
+            and not getattr(
+                self,
+                "live_inventory_account_risk_exit_reason",
+                None,
+            )
+            and all(
+                self.live_inventory_entry_cost_confirmed(open_lot)
+                for open_lot in self.live_inventory_open_lots
+            )
+        ):
+            tier_groups = dict(
+                v4_real_gradient_lot_groups(self.live_inventory_open_lots)
+            )
+            active_tiers = set(tier_groups)
+            tier_confirmations = getattr(
+                self,
+                "live_inventory_v4_gradient_tier_exit_confirmations",
+                None,
+            )
+            if not isinstance(tier_confirmations, dict):
+                tier_confirmations = {}
+                self.live_inventory_v4_gradient_tier_exit_confirmations = (
+                    tier_confirmations
+                )
+            for stale_tier in set(tier_confirmations) - active_tiers:
+                tier_confirmations.pop(stale_tier, None)
+            tier_target_bps = (
+                v4_exit_shortfall_reserve_bps
+                + LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS
+            )
+            for exit_tier in sorted(tier_groups, reverse=True):
+                tier_lots = tier_groups[exit_tier]
+                directions = {
+                    str(open_lot.get("direction") or "")
+                    for open_lot in tier_lots
+                }
+                tier_qty = sum(
+                    (
+                        to_decimal(open_lot.get("qty")) or Decimal("0")
+                        for open_lot in tier_lots
+                    ),
+                    Decimal("0"),
+                )
+                tier_context: dict[str, Any] = {
+                    "ready": False,
+                    "reason": "tier_exit_context_unavailable",
+                }
+                if len(directions) == 1 and tier_qty > 0:
+                    tier_direction = next(iter(directions))
+                    tier_depth = await self.live_inventory_lighter_depth_context(
+                        lighter_side=(
+                            "BUY"
+                            if tier_direction
+                            == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                            else "SELL"
+                        ),
+                        qty=tier_qty,
+                    )
+                    tier_lighter_exit_price = to_decimal(
+                        tier_depth.get("estimated_fill_price")
+                    )
+                    tier_var_exit_price = (
+                        var_bid
+                        if tier_direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                        else var_ask
+                    )
+                    if tier_lighter_exit_price is not None:
+                        tier_context = (
+                            self.live_inventory_v4_aggregate_exit_context(
+                                lots=tier_lots,
+                                var_exit_price=tier_var_exit_price,
+                                lighter_exit_price=tier_lighter_exit_price,
+                            )
+                        )
+                        tier_context["exit_lighter_depth"] = tier_depth
+                tier_pnl_bps = to_decimal(
+                    tier_context.get("aggregate_executable_pnl_bps")
+                )
+                tier_eligible = bool(
+                    tier_context.get("ready")
+                    and tier_pnl_bps is not None
+                    and tier_pnl_bps >= tier_target_bps
+                    and var_quote_age_ok
+                    and lighter_book_age_ok
+                )
+                confirmations = tier_confirmations.setdefault(
+                    exit_tier,
+                    deque(
+                        maxlen=(
+                            LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_WINDOW_SAMPLES
+                        )
+                    ),
+                )
+                confirmations.append(tier_eligible)
+                tier_confirmed = bool(
+                    confirmations
+                    and confirmations[-1]
+                    and sum(1 for value in confirmations if value)
+                    >= LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
+                )
+                if not tier_confirmed:
+                    continue
+                selected_ids = {
+                    self.live_inventory_normalized_lot_id(
+                        open_lot.get("lot_id")
+                    )
+                    for open_lot in tier_lots
+                }
+                remaining_ids = {
+                    self.live_inventory_normalized_lot_id(
+                        open_lot.get("lot_id")
+                    )
+                    for open_lot in self.live_inventory_open_lots
+                } - selected_ids
+                self.live_inventory_v4_portfolio_exit_lot_ids = selected_ids
+                self.live_inventory_v4_portfolio_exit_context = {
+                    **tier_context,
+                    "tier_independent_exit": True,
+                    "selected_gradient_tier": exit_tier,
+                    "current_market_tier": real_gradient_tier,
+                    "selected_lot_ids": sorted(selected_ids),
+                    "remaining_lot_ids": sorted(remaining_ids),
+                    "partial_detier": bool(remaining_ids),
+                    "effective_min_exit_pnl_bps": decimal_to_str(
+                        tier_target_bps
+                    ),
+                    "confirmation_count": sum(
+                        1 for value in confirmations if value
+                    ),
+                    "locked_at": utc_now(),
+                }
+                portfolio_exit_lot_ids = (
+                    self.live_inventory_v4_portfolio_exit_lot_ids
+                )
+                await self.persist_live_inventory_memory(
+                    reason="v4_tier_independent_exit_locked"
+                )
+                await self.append_live_inventory_log(
+                    "live_inventory_v4_tier_exit_locked",
+                    {
+                        **state_payload,
+                        **self.live_inventory_v4_portfolio_exit_context,
+                    },
+                )
+                break
+        if (
+            v4_mode
+            and self.live_inventory_basis_v4_real_gradient
+            and not getattr(
+                self,
+                "live_inventory_basis_v4_tier_independent_exit",
+                True,
+            )
             and len(self.live_inventory_open_lots) > 1
             and not portfolio_exit_lot_ids
         ):
@@ -14593,6 +15201,11 @@ class VariationalToLighterRuntime:
         if (
             v4_mode
             and self.live_inventory_basis_v4_real_gradient
+            and not getattr(
+                self,
+                "live_inventory_basis_v4_tier_independent_exit",
+                True,
+            )
             and len(self.live_inventory_open_lots) > 1
             and not portfolio_exit_lot_ids
             and not portfolio_eligible
@@ -14784,6 +15397,17 @@ class VariationalToLighterRuntime:
                     self.live_inventory_v4_portfolio_exit_context.get(
                         "partial_detier"
                     )
+                )
+                atomic_portfolio_lot["portfolio_tier_independent_exit"] = bool(
+                    self.live_inventory_v4_portfolio_exit_context.get(
+                        "tier_independent_exit"
+                    )
+                )
+                atomic_portfolio_lot["entry_gradient_tier"] = (
+                    self.live_inventory_v4_portfolio_exit_context.get(
+                        "selected_gradient_tier"
+                    )
+                    or atomic_portfolio_lot.get("entry_gradient_tier")
                 )
             except ValueError as exc:
                 await self.append_live_inventory_log(
@@ -15114,6 +15738,9 @@ class VariationalToLighterRuntime:
             selected_exit.get("portfolio_exit_selected")
         )
         partial_detier_selected = bool(lot.get("portfolio_partial_detier"))
+        tier_independent_exit_selected = bool(
+            lot.get("portfolio_tier_independent_exit")
+        )
         account_risk_exit_reason = selected_exit.get("account_risk_exit_reason")
         should_profit_take = bool(selected_exit["should_profit_take"])
         signal_exit_watch_timeout_ok = bool(selected_exit.get("signal_exit_watch_timeout_ok"))
@@ -15134,6 +15761,8 @@ class VariationalToLighterRuntime:
             if calibration_mode and should_timeout_exit
             else str(account_risk_exit_reason)
             if should_account_risk_exit and account_risk_exit_reason
+            else "v4_tier_net_target_reached"
+            if v4_mode and portfolio_exit_selected and tier_independent_exit_selected
             else "v4_portfolio_executable_net_target_reached"
             if v4_mode and portfolio_exit_selected and not partial_detier_selected
             else "v4_partial_detier_executable_net_target_reached"
@@ -15389,88 +16018,6 @@ class VariationalToLighterRuntime:
                             },
                         )
                         return
-                    if partial_detier_selected:
-                        remaining_ids = {
-                            self.live_inventory_normalized_lot_id(value)
-                            for value in list(
-                                self.live_inventory_v4_portfolio_exit_context.get(
-                                    "remaining_lot_ids"
-                                )
-                                or []
-                            )
-                        }
-                        remaining_lots = [
-                            open_lot
-                            for open_lot in self.live_inventory_open_lots
-                            if self.live_inventory_normalized_lot_id(
-                                open_lot.get("lot_id")
-                            )
-                            in remaining_ids
-                        ]
-                        remaining_qty = sum(
-                            (
-                                to_decimal(open_lot.get("qty"))
-                                or Decimal("0")
-                                for open_lot in remaining_lots
-                            ),
-                            Decimal("0"),
-                        )
-                        remaining_depth = (
-                            await self.live_inventory_lighter_depth_context(
-                                lighter_side=exit_lighter_side,
-                                qty=remaining_qty,
-                            )
-                        )
-                        remaining_lighter_price = to_decimal(
-                            remaining_depth.get("estimated_fill_price")
-                        )
-                        remaining_context = (
-                            self.live_inventory_v4_aggregate_exit_context(
-                                lots=remaining_lots,
-                                var_exit_price=var_exit_price,
-                                lighter_exit_price=remaining_lighter_price,
-                            )
-                            if remaining_lighter_price is not None
-                            else {"ready": False}
-                        )
-                        combined_projected_pnl = (
-                            pnl
-                            + (
-                                to_decimal(
-                                    remaining_context.get(
-                                        "aggregate_executable_pnl_usd"
-                                    )
-                                )
-                                or Decimal("0")
-                            )
-                        )
-                        if (
-                            not remaining_context.get("ready")
-                            or combined_projected_pnl < 0
-                        ):
-                            self.live_inventory_v4_portfolio_exit_lot_ids = set()
-                            self.live_inventory_v4_portfolio_exit_context = {}
-                            self.live_inventory_v4_portfolio_exit_confirmations.clear()
-                            self.live_inventory_v4_partial_detier_confirmations.clear()
-                            await self.persist_live_inventory_memory(
-                                reason="v4_partial_detier_combined_pnl_below_zero"
-                            )
-                            await self.append_live_inventory_log(
-                                "live_inventory_exit_blocked",
-                                {
-                                    **state_payload,
-                                    "lot_id": lot.get("lot_id"),
-                                    "reason": "v4_partial_detier_combined_pnl_below_zero",
-                                    "selected_executable_pnl_usd": decimal_to_str(
-                                        pnl
-                                    ),
-                                    "remaining_unrealized_context": remaining_context,
-                                    "combined_projected_pnl_usd": decimal_to_str(
-                                        combined_projected_pnl
-                                    ),
-                                },
-                            )
-                            return
                 else:
                     exit_lighter_depth = (
                         await self.live_inventory_lighter_depth_context(
@@ -15782,6 +16329,12 @@ class VariationalToLighterRuntime:
             for value in list(lot.get("portfolio_component_lot_ids") or [])
             if value is not None
         } or {normalized_exit_lot_id}
+        closed_gradient_tier = (
+            int(lot.get("entry_gradient_tier"))
+            if self.live_inventory_basis_v4_real_gradient
+            and lot.get("entry_gradient_tier") is not None
+            else None
+        )
         if v4_mode and not self.live_inventory_dry_decisions:
             self.live_inventory_v4_exit_reconciliation_lot_ids.add(
                 normalized_exit_lot_id
@@ -15792,6 +16345,22 @@ class VariationalToLighterRuntime:
             if self.live_inventory_normalized_lot_id(open_lot.get("lot_id"))
             not in component_exit_lot_ids
         ]
+        if self.live_inventory_basis_v4_real_gradient:
+            self.mark_live_inventory_gradient_tier_closed(
+                tier=closed_gradient_tier,
+                edge_bps=short_edge_bps,
+                thresholds_bps=real_gradient_thresholds,
+            )
+            tier_confirmations = getattr(
+                self,
+                "live_inventory_v4_gradient_tier_exit_confirmations",
+                {},
+            )
+            if closed_gradient_tier is not None and isinstance(
+                tier_confirmations,
+                dict,
+            ):
+                tier_confirmations.pop(closed_gradient_tier, None)
         portfolio_exit_ids = getattr(
             self, "live_inventory_v4_portfolio_exit_lot_ids", set()
         )
@@ -15844,6 +16413,32 @@ class VariationalToLighterRuntime:
                     "portfolio_component_lot_count": len(
                         component_exit_lot_ids
                     ),
+                    "exit_gradient_tier": closed_gradient_tier,
+                    "market_gradient_tier": real_gradient_tier,
+                    "remaining_child_lots": len(self.live_inventory_open_lots),
+                    "remaining_notional_usd": decimal_to_str(
+                        self.live_inventory_open_notional_usd()
+                    ),
+                    "variational_equity_usd": getattr(
+                        self,
+                        "live_inventory_account_risk_latest_context",
+                        {},
+                    ).get("variational_equity_usd"),
+                    "lighter_equity_usd": getattr(
+                        self,
+                        "live_inventory_account_risk_latest_context",
+                        {},
+                    ).get("lighter_equity_usd"),
+                    "variational_margin_usage_pct": getattr(
+                        self,
+                        "live_inventory_account_risk_latest_context",
+                        {},
+                    ).get("variational_maintenance_margin_usage_pct"),
+                    "lighter_margin_usage_pct": getattr(
+                        self,
+                        "live_inventory_account_risk_latest_context",
+                        {},
+                    ).get("lighter_maintenance_margin_usage_pct"),
                     "exit_reason": exit_reason,
                     "holding_samples": holding_samples,
                     "holding_seconds": holding_seconds,
@@ -15912,6 +16507,15 @@ class VariationalToLighterRuntime:
                     "exit_lighter_depth": exit_lighter_depth,
                     "estimated_pnl_usd": decimal_to_str(pnl),
                     "estimated_pnl_bps": decimal_to_str(pnl_bps),
+                    "exit_gradient_tier": closed_gradient_tier,
+                    "market_gradient_tier": real_gradient_tier,
+                    "portfolio_component_lot_count": len(
+                        component_exit_lot_ids
+                    ),
+                    "remaining_child_lots": len(self.live_inventory_open_lots),
+                    "remaining_notional_usd": decimal_to_str(
+                        self.live_inventory_open_notional_usd()
+                    ),
                     "effective_min_exit_pnl_bps": decimal_to_str(
                         effective_min_exit_pnl_bps
                     ),

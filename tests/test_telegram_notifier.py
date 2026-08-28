@@ -19,12 +19,16 @@ def test_telegram_entry_message_contains_execution_details() -> None:
             "var_price": "1800",
             "lighter_price": "1798",
             "run_id": "live-1",
+            "variational_maintenance_margin_usage_pct": "12.5",
+            "lighter_maintenance_margin_usage_pct": "11.0",
         },
     )
 
-    assert "[Var/Lighter] 开仓确认" in message
+    assert "[Var/Lighter] 开仓/加仓确认" in message
     assert "资产：ETH｜方向：做空 Variational / 做多 Lighter" in message
     assert "开仓价差：-7.1 bps" in message
+    assert "Variational 保证金使用率：12.5%" in message
+    assert "Lighter 保证金使用率：11.0%" in message
     assert "运行编号" not in message
 
 
@@ -81,12 +85,18 @@ def test_telegram_final_pnl_message_contains_final_values() -> None:
             "final_pnl_usd": "0.01",
             "final_pnl_bps": "5.0",
             "run_id": "live-1",
+            "market_gradient_tier": 2,
+            "variational_margin_usage_pct": "10.1",
+            "lighter_margin_usage_pct": "9.9",
         },
     )
 
-    assert "[Var/Lighter] 最终成交盈亏" in message
+    assert "[Var/Lighter] 档位平仓完成" in message
     assert "实际盈亏：0.01 U" in message
     assert "实际收益：5.0 bps" in message
+    assert "当前市场档位：2 / 5" in message
+    assert "Variational 保证金使用率：10.1%" in message
+    assert "Lighter 保证金使用率：9.9%" in message
 
 
 def test_telegram_account_snapshot_contains_both_venues() -> None:
@@ -117,6 +127,10 @@ def test_telegram_pnl_summary_contains_profit_and_annualized_return() -> None:
             "asset": "ETH",
             "lot_id": 3,
             "cycle_actual_pnl_usd": "0.005",
+            "beijing_day": "2026-08-28",
+            "beijing_day_actual_pnl_usd": "0.008",
+            "beijing_day_return_pct": "0.02286",
+            "beijing_day_completed_cycles": 2,
             "run_actual_pnl_usd": "0.012",
             "account_net_change_usd": "0.010",
             "variational_equity_usd": "14.85",
@@ -133,9 +147,13 @@ def test_telegram_pnl_summary_contains_profit_and_annualized_return() -> None:
 
     assert "[Var/Lighter] 平仓收益汇总" in message
     assert "本轮实际盈亏：0.005 U" in message
+    assert "统计日期：2026-08-28（北京时间）" in message
+    assert "北京时间今日累计盈亏：0.008 U" in message
     assert "本统计周期累计盈亏：0.012 U" in message
     assert "账户权益净变化：0.01 U" in message
-    assert "简单年化收益率：10.43%" in message
+    assert "北京时间当日收益率：0.0229%" in message
+    assert "统计周期累计收益率：0.0286%" in message
+    assert "统计周期简单年化收益率：10.43%" in message
     assert "收益口径：账户权益净变化" in message
     assert "年化说明：样本不足30天，仅供参考" in message
 
@@ -158,8 +176,9 @@ def test_telegram_pnl_summary_formats_long_decimals_and_missing_values() -> None
     assert "本统计周期累计盈亏：0.024696 U" in message
     assert "账户权益净变化：暂不可用" in message
     assert "双边总权益：暂不可用" in message
-    assert "本统计周期收益率：暂不可用" in message
-    assert "简单年化收益率：暂不可用" in message
+    assert "北京时间当日收益率：暂不可用" in message
+    assert "统计周期累计收益率：暂不可用" in message
+    assert "统计周期简单年化收益率：暂不可用" in message
     assert "年化说明：暂不可计算" in message
     assert "- U" not in message
     assert "-%" not in message
@@ -306,7 +325,7 @@ def test_telegram_worker_sends_queued_event_without_exposing_token(
 
         await notifier.start()
         queued = notifier.enqueue(
-            "live_inventory_exited",
+            "live_inventory_final_pnl",
             {
                 "asset": "ETH",
                 "direction": "short_var_long_lighter",
@@ -321,6 +340,31 @@ def test_telegram_worker_sends_queued_event_without_exposing_token(
         assert calls[0][1]["json"]["chat_id"] == "123"
 
     asyncio.run(run())
+
+
+def test_telegram_suppresses_internal_gradient_noise() -> None:
+    notifier = TelegramNotifier(
+        bot_token="secret-token",
+        chat_id="123",
+        logger=logging.getLogger("test_telegram"),
+    )
+
+    assert notifier.enqueue(
+        "live_inventory_entry_blocked",
+        {"asset": "ETH", "reason": "v4_real_gradient_tier_capacity_reached"},
+    ) is False
+    assert notifier.enqueue(
+        "live_inventory_v4_entry_blocked",
+        {"asset": "ETH", "reason": "v4_waiting_for_episode_rearm"},
+    ) is False
+    assert notifier.enqueue(
+        "live_inventory_exited",
+        {"asset": "ETH", "exit_reason": "v4_tier_net_target_reached"},
+    ) is False
+    assert notifier.enqueue(
+        "live_inventory_pnl_summary",
+        {"asset": "ETH", "account_snapshot_flat": False},
+    ) is False
 
 
 def test_discover_chat_ids_deduplicates_updates(monkeypatch) -> None:

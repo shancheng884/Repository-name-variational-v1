@@ -6,8 +6,8 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from statistics import median
@@ -23,7 +23,11 @@ from tools.lib.telegram_notifier import (  # noqa: E402
     format_telegram_trade_message,
 )
 from tools.lib.pnl_baseline import (  # noqa: E402
+    BEIJING_TIMEZONE,
     PNL_BASELINE_FILE_NAME,
+    PNL_REPORTING_TIMEZONE,
+    beijing_calendar_days,
+    beijing_day,
     load_pnl_baseline,
     new_pnl_baseline,
     write_pnl_baseline,
@@ -67,17 +71,37 @@ def parse_time(value: Any) -> datetime | None:
 def parse_since(value: str | None) -> datetime | None:
     if not value:
         return None
-    parsed = parse_time(value)
-    if parsed is not None:
-        return parsed
     try:
-        return datetime.strptime(value, "%Y-%m-%d").replace(
-            tzinfo=timezone.utc
+        local_day = datetime.strptime(value, "%Y-%m-%d").replace(
+            tzinfo=BEIJING_TIMEZONE
         )
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            "--since must be YYYY-MM-DD or an ISO-8601 timestamp"
-        ) from exc
+    except ValueError:
+        parsed = parse_time(value)
+        if parsed is not None:
+            return parsed
+    else:
+        return local_day.astimezone(timezone.utc)
+    raise argparse.ArgumentTypeError(
+        "--since must be YYYY-MM-DD (Beijing time) or an ISO-8601 timestamp"
+    )
+
+
+def reporting_period_since(
+    period: str | None,
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    if period not in {"1m", "3m"}:
+        return None
+    observed = now or datetime.now(timezone.utc)
+    local_day = observed.astimezone(BEIJING_TIMEZONE).date()
+    calendar_days = 30 if period == "1m" else 90
+    start_day = local_day - timedelta(days=calendar_days - 1)
+    return datetime.combine(
+        start_day,
+        datetime.min.time(),
+        tzinfo=BEIJING_TIMEZONE,
+    ).astimezone(timezone.utc)
 
 
 def load_rows(path: Path, *, asset: str) -> list[dict[str, Any]]:
@@ -243,6 +267,17 @@ def latest_pnl_telegram_payload(
     cycle_key = row_key(cycle)
     run_id = cycle_key[0]
     cycle_time = parse_time(cycle.get("logged_at"))
+    reporting_day = beijing_day(cycle_time)
+    day_cycles = [
+        row
+        for row in report.cycles
+        if beijing_day(parse_time(row.get("logged_at"))) == reporting_day
+        and (
+            cycle_time is None
+            or parse_time(row.get("logged_at")) is None
+            or parse_time(row.get("logged_at")) <= cycle_time
+        )
+    ]
     run_cycles = (
         list(report.cycles)
         if tracking_baseline is not None
@@ -261,6 +296,13 @@ def latest_pnl_telegram_payload(
         (
             to_decimal(row.get("actual_pnl_usd")) or Decimal("0")
             for row in run_cycles
+        ),
+        Decimal("0"),
+    )
+    day_actual_pnl = sum(
+        (
+            to_decimal(row.get("actual_pnl_usd")) or Decimal("0")
+            for row in day_cycles
         ),
         Decimal("0"),
     )
@@ -339,6 +381,11 @@ def latest_pnl_telegram_payload(
         if capital_usd is not None and capital_usd > 0
         else None
     )
+    day_return_pct = (
+        day_actual_pnl / capital_usd * Decimal("100")
+        if capital_usd is not None and capital_usd > 0
+        else None
+    )
     baseline_time = (
         parse_time(tracking_baseline.get("account_baseline_at"))
         or parse_time(tracking_baseline.get("started_at"))
@@ -358,14 +405,8 @@ def latest_pnl_telegram_payload(
             (value for value in reversed(run_configs) if value is not None),
             None,
         )
-    elapsed_days = (
-        Decimal(str((exit_time - baseline_time).total_seconds()))
-        / Decimal("86400")
-        if baseline_time is not None
-        and exit_time is not None
-        and exit_time > baseline_time
-        else None
-    )
+    covered_beijing_days = beijing_calendar_days(baseline_time, exit_time)
+    elapsed_days = covered_beijing_days
     annualized_pct = (
         return_pct * Decimal("365") / elapsed_days
         if return_pct is not None
@@ -386,6 +427,11 @@ def latest_pnl_telegram_payload(
         ),
         "cycle_actual_pnl_usd": decimal_text(cycle_actual_pnl),
         "run_actual_pnl_usd": decimal_text(run_actual_pnl),
+        "beijing_day": reporting_day,
+        "reporting_timezone": PNL_REPORTING_TIMEZONE,
+        "beijing_day_actual_pnl_usd": decimal_text(day_actual_pnl),
+        "beijing_day_return_pct": decimal_text(day_return_pct),
+        "beijing_day_completed_cycles": len(day_cycles),
         "account_raw_change_usd": decimal_text(account_raw_change),
         "external_cashflow_usd": decimal_text(external_cashflow),
         "account_net_change_usd": decimal_text(account_net_change),
@@ -414,6 +460,7 @@ def latest_pnl_telegram_payload(
             else "confirmed_pair_fills"
         ),
         "annualized_simple_pct": decimal_text(annualized_pct),
+        "covered_beijing_days": decimal_text(covered_beijing_days),
         "annualized_reliability": (
             "unavailable"
             if annualized_pct is None
@@ -436,7 +483,11 @@ def percent(value: Decimal | None) -> str:
 
 def timestamp(value: Any) -> str:
     parsed = parse_time(value)
-    return parsed.isoformat() if parsed is not None else "-"
+    return (
+        parsed.astimezone(BEIJING_TIMEZONE).isoformat()
+        if parsed is not None
+        else "-"
+    )
 
 
 @dataclass(frozen=True)
@@ -448,6 +499,45 @@ class Report:
     period_end: datetime | None
     capital_usd: Decimal | None
     capital_source: str
+
+
+def daily_pnl_breakdown(report: Report) -> list[dict[str, Any]]:
+    if report.period_start is None or report.period_end is None:
+        return []
+    start_day = report.period_start.astimezone(BEIJING_TIMEZONE).date()
+    end_day = report.period_end.astimezone(BEIJING_TIMEZONE).date()
+    if end_day < start_day:
+        return []
+    pnl_by_day: dict[str, Decimal] = {}
+    cycles_by_day: dict[str, int] = {}
+    for row in report.cycles:
+        day = beijing_day(parse_time(row.get("logged_at")))
+        if day is None:
+            continue
+        pnl_by_day[day] = pnl_by_day.get(day, Decimal("0")) + (
+            to_decimal(row.get("actual_pnl_usd")) or Decimal("0")
+        )
+        cycles_by_day[day] = cycles_by_day.get(day, 0) + 1
+    result: list[dict[str, Any]] = []
+    cursor = start_day
+    while cursor <= end_day:
+        key = cursor.isoformat()
+        pnl = pnl_by_day.get(key, Decimal("0"))
+        return_pct = (
+            pnl / report.capital_usd * Decimal("100")
+            if report.capital_usd is not None and report.capital_usd > 0
+            else None
+        )
+        result.append(
+            {
+                "beijing_day": key,
+                "completed_cycles": cycles_by_day.get(key, 0),
+                "actual_pnl_usd": pnl,
+                "return_pct": return_pct,
+            }
+        )
+        cursor += timedelta(days=1)
+    return result
 
 
 def build_report(
@@ -509,7 +599,12 @@ def build_report(
     )
 
 
-def print_report(report: Report, *, last_cycles: int) -> None:
+def print_report(
+    report: Report,
+    *,
+    last_cycles: int,
+    show_daily: bool = False,
+) -> None:
     pnl_values = [
         to_decimal(row.get("actual_pnl_usd")) or Decimal("0")
         for row in report.cycles
@@ -530,17 +625,10 @@ def print_report(report: Report, *, last_cycles: int) -> None:
         peak = max(peak, running)
         max_drawdown = min(max_drawdown, running - peak)
 
-    elapsed_days = None
-    if report.period_start is not None and report.period_end is not None:
-        elapsed_days = Decimal(
-            str(
-                max(
-                    0.0,
-                    (report.period_end - report.period_start).total_seconds()
-                    / 86400,
-                )
-            )
-        )
+    elapsed_days = beijing_calendar_days(
+        report.period_start,
+        report.period_end,
+    )
     return_pct = None
     annualized_pct = None
     if report.capital_usd is not None and report.capital_usd > 0:
@@ -549,11 +637,12 @@ def print_report(report: Report, *, last_cycles: int) -> None:
             annualized_pct = return_pct * Decimal("365") / elapsed_days
 
     print("== 盈利汇总 ==")
+    print(f"统计时区={PNL_REPORTING_TIMEZONE}")
     print(f"统计开始={timestamp(report.period_start)}")
     print(f"统计结束={timestamp(report.period_end)}")
     print(
         "统计天数="
-        + (f"{elapsed_days:.3f}" if elapsed_days is not None else "-")
+        + (f"{elapsed_days:.0f}" if elapsed_days is not None else "-")
     )
     print(
         f"完成轮数={len(pnl_values)} 胜={wins} 负={losses} "
@@ -574,7 +663,7 @@ def print_report(report: Report, *, last_cycles: int) -> None:
     reliability = (
         "无法计算_缺少有效本金或统计时长"
         if annualized_pct is None
-        else "样本不足30天_仅供观察"
+        else "北京时间自然日不足30天_仅供观察"
         if elapsed_days is not None and elapsed_days < 30
         else "可观察"
         if elapsed_days is not None
@@ -651,6 +740,16 @@ def print_report(report: Report, *, last_cycles: int) -> None:
     else:
         print("状态=尚无完整快照_部署新版并启动后自动开始记录")
 
+    if show_daily:
+        print("\n== 北京时间每日盈亏 ==")
+        for daily in daily_pnl_breakdown(report):
+            print(
+                f"日期={daily['beijing_day']} "
+                f"完成轮数={daily['completed_cycles']} "
+                f"实际成交盈亏={money(daily['actual_pnl_usd'])} "
+                f"当日收益率={percent(daily['return_pct'])}"
+            )
+
     print("\n== 最近每轮 ==")
     for row in report.cycles[-max(0, last_cycles):]:
         key = row_key(row)
@@ -722,6 +821,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--asset", default="ETH")
     parser.add_argument("--since")
+    parser.add_argument(
+        "--period",
+        choices=("1m", "3m"),
+        help=(
+            "Use the latest 30 or 90 Beijing natural days and print daily PnL."
+        ),
+    )
     parser.add_argument("--capital-usd", type=Decimal)
     parser.add_argument("--last", type=int, default=10)
     parser.add_argument("--path", type=Path, default=ORDER_METRICS)
@@ -740,6 +846,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.since and args.period:
+        raise SystemExit("--since and --period cannot be used together")
     if args.reset_baseline:
         try:
             baseline = reset_pnl_reporting_baseline(asset=args.asset)
@@ -755,7 +863,7 @@ def main() -> int:
         tracking_baseline.get("asset") or ""
     ).upper() != args.asset.upper():
         tracking_baseline = None
-    if args.since:
+    if args.since or args.period:
         tracking_baseline = None
     capital_usd = args.capital_usd
     if capital_usd is None:
@@ -766,7 +874,7 @@ def main() -> int:
         )
     if capital_usd is not None and capital_usd <= 0:
         raise SystemExit("--capital-usd must be greater than zero")
-    since = parse_since(args.since)
+    since = parse_since(args.since) or reporting_period_since(args.period)
     if since is None and tracking_baseline is not None:
         since = parse_time(
             tracking_baseline.get("account_baseline_at")
@@ -774,7 +882,13 @@ def main() -> int:
         )
     rows = load_rows(args.path, asset=args.asset.upper())
     report = build_report(rows, since=since, capital_usd=capital_usd)
-    print_report(report, last_cycles=args.last)
+    if args.period:
+        report = replace(report, period_end=datetime.now(timezone.utc))
+    print_report(
+        report,
+        last_cycles=args.last,
+        show_daily=bool(args.period),
+    )
     if args.telegram_latest:
         payload = latest_pnl_telegram_payload(
             rows,

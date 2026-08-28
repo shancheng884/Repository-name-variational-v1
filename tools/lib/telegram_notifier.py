@@ -91,6 +91,9 @@ def _direction_cn(value: Any) -> str:
 def _reason_cn(value: Any) -> str:
     return {
         "v4_executable_net_target_reached": "可执行净收益达到目标",
+        "v4_tier_net_target_reached": "本档可执行净收益达到目标",
+        "v4_partial_detier_executable_net_target_reached": "本档可执行净收益达到目标",
+        "v4_portfolio_executable_net_target_reached": "组合可执行净收益达到目标",
         "max_unrealized_loss_bps": "触发最大未实现亏损保护",
         "v4_max_hold_timeout": "旧版最长持仓超时",
         "operator_requested_exit": "人工请求安全退出",
@@ -163,13 +166,23 @@ def format_telegram_trade_message(
     if event_type == "live_inventory_entered":
         return "\n".join(
             [
-                "[Var/Lighter] 开仓确认",
+                "[Var/Lighter] 开仓/加仓确认",
                 f"资产：{asset}｜方向：{_direction_cn(direction)}",
-                f"数量：{_value(payload, 'qty')}｜批次：{lot_id}",
+                f"当前档位：{_value(payload, 'gradient_tier')} / 5",
+                "已开子单："
+                f"{_value(payload, 'open_child_lots')} / "
+                f"{_value(payload, 'gradient_capacity_child_lots')}",
+                f"本笔数量：{_value(payload, 'qty')}｜批次：{lot_id}",
                 f"开仓价差：{_value(payload, 'edge_bps')} bps",
-                f"动态档位：{_value(payload, 'gradient_tier')} / 5",
-                "本档累计容量："
-                f"{_value(payload, 'gradient_capacity_notional_usd')} U",
+                f"单边总仓位：{_value(payload, 'open_notional_usd')} U",
+                f"Variational 权益：{_value(payload, 'variational_equity_usd')} U",
+                f"Lighter 权益：{_value(payload, 'lighter_equity_usd')} U",
+                "Variational 保证金使用率："
+                f"{_value(payload, 'variational_maintenance_margin_usage_pct')}%",
+                "Lighter 保证金使用率："
+                f"{_value(payload, 'lighter_maintenance_margin_usage_pct')}%",
+                "最高单边预计杠杆："
+                f"{_value(payload, 'max_projected_venue_leverage')}x / 5x",
             ]
         )
     if event_type == "live_inventory_exited":
@@ -187,12 +200,21 @@ def format_telegram_trade_message(
     if event_type == "live_inventory_final_pnl":
         return "\n".join(
             [
-                "[Var/Lighter] 最终成交盈亏",
-                f"资产：{asset}｜方向：{_direction_cn(direction)}",
-                f"批次：{lot_id}｜状态：{_status_cn(_value(payload, 'final_pnl_status'))}",
+                "[Var/Lighter] 档位平仓完成",
+                f"资产：{asset}｜平仓档位：{_value(payload, 'exit_gradient_tier')} / 5",
+                "本次平仓子单："
+                f"{_value(payload, 'portfolio_component_lot_count')}｜"
+                f"剩余子单：{_value(payload, 'remaining_child_lots')}",
                 f"实际盈亏：{_value(payload, 'final_pnl_usd')} U",
                 f"实际收益：{_value(payload, 'final_pnl_bps')} bps",
-                f"价差捕获：{_value(payload, 'final_spread_capture_bps')} bps",
+                f"当前市场档位：{_value(payload, 'market_gradient_tier')} / 5",
+                f"Variational 权益：{_value(payload, 'variational_equity_usd')} U",
+                f"Lighter 权益：{_value(payload, 'lighter_equity_usd')} U",
+                "Variational 保证金使用率："
+                f"{_value(payload, 'variational_margin_usage_pct')}%",
+                "Lighter 保证金使用率："
+                f"{_value(payload, 'lighter_margin_usage_pct')}%",
+                f"原因：{_reason_cn(_value(payload, 'exit_reason'))}",
             ]
         )
     if event_type == "live_inventory_account_snapshot":
@@ -216,6 +238,9 @@ def format_telegram_trade_message(
         return_source = {
             "account_equity_delta": "账户权益净变化",
             "confirmed_pair_fills": "已确认双边成交盈亏",
+            "beijing_daily_confirmed_pair_fills": (
+                "北京时间当日已确认双边成交盈亏"
+            ),
         }.get(
             str(_value(payload, "return_pnl_source")),
             _value(payload, "return_pnl_source"),
@@ -224,6 +249,9 @@ def format_telegram_trade_message(
             "sample_under_30_days": "样本不足30天，仅供参考",
             "observable": "样本期已满30天",
             "unavailable": "暂不可计算",
+            "beijing_daily_projection": (
+                "按北京时间当日收益率乘以365，仅供参考"
+            ),
         }.get(
             str(_value(payload, "annualized_reliability")),
             _value(payload, "annualized_reliability"),
@@ -232,7 +260,13 @@ def format_telegram_trade_message(
             [
                 "[Var/Lighter] 平仓收益汇总",
                 f"资产：{asset}｜批次：{lot_id}｜状态：{status}",
+                "统计日期："
+                f"{_value(payload, 'beijing_day')}（北京时间）",
                 f"本轮实际盈亏：{_localized_money(payload, 'cycle_actual_pnl_usd')}",
+                "北京时间今日累计盈亏："
+                f"{_localized_money(payload, 'beijing_day_actual_pnl_usd')}",
+                "北京时间今日完成轮数："
+                f"{_value(payload, 'beijing_day_completed_cycles')}",
                 f"本统计周期累计盈亏：{_localized_money(payload, 'run_actual_pnl_usd')}",
                 f"账户权益净变化：{_localized_money(payload, 'account_net_change_usd')}",
                 "权益变化与成交盈亏差额："
@@ -242,9 +276,11 @@ def format_telegram_trade_message(
                 f"双边总权益：{_localized_money(payload, 'combined_equity_usd')}",
                 f"统计本金：{_localized_money(payload, 'capital_usd')}",
                 f"已完成轮数：{_value(payload, 'completed_cycles')}",
-                f"本统计周期收益率：{_localized_percent(payload, 'return_pct')}",
+                "北京时间当日收益率："
+                f"{_localized_percent(payload, 'beijing_day_return_pct')}",
+                f"统计周期累计收益率：{_localized_percent(payload, 'return_pct')}",
                 f"收益口径：{return_source}",
-                "简单年化收益率："
+                "统计周期简单年化收益率："
                 f"{_localized_percent(payload, 'annualized_simple_pct')}",
                 f"年化说明：{reliability}",
             ]
@@ -404,7 +440,19 @@ class TelegramNotifier:
             return False
         if (
             event_type == "live_inventory_account_snapshot"
-            and payload.get("snapshot_stage") == "exit_confirmed_flat"
+            and payload.get("snapshot_stage") != "startup_flat"
+        ):
+            return False
+        if event_type == "live_inventory_exited":
+            return False
+        if event_type in {
+            "live_inventory_entry_blocked",
+            "live_inventory_v4_entry_blocked",
+        }:
+            return False
+        if (
+            event_type == "live_inventory_pnl_summary"
+            and not payload.get("account_snapshot_flat")
         ):
             return False
         if (

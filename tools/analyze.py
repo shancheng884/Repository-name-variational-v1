@@ -160,7 +160,11 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     portfolio_exit_locks = [
         row
         for row in v4_rows
-        if row.get("event") == "live_inventory_v4_portfolio_exit_locked"
+        if row.get("event")
+        in {
+            "live_inventory_v4_portfolio_exit_locked",
+            "live_inventory_v4_tier_exit_locked",
+        }
     ]
     latest_portfolio_exit_lock = (
         portfolio_exit_locks[-1] if portfolio_exit_locks else {}
@@ -381,6 +385,12 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         ),
         "real_gradient_tier_thresholds_bps": latest_state.get(
             "v4_real_gradient_tier_thresholds_bps"
+        ),
+        "real_gradient_market_tier": latest_state.get(
+            "v4_real_gradient_market_tier"
+        ),
+        "real_gradient_active_tier": latest_state.get(
+            "v4_real_gradient_active_tier"
         ),
         "max_venue_leverage": latest_strategy_snapshot.get(
             "max_venue_leverage"
@@ -750,6 +760,8 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"real_gradient_tiers={funnel['real_gradient_tiers']} "
         f"real_gradient_percentiles={funnel['real_gradient_tier_percentiles']} "
         f"real_gradient_thresholds_bps={funnel['real_gradient_tier_thresholds_bps']} "
+        f"real_gradient_market_tier={funnel['real_gradient_market_tier']} "
+        f"real_gradient_active_tier={funnel['real_gradient_active_tier']} "
         f"max_venue_leverage={funnel['max_venue_leverage']}"
     )
     print(

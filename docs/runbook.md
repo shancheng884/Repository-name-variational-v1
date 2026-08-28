@@ -41,11 +41,13 @@ seconds after every confirmed entry and exit. The snapshot uses Variational
 `balance + upnl` and Lighter `collateral`; failures are logged as partial
 snapshots and never stop trading.
 
-Telegram receives an account snapshot after startup/entry and one `PNL SUMMARY`
-after every confirmed exit. The exit summary includes cycle PnL, current-run
-PnL, both venue equities, account net change, return, and simple annualized
-return. Account-equity change is the preferred return numerator; confirmed
-pair-fill PnL is used only when the account snapshot is incomplete.
+Telegram reports only operationally important state changes: the startup-flat
+account snapshot, confirmed entries/add-ons, confirmed tier exits, account-risk
+or venue failures and recovery, and the fully-flat PnL summary. Routine tier
+arming, normal entry/exit guards, percentile changes, and Robinhood collector
+heartbeats stay in local metrics instead of producing chat noise. Entry and
+tier-exit messages include the current tier, open child count, venue equities,
+and available margin-risk context.
 
 Show confirmed pair-fill PnL, both venue balances, account-equity change, and
 simple annualized return:
@@ -64,6 +66,24 @@ The confirmed pair-fill PnL is calculated from both venues' final fill prices.
 It does not separately deduct fees or funding. Account-equity change includes
 fees, funding, deposits, withdrawals, and any other account activity, so the
 report keeps these two figures separate.
+
+PnL reporting uses Beijing natural days (`Asia/Shanghai`, UTC+8). A reporting
+day runs from Beijing 00:00 through 24:00. Telegram shows both the current
+Beijing day's confirmed close PnL and the persistent tracking-period total.
+The total simple annualized return is the tracking-period return divided by its
+covered Beijing calendar days and multiplied by 365; it is not extrapolated
+from a partial day. Multi-day command-line reports use the same calendar-day
+denominator rather than fractional UTC elapsed time. Date-only `--since` values
+mean Beijing midnight.
+
+Query the latest 30 or 90 Beijing natural days. Each command prints the period
+total and annualized return followed by every day's confirmed PnL, including
+zero-trade days:
+
+```bash
+python tools/pnl_report.py --asset ETH --period 1m
+python tools/pnl_report.py --asset ETH --period 3m
+```
 
 Resend the latest confirmed close to the configured Telegram chat in the
 Chinese PnL-summary format:
@@ -166,13 +186,23 @@ python tools/analyze.py --tail 50000 --asset ETH | grep '^shadow_gradient_levels
 ### Five-tier real gradient and account risk
 
 `--v4-real-gradient` is an explicit real-order mode. It uses five dynamic
-historical-percentile tiers. Each order remains fixed at USD 20. Tier N permits
-cumulative one-sided notional up to N times the smaller venue equity, capped at
-5x per venue. Every child order requires a fresh quote and confirmation of the
-previous pair of fills. There is no fixed delay between children. Each venue
-uses a rolling 60-second request window with normal capacity reserved below the
-hard capacity so reduce-only exits remain available. It is mutually exclusive
-with `--v4-shadow-gradient`.
+historical-percentile tiers. Each order remains fixed at USD 20. The smaller
+fresh venue equity determines integer child slots: each tier receives one fifth
+of the total 5x slot budget cumulatively. For example, USD 98.64 supports
+`5/10/15/20/24` children across tiers 1-5, USD 100 supports
+`5/10/15/20/25`, and USD 120 supports `6/12/18/24/30`. This keeps the hard
+limit at 5x per venue without a static USD 500 ceiling. Every child order
+requires a fresh quote and confirmation of the previous pair of fills. There is
+no fixed delay between children. Each venue uses a rolling 60-second request
+window with normal capacity reserved below the hard capacity so reduce-only
+exits remain available. It is mutually exclusive with `--v4-shadow-gradient`.
+
+Tier activation requires the latest observation and at least two of the latest
+three observations to reach that tier. The spacing between adjacent tiers is
+the maximum of the historical percentile difference, observed market noise,
+incremental depth cost, and recent paired-execution error. After a tier closes,
+that tier must first fall below its threshold and then satisfy activation again
+before it can add new children.
 
 Every candidate entry is checked against fresh account data. The hard leverage
 limit is 5x on each venue independently, not 5x on combined gross notional.
@@ -185,13 +215,14 @@ while a position is open and every 15 seconds while flat. If a venue omits
 maintenance-margin data, the engine uses a conservative venue-specific fallback
 rate instead of disabling the risk ladder.
 
-When several confirmed child lots jointly reach the executable net target, the
-engine quantity-weights their entry fills and submits one total reduce-only
-order to each venue. All component IDs remain in the audit payload. If the live
-edge falls to a lower tier before the whole basket reaches target, partial
-de-tiering may remove the newest, highest-tier excess lots only when the removed
-basket itself reaches the normal net target and removed realized plus remaining
-executable unrealized PnL is not negative.
+Exit accounting is independent by entry tier. The engine checks higher tiers
+first, quantity-weights only that tier's confirmed child fills, and closes the
+whole tier only when that tier alone reaches its executable net target. A
+partially filled tier may close under the same rule. Profit from a higher tier
+never subsidizes a loss in a lower tier; lower tiers may remain open for their
+own later profitable reversion. Risk-forced reduction and emergency exit remain
+allowed to override profit exits. Funding is excluded from live exit decisions
+and is included only in post-close account-equity reporting.
 
 V4 has no time-driven exit and does not relax its profit target based on holding
 time. Executable profit, the independent unrealized-loss fuse, and account-risk

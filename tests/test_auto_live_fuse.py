@@ -19,9 +19,13 @@ from main import (
     account_risk_context,
     adaptive_margin_thresholds,
     account_snapshot_freshness,
+    live_inventory_state_status,
     variational_api_amount_to_str,
     v4_real_gradient_capacity_notional_usd,
+    v4_real_gradient_confirmed_tier,
     v4_real_gradient_eligible_tier,
+    v4_real_gradient_lot_groups,
+    v4_real_gradient_slot_caps,
     v4_real_gradient_thresholds,
     v4_partial_detier_selection,
     v4_weekend_regime_context,
@@ -84,6 +88,12 @@ def test_variational_account_snapshot_freshness_rejects_stale_data() -> None:
     assert stale["reason"] == "snapshot_stale"
 
 
+def test_live_inventory_state_status_follows_actual_positions_and_actions() -> None:
+    assert live_inventory_state_status(open_lots=[{"lot_id": 1}], pending_actions=[]) == "open"
+    assert live_inventory_state_status(open_lots=[], pending_actions=[{"role": "entry"}]) == "pending"
+    assert live_inventory_state_status(open_lots=[], pending_actions=[]) == "flat"
+
+
 def test_v4_real_gradient_thresholds_are_dynamic_and_strictly_ordered() -> None:
     history = [Decimal(index) / Decimal("10") for index in range(1000)]
 
@@ -97,6 +107,69 @@ def test_v4_real_gradient_thresholds_are_dynamic_and_strictly_ordered() -> None:
     assert thresholds[0] == Decimal("97.4")
     assert all(right > left for left, right in zip(thresholds, thresholds[1:]))
     assert v4_real_gradient_eligible_tier(thresholds[2], thresholds) == 3
+
+
+def test_v4_real_gradient_thresholds_respect_noise_and_depth_spacing() -> None:
+    thresholds = v4_real_gradient_thresholds(
+        history_values=[Decimal(index) / Decimal("10") for index in range(1000)],
+        base_threshold_bps=Decimal("97.4"),
+        entry_execution_reserve_bps=Decimal("0.5"),
+        actual_market_noise_bps=Decimal("0.8"),
+        incremental_depth_cost_bps=Decimal("0.6"),
+        recent_pair_execution_error_bps=Decimal("0.7"),
+    )
+
+    assert all(
+        right - left >= Decimal("0.8")
+        for left, right in zip(thresholds, thresholds[1:])
+    )
+
+
+def test_v4_real_gradient_entry_uses_latest_and_two_of_three() -> None:
+    assert v4_real_gradient_confirmed_tier([0, 3], latest_tier=3) == 0
+    assert v4_real_gradient_confirmed_tier([3, 0, 3], latest_tier=3) == 3
+    assert v4_real_gradient_confirmed_tier([3, 3, 0], latest_tier=0) == 0
+
+
+def test_v4_real_gradient_closed_tier_requires_reset_before_rearm() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_v4_gradient_entry_tier_window = deque(
+        [3, 3],
+        maxlen=3,
+    )
+    runtime.live_inventory_v4_gradient_tier_states = {
+        tier: {"armed": True, "reset_seen": False}
+        for tier in range(1, 6)
+    }
+    thresholds = [
+        Decimal("1"),
+        Decimal("2"),
+        Decimal("3"),
+        Decimal("4"),
+        Decimal("5"),
+    ]
+
+    runtime.mark_live_inventory_gradient_tier_closed(
+        tier=3,
+        edge_bps=Decimal("4"),
+        thresholds_bps=thresholds,
+    )
+
+    assert runtime.live_inventory_basis_v4_active_gradient_tier(
+        raw_tier=3,
+        edge_bps=Decimal("4"),
+        thresholds_bps=thresholds,
+    ) == 2
+    assert runtime.live_inventory_basis_v4_active_gradient_tier(
+        raw_tier=0,
+        edge_bps=Decimal("0"),
+        thresholds_bps=thresholds,
+    ) == 0
+    assert runtime.live_inventory_basis_v4_active_gradient_tier(
+        raw_tier=3,
+        edge_bps=Decimal("4"),
+        thresholds_bps=thresholds,
+    ) == 3
 
 
 def test_v4_real_gradient_capacity_uses_smaller_venue_equity() -> None:
@@ -114,7 +187,28 @@ def test_v4_real_gradient_capacity_uses_smaller_venue_equity() -> None:
     ) == Decimal("500")
 
 
-def test_v4_partial_detier_selects_highest_newest_lots_only() -> None:
+def test_v4_real_gradient_slot_caps_follow_dynamic_smaller_equity() -> None:
+    assert v4_real_gradient_slot_caps(
+        variational_equity_usd=Decimal("102.97"),
+        lighter_equity_usd=Decimal("98.64"),
+        child_notional_usd=Decimal("20"),
+        max_venue_leverage=Decimal("5"),
+    ) == [5, 10, 15, 20, 24]
+    assert v4_real_gradient_slot_caps(
+        variational_equity_usd=Decimal("100"),
+        lighter_equity_usd=Decimal("100"),
+        child_notional_usd=Decimal("20"),
+        max_venue_leverage=Decimal("5"),
+    ) == [5, 10, 15, 20, 25]
+    assert v4_real_gradient_slot_caps(
+        variational_equity_usd=Decimal("120"),
+        lighter_equity_usd=Decimal("120"),
+        child_notional_usd=Decimal("20"),
+        max_venue_leverage=Decimal("5"),
+    ) == [6, 12, 18, 24, 30]
+
+
+def test_v4_partial_detier_selects_entire_highest_tier_only() -> None:
     lots = [
         {
             "lot_id": 1,
@@ -148,9 +242,26 @@ def test_v4_partial_detier_selects_highest_newest_lots_only() -> None:
     )
 
     assert plan["ready"] is True
-    assert plan["selected_lot_ids"] == ["3"]
-    assert plan["remaining_notional_usd"] == "40"
-    assert plan["target_capacity_usd"] == "40"
+    assert plan["selected_lot_ids"] == ["2", "3"]
+    assert plan["selected_gradient_tier"] == 3
+    assert plan["remaining_notional_usd"] == "20"
+    assert "combined_projected_pnl_usd" not in plan
+
+
+def test_v4_real_gradient_lot_groups_never_mix_tier_pnl() -> None:
+    lots = [
+        {"lot_id": 1, "entry_gradient_tier": 1},
+        {"lot_id": 2, "entry_gradient_tier": 3},
+        {"lot_id": 3, "entry_gradient_tier": 1},
+        {"lot_id": 4, "entry_gradient_tier": 3},
+    ]
+
+    groups = v4_real_gradient_lot_groups(lots)
+
+    assert [(tier, [lot["lot_id"] for lot in group]) for tier, group in groups] == [
+        (3, [2, 4]),
+        (1, [1, 3]),
+    ]
 
 
 def test_adaptive_margin_thresholds_allow_normal_five_x_baseline() -> None:

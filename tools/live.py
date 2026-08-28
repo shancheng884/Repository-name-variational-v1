@@ -128,6 +128,10 @@ def validate_state(
     status = str(state.get("status") or "unknown")
     open_lots = state.get("open_lots") or []
     pending_actions = state.get("pending_actions") or []
+    if status == "flat" and open_lots:
+        status = "open"
+    elif status == "flat" and pending_actions:
+        status = "pending"
     asset = str(state.get("asset") or "-").upper()
     try:
         completed_cycles = int(state.get("completed_cycles") or 0)
@@ -182,6 +186,17 @@ def validate_state(
         )
 
     if reset_state_after_manual_flat and not collect_only:
+        if open_lots:
+            return (
+                False,
+                f"reset_refuses_open_lots count={len(open_lots)} asset={asset}",
+            )
+        if pending_actions:
+            return (
+                False,
+                "reset_refuses_pending_actions "
+                f"count={len(pending_actions)} asset={asset}",
+            )
         return (
             True,
             f"state={status} asset={asset} open_lots={len(open_lots)} "
