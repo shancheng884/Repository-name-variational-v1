@@ -93,6 +93,7 @@ def _reason_cn(value: Any) -> str:
         "v4_executable_net_target_reached": "可执行净收益达到目标",
         "max_unrealized_loss_bps": "触发最大未实现亏损保护",
         "v4_max_hold_timeout": "旧版最长持仓超时",
+        "operator_requested_exit": "人工请求安全退出",
         "basis_exit_refresh_pnl_below_threshold": "刷新后可执行收益低于平仓目标",
         "v4_exit_confirmation_pending": "等待平仓价格确认",
         "basis_var_quote_too_old": "Variational 报价过旧",

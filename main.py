@@ -1662,6 +1662,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_i_accept_open_state_resume = bool(args.live_inventory_i_accept_open_state_resume)
         self.live_inventory_reset_state_after_manual_flat = bool(args.live_inventory_reset_state_after_manual_flat)
         self.live_inventory_auto_close_manual_review_position = bool(args.live_inventory_auto_close_manual_review_position)
+        self.live_inventory_force_close_open_state = bool(
+            args.live_inventory_force_close_open_state
+        )
         self.live_inventory_lot_notional_usd = Decimal(str(args.live_inventory_lot_notional_usd))
         self.live_inventory_max_total_notional_usd = Decimal(str(args.live_inventory_max_total_notional_usd))
         self.live_inventory_max_lots = int(args.live_inventory_max_lots)
@@ -8510,6 +8513,26 @@ class VariationalToLighterRuntime:
                             "live_inventory_manual_review_auto_close_requires_slippage_manual_review: "
                             + self.live_inventory_state_summary(state)
                         )
+                elif getattr(self, "live_inventory_force_close_open_state", False):
+                    state = self.load_live_inventory_state()
+                    state_status = clean_state_value(state.get("status")) or "unknown"
+                    open_lots = (
+                        state.get("open_lots")
+                        if isinstance(state.get("open_lots"), list)
+                        else []
+                    )
+                    pending_actions = (
+                        state.get("pending_actions")
+                        if isinstance(state.get("pending_actions"), list)
+                        else []
+                    )
+                    if state_status == "open" and open_lots and not pending_actions:
+                        passed.append("live_inventory_force_close_open_state_requested")
+                    else:
+                        blocking_errors.append(
+                            "live_inventory_force_close_requires_clean_open_state: "
+                            + self.live_inventory_state_summary(state)
+                        )
                 elif self.live_inventory_i_confirm_flat_start:
                     passed.append("live_inventory_flat_start_manually_confirmed")
                     state = self.load_live_inventory_state()
@@ -12239,6 +12262,12 @@ class VariationalToLighterRuntime:
             return
         if (
             not collect_only
+            and getattr(self, "live_inventory_force_close_open_state", False)
+            and not self.live_inventory_open_lots
+        ):
+            return
+        if (
+            not collect_only
             and self.live_inventory_completed_cycles >= self.live_inventory_max_cycles
             and not self.live_inventory_open_lots
         ):
@@ -14404,6 +14433,32 @@ class VariationalToLighterRuntime:
         ):
             return
         if (
+            getattr(self, "live_inventory_force_close_open_state", False)
+            and len(self.live_inventory_open_lots) > 1
+            and not portfolio_exit_lot_ids
+        ):
+            self.live_inventory_v4_portfolio_exit_lot_ids = {
+                self.live_inventory_normalized_lot_id(lot.get("lot_id"))
+                for lot in self.live_inventory_open_lots
+            }
+            self.live_inventory_v4_portfolio_exit_context = {
+                "operator_requested_exit": True,
+                "partial_detier": False,
+                "locked_at": utc_now(),
+            }
+            portfolio_exit_lot_ids = self.live_inventory_v4_portfolio_exit_lot_ids
+            await self.persist_live_inventory_memory(
+                reason="operator_requested_atomic_exit_locked"
+            )
+            await self.append_live_inventory_log(
+                "live_inventory_operator_exit_locked",
+                {
+                    **state_payload,
+                    "reason": "operator_requested_exit",
+                    "lot_ids": sorted(portfolio_exit_lot_ids),
+                },
+            )
+        if (
             v4_mode
             and self.live_inventory_basis_v4_real_gradient
             and len(self.live_inventory_open_lots) > 1
@@ -14858,7 +14913,13 @@ class VariationalToLighterRuntime:
             account_risk_exit_reason = getattr(
                 self, "live_inventory_account_risk_exit_reason", None
             )
-            should_account_risk_exit = bool(account_risk_exit_reason)
+            operator_exit_reason = (
+                "operator_requested_exit"
+                if getattr(self, "live_inventory_force_close_open_state", False)
+                else None
+            )
+            forced_exit_reason = operator_exit_reason or account_risk_exit_reason
+            should_account_risk_exit = bool(forced_exit_reason)
             should_timeout = holding_samples >= self.live_inventory_max_hold_samples
             should_timeout_exit = should_timeout and self.live_inventory_basis_max_hold_action == "exit"
             if v4_mode and candidate_lot.get("entry_kind") == "basis_v4_eth_short_p97_5":
@@ -14978,7 +15039,7 @@ class VariationalToLighterRuntime:
                     "should_timeout": should_timeout,
                     "should_timeout_exit": should_timeout_exit,
                     "should_account_risk_exit": should_account_risk_exit,
-                    "account_risk_exit_reason": account_risk_exit_reason,
+                    "account_risk_exit_reason": forced_exit_reason,
                     "portfolio_exit_selected": portfolio_exit_selected,
                     "should_profit_take": should_profit_take,
                     "signal_exit_watch_timeout_ok": signal_exit_watch_timeout_ok,
@@ -15069,7 +15130,12 @@ class VariationalToLighterRuntime:
         exit_var_order_quote: dict[str, Any] = {}
         exit_lighter_depth: dict[str, Any] | None = None
         if not self.live_inventory_dry_decisions:
-            if should_exit and not should_timeout and not self.live_inventory_entry_cost_confirmed(lot):
+            if (
+                should_exit
+                and not should_timeout
+                and not should_account_risk_exit
+                and not self.live_inventory_entry_cost_confirmed(lot)
+            ):
                 await self.append_live_inventory_log(
                     "live_inventory_exit_blocked",
                     {
@@ -15091,6 +15157,7 @@ class VariationalToLighterRuntime:
                 and not portfolio_exit_selected
                 and not should_stop
                 and not should_timeout_exit
+                and not should_account_risk_exit
                 and self.live_inventory_basis_refresh_exit_quote_before_submit
             )
             if use_fast_refresh_window:
@@ -15187,7 +15254,11 @@ class VariationalToLighterRuntime:
             else:
                 refresh_context: dict[str, Any] | None = None
                 if (
-                    (should_exit or (v4_mode and should_timeout_exit))
+                    (
+                        should_exit
+                        or (v4_mode and should_timeout_exit)
+                    )
+                    and not should_account_risk_exit
                     and self.live_inventory_basis_refresh_exit_quote_before_submit
                 ):
                     refresh_context = (
@@ -15413,6 +15484,7 @@ class VariationalToLighterRuntime:
                     and not portfolio_exit_selected
                     and not should_stop
                     and not should_timeout_exit
+                    and not should_account_risk_exit
                     and (
                     pnl_bps is None or pnl_bps < effective_min_exit_pnl_bps
                     )
@@ -15440,6 +15512,7 @@ class VariationalToLighterRuntime:
                     and not portfolio_exit_selected
                     and not should_stop
                     and not should_timeout_exit
+                    and not should_account_risk_exit
                 ):
                     exit_confirmed, confirmation_count = (
                         self.live_inventory_basis_v4_confirm_exit_candidate(
@@ -17793,10 +17866,25 @@ class VariationalToLighterRuntime:
         if self.is_live_inventory_enabled():
             self.sync_live_inventory_memory_from_state()
             self.sync_live_inventory_pnl_tracking_baseline()
+            if self.live_inventory_force_close_open_state:
+                self.live_inventory_max_cycles = (
+                    self.live_inventory_completed_cycles + 1
+                )
             self.live_inventory_calibration_start_realized_pnl_usd = self.live_inventory_realized_pnl_usd
             self.live_inventory_v4_run_start_realized_pnl_usd = self.live_inventory_realized_pnl_usd
             if not self.live_inventory_dry_decisions:
                 await self.reconcile_live_inventory_startup_state()
+
+        if self.live_inventory_force_close_open_state:
+            await self.append_live_inventory_log(
+                "live_inventory_operator_exit_requested",
+                {
+                    "asset": self.live_inventory_state_asset(),
+                    "reason": "operator_requested_exit",
+                    "open_lots_total": len(self.live_inventory_open_lots),
+                    "max_cycles": self.live_inventory_max_cycles,
+                },
+            )
 
         if self.live_inventory_auto_close_manual_review_position:
             await self.auto_close_live_inventory_manual_review_position_once()
@@ -18297,6 +18385,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="One-shot recovery: only for live_inventory manual_review caused by entry Lighter actual slippage exceeding the limit; submit reduce-only closes for both legs and exit.",
     )
+    parser.add_argument(
+        "--live-inventory-force-close-open-state",
+        action="store_true",
+        help="One-shot operator exit: reconcile a saved healthy open state, submit concurrent reduce-only exits for all recorded lots, confirm final fills, and stop.",
+    )
     parser.add_argument("--live-inventory-lot-notional-usd", type=float, default=20.0)
     parser.add_argument(
         "--live-inventory-max-total-notional-usd",
@@ -18759,11 +18852,13 @@ def parse_args() -> argparse.Namespace:
             not args.live_inventory_i_confirm_flat_start
             and not args.live_inventory_i_accept_open_state_resume
             and not args.live_inventory_auto_close_manual_review_position
+            and not args.live_inventory_force_close_open_state
         ):
             parser.error(
                 "--live-inventory requires --live-inventory-i-confirm-flat-start after manually confirming flat, "
                 "--live-inventory-i-accept-open-state-resume after manually confirming the saved open state matches both venues, "
-                "or --live-inventory-auto-close-manual-review-position for one-shot recovery"
+                "--live-inventory-auto-close-manual-review-position for one-shot recovery, "
+                "or --live-inventory-force-close-open-state for a reconciled one-shot operator exit"
             )
         live_inventory_start_modes = sum(
             bool(flag)
@@ -18771,12 +18866,15 @@ def parse_args() -> argparse.Namespace:
                 args.live_inventory_i_confirm_flat_start,
                 args.live_inventory_i_accept_open_state_resume,
                 args.live_inventory_auto_close_manual_review_position,
+                args.live_inventory_force_close_open_state,
             )
         )
         if live_inventory_start_modes > 1:
             parser.error(
                 "use only one of --live-inventory-i-confirm-flat-start, "
-                "--live-inventory-i-accept-open-state-resume, or --live-inventory-auto-close-manual-review-position"
+                "--live-inventory-i-accept-open-state-resume, "
+                "--live-inventory-auto-close-manual-review-position, or "
+                "--live-inventory-force-close-open-state"
             )
         allowed_assets = {asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()}
         if args.live_inventory_collect_only and (

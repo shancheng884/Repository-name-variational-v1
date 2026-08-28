@@ -271,6 +271,75 @@ def test_live_tool_v4_real_gradient_enables_five_dynamic_tiers(monkeypatch) -> N
     assert args.live_inventory_equity_balance_block_ratio == 0.74
 
 
+def test_live_tool_close_open_position_uses_reconciled_one_shot_mode(
+    monkeypatch,
+) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(v4_live_mode=True),
+        close_open_position=True,
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_force_close_open_state is True
+    assert "--live-inventory-force-close-open-state" in command
+    assert "--live-inventory-i-confirm-flat-start" not in command
+    assert "--live-inventory-reset-state-after-manual-flat" not in command
+
+
+def test_live_tool_close_open_position_requires_clean_open_state(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    monkeypatch.setattr(live, "LIVE_STATE", state_path)
+
+    missing_ok, missing_message = validate_state(
+        LiveConfig(v4_live_mode=True),
+        close_open_position=True,
+    )
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "open",
+                "asset": "ETH",
+                "open_lots": [{"lot_id": 1, "qty": "0.008"}],
+                "pending_actions": [],
+                "completed_cycles": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    open_ok, open_message = validate_state(
+        LiveConfig(v4_live_mode=True),
+        close_open_position=True,
+    )
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "open",
+                "asset": "ETH",
+                "open_lots": [{"lot_id": 1, "qty": "0.008"}],
+                "pending_actions": [{"role": "live_inventory_exit"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pending_ok, pending_message = validate_state(
+        LiveConfig(v4_live_mode=True),
+        close_open_position=True,
+    )
+
+    assert missing_ok is False
+    assert missing_message == "close_requires_existing_open_state"
+    assert open_ok is True
+    assert "operator_exit_requested" in open_message
+    assert pending_ok is False
+    assert "close_refuses_pending_actions" in pending_message
+
+
 def test_live_tool_v4_batch_is_sequential_bounded_and_guarded(
     monkeypatch,
 ) -> None:

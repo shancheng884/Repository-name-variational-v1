@@ -228,6 +228,22 @@ python tools/live.py --asset ETH --v4-live --v4-real-gradient \
   --v4-test-skip-recent-health --v4-test-max-cycles 3 \
   --reset-state-after-manual-flat
 ```
+
+To end a healthy V4 test position before its normal profit exit, stop the old
+process without changing `live_inventory_state.json`, then run the reconciled
+one-shot exit:
+
+```bash
+python tools/live.py --asset ETH --v4-live --close-open-position
+```
+
+This command accepts only `status=open` with at least one recorded lot and no
+pending action. Startup fetches both venue positions and requires their
+quantities and directions to match the saved lots. It then disables entries,
+submits the existing concurrent reduce-only exit path, waits for both final
+fills and the PnL report, and stops. It never resets an open state. Do not use
+manual sequential closes unless startup reconciliation has refused and the
+venues require manual recovery.
 # Automatic margin rebalance
 
 The implementation contract and safety state machine are documented in

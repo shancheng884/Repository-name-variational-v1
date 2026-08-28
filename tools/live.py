@@ -116,9 +116,12 @@ def validate_state(
     *,
     reset_state_after_manual_flat: bool = False,
     collect_only: bool = False,
+    close_open_position: bool = False,
 ) -> tuple[bool, str]:
     state = read_json(LIVE_STATE)
     if not state:
+        if close_open_position:
+            return False, "close_requires_existing_open_state"
         return True, "state=missing allowed=start_after_manual_exchange_flat_confirmation"
 
     status = str(state.get("status") or "unknown")
@@ -129,6 +132,23 @@ def validate_state(
         completed_cycles = int(state.get("completed_cycles") or 0)
     except (TypeError, ValueError):
         completed_cycles = 0
+
+    if close_open_position:
+        if status != "open":
+            return False, f"close_requires_open_state status={status} asset={asset}"
+        if not open_lots:
+            return False, f"close_requires_open_lots asset={asset}"
+        if pending_actions:
+            return (
+                False,
+                f"close_refuses_pending_actions count={len(pending_actions)} asset={asset}",
+            )
+        return (
+            True,
+            f"state=open asset={asset} open_lots={len(open_lots)} "
+            f"pending_actions=0 completed_cycles={completed_cycles} "
+            "operator_exit_requested exchange_reconcile_required=true",
+        )
 
     if reset_state_after_manual_flat and not collect_only:
         return (
@@ -339,6 +359,7 @@ def build_main_command(
     v4_test_allow_weekend: bool = False,
     v4_shadow_gradient: bool = False,
     v4_real_gradient: bool = False,
+    close_open_position: bool = False,
 ) -> list[str]:
     reversion_mode = config.reversion_mode
     calibration_mode = config.calibration_mode
@@ -464,8 +485,12 @@ def build_main_command(
         config.entry_lighter_fill_timeout_seconds,
         "--live-inventory-snapshot-timeout-seconds",
         config.snapshot_timeout_seconds,
-        "--live-inventory-i-confirm-flat-start",
     ]
+    command.append(
+        "--live-inventory-force-close-open-state"
+        if close_open_position
+        else "--live-inventory-i-confirm-flat-start"
+    )
     if collect_only:
         command.extend(["--live-inventory-dry-decisions", "--live-inventory-collect-only"])
     else:
@@ -631,6 +656,11 @@ def main() -> int:
         help="Enable five dynamic V4 leverage tiers using confirmed 20 USD child orders.",
     )
     parser.add_argument(
+        "--close-open-position",
+        action="store_true",
+        help="One-shot: reconcile the saved open position, close all recorded lots with concurrent reduce-only orders, confirm final fills, and stop.",
+    )
+    parser.add_argument(
         "--v4-test-max-cycles",
         type=int,
         choices=range(1, 4),
@@ -685,6 +715,20 @@ def main() -> int:
         parser.error("use only one of --reversion, --calibration, --v4-live, or --collect-only")
     if args.collect_only and args.reset_state_after_manual_flat:
         parser.error("--collect-only does not allow --reset-state-after-manual-flat")
+    if args.close_open_position and not args.v4_live:
+        parser.error("--close-open-position requires --v4-live")
+    if args.close_open_position and (
+        args.reset_state_after_manual_flat
+        or args.collect_only
+        or args.reversion
+        or args.calibration
+        or args.v4_shadow_gradient
+        or args.v4_real_gradient
+    ):
+        parser.error(
+            "--close-open-position cannot be combined with reset, collect-only, "
+            "reversion, calibration, or gradient flags"
+        )
     if args.reversion:
         config = replace(
             config,
@@ -759,6 +803,7 @@ def main() -> int:
         config,
         reset_state_after_manual_flat=args.reset_state_after_manual_flat,
         collect_only=args.collect_only,
+        close_open_position=args.close_open_position,
     )
     print(state_message)
     print(disk_warning())
@@ -785,6 +830,7 @@ def main() -> int:
             v4_test_allow_weekend=args.v4_test_allow_weekend,
             v4_shadow_gradient=args.v4_shadow_gradient,
             v4_real_gradient=args.v4_real_gradient,
+            close_open_position=args.close_open_position,
         )
     )
     effective_max_cycles = (
