@@ -180,6 +180,29 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         }
     ]
     latest_account_risk = account_risk_rows[-1] if account_risk_rows else {}
+    risk_snapshot_fresh = latest_account_risk.get(
+        "variational_account_snapshot_fresh"
+    )
+    risk_snapshot_age = latest_account_risk.get(
+        "variational_account_snapshot_age_seconds"
+    )
+    variational_snapshot_fresh = (
+        risk_snapshot_fresh
+        if risk_snapshot_fresh is not None
+        else latest_account_snapshot.get("variational_snapshot_fresh")
+    )
+    variational_snapshot_age_seconds = (
+        risk_snapshot_age
+        if risk_snapshot_age is not None
+        else latest_account_snapshot.get("variational_snapshot_age_seconds")
+    )
+    variational_snapshot_status_source = (
+        "account_risk"
+        if risk_snapshot_fresh is not None or risk_snapshot_age is not None
+        else "account_snapshot"
+        if latest_account_snapshot
+        else None
+    )
     shadow_gradient_entries = [
         row
         for row in v4_rows
@@ -362,11 +385,10 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "max_venue_leverage": latest_strategy_snapshot.get(
             "max_venue_leverage"
         ),
-        "variational_snapshot_fresh": latest_account_snapshot.get(
-            "variational_snapshot_fresh"
-        ),
-        "variational_snapshot_age_seconds": latest_account_snapshot.get(
-            "variational_snapshot_age_seconds"
+        "variational_snapshot_fresh": variational_snapshot_fresh,
+        "variational_snapshot_age_seconds": variational_snapshot_age_seconds,
+        "variational_snapshot_status_source": (
+            variational_snapshot_status_source
         ),
         "portfolio_exit_locks": len(portfolio_exit_locks),
         "portfolio_exit_last_lot_ids": latest_portfolio_exit_lock.get("lot_ids"),
@@ -733,7 +755,9 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
     print(
         f"variational_snapshot_fresh={funnel['variational_snapshot_fresh']} "
         f"variational_snapshot_age_seconds="
-        f"{funnel['variational_snapshot_age_seconds']}"
+        f"{funnel['variational_snapshot_age_seconds']} "
+        f"variational_snapshot_status_source="
+        f"{funnel['variational_snapshot_status_source']}"
     )
     print(
         f"portfolio_exit_locks={funnel['portfolio_exit_locks']} "

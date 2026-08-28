@@ -153,6 +153,39 @@ def test_v4_live_funnel_reports_shadow_gradient_result() -> None:
     assert funnel["strong_single_shortfall_raw_p80_bps"] == "11.68"
 
 
+def test_v4_live_funnel_prefers_latest_account_risk_freshness() -> None:
+    common = {
+        "run_id": "live-v4-account-risk",
+        "strategy_version": "basis-v4-live-test-v14",
+        "asset": "ETH",
+    }
+    funnel = build_v4_live_funnel(
+        [
+            {**common, "event": "live_inventory_strategy_snapshot"},
+            {**common, "event": "live_inventory_basis_state"},
+            {
+                **common,
+                "event": "live_inventory_account_snapshot",
+                "variational_snapshot_fresh": True,
+                "variational_snapshot_age_seconds": 0.15,
+            },
+            {
+                **common,
+                "event": "live_inventory_account_risk_alert",
+                "risk_action": "block_entry",
+                "risk_reason": "variational_account_snapshot_stale",
+                "variational_account_snapshot_fresh": False,
+                "variational_account_snapshot_age_seconds": 62.6,
+            },
+        ]
+    )
+
+    assert funnel is not None
+    assert funnel["variational_snapshot_fresh"] is False
+    assert funnel["variational_snapshot_age_seconds"] == 62.6
+    assert funnel["variational_snapshot_status_source"] == "account_risk"
+
+
 def test_v4_live_funnel_distinguishes_anchor_and_recent_health_waits() -> None:
     common = {
         "run_id": "live-v4-wait-test",
