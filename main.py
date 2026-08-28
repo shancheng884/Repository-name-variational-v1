@@ -1827,6 +1827,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_max_hold_samples = int(args.live_inventory_max_hold_samples)
         self.live_inventory_max_unrealized_loss_bps = Decimal(str(args.live_inventory_max_unrealized_loss_bps))
         self.live_inventory_max_cycles = int(args.live_inventory_max_cycles)
+        self.live_inventory_basis_v4_continuous = bool(
+            args.live_inventory_basis_v4_continuous
+        )
         self.live_inventory_basis_z_entry = Decimal(str(args.live_inventory_basis_z_entry))
         self.live_inventory_basis_z_exit = Decimal(str(args.live_inventory_basis_z_exit))
         self.live_inventory_basis_min_entry_edge_bps = Decimal(str(args.live_inventory_basis_min_entry_edge_bps))
@@ -2117,7 +2120,12 @@ class VariationalToLighterRuntime:
             if self.live_inventory_basis_reversion_mode
             else "legacy-basis"
         )
-        if self.live_inventory_basis_v4_mode and self.live_inventory_max_cycles > 1:
+        if (
+            self.live_inventory_basis_v4_mode
+            and self.live_inventory_basis_v4_continuous
+        ):
+            self.live_inventory_strategy_variant += "-continuous"
+        elif self.live_inventory_basis_v4_mode and self.live_inventory_max_cycles > 1:
             self.live_inventory_strategy_variant += (
                 f"-bounded-batch-{self.live_inventory_max_cycles}"
             )
@@ -10979,7 +10987,7 @@ class VariationalToLighterRuntime:
             return False
         completed_cycles = int(getattr(self, "live_inventory_completed_cycles", 0))
         max_cycles = int(getattr(self, "live_inventory_max_cycles", 1))
-        final_cycle = completed_cycles >= max_cycles
+        final_cycle = max_cycles > 0 and completed_cycles >= max_cycles
         if final_cycle and getattr(self, "live_inventory_cycle_report_emitted", False):
             return False
         final_payload = getattr(self, "live_inventory_last_final_pnl_payload", None)
@@ -11091,7 +11099,7 @@ class VariationalToLighterRuntime:
     ) -> tuple[bool, str, dict[str, Any]]:
         if (
             not getattr(self, "live_inventory_basis_v4_mode", False)
-            or int(getattr(self, "live_inventory_max_cycles", 1)) <= 1
+            or int(getattr(self, "live_inventory_max_cycles", 1)) == 1
         ):
             return True, "ready", {}
 
@@ -11229,6 +11237,8 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_v4_test_skip_recent_health",
             "live_inventory_basis_v4_test_allow_weekend",
             "live_inventory_basis_v4_shadow_gradient",
+            "live_inventory_basis_v4_real_gradient",
+            "live_inventory_basis_v4_continuous",
             "live_inventory_basis_v4_max_run_loss_usd",
             "live_inventory_basis_v4_cycle_cooldown_seconds",
             "live_inventory_accept_basis_v4_live",
@@ -11394,7 +11404,11 @@ class VariationalToLighterRuntime:
                         for value in LIVE_INVENTORY_BASIS_V4_SHADOW_TRANCHE_IMPROVEMENT_LEVELS_BPS
                     ],
                     "max_cycles": self.live_inventory_max_cycles,
-                    "batch_mode": self.live_inventory_max_cycles > 1,
+                    "continuous_mode": self.live_inventory_basis_v4_continuous,
+                    "batch_mode": (
+                        self.live_inventory_basis_v4_continuous
+                        or self.live_inventory_max_cycles > 1
+                    ),
                     "batch_max_run_loss_usd": decimal_to_str(
                         self.live_inventory_basis_v4_max_run_loss_usd
                     ),
@@ -12939,6 +12953,7 @@ class VariationalToLighterRuntime:
             return
         if (
             not collect_only
+            and self.live_inventory_max_cycles > 0
             and self.live_inventory_completed_cycles >= self.live_inventory_max_cycles
             and not self.live_inventory_open_lots
         ):
@@ -16918,7 +16933,11 @@ class VariationalToLighterRuntime:
         index = self.live_inventory_sample_index
         event_prefix = "live_inventory_dry" if self.live_inventory_dry_decisions else "live_inventory"
         if not self.live_inventory_open_lots:
-            if self.live_inventory_completed_cycles >= self.live_inventory_max_cycles:
+            if (
+                self.live_inventory_max_cycles > 0
+                and self.live_inventory_completed_cycles
+                >= self.live_inventory_max_cycles
+            ):
                 return
             directions = (
                 (
@@ -19577,6 +19596,14 @@ def parse_args() -> argparse.Namespace:
         help="Enable five dynamic leverage tiers using confirmed 20 USD child orders.",
     )
     parser.add_argument(
+        "--live-inventory-basis-v4-continuous",
+        action="store_true",
+        help=(
+            "Allow a real-gradient V4 process to start another episode after "
+            "every fully-flat reconciliation. Requires max_cycles=0."
+        ),
+    )
+    parser.add_argument(
         "--live-inventory-basis-v4-max-run-loss-usd",
         type=float,
         default=0.0,
@@ -19876,8 +19903,19 @@ def parse_args() -> argparse.Namespace:
                         )
                 elif args.live_inventory_max_lots != 1 or args.live_inventory_max_total_lots != 1:
                     parser.error("basis real-submit diagnostic requires --live-inventory-max-lots 1 --live-inventory-max-total-lots 1")
-                if args.live_inventory_max_cycles <= 0 or args.live_inventory_max_cycles > 10:
-                    parser.error("basis real-submit diagnostic requires 0 < --live-inventory-max-cycles <= 10")
+                continuous_v4 = bool(
+                    args.live_inventory_basis_v4_profile
+                    and args.live_inventory_basis_v4_continuous
+                )
+                if (
+                    args.live_inventory_max_cycles < 0
+                    or args.live_inventory_max_cycles > 10
+                    or (args.live_inventory_max_cycles == 0 and not continuous_v4)
+                ):
+                    parser.error(
+                        "basis real-submit diagnostic requires max_cycles=1..10, "
+                        "or 0 with explicit continuous V4"
+                    )
             elif args.live_inventory_i_accept_basis_real_diagnostic:
                 parser.error("--live-inventory-i-accept-basis-real-diagnostic is only for real-submit diagnostic runs")
             elif args.live_inventory_i_accept_basis_addon_diagnostic:
@@ -19990,8 +20028,15 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-max-hold-samples must be > 0")
         if args.live_inventory_max_unrealized_loss_bps <= 0:
             parser.error("--live-inventory-max-unrealized-loss-bps must be > 0")
-        if args.live_inventory_max_cycles <= 0:
-            parser.error("--live-inventory-max-cycles must be > 0 in V1")
+        if args.live_inventory_max_cycles < 0:
+            parser.error("--live-inventory-max-cycles must be >= 0 in V1")
+        if (
+            args.live_inventory_max_cycles == 0
+            and not args.live_inventory_basis_v4_continuous
+        ):
+            parser.error(
+                "--live-inventory-max-cycles 0 requires explicit continuous V4"
+            )
         if args.live_inventory_execution_calibration:
             if args.live_inventory_signal_mode != LIVE_INVENTORY_SIGNAL_BASIS:
                 parser.error("--live-inventory-execution-calibration requires --live-inventory-signal-mode basis")
@@ -20064,8 +20109,16 @@ def parse_args() -> argparse.Namespace:
                 parser.error(
                     "basis V4 requires --live-inventory-i-accept-basis-v4-live"
                 )
-            if args.live_inventory_max_cycles < 1 or args.live_inventory_max_cycles > 3:
-                parser.error("basis V4 requires max_cycles between 1 and 3")
+            if args.live_inventory_basis_v4_continuous:
+                if args.live_inventory_max_cycles != 0:
+                    parser.error("continuous basis V4 requires max_cycles=0")
+                if not args.live_inventory_basis_v4_real_gradient:
+                    parser.error("continuous basis V4 requires real gradient")
+            elif (
+                args.live_inventory_max_cycles < 1
+                or args.live_inventory_max_cycles > 3
+            ):
+                parser.error("bounded basis V4 requires max_cycles between 1 and 3")
             if (
                 args.live_inventory_basis_v4_test_allow_weekend
                 and not args.live_inventory_basis_v4_test_skip_recent_health
@@ -20095,10 +20148,15 @@ def parse_args() -> argparse.Namespace:
             if args.live_inventory_basis_v4_max_run_loss_usd < 0:
                 parser.error("basis V4 max run loss must be >= 0")
             if (
-                args.live_inventory_max_cycles > 1
+                (
+                    args.live_inventory_max_cycles > 1
+                    or args.live_inventory_basis_v4_continuous
+                )
                 and args.live_inventory_basis_v4_max_run_loss_usd <= 0
             ):
-                parser.error("multi-cycle basis V4 requires a positive max run loss")
+                parser.error(
+                    "multi-cycle or continuous basis V4 requires a positive max run loss"
+                )
             if args.live_inventory_basis_v4_cycle_cooldown_seconds < 0:
                 parser.error("basis V4 cycle cooldown must be >= 0")
             expected_total_notional = (
@@ -20149,6 +20207,10 @@ def parse_args() -> argparse.Namespace:
         elif args.live_inventory_basis_v4_real_gradient:
             parser.error(
                 "--live-inventory-basis-v4-real-gradient requires a V4 profile"
+            )
+        elif args.live_inventory_basis_v4_continuous:
+            parser.error(
+                "--live-inventory-basis-v4-continuous requires a V4 profile"
             )
         elif args.live_inventory_i_accept_basis_v4_live:
             parser.error(

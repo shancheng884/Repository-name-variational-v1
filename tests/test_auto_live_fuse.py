@@ -6168,6 +6168,66 @@ def test_v4_intermediate_cycle_checkpoints_without_stopping(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_v4_continuous_cycle_checkpoints_without_stopping(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_v4_mode = True
+        runtime.live_inventory_cycle_report_emitted = False
+        runtime.live_inventory_last_final_pnl_payload = None
+        runtime.live_inventory_exit_events_logged = {"9"}
+        runtime.live_inventory_v4_checkpointed_lot_ids = set()
+        runtime.live_inventory_open_lots = []
+        runtime.live_inventory_completed_cycles = 27
+        runtime.live_inventory_max_cycles = 0
+        runtime.live_inventory_v4_run_start_realized_pnl_usd = Decimal("0")
+        runtime.live_inventory_realized_pnl_usd = Decimal("0.12")
+        runtime.stop_flag = False
+
+        async def fake_persist_live_inventory_memory(**_kwargs):
+            return None
+
+        runtime.persist_live_inventory_memory = fake_persist_live_inventory_memory
+        stopped = await runtime.maybe_auto_stop_completed_v4_cycle(
+            {
+                "asset": "ETH",
+                "lot_id": 9,
+                "final_pnl_status": "var_and_lighter_final_fills_confirmed",
+                "final_pnl_bps": "1.2",
+            }
+        )
+
+        assert stopped is False
+        assert runtime.stop_flag is False
+        rows = [
+            json.loads(line)
+            for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()
+        ]
+        assert rows[-1]["event"] == "live_inventory_v4_cycle_checkpoint"
+        assert rows[-1]["completed_cycles"] == 27
+        assert rows[-1]["max_cycles"] == 0
+        assert rows[-1]["next_cycle"] == 28
+
+    asyncio.run(run())
+
+
+def test_v4_continuous_entry_gate_keeps_cumulative_loss_fuse(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_max_cycles = 0
+    runtime.live_inventory_basis_v4_max_run_loss_usd = Decimal("0.05")
+    runtime.live_inventory_basis_v4_cycle_cooldown_seconds = 0.0
+    runtime.live_inventory_v4_run_start_realized_pnl_usd = Decimal("1.00")
+    runtime.live_inventory_realized_pnl_usd = Decimal("0.95")
+
+    ready, reason, context = runtime.live_inventory_v4_batch_entry_gate(
+        now_monotonic=300.0
+    )
+
+    assert ready is False
+    assert reason == "v4_batch_max_run_loss_reached"
+    assert context["batch_run_pnl_usd"] == "-0.05"
+
+
 def test_live_inventory_final_pnl_key_normalizes_numeric_lot_ids() -> None:
     assert VariationalToLighterRuntime.live_inventory_final_pnl_key(
         " eth ", 1

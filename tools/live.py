@@ -277,7 +277,11 @@ def validate_state(
         if config.reversion_mode
         else config.max_cycles
     )
-    if completed_cycles >= effective_max_cycles and not collect_only:
+    if (
+        effective_max_cycles > 0
+        and completed_cycles >= effective_max_cycles
+        and not collect_only
+    ):
         return (
             False,
             f"state_cycle_cap_reached asset={asset} completed_cycles={completed_cycles} max_cycles={effective_max_cycles} "
@@ -466,6 +470,7 @@ def build_main_command(
     v4_test_allow_weekend: bool = False,
     v4_shadow_gradient: bool = False,
     v4_real_gradient: bool = False,
+    v4_continuous: bool = False,
     close_open_position: bool = False,
     resume_open_position: bool = False,
     maintenance_drain_after_start: bool = False,
@@ -487,7 +492,9 @@ def build_main_command(
         else config.max_total_inventory_notional_usd
     )
     effective_max_cycles = (
-        config.calibration_max_cycles
+        0
+        if v4_live_mode and v4_continuous
+        else config.calibration_max_cycles
         if calibration_mode
         else 1
         if reversion_mode
@@ -659,6 +666,8 @@ def build_main_command(
             command.append("--live-inventory-basis-v4-shadow-gradient")
         if v4_real_gradient:
             command.append("--live-inventory-basis-v4-real-gradient")
+        if v4_continuous:
+            command.append("--live-inventory-basis-v4-continuous")
     elif reversion_mode:
         command.extend(
             [
@@ -769,6 +778,14 @@ def main() -> int:
         help="Enable five dynamic V4 leverage tiers using confirmed 20 USD child orders.",
     )
     parser.add_argument(
+        "--v4-continuous",
+        action="store_true",
+        help=(
+            "Run real-gradient V4 across unlimited fully-flat cycles. "
+            "Safety fuses and maintenance drain remain active."
+        ),
+    )
+    parser.add_argument(
         "--close-open-position",
         action="store_true",
         help="One-shot: reconcile the saved open position, close all recorded lots with concurrent reduce-only orders, confirm final fills, and stop.",
@@ -847,6 +864,7 @@ def main() -> int:
             or args.close_open_position
             or args.v4_shadow_gradient
             or args.v4_real_gradient
+            or args.v4_continuous
         )
         if incompatible:
             parser.error(
@@ -894,6 +912,7 @@ def main() -> int:
         or args.calibration
         or args.v4_shadow_gradient
         or args.v4_real_gradient
+        or args.v4_continuous
     ):
         parser.error(
             "--close-open-position cannot be combined with reset, collect-only, "
@@ -927,7 +946,7 @@ def main() -> int:
             calibration_mode=False,
             reversion_mode=False,
             v4_live_mode=True,
-            max_cycles=args.v4_test_max_cycles,
+            max_cycles=0 if args.v4_continuous else args.v4_test_max_cycles,
         )
     if args.calibration_direction is not None:
         config = replace(config, calibration_direction=args.calibration_direction)
@@ -955,6 +974,14 @@ def main() -> int:
         parser.error("--v4-real-gradient requires --v4-live")
     if args.v4_real_gradient and args.v4_shadow_gradient:
         parser.error("use only one of --v4-real-gradient or --v4-shadow-gradient")
+    if args.v4_continuous and not (
+        config.v4_live_mode and args.v4_real_gradient
+    ):
+        parser.error("--v4-continuous requires --v4-live and --v4-real-gradient")
+    if args.v4_continuous and args.v4_test_max_cycles != 1:
+        parser.error(
+            "--v4-continuous cannot be combined with --v4-test-max-cycles"
+        )
     if args.v4_test_max_cycles > 1 and not (
         config.v4_live_mode and args.v4_test_skip_recent_health
     ):
@@ -965,10 +992,13 @@ def main() -> int:
     if args.v4_test_max_cycles > 3:
         parser.error("--v4-test-max-cycles cannot exceed 3")
     if (
-        args.v4_test_max_cycles > 1
+        (args.v4_test_max_cycles > 1 or args.v4_continuous)
         and Decimal(config.v4_test_max_run_loss_usd) <= 0
     ):
-        parser.error("multi-cycle V4 requires v4_test_max_run_loss_usd > 0")
+        parser.error(
+            "multi-cycle or continuous V4 requires "
+            "v4_test_max_run_loss_usd > 0"
+        )
     if (
         args.calibration_direction is not None
         or args.calibration_weekdays_only is not None
@@ -1014,6 +1044,7 @@ def main() -> int:
             v4_test_allow_weekend=args.v4_test_allow_weekend,
             v4_shadow_gradient=args.v4_shadow_gradient,
             v4_real_gradient=args.v4_real_gradient,
+            v4_continuous=args.v4_continuous,
             close_open_position=args.close_open_position,
             resume_open_position=args.resume_open_position,
             maintenance_drain_after_start=(
@@ -1034,7 +1065,11 @@ def main() -> int:
         else "execution_calibration"
         if config.calibration_mode
         else (
-            "basis_v4_live_test_health_weekend_bypass"
+            "basis_v4_live_continuous_health_bypass"
+            if args.v4_continuous and args.v4_test_skip_recent_health
+            else "basis_v4_live_continuous"
+            if args.v4_continuous
+            else "basis_v4_live_test_health_weekend_bypass"
             if args.v4_test_allow_weekend
             else "basis_v4_live_test_health_bypass"
             if args.v4_test_skip_recent_health
@@ -1048,9 +1083,12 @@ def main() -> int:
     asset_text = ",".join(assets) if assets else str(asset)
     if assets:
         strategy_mode = "basis_multi_asset_collect_only"
+    max_cycles_text = (
+        "unlimited" if effective_max_cycles == 0 else effective_max_cycles
+    )
     print(
         f"starting asset={asset_text} strategy_mode={strategy_mode} "
-        f"max_cycles={effective_max_cycles} lot_notional_usd={config.lot_notional_usd}"
+        f"max_cycles={max_cycles_text} lot_notional_usd={config.lot_notional_usd}"
     )
     if args.verbose:
         print("main_command=" + " ".join(command))

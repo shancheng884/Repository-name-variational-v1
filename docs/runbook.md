@@ -260,6 +260,20 @@ python tools/live.py --asset ETH --v4-live --v4-real-gradient \
   --reset-state-after-manual-flat
 ```
 
+The command above is a bounded three-cycle acceptance run. For normal
+continuous operation after acceptance, use the explicit continuous mode:
+
+```bash
+python tools/live.py --asset ETH --v4-live --v4-real-gradient \
+  --v4-continuous --v4-test-skip-recent-health \
+  --reset-state-after-manual-flat
+```
+
+Continuous mode records a checkpoint every time the whole portfolio returns to
+flat, then rearms and starts another episode. `max_cycles=0` is accepted only
+with this explicit real-gradient mode. The cumulative run-loss fuse, account
+risk actions, exchange reconciliation, and maintenance drain remain active.
+
 To end a healthy V4 test position before its normal profit exit, stop the old
 process without changing `live_inventory_state.json`, then run the reconciled
 one-shot exit:

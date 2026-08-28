@@ -366,11 +366,17 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
             or latest_cycle_checkpoint.get("completed_cycles")
             or 0
         ),
-        "max_cycles": (
-            latest_cycle_report.get("max_cycles")
-            or latest_cycle_checkpoint.get("max_cycles")
-            or latest_strategy_snapshot.get("max_cycles")
-            or 1
+        "max_cycles": next(
+            (
+                value
+                for value in (
+                    latest_cycle_report.get("max_cycles"),
+                    latest_cycle_checkpoint.get("max_cycles"),
+                    latest_strategy_snapshot.get("max_cycles"),
+                )
+                if value is not None
+            ),
+            1,
         ),
         "shadow_gradient_enabled": latest_strategy_snapshot.get(
             "shadow_gradient_enabled"
@@ -699,6 +705,9 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
     if funnel is None:
         return
     print("== v4_live_funnel ==")
+    max_cycles_text = (
+        "unlimited" if funnel["max_cycles"] == 0 else funnel["max_cycles"]
+    )
     print(
         f"profile={funnel['profile']} samples={funnel['samples']} "
         f"threshold_crossings={funnel['threshold_crossings']} "
@@ -714,7 +723,7 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"exited={funnel['exited']} actual_pnl={funnel['actual_pnl']} "
         f"final_pnl={funnel['final_pnl']} cycle_reports={funnel['cycle_reports']} "
         f"cycle_checkpoints={funnel['cycle_checkpoints']} "
-        f"completed_cycles={funnel['completed_cycles']}/{funnel['max_cycles']}"
+        f"completed_cycles={funnel['completed_cycles']}/{max_cycles_text}"
     )
     if funnel["batch_wait_reason"]:
         print(

@@ -480,6 +480,56 @@ def test_live_tool_v4_batch_is_sequential_bounded_and_guarded(
     assert args.live_inventory_basis_v4_cycle_cooldown_seconds == 0
 
 
+def test_live_tool_v4_continuous_is_explicit_unbounded_and_guarded(
+    monkeypatch,
+) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(
+            v4_live_mode=True,
+            max_cycles=0,
+            v4_test_max_run_loss_usd="0.025",
+        ),
+        v4_real_gradient=True,
+        v4_continuous=True,
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_max_cycles == 0
+    assert args.live_inventory_basis_v4_real_gradient is True
+    assert args.live_inventory_basis_v4_continuous is True
+    assert args.live_inventory_basis_v4_max_run_loss_usd == 0.025
+
+
+def test_live_tool_continuous_state_has_no_completed_cycle_cap(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "flat",
+                "asset": "ETH",
+                "open_lots": [],
+                "pending_actions": [],
+                "completed_cycles": 999,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(live, "LIVE_STATE", state_path)
+
+    ok, message = validate_state(
+        LiveConfig(v4_live_mode=True, max_cycles=0)
+    )
+
+    assert ok is True
+    assert "max_cycles=0" in message
+
+
 def test_live_tool_v4_batch_requires_explicit_test_health_bypass(
     monkeypatch,
 ) -> None:

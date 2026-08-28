@@ -19,6 +19,7 @@ from tools.analyze import (
     dynamic_cost_summary,
     summarize_basis_v2_sweep_events,
     print_execution_calibration,
+    print_v4_live_funnel,
 )
 
 
@@ -459,6 +460,36 @@ def test_v4_live_funnel_reports_intermediate_batch_checkpoint() -> None:
     assert funnel["completed_cycles"] == 1
     assert funnel["max_cycles"] == 5
     assert funnel["batch_wait_reason"] == "v4_batch_cycle_cooldown"
+
+
+def test_v4_live_funnel_reports_continuous_cycles_as_unlimited(capsys) -> None:
+    common = {
+        "run_id": "live-v4-continuous",
+        "strategy_version": "basis-v4-live-v14",
+        "asset": "ETH",
+    }
+    rows = [
+        {
+            **common,
+            "event": "live_inventory_strategy_snapshot",
+            "max_cycles": 0,
+            "continuous_mode": True,
+        },
+        {
+            **common,
+            "event": "live_inventory_v4_cycle_checkpoint",
+            "completed_cycles": 27,
+            "max_cycles": 0,
+        },
+    ]
+
+    funnel = build_v4_live_funnel(rows)
+
+    assert funnel is not None
+    assert funnel["completed_cycles"] == 27
+    assert funnel["max_cycles"] == 0
+    print_v4_live_funnel(rows)
+    assert "completed_cycles=27/unlimited" in capsys.readouterr().out
 
 
 def test_v4_live_funnel_checkpoint_resolves_final_fill_wait_status() -> None:
