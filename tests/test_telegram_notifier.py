@@ -32,6 +32,33 @@ def test_telegram_entry_message_contains_execution_details() -> None:
     assert "运行编号" not in message
 
 
+def test_telegram_maintenance_drain_messages_are_chinese() -> None:
+    requested = format_telegram_trade_message(
+        "live_inventory_maintenance_drain_requested",
+        {
+            "asset": "ETH",
+            "run_id": "liveinv-1",
+            "open_lots_total": 24,
+            "pending_actions_total": 0,
+        },
+    )
+    completed = format_telegram_trade_message(
+        "live_inventory_maintenance_drain_completed",
+        {
+            "asset": "ETH",
+            "run_id": "liveinv-1",
+            "variational_position_qty": "0",
+            "lighter_position_qty": "0",
+        },
+    )
+
+    assert "维护排空已启动" in requested
+    assert "已禁止新开仓和加仓" in requested
+    assert "当前未平子单：24" in requested
+    assert "维护排空完成" in completed
+    assert "可以安全更新并重启" in completed
+
+
 def test_telegram_pushes_final_pnl_and_throttles_repeated_failures() -> None:
     notifier = TelegramNotifier(
         bot_token="secret-token",

@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 from tools.lib.runtime_files import (  # noqa: E402
     BASIS_SAMPLES_DIR,
     COLLECTOR_LOG,
+    LIVE_CONTROL,
     LIVE_STATE,
     LOG_DIR,
     ORDER_METRICS,
@@ -3816,6 +3817,11 @@ def main() -> int:
     state_asset = str(state.get("asset") or "-").upper()
     open_lots = state.get("open_lots") or []
     pending_actions = state.get("pending_actions") or []
+    if status == "flat" and open_lots:
+        status = "open"
+    elif status == "flat" and pending_actions:
+        status = "pending"
+    maintenance_control = read_json(LIVE_CONTROL)
 
     print("== live ==")
     if data_cutoff is not None:
@@ -3824,6 +3830,13 @@ def main() -> int:
     for process in processes:
         print(f"process_detail={process}")
     print(f"state={status} asset={state_asset} open_lots={len(open_lots)} pending_actions={len(pending_actions)}")
+    print(
+        "maintenance_drain_status="
+        f"{maintenance_control.get('status') or 'not_requested'} "
+        f"target_pid={maintenance_control.get('target_pid') or '-'} "
+        f"requested_at={maintenance_control.get('requested_at') or '-'} "
+        f"completed_at={maintenance_control.get('completed_at') or '-'}"
+    )
     print(f"logs order_metrics={file_size(ORDER_METRICS)} runtime={file_size(RUNTIME_LOG)} log_dir={human_bytes(sum(p.stat().st_size for p in LOG_DIR.rglob('*') if p.is_file())) if LOG_DIR.exists() else 'missing'}")
     collector_health = read_json(BASIS_SAMPLES_DIR / "health.json")
     if collector_health:

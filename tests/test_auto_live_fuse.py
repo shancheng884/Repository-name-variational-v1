@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from main import (
     adaptive_margin_thresholds,
     account_snapshot_freshness,
     live_inventory_state_status,
+    maintenance_control_targets_runtime,
     variational_api_amount_to_str,
     v4_real_gradient_capacity_notional_usd,
     v4_real_gradient_confirmed_tier,
@@ -92,6 +94,35 @@ def test_live_inventory_state_status_follows_actual_positions_and_actions() -> N
     assert live_inventory_state_status(open_lots=[{"lot_id": 1}], pending_actions=[]) == "open"
     assert live_inventory_state_status(open_lots=[], pending_actions=[{"role": "entry"}]) == "pending"
     assert live_inventory_state_status(open_lots=[], pending_actions=[]) == "flat"
+
+
+def test_maintenance_control_is_bound_to_exact_runtime() -> None:
+    control = {
+        "action": "drain_after_flat",
+        "status": "requested",
+        "asset": "ETH",
+        "target_pid": 54217,
+        "target_run_id": "liveinv-1",
+    }
+
+    assert maintenance_control_targets_runtime(
+        control,
+        process_id=54217,
+        run_id="liveinv-1",
+        asset="ETH",
+    )
+    assert not maintenance_control_targets_runtime(
+        control,
+        process_id=54218,
+        run_id="liveinv-1",
+        asset="ETH",
+    )
+    assert not maintenance_control_targets_runtime(
+        control,
+        process_id=54217,
+        run_id="liveinv-2",
+        asset="ETH",
+    )
 
 
 def test_v4_real_gradient_thresholds_are_dynamic_and_strictly_ordered() -> None:
@@ -2690,6 +2721,15 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_i_accept_basis_addon_diagnostic = False
     runtime.live_inventory_basis_addon_min_basis_improvement_bps = Decimal("1.5")
     runtime.live_inventory_state_file = Path(tmp_path) / "live_inventory_state.json"
+    runtime.live_inventory_control_file = (
+        Path(tmp_path) / "live_inventory_control.json"
+    )
+    runtime.live_inventory_maintenance_drain_requested = False
+    runtime.live_inventory_maintenance_drain_requested_at = None
+    runtime.live_inventory_maintenance_control_payload = {}
+    runtime.live_inventory_maintenance_last_flat_check_monotonic = 0.0
+    runtime.live_inventory_maintenance_last_block_log_monotonic = 0.0
+    runtime.stop_flag = False
     runtime.orders_file = Path(tmp_path) / "order_metrics.jsonl"
     runtime._order_write_lock = asyncio.Lock()
     runtime._record_lock = asyncio.Lock()
@@ -2721,6 +2761,71 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime.live_inventory_var_reject_cooldown_seconds = 600.0
     runtime.logger = logging.getLogger("test_auto_live_fuse")
     return runtime
+
+
+def test_maintenance_drain_waits_for_positions_then_confirms_both_venues_flat(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 1,
+                "asset": "ETH",
+                "direction": "short_var_long_lighter",
+                "qty": "0.008",
+            }
+        ]
+        control = {
+            "schema_version": 1,
+            "action": "drain_after_flat",
+            "status": "requested",
+            "asset": "ETH",
+            "target_pid": os.getpid(),
+            "target_run_id": runtime.live_inventory_run_id,
+            "requested_at": "2026-08-28T13:00:00+00:00",
+        }
+        runtime.live_inventory_control_file.write_text(
+            json.dumps(control),
+            encoding="utf-8",
+        )
+
+        await runtime.poll_live_inventory_maintenance_control()
+
+        assert runtime.live_inventory_maintenance_drain_requested is True
+        assert runtime.stop_flag is False
+
+        runtime.live_inventory_open_lots = []
+
+        async def fake_fetch_variational_positions():
+            return {"ok": True, "result": {"positions": []}}
+
+        async def fake_fetch_lighter_account():
+            return {"code": 200, "accounts": [{"positions": []}]}
+
+        async def fake_capture_live_inventory_account_snapshot(**_kwargs):
+            return None
+
+        runtime.fetch_variational_positions = fake_fetch_variational_positions
+        runtime.fetch_lighter_account = fake_fetch_lighter_account
+        runtime.capture_live_inventory_account_snapshot = (
+            fake_capture_live_inventory_account_snapshot
+        )
+        runtime.live_inventory_maintenance_last_flat_check_monotonic = 0.0
+
+        await runtime.poll_live_inventory_maintenance_control()
+
+        completed = json.loads(
+            runtime.live_inventory_control_file.read_text(encoding="utf-8")
+        )
+        assert completed["status"] == "completed"
+        assert completed["variational_position_qty"] == "0"
+        assert completed["lighter_position_qty"] == "0"
+        assert runtime.shutdown_reason == "maintenance_drain_completed"
+        assert runtime.stop_flag is True
+
+    asyncio.run(run())
 
 
 def _inventory_entry_snapshot() -> CrossSpreadSnapshot:

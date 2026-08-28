@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,14 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tools.lib.runtime_files import LIVE_STATE, LOG_DIR, human_bytes, read_json  # noqa: E402
+from tools.lib.runtime_files import (  # noqa: E402
+    LIVE_CONTROL,
+    LIVE_STATE,
+    LOG_DIR,
+    human_bytes,
+    read_json,
+    write_json_atomic,
+)
 
 
 ALLOWED_ASSETS = {"BNB", "BTC", "ETH", "HYPE", "SOL", "XRP"}
@@ -100,6 +108,59 @@ def running_main_processes() -> list[str]:
     except FileNotFoundError:
         return []
     return [line for line in result.stdout.splitlines() if line.strip() and "tools/live.py" not in line]
+
+
+def running_live_strategy_processes() -> list[str]:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-af", "python.*main.py"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return []
+    return [
+        line
+        for line in result.stdout.splitlines()
+        if line.strip() and "tools/live.py" not in line
+    ]
+
+
+def process_id_from_line(line: str) -> int | None:
+    token = line.strip().split(maxsplit=1)[0] if line.strip() else ""
+    try:
+        return int(token)
+    except ValueError:
+        return None
+
+
+def request_maintenance_drain(
+    *,
+    asset: str,
+    process_line: str,
+    state: dict[str, Any],
+    control_path: Path = LIVE_CONTROL,
+) -> dict[str, Any]:
+    process_id = process_id_from_line(process_line)
+    if process_id is None:
+        raise ValueError("unable_to_parse_strategy_pid")
+    state_asset = str(state.get("asset") or asset).upper()
+    if state_asset != asset.upper():
+        raise ValueError(
+            f"asset_mismatch requested={asset.upper()} state={state_asset}"
+        )
+    request = {
+        "schema_version": 1,
+        "action": "drain_after_flat",
+        "status": "requested",
+        "asset": asset.upper(),
+        "target_pid": process_id,
+        "target_run_id": state.get("run_id"),
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json_atomic(control_path, request)
+    return request
 
 
 def build_multi_asset_collector_command(assets: tuple[str, ...]) -> list[str]:
@@ -407,6 +468,7 @@ def build_main_command(
     v4_real_gradient: bool = False,
     close_open_position: bool = False,
     resume_open_position: bool = False,
+    maintenance_drain_after_start: bool = False,
 ) -> list[str]:
     reversion_mode = config.reversion_mode
     calibration_mode = config.calibration_mode
@@ -540,6 +602,8 @@ def build_main_command(
         if resume_open_position
         else "--live-inventory-i-confirm-flat-start"
     )
+    if maintenance_drain_after_start:
+        command.append("--live-inventory-maintenance-drain-after-start")
     if collect_only:
         command.extend(["--live-inventory-dry-decisions", "--live-inventory-collect-only"])
     else:
@@ -718,6 +782,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--drain-after-flat",
+        action="store_true",
+        help=(
+            "Ask the currently running live strategy to block new entries, "
+            "manage existing positions normally, verify both venues flat, and stop."
+        ),
+    )
+    parser.add_argument(
         "--v4-test-max-cycles",
         type=int,
         choices=range(1, 4),
@@ -763,6 +835,47 @@ def main() -> int:
         parser.error(f"--assets requires at least two unique values from {sorted(ALLOWED_ASSETS)}")
     if assets and not args.collect_only:
         parser.error("--assets is hard-isolated to --collect-only and cannot be used by live/reversion/calibration")
+    if args.drain_after_flat and not args.resume_open_position:
+        if assets:
+            parser.error("--drain-after-flat requires one --asset")
+        incompatible = (
+            args.reversion
+            or args.calibration
+            or args.v4_live
+            or args.collect_only
+            or args.reset_state_after_manual_flat
+            or args.close_open_position
+            or args.v4_shadow_gradient
+            or args.v4_real_gradient
+        )
+        if incompatible:
+            parser.error(
+                "--drain-after-flat cannot be combined with strategy startup flags"
+            )
+        processes = running_live_strategy_processes()
+        if len(processes) != 1:
+            print(
+                "REFUSE_DRAIN reason=strategy_process_count_not_one "
+                f"count={len(processes)}"
+            )
+            for process in processes:
+                print(process)
+            return 2
+        try:
+            request = request_maintenance_drain(
+                asset=str(asset),
+                process_line=processes[0],
+                state=read_json(LIVE_STATE),
+            )
+        except ValueError as exc:
+            print(f"REFUSE_DRAIN reason={exc}")
+            return 2
+        print("maintenance_drain=REQUESTED")
+        print(f"asset={request['asset']}")
+        print(f"target_pid={request['target_pid']}")
+        print(f"target_run_id={request.get('target_run_id') or '-'}")
+        print("action=block_new_entries_manage_existing_positions_until_flat")
+        return 0
     try:
         config = load_config(Path(args.config))
     except ValueError as exc:
@@ -903,6 +1016,9 @@ def main() -> int:
             v4_real_gradient=args.v4_real_gradient,
             close_open_position=args.close_open_position,
             resume_open_position=args.resume_open_position,
+            maintenance_drain_after_start=(
+                args.drain_after_flat and args.resume_open_position
+            ),
         )
     )
     effective_max_cycles = (

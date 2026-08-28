@@ -275,6 +275,23 @@ submits the existing concurrent reduce-only exit path, waits for both final
 fills and the PnL report, and stops. It never resets an open state. Do not use
 manual sequential closes unless startup reconciliation has refused and the
 venues require manual recovery.
+
+For routine deployment, request a maintenance drain instead of waiting for a
+multi-cycle batch to finish:
+
+```bash
+python tools/live.py --asset ETH --drain-after-flat
+```
+
+The request is bound to the currently running PID and run id. The live process
+immediately blocks every new entry and add-on, but keeps each existing gradient
+tier under its normal independent profit-exit rule. Once there are no local
+lots or pending submissions, it reads both exchanges again. It stops only when
+both venue positions are confirmed flat, then sends a Chinese Telegram message
+that the deployment can proceed. If either venue cannot be checked or still has
+a position, entries stay blocked and the process retries without forcing a
+loss-making exit. `tools/analyze.py` reports the request as
+`maintenance_drain_status=`.
 # Automatic margin rebalance
 
 The implementation contract and safety state machine are documented in

@@ -41,6 +41,7 @@ from tools.lib.pnl_baseline import (
     set_pnl_account_baseline,
 )
 from tools.lib.rolling_rate_limiter import RollingWindowRateLimiter
+from tools.lib.runtime_files import read_json, write_json_atomic
 from variational.listener import (
     CommandBroker,
     HEARTBEAT_STALE_SECONDS,
@@ -265,6 +266,7 @@ INVENTORY_PAPER_FILE = LOG_DIR / "inventory_paper.jsonl"
 INSTANCE_LOCK_FILE = LOG_DIR / "main.instance.lock"
 AUTO_LIVE_STATE_FILE = LOG_DIR / "auto_live_state.json"
 LIVE_INVENTORY_STATE_FILE = LOG_DIR / "live_inventory_state.json"
+LIVE_INVENTORY_CONTROL_FILE = LOG_DIR / "live_inventory_control.json"
 READY_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
@@ -888,6 +890,29 @@ def live_inventory_state_status(
     if any(True for _ in pending_actions):
         return "pending"
     return "flat"
+
+
+def maintenance_control_targets_runtime(
+    control: dict[str, Any],
+    *,
+    process_id: int,
+    run_id: str,
+    asset: str,
+) -> bool:
+    if str(control.get("action") or "") != "drain_after_flat":
+        return False
+    if str(control.get("status") or "") != "requested":
+        return False
+    try:
+        target_pid = int(control.get("target_pid"))
+    except (TypeError, ValueError):
+        return False
+    if target_pid != process_id:
+        return False
+    target_run_id = str(control.get("target_run_id") or "").strip()
+    if target_run_id and target_run_id != run_id:
+        return False
+    return str(control.get("asset") or "").upper() == asset.upper()
 
 
 def v4_partial_detier_selection(
@@ -1748,6 +1773,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_i_accept_basis_real_diagnostic = bool(args.live_inventory_i_accept_basis_real_diagnostic)
         self.live_inventory_i_confirm_flat_start = bool(args.live_inventory_i_confirm_flat_start)
         self.live_inventory_i_accept_open_state_resume = bool(args.live_inventory_i_accept_open_state_resume)
+        self.live_inventory_maintenance_drain_after_start = bool(
+            args.live_inventory_maintenance_drain_after_start
+        )
         self.live_inventory_reset_state_after_manual_flat = bool(args.live_inventory_reset_state_after_manual_flat)
         self.live_inventory_auto_close_manual_review_position = bool(args.live_inventory_auto_close_manual_review_position)
         self.live_inventory_force_close_open_state = bool(
@@ -2021,6 +2049,9 @@ class VariationalToLighterRuntime:
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
         self.auto_live_state_file = output_dir / AUTO_LIVE_STATE_FILE.name if output_dir else None
         self.live_inventory_state_file = output_dir / LIVE_INVENTORY_STATE_FILE.name if output_dir else None
+        self.live_inventory_control_file = (
+            output_dir / LIVE_INVENTORY_CONTROL_FILE.name if output_dir else None
+        )
         self.live_inventory_pnl_baseline_file = (
             output_dir / PNL_BASELINE_FILE_NAME if output_dir else None
         )
@@ -2030,6 +2061,14 @@ class VariationalToLighterRuntime:
         self.live_inventory_realized_pnl_usd = Decimal("0")
         self.live_inventory_completed_cycles = 0
         self.live_inventory_run_id = f"liveinv-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        self.live_inventory_maintenance_drain_requested = bool(
+            self.live_inventory_maintenance_drain_after_start
+        )
+        self.live_inventory_maintenance_drain_announced = False
+        self.live_inventory_maintenance_drain_requested_at: str | None = None
+        self.live_inventory_maintenance_control_payload: dict[str, Any] = {}
+        self.live_inventory_maintenance_last_flat_check_monotonic = 0.0
+        self.live_inventory_maintenance_last_block_log_monotonic = 0.0
         self.live_inventory_schema_version = "2"
         self.live_inventory_strategy_version = (
             "basis-v3-collector-v1"
@@ -4666,6 +4705,7 @@ class VariationalToLighterRuntime:
                     open_lots=self.live_inventory_open_lots,
                     pending_actions=pending_actions,
                 ),
+                "run_id": self.live_inventory_run_id,
                 "asset": self.live_inventory_state_asset(),
                 "next_lot_id": self.live_inventory_next_lot_id,
                 "open_lots": self.live_inventory_open_lots,
@@ -4673,6 +4713,20 @@ class VariationalToLighterRuntime:
                 "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
                 "completed_cycles": self.live_inventory_completed_cycles,
                 "reason": reason,
+                "maintenance_drain_requested": bool(
+                    getattr(
+                        self,
+                        "live_inventory_maintenance_drain_requested",
+                        False,
+                    )
+                ),
+                "maintenance_drain_requested_at": (
+                    getattr(
+                        self,
+                        "live_inventory_maintenance_drain_requested_at",
+                        None,
+                    )
+                ),
                 **self.live_inventory_v4_episode_payload(),
                 "v4_shadow_tranche": getattr(
                     self, "live_inventory_v4_shadow_tranche", None
@@ -4702,6 +4756,7 @@ class VariationalToLighterRuntime:
         await self.write_live_inventory_state_async(
             {
                 "status": "manual_review_required",
+                "run_id": self.live_inventory_run_id,
                 "asset": asset,
                 "next_lot_id": self.live_inventory_next_lot_id,
                 "open_lots": self.live_inventory_open_lots,
@@ -4744,6 +4799,7 @@ class VariationalToLighterRuntime:
                     open_lots=self.live_inventory_open_lots,
                     pending_actions=pending_actions,
                 ),
+                "run_id": self.live_inventory_run_id,
                 "asset": asset,
                 "next_lot_id": self.live_inventory_next_lot_id,
                 "open_lots": self.live_inventory_open_lots,
@@ -4765,6 +4821,191 @@ class VariationalToLighterRuntime:
                 "completed_cycles": self.live_inventory_completed_cycles,
             },
         )
+
+    async def poll_live_inventory_maintenance_control(self) -> None:
+        if not self.is_live_inventory_enabled() or self.live_inventory_dry_decisions:
+            return
+        control_path = getattr(self, "live_inventory_control_file", None)
+        if control_path is None:
+            return
+        if not getattr(
+            self,
+            "live_inventory_maintenance_drain_requested",
+            False,
+        ):
+            control = await asyncio.to_thread(read_json, control_path)
+            if not maintenance_control_targets_runtime(
+                control,
+                process_id=os.getpid(),
+                run_id=self.live_inventory_run_id,
+                asset=self.live_inventory_state_asset(),
+            ):
+                return
+            self.live_inventory_maintenance_drain_requested = True
+            self.live_inventory_maintenance_drain_requested_at = str(
+                control.get("requested_at") or utc_now()
+            )
+            self.live_inventory_maintenance_control_payload = dict(control)
+        if not getattr(
+            self,
+            "live_inventory_maintenance_drain_announced",
+            False,
+        ):
+            if self.live_inventory_maintenance_drain_requested_at is None:
+                self.live_inventory_maintenance_drain_requested_at = utc_now()
+            if not self.live_inventory_maintenance_control_payload:
+                self.live_inventory_maintenance_control_payload = {
+                    "schema_version": 1,
+                    "action": "drain_after_flat",
+                    "status": "requested",
+                    "asset": self.live_inventory_state_asset(),
+                    "target_pid": os.getpid(),
+                    "target_run_id": self.live_inventory_run_id,
+                    "requested_at": (
+                        self.live_inventory_maintenance_drain_requested_at
+                    ),
+                    "request_source": "startup_resume_and_drain",
+                }
+                await asyncio.to_thread(
+                    write_json_atomic,
+                    control_path,
+                    self.live_inventory_maintenance_control_payload,
+                )
+            self.live_inventory_basis_entry_confirm_counts.clear()
+            gradient_window = getattr(
+                self,
+                "live_inventory_v4_gradient_entry_tier_window",
+                None,
+            )
+            if gradient_window is not None:
+                gradient_window.clear()
+            await self.persist_live_inventory_memory(
+                reason="maintenance_drain_requested"
+            )
+            await self.append_live_inventory_log(
+                "live_inventory_maintenance_drain_requested",
+                {
+                    "asset": self.live_inventory_state_asset(),
+                    "action": "block_new_entries_manage_existing_positions",
+                    "open_lots_total": len(self.live_inventory_open_lots),
+                    "pending_actions_total": len(
+                        self.pending_live_inventory_actions_payload()
+                    ),
+                    "requested_at": self.live_inventory_maintenance_drain_requested_at,
+                },
+            )
+            self.live_inventory_maintenance_drain_announced = True
+        pending_actions = self.pending_live_inventory_actions_payload()
+        if self.live_inventory_open_lots or pending_actions:
+            return
+        now = time.monotonic()
+        if (
+            now
+            - getattr(
+                self,
+                "live_inventory_maintenance_last_flat_check_monotonic",
+                0.0,
+            )
+            < 3.0
+        ):
+            return
+        self.live_inventory_maintenance_last_flat_check_monotonic = now
+        asset = self.live_inventory_state_asset()
+        try:
+            variational_positions = await self.fetch_variational_positions()
+            if (
+                not isinstance(variational_positions, dict)
+                or variational_positions.get("ok") is False
+            ):
+                raise RuntimeError("invalid_variational_positions_response")
+            variational_qty = self.extract_variational_position_qty(
+                variational_positions,
+                asset=asset,
+            )
+            lighter_account = await self.fetch_lighter_account()
+            lighter_qty = self.extract_lighter_position_qty(
+                lighter_account,
+                asset=asset,
+            )
+            if variational_qty is None or lighter_qty is None:
+                raise RuntimeError("exchange_position_quantity_unavailable")
+        except Exception as exc:
+            if now - getattr(
+                self,
+                "live_inventory_maintenance_last_block_log_monotonic",
+                0.0,
+            ) >= 30.0:
+                self.live_inventory_maintenance_last_block_log_monotonic = now
+                await self.append_live_inventory_log(
+                    "live_inventory_maintenance_drain_blocked",
+                    {
+                        "asset": asset,
+                        "reason": "exchange_flat_confirmation_failed",
+                        "error": type(exc).__name__,
+                        "action": "keep_entries_blocked_and_retry",
+                    },
+                )
+            return
+        tolerance = self.live_inventory_position_qty_tolerance(Decimal("0"))
+        if abs(variational_qty) > tolerance or abs(lighter_qty) > tolerance:
+            if now - getattr(
+                self,
+                "live_inventory_maintenance_last_block_log_monotonic",
+                0.0,
+            ) >= 30.0:
+                self.live_inventory_maintenance_last_block_log_monotonic = now
+                await self.append_live_inventory_log(
+                    "live_inventory_maintenance_drain_blocked",
+                    {
+                        "asset": asset,
+                        "reason": "exchange_positions_not_flat",
+                        "variational_position_qty": decimal_to_str(
+                            variational_qty
+                        ),
+                        "lighter_position_qty": decimal_to_str(lighter_qty),
+                        "action": "keep_entries_blocked_and_retry",
+                    },
+                )
+            return
+        await self.capture_live_inventory_account_snapshot(
+            stage="maintenance_flat",
+            asset=asset,
+            lighter_account_result=lighter_account,
+        )
+        await self.persist_live_inventory_memory(
+            reason="maintenance_drain_completed"
+        )
+        completed_at = utc_now()
+        completed_control = {
+            **getattr(
+                self,
+                "live_inventory_maintenance_control_payload",
+                {},
+            ),
+            "status": "completed",
+            "completed_at": completed_at,
+            "variational_position_qty": decimal_to_str(variational_qty),
+            "lighter_position_qty": decimal_to_str(lighter_qty),
+        }
+        await asyncio.to_thread(
+            write_json_atomic,
+            control_path,
+            completed_control,
+        )
+        await self.append_live_inventory_log(
+            "live_inventory_maintenance_drain_completed",
+            {
+                "asset": asset,
+                "action": "runtime_stop_for_maintenance",
+                "open_lots_total": 0,
+                "pending_actions_total": 0,
+                "variational_position_qty": decimal_to_str(variational_qty),
+                "lighter_position_qty": decimal_to_str(lighter_qty),
+                "completed_at": completed_at,
+            },
+        )
+        self.shutdown_reason = "maintenance_drain_completed"
+        self.stop_flag = True
 
     async def maybe_timeout_pending_live_inventory_var_entry(self, *, asset: str) -> bool:
         now_monotonic = time.monotonic()
@@ -12649,6 +12890,10 @@ class VariationalToLighterRuntime:
             return
         self.live_inventory_sample_index += 1
         index = self.live_inventory_sample_index
+        if not collect_only:
+            await self.poll_live_inventory_maintenance_control()
+            if getattr(self, "stop_flag", False):
+                return
         pending_entry_roles = {
             "live_inventory_entry_pending_lighter",
             "live_inventory_entry_pending_var_fill",
@@ -13276,6 +13521,11 @@ class VariationalToLighterRuntime:
         gradient_capacity_child_lots: int | None = None
         if (
             self.live_inventory_open_lots
+            and not getattr(
+                self,
+                "live_inventory_maintenance_drain_requested",
+                False,
+            )
             and self.live_inventory_i_accept_basis_addon_diagnostic
             and (
                 self.live_inventory_basis_v4_real_gradient
@@ -13320,7 +13570,17 @@ class VariationalToLighterRuntime:
                         addon_threshold = max(entry_basis_values) + self.live_inventory_basis_addon_min_basis_improvement_bps
                         if basis_bps >= addon_threshold:
                             addon_direction = existing_direction
-        if not self.live_inventory_open_lots or addon_direction is not None:
+        if (
+            not getattr(
+                self,
+                "live_inventory_maintenance_drain_requested",
+                False,
+            )
+            and (
+                not self.live_inventory_open_lots
+                or addon_direction is not None
+            )
+        ):
             watch_now = time.monotonic()
             if self.has_pending_live_inventory_var_fill_match(asset=asset, roles={"live_inventory_entry_pending_lighter", "live_inventory_entry_pending_var_fill"}):
                 if await self.maybe_timeout_pending_live_inventory_var_entry(asset=asset):
@@ -14487,6 +14747,21 @@ class VariationalToLighterRuntime:
                     )
                     if not preflight_ok:
                         await self.block_live_inventory_entry(asset=asset, reason=preflight_reason, context=preflight_context)
+                        return
+                    await self.poll_live_inventory_maintenance_control()
+                    if getattr(
+                        self,
+                        "live_inventory_maintenance_drain_requested",
+                        False,
+                    ):
+                        await self.append_live_inventory_log(
+                            "live_inventory_entry_blocked",
+                            {
+                                **state_payload,
+                                "reason": "maintenance_drain_requested",
+                                "direction": direction,
+                            },
+                        )
                         return
                     pending_context = {
                         "signal_mode": LIVE_INVENTORY_SIGNAL_BASIS,
@@ -16611,6 +16886,10 @@ class VariationalToLighterRuntime:
     async def maybe_run_live_inventory(self, snapshot: CrossSpreadSnapshot) -> None:
         if not self.is_live_inventory_enabled():
             return
+        if not self.live_inventory_dry_decisions:
+            await self.poll_live_inventory_maintenance_control()
+            if getattr(self, "stop_flag", False):
+                return
         if getattr(self, "live_inventory_signal_mode", LIVE_INVENTORY_SIGNAL_SNAPSHOT) == LIVE_INVENTORY_SIGNAL_BASIS:
             await self.maybe_run_live_inventory_basis(snapshot)
             return
@@ -18542,6 +18821,7 @@ class VariationalToLighterRuntime:
         self.dashboard_task = self.track_background_task(asyncio.create_task(self.dashboard_loop()), "dashboard_loop")
 
         while not self.stop_flag:
+            await self.poll_live_inventory_maintenance_control()
             await asyncio.sleep(0.25)
 
     async def close(self) -> None:
@@ -19007,6 +19287,14 @@ def parse_args() -> argparse.Namespace:
         "--live-inventory-i-accept-open-state-resume",
         action="store_true",
         help="Resume managing an existing live_inventory_state.json open position after manually confirming both venues match the state.",
+    )
+    parser.add_argument(
+        "--live-inventory-maintenance-drain-after-start",
+        action="store_true",
+        help=(
+            "After strict open-state startup reconciliation, block new entries, "
+            "manage existing positions normally, verify both venues flat, and stop."
+        ),
     )
     parser.add_argument(
         "--live-inventory-reset-state-after-manual-flat",
@@ -19508,6 +19796,14 @@ def parse_args() -> argparse.Namespace:
                 "--live-inventory-i-accept-open-state-resume, "
                 "--live-inventory-auto-close-manual-review-position, or "
                 "--live-inventory-force-close-open-state"
+            )
+        if (
+            args.live_inventory_maintenance_drain_after_start
+            and not args.live_inventory_i_accept_open_state_resume
+        ):
+            parser.error(
+                "--live-inventory-maintenance-drain-after-start requires "
+                "--live-inventory-i-accept-open-state-resume"
             )
         allowed_assets = {asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()}
         if args.live_inventory_collect_only and (

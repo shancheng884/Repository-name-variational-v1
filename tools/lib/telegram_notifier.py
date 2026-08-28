@@ -25,6 +25,9 @@ TELEGRAM_EVENT_TYPES = {
     "live_inventory_pnl_summary",
     "live_inventory_account_risk_alert",
     "live_inventory_account_risk_recovered",
+    "live_inventory_maintenance_drain_requested",
+    "live_inventory_maintenance_drain_blocked",
+    "live_inventory_maintenance_drain_completed",
 }
 
 TELEGRAM_CRITICAL_EXIT_BLOCK_REASONS = {
@@ -37,6 +40,7 @@ TELEGRAM_THROTTLED_EVENT_TYPES = {
     "live_inventory_basis_quote_failed",
     "live_inventory_exit_blocked",
     "live_inventory_account_risk_alert",
+    "live_inventory_maintenance_drain_blocked",
 }
 
 
@@ -116,6 +120,8 @@ def _reason_cn(value: Any) -> str:
         "venue_equity_imbalance_warning": "双边权益不均衡，建议补齐较少一侧",
         "venue_equity_imbalance_blocks_entry": "双边权益严重失衡，禁止新开仓",
         "account_risk_normal": "账户风险正常",
+        "exchange_flat_confirmation_failed": "双边空仓确认暂时失败",
+        "exchange_positions_not_flat": "交易所仍有未平仓仓位",
     }.get(str(value), str(value))
 
 
@@ -227,6 +233,44 @@ def format_telegram_trade_message(
                 f"Lighter 权益：{_value(payload, 'lighter_equity_usd')} U",
                 f"双边总权益：{_value(payload, 'combined_equity_usd')} U",
                 f"双边权益平衡度：{_value(payload, 'equity_balance_ratio')}",
+            ]
+        )
+    if event_type == "live_inventory_maintenance_drain_requested":
+        return "\n".join(
+            [
+                "[Var/Lighter] 维护排空已启动",
+                f"资产：{asset}",
+                "动作：已禁止新开仓和加仓",
+                "现有仓位：继续按各档原盈利条件管理和平仓",
+                f"当前未平子单：{_value(payload, 'open_lots_total')}",
+                f"待确认动作：{_value(payload, 'pending_actions_total')}",
+                f"运行编号：{run_id}",
+            ]
+        )
+    if event_type == "live_inventory_maintenance_drain_blocked":
+        return "\n".join(
+            [
+                "[Var/Lighter] 维护排空等待确认",
+                f"资产：{asset}",
+                f"原因：{_reason_cn(_value(payload, 'reason'))}",
+                "动作：继续禁止开仓并自动重试",
+                "Variational 仓位："
+                f"{_value(payload, 'variational_position_qty')}",
+                f"Lighter 仓位：{_value(payload, 'lighter_position_qty')}",
+                f"运行编号：{run_id}",
+            ]
+        )
+    if event_type == "live_inventory_maintenance_drain_completed":
+        return "\n".join(
+            [
+                "[Var/Lighter] 维护排空完成",
+                f"资产：{asset}",
+                "双边仓位：已确认全部为空",
+                "策略状态：已自动停止，可以安全更新并重启",
+                "Variational 仓位："
+                f"{_value(payload, 'variational_position_qty')}",
+                f"Lighter 仓位：{_value(payload, 'lighter_position_qty')}",
+                f"运行编号：{run_id}",
             ]
         )
     if event_type == "live_inventory_pnl_summary":

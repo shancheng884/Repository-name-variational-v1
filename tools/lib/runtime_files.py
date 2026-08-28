@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import gzip
+import os
 from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -16,6 +17,17 @@ ORDER_METRICS = LOG_DIR / "order_metrics.jsonl"
 RUNTIME_LOG = LOG_DIR / "runtime.log"
 COLLECTOR_LOG = LOG_DIR / "basis_collector.log"
 LIVE_STATE = LOG_DIR / "live_inventory_state.json"
+LIVE_CONTROL = LOG_DIR / "live_inventory_control.json"
+
+
+def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
 
 
 def read_json(path: Path) -> dict[str, Any]:

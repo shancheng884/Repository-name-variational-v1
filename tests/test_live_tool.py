@@ -4,7 +4,13 @@ import pytest
 
 from main import parse_args
 from tools import live
-from tools.live import LiveConfig, build_main_command, build_multi_asset_collector_command, validate_state
+from tools.live import (
+    LiveConfig,
+    build_main_command,
+    build_multi_asset_collector_command,
+    request_maintenance_drain,
+    validate_state,
+)
 
 
 def test_multi_asset_collector_command_has_no_live_submit_path() -> None:
@@ -23,6 +29,24 @@ def test_live_tool_disk_start_guard_requires_three_gb(monkeypatch) -> None:
     monkeypatch.setattr(live.shutil, "disk_usage", lambda _path: Usage())
 
     assert live.disk_start_allowed() is False
+
+
+def test_live_tool_maintenance_drain_targets_current_process(
+    tmp_path,
+) -> None:
+    control_path = tmp_path / "live_inventory_control.json"
+
+    request = request_maintenance_drain(
+        asset="ETH",
+        process_line="54217 /home/ubuntu/project/.venv/bin/python main.py --mode live",
+        state={"asset": "ETH", "run_id": "liveinv-1"},
+        control_path=control_path,
+    )
+
+    assert request["action"] == "drain_after_flat"
+    assert request["target_pid"] == 54217
+    assert request["target_run_id"] == "liveinv-1"
+    assert json.loads(control_path.read_text(encoding="utf-8")) == request
 
 
 def test_live_tool_adds_basis_addon_flags_for_three_lots() -> None:
@@ -357,6 +381,23 @@ def test_live_tool_resume_open_position_uses_strict_reconcile_mode(
     assert "--live-inventory-i-accept-open-state-resume" in command
     assert "--live-inventory-i-confirm-flat-start" not in command
     assert "--live-inventory-force-close-open-state" not in command
+
+
+def test_live_tool_resume_and_drain_blocks_entries_from_start(monkeypatch) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(v4_live_mode=True),
+        v4_real_gradient=True,
+        resume_open_position=True,
+        maintenance_drain_after_start=True,
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_i_accept_open_state_resume is True
+    assert args.live_inventory_maintenance_drain_after_start is True
+    assert "--live-inventory-maintenance-drain-after-start" in command
 
 
 def test_live_tool_resume_accepts_only_clean_recoverable_open_state(
