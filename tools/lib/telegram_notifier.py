@@ -138,6 +138,13 @@ def _action_cn(value: Any) -> str:
     }.get(str(value), str(value))
 
 
+def _venue_name(value: Any) -> str:
+    return {
+        "variational": "Variational",
+        "lighter": "Lighter",
+    }.get(str(value).strip().lower(), str(value))
+
+
 def _stage_cn(value: Any) -> str:
     return {
         "startup_flat": "启动空仓",
@@ -411,14 +418,25 @@ def format_telegram_trade_message(
             "Variational 快照年龄："
             f"{_value(payload, 'variational_account_snapshot_age_seconds')} 秒",
         ]
-        if payload.get("rebalance_suggested_amount_usd") not in (None, "", "-"):
-            lines.insert(
-                7,
-                "建议平衡：从 "
-                f"{_value(payload, 'rebalance_from_venue')} 向 "
-                f"{_value(payload, 'rebalance_to_venue')} 补充约 "
-                f"{_value(payload, 'rebalance_suggested_amount_usd')} U",
-            )
+        if payload.get("rebalance_recommended") is True:
+            lines[7:7] = [
+                "建议平衡方向："
+                f"{_venue_name(_value(payload, 'rebalance_from_venue'))} → "
+                f"{_venue_name(_value(payload, 'rebalance_to_venue'))}",
+                "建议平衡金额：约 "
+                f"{_value(payload, 'rebalance_suggested_amount_usd')} U"
+                f"（目标权益差距 {_value(payload, 'rebalance_target_imbalance_pct')}%）",
+            ]
+        elif payload.get("rebalance_recommended") is False:
+            lines[7:7] = [
+                "建议平衡方向：无需调整",
+                "建议平衡金额：0 U（双边权益尚未达到平衡预警线）",
+            ]
+        else:
+            lines[7:7] = [
+                "建议平衡方向：暂不可计算",
+                "建议平衡金额：暂不可计算（需双边最新权益）",
+            ]
         return "\n".join(lines)
     if event_type == "live_inventory_account_risk_recovered":
         return "\n".join(

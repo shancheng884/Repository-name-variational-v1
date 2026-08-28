@@ -29,7 +29,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
-from tools.lib.telegram_notifier import TelegramNotifier
+from tools.lib.auto_rebalance import build_rebalance_plan
 from tools.lib.pnl_baseline import (
     PNL_BASELINE_FILE_NAME,
     PNL_REPORTING_TIMEZONE,
@@ -42,6 +42,7 @@ from tools.lib.pnl_baseline import (
 )
 from tools.lib.rolling_rate_limiter import RollingWindowRateLimiter
 from tools.lib.runtime_files import read_json, write_json_atomic
+from tools.lib.telegram_notifier import TelegramNotifier
 from variational.listener import (
     CommandBroker,
     HEARTBEAT_STALE_SECONDS,
@@ -450,31 +451,20 @@ def account_risk_context(
         and lighter_equity > 0
         else None
     )
-    rebalance_from = None
-    rebalance_to = None
-    rebalance_amount_usd = None
+    rebalance_plan = None
     if (
-        equity_imbalance_pct is not None
-        and var_equity is not None
+        var_equity is not None
         and lighter_equity is not None
-        and balance_ratio is not None
-        and balance_ratio < balance_block_ratio
+        and var_equity > 0
+        and lighter_equity > 0
     ):
-        rebalance_from = (
-            "variational" if var_equity > lighter_equity else "lighter"
-        )
-        rebalance_to = (
-            "lighter" if rebalance_from == "variational" else "variational"
-        )
-        current_difference = abs(var_equity - lighter_equity)
-        target_difference = (
-            (var_equity + lighter_equity)
-            * LIVE_INVENTORY_EQUITY_REBALANCE_TARGET_IMBALANCE_PCT
-            / Decimal("200")
-        )
-        rebalance_amount_usd = max(
-            Decimal("0"),
-            (current_difference - target_difference) / Decimal("2"),
+        rebalance_plan = build_rebalance_plan(
+            variational_equity_usd=var_equity,
+            lighter_equity_usd=lighter_equity,
+            block_ratio=balance_warning_ratio,
+            target_imbalance_pct=(
+                LIVE_INVENTORY_EQUITY_REBALANCE_TARGET_IMBALANCE_PCT
+            ),
         )
     target_notional = (
         proposed_notional_usd
@@ -625,10 +615,17 @@ def account_risk_context(
         ),
         "equity_balance_ratio": decimal_to_str(balance_ratio),
         "equity_imbalance_pct": decimal_to_str(equity_imbalance_pct),
-        "rebalance_from_venue": rebalance_from,
-        "rebalance_to_venue": rebalance_to,
-        "rebalance_suggested_amount_usd": decimal_to_str(
-            rebalance_amount_usd
+        "rebalance_recommended": (
+            bool(rebalance_plan.get("required")) if rebalance_plan else None
+        ),
+        "rebalance_from_venue": (
+            rebalance_plan.get("source_venue") if rebalance_plan else None
+        ),
+        "rebalance_to_venue": (
+            rebalance_plan.get("destination_venue") if rebalance_plan else None
+        ),
+        "rebalance_suggested_amount_usd": (
+            rebalance_plan.get("amount_usd") if rebalance_plan else None
         ),
         "rebalance_target_imbalance_pct": decimal_to_str(
             LIVE_INVENTORY_EQUITY_REBALANCE_TARGET_IMBALANCE_PCT

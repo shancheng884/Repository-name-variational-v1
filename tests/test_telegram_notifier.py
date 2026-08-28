@@ -254,6 +254,11 @@ def test_telegram_account_risk_alert_is_chinese() -> None:
             "variational_equity_usd": "100",
             "lighter_equity_usd": "70",
             "equity_balance_ratio": "0.70",
+            "rebalance_recommended": True,
+            "rebalance_from_venue": "Variational",
+            "rebalance_to_venue": "Lighter",
+            "rebalance_suggested_amount_usd": "11.75",
+            "rebalance_target_imbalance_pct": "6.5",
             "max_projected_venue_leverage": "2.0",
             "max_maintenance_margin_usage_pct": "35",
         },
@@ -263,6 +268,24 @@ def test_telegram_account_risk_alert_is_chinese() -> None:
     assert "双边权益不均衡" in message
     assert "动作：仅提醒" in message
     assert "最高单边预计杠杆：2.0x / 5x" in message
+    assert "建议平衡方向：Variational → Lighter" in message
+    assert "建议平衡金额：约 11.75 U（目标权益差距 6.5%）" in message
+
+
+def test_telegram_account_risk_alert_explains_unavailable_rebalance() -> None:
+    message = format_telegram_trade_message(
+        "live_inventory_account_risk_alert",
+        {
+            "asset": "ETH",
+            "risk_reason": "variational_account_snapshot_stale",
+            "risk_action": "block_entry",
+            "variational_equity_usd": None,
+            "lighter_equity_usd": "100",
+        },
+    )
+
+    assert "建议平衡方向：暂不可计算" in message
+    assert "建议平衡金额：暂不可计算（需双边最新权益）" in message
 
 
 def test_telegram_account_risk_throttle_distinguishes_risk_reasons() -> None:

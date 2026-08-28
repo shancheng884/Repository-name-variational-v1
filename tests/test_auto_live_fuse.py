@@ -362,6 +362,35 @@ def test_account_risk_uses_venue_specific_adaptive_margin_thresholds() -> None:
     assert context["lighter_effective_margin_warning_pct"] == "40"
 
 
+def test_account_risk_recommends_rebalance_at_warning_threshold() -> None:
+    context = account_risk_context(
+        variational_metrics={
+            "equity_usd": Decimal("110"),
+            "maintenance_margin_usage_pct": Decimal("0"),
+        },
+        lighter_metrics={
+            "equity_usd": Decimal("90"),
+            "maintenance_margin_usage_pct": Decimal("0"),
+        },
+        current_notional_usd=Decimal("100"),
+        proposed_notional_usd=None,
+        max_venue_leverage=Decimal("5"),
+        margin_warning_pct=Decimal("40"),
+        margin_block_entry_pct=Decimal("50"),
+        margin_reduce_pct=Decimal("60"),
+        margin_emergency_pct=Decimal("75"),
+        balance_warning_ratio=Decimal("0.82"),
+        balance_block_ratio=Decimal("0.74"),
+    )
+
+    assert context["risk_action"] == "warning"
+    assert context["risk_reason"] == "venue_equity_imbalance_warning"
+    assert context["rebalance_recommended"] is True
+    assert context["rebalance_from_venue"] == "variational"
+    assert context["rebalance_to_venue"] == "lighter"
+    assert Decimal(context["rebalance_suggested_amount_usd"]) == Decimal("6.75")
+
+
 def test_account_risk_blocks_new_notional_above_five_x_but_does_not_immediately_reduce() -> None:
     metrics = {
         "equity_usd": Decimal("99"),
