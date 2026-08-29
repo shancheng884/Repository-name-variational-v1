@@ -233,7 +233,42 @@ normal exit condition.
 Variational account data must have a valid `published_at` no older than 60
 seconds. A stale snapshot is logged as partial, is excluded from account PnL and
 capital baselines, and pauses new entries/add-ons without forcing an open
-position to close.
+position to close. Every live startup and every recovery from stale or incomplete
+account data requires three consecutive complete account checks. Entry and
+gradient confirmation windows are cleared during recovery, so a position cannot
+open immediately from a signal observed while the browser link was unavailable.
+
+### Persistent Variational browser
+
+The Chrome extension stores the enabled tab, wakes itself every 30 seconds,
+restores its debugger attachment and local sockets after a Manifest V3 service
+worker restart, and keeps the Variational page lifecycle active. After updating
+the repository, reload the unpacked extension once and click `Start` once; later
+service-worker restarts recover automatically.
+
+Chrome itself must be launched with background throttling disabled. Do this only
+while the strategy is stopped and both venues are confirmed flat. Close every
+Chrome window, open a terminal inside the VPS remote desktop, and run:
+
+```bash
+cd ~/Repository-name-variational-v1
+source .venv/bin/activate
+python tools/launch_variational_chrome.py
+```
+
+Unlock the wallet, open Variational, reload the unpacked extension if Chrome asks,
+and click the forwarder's `Start` button once. The launcher reuses the existing
+Chrome profile; it never reads or stores wallet secrets. Verify that the required
+anti-throttling flags are active:
+
+```bash
+python tools/launch_variational_chrome.py --check
+```
+
+Test the fix by disconnecting the remote desktop for at least five minutes. After
+reconnecting, `variational_snapshot_age_seconds` should remain below 60 and no
+stale-account alert should appear. If the page or wallet genuinely logs out, the
+strategy remains fail-closed and requires fresh account checks after login.
 
 External deposits and withdrawals are detected again after every complete,
 confirmed flat exit snapshot, not only at startup. The current cycle PnL is

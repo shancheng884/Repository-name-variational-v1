@@ -317,6 +317,30 @@ def test_telegram_account_risk_alert_explains_unavailable_rebalance() -> None:
     assert "建议平衡金额：暂不可计算（需双边最新权益）" in message
 
 
+def test_telegram_account_recovery_wait_is_chinese() -> None:
+    pending = format_telegram_trade_message(
+        "live_inventory_account_risk_alert",
+        {
+            "asset": "ETH",
+            "risk_reason": "variational_account_recovery_confirmation_pending",
+            "risk_action": "block_entry",
+            "variational_equity_usd": "100",
+            "lighter_equity_usd": "100",
+        },
+    )
+    recovered = format_telegram_trade_message(
+        "live_inventory_account_risk_recovered",
+        {
+            "asset": "ETH",
+            "variational_equity_usd": "100",
+            "lighter_equity_usd": "100",
+        },
+    )
+
+    assert "账户链路已恢复，正在重新确认" in pending
+    assert "连续账户检查已通过" in recovered
+
+
 def test_telegram_account_risk_throttle_distinguishes_risk_reasons() -> None:
     notifier = TelegramNotifier(
         bot_token="secret-token",

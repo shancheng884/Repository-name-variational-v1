@@ -111,6 +111,7 @@ def _reason_cn(value: Any) -> str:
         "variational_extension_disconnected": "Variational 浏览器扩展断开",
         "account_equity_unavailable": "账户权益暂不可用，禁止新开仓",
         "variational_account_snapshot_stale": "Variational 账户快照过旧，暂停开仓和加仓",
+        "variational_account_recovery_confirmation_pending": "Variational 账户链路已恢复，正在重新确认",
         "v4_real_gradient_tier_capacity_reached": "当前价差档位的累计仓位已满",
         "venue_leverage_exceeds_hard_limit": "单个平台杠杆超过硬上限",
         "maintenance_margin_usage_warning": "维持保证金使用率进入预警区",
@@ -445,7 +446,7 @@ def format_telegram_trade_message(
             [
                 "[Var/Lighter] 账户风险已恢复",
                 f"资产：{asset}",
-                "动作：恢复允许开仓和加仓",
+                "动作：连续账户检查已通过，恢复允许开仓和加仓",
                 f"Variational 权益：{_value(payload, 'variational_equity_usd')} U",
                 f"Lighter 权益：{_value(payload, 'lighter_equity_usd')} U",
                 f"双边权益差距：{_value(payload, 'equity_imbalance_pct')}%",

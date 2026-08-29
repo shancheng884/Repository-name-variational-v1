@@ -446,6 +446,15 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "account_risk_event": latest_account_risk.get("event"),
         "account_risk_action": latest_account_risk.get("risk_action"),
         "account_risk_reason": latest_account_risk.get("risk_reason"),
+        "account_recovery_required": latest_account_risk.get(
+            "account_recovery_required"
+        ),
+        "account_recovery_confirm_count": latest_account_risk.get(
+            "account_recovery_confirm_count"
+        ),
+        "account_recovery_confirm_samples": latest_account_risk.get(
+            "account_recovery_confirm_samples"
+        ),
         "variational_margin_thresholds": {
             "usage": latest_account_risk.get(
                 "variational_effective_margin_usage_pct"
@@ -812,6 +821,10 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"account_risk_event={funnel['account_risk_event']} "
         f"account_risk_action={funnel['account_risk_action']} "
         f"account_risk_reason={funnel['account_risk_reason']} "
+        f"account_recovery_required={funnel['account_recovery_required']} "
+        f"account_recovery_progress="
+        f"{funnel['account_recovery_confirm_count']}/"
+        f"{funnel['account_recovery_confirm_samples']} "
         f"variational_margin_thresholds="
         f"{funnel['variational_margin_thresholds']} "
         f"lighter_margin_thresholds={funnel['lighter_margin_thresholds']}"

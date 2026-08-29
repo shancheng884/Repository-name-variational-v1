@@ -3,6 +3,10 @@ import { buildVariationalApiScript } from "./var_api.js";
 const DEBUGGER_VERSION = "1.3";
 const MAX_QUEUE_SIZE = 1000;
 const AUTO_RELOAD_COOLDOWN_MS = 5000;
+const FORWARDER_SESSION_KEY = "forwarderSession";
+const KEEPALIVE_ALARM_NAME = "variationalForwarderKeepalive";
+const KEEPALIVE_PERIOD_MINUTES = 0.5;
+const DEFAULT_VARIATIONAL_URL = "https://omni.variational.io/";
 
 const DEFAULT_CONFIG = {
   wsEndpoint: "ws://127.0.0.1:8766",
@@ -28,6 +32,8 @@ const state = {
   lastError: null,
   lastAutoReloadAt: 0
 };
+
+let restorePromise = null;
 
 class ForwardSocket {
   constructor(label, configKey, options = {}) {
@@ -336,6 +342,18 @@ async function debuggerAttach(tabId) {
   });
 }
 
+async function debuggerAttachOrReuse(tabId) {
+  try {
+    await debuggerAttach(tabId);
+  } catch (error) {
+    const message = String(error?.message || error).toLowerCase();
+    if (!message.includes("already attached")) {
+      throw error;
+    }
+    await sendDebuggerCommand(tabId, "Network.enable");
+  }
+}
+
 async function debuggerDetach(tabId) {
   await new Promise((resolve, reject) => {
     chrome.debugger.detach({ tabId }, () => {
@@ -370,7 +388,64 @@ async function getActiveTabId() {
   return tabs[0].id;
 }
 
-async function startForwarding(tabId = null) {
+async function saveForwarderSession(enabled, tabId = null) {
+  await chrome.storage.local.set({
+    [FORWARDER_SESSION_KEY]: {
+      enabled: Boolean(enabled),
+      tabId,
+      updatedAt: nowIso()
+    }
+  });
+}
+
+async function loadForwarderSession() {
+  const stored = await chrome.storage.local.get(FORWARDER_SESSION_KEY);
+  const session = stored[FORWARDER_SESSION_KEY];
+  return session && typeof session === "object"
+    ? session
+    : { enabled: false, tabId: null };
+}
+
+async function findVariationalTab(preferredTabId = null) {
+  if (preferredTabId != null) {
+    try {
+      const preferred = await chrome.tabs.get(preferredTabId);
+      if (preferred?.id != null && matchesDomainFilter(preferred.url || "")) {
+        return preferred;
+      }
+    } catch {
+      // The remembered tab no longer exists; fall through to discovery.
+    }
+  }
+
+  const tabs = await chrome.tabs.query({});
+  const matches = tabs.filter(
+    (tab) => tab.id != null && matchesDomainFilter(tab.url || "")
+  );
+  matches.sort(
+    (left, right) => Number(Boolean(right.active)) - Number(Boolean(left.active))
+  );
+  return matches[0] || null;
+}
+
+async function keepAttachedPageActive() {
+  if (!state.active || state.attachedTabId == null) {
+    return;
+  }
+  try {
+    await sendDebuggerCommand(state.attachedTabId, "Page.setWebLifecycleState", {
+      state: "active"
+    });
+  } catch {
+    // Older Chromium builds may not expose Page.setWebLifecycleState.
+  }
+  await sendDebuggerCommand(state.attachedTabId, "Runtime.evaluate", {
+    expression: "Date.now()",
+    returnByValue: true
+  });
+}
+
+async function startForwarding(tabId = null, options = {}) {
   await ensureConfigLoaded();
 
   if (state.active) {
@@ -378,7 +453,7 @@ async function startForwarding(tabId = null) {
   }
 
   const targetTabId = tabId ?? (await getActiveTabId());
-  await debuggerAttach(targetTabId);
+  await debuggerAttachOrReuse(targetTabId);
 
   try {
     await sendDebuggerCommand(targetTabId, "Network.enable");
@@ -394,11 +469,14 @@ async function startForwarding(tabId = null) {
   restForwarder.connect();
   commandForwarder.connect();
   autoReloadAttachedTab("forwarder started");
+  if (options.persist !== false) {
+    await saveForwarderSession(true, targetTabId);
+  }
   notifyStatus();
   return getStatus();
 }
 
-async function stopForwarding() {
+async function stopForwarding(options = {}) {
   const attachedTabId = state.attachedTabId;
   cleanupForwardingState();
   if (attachedTabId != null) {
@@ -408,8 +486,74 @@ async function stopForwarding() {
       state.lastError = `Debugger detach failed: ${error.message}`;
     }
   }
+  if (options.persist !== false) {
+    await saveForwarderSession(false, null);
+  }
   notifyStatus();
   return getStatus();
+}
+
+async function restoreForwarding() {
+  if (restorePromise) {
+    return restorePromise;
+  }
+  restorePromise = (async () => {
+    await ensureConfigLoaded();
+    const session = await loadForwarderSession();
+    if (!session.enabled || state.active) {
+      return getStatus();
+    }
+    let tab = await findVariationalTab(session.tabId);
+    if (!tab) {
+      tab = await chrome.tabs.create({
+        url: DEFAULT_VARIATIONAL_URL,
+        active: false
+      });
+    }
+    if (tab?.id == null) {
+      throw new Error("No Variational tab is available for automatic recovery.");
+    }
+    return startForwarding(tab.id, { persist: true });
+  })()
+    .catch((error) => {
+      state.lastError = `Automatic recovery failed: ${error.message}`;
+      notifyStatus();
+      return getStatus();
+    })
+    .finally(() => {
+      restorePromise = null;
+    });
+  return restorePromise;
+}
+
+async function maintainForwarding() {
+  const session = await loadForwarderSession();
+  if (!session.enabled) {
+    return;
+  }
+  if (!state.active || state.attachedTabId == null) {
+    await restoreForwarding();
+    return;
+  }
+  try {
+    await keepAttachedPageActive();
+    wsForwarder.connect();
+    restForwarder.connect();
+    commandForwarder.connect();
+  } catch (error) {
+    state.lastError = `Keepalive failed: ${error.message}`;
+    cleanupForwardingState();
+    notifyStatus();
+    await restoreForwarding();
+  }
+}
+
+async function initializePersistentForwarding() {
+  await ensureConfigLoaded();
+  chrome.alarms.create(KEEPALIVE_ALARM_NAME, {
+    periodInMinutes: KEEPALIVE_PERIOD_MINUTES
+  });
+  await restoreForwarding();
 }
 
 function cleanupForwardingState() {
@@ -1393,7 +1537,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  ensureConfigLoaded().catch(() => {
-    // Ignore config load errors during install.
+  initializePersistentForwarding().catch(() => {
+    // The popup exposes recovery errors after installation.
   });
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  initializePersistentForwarding().catch(() => {
+    // The periodic alarm retries after browser startup.
+  });
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== KEEPALIVE_ALARM_NAME) {
+    return;
+  }
+  maintainForwarding().catch((error) => {
+    state.lastError = `Periodic keepalive failed: ${error.message}`;
+    notifyStatus();
+  });
+});
+
+initializePersistentForwarding().catch(() => {
+  // Startup can race extension installation; the alarm retries shortly.
 });

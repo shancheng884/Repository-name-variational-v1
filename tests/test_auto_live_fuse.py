@@ -91,6 +91,75 @@ def test_variational_account_snapshot_freshness_rejects_stale_data() -> None:
     assert stale["reason"] == "snapshot_stale"
 
 
+def test_account_recovery_requires_three_complete_checks_and_clears_signals() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_account_recovery_required = True
+    runtime.live_inventory_account_recovery_confirm_count = 0
+    runtime.live_inventory_account_recovery_confirm_samples = 3
+    runtime.live_inventory_account_recovery_reason = "startup_confirmation_required"
+    runtime.live_inventory_basis_entry_confirm_counts = {
+        "short_var_long_lighter": 1
+    }
+    runtime.live_inventory_v4_gradient_entry_tier_window = deque([2, 2], maxlen=3)
+    fresh = {
+        "risk_action": "normal",
+        "risk_reason": "account_risk_normal",
+        "variational_account_snapshot_fresh": True,
+        "variational_account_snapshot_freshness_reason": "fresh",
+        "variational_equity_usd": "100",
+        "lighter_equity_usd": "100",
+    }
+
+    first = runtime.apply_live_inventory_account_recovery_gate(
+        fresh,
+        advance_confirmation=True,
+    )
+    second = runtime.apply_live_inventory_account_recovery_gate(
+        fresh,
+        advance_confirmation=True,
+    )
+    third = runtime.apply_live_inventory_account_recovery_gate(
+        fresh,
+        advance_confirmation=True,
+    )
+
+    assert first["risk_action"] == "block_entry"
+    assert first["account_recovery_confirm_count"] == 1
+    assert second["risk_action"] == "block_entry"
+    assert second["account_recovery_confirm_count"] == 2
+    assert third["risk_action"] == "normal"
+    assert third["account_recovery_required"] is False
+    assert runtime.live_inventory_basis_entry_confirm_counts == {}
+    assert list(runtime.live_inventory_v4_gradient_entry_tier_window) == []
+
+
+def test_account_recovery_resets_after_an_incomplete_check() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_account_recovery_required = True
+    runtime.live_inventory_account_recovery_confirm_count = 2
+    runtime.live_inventory_account_recovery_confirm_samples = 3
+    runtime.live_inventory_account_recovery_reason = "startup_confirmation_required"
+    runtime.live_inventory_basis_entry_confirm_counts = {}
+    runtime.live_inventory_v4_gradient_entry_tier_window = deque(maxlen=3)
+    incomplete = {
+        "risk_action": "block_entry",
+        "risk_reason": "account_equity_unavailable",
+        "variational_account_snapshot_fresh": True,
+        "variational_account_snapshot_freshness_reason": "fresh",
+        "variational_equity_usd": "100",
+        "lighter_equity_usd": None,
+    }
+
+    result = runtime.apply_live_inventory_account_recovery_gate(
+        incomplete,
+        advance_confirmation=True,
+    )
+
+    assert result["risk_action"] == "block_entry"
+    assert result["account_recovery_confirm_count"] == 0
+    assert result["account_recovery_required"] is True
+
+
 def test_live_inventory_state_status_follows_actual_positions_and_actions() -> None:
     assert live_inventory_state_status(open_lots=[{"lot_id": 1}], pending_actions=[]) == "open"
     assert live_inventory_state_status(open_lots=[], pending_actions=[{"role": "entry"}]) == "pending"

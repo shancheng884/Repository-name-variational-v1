@@ -175,6 +175,7 @@ LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_HARD_PER_MINUTE = 36
 LIVE_INVENTORY_LIGHTER_ORDER_RATE_NORMAL_PER_MINUTE = 30
 LIVE_INVENTORY_LIGHTER_ORDER_RATE_HARD_PER_MINUTE = 36
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_MAX_AGE_SECONDS = 60.0
+LIVE_INVENTORY_ACCOUNT_RECOVERY_CONFIRM_SAMPLES = 3
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS = 5
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_CHILD_LOTS = 25
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MIN_TIER_SPACING_BPS = Decimal("0.25")
@@ -2148,6 +2149,21 @@ class VariationalToLighterRuntime:
         self.live_inventory_account_risk_last_alert_key: tuple[str, str] | None = None
         self.live_inventory_account_risk_task: asyncio.Task[None] | None = None
         self.live_inventory_account_risk_latest_context: dict[str, Any] = {}
+        self.live_inventory_account_recovery_required = bool(
+            self.mode == MODE_LIVE
+            and self.live_inventory
+            and not self.live_inventory_dry_decisions
+            and not self.live_inventory_collect_only
+        )
+        self.live_inventory_account_recovery_confirm_count = 0
+        self.live_inventory_account_recovery_confirm_samples = (
+            LIVE_INVENTORY_ACCOUNT_RECOVERY_CONFIRM_SAMPLES
+        )
+        self.live_inventory_account_recovery_reason: str | None = (
+            "startup_confirmation_required"
+            if self.live_inventory_account_recovery_required
+            else None
+        )
         self.live_inventory_variational_order_limiter = RollingWindowRateLimiter(
             normal_limit=LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_NORMAL_PER_MINUTE,
             hard_limit=LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_HARD_PER_MINUTE,
@@ -3814,10 +3830,102 @@ class VariationalToLighterRuntime:
             )
         return result
 
+    def apply_live_inventory_account_recovery_gate(
+        self,
+        context: dict[str, Any],
+        *,
+        advance_confirmation: bool = False,
+    ) -> dict[str, Any]:
+        result = dict(context)
+        fresh = bool(
+            result.get("variational_account_snapshot_fresh")
+            and result.get("variational_equity_usd") not in (None, "")
+            and result.get("lighter_equity_usd") not in (None, "")
+        )
+        required_samples = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "live_inventory_account_recovery_confirm_samples",
+                    LIVE_INVENTORY_ACCOUNT_RECOVERY_CONFIRM_SAMPLES,
+                )
+            ),
+        )
+        if not fresh:
+            self.live_inventory_account_recovery_required = True
+            self.live_inventory_account_recovery_confirm_count = 0
+            self.live_inventory_account_recovery_reason = str(
+                result.get("risk_reason")
+                or result.get("variational_account_snapshot_freshness_reason")
+                or "variational_account_snapshot_stale"
+            )
+            self.clear_live_inventory_entry_confirmations_after_account_recovery()
+        elif getattr(self, "live_inventory_account_recovery_required", False):
+            if advance_confirmation:
+                self.live_inventory_account_recovery_confirm_count = min(
+                    required_samples,
+                    int(
+                        getattr(
+                            self,
+                            "live_inventory_account_recovery_confirm_count",
+                            0,
+                        )
+                    )
+                    + 1,
+                )
+            if self.live_inventory_account_recovery_confirm_count >= required_samples:
+                self.live_inventory_account_recovery_required = False
+                self.live_inventory_account_recovery_reason = None
+                self.clear_live_inventory_entry_confirmations_after_account_recovery()
+            else:
+                result["risk_action"] = "block_entry"
+                result["risk_reason"] = (
+                    "variational_account_recovery_confirmation_pending"
+                )
+                self.clear_live_inventory_entry_confirmations_after_account_recovery()
+
+        result["account_recovery_required"] = bool(
+            getattr(self, "live_inventory_account_recovery_required", False)
+        )
+        result["account_recovery_confirm_count"] = int(
+            getattr(
+                self,
+                "live_inventory_account_recovery_confirm_count",
+                0,
+            )
+        )
+        result["account_recovery_confirm_samples"] = required_samples
+        result["account_recovery_reason"] = getattr(
+            self,
+            "live_inventory_account_recovery_reason",
+            None,
+        )
+        return result
+
+    def clear_live_inventory_entry_confirmations_after_account_recovery(
+        self,
+    ) -> None:
+        entry_confirmations = getattr(
+            self,
+            "live_inventory_basis_entry_confirm_counts",
+            None,
+        )
+        if isinstance(entry_confirmations, dict):
+            entry_confirmations.clear()
+        gradient_window = getattr(
+            self,
+            "live_inventory_v4_gradient_entry_tier_window",
+            None,
+        )
+        if gradient_window is not None and hasattr(gradient_window, "clear"):
+            gradient_window.clear()
+
     async def live_inventory_account_risk_context(
         self,
         *,
         proposed_notional_usd: Decimal | None = None,
+        advance_recovery_confirmation: bool = False,
     ) -> dict[str, Any]:
         if not hasattr(self, "live_inventory_max_venue_leverage"):
             return {
@@ -3889,12 +3997,17 @@ class VariationalToLighterRuntime:
             context["risk_reason"] = "variational_account_snapshot_stale"
         if lighter_metrics.get("risk_fetch_error"):
             context["lighter_risk_fetch_error"] = lighter_metrics["risk_fetch_error"]
-        return context
+        return self.apply_live_inventory_account_recovery_gate(
+            context,
+            advance_confirmation=advance_recovery_confirmation,
+        )
 
     async def live_inventory_account_risk_loop(self) -> None:
         while not self.stop_flag:
             try:
-                context = await self.live_inventory_account_risk_context()
+                context = await self.live_inventory_account_risk_context(
+                    advance_recovery_confirmation=True
+                )
                 self.live_inventory_account_risk_latest_context = dict(context)
                 action = str(context.get("risk_action") or "normal")
                 reason = str(context.get("risk_reason") or "account_risk_normal")
