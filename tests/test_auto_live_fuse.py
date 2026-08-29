@@ -2724,6 +2724,136 @@ def test_reduce_only_lighter_order_bypasses_live_cooldown() -> None:
     asyncio.run(run())
 
 
+def test_reduce_only_lighter_order_bypasses_entry_sizing_and_edge_limits() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.mode = "live"
+        runtime.records = {}
+        runtime.record_order = deque()
+        runtime._record_lock = asyncio.Lock()
+        runtime._lighter_signer_lock = asyncio.Lock()
+        runtime.lighter_submit_transport = "http"
+        runtime.lighter_order_mode = "market-ioc"
+        runtime.lighter_market_index = 1
+        runtime.price_multiplier = Decimal("100")
+        runtime.base_amount_multiplier = Decimal("10000")
+        runtime.risk_guard_max_base_amount = 1000000
+        runtime.risk_guard_max_price_deviation_bps = Decimal("1000")
+        runtime.lighter_min_base_amount = None
+        runtime.lighter_min_quote_amount = None
+        runtime.live_allowed_sides = {"buy", "sell"}
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_max_qty = Decimal("0.01")
+        runtime.live_max_notional_usd = Decimal("25")
+        runtime.live_require_min_edge_bps = Decimal("999")
+        runtime.live_inventory_max_lighter_slippage_bps = Decimal("3")
+        runtime.live_inventory_lighter_submit_slippage_bps = Decimal("15")
+        runtime.live_inventory_lighter_exit_submit_slippage_bps = Decimal("30")
+        runtime.live_cooldown_seconds = 0.0
+        runtime.last_live_submit_monotonic_by_asset = {}
+        runtime.lighter_client_order_to_trade_key = {}
+        runtime.lighter_best_bid = Decimal("2431.94")
+        runtime.lighter_best_ask = Decimal("2431.95")
+        runtime.lighter_order_book_lock = asyncio.Lock()
+        runtime.last_lighter_order_book_update_at = "2999-06-02T08:50:11+00:00"
+        runtime.logger = logging.getLogger("test_auto_live_fuse")
+
+        captured_kwargs = {}
+
+        class FakeClient:
+            ORDER_TYPE_LIMIT = 0
+            ORDER_TYPE_MARKET = 1
+            ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0
+            ORDER_TIME_IN_FORCE_GOOD_TILL_TIME = 1
+            DEFAULT_IOC_EXPIRY = 0
+            DEFAULT_28_DAY_ORDER_EXPIRY = -1
+
+            async def create_order(self, **kwargs):
+                captured_kwargs.update(kwargs)
+                return None, "0xabc", None
+
+        runtime.lighter_client = FakeClient()
+
+        async def fake_append_order_log(_event_type, _payload) -> None:
+            return None
+
+        runtime.append_order_log = fake_append_order_log
+
+        record, payload = await runtime.place_lighter_order_from_plan(
+            asset="ETH",
+            side="BUY",
+            qty=Decimal("0.05720"),
+            var_fill_price=Decimal("2431.72"),
+            role="live_inventory_exit",
+            reduce_only=True,
+        )
+
+        assert record is not None
+        assert captured_kwargs["reduce_only"] is True
+        assert captured_kwargs["base_amount"] == 572
+        assert payload["live_notional_usd"] == "138.6896470960"
+        assert payload["failure_reason"] is None
+        assert payload["processing_stage"] == "live_submit_sent"
+
+    asyncio.run(run())
+
+
+def test_non_reduce_only_lighter_order_keeps_live_notional_limit() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.mode = "live"
+        runtime.records = {}
+        runtime.record_order = deque()
+        runtime._record_lock = asyncio.Lock()
+        runtime._lighter_signer_lock = asyncio.Lock()
+        runtime.lighter_submit_transport = "http"
+        runtime.lighter_order_mode = "market-ioc"
+        runtime.lighter_market_index = 1
+        runtime.price_multiplier = Decimal("100")
+        runtime.base_amount_multiplier = Decimal("10000")
+        runtime.risk_guard_max_base_amount = 1000000
+        runtime.risk_guard_max_price_deviation_bps = Decimal("1000")
+        runtime.lighter_min_base_amount = None
+        runtime.lighter_min_quote_amount = None
+        runtime.live_allowed_sides = {"buy", "sell"}
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_max_qty = Decimal("0")
+        runtime.live_max_notional_usd = Decimal("25")
+        runtime.live_require_min_edge_bps = Decimal("0")
+        runtime.live_inventory_max_lighter_slippage_bps = Decimal("3")
+        runtime.live_inventory_lighter_submit_slippage_bps = Decimal("15")
+        runtime.live_inventory_lighter_exit_submit_slippage_bps = Decimal("30")
+        runtime.live_cooldown_seconds = 0.0
+        runtime.last_live_submit_monotonic_by_asset = {}
+        runtime.lighter_client_order_to_trade_key = {}
+        runtime.lighter_best_bid = Decimal("2431.94")
+        runtime.lighter_best_ask = Decimal("2431.95")
+        runtime.lighter_order_book_lock = asyncio.Lock()
+        runtime.last_lighter_order_book_update_at = "2999-06-02T08:50:11+00:00"
+        runtime.logger = logging.getLogger("test_auto_live_fuse")
+
+        async def fake_append_order_log(_event_type, _payload) -> None:
+            return None
+
+        runtime.append_order_log = fake_append_order_log
+
+        record, payload = await runtime.place_lighter_order_from_plan(
+            asset="ETH",
+            side="BUY",
+            qty=Decimal("0.05720"),
+            var_fill_price=Decimal("2431.72"),
+            role="live_inventory_entry",
+            reduce_only=False,
+        )
+
+        assert record is not None
+        assert payload["failure_reason"] == "live_notional_exceeds_limit"
+        assert payload["processing_stage"] == "live_submit_started"
+        assert payload["lighter_client_order_id"] is None
+
+    asyncio.run(run())
+
+
 def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.mode = "live"

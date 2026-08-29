@@ -11773,7 +11773,14 @@ class VariationalToLighterRuntime:
                 await self.append_order_log("lighter_error", payload)
                 return None
 
-            if self.live_max_qty > 0 and record.qty > self.live_max_qty:
+            # Entry sizing limits must not strand an already-submitted
+            # Variational reduce-only exit. Aggregated gradient exits can be
+            # larger than one entry child order while still only reducing risk.
+            if (
+                not record.lighter_reduce_only
+                and self.live_max_qty > 0
+                and record.qty > self.live_max_qty
+            ):
                 async with self._record_lock:
                     record.hedge_error = f"Live qty {record.qty} exceeds live max qty {self.live_max_qty}"
                     self.set_record_stage(
@@ -11786,7 +11793,11 @@ class VariationalToLighterRuntime:
                 await self.append_order_log("lighter_error", payload)
                 return None
 
-            if self.live_max_notional_usd > 0 and notional > self.live_max_notional_usd:
+            if (
+                not record.lighter_reduce_only
+                and self.live_max_notional_usd > 0
+                and notional > self.live_max_notional_usd
+            ):
                 async with self._record_lock:
                     record.hedge_error = (
                         f"Live notional {notional} exceeds live max notional {self.live_max_notional_usd}"
@@ -11801,7 +11812,11 @@ class VariationalToLighterRuntime:
                 await self.append_order_log("lighter_error", payload)
                 return None
 
-            if edge_bps is not None and edge_bps < self.live_require_min_edge_bps:
+            if (
+                not record.lighter_reduce_only
+                and edge_bps is not None
+                and edge_bps < self.live_require_min_edge_bps
+            ):
                 async with self._record_lock:
                     record.hedge_error = (
                         f"Live edge {edge_bps:.2f}bps is below required minimum {self.live_require_min_edge_bps}bps"
