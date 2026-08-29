@@ -181,13 +181,15 @@ def format_telegram_trade_message(
             [
                 "[Var/Lighter] 开仓/加仓确认",
                 f"资产：{asset}｜方向：{_direction_cn(direction)}",
-                f"当前档位：{_value(payload, 'gradient_tier')} / 5",
+                "当前档位："
+                f"{_value(payload, 'gradient_tier', 'entry_gradient_tier')} / 5",
                 "已开子单："
-                f"{_value(payload, 'open_child_lots')} / "
-                f"{_value(payload, 'gradient_capacity_child_lots')}",
+                f"{_value(payload, 'open_child_lots', 'open_lots_total')} / "
+                f"{_value(payload, 'gradient_capacity_child_lots', 'entry_gradient_capacity_child_lots')}",
                 f"本笔数量：{_value(payload, 'qty')}｜批次：{lot_id}",
                 f"开仓价差：{_value(payload, 'edge_bps')} bps",
-                f"单边总仓位：{_value(payload, 'open_notional_usd')} U",
+                "单边总仓位："
+                f"{_value(payload, 'open_notional_usd', 'current_notional_usd', 'proposed_notional_usd')} U",
                 f"Variational 权益：{_value(payload, 'variational_equity_usd')} U",
                 f"Lighter 权益：{_value(payload, 'lighter_equity_usd')} U",
                 "Variational 保证金使用率："

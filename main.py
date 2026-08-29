@@ -7728,6 +7728,13 @@ class VariationalToLighterRuntime:
                 "entry_gradient_capacity_child_lots": lot.get(
                     "entry_gradient_capacity_child_lots"
                 ),
+                "gradient_tier": lot.get("entry_gradient_tier"),
+                "gradient_capacity_notional_usd": lot.get(
+                    "entry_gradient_capacity_notional_usd"
+                ),
+                "gradient_capacity_child_lots": lot.get(
+                    "entry_gradient_capacity_child_lots"
+                ),
                 "var_price": decimal_to_str(var_fill_price),
                 "lighter_price": decimal_to_str(lighter_fill_price),
                 "estimated_entry_lighter_price": decimal_to_str(estimated_entry_lighter_price),
@@ -7736,9 +7743,27 @@ class VariationalToLighterRuntime:
                 "var_submit_ms": context.get("var_submit_ms"),
                 "lighter_submit_ms": lighter_submit_ms,
                 "open_lots_total": len(self.live_inventory_open_lots),
+                "open_child_lots": len(self.live_inventory_open_lots),
+                "open_notional_usd": decimal_to_str(
+                    self.live_inventory_open_notional_usd()
+                ),
                 "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
                 "completed_cycles": self.live_inventory_completed_cycles,
                 "entry_confirmation_mode": "concurrent_var_and_lighter_then_var_fill_confirmed" if context.get("lighter_submitted_before_var_fill") else "var_fill_then_lighter",
+                "variational_equity_usd": context.get(
+                    "variational_equity_usd"
+                ),
+                "lighter_equity_usd": context.get("lighter_equity_usd"),
+                "combined_equity_usd": context.get("combined_equity_usd"),
+                "variational_maintenance_margin_usage_pct": context.get(
+                    "variational_maintenance_margin_usage_pct"
+                ),
+                "lighter_maintenance_margin_usage_pct": context.get(
+                    "lighter_maintenance_margin_usage_pct"
+                ),
+                "max_projected_venue_leverage": context.get(
+                    "max_projected_venue_leverage"
+                ),
             },
         )
         await self.append_live_inventory_log(
@@ -14847,6 +14872,11 @@ class VariationalToLighterRuntime:
                             if self.live_inventory_basis_v4_real_gradient
                             else None
                         ),
+                        "entry_gradient_capacity_child_lots": (
+                            gradient_capacity_child_lots
+                            if self.live_inventory_basis_v4_real_gradient
+                            else None
+                        ),
                         "entry_v4_baseline_window_seconds": (
                             v4_entry_context.get("v4_baseline_window_seconds")
                             if v4_mode
@@ -14865,6 +14895,10 @@ class VariationalToLighterRuntime:
                             reversion_deviation_bps if self.live_inventory_basis_reversion_mode else None
                         ),
                         "lighter_submitted_before_var_fill": self.live_inventory_basis_entry_mode == LIVE_INVENTORY_ENTRY_MODE_CONCURRENT,
+                        # This pre-submit context already uses the proposed
+                        # post-fill notional and remains valid when the
+                        # asynchronous Variational fill is confirmed.
+                        **account_risk,
                     }
                     pending_match = PendingLiveInventoryVarFillMatch(
                         asset=asset,

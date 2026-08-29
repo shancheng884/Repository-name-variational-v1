@@ -3413,6 +3413,12 @@ def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tm
             {
                 "entry_gradient_tier": 3,
                 "entry_gradient_capacity_notional_usd": "294.66",
+                "entry_gradient_capacity_child_lots": 15,
+                "variational_equity_usd": "100",
+                "lighter_equity_usd": "98.22",
+                "variational_maintenance_margin_usage_pct": "12.5",
+                "lighter_maintenance_margin_usage_pct": "11.5",
+                "max_projected_venue_leverage": "0.41",
             }
         )
         assert rows[-1]["event"] == "live_inventory_var_entry_submitted"
@@ -3446,7 +3452,14 @@ def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tm
             row for row in reversed(rows) if row["event"] == "live_inventory_entered"
         )
         assert entered["entry_gradient_tier"] == 3
+        assert entered["gradient_tier"] == 3
         assert entered["entry_gradient_capacity_notional_usd"] == "294.66"
+        assert entered["gradient_capacity_child_lots"] == 15
+        assert entered["open_child_lots"] == 1
+        assert entered["open_notional_usd"] != ""
+        assert entered["variational_equity_usd"] == "100"
+        assert entered["lighter_equity_usd"] == "98.22"
+        assert entered["max_projected_venue_leverage"] == "0.41"
         assert entered["entry_confirmation_mode"] == "concurrent_var_and_lighter_then_var_fill_confirmed"
 
     asyncio.run(run())

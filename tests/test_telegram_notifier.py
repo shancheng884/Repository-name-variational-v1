@@ -32,6 +32,35 @@ def test_telegram_entry_message_contains_execution_details() -> None:
     assert "运行编号" not in message
 
 
+def test_telegram_entry_message_accepts_async_fill_field_names() -> None:
+    message = format_telegram_trade_message(
+        "live_inventory_entered",
+        {
+            "asset": "ETH",
+            "direction": "short_var_long_lighter",
+            "qty": "0.0082",
+            "lot_id": 15,
+            "edge_bps": "0.4511",
+            "entry_gradient_tier": 2,
+            "open_lots_total": 15,
+            "entry_gradient_capacity_child_lots": 20,
+            "current_notional_usd": "300",
+            "variational_equity_usd": "111.83",
+            "lighter_equity_usd": "100.45",
+            "variational_maintenance_margin_usage_pct": "3.1",
+            "lighter_maintenance_margin_usage_pct": "4.2",
+            "max_projected_venue_leverage": "2.99",
+        },
+    )
+
+    assert "当前档位：2 / 5" in message
+    assert "已开子单：15 / 20" in message
+    assert "单边总仓位：300 U" in message
+    assert "Variational 权益：111.83 U" in message
+    assert "Lighter 权益：100.45 U" in message
+    assert "最高单边预计杠杆：2.99x / 5x" in message
+
+
 def test_telegram_maintenance_drain_messages_are_chinese() -> None:
     requested = format_telegram_trade_message(
         "live_inventory_maintenance_drain_requested",
