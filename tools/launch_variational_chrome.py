@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -79,12 +80,56 @@ def iter_browser_commands(proc_root: Path = Path("/proc")) -> Iterable[list[str]
         if not parts:
             continue
         executable = Path(parts[0]).name.lower()
-        if "chrome" in executable or "chromium" in executable:
+        if is_browser_executable(executable):
+            yield parts
+
+
+def is_browser_executable(executable: str) -> bool:
+    name = Path(executable).name.lower()
+    return name in {"chrome", "chromium", "chromium-browser"} or name.startswith(
+        "google-chrome"
+    )
+
+
+def parse_ps_browser_commands(output: str) -> Iterable[list[str]]:
+    for line in output.splitlines():
+        try:
+            parts = shlex.split(line.strip())
+        except ValueError:
+            continue
+        if parts and is_browser_executable(parts[0]):
             yield parts
 
 
 def command_has_background_flags(command: list[str]) -> bool:
     return all(flag in command for flag in REQUIRED_BACKGROUND_FLAGS)
+
+
+def collect_browser_commands(
+    proc_root: Path = Path("/proc"),
+    *,
+    ps_output: str | None = None,
+) -> list[list[str]]:
+    commands = list(iter_browser_commands(proc_root))
+    if any(command_has_background_flags(command) for command in commands):
+        return commands
+
+    if ps_output is None:
+        result = subprocess.run(
+            ["ps", "-ww", "-eo", "args="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        ps_output = result.stdout if result.returncode == 0 else ""
+
+    seen = {tuple(command) for command in commands}
+    for command in parse_ps_browser_commands(ps_output):
+        key = tuple(command)
+        if key not in seen:
+            commands.append(command)
+            seen.add(key)
+    return commands
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,7 +149,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    commands = list(iter_browser_commands())
+    commands = collect_browser_commands()
     if args.check:
         if not commands:
             print("chrome_status=stopped")
