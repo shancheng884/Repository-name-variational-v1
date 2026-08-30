@@ -131,7 +131,16 @@ python tools/risk_wakeup_watchdog.py --test-alert
 ```
 
 命令必须显示 `pushover_test=PASS`。确认手机会持续发声，然后在 Pushover
-中点确认。最后显式测试一次语音电话：
+中点确认。用以下命令现场验证回执被 watchdog 收到，并且电话未被触发：
+
+```bash
+python tools/risk_wakeup_watchdog.py --test-alert --wait-for-ack-seconds 180 --include-voice
+```
+
+在 180 秒内点击 Pushover 确认，命令必须显示
+`pushover_ack_test=PASS` 和 `tencent_voice_suppression_test=PASS`。
+
+最后显式测试一次语音电话：
 
 ```bash
 python tools/risk_wakeup_watchdog.py --test-alert --include-voice

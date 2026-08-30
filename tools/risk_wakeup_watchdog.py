@@ -863,7 +863,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--test-alert", action="store_true")
     parser.add_argument("--include-voice", action="store_true")
+    parser.add_argument(
+        "--wait-for-ack-seconds",
+        type=float,
+        default=0.0,
+        help="wait for a real Pushover acknowledgement during a test",
+    )
     return parser
+
+
+def wait_for_test_acknowledgement(
+    watchdog: RiskWakeupWatchdog,
+    incident: Incident,
+    *,
+    timeout_seconds: float,
+    poll_seconds: float = 5.0,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> bool:
+    timeout = max(0.0, timeout_seconds)
+    deadline = monotonic_fn() + timeout
+    while True:
+        record = watchdog.memory["active_incidents"].get(incident.key, {})
+        if record.get("pushover_acknowledged_at"):
+            return True
+        remaining = deadline - monotonic_fn()
+        if remaining <= 0:
+            return False
+        sleep_fn(min(max(0.1, poll_seconds), remaining))
+        watchdog.run_once(synthetic=incident, force_voice=False)
 
 
 def main() -> int:
@@ -885,11 +913,12 @@ def main() -> int:
         print(f"configuration_ready={not errors}")
         for error in errors:
             print(f"configuration_error={error}")
-        return 0
+        return 0 if not errors else 1
     if not config.enabled and not args.test_alert and not args.dry_run:
         print("watchdog_disabled set RISK_WAKEUP_ENABLED=true")
         return 2
     if args.test_alert:
+        wait_for_ack_seconds = max(0.0, args.wait_for_ack_seconds)
         incident = Incident(
             key=f"end_to_end_test:{int(time.time())}",
             severity="critical",
@@ -899,11 +928,24 @@ def main() -> int:
         )
         watchdog.run_once(
             synthetic=incident,
-            force_voice=args.include_voice,
+            force_voice=args.include_voice and wait_for_ack_seconds <= 0,
         )
         if args.dry_run:
             print("test_alert=DRY_RUN")
             return 0
+        acknowledgement_passed = False
+        if wait_for_ack_seconds > 0:
+            acknowledgement_passed = wait_for_test_acknowledgement(
+                watchdog,
+                incident,
+                timeout_seconds=wait_for_ack_seconds,
+            )
+            print(
+                "pushover_ack_test="
+                + ("PASS" if acknowledgement_passed else "TIMEOUT")
+            )
+            if not acknowledgement_passed and args.include_voice:
+                watchdog.run_once(synthetic=incident, force_voice=True)
         record = watchdog.memory["active_incidents"].get(incident.key, {})
         pushover_passed = record.get("pushover_status") == "sent"
         print(
@@ -914,13 +956,30 @@ def main() -> int:
         voice_passed = True
         if args.include_voice:
             voice_status = str(record.get("voice_status") or "not_attempted")
-            voice_passed = voice_status == "sent" or voice_status.startswith("sent:")
-            print(
-                "tencent_voice_test="
-                + ("PASS" if voice_passed else "FAIL")
-                + f" detail={voice_status}"
-            )
-        return 0 if pushover_passed and voice_passed else 1
+            if wait_for_ack_seconds > 0 and acknowledgement_passed:
+                voice_passed = voice_status == "not_attempted"
+                print(
+                    "tencent_voice_suppression_test="
+                    + ("PASS" if voice_passed else "FAIL")
+                    + f" detail={voice_status}"
+                )
+            else:
+                voice_passed = voice_status == "sent" or voice_status.startswith("sent:")
+                print(
+                    "tencent_voice_test="
+                    + ("PASS" if voice_passed else "FAIL")
+                    + f" detail={voice_status}"
+                )
+        acknowledgement_result = (
+            acknowledgement_passed
+            if wait_for_ack_seconds > 0 and not args.include_voice
+            else True
+        )
+        return (
+            0
+            if pushover_passed and voice_passed and acknowledgement_result
+            else 1
+        )
     if args.once:
         incidents = watchdog.run_once()
         print(f"incidents={len(incidents)}")

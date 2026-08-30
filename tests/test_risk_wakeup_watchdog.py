@@ -13,6 +13,7 @@ from tools.risk_wakeup_watchdog import (
     WatchdogConfig,
     evaluate_incidents,
     is_night_window,
+    wait_for_test_acknowledgement,
 )
 from tools.lib.wakeup_notifiers import NotificationResult
 
@@ -280,6 +281,45 @@ def test_new_critical_reason_realerts_after_previous_acknowledgement(tmp_path) -
     watchdog.run_once(synthetic=second)
 
     assert len(pushover.sent) == 2
+
+
+def test_real_ack_wait_path_suppresses_voice(tmp_path) -> None:
+    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
+    monotonic = [0.0]
+    pushover = FakePushover()
+    voice = FakeVoice()
+    watchdog = RiskWakeupWatchdog(
+        config=config(),
+        state_path=tmp_path / "state.json",
+        risk_health_path=tmp_path / "risk.json",
+        metrics_path=tmp_path / "metrics.jsonl",
+        watchdog_state_path=tmp_path / "watchdog.json",
+        watchdog_health_path=tmp_path / "health.json",
+        pushover=pushover,
+        voice=voice,
+        telegram=FakeTelegram(),
+        clock=lambda: current[0],
+        strategy_check=lambda _pid: True,
+    )
+    incident = Incident("test", "critical", "title", "message", ("ETH", "test"))
+    watchdog.run_once(synthetic=incident)
+
+    def sleep(seconds):
+        monotonic[0] += seconds
+        current[0] += timedelta(seconds=seconds)
+        pushover.acknowledged = True
+
+    acknowledged = wait_for_test_acknowledgement(
+        watchdog,
+        incident,
+        timeout_seconds=20,
+        poll_seconds=5,
+        monotonic_fn=lambda: monotonic[0],
+        sleep_fn=sleep,
+    )
+
+    assert acknowledged is True
+    assert voice.sent == []
 
 
 def test_persistent_account_data_loss_with_position_escalates(tmp_path) -> None:
