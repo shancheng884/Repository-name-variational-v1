@@ -356,3 +356,10 @@ python tools/validate_gradient_tiers.py --asset ETH
 The first 70% of samples fits thresholds; the final 30% reports crossings and
 six-hour 1/2/4 bps reversion hit rates. The tool is offline and never feeds its
 output into the live process.
+
+# Independent night risk wakeup
+
+The independent Pushover Emergency and Tencent Cloud voice escalation service
+is documented in `docs/risk_wakeup_watchdog.md`. It reads local state and the
+main runtime's small risk heartbeat only; it never enters the quote or order
+path.

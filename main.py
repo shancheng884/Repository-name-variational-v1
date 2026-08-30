@@ -269,6 +269,7 @@ INSTANCE_LOCK_FILE = LOG_DIR / "main.instance.lock"
 AUTO_LIVE_STATE_FILE = LOG_DIR / "auto_live_state.json"
 LIVE_INVENTORY_STATE_FILE = LOG_DIR / "live_inventory_state.json"
 LIVE_INVENTORY_CONTROL_FILE = LOG_DIR / "live_inventory_control.json"
+LIVE_INVENTORY_RISK_HEALTH_FILE = LOG_DIR / "live_inventory_risk_health.json"
 READY_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
@@ -2064,6 +2065,11 @@ class VariationalToLighterRuntime:
         self.live_inventory_state_file = output_dir / LIVE_INVENTORY_STATE_FILE.name if output_dir else None
         self.live_inventory_control_file = (
             output_dir / LIVE_INVENTORY_CONTROL_FILE.name if output_dir else None
+        )
+        self.live_inventory_risk_health_file = (
+            output_dir / LIVE_INVENTORY_RISK_HEALTH_FILE.name
+            if output_dir
+            else None
         )
         self.live_inventory_pnl_baseline_file = (
             output_dir / PNL_BASELINE_FILE_NAME if output_dir else None
@@ -4009,6 +4015,13 @@ class VariationalToLighterRuntime:
                     advance_recovery_confirmation=True
                 )
                 self.live_inventory_account_risk_latest_context = dict(context)
+                try:
+                    await self.write_live_inventory_risk_health(context)
+                except Exception as exc:
+                    self.logger.warning(
+                        "live_inventory_risk_health_write_failed error=%s",
+                        type(exc).__name__,
+                    )
                 action = str(context.get("risk_action") or "normal")
                 reason = str(context.get("risk_reason") or "account_risk_normal")
                 if action in {"force_reduce", "emergency_exit"} and self.live_inventory_open_lots:
@@ -4043,6 +4056,39 @@ class VariationalToLighterRuntime:
                 if self.live_inventory_open_lots
                 else LIVE_INVENTORY_ACCOUNT_RISK_INTERVAL_SECONDS
             )
+
+    async def write_live_inventory_risk_health(
+        self,
+        context: dict[str, Any],
+    ) -> None:
+        path = getattr(self, "live_inventory_risk_health_file", None)
+        if path is None:
+            return
+        open_lots = list(getattr(self, "live_inventory_open_lots", []) or [])
+        pending_actions = self.pending_live_inventory_actions_payload()
+        expected_open_qty = sum(
+            (
+                to_decimal(lot.get("qty")) or Decimal("0")
+                for lot in open_lots
+            ),
+            Decimal("0"),
+        )
+        payload = {
+            "schema_version": 1,
+            "updated_at": utc_now(),
+            "pid": os.getpid(),
+            "run_id": getattr(self, "live_inventory_run_id", None),
+            "asset": self.live_inventory_state_asset(),
+            "status": live_inventory_state_status(
+                open_lots=open_lots,
+                pending_actions=pending_actions,
+            ),
+            "open_lots_total": len(open_lots),
+            "pending_actions_total": len(pending_actions),
+            "expected_open_qty": decimal_to_str(expected_open_qty),
+            **context,
+        }
+        await asyncio.to_thread(write_json_atomic, path, payload)
 
     async def capture_live_inventory_account_snapshot(
         self,
