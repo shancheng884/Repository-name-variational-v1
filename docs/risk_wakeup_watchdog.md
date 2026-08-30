@@ -47,7 +47,17 @@ Pushover Emergency 参数遵循官方约束：`retry` 不低于 30 秒，`expire
 
 ## VPS 安全配置
 
-所有密钥只写到 VPS 的 `.env`。不要在聊天、截图、Git 提交或命令输出中发送密钥。
+所有密钥只写到 VPS 的 `.env`。不要在聊天、截图、Git 提交或命令输出中发送密钥。推荐使用本地交互向导；敏感字段不会回显，全部校验通过后才会原子更新文件，并自动设置权限为 `600`：
+
+```bash
+cd ~/Repository-name-variational-v1
+source .venv/bin/activate
+python tools/setup_risk_wakeup.py
+```
+
+向导只更新本节列出的风险叫醒字段，不改变现有交易所、钱包和 Telegram 配置。已配置的字段可直接留空保留。
+
+如需手工配置：
 
 ```bash
 cd ~/Repository-name-variational-v1
