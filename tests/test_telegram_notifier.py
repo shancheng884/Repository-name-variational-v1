@@ -214,6 +214,36 @@ def test_telegram_pnl_summary_contains_profit_and_annualized_return() -> None:
     assert "年化说明：样本不足30天，仅供参考" in message
 
 
+def test_telegram_daily_pnl_summary_contains_volume_and_both_annualized_views() -> None:
+    message = format_telegram_trade_message(
+        "live_inventory_pnl_summary",
+        {
+            "asset": "ETH",
+            "summary_scope": "beijing_daily",
+            "beijing_day": "2026-08-31",
+            "daily_closed_child_lots": 12,
+            "daily_completed_close_groups": 3,
+            "daily_four_leg_volume_usd": "238.1344",
+            "beijing_day_actual_pnl_usd": "0.088719",
+            "beijing_day_return_pct": "0.04178",
+            "daily_annualized_simple_pct": "15.2497",
+            "run_actual_pnl_usd": "0.443523",
+            "cumulative_four_leg_volume_usd": "1723.1334",
+            "return_pct": "0.20886",
+            "annualized_simple_pct": "15.247",
+            "capital_usd": "212.357811",
+            "combined_equity_usd": "212.44653",
+        },
+    )
+
+    assert "[Var/Lighter] 北京时间每日收益" in message
+    assert "平仓子单：12 笔｜平仓批次：3 组" in message
+    assert "双平台四腿成交量：238.1344 U" in message
+    assert "确认成交盈亏：0.088719 U" in message
+    assert "当日简单年化：15.2497%" in message
+    assert "累计四腿成交量：1723.1334 U" in message
+
+
 def test_telegram_pnl_summary_formats_long_decimals_and_missing_values() -> None:
     message = format_telegram_trade_message(
         "live_inventory_pnl_summary",

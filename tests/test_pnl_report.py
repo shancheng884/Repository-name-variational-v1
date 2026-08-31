@@ -23,8 +23,11 @@ from tools.pnl_report import (
 )
 from tools.lib.pnl_baseline import (
     load_pnl_baseline,
+    new_pnl_baseline,
+    pnl_day_summary,
     record_external_cashflow,
     record_pnl_cycle,
+    write_pnl_baseline,
 )
 
 
@@ -228,6 +231,8 @@ def test_pnl_baseline_records_cycles_once_across_runs(tmp_path) -> None:
         asset="ETH",
         lot_id=1,
         actual_pnl_usd="0.01",
+        four_leg_volume_usd="80",
+        closed_child_lots=2,
     )
     record_pnl_cycle(
         baseline_path,
@@ -235,6 +240,8 @@ def test_pnl_baseline_records_cycles_once_across_runs(tmp_path) -> None:
         asset="ETH",
         lot_id=1,
         actual_pnl_usd="0.01",
+        four_leg_volume_usd="80",
+        closed_child_lots=2,
     )
     record_pnl_cycle(
         baseline_path,
@@ -242,12 +249,15 @@ def test_pnl_baseline_records_cycles_once_across_runs(tmp_path) -> None:
         asset="ETH",
         lot_id=1,
         actual_pnl_usd="-0.004",
+        four_leg_volume_usd="40",
     )
 
     baseline = load_pnl_baseline(baseline_path)
     assert baseline is not None
     assert baseline["confirmed_pnl_usd"] == "0.006"
     assert baseline["tracked_completed_cycles"] == 2
+    assert baseline["confirmed_four_leg_volume_usd"] == "120"
+    assert baseline["tracked_closed_child_lots"] == 3
 
 
 def test_pnl_baseline_rolls_at_beijing_midnight(tmp_path) -> None:
@@ -279,6 +289,7 @@ def test_pnl_baseline_rolls_at_beijing_midnight(tmp_path) -> None:
         lot_id=1,
         actual_pnl_usd="0.01",
         observed_at="2026-08-27T15:59:59+00:00",
+        four_leg_volume_usd="80",
     )
     record_pnl_cycle(
         baseline_path,
@@ -287,6 +298,8 @@ def test_pnl_baseline_rolls_at_beijing_midnight(tmp_path) -> None:
         lot_id=2,
         actual_pnl_usd="0.02",
         observed_at="2026-08-27T16:00:01+00:00",
+        four_leg_volume_usd="120",
+        closed_child_lots=3,
     )
 
     baseline = load_pnl_baseline(baseline_path)
@@ -295,6 +308,49 @@ def test_pnl_baseline_rolls_at_beijing_midnight(tmp_path) -> None:
     assert baseline["current_beijing_day"] == "2026-08-28"
     assert baseline["daily_confirmed_pnl_usd"] == "0.02"
     assert baseline["daily_tracked_completed_cycles"] == 1
+    assert baseline["daily_four_leg_volume_usd"] == "120"
+    assert baseline["daily_closed_child_lots"] == 3
+    prior_day = pnl_day_summary(baseline, "2026-08-27")
+    assert prior_day["confirmed_pnl_usd"] == "0.01"
+    assert prior_day["four_leg_volume_usd"] == "80"
+
+
+def test_pnl_baseline_backfills_volume_without_double_counting_pnl(tmp_path) -> None:
+    baseline_path = tmp_path / "pnl_reporting_baseline.json"
+    write_pnl_baseline(
+        baseline_path,
+        new_pnl_baseline(
+            asset="ETH",
+            realized_pnl_usd="0",
+            completed_cycles=0,
+            started_at="2026-08-31T00:00:00+00:00",
+        ),
+    )
+    record_pnl_cycle(
+        baseline_path,
+        run_id="run-old",
+        asset="ETH",
+        lot_id=1,
+        actual_pnl_usd="0.01",
+        observed_at="2026-08-31T01:00:00+00:00",
+    )
+    record_pnl_cycle(
+        baseline_path,
+        run_id="run-old",
+        asset="ETH",
+        lot_id=1,
+        actual_pnl_usd="0.01",
+        observed_at="2026-08-31T01:00:00+00:00",
+        four_leg_volume_usd="80",
+        closed_child_lots=2,
+    )
+
+    baseline = load_pnl_baseline(baseline_path)
+    assert baseline is not None
+    assert baseline["confirmed_pnl_usd"] == "0.01"
+    assert baseline["tracked_completed_cycles"] == 1
+    assert baseline["confirmed_four_leg_volume_usd"] == "80"
+    assert baseline["tracked_closed_child_lots"] == 2
 
 
 def test_parse_since_date_uses_beijing_midnight() -> None:

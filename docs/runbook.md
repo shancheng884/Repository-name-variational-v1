@@ -94,6 +94,39 @@ python tools/pnl_report.py --asset ETH --telegram-latest
 
 This command only reads logs and sends a message. It never submits orders.
 
+The live process also maintains a small atomic daily ledger at
+`log/pnl_reporting_baseline.json`. Each confirmed two-venue close records PnL,
+closed child lots, and exact four-leg notional once. The ledger is keyed by
+run id, asset, and lot id, so restarts and repeated fill callbacks do not count
+the same close twice.
+
+After the first upgrade from the schema-v1 ledger, backfill historical volume
+once. This streams the audit log and updates only close keys already counted in
+the baseline; it cannot submit orders or double-count PnL:
+
+```bash
+python tools/backfill_pnl_volume.py
+```
+
+Preview or manually send one Beijing-day report:
+
+```bash
+python tools/daily_pnl_report.py --asset ETH --day today --dry-run
+python tools/daily_pnl_report.py --asset ETH --day today --force
+```
+
+Install the independent systemd timer. It runs every five minutes, sends the
+previous completed Beijing day once, retries failed Telegram delivery, and
+catches up missed days after a VPS outage. It reads only the small ledger and
+continues working when the strategy process is stopped:
+
+```bash
+sudo cp deploy/systemd/var-lighter-daily-pnl.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now var-lighter-daily-pnl.timer
+systemctl list-timers var-lighter-daily-pnl.timer
+```
+
 Start a new persistent PnL reporting period, excluding all older trades:
 
 ```bash

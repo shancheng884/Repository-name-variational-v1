@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -3933,7 +3934,7 @@ def test_live_inventory_basis_real_entry_rejected_after_concurrent_lighter_requi
     asyncio.run(run())
 
 
-def test_live_inventory_basis_pending_entry_survives_match_window(tmp_path) -> None:
+def test_live_inventory_durable_order_intents_survive_match_window(tmp_path) -> None:
     runtime = _live_inventory_runtime(tmp_path)
     runtime.auto_live_match_window_seconds = 0
     runtime.pending_live_inventory_var_fill_matches = [
@@ -3957,8 +3958,9 @@ def test_live_inventory_basis_pending_entry_survives_match_window(tmp_path) -> N
 
     runtime.prune_pending_live_inventory_var_fill_matches()
 
-    assert len(runtime.pending_live_inventory_var_fill_matches) == 1
-    assert runtime.pending_live_inventory_var_fill_matches[0].role == "live_inventory_entry_pending_lighter"
+    assert [
+        item.role for item in runtime.pending_live_inventory_var_fill_matches
+    ] == ["live_inventory_entry_pending_lighter", "live_inventory_exit"]
 
 
 def test_live_inventory_basis_addon_submits_when_basis_expands(tmp_path) -> None:
@@ -5917,6 +5919,51 @@ def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path) -> 
     asyncio.run(run())
 
 
+def test_pnl_ledger_failure_does_not_block_fill_reconciliation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_pnl_baseline_file = tmp_path / "pnl.json"
+        runtime.pending_live_inventory_actual_pnl["exit-ledger-failure"] = {
+            "asset": "ETH",
+            "lot_id": 9,
+            "direction": "short_var_long_lighter",
+            "qty": "1",
+            "entry_var_price": "100",
+            "entry_lighter_price": "100",
+            "exit_var_price": "99.9",
+            "estimated_pnl_usd": "0.1",
+            "estimated_pnl_bps": "10",
+        }
+
+        def fail_record(*_args, **_kwargs):
+            raise OSError("disk unavailable")
+
+        monkeypatch.setattr("main.record_pnl_cycle", fail_record)
+        await runtime.maybe_append_live_inventory_actual_pnl(
+            {
+                "trade_key": "exit-ledger-failure",
+                "lighter_filled_price": "100",
+                "lighter_filled_base_amount": "1",
+            }
+        )
+
+        rows = [
+            json.loads(line)
+            for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()
+        ]
+        assert rows[-1]["event"] == "live_inventory_actual_pnl"
+        assert rows[-1]["actual_pnl_status"] == "lighter_final_fill_confirmed"
+        assert "exit-ledger-failure" not in runtime.pending_live_inventory_actual_pnl
+        state = json.loads(runtime.live_inventory_state_file.read_text())
+        assert state["reason"] == "actual_pnl_final_fill_update"
+
+    asyncio.run(run())
+
+
 def test_live_inventory_actual_pnl_uses_leg_specific_filled_qty(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
@@ -6142,6 +6189,81 @@ def test_live_inventory_state_asset_uses_allowed_single_asset(tmp_path) -> None:
 
         state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
         assert state["asset"] == "ETH"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_pending_consumption_is_checkpointed(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = []
+        match = PendingLiveInventoryVarFillMatch(
+            asset="ETH",
+            side="buy",
+            qty=Decimal("0.0082"),
+            lot_id=24,
+            role="live_inventory_exit",
+            created_at_monotonic=time.monotonic(),
+        )
+
+        runtime.add_pending_live_inventory_var_fill_match(match)
+        await runtime.persist_live_inventory_memory(reason="exit_intent")
+        persisted = json.loads(
+            runtime.live_inventory_state_file.read_text(encoding="utf-8")
+        )
+        assert persisted["pending_actions"][0]["lot_id"] == 24
+
+        consumed = runtime.consume_pending_live_inventory_var_fill_match(
+            asset="ETH",
+            side="buy",
+            qty=Decimal("0.0082"),
+        )
+        assert consumed is match
+        assert await runtime.flush_live_inventory_state_if_dirty() is True
+
+        persisted = json.loads(
+            runtime.live_inventory_state_file.read_text(encoding="utf-8")
+        )
+        assert persisted["pending_actions"] == []
+        assert persisted["state_mutation_revision"] == 2
+        assert persisted["state_revision"] == 2
+
+    asyncio.run(run())
+
+
+def test_live_inventory_state_writer_freezes_mutable_snapshot(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        entered_writer = threading.Event()
+        release_writer = threading.Event()
+        original_writer = runtime.write_live_inventory_state
+
+        def delayed_writer(state):
+            entered_writer.set()
+            assert release_writer.wait(timeout=2)
+            original_writer(state)
+
+        runtime.write_live_inventory_state = delayed_writer
+        open_lots = [{"lot_id": 1, "qty": "0.0081"}]
+        task = asyncio.create_task(
+            runtime.write_live_inventory_state_async(
+                {
+                    "status": "open",
+                    "open_lots": open_lots,
+                    "pending_actions": [],
+                }
+            )
+        )
+        assert await asyncio.to_thread(entered_writer.wait, 1)
+        open_lots.clear()
+        release_writer.set()
+        await task
+
+        persisted = json.loads(
+            runtime.live_inventory_state_file.read_text(encoding="utf-8")
+        )
+        assert persisted["open_lots"] == [{"lot_id": 1, "qty": "0.0081"}]
 
     asyncio.run(run())
 

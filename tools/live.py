@@ -223,7 +223,7 @@ def validate_state(
             "variational_html_response",
             "startup_reconcile_open_state_but_variational_flat",
         }
-        state_is_resumable = status == "open" or (
+        state_is_resumable = status in {"open", "pending"} or (
             status == "manual_review_required"
             and manual_reason in recoverable_manual_reasons
         )
@@ -232,17 +232,12 @@ def validate_state(
                 False,
                 f"resume_refuses_state status={status} reason={manual_reason or '-'} asset={asset}",
             )
-        if not open_lots:
-            return False, f"resume_requires_open_lots asset={asset}"
-        if pending_actions:
-            return (
-                False,
-                f"resume_refuses_pending_actions count={len(pending_actions)} asset={asset}",
-            )
+        if not open_lots and not pending_actions:
+            return False, f"resume_requires_open_lots_or_pending_action asset={asset}"
         return (
             True,
             f"state={status} asset={asset} open_lots={len(open_lots)} "
-            f"pending_actions=0 completed_cycles={completed_cycles} "
+            f"pending_actions={len(pending_actions)} completed_cycles={completed_cycles} "
             "resume_requested strict_exchange_reconcile_required=true",
         )
 

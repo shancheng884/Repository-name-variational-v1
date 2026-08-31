@@ -39,6 +39,7 @@ from tools.lib.pnl_baseline import (
     record_external_cashflow,
     record_pnl_cycle,
     set_pnl_account_baseline,
+    set_pnl_latest_account_snapshot,
 )
 from tools.lib.rolling_rate_limiter import RollingWindowRateLimiter
 from tools.lib.runtime_files import read_json, write_json_atomic
@@ -2249,6 +2250,13 @@ class VariationalToLighterRuntime:
         self.load_recent_live_inventory_exit_shortfall_bps()
         self.load_recent_live_inventory_actual_pnl_stats()
         self.pending_live_inventory_var_fill_matches: list[PendingLiveInventoryVarFillMatch] = []
+        self.live_inventory_state_mutation_revision = 0
+        self.live_inventory_state_persisted_mutation_revision = 0
+        self.live_inventory_state_dirty_reason: str | None = None
+        self.live_inventory_state_revision = 0
+        self.live_inventory_state_write_request_revision = 0
+        self.live_inventory_state_written_request_revision = 0
+        self._live_inventory_state_write_lock = asyncio.Lock()
         self.live_inventory_basis_state = LiveInventoryBasisState(
             half_life_seconds=float(args.live_inventory_basis_half_life_seconds),
             warmup_samples=int(args.live_inventory_basis_warmup_samples),
@@ -3366,6 +3374,18 @@ class VariationalToLighterRuntime:
 
     def sync_live_inventory_memory_from_state(self) -> None:
         state = self.load_live_inventory_state()
+        self.live_inventory_state_revision = int(
+            state.get("state_revision") or 0
+        )
+        self.live_inventory_state_mutation_revision = int(
+            state.get("state_mutation_revision") or 0
+        )
+        self.live_inventory_state_persisted_mutation_revision = (
+            self.live_inventory_state_mutation_revision
+        )
+        self.live_inventory_startup_persisted_pending_actions = list(
+            state.get("pending_actions") or []
+        )
         open_lots = state.get("open_lots")
         self.live_inventory_open_lots = open_lots if isinstance(open_lots, list) else []
         self.live_inventory_next_lot_id = int(state.get("next_lot_id") or 1)
@@ -4244,17 +4264,32 @@ class VariationalToLighterRuntime:
                 "equity_balance_ratio": decimal_to_str(equity_balance_ratio),
             },
         )
+        baseline_file = getattr(
+            self,
+            "live_inventory_pnl_baseline_file",
+            None,
+        )
+        if total_equity is not None and not errors and baseline_file is not None:
+            try:
+                set_pnl_latest_account_snapshot(
+                    baseline_file,
+                    variational_equity_usd=variational_equity,
+                    lighter_equity_usd=lighter_equity,
+                    combined_equity_usd=total_equity,
+                    captured_at=captured_at,
+                    account_snapshot_flat=open_lots_total == 0,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "pnl_latest_account_snapshot_write_failed error=%s",
+                    type(exc).__name__,
+                )
         if (
             stage in {"startup_flat", "exit_confirmed_flat"}
             and total_equity is not None
             and open_lots_total == 0
             and not errors
         ):
-            baseline_file = getattr(
-                self,
-                "live_inventory_pnl_baseline_file",
-                None,
-            )
             tracking_baseline = (
                 load_pnl_baseline(baseline_file)
                 if baseline_file is not None
@@ -4276,18 +4311,43 @@ class VariationalToLighterRuntime:
                         == "lighter_final_fill_confirmed"
                         and actual_payload.get("actual_pnl_usd") is not None
                     ):
-                        record_pnl_cycle(
-                            baseline_file,
-                            run_id=str(
-                                getattr(self, "live_inventory_run_id", "unknown")
-                            ),
-                            asset=asset,
-                            lot_id=lot_id,
-                            actual_pnl_usd=actual_payload.get("actual_pnl_usd"),
-                            observed_at=(
-                                actual_payload.get("logged_at") or captured_at
-                            ),
-                        )
+                        try:
+                            record_pnl_cycle(
+                                baseline_file,
+                                run_id=str(
+                                    getattr(
+                                        self,
+                                        "live_inventory_run_id",
+                                        "unknown",
+                                    )
+                                ),
+                                asset=asset,
+                                lot_id=lot_id,
+                                actual_pnl_usd=actual_payload.get(
+                                    "actual_pnl_usd"
+                                ),
+                                observed_at=(
+                                    actual_payload.get("confirmed_at")
+                                    or actual_payload.get("logged_at")
+                                    or captured_at
+                                ),
+                                four_leg_volume_usd=actual_payload.get(
+                                    "four_leg_volume_usd"
+                                ),
+                                closed_child_lots=(
+                                    actual_payload.get("closed_child_lots")
+                                    or actual_payload.get(
+                                        "portfolio_component_lot_count"
+                                    )
+                                    or 1
+                                ),
+                            )
+                        except Exception as exc:
+                            self.logger.warning(
+                                "pnl_cycle_checkpoint_failed lot_id=%s error=%s",
+                                lot_id,
+                                type(exc).__name__,
+                            )
                         tracking_baseline = (
                             load_pnl_baseline(baseline_file)
                             or tracking_baseline
@@ -4407,14 +4467,35 @@ class VariationalToLighterRuntime:
             None,
         )
         if baseline_file is not None and cycle_actual_pnl is not None:
-            record_pnl_cycle(
-                baseline_file,
-                run_id=str(getattr(self, "live_inventory_run_id", "unknown")),
-                asset=asset,
-                lot_id=lot_id,
-                actual_pnl_usd=cycle_actual_pnl,
-                observed_at=(actual_payload.get("logged_at") or captured_at),
-            )
+            try:
+                record_pnl_cycle(
+                    baseline_file,
+                    run_id=str(
+                        getattr(self, "live_inventory_run_id", "unknown")
+                    ),
+                    asset=asset,
+                    lot_id=lot_id,
+                    actual_pnl_usd=cycle_actual_pnl,
+                    observed_at=(
+                        actual_payload.get("confirmed_at")
+                        or actual_payload.get("logged_at")
+                        or captured_at
+                    ),
+                    four_leg_volume_usd=actual_payload.get(
+                        "four_leg_volume_usd"
+                    ),
+                    closed_child_lots=(
+                        actual_payload.get("closed_child_lots")
+                        or actual_payload.get("portfolio_component_lot_count")
+                        or 1
+                    ),
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "pnl_summary_cycle_checkpoint_failed lot_id=%s error=%s",
+                    lot_id,
+                    type(exc).__name__,
+                )
             self.sync_live_inventory_pnl_tracking_baseline()
         realized_pnl = to_decimal(
             getattr(self, "live_inventory_realized_pnl_usd", None)
@@ -4733,6 +4814,14 @@ class VariationalToLighterRuntime:
             )
             return
         asset = self.live_inventory_state_asset()
+        persisted_pending_actions = list(
+            getattr(
+                self,
+                "live_inventory_startup_persisted_pending_actions",
+                [],
+            )
+            or []
+        )
         variational_positions_result = None
         variational_position_qty = None
         lighter_account_result = None
@@ -4808,6 +4897,19 @@ class VariationalToLighterRuntime:
                     "lighter_position_qty": decimal_to_str(lighter_position_qty),
                 },
             )
+            if persisted_pending_actions:
+                await self.append_live_inventory_log(
+                    "live_inventory_startup_pending_reconciled",
+                    {
+                        "asset": asset,
+                        "status": "exchange_flat_matches_local_state",
+                        "persisted_pending_actions": persisted_pending_actions,
+                        "action": "cleared_after_strict_exchange_reconcile",
+                    },
+                )
+                await self.persist_live_inventory_memory(
+                    reason="startup_flat_pending_reconciled"
+                )
             return
 
         open_directions = {
@@ -4866,6 +4968,16 @@ class VariationalToLighterRuntime:
                 "lighter_position_qty": decimal_to_str(lighter_position_qty),
             },
         )
+        if persisted_pending_actions:
+            await self.append_live_inventory_log(
+                "live_inventory_startup_pending_reconciled",
+                {
+                    "asset": asset,
+                    "status": "exchange_positions_match_local_open_lots",
+                    "persisted_pending_actions": persisted_pending_actions,
+                    "action": "cleared_after_strict_exchange_reconcile",
+                },
+            )
         # A verified resume supersedes a stale manual-review marker from a
         # transient data outage. Persist immediately so operators and future
         # restarts see the same open state that this runtime is managing.
@@ -4889,6 +5001,11 @@ class VariationalToLighterRuntime:
                 "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
                 "completed_cycles": self.live_inventory_completed_cycles,
                 "reason": reason,
+                "state_mutation_revision": getattr(
+                    self,
+                    "live_inventory_state_mutation_revision",
+                    0,
+                ),
                 "maintenance_drain_requested": bool(
                     getattr(
                         self,
@@ -4920,6 +5037,33 @@ class VariationalToLighterRuntime:
                 ),
             }
         )
+
+    def mark_live_inventory_state_dirty(self, *, reason: str) -> None:
+        self.live_inventory_state_mutation_revision = int(
+            getattr(self, "live_inventory_state_mutation_revision", 0)
+        ) + 1
+        self.live_inventory_state_dirty_reason = reason
+
+    async def flush_live_inventory_state_if_dirty(self) -> bool:
+        mutation_revision = int(
+            getattr(self, "live_inventory_state_mutation_revision", 0)
+        )
+        persisted_revision = int(
+            getattr(
+                self,
+                "live_inventory_state_persisted_mutation_revision",
+                0,
+            )
+        )
+        if mutation_revision <= persisted_revision:
+            return False
+        await self.persist_live_inventory_memory(
+            reason=(
+                getattr(self, "live_inventory_state_dirty_reason", None)
+                or "pending_action_mutated"
+            )
+        )
+        return True
 
     async def require_live_inventory_manual_review(
         self,
@@ -8004,6 +8148,16 @@ class VariationalToLighterRuntime:
             if exit_lighter_slippage_bps is not None and exit_lighter_slippage_bps < 0:
                 exit_lighter_slippage_bps = Decimal("0")
         pnl_shortfall_usd = estimated_pnl - actual_pnl
+        four_leg_volume_usd = (
+            entry_var_qty * entry_var_price
+            + entry_lighter_qty * entry_lighter_price
+            + exit_var_qty * exit_var_price
+            + exit_lighter_qty * exit_lighter_price
+        )
+        closed_child_lots = int(
+            pending.get("portfolio_component_lot_count") or 1
+        )
+        confirmed_at = utc_now()
         var_fill_to_lighter_fill_ms = decimal_to_str(elapsed_iso_ms(
             payload.get("variational_filled_at"),
             payload.get("lighter_filled_at"),
@@ -8102,9 +8256,42 @@ class VariationalToLighterRuntime:
             "actual_lighter_leg_pnl_usd": decimal_to_str(lighter_leg_pnl),
             "actual_pnl_usd": decimal_to_str(actual_pnl),
             "actual_pnl_bps": decimal_to_str(actual_pnl_bps),
+            "four_leg_volume_usd": decimal_to_str(four_leg_volume_usd),
+            "closed_child_lots": closed_child_lots,
+            "confirmed_at": confirmed_at,
             "exit_lighter_payload": payload,
         }
         self.live_inventory_last_actual_pnl_payload = actual_pnl_payload
+        if (
+            actual_pnl_payload["actual_pnl_status"]
+            == "lighter_final_fill_confirmed"
+        ):
+            baseline_file = getattr(
+                self,
+                "live_inventory_pnl_baseline_file",
+                None,
+            )
+            if baseline_file is not None:
+                try:
+                    record_pnl_cycle(
+                        baseline_file,
+                        run_id=str(
+                            getattr(self, "live_inventory_run_id", "unknown")
+                        ),
+                        asset=str(pending.get("asset") or ""),
+                        lot_id=pending.get("lot_id"),
+                        actual_pnl_usd=actual_pnl,
+                        observed_at=confirmed_at,
+                        four_leg_volume_usd=four_leg_volume_usd,
+                        closed_child_lots=closed_child_lots,
+                    )
+                    self.sync_live_inventory_pnl_tracking_baseline()
+                except Exception as exc:
+                    self.logger.warning(
+                        "pnl_actual_fill_checkpoint_failed lot_id=%s error=%s",
+                        pending.get("lot_id"),
+                        type(exc).__name__,
+                    )
         final_key = self.live_inventory_final_pnl_key(
             str(pending.get("asset") or ""),
             pending.get("lot_id"),
@@ -8291,10 +8478,15 @@ class VariationalToLighterRuntime:
             )
         ]
         self.pending_live_inventory_var_fill_matches = retained_matches
+        removed_matches = len(pending_matches) - len(retained_matches)
+        if removed_matches:
+            self.mark_live_inventory_state_dirty(
+                reason=f"checkpoint_reconciliation_cleared:{normalized_lot_id}"
+            )
         return {
             "pending_actual_pnl": len(stale_actual_keys),
             "pending_final_pnl": final_before - final_after,
-            "pending_var_fill_matches": len(pending_matches) - len(retained_matches),
+            "pending_var_fill_matches": removed_matches,
         }
 
     def prune_checkpointed_live_inventory_reconciliation(self) -> dict[str, int]:
@@ -9010,7 +9202,58 @@ class VariationalToLighterRuntime:
         tmp_path.replace(self.live_inventory_state_file)
 
     async def write_live_inventory_state_async(self, state: dict[str, Any]) -> None:
-        await asyncio.to_thread(self.write_live_inventory_state, state)
+        # Freeze mutable lot/pending lists before the first await. Otherwise a
+        # later trade callback can mutate the object while the file writer is
+        # serializing it in a worker thread.
+        state_snapshot = json.loads(
+            json.dumps(state, ensure_ascii=True, default=json_log_default)
+        )
+        self.live_inventory_state_write_request_revision = int(
+            getattr(self, "live_inventory_state_write_request_revision", 0)
+        ) + 1
+        request_revision = self.live_inventory_state_write_request_revision
+        lock = getattr(self, "_live_inventory_state_write_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._live_inventory_state_write_lock = lock
+        async with lock:
+            mutation_revision = int(
+                state_snapshot.get(
+                    "state_mutation_revision",
+                    getattr(self, "live_inventory_state_mutation_revision", 0),
+                )
+            )
+            if request_revision < int(
+                getattr(self, "live_inventory_state_written_request_revision", 0)
+            ):
+                return
+            state_revision = int(
+                getattr(self, "live_inventory_state_revision", 0)
+            ) + 1
+            await asyncio.to_thread(
+                self.write_live_inventory_state,
+                {
+                    **state_snapshot,
+                    "state_revision": state_revision,
+                    "state_mutation_revision": mutation_revision,
+                },
+            )
+            self.live_inventory_state_revision = state_revision
+            self.live_inventory_state_written_request_revision = request_revision
+            self.live_inventory_state_persisted_mutation_revision = max(
+                int(
+                    getattr(
+                        self,
+                        "live_inventory_state_persisted_mutation_revision",
+                        0,
+                    )
+                ),
+                mutation_revision,
+            )
+            if int(
+                getattr(self, "live_inventory_state_mutation_revision", 0)
+            ) == mutation_revision:
+                self.live_inventory_state_dirty_reason = None
 
     def live_inventory_state_summary(self, state: dict[str, Any]) -> str:
         status = clean_state_value(state.get("status"))
@@ -9409,6 +9652,7 @@ class VariationalToLighterRuntime:
                     state_status = clean_state_value(state.get("status")) or "unknown"
                     manual_reason = clean_state_value(state.get("manual_review_reason")) or ""
                     open_lots = state.get("open_lots") if isinstance(state.get("open_lots"), list) else []
+                    pending_actions = state.get("pending_actions") if isinstance(state.get("pending_actions"), list) else []
                     recoverable_open_manual_review = (
                         state_status == "manual_review_required"
                         and manual_reason
@@ -9419,11 +9663,20 @@ class VariationalToLighterRuntime:
                         }
                         and bool(open_lots)
                     )
-                    if (state_status == "open" and open_lots) or recoverable_open_manual_review:
+                    recoverable_pending_intent = (
+                        state_status == "pending"
+                        and bool(pending_actions)
+                        and not open_lots
+                    )
+                    if (
+                        (state_status == "open" and open_lots)
+                        or recoverable_open_manual_review
+                        or recoverable_pending_intent
+                    ):
                         passed.append("live_inventory_open_state_resume_accepted")
                     else:
                         blocking_errors.append(
-                            "live_inventory_open_state_resume_requires_open_lots: "
+                            "live_inventory_open_state_resume_requires_open_lots_or_pending_action: "
                             + self.live_inventory_state_summary(state)
                         )
             if not account_index:
@@ -10196,12 +10449,23 @@ class VariationalToLighterRuntime:
     def prune_pending_live_inventory_var_fill_matches(self) -> None:
         now_monotonic = time.monotonic()
         pending_matches = getattr(self, "pending_live_inventory_var_fill_matches", [])
-        self.pending_live_inventory_var_fill_matches = [
+        retained_matches = [
             item
             for item in pending_matches
-            if item.role in {"live_inventory_entry_pending_lighter", "live_inventory_entry_pending_var_fill"}
+            if item.role
+            in {
+                "live_inventory_entry_pending_lighter",
+                "live_inventory_entry_pending_var_fill",
+                "live_inventory_entry",
+                "live_inventory_exit",
+            }
             or now_monotonic - item.created_at_monotonic <= self.auto_live_match_window_seconds
         ]
+        self.pending_live_inventory_var_fill_matches = retained_matches
+        if len(retained_matches) != len(pending_matches):
+            self.mark_live_inventory_state_dirty(
+                reason="expired_pending_action_pruned"
+            )
 
     def consume_pending_live_inventory_var_fill_match(
         self,
@@ -10217,7 +10481,11 @@ class VariationalToLighterRuntime:
                 continue
             if abs(item.qty - qty) > Decimal("0.000002"):
                 continue
-            return self.pending_live_inventory_var_fill_matches.pop(idx)
+            match = self.pending_live_inventory_var_fill_matches.pop(idx)
+            self.mark_live_inventory_state_dirty(
+                reason=f"pending_action_consumed:{match.role}:{match.lot_id}"
+            )
+            return match
         return None
 
     def consume_pending_live_inventory_var_status_match(
@@ -10237,13 +10505,20 @@ class VariationalToLighterRuntime:
             if roles is not None and item.role not in roles:
                 continue
             if abs(item.qty - qty) <= max(Decimal("0.00000001"), qty * Decimal("0.0001")):
-                return self.pending_live_inventory_var_fill_matches.pop(idx)
+                match = self.pending_live_inventory_var_fill_matches.pop(idx)
+                self.mark_live_inventory_state_dirty(
+                    reason=f"pending_status_consumed:{match.role}:{match.lot_id}"
+                )
+                return match
         return None
 
     def add_pending_live_inventory_var_fill_match(self, match: PendingLiveInventoryVarFillMatch) -> None:
         if not hasattr(self, "pending_live_inventory_var_fill_matches"):
             self.pending_live_inventory_var_fill_matches = []
         self.pending_live_inventory_var_fill_matches.append(match)
+        self.mark_live_inventory_state_dirty(
+            reason=f"pending_action_added:{match.role}:{match.lot_id}"
+        )
 
     def has_pending_live_inventory_var_fill_match(self, *, asset: str, roles: set[str] | None = None) -> bool:
         self.prune_pending_live_inventory_var_fill_matches()
@@ -10258,11 +10533,16 @@ class VariationalToLighterRuntime:
 
     def remove_pending_live_inventory_var_fill_match(self, *, asset: str, lot_id: Any, role: str) -> None:
         pending_matches = getattr(self, "pending_live_inventory_var_fill_matches", [])
-        self.pending_live_inventory_var_fill_matches = [
+        retained_matches = [
             item
             for item in pending_matches
             if not (item.asset == asset and item.lot_id == lot_id and item.role == role)
         ]
+        self.pending_live_inventory_var_fill_matches = retained_matches
+        if len(retained_matches) != len(pending_matches):
+            self.mark_live_inventory_state_dirty(
+                reason=f"pending_action_removed:{role}:{lot_id}"
+            )
 
     def _rekey_record_locked(self, record: OrderLifecycle, new_trade_key: str) -> None:
         old_trade_key = record.trade_key
@@ -12166,6 +12446,14 @@ class VariationalToLighterRuntime:
                 side=side,
                 qty=qty,
             )
+            if matched_live_inventory_var_fill is not None:
+                await self.persist_live_inventory_memory(
+                    reason=(
+                        "variational_fill_matched:"
+                        f"{matched_live_inventory_var_fill.role}:"
+                        f"{matched_live_inventory_var_fill.lot_id}"
+                    )
+                )
         matched_trade_key = matched_auto_live.record_key if matched_auto_live is not None else None
 
         async with self._record_lock:
@@ -16652,6 +16940,10 @@ class VariationalToLighterRuntime:
                     created_at_monotonic=time.monotonic(),
                 )
             )
+            # Persist the reduce-only intent before either venue is touched.
+            await self.persist_live_inventory_memory(
+                reason="basis_exit_submission_started"
+            )
             exit_pair_context: dict[str, Any] = {}
             var_exception: Exception | None = None
             lighter_exception: Exception | None = None
@@ -17240,6 +17532,9 @@ class VariationalToLighterRuntime:
                             created_at_monotonic=time.monotonic(),
                         )
                     )
+                    await self.persist_live_inventory_memory(
+                        reason="legacy_entry_submission_started"
+                    )
                     try:
                         var_task = asyncio.create_task(
                             self._timed_submit(
@@ -17510,6 +17805,9 @@ class VariationalToLighterRuntime:
                     role="live_inventory_exit",
                     created_at_monotonic=time.monotonic(),
                 )
+            )
+            await self.persist_live_inventory_memory(
+                reason="legacy_exit_submission_started"
             )
             try:
                 var_task = asyncio.create_task(
@@ -19068,9 +19366,13 @@ class VariationalToLighterRuntime:
 
         while not self.stop_flag:
             await self.poll_live_inventory_maintenance_control()
+            await self.flush_live_inventory_state_if_dirty()
             await asyncio.sleep(0.25)
 
     async def close(self) -> None:
+        if self.is_live_inventory_enabled():
+            with contextlib.suppress(Exception):
+                await self.flush_live_inventory_state_if_dirty()
         pending_entry_actions = [
             action
             for action in self.pending_live_inventory_actions_payload()

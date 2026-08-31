@@ -409,6 +409,44 @@ def test_v4_live_funnel_reports_concurrent_exit_and_cycle_summary() -> None:
     }
 
 
+def test_v4_live_funnel_keeps_partial_tier_close_as_position_open() -> None:
+    common = {
+        "run_id": "live-v4-partial-close",
+        "strategy_version": "basis-v4-live-v2",
+        "asset": "ETH",
+    }
+    funnel = build_v4_live_funnel(
+        [
+            {
+                **common,
+                "event": "live_inventory_entered",
+                "lot_id": 1,
+            },
+            {
+                **common,
+                "event": "live_inventory_entered",
+                "lot_id": 2,
+            },
+            {
+                **common,
+                "event": "live_inventory_exited",
+                "lot_id": 1,
+            },
+            {
+                **common,
+                "event": "live_inventory_final_pnl",
+                "logged_at": "2026-08-31T12:00:00+00:00",
+                "lot_id": 1,
+                "final_pnl_status": "var_and_lighter_final_fills_confirmed",
+                "remaining_child_lots": 1,
+            },
+        ]
+    )
+
+    assert funnel is not None
+    assert funnel["status"] == "POSITION_OPEN"
+
+
 def test_v4_live_funnel_does_not_call_reconciliation_cycle_complete() -> None:
     funnel = build_v4_live_funnel(
         [

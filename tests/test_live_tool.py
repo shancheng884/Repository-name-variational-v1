@@ -451,8 +451,28 @@ def test_live_tool_resume_accepts_only_clean_recoverable_open_state(
     assert "strict_exchange_reconcile_required=true" in message
     assert unsafe_ok is False
     assert "resume_refuses_state" in unsafe_message
-    assert pending_ok is False
-    assert "resume_refuses_pending_actions" in pending_message
+    assert pending_ok is True
+    assert "pending_actions=1" in pending_message
+    assert "strict_exchange_reconcile_required=true" in pending_message
+
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "pending",
+                "asset": "ETH",
+                "open_lots": [],
+                "pending_actions": [{"role": "live_inventory_entry"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pending_only_ok, pending_only_message = validate_state(
+        LiveConfig(v4_live_mode=True),
+        resume_open_position=True,
+    )
+    assert pending_only_ok is True
+    assert "state=pending" in pending_only_message
+    assert "strict_exchange_reconcile_required=true" in pending_only_message
 
 
 def test_live_tool_v4_batch_is_sequential_bounded_and_guarded(

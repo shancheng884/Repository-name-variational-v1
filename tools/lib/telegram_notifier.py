@@ -284,6 +284,38 @@ def format_telegram_trade_message(
             ]
         )
     if event_type == "live_inventory_pnl_summary":
+        if payload.get("summary_scope") == "beijing_daily":
+            return "\n".join(
+                [
+                    "[Var/Lighter] 北京时间每日收益",
+                    f"日期：{_value(payload, 'beijing_day')}｜资产：{asset}",
+                    "平仓子单："
+                    f"{_value(payload, 'daily_closed_child_lots')} 笔｜"
+                    "平仓批次："
+                    f"{_value(payload, 'daily_completed_close_groups')} 组",
+                    "双平台四腿成交量："
+                    f"{_localized_money(payload, 'daily_four_leg_volume_usd')}",
+                    "确认成交盈亏："
+                    f"{_localized_money(payload, 'beijing_day_actual_pnl_usd')}",
+                    "当日收益率："
+                    f"{_localized_percent(payload, 'beijing_day_return_pct')}",
+                    "当日简单年化："
+                    f"{_localized_percent(payload, 'daily_annualized_simple_pct')}",
+                    "累计确认盈亏："
+                    f"{_localized_money(payload, 'run_actual_pnl_usd')}",
+                    "累计四腿成交量："
+                    f"{_localized_money(payload, 'cumulative_four_leg_volume_usd')}",
+                    "累计收益率："
+                    f"{_localized_percent(payload, 'return_pct')}",
+                    "累计简单年化："
+                    f"{_localized_percent(payload, 'annualized_simple_pct')}",
+                    f"统计本金：{_localized_money(payload, 'capital_usd')}",
+                    "最新双边权益："
+                    f"{_localized_money(payload, 'combined_equity_usd')}",
+                    "口径：双边最终成交价；手续费和资金费未单独计入",
+                    "说明：单日及短周期年化仅供观察",
+                ]
+            )
         status = {
             "complete": "完整",
             "partial": "部分数据",

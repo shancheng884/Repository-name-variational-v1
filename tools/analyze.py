@@ -304,9 +304,16 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         not final_pnl_resolved
         and latest_final_pnl.get("final_pnl_status")
         == "var_and_lighter_final_fills_confirmed"
+        and (to_decimal(latest_final_pnl.get("remaining_child_lots")) or Decimal("0"))
+        == 0
     ):
         status = "FINAL_FILLS_CONFIRMED_WAITING_FOR_REPORT"
-    elif latest_final_pnl and not final_pnl_resolved:
+    elif (
+        latest_final_pnl
+        and not final_pnl_resolved
+        and (to_decimal(latest_final_pnl.get("remaining_child_lots")) or Decimal("0"))
+        == 0
+    ):
         status = "ERROR_FINAL_PNL_RECONCILIATION_REQUIRED"
     elif events["live_inventory_entered"] > events["live_inventory_exited"]:
         status = "POSITION_OPEN"
