@@ -314,6 +314,29 @@ def test_live_tool_v4_reverse_test_is_one_bounded_lot(monkeypatch) -> None:
     assert args.live_inventory_lot_notional_usd == 20
 
 
+def test_live_tool_v4_bidirectional_requires_continuous_real_gradient(
+    monkeypatch,
+) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(v4_live_mode=True),
+        v4_real_gradient=True,
+        v4_bidirectional=True,
+        v4_continuous=True,
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_basis_v4_bidirectional is True
+    assert args.live_inventory_basis_v4_real_gradient is True
+    assert args.live_inventory_basis_v4_continuous is True
+    assert args.live_inventory_max_cycles == 0
+    assert args.live_inventory_max_lots == 0
+    assert args.live_inventory_max_total_lots == 0
+    assert args.live_inventory_basis_disable_negative_direction is True
+
+
 def test_live_tool_close_open_position_uses_reconciled_one_shot_mode(
     monkeypatch,
 ) -> None:

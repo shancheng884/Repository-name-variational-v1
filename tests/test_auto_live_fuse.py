@@ -2024,6 +2024,189 @@ def test_v4_reverse_test_selects_long_direction_and_conservative_reserves() -> N
     )
 
 
+def test_v4_bidirectional_selects_best_flat_direction_and_locks_open_episode() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_reverse_test = False
+    runtime.live_inventory_basis_v4_bidirectional = True
+    runtime.live_inventory_open_lots = []
+    edges = {
+        "long_var_short_lighter": Decimal("4.0"),
+        "short_var_long_lighter": Decimal("3.0"),
+    }
+    thresholds = {
+        "long_var_short_lighter": Decimal("1.5"),
+        "short_var_long_lighter": Decimal("1.0"),
+    }
+
+    assert runtime.live_inventory_basis_v4_select_entry_direction(
+        signal_edges=edges,
+        thresholds=thresholds,
+    ) == "long_var_short_lighter"
+
+    runtime.live_inventory_open_lots = [
+        {"direction": "short_var_long_lighter"}
+    ]
+    assert runtime.live_inventory_basis_v4_select_entry_direction(
+        signal_edges=edges,
+        thresholds=thresholds,
+    ) == "short_var_long_lighter"
+
+
+def test_v4_bidirectional_uses_conservative_long_execution_reserves() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_reverse_test = False
+    runtime.live_inventory_basis_v4_bidirectional = True
+    runtime.live_inventory_basis_v4_entry_calibration_context = lambda: {
+        "applied_bps": Decimal("0.25")
+    }
+    runtime.live_inventory_basis_v4_exit_calibration_context = lambda: {
+        "sample_count": 20,
+        "min_samples": 10,
+        "full_samples": 20,
+        "ready": True,
+        "fully_mature": True,
+        "raw_p80_bps": Decimal("0.25"),
+        "prior_bps": Decimal("3.50"),
+        "calibration_weight": Decimal("1"),
+        "stage_floor_bps": Decimal("0.50"),
+        "cap_bps": Decimal("3.00"),
+        "applied_dynamic_bps": Decimal("0.25"),
+        "reserve_bps": Decimal("0.50"),
+    }
+
+    assert runtime.live_inventory_basis_v4_entry_execution_reserve_bps(
+        direction="long_var_short_lighter"
+    ) == Decimal("1.50")
+    assert runtime.live_inventory_basis_v4_entry_execution_reserve_bps(
+        direction="short_var_long_lighter"
+    ) == Decimal("0.25")
+    assert runtime.live_inventory_basis_v4_exit_calibration_payload(
+        direction="long_var_short_lighter"
+    )["v4_exit_shortfall_reserve_bps"] == "3.50"
+
+
+def test_v4_bidirectional_gradient_confirmation_state_is_isolated() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_bidirectional = True
+    runtime.live_inventory_v4_gradient_entry_tier_windows_by_direction = {
+        "long_var_short_lighter": deque(maxlen=3),
+        "short_var_long_lighter": deque(maxlen=3),
+    }
+    runtime.live_inventory_v4_gradient_tier_states_by_direction = {
+        direction: {
+            tier: {"armed": True, "reset_seen": False}
+            for tier in range(1, 6)
+        }
+        for direction in (
+            "long_var_short_lighter",
+            "short_var_long_lighter",
+        )
+    }
+    thresholds = [Decimal(str(value)) for value in range(1, 6)]
+
+    runtime.live_inventory_basis_v4_active_gradient_tier(
+        raw_tier=3,
+        edge_bps=Decimal("3.5"),
+        thresholds_bps=thresholds,
+        direction="long_var_short_lighter",
+    )
+
+    assert list(
+        runtime.live_inventory_v4_gradient_entry_tier_windows_by_direction[
+            "long_var_short_lighter"
+        ]
+    ) == [3]
+    assert list(
+        runtime.live_inventory_v4_gradient_entry_tier_windows_by_direction[
+            "short_var_long_lighter"
+        ]
+    ) == []
+
+
+def test_v4_bidirectional_records_each_direction_history_independently() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_bidirectional = True
+    runtime.live_inventory_basis_v4_reverse_test = False
+    runtime.live_inventory_basis_v4_history = deque()
+    runtime.live_inventory_basis_v4_histories = {
+        "long_var_short_lighter": deque(),
+        "short_var_long_lighter": deque(),
+    }
+    runtime.live_inventory_basis_v4_next_history_sample_at_by_direction = {
+        "long_var_short_lighter": 0.0,
+        "short_var_long_lighter": 0.0,
+    }
+
+    assert runtime.record_live_inventory_basis_v4_edge(
+        now=100.0,
+        direction="long_var_short_lighter",
+        edge_bps=Decimal("2.5"),
+    ) is True
+    assert runtime.record_live_inventory_basis_v4_edge(
+        now=100.0,
+        direction="short_var_long_lighter",
+        edge_bps=Decimal("1.5"),
+    ) is True
+
+    assert list(runtime.live_inventory_basis_v4_histories["long_var_short_lighter"]) == [
+        (100.0, Decimal("2.5"))
+    ]
+    assert list(runtime.live_inventory_basis_v4_histories["short_var_long_lighter"]) == [
+        (100.0, Decimal("1.5"))
+    ]
+
+
+def test_v4_bidirectional_thresholds_use_separate_direction_histories() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_bidirectional = True
+    runtime.live_inventory_basis_v4_reverse_test = False
+    runtime.live_inventory_basis_v4_test_skip_recent_health = False
+    runtime.live_inventory_basis_v4_histories = {}
+    runtime.live_inventory_basis_v4_threshold_cached_at_by_direction = {}
+    runtime.live_inventory_basis_v4_threshold_cache_by_direction = {}
+    runtime.live_inventory_basis_v4_shadow_cached_at_by_direction = {}
+    runtime.live_inventory_basis_v4_shadow_cache_by_direction = {}
+    runtime.live_inventory_basis_v4_projection_cached_at_by_direction = {}
+    runtime.live_inventory_basis_v4_projection_cache_by_direction = {}
+    runtime.live_inventory_execution_loss_bps_samples_by_direction = {
+        "long_var_short_lighter": deque(maxlen=20),
+        "short_var_long_lighter": deque(maxlen=20),
+    }
+    runtime.live_inventory_basis_sample_move_bps_samples = deque(maxlen=200)
+    runtime.live_inventory_latest_basis_size_ladder = []
+    now = 1_000_000.0
+    short_rows = _v4_rolling_anchor_rows(
+        now,
+        [
+            (now - 3000 + index * 30, Decimal(index))
+            for index in range(100)
+        ],
+    )
+    long_rows = deque(
+        (timestamp, edge + Decimal("10"))
+        for timestamp, edge in short_rows
+    )
+    runtime.live_inventory_basis_v4_histories = {
+        "long_var_short_lighter": long_rows,
+        "short_var_long_lighter": short_rows,
+    }
+
+    long_threshold, long_context = runtime.live_inventory_basis_v4_entry_threshold(
+        now=now,
+        direction="long_var_short_lighter",
+    )
+    short_threshold, short_context = runtime.live_inventory_basis_v4_entry_threshold(
+        now=now,
+        direction="short_var_long_lighter",
+    )
+
+    assert long_threshold is not None
+    assert short_threshold is not None
+    assert long_threshold - short_threshold == Decimal("10")
+    assert long_context["v4_history_direction"] == "long_var_short_lighter"
+    assert short_context["v4_history_direction"] == "short_var_long_lighter"
+
+
 def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.output_dir = Path(tmp_path)

@@ -151,6 +151,7 @@ LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
         "basis-v4-live-test-v13",
         "basis-v4-live-v14",
         "basis-v4-live-test-v14",
+        "basis-v4-live-v15-bidirectional",
     }
 )
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
@@ -1908,6 +1909,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_reverse_test = bool(
             args.live_inventory_basis_v4_reverse_test
         )
+        self.live_inventory_basis_v4_bidirectional = bool(
+            args.live_inventory_basis_v4_bidirectional
+        )
         self.live_inventory_basis_v4_max_run_loss_usd = Decimal(
             str(args.live_inventory_basis_v4_max_run_loss_usd)
         )
@@ -2099,6 +2103,11 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
+            else "basis-v4-live-v15-bidirectional"
+            if (
+                self.live_inventory_basis_v4_mode
+                and self.live_inventory_basis_v4_bidirectional
+            )
             else "basis-v4-live-test-v14"
             if (
                 self.live_inventory_basis_v4_mode
@@ -2145,6 +2154,8 @@ class VariationalToLighterRuntime:
             self.live_inventory_strategy_variant += "-real-gradient-5-tier-20usd"
         if self.live_inventory_basis_v4_reverse_test:
             self.live_inventory_strategy_variant += "-reverse-bounded-20usd"
+        if self.live_inventory_basis_v4_bidirectional:
+            self.live_inventory_strategy_variant += "-bidirectional-direction-locked"
         strategy_config = {
             key: str(value)
             for key, value in vars(args).items()
@@ -2199,6 +2210,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_rearm_confirmation_count = 0
         self.live_inventory_v4_rearm_reason: str | None = None
         self.live_inventory_v4_rearm_threshold_bps: Decimal | None = None
+        self.live_inventory_v4_rearm_direction: str | None = None
         self.live_inventory_v4_last_exit_reason: str | None = None
         self.live_inventory_v4_last_exit_at: str | None = None
         self.live_inventory_v4_checkpointed_lot_ids: set[str] = set()
@@ -2224,6 +2236,32 @@ class VariationalToLighterRuntime:
                 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
             )
         }
+        self.live_inventory_v4_gradient_entry_tier_windows_by_direction: dict[
+            str, deque[int]
+        ] = {
+            direction: deque(
+                maxlen=LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_WINDOW_SAMPLES
+            )
+            for direction in (
+                DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                DIRECTION_SHORT_VAR_LONG_LIGHTER,
+            )
+        }
+        self.live_inventory_v4_gradient_tier_states_by_direction: dict[
+            str, dict[int, dict[str, Any]]
+        ] = {
+            direction: {
+                tier: {"armed": True, "reset_seen": False}
+                for tier in range(
+                    1,
+                    LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
+                )
+            }
+            for direction in (
+                DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                DIRECTION_SHORT_VAR_LONG_LIGHTER,
+            )
+        }
         self.live_inventory_v4_portfolio_exit_context: dict[str, Any] = {}
         self.live_inventory_calibration_last_exit_sample_index: int | None = None
         self.live_inventory_calibration_halted_reason: str | None = None
@@ -2243,6 +2281,14 @@ class VariationalToLighterRuntime:
         self.live_inventory_execution_loss_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_exit_estimate_shortfall_bps_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_strong_single_shortfall_bps_samples: deque[Decimal] = deque(maxlen=20)
+        self.live_inventory_execution_loss_bps_samples_by_direction = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(maxlen=20),
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(maxlen=20),
+        }
+        self.live_inventory_exit_shortfall_bps_samples_by_direction = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(maxlen=20),
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(maxlen=20),
+        }
         self.live_inventory_exit_fill_latency_ms_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_basis_var_spread_bps_samples: deque[Decimal] = deque(maxlen=200)
         self.live_inventory_basis_lighter_spread_bps_samples: deque[Decimal] = deque(maxlen=200)
@@ -2296,6 +2342,42 @@ class VariationalToLighterRuntime:
         ] | None = None
         self.live_inventory_basis_v4_shadow_cached_at = 0.0
         self.live_inventory_basis_v4_shadow_cache: dict[str, Any] = {}
+        self.live_inventory_basis_v4_histories: dict[
+            str, deque[tuple[float, Decimal]]
+        ] = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(),
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(),
+        }
+        self.live_inventory_basis_v4_next_history_sample_at_by_direction = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: 0.0,
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: 0.0,
+        }
+        self.live_inventory_basis_v4_history_ready_by_direction = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: False,
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: False,
+        }
+        self.live_inventory_basis_v4_history_reason_by_direction = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: "not_loaded",
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: "not_loaded",
+        }
+        self.live_inventory_basis_v4_threshold_cached_at_by_direction: dict[
+            str, float
+        ] = {}
+        self.live_inventory_basis_v4_threshold_cache_by_direction: dict[
+            str, tuple[Decimal | None, dict[str, Any]]
+        ] = {}
+        self.live_inventory_basis_v4_shadow_cached_at_by_direction: dict[
+            str, float
+        ] = {}
+        self.live_inventory_basis_v4_shadow_cache_by_direction: dict[
+            str, dict[str, Any]
+        ] = {}
+        self.live_inventory_basis_v4_projection_cached_at_by_direction: dict[
+            str, float
+        ] = {}
+        self.live_inventory_basis_v4_projection_cache_by_direction: dict[
+            str, dict[str, Any]
+        ] = {}
         self.live_inventory_extension_disconnect_failures = 0
         self.live_inventory_extension_failure_started_monotonic = 0.0
         self.live_inventory_extension_disconnect_fuse_triggered = False
@@ -2400,7 +2482,10 @@ class VariationalToLighterRuntime:
         orders_file = getattr(self, "orders_file", None)
         if orders_file is None or not orders_file.exists():
             return
-        samples: deque[Decimal] = deque(maxlen=self.live_inventory_execution_loss_bps_samples.maxlen)
+        samples_by_direction = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(maxlen=20),
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(maxlen=20),
+        }
         try:
             with orders_file.open("r", encoding="utf-8") as handle:
                 for line in handle:
@@ -2416,7 +2501,8 @@ class VariationalToLighterRuntime:
                         continue
                     if str(row.get("asset") or "").upper() != "ETH":
                         continue
-                    if row.get("direction") != DIRECTION_SHORT_VAR_LONG_LIGHTER:
+                    direction = str(row.get("direction") or "")
+                    if direction not in samples_by_direction:
                         continue
                     if row.get("final_pnl_status") != "var_and_lighter_final_fills_confirmed":
                         continue
@@ -2424,11 +2510,28 @@ class VariationalToLighterRuntime:
                     if loss_bps is not None:
                         # Zero-loss fills are observations and must contribute to
                         # calibration maturity instead of biasing P80 upward.
-                        samples.append(max(loss_bps, Decimal("0")))
+                        samples_by_direction[direction].append(
+                            max(loss_bps, Decimal("0"))
+                        )
         except OSError as exc:
             self.logger.warning("Could not load recent live inventory execution loss samples: %s", exc)
             return
-        self.live_inventory_execution_loss_bps_samples.extend(samples)
+        targets = getattr(
+            self,
+            "live_inventory_execution_loss_bps_samples_by_direction",
+            None,
+        )
+        if not isinstance(targets, dict):
+            targets = {
+                direction: deque(maxlen=20)
+                for direction in samples_by_direction
+            }
+            self.live_inventory_execution_loss_bps_samples_by_direction = targets
+        for direction, samples in samples_by_direction.items():
+            targets[direction].extend(samples)
+        self.live_inventory_execution_loss_bps_samples.extend(
+            samples_by_direction[DIRECTION_SHORT_VAR_LONG_LIGHTER]
+        )
 
     @staticmethod
     def percentile_decimal(values: Iterable[Decimal], percentile: int) -> Decimal | None:
@@ -2442,10 +2545,22 @@ class VariationalToLighterRuntime:
     def live_inventory_recent_execution_loss_buffer_bps(self) -> Decimal:
         return self.percentile_decimal(getattr(self, "live_inventory_execution_loss_bps_samples", []), 80) or Decimal("0")
 
-    def live_inventory_basis_v4_entry_calibration_context(self) -> dict[str, Any]:
-        samples = list(
-            getattr(self, "live_inventory_execution_loss_bps_samples", [])
+    def live_inventory_basis_v4_entry_calibration_context(
+        self,
+        *,
+        direction: str | None = None,
+    ) -> dict[str, Any]:
+        by_direction = getattr(
+            self,
+            "live_inventory_execution_loss_bps_samples_by_direction",
+            {},
         )
+        source = (
+            by_direction.get(direction, [])
+            if direction is not None and isinstance(by_direction, dict)
+            else getattr(self, "live_inventory_execution_loss_bps_samples", [])
+        )
+        samples = list(source)
         sample_count = len(samples)
         raw_p80_bps = self.percentile_decimal(samples, 80) or Decimal("0")
         ready = sample_count >= LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_MIN_SAMPLES
@@ -2487,9 +2602,19 @@ class VariationalToLighterRuntime:
             "applied_bps": applied_bps,
         }
 
-    def live_inventory_basis_v4_entry_calibration_payload(self) -> dict[str, Any]:
-        context = self.live_inventory_basis_v4_entry_calibration_context()
+    def live_inventory_basis_v4_entry_calibration_payload(
+        self,
+        *,
+        direction: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            context = self.live_inventory_basis_v4_entry_calibration_context(
+                direction=direction
+            )
+        except TypeError:
+            context = self.live_inventory_basis_v4_entry_calibration_context()
         return {
+            "v4_entry_capture_direction": direction,
             "v4_entry_capture_sample_count": context["sample_count"],
             "v4_entry_capture_min_samples": context["min_samples"],
             "v4_entry_capture_full_samples": context["full_samples"],
@@ -2510,11 +2635,25 @@ class VariationalToLighterRuntime:
             ),
         }
 
-    def live_inventory_basis_v4_entry_execution_reserve_bps(self) -> Decimal:
-        reserve = self.live_inventory_basis_v4_entry_calibration_context()[
-            "applied_bps"
-        ]
-        if getattr(self, "live_inventory_basis_v4_reverse_test", False):
+    def live_inventory_basis_v4_entry_execution_reserve_bps(
+        self,
+        *,
+        direction: str | None = None,
+    ) -> Decimal:
+        try:
+            context = self.live_inventory_basis_v4_entry_calibration_context(
+                direction=direction
+            )
+        except TypeError:
+            context = self.live_inventory_basis_v4_entry_calibration_context()
+        reserve = context["applied_bps"]
+        if (
+            getattr(self, "live_inventory_basis_v4_reverse_test", False)
+            or (
+                direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                and getattr(self, "live_inventory_basis_v4_bidirectional", False)
+            )
+        ):
             return max(reserve, LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_PRIOR_BPS)
         return reserve
 
@@ -2522,7 +2661,10 @@ class VariationalToLighterRuntime:
         orders_file = getattr(self, "orders_file", None)
         if orders_file is None or not orders_file.exists():
             return
-        samples: deque[Decimal] = deque(maxlen=self.live_inventory_exit_estimate_shortfall_bps_samples.maxlen)
+        samples_by_direction = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(maxlen=20),
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(maxlen=20),
+        }
         strong_single_target = getattr(
             self,
             "live_inventory_strong_single_shortfall_bps_samples",
@@ -2551,7 +2693,8 @@ class VariationalToLighterRuntime:
                         continue
                     if str(row.get("asset") or "").upper() != "ETH":
                         continue
-                    if row.get("direction") != DIRECTION_SHORT_VAR_LONG_LIGHTER:
+                    direction = str(row.get("direction") or "")
+                    if direction not in samples_by_direction:
                         continue
                     if row.get("actual_pnl_status") != "lighter_final_fill_confirmed":
                         continue
@@ -2565,13 +2708,31 @@ class VariationalToLighterRuntime:
                         estimated_bps - actual_bps,
                         Decimal("0"),
                     )
-                    samples.append(shortfall_bps)
-                    if row.get("exit_confirmation_mode") == "strong_single":
+                    samples_by_direction[direction].append(shortfall_bps)
+                    if (
+                        direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
+                        and row.get("exit_confirmation_mode") == "strong_single"
+                    ):
                         strong_single_samples.append(shortfall_bps)
         except OSError as exc:
             self.logger.warning("Could not load recent live inventory exit shortfall samples: %s", exc)
             return
-        self.live_inventory_exit_estimate_shortfall_bps_samples.extend(samples)
+        targets = getattr(
+            self,
+            "live_inventory_exit_shortfall_bps_samples_by_direction",
+            None,
+        )
+        if not isinstance(targets, dict):
+            targets = {
+                direction: deque(maxlen=20)
+                for direction in samples_by_direction
+            }
+            self.live_inventory_exit_shortfall_bps_samples_by_direction = targets
+        for direction, samples in samples_by_direction.items():
+            targets[direction].extend(samples)
+        self.live_inventory_exit_estimate_shortfall_bps_samples.extend(
+            samples_by_direction[DIRECTION_SHORT_VAR_LONG_LIGHTER]
+        )
         self.live_inventory_strong_single_shortfall_bps_samples.extend(
             strong_single_samples
         )
@@ -2581,10 +2742,26 @@ class VariationalToLighterRuntime:
             return Decimal("0")
         return self.percentile_decimal(getattr(self, "live_inventory_exit_estimate_shortfall_bps_samples", []), 80) or Decimal("0")
 
-    def live_inventory_basis_v4_exit_calibration_context(self) -> dict[str, Any]:
-        samples = list(
-            getattr(self, "live_inventory_exit_estimate_shortfall_bps_samples", [])
+    def live_inventory_basis_v4_exit_calibration_context(
+        self,
+        *,
+        direction: str | None = None,
+    ) -> dict[str, Any]:
+        by_direction = getattr(
+            self,
+            "live_inventory_exit_shortfall_bps_samples_by_direction",
+            {},
         )
+        source = (
+            by_direction.get(direction, [])
+            if direction is not None and isinstance(by_direction, dict)
+            else getattr(
+                self,
+                "live_inventory_exit_estimate_shortfall_bps_samples",
+                [],
+            )
+        )
+        samples = list(source)
         sample_count = len(samples)
         raw_p80_bps = self.percentile_decimal(samples, 80) or Decimal("0")
         enabled = bool(
@@ -2645,9 +2822,28 @@ class VariationalToLighterRuntime:
             "reserve_bps": reserve_bps,
         }
 
-    def live_inventory_basis_v4_exit_calibration_payload(self) -> dict[str, Any]:
-        context = self.live_inventory_basis_v4_exit_calibration_context()
+    def live_inventory_basis_v4_exit_calibration_payload(
+        self,
+        *,
+        direction: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            context = self.live_inventory_basis_v4_exit_calibration_context(
+                direction=direction
+            )
+        except TypeError:
+            context = self.live_inventory_basis_v4_exit_calibration_context()
+        reserve_bps = context["reserve_bps"]
+        if (
+            direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+            and getattr(self, "live_inventory_basis_v4_bidirectional", False)
+        ):
+            reserve_bps = max(
+                reserve_bps,
+                LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS,
+            )
         return {
+            "v4_exit_shortfall_direction": direction,
             "v4_exit_shortfall_sample_count": context["sample_count"],
             "v4_exit_shortfall_min_samples": context["min_samples"],
             "v4_exit_shortfall_full_samples": context["full_samples"],
@@ -2670,7 +2866,7 @@ class VariationalToLighterRuntime:
                 context["applied_dynamic_bps"]
             ),
             "v4_exit_shortfall_reserve_bps": decimal_to_str(
-                context["reserve_bps"]
+                reserve_bps
             ),
         }
 
@@ -2842,6 +3038,52 @@ class VariationalToLighterRuntime:
         if getattr(self, "live_inventory_basis_v4_reverse_test", False):
             return DIRECTION_LONG_VAR_SHORT_LIGHTER
         return DIRECTION_SHORT_VAR_LONG_LIGHTER
+
+    def live_inventory_basis_v4_entry_directions(self) -> tuple[str, ...]:
+        if getattr(self, "live_inventory_basis_v4_bidirectional", False):
+            return (
+                DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                DIRECTION_SHORT_VAR_LONG_LIGHTER,
+            )
+        return (self.live_inventory_basis_v4_entry_direction(),)
+
+    def live_inventory_basis_v4_select_entry_direction(
+        self,
+        *,
+        signal_edges: dict[str, Decimal],
+        thresholds: dict[str, Decimal | None],
+    ) -> str:
+        allowed = self.live_inventory_basis_v4_entry_directions()
+        open_directions = {
+            str(lot.get("direction") or "")
+            for lot in getattr(self, "live_inventory_open_lots", [])
+        }
+        if len(open_directions) == 1:
+            open_direction = next(iter(open_directions))
+            if open_direction in allowed:
+                return open_direction
+        qualified = [
+            direction
+            for direction in allowed
+            if thresholds.get(direction) is not None
+            and not (
+                getattr(
+                    self,
+                    "live_inventory_basis_disable_negative_direction",
+                    False,
+                )
+                and self.live_inventory_direction_paused(direction)[0]
+            )
+        ]
+        if not qualified:
+            return self.live_inventory_basis_v4_entry_direction()
+        return max(
+            qualified,
+            key=lambda direction: (
+                signal_edges[direction]
+                - (thresholds[direction] or Decimal("0"))
+            ),
+        )
 
     def live_inventory_calibration_direction_for_cycle(self) -> str:
         configured = getattr(self, "live_inventory_calibration_direction", "alternate")
@@ -3424,6 +3666,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_rearm_threshold_bps = to_decimal(
             state.get("v4_rearm_threshold_bps")
         )
+        self.live_inventory_v4_rearm_direction = (
+            state.get("v4_rearm_direction") or None
+        )
         self.live_inventory_v4_last_exit_reason = (
             state.get("v4_last_exit_reason") or None
         )
@@ -3530,6 +3775,54 @@ class VariationalToLighterRuntime:
                     LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
                 )
             }
+        persisted_direction_states = state.get(
+            "v4_gradient_tier_states_by_direction"
+        )
+        if isinstance(persisted_direction_states, dict):
+            direction_state_map = getattr(
+                self,
+                "live_inventory_v4_gradient_tier_states_by_direction",
+                None,
+            )
+            if not isinstance(direction_state_map, dict):
+                direction_state_map = {}
+                self.live_inventory_v4_gradient_tier_states_by_direction = (
+                    direction_state_map
+                )
+            for direction in (
+                DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                DIRECTION_SHORT_VAR_LONG_LIGHTER,
+            ):
+                raw_states = persisted_direction_states.get(direction)
+                if not isinstance(raw_states, dict):
+                    continue
+                direction_state_map[direction] = {
+                    tier: {
+                        "armed": bool(
+                            (raw_states.get(str(tier)) or {}).get(
+                                "armed",
+                                True,
+                            )
+                        ),
+                        "reset_seen": bool(
+                            (raw_states.get(str(tier)) or {}).get(
+                                "reset_seen",
+                                False,
+                            )
+                        ),
+                        **{
+                            key: value
+                            for key, value in (
+                                raw_states.get(str(tier)) or {}
+                            ).items()
+                            if key in {"closed_at", "rearmed_at"}
+                        },
+                    }
+                    for tier in range(
+                        1,
+                        LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
+                    )
+                }
 
     def sync_live_inventory_pnl_tracking_baseline(self) -> None:
         baseline_file = getattr(
@@ -3652,6 +3945,17 @@ class VariationalToLighterRuntime:
                     {},
                 ).items()
             },
+            "v4_gradient_tier_states_by_direction": {
+                direction: {
+                    str(tier): dict(value)
+                    for tier, value in states.items()
+                }
+                for direction, states in getattr(
+                    self,
+                    "live_inventory_v4_gradient_tier_states_by_direction",
+                    {},
+                ).items()
+            },
             "v4_strong_single_enabled": bool(
                 getattr(self, "live_inventory_v4_strong_single_enabled", True)
             ),
@@ -3702,6 +4006,11 @@ class VariationalToLighterRuntime:
             ),
             "v4_rearm_threshold_bps": decimal_to_str(
                 getattr(self, "live_inventory_v4_rearm_threshold_bps", None)
+            ),
+            "v4_rearm_direction": getattr(
+                self,
+                "live_inventory_v4_rearm_direction",
+                None,
             ),
             "v4_last_exit_reason": getattr(
                 self,
@@ -3965,6 +4274,13 @@ class VariationalToLighterRuntime:
         )
         if gradient_window is not None and hasattr(gradient_window, "clear"):
             gradient_window.clear()
+        for direction_window in getattr(
+            self,
+            "live_inventory_v4_gradient_entry_tier_windows_by_direction",
+            {},
+        ).values():
+            if hasattr(direction_window, "clear"):
+                direction_window.clear()
 
     async def live_inventory_account_risk_context(
         self,
@@ -6360,6 +6676,24 @@ class VariationalToLighterRuntime:
         )
         return ordered[max(0, min(index, len(ordered) - 1))]
 
+    def live_inventory_basis_v4_history_for_direction(
+        self,
+        direction: str | None = None,
+    ) -> deque[tuple[float, Decimal]]:
+        if (
+            direction is not None
+            and getattr(self, "live_inventory_basis_v4_bidirectional", False)
+        ):
+            histories = getattr(
+                self,
+                "live_inventory_basis_v4_histories",
+                {},
+            )
+            history = histories.get(direction)
+            if isinstance(history, deque):
+                return history
+        return self.live_inventory_basis_v4_history
+
     def live_inventory_basis_v4_window_stats(
         self,
         *,
@@ -6369,10 +6703,16 @@ class VariationalToLighterRuntime:
         min_effective_seconds: int,
         min_coverage_seconds: int,
         require_contiguous: bool,
+        history: deque[tuple[float, Decimal]] | None = None,
     ) -> dict[str, Any]:
+        source_history = (
+            history
+            if history is not None
+            else self.live_inventory_basis_v4_history
+        )
         cutoff = now - window_seconds
         rows = []
-        for row in reversed(self.live_inventory_basis_v4_history):
+        for row in reversed(source_history):
             if row[0] <= cutoff:
                 break
             rows.append(row)
@@ -6422,18 +6762,47 @@ class VariationalToLighterRuntime:
             "ready": ready,
         }
 
-    def live_inventory_basis_v4_anchor_projection(self, *, now: float) -> dict[str, Any]:
-        cached_at = float(
-            getattr(self, "live_inventory_basis_v4_projection_cached_at", 0.0)
-            or 0.0
+    def live_inventory_basis_v4_anchor_projection(
+        self,
+        *,
+        now: float,
+        direction: str | None = None,
+        history: deque[tuple[float, Decimal]] | None = None,
+    ) -> dict[str, Any]:
+        bidirectional = bool(
+            direction is not None
+            and getattr(self, "live_inventory_basis_v4_bidirectional", False)
         )
-        cached = getattr(self, "live_inventory_basis_v4_projection_cache", {})
+        if bidirectional:
+            cached_at = float(
+                getattr(
+                    self,
+                    "live_inventory_basis_v4_projection_cached_at_by_direction",
+                    {},
+                ).get(direction, 0.0)
+                or 0.0
+            )
+            cached = getattr(
+                self,
+                "live_inventory_basis_v4_projection_cache_by_direction",
+                {},
+            ).get(direction, {})
+        else:
+            cached_at = float(
+                getattr(self, "live_inventory_basis_v4_projection_cached_at", 0.0)
+                or 0.0
+            )
+            cached = getattr(self, "live_inventory_basis_v4_projection_cache", {})
         if cached and now - cached_at < 300.0:
             return dict(cached)
 
         rows = deque(
             row
-            for row in self.live_inventory_basis_v4_history
+            for row in (
+                history
+                if history is not None
+                else self.live_inventory_basis_v4_history
+            )
             if row[0] > now - LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS
         )
         projected_seconds: int | None = None
@@ -6475,11 +6844,51 @@ class VariationalToLighterRuntime:
             "v4_anchor_projected_ready_at": projected_at,
             "v4_anchor_projection_assumption": "continuous_valid_30s_samples",
         }
-        self.live_inventory_basis_v4_projection_cached_at = now
-        self.live_inventory_basis_v4_projection_cache = dict(result)
+        if bidirectional:
+            self.live_inventory_basis_v4_projection_cached_at_by_direction[
+                str(direction)
+            ] = now
+            self.live_inventory_basis_v4_projection_cache_by_direction[
+                str(direction)
+            ] = dict(result)
+        else:
+            self.live_inventory_basis_v4_projection_cached_at = now
+            self.live_inventory_basis_v4_projection_cache = dict(result)
         return result
 
     def load_live_inventory_basis_v4_history(self, *, asset: str) -> dict[str, Any]:
+        directions = (
+            DIRECTION_LONG_VAR_SHORT_LIGHTER,
+            DIRECTION_SHORT_VAR_LONG_LIGHTER,
+        )
+        if not isinstance(
+            getattr(self, "live_inventory_basis_v4_histories", None),
+            dict,
+        ):
+            self.live_inventory_basis_v4_histories = {
+                direction: deque() for direction in directions
+            }
+        for attribute, default in (
+            ("live_inventory_basis_v4_next_history_sample_at_by_direction", 0.0),
+            ("live_inventory_basis_v4_history_ready_by_direction", False),
+            ("live_inventory_basis_v4_history_reason_by_direction", "not_loaded"),
+        ):
+            if not isinstance(getattr(self, attribute, None), dict):
+                setattr(
+                    self,
+                    attribute,
+                    {direction: default for direction in directions},
+                )
+        for attribute in (
+            "live_inventory_basis_v4_threshold_cached_at_by_direction",
+            "live_inventory_basis_v4_threshold_cache_by_direction",
+            "live_inventory_basis_v4_shadow_cached_at_by_direction",
+            "live_inventory_basis_v4_shadow_cache_by_direction",
+            "live_inventory_basis_v4_projection_cached_at_by_direction",
+            "live_inventory_basis_v4_projection_cache_by_direction",
+        ):
+            if not isinstance(getattr(self, attribute, None), dict):
+                setattr(self, attribute, {})
         self.live_inventory_basis_v4_history.clear()
         self.live_inventory_basis_v4_history_ready = False
         self.live_inventory_basis_v4_history_reason = "insufficient_rolling_7d_anchor"
@@ -6487,15 +6896,17 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_threshold_cache = None
         self.live_inventory_basis_v4_shadow_cached_at = 0.0
         self.live_inventory_basis_v4_shadow_cache = {}
+        for history in self.live_inventory_basis_v4_histories.values():
+            history.clear()
+        self.live_inventory_basis_v4_threshold_cached_at_by_direction.clear()
+        self.live_inventory_basis_v4_threshold_cache_by_direction.clear()
+        self.live_inventory_basis_v4_shadow_cached_at_by_direction.clear()
+        self.live_inventory_basis_v4_shadow_cache_by_direction.clear()
+        self.live_inventory_basis_v4_projection_cached_at_by_direction.clear()
+        self.live_inventory_basis_v4_projection_cache_by_direction.clear()
         now = datetime.now(timezone.utc).timestamp()
         cutoff = now - LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS
-        next_sample_at = cutoff
-        entry_direction = self.live_inventory_basis_v4_entry_direction()
-        edge_key = (
-            "long_edge_bps"
-            if entry_direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
-            else "short_edge_bps"
-        )
+        entry_directions = self.live_inventory_basis_v4_entry_directions()
         source_rows = read_basis_samples(
             self.output_dir / "basis_samples",
             limit=100000,
@@ -6503,73 +6914,139 @@ class VariationalToLighterRuntime:
             sample_kind_filter="baseline",
             sample_quality_filter="valid",
         )
-        for row in source_rows:
-            logged_at = self._parse_iso_ts(str(row.get("logged_at") or ""))
-            edge_bps = to_decimal(row.get(edge_key))
-            if logged_at is None or edge_bps is None:
-                continue
-            timestamp = logged_at.timestamp()
-            if timestamp < cutoff or timestamp >= now or timestamp < next_sample_at:
-                continue
-            self.live_inventory_basis_v4_history.append((timestamp, edge_bps))
-            next_sample_at = timestamp + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
-        latest_at = (
-            self.live_inventory_basis_v4_history[-1][0]
-            if self.live_inventory_basis_v4_history
-            else None
-        )
-        latest_age_seconds = None if latest_at is None else max(0.0, now - latest_at)
-        if (
-            latest_age_seconds is not None
-            and latest_age_seconds <= LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
-        ):
-            threshold, context = self.live_inventory_basis_v4_entry_threshold(now=now)
-            self.live_inventory_basis_v4_history_ready = threshold is not None
-            if threshold is not None:
-                self.live_inventory_basis_v4_history_reason = "ready"
-            elif not context.get("v4_anchor_ready"):
-                self.live_inventory_basis_v4_history_reason = "insufficient_rolling_7d_anchor"
+        direction_contexts: dict[str, dict[str, Any]] = {}
+        for direction in entry_directions:
+            edge_key = (
+                "long_edge_bps"
+                if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                else "short_edge_bps"
+            )
+            history = self.live_inventory_basis_v4_history_for_direction(direction)
+            next_sample_at = cutoff
+            for row in source_rows:
+                logged_at = self._parse_iso_ts(str(row.get("logged_at") or ""))
+                edge_bps = to_decimal(row.get(edge_key))
+                if logged_at is None or edge_bps is None:
+                    continue
+                timestamp = logged_at.timestamp()
+                if (
+                    timestamp < cutoff
+                    or timestamp >= now
+                    or timestamp < next_sample_at
+                ):
+                    continue
+                history.append((timestamp, edge_bps))
+                next_sample_at = (
+                    timestamp + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
+                )
+            latest_at = history[-1][0] if history else None
+            latest_age_seconds = (
+                None if latest_at is None else max(0.0, now - latest_at)
+            )
+            context: dict[str, Any] = {}
+            if (
+                latest_age_seconds is not None
+                and latest_age_seconds
+                <= LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
+            ):
+                threshold, context = self.live_inventory_basis_v4_entry_threshold(
+                    now=now,
+                    direction=direction,
+                )
+                ready = threshold is not None
+                reason = (
+                    "ready"
+                    if ready
+                    else "insufficient_rolling_7d_anchor"
+                    if not context.get("v4_anchor_ready")
+                    else "recent_1h_health_not_ready"
+                )
             else:
-                self.live_inventory_basis_v4_history_reason = "recent_1h_health_not_ready"
-        else:
-            context = {}
-            self.live_inventory_basis_v4_history_reason = "history_latest_sample_stale"
+                ready = False
+                reason = "history_latest_sample_stale"
+            self.live_inventory_basis_v4_history_ready_by_direction[direction] = ready
+            self.live_inventory_basis_v4_history_reason_by_direction[direction] = reason
+            self.live_inventory_basis_v4_next_history_sample_at_by_direction[
+                direction
+            ] = (
+                latest_at + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
+                if latest_at is not None
+                else now
+            )
+            direction_contexts[direction] = {
+                "entry_edge_key": edge_key,
+                "history_samples": len(history),
+                "latest_age_seconds": latest_age_seconds,
+                "ready": ready,
+                "reason": reason,
+                **context,
+            }
+
+        entry_direction = self.live_inventory_basis_v4_entry_direction()
+        primary = direction_contexts[entry_direction]
+        if getattr(self, "live_inventory_basis_v4_bidirectional", False):
+            self.live_inventory_basis_v4_history = (
+                self.live_inventory_basis_v4_histories[entry_direction]
+            )
+        self.live_inventory_basis_v4_history_ready = bool(primary["ready"])
+        self.live_inventory_basis_v4_history_reason = str(primary["reason"])
         self.live_inventory_basis_v4_next_history_sample_at = (
-            (latest_at + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS)
-            if latest_at is not None
-            else now
+            self.live_inventory_basis_v4_next_history_sample_at_by_direction[
+                entry_direction
+            ]
         )
         return {
             "profile": self.live_inventory_basis_v4_profile,
             "entry_direction": entry_direction,
-            "entry_edge_key": edge_key,
+            "entry_directions": list(entry_directions),
+            "bidirectional": bool(
+                getattr(self, "live_inventory_basis_v4_bidirectional", False)
+            ),
             "asset": asset,
             "source_rows": len(source_rows),
-            "history_samples": len(self.live_inventory_basis_v4_history),
-            "latest_age_seconds": latest_age_seconds,
-            "ready": self.live_inventory_basis_v4_history_ready,
-            "reason": self.live_inventory_basis_v4_history_reason,
-            **context,
+            "directions": direction_contexts,
+            **primary,
         }
 
     def live_inventory_basis_v4_entry_threshold(
         self,
         *,
         now: float,
+        direction: str | None = None,
     ) -> tuple[Decimal | None, dict[str, Any]]:
-        cached = getattr(
-            self,
-            "live_inventory_basis_v4_threshold_cache",
-            None,
+        bidirectional = bool(
+            direction is not None
+            and getattr(self, "live_inventory_basis_v4_bidirectional", False)
         )
-        cached_at = float(
-            getattr(
+        history = self.live_inventory_basis_v4_history_for_direction(direction)
+        if bidirectional:
+            cached = getattr(
                 self,
-                "live_inventory_basis_v4_threshold_cached_at",
-                0.0,
+                "live_inventory_basis_v4_threshold_cache_by_direction",
+                {},
+            ).get(direction)
+            cached_at = float(
+                getattr(
+                    self,
+                    "live_inventory_basis_v4_threshold_cached_at_by_direction",
+                    {},
+                ).get(direction, 0.0)
+                or 0.0
             )
-            or 0.0
-        )
+        else:
+            cached = getattr(
+                self,
+                "live_inventory_basis_v4_threshold_cache",
+                None,
+            )
+            cached_at = float(
+                getattr(
+                    self,
+                    "live_inventory_basis_v4_threshold_cached_at",
+                    0.0,
+                )
+                or 0.0
+            )
         if (
             cached is not None
             and now - cached_at < LIVE_INVENTORY_BASIS_V4_THRESHOLD_CACHE_SECONDS
@@ -6580,16 +7057,24 @@ class VariationalToLighterRuntime:
             threshold_bps: Decimal | None,
             threshold_context: dict[str, Any],
         ) -> tuple[Decimal | None, dict[str, Any]]:
-            self.live_inventory_basis_v4_threshold_cached_at = now
-            self.live_inventory_basis_v4_threshold_cache = (
-                threshold_bps,
-                dict(threshold_context),
-            )
+            if bidirectional:
+                self.live_inventory_basis_v4_threshold_cached_at_by_direction[
+                    str(direction)
+                ] = now
+                self.live_inventory_basis_v4_threshold_cache_by_direction[
+                    str(direction)
+                ] = (threshold_bps, dict(threshold_context))
+            else:
+                self.live_inventory_basis_v4_threshold_cached_at = now
+                self.live_inventory_basis_v4_threshold_cache = (
+                    threshold_bps,
+                    dict(threshold_context),
+                )
             return threshold_bps, threshold_context
 
         anchor_cutoff = now - LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS
         anchor_rows = []
-        for row in reversed(self.live_inventory_basis_v4_history):
+        for row in reversed(history):
             if row[0] <= anchor_cutoff:
                 break
             anchor_rows.append(row)
@@ -6657,16 +7142,32 @@ class VariationalToLighterRuntime:
             min_effective_seconds=LIVE_INVENTORY_BASIS_V4_FAST_MIN_EFFECTIVE_SECONDS,
             min_coverage_seconds=LIVE_INVENTORY_BASIS_V4_FAST_MIN_EFFECTIVE_SECONDS,
             require_contiguous=True,
+            history=history,
         )
-        shadow_cached_at = float(
-            getattr(self, "live_inventory_basis_v4_shadow_cached_at", 0.0)
-            or 0.0
-        )
-        shadow_cache = getattr(
-            self,
-            "live_inventory_basis_v4_shadow_cache",
-            {},
-        )
+        if bidirectional:
+            shadow_cached_at = float(
+                getattr(
+                    self,
+                    "live_inventory_basis_v4_shadow_cached_at_by_direction",
+                    {},
+                ).get(direction, 0.0)
+                or 0.0
+            )
+            shadow_cache = getattr(
+                self,
+                "live_inventory_basis_v4_shadow_cache_by_direction",
+                {},
+            ).get(direction, {})
+        else:
+            shadow_cached_at = float(
+                getattr(self, "live_inventory_basis_v4_shadow_cached_at", 0.0)
+                or 0.0
+            )
+            shadow_cache = getattr(
+                self,
+                "live_inventory_basis_v4_shadow_cache",
+                {},
+            )
         if (
             shadow_cache
             and now - shadow_cached_at
@@ -6685,6 +7186,7 @@ class VariationalToLighterRuntime:
                     * float(LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE)
                 ),
                 require_contiguous=False,
+                history=history,
             )
             long_context = self.live_inventory_basis_v4_window_stats(
                 now=now,
@@ -6696,14 +7198,27 @@ class VariationalToLighterRuntime:
                     * float(LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE)
                 ),
                 require_contiguous=False,
+                history=history,
             )
-            self.live_inventory_basis_v4_shadow_cached_at = now
-            self.live_inventory_basis_v4_shadow_cache = {
-                "mid": dict(mid_context),
-                "long": dict(long_context),
-            }
+            if bidirectional:
+                self.live_inventory_basis_v4_shadow_cached_at_by_direction[
+                    str(direction)
+                ] = now
+                self.live_inventory_basis_v4_shadow_cache_by_direction[
+                    str(direction)
+                ] = {
+                    "mid": dict(mid_context),
+                    "long": dict(long_context),
+                }
+            else:
+                self.live_inventory_basis_v4_shadow_cached_at = now
+                self.live_inventory_basis_v4_shadow_cache = {
+                    "mid": dict(mid_context),
+                    "long": dict(long_context),
+                }
         context = {
-            "v4_history_samples": len(self.live_inventory_basis_v4_history),
+            "v4_history_direction": direction,
+            "v4_history_samples": len(history),
             "v4_anchor_window_seconds": LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS,
             "v4_anchor_count": len(anchor_rows),
             "v4_anchor_coverage_seconds": f"{anchor_coverage_seconds:.3f}",
@@ -6742,7 +7257,11 @@ class VariationalToLighterRuntime:
             "v4_baseline_count": len(anchor_rows),
             "v4_baseline_coverage_seconds": f"{anchor_coverage_seconds:.3f}",
             "v4_baseline_max_sample_gap_seconds": f"{anchor_max_gap_seconds:.3f}",
-            **self.live_inventory_basis_v4_anchor_projection(now=now),
+            **self.live_inventory_basis_v4_anchor_projection(
+                now=now,
+                direction=direction,
+                history=history,
+            ),
         }
         if not anchor_ready or not health_ready:
             return finish(None, context)
@@ -6766,7 +7285,9 @@ class VariationalToLighterRuntime:
                     transition_candidates.append(window_threshold)
             raw_threshold = max(transition_candidates)
         entry_execution_reserve_bps = (
-            self.live_inventory_basis_v4_entry_execution_reserve_bps()
+            self.live_inventory_basis_v4_entry_execution_reserve_bps(
+                direction=direction
+            )
         )
         threshold = raw_threshold + entry_execution_reserve_bps
         market_noise_bps = self.percentile_decimal(
@@ -6806,8 +7327,19 @@ class VariationalToLighterRuntime:
             ),
             default=Decimal("0"),
         )
+        execution_samples_by_direction = getattr(
+            self,
+            "live_inventory_execution_loss_bps_samples_by_direction",
+            {},
+        )
+        execution_samples = (
+            execution_samples_by_direction.get(direction, [])
+            if direction is not None
+            and isinstance(execution_samples_by_direction, dict)
+            else getattr(self, "live_inventory_execution_loss_bps_samples", [])
+        )
         recent_pair_execution_error_bps = self.percentile_decimal(
-            getattr(self, "live_inventory_execution_loss_bps_samples", []),
+            execution_samples,
             80,
         )
         gradient_thresholds = v4_real_gradient_thresholds(
@@ -6834,7 +7366,9 @@ class VariationalToLighterRuntime:
             "v4_entry_execution_reserve_bps": decimal_to_str(
                 entry_execution_reserve_bps
             ),
-            **self.live_inventory_basis_v4_entry_calibration_payload(),
+            **self.live_inventory_basis_v4_entry_calibration_payload(
+                direction=direction
+            ),
             "v4_entry_threshold_bps": decimal_to_str(threshold),
             "v4_real_gradient_tier_percentiles": [
                 decimal_to_str(value)
@@ -6858,20 +7392,45 @@ class VariationalToLighterRuntime:
         self,
         *,
         now: float,
-        short_edge_bps: Decimal,
+        short_edge_bps: Decimal | None = None,
+        direction: str | None = None,
+        edge_bps: Decimal | None = None,
     ) -> bool:
-        if now < self.live_inventory_basis_v4_next_history_sample_at:
+        selected_direction = direction or self.live_inventory_basis_v4_entry_direction()
+        selected_edge_bps = edge_bps if edge_bps is not None else short_edge_bps
+        if selected_edge_bps is None:
             return False
-        self.live_inventory_basis_v4_history.append((now, short_edge_bps))
-        self.live_inventory_basis_v4_next_history_sample_at = (
-            now + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
+        bidirectional = bool(
+            direction is not None
+            and getattr(self, "live_inventory_basis_v4_bidirectional", False)
         )
+        next_sample_at = (
+            self.live_inventory_basis_v4_next_history_sample_at_by_direction.get(
+                selected_direction,
+                0.0,
+            )
+            if bidirectional
+            else self.live_inventory_basis_v4_next_history_sample_at
+        )
+        if now < next_sample_at:
+            return False
+        history = self.live_inventory_basis_v4_history_for_direction(
+            selected_direction if bidirectional else None
+        )
+        history.append((now, selected_edge_bps))
+        next_sample_at = now + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
+        if bidirectional:
+            self.live_inventory_basis_v4_next_history_sample_at_by_direction[
+                selected_direction
+            ] = next_sample_at
+        else:
+            self.live_inventory_basis_v4_next_history_sample_at = next_sample_at
         cutoff = now - LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS
         while (
-            self.live_inventory_basis_v4_history
-            and self.live_inventory_basis_v4_history[0][0] <= cutoff
+            history
+            and history[0][0] <= cutoff
         ):
-            self.live_inventory_basis_v4_history.popleft()
+            history.popleft()
         return True
 
     def live_inventory_basis_v4_update_rearm(
@@ -6879,6 +7438,7 @@ class VariationalToLighterRuntime:
         *,
         short_edge_bps: Decimal,
         entry_threshold_bps: Decimal | None,
+        direction: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         required = bool(
             getattr(self, "live_inventory_v4_rearm_required", False)
@@ -6919,6 +7479,7 @@ class VariationalToLighterRuntime:
             self.live_inventory_v4_rearm_confirmation_count = 0
             self.live_inventory_v4_rearm_reason = None
             self.live_inventory_v4_rearm_threshold_bps = None
+            self.live_inventory_v4_rearm_direction = None
             self.live_inventory_v4_episode_id = None
             self.live_inventory_v4_next_tranche_index = 1
             self.live_inventory_v4_gradient_tier_states = {
@@ -6928,6 +7489,21 @@ class VariationalToLighterRuntime:
                     LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
                 )
             }
+            for direction_states in getattr(
+                self,
+                "live_inventory_v4_gradient_tier_states_by_direction",
+                {},
+            ).values():
+                direction_states.clear()
+                direction_states.update(
+                    {
+                        tier: {"armed": True, "reset_seen": False}
+                        for tier in range(
+                            1,
+                            LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
+                        )
+                    }
+                )
             tier_window = getattr(
                 self,
                 "live_inventory_v4_gradient_entry_tier_window",
@@ -6935,11 +7511,18 @@ class VariationalToLighterRuntime:
             )
             if isinstance(tier_window, deque):
                 tier_window.clear()
+            for direction_window in getattr(
+                self,
+                "live_inventory_v4_gradient_entry_tier_windows_by_direction",
+                {},
+            ).values():
+                direction_window.clear()
             self.reset_live_inventory_basis_v4_shadow_gradient()
         return rearmed, {
             **self.live_inventory_v4_episode_payload(),
             "v4_rearm_reset_threshold_bps": decimal_to_str(reset_threshold),
             "v4_rearm_signal_below_reset": below_reset,
+            "v4_rearm_direction": direction,
         }
 
     def live_inventory_basis_v4_active_gradient_tier(
@@ -6948,11 +7531,24 @@ class VariationalToLighterRuntime:
         raw_tier: int,
         edge_bps: Decimal,
         thresholds_bps: list[Decimal],
+        direction: str | None = None,
     ) -> int:
-        window = getattr(
-            self,
-            "live_inventory_v4_gradient_entry_tier_window",
-            None,
+        bidirectional = bool(
+            direction is not None
+            and getattr(self, "live_inventory_basis_v4_bidirectional", False)
+        )
+        window = (
+            getattr(
+                self,
+                "live_inventory_v4_gradient_entry_tier_windows_by_direction",
+                {},
+            ).get(direction)
+            if bidirectional
+            else getattr(
+                self,
+                "live_inventory_v4_gradient_entry_tier_window",
+                None,
+            )
         )
         if not isinstance(window, deque):
             window = deque(
@@ -6960,16 +7556,34 @@ class VariationalToLighterRuntime:
                     LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_WINDOW_SAMPLES
                 )
             )
-            self.live_inventory_v4_gradient_entry_tier_window = window
+            if bidirectional:
+                self.live_inventory_v4_gradient_entry_tier_windows_by_direction[
+                    str(direction)
+                ] = window
+            else:
+                self.live_inventory_v4_gradient_entry_tier_window = window
         window.append(max(0, int(raw_tier)))
         confirmed_tier = v4_real_gradient_confirmed_tier(
             window,
             latest_tier=raw_tier,
         )
-        states = getattr(self, "live_inventory_v4_gradient_tier_states", None)
+        states = (
+            getattr(
+                self,
+                "live_inventory_v4_gradient_tier_states_by_direction",
+                {},
+            ).get(direction)
+            if bidirectional
+            else getattr(self, "live_inventory_v4_gradient_tier_states", None)
+        )
         if not isinstance(states, dict):
             states = {}
-            self.live_inventory_v4_gradient_tier_states = states
+            if bidirectional:
+                self.live_inventory_v4_gradient_tier_states_by_direction[
+                    str(direction)
+                ] = states
+            else:
+                self.live_inventory_v4_gradient_tier_states = states
         active_tier = 0
         for tier, threshold in enumerate(thresholds_bps, start=1):
             state = states.setdefault(
@@ -6993,13 +7607,31 @@ class VariationalToLighterRuntime:
         tier: int | None,
         edge_bps: Decimal,
         thresholds_bps: list[Decimal],
+        direction: str | None = None,
     ) -> None:
         if tier is None or tier <= 0 or tier > len(thresholds_bps):
             return
-        states = getattr(self, "live_inventory_v4_gradient_tier_states", None)
+        bidirectional = bool(
+            direction is not None
+            and getattr(self, "live_inventory_basis_v4_bidirectional", False)
+        )
+        states = (
+            getattr(
+                self,
+                "live_inventory_v4_gradient_tier_states_by_direction",
+                {},
+            ).get(direction)
+            if bidirectional
+            else getattr(self, "live_inventory_v4_gradient_tier_states", None)
+        )
         if not isinstance(states, dict):
             states = {}
-            self.live_inventory_v4_gradient_tier_states = states
+            if bidirectional:
+                self.live_inventory_v4_gradient_tier_states_by_direction[
+                    str(direction)
+                ] = states
+            else:
+                self.live_inventory_v4_gradient_tier_states = states
         threshold = thresholds_bps[tier - 1]
         states[tier] = {
             "armed": False,
@@ -7012,11 +7644,13 @@ class VariationalToLighterRuntime:
         *,
         exit_reason: str,
         entry_threshold_bps: Decimal | None,
+        direction: str | None = None,
     ) -> None:
         self.live_inventory_v4_rearm_required = True
         self.live_inventory_v4_rearm_confirmation_count = 0
         self.live_inventory_v4_rearm_reason = exit_reason
         self.live_inventory_v4_rearm_threshold_bps = entry_threshold_bps
+        self.live_inventory_v4_rearm_direction = direction
         self.live_inventory_v4_last_exit_reason = exit_reason
         self.live_inventory_v4_last_exit_at = utc_now()
         self.live_inventory_v4_next_tranche_index = 1
@@ -7171,6 +7805,15 @@ class VariationalToLighterRuntime:
         strong_single_context = self.live_inventory_basis_v4_strong_single_context(
             effective_min_exit_pnl_bps=effective_min_exit_pnl_bps
         )
+        if (
+            getattr(self, "live_inventory_basis_v4_bidirectional", False)
+            and direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+        ):
+            strong_single_context = {
+                **strong_single_context,
+                "enabled": False,
+                "disabled_reason": "reverse_direction_requires_two_of_three",
+            }
         strong_single_threshold_bps = strong_single_context["threshold_bps"]
         strong_stability_values = [
             value
@@ -8298,14 +8941,30 @@ class VariationalToLighterRuntime:
             payload.get("variational_filled_at"),
             payload.get("lighter_filled_at"),
         ))
+        direction = str(pending.get("direction") or "")
         if estimated_pnl_bps is not None and actual_pnl_bps is not None:
             if not hasattr(self, "live_inventory_exit_estimate_shortfall_bps_samples"):
                 self.live_inventory_exit_estimate_shortfall_bps_samples = deque(maxlen=20)
             shortfall_bps = estimated_pnl_bps - actual_pnl_bps
-            self.live_inventory_exit_estimate_shortfall_bps_samples.append(
-                max(shortfall_bps, Decimal("0"))
+            observed_shortfall_bps = max(shortfall_bps, Decimal("0"))
+            direction_samples = getattr(
+                self,
+                "live_inventory_exit_shortfall_bps_samples_by_direction",
+                {},
             )
-            if pending.get("exit_confirmation_mode") == "strong_single":
+            if direction in direction_samples:
+                direction_samples[direction].append(observed_shortfall_bps)
+            if (
+                not getattr(self, "live_inventory_basis_v4_bidirectional", False)
+                or direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
+            ):
+                self.live_inventory_exit_estimate_shortfall_bps_samples.append(
+                    observed_shortfall_bps
+                )
+            if (
+                direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
+                and pending.get("exit_confirmation_mode") == "strong_single"
+            ):
                 if not hasattr(
                     self,
                     "live_inventory_strong_single_shortfall_bps_samples",
@@ -8314,9 +8973,8 @@ class VariationalToLighterRuntime:
                         deque(maxlen=20)
                     )
                 self.live_inventory_strong_single_shortfall_bps_samples.append(
-                    max(shortfall_bps, Decimal("0"))
+                    observed_shortfall_bps
                 )
-        direction = str(pending.get("direction") or "")
         if actual_pnl_bps is not None and direction in getattr(self, "live_inventory_actual_pnl_bps_by_direction", {}):
             self.live_inventory_actual_pnl_bps_by_direction[direction].append(actual_pnl_bps)
         latency_ms = to_decimal(var_fill_to_lighter_fill_ms)
@@ -8960,9 +9618,24 @@ class VariationalToLighterRuntime:
             and var_roundtrip_qty_match
             and lighter_roundtrip_qty_match
         ):
-            self.live_inventory_execution_loss_bps_samples.append(
-                max(entry_edge_capture_loss_bps, Decimal("0"))
+            observed_capture_loss_bps = max(
+                entry_edge_capture_loss_bps,
+                Decimal("0"),
             )
+            direction_samples = getattr(
+                self,
+                "live_inventory_execution_loss_bps_samples_by_direction",
+                {},
+            )
+            if direction in direction_samples:
+                direction_samples[direction].append(observed_capture_loss_bps)
+            if (
+                not getattr(self, "live_inventory_basis_v4_bidirectional", False)
+                or direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
+            ):
+                self.live_inventory_execution_loss_bps_samples.append(
+                    observed_capture_loss_bps
+                )
         pending["final_pnl_emitted"] = True
         final_pnl_payload = {
                 **pending,
@@ -11854,6 +12527,7 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_v4_shadow_gradient",
             "live_inventory_basis_v4_real_gradient",
             "live_inventory_basis_v4_reverse_test",
+            "live_inventory_basis_v4_bidirectional",
             "live_inventory_basis_v4_continuous",
             "live_inventory_basis_v4_max_run_loss_usd",
             "live_inventory_basis_v4_cycle_cooldown_seconds",
@@ -11950,7 +12624,12 @@ class VariationalToLighterRuntime:
                         self.live_inventory_basis_v4_test_allow_weekend
                     ),
                     "entry_direction": self.live_inventory_basis_v4_entry_direction(),
+                    "entry_directions": list(
+                        self.live_inventory_basis_v4_entry_directions()
+                    ),
                     "reverse_test": self.live_inventory_basis_v4_reverse_test,
+                    "bidirectional": self.live_inventory_basis_v4_bidirectional,
+                    "direction_lock": "one_direction_until_fully_flat",
                     "entry_submit_mode": "concurrent",
                     "exit_submit_mode": "concurrent",
                     "exit_fast_refresh_attempts": (
@@ -13784,21 +14463,29 @@ class VariationalToLighterRuntime:
             var_price=var_bid,
             lighter_price=lighter_buy_price,
         ) or Decimal("0")
+        v4_signal_edges = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: long_edge_bps,
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: short_edge_bps,
+        }
+        v4_entry_directions = self.live_inventory_basis_v4_entry_directions()
         v4_entry_direction = self.live_inventory_basis_v4_entry_direction()
-        v4_signal_edge_bps = (
-            long_edge_bps
-            if v4_entry_direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
-            else short_edge_bps
-        )
+        open_directions = {
+            str(lot.get("direction") or "")
+            for lot in self.live_inventory_open_lots
+        }
+        if len(open_directions) == 1:
+            open_direction = next(iter(open_directions))
+            if open_direction in v4_entry_directions:
+                v4_entry_direction = open_direction
+        v4_signal_edge_bps = v4_signal_edges[v4_entry_direction]
         v4_now = datetime.now(timezone.utc).timestamp()
         v4_entry_threshold_bps = None
         v4_entry_context: dict[str, Any] = {}
+        v4_entry_thresholds: dict[str, Decimal | None] = {}
+        v4_entry_contexts: dict[str, dict[str, Any]] = {}
         v4_rearm_context: dict[str, Any] = {}
         v4_baseline_sample_due = False
         if v4_mode:
-            v4_entry_threshold_bps, v4_entry_context = (
-                self.live_inventory_basis_v4_entry_threshold(now=v4_now)
-            )
             # The Robinhood-chain collector is a separate research process.
             # Live trading never reads its files or waits for its health path.
             robinhood_context = {
@@ -13807,28 +14494,99 @@ class VariationalToLighterRuntime:
                 "v4_robinhood_threshold_penalty_bps": "0",
                 "v4_robinhood_policy": "independent_observation_only",
             }
-            v4_entry_context = {**v4_entry_context, **robinhood_context}
-            if v4_entry_threshold_bps is not None:
-                self.live_inventory_basis_v4_history_ready = True
-                self.live_inventory_basis_v4_history_reason = "ready"
-            else:
-                self.live_inventory_basis_v4_history_ready = False
-                self.live_inventory_basis_v4_history_reason = (
-                    "insufficient_rolling_7d_anchor"
-                    if not v4_entry_context.get("v4_anchor_ready")
+            for direction in v4_entry_directions:
+                threshold, context = self.live_inventory_basis_v4_entry_threshold(
+                    now=v4_now,
+                    direction=(
+                        direction
+                        if self.live_inventory_basis_v4_bidirectional
+                        else None
+                    ),
+                )
+                context = {**context, **robinhood_context}
+                v4_entry_thresholds[direction] = threshold
+                v4_entry_contexts[direction] = context
+                ready = threshold is not None
+                reason = (
+                    "ready"
+                    if ready
+                    else "insufficient_rolling_7d_anchor"
+                    if not context.get("v4_anchor_ready")
                     else "recent_1h_health_not_ready"
                 )
-            v4_baseline_sample_due = self.record_live_inventory_basis_v4_edge(
-                now=v4_now,
-                short_edge_bps=v4_signal_edge_bps,
+                if self.live_inventory_basis_v4_bidirectional:
+                    self.live_inventory_basis_v4_history_ready_by_direction[
+                        direction
+                    ] = ready
+                    self.live_inventory_basis_v4_history_reason_by_direction[
+                        direction
+                    ] = reason
+                if self.record_live_inventory_basis_v4_edge(
+                    now=v4_now,
+                    direction=(
+                        direction
+                        if self.live_inventory_basis_v4_bidirectional
+                        else None
+                    ),
+                    edge_bps=v4_signal_edges[direction],
+                ):
+                    v4_baseline_sample_due = True
+
+            v4_entry_direction = (
+                self.live_inventory_basis_v4_select_entry_direction(
+                    signal_edges=v4_signal_edges,
+                    thresholds=v4_entry_thresholds,
+                )
+            )
+            v4_signal_edge_bps = v4_signal_edges[v4_entry_direction]
+            v4_entry_threshold_bps = v4_entry_thresholds.get(
+                v4_entry_direction
+            )
+            v4_entry_context = dict(
+                v4_entry_contexts.get(v4_entry_direction, {})
+            )
+            self.live_inventory_basis_v4_history_ready = bool(
+                v4_entry_threshold_bps is not None
+            )
+            self.live_inventory_basis_v4_history_reason = (
+                self.live_inventory_basis_v4_history_reason_by_direction.get(
+                    v4_entry_direction,
+                    "not_loaded",
+                )
+                if self.live_inventory_basis_v4_bidirectional
+                else "ready"
+                if v4_entry_threshold_bps is not None
+                else "insufficient_rolling_7d_anchor"
+                if not v4_entry_context.get("v4_anchor_ready")
+                else "recent_1h_health_not_ready"
+            )
+            rearm_direction = (
+                self.live_inventory_v4_rearm_direction
+                if self.live_inventory_v4_rearm_direction in v4_entry_directions
+                else v4_entry_direction
             )
             rearmed, v4_rearm_context = (
                 self.live_inventory_basis_v4_update_rearm(
-                    short_edge_bps=v4_signal_edge_bps,
-                    entry_threshold_bps=v4_entry_threshold_bps,
+                    short_edge_bps=v4_signal_edges[rearm_direction],
+                    entry_threshold_bps=v4_entry_thresholds.get(
+                        rearm_direction
+                    ),
+                    direction=rearm_direction,
                 )
             )
-            v4_entry_context = {**v4_entry_context, **v4_rearm_context}
+            v4_entry_context = {
+                **v4_entry_context,
+                "v4_bidirectional": self.live_inventory_basis_v4_bidirectional,
+                "v4_direction_thresholds_bps": {
+                    direction: decimal_to_str(threshold)
+                    for direction, threshold in v4_entry_thresholds.items()
+                },
+                "v4_direction_edges_bps": {
+                    direction: decimal_to_str(v4_signal_edges[direction])
+                    for direction in v4_entry_directions
+                },
+                **v4_rearm_context,
+            }
             if rearmed:
                 await self.append_live_inventory_log(
                     "live_inventory_v4_episode_rearmed",
@@ -13998,36 +14756,56 @@ class VariationalToLighterRuntime:
                 else None
             ),
         )
-        real_gradient_thresholds = [
-            value
-            for value in (
-                to_decimal(item)
-                for item in list(
-                    v4_entry_context.get(
-                        "v4_real_gradient_tier_thresholds_bps"
+        real_gradient_thresholds_by_direction: dict[str, list[Decimal]] = {}
+        raw_real_gradient_tiers: dict[str, int] = {}
+        real_gradient_tiers: dict[str, int] = {}
+        for direction in v4_entry_directions:
+            thresholds = [
+                value
+                for value in (
+                    to_decimal(item)
+                    for item in list(
+                        v4_entry_contexts.get(direction, {}).get(
+                            "v4_real_gradient_tier_thresholds_bps"
+                        )
+                        or []
                     )
-                    or []
                 )
+                if value is not None
+            ]
+            real_gradient_thresholds_by_direction[direction] = thresholds
+            raw_tier = (
+                v4_real_gradient_eligible_tier(
+                    v4_signal_edges[direction],
+                    thresholds,
+                )
+                if self.live_inventory_basis_v4_real_gradient
+                else 0
             )
-            if value is not None
-        ]
-        raw_real_gradient_tier = (
-            v4_real_gradient_eligible_tier(
-                short_edge_bps,
-                real_gradient_thresholds,
+            raw_real_gradient_tiers[direction] = raw_tier
+            real_gradient_tiers[direction] = (
+                self.live_inventory_basis_v4_active_gradient_tier(
+                    raw_tier=raw_tier,
+                    edge_bps=v4_signal_edges[direction],
+                    thresholds_bps=thresholds,
+                    direction=(
+                        direction
+                        if self.live_inventory_basis_v4_bidirectional
+                        else None
+                    ),
+                )
+                if self.live_inventory_basis_v4_real_gradient
+                else 0
             )
-            if self.live_inventory_basis_v4_real_gradient
-            else 0
+        real_gradient_thresholds = real_gradient_thresholds_by_direction.get(
+            v4_entry_direction,
+            [],
         )
-        real_gradient_tier = (
-            self.live_inventory_basis_v4_active_gradient_tier(
-                raw_tier=raw_real_gradient_tier,
-                edge_bps=short_edge_bps,
-                thresholds_bps=real_gradient_thresholds,
-            )
-            if self.live_inventory_basis_v4_real_gradient
-            else 0
+        raw_real_gradient_tier = raw_real_gradient_tiers.get(
+            v4_entry_direction,
+            0,
         )
+        real_gradient_tier = real_gradient_tiers.get(v4_entry_direction, 0)
         variational_rate = self.live_inventory_order_limiter(
             "variational"
         ).snapshot()
@@ -14226,8 +15004,8 @@ class VariationalToLighterRuntime:
                         )
                     )
                     if (
-                        existing_direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
-                        and real_gradient_tier > 0
+                        existing_direction in v4_entry_directions
+                        and real_gradient_tiers.get(existing_direction, 0) > 0
                         and prior_entries_confirmed
                     ):
                         addon_direction = existing_direction
@@ -14338,6 +15116,22 @@ class VariationalToLighterRuntime:
                         continue
                 if v4_mode and direction != v4_entry_direction:
                     continue
+                if v4_mode and self.live_inventory_basis_v4_bidirectional:
+                    direction_paused, direction_context = (
+                        self.live_inventory_direction_paused(direction)
+                    )
+                    if direction_paused:
+                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                        if index == 1 or index % 30 == 0:
+                            await self.append_live_inventory_log(
+                                "live_inventory_v4_entry_blocked",
+                                {
+                                    **state_payload,
+                                    "reason": "v4_direction_paused_negative_recent_pnl",
+                                    **direction_context,
+                                },
+                            )
+                        continue
                 is_negative_direction, negative_entry_penalty_bps, negative_abs_penalty_bps, negative_context = self.live_inventory_negative_direction_penalties(direction)
                 if (
                     not calibration_mode
@@ -15857,7 +16651,9 @@ class VariationalToLighterRuntime:
                 return
         dynamic_exit_buffer_bps = self.live_inventory_dynamic_exit_buffer_bps()
         v4_exit_calibration_payload = (
-            self.live_inventory_basis_v4_exit_calibration_payload()
+            self.live_inventory_basis_v4_exit_calibration_payload(
+                direction=v4_entry_direction
+            )
         )
         v4_exit_shortfall_reserve_bps = to_decimal(
             v4_exit_calibration_payload["v4_exit_shortfall_reserve_bps"]
@@ -17347,8 +18143,13 @@ class VariationalToLighterRuntime:
         if self.live_inventory_basis_v4_real_gradient:
             self.mark_live_inventory_gradient_tier_closed(
                 tier=closed_gradient_tier,
-                edge_bps=short_edge_bps,
+                edge_bps=v4_signal_edges.get(direction, short_edge_bps),
                 thresholds_bps=real_gradient_thresholds,
+                direction=(
+                    direction
+                    if self.live_inventory_basis_v4_bidirectional
+                    else None
+                ),
             )
             tier_confirmations = getattr(
                 self,
@@ -17394,6 +18195,7 @@ class VariationalToLighterRuntime:
             self.require_live_inventory_basis_v4_rearm(
                 exit_reason=exit_reason,
                 entry_threshold_bps=v4_entry_threshold_bps,
+                direction=direction,
             )
         if calibration_mode:
             self.live_inventory_calibration_last_exit_sample_index = index
@@ -20304,6 +21106,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--live-inventory-basis-v4-bidirectional",
+        action="store_true",
+        help=(
+            "Continuously evaluate both V4 directions while flat. Once an "
+            "episode opens, lock all add-ons to that direction until flat."
+        ),
+    )
+    parser.add_argument(
         "--live-inventory-basis-v4-continuous",
         action="store_true",
         help=(
@@ -20872,6 +21682,18 @@ def parse_args() -> argparse.Namespace:
                     parser.error(
                         "basis V4 reverse test requires one cycle and one total lot"
                     )
+            if args.live_inventory_basis_v4_bidirectional:
+                if args.live_inventory_basis_v4_reverse_test:
+                    parser.error(
+                        "basis V4 bidirectional mode cannot use reverse-test mode"
+                    )
+                if not (
+                    args.live_inventory_basis_v4_real_gradient
+                    and args.live_inventory_basis_v4_continuous
+                ):
+                    parser.error(
+                        "basis V4 bidirectional mode requires real-gradient continuous mode"
+                    )
             if (
                 (
                     args.live_inventory_max_cycles > 1
@@ -20936,6 +21758,10 @@ def parse_args() -> argparse.Namespace:
         elif args.live_inventory_basis_v4_reverse_test:
             parser.error(
                 "--live-inventory-basis-v4-reverse-test requires a V4 profile"
+            )
+        elif args.live_inventory_basis_v4_bidirectional:
+            parser.error(
+                "--live-inventory-basis-v4-bidirectional requires a V4 profile"
             )
         elif args.live_inventory_basis_v4_continuous:
             parser.error(

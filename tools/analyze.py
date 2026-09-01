@@ -615,6 +615,11 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         ),
         "entry_direction": latest_state.get("v4_entry_direction")
         or "short_var_long_lighter",
+        "bidirectional": bool(latest_state.get("v4_bidirectional")),
+        "direction_edges_bps": latest_state.get("v4_direction_edges_bps"),
+        "direction_thresholds_bps": latest_state.get(
+            "v4_direction_thresholds_bps"
+        ),
         "latest_edge_bps": latest_state.get("v4_signal_edge_bps")
         if latest_state.get("v4_signal_edge_bps") is not None
         else latest_state.get("short_edge_bps"),
@@ -759,6 +764,7 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
     print(
         f"latest_edge_bps={funnel['latest_edge_bps']} "
         f"entry_direction={funnel['entry_direction']} "
+        f"bidirectional={funnel['bidirectional']} "
         f"latest_raw_threshold_bps={funnel['latest_raw_threshold_bps']} "
         f"entry_execution_reserve_bps={funnel['latest_entry_execution_reserve_bps']} "
         f"latest_threshold_bps={funnel['latest_threshold_bps']} "
@@ -772,6 +778,11 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"health_max_gap_seconds={funnel['health_max_gap_seconds']} "
         f"status={funnel['status']}"
     )
+    if funnel["bidirectional"]:
+        print(
+            f"direction_edges_bps={funnel['direction_edges_bps']} "
+            f"direction_thresholds_bps={funnel['direction_thresholds_bps']}"
+        )
     print(
         f"multi_window_7d_p97_5={funnel['seven_day_threshold_bps']} "
         f"fast_1d_p95={funnel['fast_threshold_bps']} "

@@ -466,6 +466,7 @@ def build_main_command(
     v4_shadow_gradient: bool = False,
     v4_real_gradient: bool = False,
     v4_reverse_test: bool = False,
+    v4_bidirectional: bool = False,
     v4_continuous: bool = False,
     close_open_position: bool = False,
     resume_open_position: bool = False,
@@ -664,6 +665,9 @@ def build_main_command(
             command.append("--live-inventory-basis-v4-real-gradient")
         if v4_reverse_test:
             command.append("--live-inventory-basis-v4-reverse-test")
+        if v4_bidirectional:
+            command.append("--live-inventory-basis-v4-bidirectional")
+            command.append("--live-inventory-basis-disable-negative-direction")
         if v4_continuous:
             command.append("--live-inventory-basis-v4-continuous")
     elif reversion_mode:
@@ -784,6 +788,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--v4-bidirectional",
+        action="store_true",
+        help=(
+            "Enable continuous two-way V4 opportunity selection. Each open "
+            "episode remains locked to one direction until both venues are flat."
+        ),
+    )
+    parser.add_argument(
         "--v4-continuous",
         action="store_true",
         help=(
@@ -870,6 +882,8 @@ def main() -> int:
             or args.close_open_position
             or args.v4_shadow_gradient
             or args.v4_real_gradient
+            or args.v4_reverse_test
+            or args.v4_bidirectional
             or args.v4_continuous
         )
         if incompatible:
@@ -988,6 +1002,14 @@ def main() -> int:
         parser.error(
             "--v4-reverse-test cannot be combined with gradient, shadow, or continuous mode"
         )
+    if args.v4_bidirectional and args.v4_reverse_test:
+        parser.error("--v4-bidirectional cannot be combined with --v4-reverse-test")
+    if args.v4_bidirectional and not (
+        config.v4_live_mode and args.v4_real_gradient and args.v4_continuous
+    ):
+        parser.error(
+            "--v4-bidirectional requires --v4-live --v4-real-gradient --v4-continuous"
+        )
     if args.v4_continuous and not (
         config.v4_live_mode and args.v4_real_gradient
     ):
@@ -1059,6 +1081,7 @@ def main() -> int:
             v4_shadow_gradient=args.v4_shadow_gradient,
             v4_real_gradient=args.v4_real_gradient,
             v4_reverse_test=args.v4_reverse_test,
+            v4_bidirectional=args.v4_bidirectional,
             v4_continuous=args.v4_continuous,
             close_open_position=args.close_open_position,
             resume_open_position=args.resume_open_position,
