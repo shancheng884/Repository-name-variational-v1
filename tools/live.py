@@ -465,6 +465,7 @@ def build_main_command(
     v4_test_allow_weekend: bool = False,
     v4_shadow_gradient: bool = False,
     v4_real_gradient: bool = False,
+    v4_reverse_test: bool = False,
     v4_continuous: bool = False,
     close_open_position: bool = False,
     resume_open_position: bool = False,
@@ -661,6 +662,8 @@ def build_main_command(
             command.append("--live-inventory-basis-v4-shadow-gradient")
         if v4_real_gradient:
             command.append("--live-inventory-basis-v4-real-gradient")
+        if v4_reverse_test:
+            command.append("--live-inventory-basis-v4-reverse-test")
         if v4_continuous:
             command.append("--live-inventory-basis-v4-continuous")
     elif reversion_mode:
@@ -771,6 +774,14 @@ def main() -> int:
         "--v4-real-gradient",
         action="store_true",
         help="Enable five dynamic V4 leverage tiers using confirmed 20 USD child orders.",
+    )
+    parser.add_argument(
+        "--v4-reverse-test",
+        action="store_true",
+        help=(
+            "Run one bounded 20 USD long-Variational/short-Lighter V4 test. "
+            "Cannot be combined with gradient or continuous mode."
+        ),
     )
     parser.add_argument(
         "--v4-continuous",
@@ -969,6 +980,14 @@ def main() -> int:
         parser.error("--v4-real-gradient requires --v4-live")
     if args.v4_real_gradient and args.v4_shadow_gradient:
         parser.error("use only one of --v4-real-gradient or --v4-shadow-gradient")
+    if args.v4_reverse_test and not config.v4_live_mode:
+        parser.error("--v4-reverse-test requires --v4-live")
+    if args.v4_reverse_test and (
+        args.v4_real_gradient or args.v4_shadow_gradient or args.v4_continuous
+    ):
+        parser.error(
+            "--v4-reverse-test cannot be combined with gradient, shadow, or continuous mode"
+        )
     if args.v4_continuous and not (
         config.v4_live_mode and args.v4_real_gradient
     ):
@@ -1039,6 +1058,7 @@ def main() -> int:
             v4_test_allow_weekend=args.v4_test_allow_weekend,
             v4_shadow_gradient=args.v4_shadow_gradient,
             v4_real_gradient=args.v4_real_gradient,
+            v4_reverse_test=args.v4_reverse_test,
             v4_continuous=args.v4_continuous,
             close_open_position=args.close_open_position,
             resume_open_position=args.resume_open_position,

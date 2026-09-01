@@ -89,7 +89,11 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     ]
     threshold_crossings = 0
     for row in state_rows:
-        edge = to_decimal(row.get("short_edge_bps"))
+        edge = to_decimal(
+            row.get("v4_signal_edge_bps")
+            if row.get("v4_signal_edge_bps") is not None
+            else row.get("short_edge_bps")
+        )
         threshold = to_decimal(row.get("v4_entry_threshold_bps"))
         if edge is not None and threshold is not None and edge > threshold:
             threshold_crossings += 1
@@ -609,7 +613,11 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
             exit_calibration.get("effective_min_exit_pnl_bps")
             or exit_calibration.get("quoted_exit_target_bps")
         ),
-        "latest_edge_bps": latest_state.get("short_edge_bps"),
+        "entry_direction": latest_state.get("v4_entry_direction")
+        or "short_var_long_lighter",
+        "latest_edge_bps": latest_state.get("v4_signal_edge_bps")
+        if latest_state.get("v4_signal_edge_bps") is not None
+        else latest_state.get("short_edge_bps"),
         "latest_raw_threshold_bps": latest_state.get(
             "v4_raw_entry_threshold_bps"
         ),
@@ -750,6 +758,7 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         )
     print(
         f"latest_edge_bps={funnel['latest_edge_bps']} "
+        f"entry_direction={funnel['entry_direction']} "
         f"latest_raw_threshold_bps={funnel['latest_raw_threshold_bps']} "
         f"entry_execution_reserve_bps={funnel['latest_entry_execution_reserve_bps']} "
         f"latest_threshold_bps={funnel['latest_threshold_bps']} "

@@ -80,6 +80,29 @@ def test_v4_live_funnel_flags_incompatible_immediate_arb_floor() -> None:
     assert funnel["status"] == "ERROR_V4_IMMEDIATE_ARB_FLOOR_APPLIED"
 
 
+def test_v4_live_funnel_uses_reverse_test_signal_edge() -> None:
+    funnel = build_v4_live_funnel(
+        [
+            {
+                "run_id": "live-v4-reverse",
+                "strategy_version": "basis-v4-live-test-v14",
+                "event": "live_inventory_basis_state",
+                "asset": "ETH",
+                "short_edge_bps": "-6",
+                "long_edge_bps": "5",
+                "v4_entry_direction": "long_var_short_lighter",
+                "v4_signal_edge_bps": "5",
+                "v4_entry_threshold_bps": "4",
+            }
+        ]
+    )
+
+    assert funnel is not None
+    assert funnel["entry_direction"] == "long_var_short_lighter"
+    assert funnel["latest_edge_bps"] == "5"
+    assert funnel["threshold_crossings"] == 1
+
+
 def test_v4_live_funnel_reports_shadow_gradient_result() -> None:
     common = {
         "run_id": "live-v4-shadow-gradient",

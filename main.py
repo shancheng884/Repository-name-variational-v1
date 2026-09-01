@@ -1905,6 +1905,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_real_gradient = bool(
             args.live_inventory_basis_v4_real_gradient
         )
+        self.live_inventory_basis_v4_reverse_test = bool(
+            args.live_inventory_basis_v4_reverse_test
+        )
         self.live_inventory_basis_v4_max_run_loss_usd = Decimal(
             str(args.live_inventory_basis_v4_max_run_loss_usd)
         )
@@ -2140,6 +2143,8 @@ class VariationalToLighterRuntime:
             )
         if self.live_inventory_basis_v4_real_gradient:
             self.live_inventory_strategy_variant += "-real-gradient-5-tier-20usd"
+        if self.live_inventory_basis_v4_reverse_test:
+            self.live_inventory_strategy_variant += "-reverse-bounded-20usd"
         strategy_config = {
             key: str(value)
             for key, value in vars(args).items()
@@ -2506,9 +2511,12 @@ class VariationalToLighterRuntime:
         }
 
     def live_inventory_basis_v4_entry_execution_reserve_bps(self) -> Decimal:
-        return self.live_inventory_basis_v4_entry_calibration_context()[
+        reserve = self.live_inventory_basis_v4_entry_calibration_context()[
             "applied_bps"
         ]
+        if getattr(self, "live_inventory_basis_v4_reverse_test", False):
+            return max(reserve, LIVE_INVENTORY_BASIS_V4_ENTRY_CAPTURE_PRIOR_BPS)
+        return reserve
 
     def load_recent_live_inventory_exit_shortfall_bps(self) -> None:
         orders_file = getattr(self, "orders_file", None)
@@ -2667,7 +2675,10 @@ class VariationalToLighterRuntime:
         }
 
     def live_inventory_basis_v4_exit_shortfall_reserve_bps(self) -> Decimal:
-        return self.live_inventory_basis_v4_exit_calibration_context()["reserve_bps"]
+        reserve = self.live_inventory_basis_v4_exit_calibration_context()["reserve_bps"]
+        if getattr(self, "live_inventory_basis_v4_reverse_test", False):
+            return max(reserve, LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS)
+        return reserve
 
     def live_inventory_basis_v4_effective_exit_target_bps(self) -> Decimal:
         return (
@@ -2826,6 +2837,11 @@ class VariationalToLighterRuntime:
         if direction == DIRECTION_SHORT_VAR_LONG_LIGHTER and self.live_inventory_basis_short_min_entry_edge_bps > 0:
             return self.live_inventory_basis_short_min_entry_edge_bps
         return self.live_inventory_basis_min_entry_edge_bps
+
+    def live_inventory_basis_v4_entry_direction(self) -> str:
+        if getattr(self, "live_inventory_basis_v4_reverse_test", False):
+            return DIRECTION_LONG_VAR_SHORT_LIGHTER
+        return DIRECTION_SHORT_VAR_LONG_LIGHTER
 
     def live_inventory_calibration_direction_for_cycle(self) -> str:
         configured = getattr(self, "live_inventory_calibration_direction", "alternate")
@@ -6474,6 +6490,12 @@ class VariationalToLighterRuntime:
         now = datetime.now(timezone.utc).timestamp()
         cutoff = now - LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS
         next_sample_at = cutoff
+        entry_direction = self.live_inventory_basis_v4_entry_direction()
+        edge_key = (
+            "long_edge_bps"
+            if entry_direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+            else "short_edge_bps"
+        )
         source_rows = read_basis_samples(
             self.output_dir / "basis_samples",
             limit=100000,
@@ -6483,7 +6505,7 @@ class VariationalToLighterRuntime:
         )
         for row in source_rows:
             logged_at = self._parse_iso_ts(str(row.get("logged_at") or ""))
-            edge_bps = to_decimal(row.get("short_edge_bps"))
+            edge_bps = to_decimal(row.get(edge_key))
             if logged_at is None or edge_bps is None:
                 continue
             timestamp = logged_at.timestamp()
@@ -6519,6 +6541,8 @@ class VariationalToLighterRuntime:
         )
         return {
             "profile": self.live_inventory_basis_v4_profile,
+            "entry_direction": entry_direction,
+            "entry_edge_key": edge_key,
             "asset": asset,
             "source_rows": len(source_rows),
             "history_samples": len(self.live_inventory_basis_v4_history),
@@ -11515,7 +11539,11 @@ class VariationalToLighterRuntime:
     def should_log_live_inventory_basis_state(self, payload: dict[str, Any]) -> bool:
         if not getattr(self, "live_inventory_basis_v4_mode", False):
             return True
-        edge = to_decimal(payload.get("short_edge_bps"))
+        edge = to_decimal(
+            payload.get("v4_signal_edge_bps")
+            if payload.get("v4_signal_edge_bps") is not None
+            else payload.get("short_edge_bps")
+        )
         threshold = to_decimal(payload.get("v4_entry_threshold_bps"))
         crossing = bool(
             edge is not None and threshold is not None and edge >= threshold
@@ -11825,6 +11853,7 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_v4_test_allow_weekend",
             "live_inventory_basis_v4_shadow_gradient",
             "live_inventory_basis_v4_real_gradient",
+            "live_inventory_basis_v4_reverse_test",
             "live_inventory_basis_v4_continuous",
             "live_inventory_basis_v4_max_run_loss_usd",
             "live_inventory_basis_v4_cycle_cooldown_seconds",
@@ -11920,7 +11949,8 @@ class VariationalToLighterRuntime:
                     "test_allow_weekend": (
                         self.live_inventory_basis_v4_test_allow_weekend
                     ),
-                    "entry_direction": DIRECTION_SHORT_VAR_LONG_LIGHTER,
+                    "entry_direction": self.live_inventory_basis_v4_entry_direction(),
+                    "reverse_test": self.live_inventory_basis_v4_reverse_test,
                     "entry_submit_mode": "concurrent",
                     "exit_submit_mode": "concurrent",
                     "exit_fast_refresh_attempts": (
@@ -13754,6 +13784,12 @@ class VariationalToLighterRuntime:
             var_price=var_bid,
             lighter_price=lighter_buy_price,
         ) or Decimal("0")
+        v4_entry_direction = self.live_inventory_basis_v4_entry_direction()
+        v4_signal_edge_bps = (
+            long_edge_bps
+            if v4_entry_direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+            else short_edge_bps
+        )
         v4_now = datetime.now(timezone.utc).timestamp()
         v4_entry_threshold_bps = None
         v4_entry_context: dict[str, Any] = {}
@@ -13784,11 +13820,11 @@ class VariationalToLighterRuntime:
                 )
             v4_baseline_sample_due = self.record_live_inventory_basis_v4_edge(
                 now=v4_now,
-                short_edge_bps=short_edge_bps,
+                short_edge_bps=v4_signal_edge_bps,
             )
             rearmed, v4_rearm_context = (
                 self.live_inventory_basis_v4_update_rearm(
-                    short_edge_bps=short_edge_bps,
+                    short_edge_bps=v4_signal_edge_bps,
                     entry_threshold_bps=v4_entry_threshold_bps,
                 )
             )
@@ -13800,6 +13836,9 @@ class VariationalToLighterRuntime:
                         "asset": asset,
                         "sample_index": index,
                         "short_edge_bps": decimal_to_str(short_edge_bps),
+                        "long_edge_bps": decimal_to_str(long_edge_bps),
+                        "v4_entry_direction": v4_entry_direction,
+                        "v4_signal_edge_bps": decimal_to_str(v4_signal_edge_bps),
                         "v4_entry_threshold_bps": decimal_to_str(
                             v4_entry_threshold_bps
                         ),
@@ -14025,6 +14064,8 @@ class VariationalToLighterRuntime:
             "warm": warm,
             "basis_reversion_enabled": self.live_inventory_basis_reversion_mode,
             "basis_v4_profile": getattr(self, "live_inventory_basis_v4_profile", "") or None,
+            "v4_entry_direction": v4_entry_direction if v4_mode else None,
+            "v4_signal_edge_bps": decimal_to_str(v4_signal_edge_bps) if v4_mode else None,
             **v4_entry_context,
             "basis_reversion_min_deviation_bps": decimal_to_str(self.live_inventory_basis_reversion_min_deviation_bps),
             "basis_reversion_exit_deviation_bps": decimal_to_str(self.live_inventory_basis_reversion_exit_deviation_bps),
@@ -14295,7 +14336,7 @@ class VariationalToLighterRuntime:
                     calibration_direction = self.live_inventory_calibration_direction_for_cycle()
                     if direction != calibration_direction:
                         continue
-                if v4_mode and direction != DIRECTION_SHORT_VAR_LONG_LIGHTER:
+                if v4_mode and direction != v4_entry_direction:
                     continue
                 is_negative_direction, negative_entry_penalty_bps, negative_abs_penalty_bps, negative_context = self.live_inventory_negative_direction_penalties(direction)
                 if (
@@ -14351,10 +14392,10 @@ class VariationalToLighterRuntime:
                                 },
                             )
                         continue
-                    direction_signal = short_edge_bps - v4_entry_threshold_bps
+                    direction_signal = edge_bps - v4_entry_threshold_bps
                     if self.live_inventory_basis_v4_real_gradient:
                         raw_real_gradient_tier = v4_real_gradient_eligible_tier(
-                            short_edge_bps,
+                            edge_bps,
                             real_gradient_thresholds,
                         )
                         if real_gradient_tier <= 0:
@@ -20255,6 +20296,14 @@ def parse_args() -> argparse.Namespace:
         help="Enable five dynamic leverage tiers using confirmed 20 USD child orders.",
     )
     parser.add_argument(
+        "--live-inventory-basis-v4-reverse-test",
+        action="store_true",
+        help=(
+            "Bounded one-lot test using long Variational / short Lighter. "
+            "Uses direction-specific history and conservative uncalibrated reserves."
+        ),
+    )
+    parser.add_argument(
         "--live-inventory-basis-v4-continuous",
         action="store_true",
         help=(
@@ -20806,6 +20855,23 @@ def parse_args() -> argparse.Namespace:
                 )
             if args.live_inventory_basis_v4_max_run_loss_usd < 0:
                 parser.error("basis V4 max run loss must be >= 0")
+            if args.live_inventory_basis_v4_reverse_test:
+                if (
+                    args.live_inventory_basis_v4_real_gradient
+                    or args.live_inventory_basis_v4_shadow_gradient
+                    or args.live_inventory_basis_v4_continuous
+                ):
+                    parser.error(
+                        "basis V4 reverse test cannot use gradient, shadow, or continuous mode"
+                    )
+                if (
+                    args.live_inventory_max_cycles != 1
+                    or args.live_inventory_max_lots != 1
+                    or args.live_inventory_max_total_lots != 1
+                ):
+                    parser.error(
+                        "basis V4 reverse test requires one cycle and one total lot"
+                    )
             if (
                 (
                     args.live_inventory_max_cycles > 1
@@ -20866,6 +20932,10 @@ def parse_args() -> argparse.Namespace:
         elif args.live_inventory_basis_v4_real_gradient:
             parser.error(
                 "--live-inventory-basis-v4-real-gradient requires a V4 profile"
+            )
+        elif args.live_inventory_basis_v4_reverse_test:
+            parser.error(
+                "--live-inventory-basis-v4-reverse-test requires a V4 profile"
             )
         elif args.live_inventory_basis_v4_continuous:
             parser.error(

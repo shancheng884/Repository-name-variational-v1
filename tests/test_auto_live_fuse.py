@@ -2000,6 +2000,30 @@ def test_v4_history_gap_preserves_rolling_anchor_before_recording() -> None:
     assert runtime.live_inventory_basis_v4_history_reason == "ready"
 
 
+def test_v4_reverse_test_selects_long_direction_and_conservative_reserves() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_reverse_test = True
+    runtime.live_inventory_basis_v4_entry_calibration_context = lambda: {
+        "applied_bps": Decimal("0.25")
+    }
+    runtime.live_inventory_basis_v4_exit_calibration_context = lambda: {
+        "reserve_bps": Decimal("0.50")
+    }
+
+    assert (
+        runtime.live_inventory_basis_v4_entry_direction()
+        == "long_var_short_lighter"
+    )
+    assert (
+        runtime.live_inventory_basis_v4_entry_execution_reserve_bps()
+        == Decimal("1.50")
+    )
+    assert (
+        runtime.live_inventory_basis_v4_exit_shortfall_reserve_bps()
+        == Decimal("3.50")
+    )
+
+
 def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.output_dir = Path(tmp_path)
