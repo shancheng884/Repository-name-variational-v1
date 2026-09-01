@@ -114,14 +114,14 @@ class BarkNotifier:
             "body": message[:1800],
             "group": self.group,
             "sound": self.sound,
-            "isArchive": 1,
+            "isArchive": "1",
         }
         if critical:
             payload.update(
                 {
                     "level": "critical",
-                    "volume": self.volume,
-                    "call": 1,
+                    "volume": str(self.volume),
+                    "call": "1",
                 }
             )
         try:

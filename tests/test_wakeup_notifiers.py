@@ -137,8 +137,9 @@ def test_bark_critical_push_uses_call_and_does_not_leak_key() -> None:
     assert url == "https://api.day.app/push"
     assert payload["device_key"] == "private-device-key"
     assert payload["level"] == "critical"
-    assert payload["call"] == 1
-    assert payload["volume"] == 10
+    assert payload["call"] == "1"
+    assert payload["volume"] == "10"
+    assert payload["isArchive"] == "1"
     assert "private-device-key" not in result.detail
 
 
