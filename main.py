@@ -16525,6 +16525,32 @@ class VariationalToLighterRuntime:
                 # executable profit, and the independent loss fuse are the only exits.
                 should_timeout = False
                 should_timeout_exit = False
+                if (
+                    not raw_should_exit
+                    and pnl_bps is not None
+                    and self.should_log_live_inventory_exit_blocked(
+                        lot_id=candidate_lot.get("lot_id"),
+                        reason="v4_executable_pnl_below_threshold",
+                    )
+                ):
+                    await self.append_live_inventory_log(
+                        "live_inventory_exit_blocked",
+                        {
+                            **state_payload,
+                            "lot_id": candidate_lot.get("lot_id"),
+                            "basis_trace_id": candidate_lot.get("basis_trace_id"),
+                            "direction": direction,
+                            "reason": "v4_executable_pnl_below_threshold",
+                            "holding_samples": holding_samples,
+                            "holding_seconds": holding_seconds,
+                            "pnl_bps": decimal_to_str(pnl_bps),
+                            "effective_min_exit_pnl_bps": decimal_to_str(
+                                effective_min_exit_pnl_bps
+                            ),
+                            "var_quote_age_ok": var_quote_age_ok,
+                            "lighter_book_age_ok": lighter_book_age_ok,
+                        },
+                    )
             if should_timeout and not should_timeout_exit:
                 last_warned = int(candidate_lot.get("max_hold_warned_samples") or 0)
                 if holding_samples > last_warned and self.should_log_live_inventory_exit_blocked(
