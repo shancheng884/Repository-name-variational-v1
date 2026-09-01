@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import stat
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 import requests
@@ -10,6 +14,16 @@ import requests
 
 PUSHOVER_MESSAGES_URL = "https://api.pushover.net/1/messages.json"
 PUSHOVER_RECEIPTS_URL = "https://api.pushover.net/1/receipts"
+DEFAULT_BARK_CONFIG_PATH = (
+    Path.home() / ".config" / "var-risk-alarm-a" / "bark.json"
+)
+DEFAULT_FEISHU_CONFIG_PATH = (
+    Path.home() / ".config" / "var-risk-alarm-a" / "feishu.json"
+)
+FEISHU_TOKEN_URL = (
+    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+)
+FEISHU_MESSAGES_URL = "https://open.feishu.cn/open-apis/im/v1/messages"
 
 
 @dataclass(frozen=True)
@@ -24,6 +38,250 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _read_private_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def private_config_error(path: Path) -> str | None:
+    if not path.exists():
+        return "missing"
+    if os.name == "nt":
+        return None
+    try:
+        permissions = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return "permissions_unavailable"
+    return "permissions_not_600" if permissions & 0o077 else None
+
+
+class BarkNotifier:
+    def __init__(
+        self,
+        *,
+        server: str,
+        key: str,
+        sound: str = "alarm",
+        volume: int = 10,
+        group: str = "Var-Lighter-Risk",
+        session: Any = requests,
+        config_path: Path | None = None,
+    ) -> None:
+        self.server = server.strip().rstrip("/")
+        self.key = key.strip()
+        self.sound = sound.strip() or "alarm"
+        self.volume = min(10, max(0, int(volume)))
+        self.group = group.strip() or "Var-Lighter-Risk"
+        self.session = session
+        self.config_path = config_path
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.server and self.key)
+
+    @classmethod
+    def from_config(cls, path: Path | None = None) -> "BarkNotifier":
+        config_path = path or Path(
+            os.getenv("BARK_CONFIG_FILE", str(DEFAULT_BARK_CONFIG_PATH))
+        ).expanduser()
+        body = _read_private_json(config_path)
+        return cls(
+            server=str(body.get("server") or body.get("base_url") or ""),
+            key=str(body.get("key") or body.get("device_key") or ""),
+            sound=str(body.get("sound") or "alarm"),
+            volume=int(body.get("volume") or 10),
+            group=str(body.get("group") or "Var-Lighter-Risk"),
+            config_path=config_path,
+        )
+
+    def send(
+        self,
+        *,
+        title: str,
+        message: str,
+        critical: bool,
+    ) -> NotificationResult:
+        if not self.enabled:
+            return NotificationResult(False, "bark_not_configured")
+        payload: dict[str, Any] = {
+            "device_key": self.key,
+            "title": title[:120],
+            "body": message[:1800],
+            "group": self.group,
+            "sound": self.sound,
+            "isArchive": 1,
+        }
+        if critical:
+            payload.update(
+                {
+                    "level": "critical",
+                    "volume": self.volume,
+                    "call": 1,
+                }
+            )
+        try:
+            response = self.session.post(
+                f"{self.server}/push",
+                json=payload,
+                timeout=(3.0, 8.0),
+            )
+        except Exception as exc:
+            return NotificationResult(
+                False,
+                f"bark_request_failed:{type(exc).__name__}",
+            )
+        if response.status_code != 200:
+            return NotificationResult(False, f"bark_http_{response.status_code}")
+        try:
+            body = response.json()
+        except Exception:
+            return NotificationResult(False, "bark_invalid_json")
+        if int(body.get("code") or 0) != 200:
+            return NotificationResult(False, "bark_api_rejected")
+        return NotificationResult(True, "sent")
+
+
+class FeishuUrgentNotifier:
+    def __init__(
+        self,
+        *,
+        app_id: str,
+        app_secret: str,
+        open_id: str,
+        session: Any = requests,
+        config_path: Path | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.app_id = app_id.strip()
+        self.app_secret = app_secret.strip()
+        self.open_id = open_id.strip()
+        self.session = session
+        self.config_path = config_path
+        self.monotonic = monotonic
+        self._token = ""
+        self._token_expires_at = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.app_id and self.app_secret and self.open_id)
+
+    @classmethod
+    def from_config(cls, path: Path | None = None) -> "FeishuUrgentNotifier":
+        config_path = path or Path(
+            os.getenv("FEISHU_CONFIG_FILE", str(DEFAULT_FEISHU_CONFIG_PATH))
+        ).expanduser()
+        body = _read_private_json(config_path)
+        return cls(
+            app_id=str(body.get("app_id") or ""),
+            app_secret=str(body.get("app_secret") or ""),
+            open_id=str(body.get("open_id") or ""),
+            config_path=config_path,
+        )
+
+    @staticmethod
+    def _body(response: Any, *, prefix: str) -> tuple[dict[str, Any] | None, str]:
+        if response.status_code != 200:
+            return None, f"{prefix}_http_{response.status_code}"
+        try:
+            body = response.json()
+        except Exception:
+            return None, f"{prefix}_invalid_json"
+        code = int(body.get("code") or 0)
+        if code != 0:
+            return None, f"{prefix}_api_{code}"
+        return body, "ok"
+
+    def _tenant_token(self) -> tuple[str | None, str]:
+        if self._token and self.monotonic() < self._token_expires_at:
+            return self._token, "cached"
+        try:
+            response = self.session.post(
+                FEISHU_TOKEN_URL,
+                json={"app_id": self.app_id, "app_secret": self.app_secret},
+                timeout=(3.0, 8.0),
+            )
+        except Exception as exc:
+            return None, f"feishu_token_failed:{type(exc).__name__}"
+        body, detail = self._body(response, prefix="feishu_token")
+        if body is None:
+            return None, detail
+        token = str(body.get("tenant_access_token") or "").strip()
+        if not token:
+            return None, "feishu_token_missing"
+        try:
+            expires = int(body.get("expire") or 7200)
+        except (TypeError, ValueError):
+            expires = 7200
+        self._token = token
+        self._token_expires_at = self.monotonic() + max(60, expires - 60)
+        return token, "fetched"
+
+    def send_message(self, *, title: str, message: str) -> NotificationResult:
+        if not self.enabled:
+            return NotificationResult(False, "feishu_not_configured")
+        token, detail = self._tenant_token()
+        if not token:
+            return NotificationResult(False, detail)
+        text = f"{title}\n{message}"[:4000]
+        try:
+            response = self.session.post(
+                FEISHU_MESSAGES_URL,
+                params={"receive_id_type": "open_id"},
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "receive_id": self.open_id,
+                    "msg_type": "text",
+                    "content": json.dumps(
+                        {"text": text},
+                        ensure_ascii=False,
+                    ),
+                },
+                timeout=(3.0, 8.0),
+            )
+        except Exception as exc:
+            return NotificationResult(
+                False,
+                f"feishu_message_failed:{type(exc).__name__}",
+            )
+        body, detail = self._body(response, prefix="feishu_message")
+        if body is None:
+            return NotificationResult(False, detail)
+        message_id = str((body.get("data") or {}).get("message_id") or "").strip()
+        if not message_id:
+            return NotificationResult(False, "feishu_message_id_missing")
+        return NotificationResult(True, "sent", message_id)
+
+    def phone_urgent(self, message_id: str) -> NotificationResult:
+        if not self.enabled or not message_id:
+            return NotificationResult(False, "feishu_phone_unavailable")
+        token, detail = self._tenant_token()
+        if not token:
+            return NotificationResult(False, detail)
+        try:
+            response = self.session.patch(
+                f"{FEISHU_MESSAGES_URL}/{message_id}/urgent_phone",
+                params={"user_id_type": "open_id"},
+                headers={"Authorization": f"Bearer {token}"},
+                json={"user_id_list": [self.open_id]},
+                timeout=(3.0, 8.0),
+            )
+        except Exception as exc:
+            return NotificationResult(
+                False,
+                f"feishu_phone_failed:{type(exc).__name__}",
+            )
+        body, detail = self._body(response, prefix="feishu_phone")
+        if body is None:
+            return NotificationResult(False, detail)
+        invalid = (body.get("data") or {}).get("invalid_user_id_list") or []
+        if invalid:
+            return NotificationResult(False, "feishu_phone_invalid_receiver")
+        return NotificationResult(True, "sent")
 
 
 class PushoverNotifier:

@@ -11,7 +11,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, time as clock_time, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,7 +23,11 @@ if str(ROOT) not in sys.path:
 
 from tools.lib.runtime_files import read_json, write_json_atomic
 from tools.lib.telegram_notifier import TelegramNotifier
-from tools.lib.wakeup_notifiers import PushoverNotifier, TencentVoiceNotifier
+from tools.lib.wakeup_notifiers import (
+    BarkNotifier,
+    FeishuUrgentNotifier,
+    private_config_error,
+)
 
 
 STATE_PATH = ROOT / "log" / "live_inventory_state.json"
@@ -31,6 +35,7 @@ RISK_HEALTH_PATH = ROOT / "log" / "live_inventory_risk_health.json"
 ORDER_METRICS_PATH = ROOT / "log" / "order_metrics.jsonl"
 WATCHDOG_STATE_PATH = ROOT / "log" / "risk_wakeup_watchdog_state.json"
 WATCHDOG_HEALTH_PATH = ROOT / "log" / "risk_wakeup_watchdog_health.json"
+WATCHDOG_CONTROL_PATH = ROOT / "log" / "risk_wakeup_watchdog_control.json"
 
 
 CRITICAL_MANUAL_REVIEW_MARKERS = (
@@ -85,37 +90,6 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
-def parse_clock(value: str, default: clock_time) -> clock_time:
-    try:
-        hour, minute = value.strip().split(":", 1)
-        return clock_time(hour=int(hour), minute=int(minute))
-    except (AttributeError, TypeError, ValueError):
-        return default
-
-
-def beijing_timezone() -> timezone:
-    try:
-        from zoneinfo import ZoneInfo
-
-        return ZoneInfo("Asia/Shanghai")
-    except Exception:
-        return timezone(timedelta(hours=8), name="Asia/Shanghai")
-
-
-def is_night_window(
-    now: datetime,
-    *,
-    start: clock_time,
-    end: clock_time,
-) -> bool:
-    current = now.astimezone(beijing_timezone()).time().replace(tzinfo=None)
-    if start == end:
-        return True
-    if start < end:
-        return start <= current < end
-    return current >= start or current < end
-
-
 def process_is_strategy(pid: int | None) -> bool:
     if not pid or pid <= 0:
         return False
@@ -136,7 +110,7 @@ class Incident:
     severity: str
     title: str
     message: str
-    voice_params: tuple[str, ...]
+    alert_params: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -147,12 +121,9 @@ class WatchdogConfig:
     risk_heartbeat_max_age_seconds: float
     pending_action_max_age_seconds: float
     data_unavailable_critical_seconds: float
-    voice_escalation_seconds: float
-    voice_repeat_seconds: float
-    max_voice_calls_per_incident: int
-    voice_only_at_night: bool
-    night_start: clock_time
-    night_end: clock_time
+    max_phone_attempts_per_incident: int
+    monitor_strategy: bool = True
+    channel_retry_seconds: float = 10.0
 
     @classmethod
     def from_env(cls) -> "WatchdogConfig":
@@ -178,29 +149,17 @@ class WatchdogConfig:
                     300.0,
                 ),
             ),
-            voice_escalation_seconds=max(
-                0.0,
-                env_float("RISK_WAKEUP_VOICE_ESCALATION_SECONDS", 120.0),
-            ),
-            voice_repeat_seconds=max(
-                60.0,
-                env_float("RISK_WAKEUP_VOICE_REPEAT_SECONDS", 900.0),
-            ),
-            max_voice_calls_per_incident=max(
+            max_phone_attempts_per_incident=max(
                 1,
-                env_int("RISK_WAKEUP_MAX_VOICE_CALLS", 3),
+                env_int("RISK_WAKEUP_MAX_PHONE_ATTEMPTS", 3),
             ),
-            voice_only_at_night=env_bool(
-                "RISK_WAKEUP_VOICE_ONLY_AT_NIGHT",
-                True,
+            monitor_strategy=env_bool(
+                "RISK_WAKEUP_MONITOR_STRATEGY",
+                False,
             ),
-            night_start=parse_clock(
-                os.getenv("RISK_WAKEUP_NIGHT_START", "23:00"),
-                clock_time(23, 0),
-            ),
-            night_end=parse_clock(
-                os.getenv("RISK_WAKEUP_NIGHT_END", "08:00"),
-                clock_time(8, 0),
+            channel_retry_seconds=max(
+                5.0,
+                env_float("RISK_WAKEUP_CHANNEL_RETRY_SECONDS", 10.0),
             ),
         )
 
@@ -301,7 +260,7 @@ def evaluate_incidents(
                 severity="warning",
                 title="套利策略已停止",
                 message=f"{asset}：当前空仓，但主策略进程未运行。",
-                voice_params=(asset, "策略已停止"),
+                alert_params=(asset, "策略已停止"),
             )
         )
 
@@ -312,7 +271,7 @@ def evaluate_incidents(
                 severity="critical",
                 title="套利策略停止但仍有仓位",
                 message=f"{asset}：主策略已停止；{lot_text}。请立即检查双边仓位。",
-                voice_params=(asset, "策略停止且仍有仓位"),
+                alert_params=(asset, "策略停止且仍有仓位"),
             )
         )
 
@@ -326,7 +285,7 @@ def evaluate_incidents(
                 severity="critical" if critical else "warning",
                 title="套利账户需要人工核对",
                 message=f"{asset}：原因 {reason}；{lot_text}。",
-                voice_params=(asset, "双边账户需要人工核对"),
+                alert_params=(asset, "双边账户需要人工核对"),
             )
         )
 
@@ -354,7 +313,7 @@ def evaluate_incidents(
                         if oldest is not None
                         else f"{asset}：{pending_count} 个动作未完成。"
                     ),
-                    voice_params=(asset, "双边成交确认超时"),
+                    alert_params=(asset, "双边成交确认超时"),
                 )
             )
 
@@ -375,7 +334,7 @@ def evaluate_incidents(
                 severity="critical",
                 title="套利账户风险监控失联",
                 message=f"{asset}：风险心跳年龄 {age_text}；{lot_text}。",
-                voice_params=(asset, "账户风险监控失联"),
+                alert_params=(asset, "账户风险监控失联"),
             )
         )
 
@@ -394,7 +353,7 @@ def evaluate_incidents(
                     f"最高保证金使用率 {margin or '-'}%，"
                     f"最高单边杠杆 {leverage or '-'}x。"
                 ),
-                voice_params=(asset, "保证金风险已触发强制处理"),
+                alert_params=(asset, "保证金风险已触发强制处理"),
             )
         )
     elif action in {"warning", "block_entry"}:
@@ -412,7 +371,7 @@ def evaluate_incidents(
                 severity="warning",
                 title="套利账户风险提醒",
                 message=f"{asset}：动作 {action}，原因 {risk_reason}。",
-                voice_params=(asset, "账户风险提醒"),
+                alert_params=(asset, "账户风险提醒"),
             )
         )
 
@@ -449,7 +408,7 @@ def evaluate_incidents(
                     severity="critical",
                     title="套利双边状态尚未重新核对",
                     message=f"{asset}：故障 {event_reason} 后尚无成功双边核对；{lot_text}。",
-                    voice_params=(asset, "双边仓位尚未重新核对"),
+                    alert_params=(asset, "双边仓位尚未重新核对"),
                 )
             )
 
@@ -463,7 +422,7 @@ def evaluate_incidents(
                 severity="critical",
                 title="Var/Lighter 账户紧急风险",
                 message="\n".join(messages),
-                voice_params=(asset, "账户出现紧急风险，请立即检查"),
+                alert_params=(asset, "账户出现紧急风险，请立即检查"),
             )
         )
 
@@ -483,8 +442,9 @@ class RiskWakeupWatchdog:
         metrics_path: Path = ORDER_METRICS_PATH,
         watchdog_state_path: Path = WATCHDOG_STATE_PATH,
         watchdog_health_path: Path = WATCHDOG_HEALTH_PATH,
-        pushover: PushoverNotifier | None = None,
-        voice: TencentVoiceNotifier | None = None,
+        watchdog_control_path: Path = WATCHDOG_CONTROL_PATH,
+        bark: BarkNotifier | None = None,
+        feishu: FeishuUrgentNotifier | None = None,
         telegram: TelegramNotifier | None = None,
         clock: Callable[[], datetime] = utc_now,
         strategy_check: Callable[[int | None], bool] = process_is_strategy,
@@ -495,8 +455,9 @@ class RiskWakeupWatchdog:
         self.risk_health_path = risk_health_path
         self.watchdog_state_path = watchdog_state_path
         self.watchdog_health_path = watchdog_health_path
-        self.pushover = pushover or PushoverNotifier.from_env()
-        self.voice = voice or TencentVoiceNotifier.from_env()
+        self.watchdog_control_path = watchdog_control_path
+        self.bark = bark or BarkNotifier.from_config()
+        self.feishu = feishu or FeishuUrgentNotifier.from_config()
         self.telegram = telegram or TelegramNotifier.from_env(
             logger=logging.getLogger("risk_wakeup_watchdog.telegram")
         )
@@ -511,12 +472,17 @@ class RiskWakeupWatchdog:
 
     def configuration_errors(self) -> list[str]:
         errors: list[str] = []
-        if not self.pushover.enabled:
-            errors.append("pushover_not_configured")
-        if not self.voice.enabled:
-            errors.append("tencent_voice_not_configured")
-        elif not self.voice.sdk_available:
-            errors.append("tencentcloud_sdk_missing")
+        if not self.bark.enabled:
+            errors.append("bark_not_configured")
+        if not self.feishu.enabled:
+            errors.append("feishu_not_configured")
+        for label, notifier in (("bark", self.bark), ("feishu", self.feishu)):
+            config_path = getattr(notifier, "config_path", None)
+            if config_path is None:
+                continue
+            problem = private_config_error(config_path)
+            if problem:
+                errors.append(f"{label}_config_{problem}")
         env_path = ROOT / ".env"
         if not env_path.exists():
             errors.append("env_file_missing")
@@ -529,6 +495,13 @@ class RiskWakeupWatchdog:
                 if permissions & 0o077:
                     errors.append("env_file_permissions_not_600")
         return errors
+
+    def monitor_strategy_enabled(self) -> bool:
+        control = read_json(self.watchdog_control_path)
+        value = control.get("monitor_strategy")
+        if isinstance(value, bool):
+            return value
+        return self.config.monitor_strategy
 
     def _notify_telegram(self, message: str) -> None:
         if self.dry_run or not self.telegram.enabled:
@@ -558,8 +531,14 @@ class RiskWakeupWatchdog:
                 "critical_incidents": sum(
                     item.severity == "critical" for item in incidents
                 ),
-                "pushover_configured": self.pushover.enabled,
-                "tencent_voice_configured": self.voice.enabled,
+                "monitor_strategy": self.monitor_strategy_enabled(),
+                "mode": (
+                    "strategy_monitoring"
+                    if self.monitor_strategy_enabled()
+                    else "heartbeat_only"
+                ),
+                "bark_configured": self.bark.enabled,
+                "feishu_configured": self.feishu.enabled,
                 "telegram_configured": self.telegram.enabled,
                 "dry_run": self.dry_run,
             },
@@ -572,20 +551,35 @@ class RiskWakeupWatchdog:
         *,
         now: datetime,
     ) -> None:
+        if not self.dry_run:
+            # The phone path runs first so a slow fallback channel cannot delay it.
+            self._deliver_incident(incident, record, now=now, force=True)
         self._notify_telegram(
             "\n".join(
                 [
-                    "[Var/Lighter] 夜间风险监控",
+                    "[Var/Lighter] 独立风险监控",
                     f"级别：{'紧急' if incident.severity == 'critical' else '提醒'}",
                     incident.message,
                 ]
             )
         )
-        if incident.severity != "critical" or self.dry_run:
-            return
-        self._send_pushover_emergency(incident, record, now=now, force=True)
 
-    def _send_pushover_emergency(
+    def _retry_due(
+        self,
+        record: dict[str, Any],
+        key: str,
+        *,
+        now: datetime,
+        force: bool,
+    ) -> bool:
+        if force:
+            return True
+        attempted_at = parse_time(record.get(key))
+        return attempted_at is None or (
+            now - attempted_at
+        ).total_seconds() >= self.config.channel_retry_seconds
+
+    def _send_bark(
         self,
         incident: Incident,
         record: dict[str, Any],
@@ -593,29 +587,27 @@ class RiskWakeupWatchdog:
         now: datetime,
         force: bool = False,
     ) -> None:
-        if self.dry_run or record.get("pushover_receipt"):
+        if self.dry_run or record.get("bark_status") == "sent":
             return
-        last_attempt = parse_time(record.get("last_pushover_attempt_at"))
-        retry_seconds = max(30, int(getattr(self.pushover, "retry_seconds", 60)))
-        if (
-            not force
-            and last_attempt is not None
-            and (now - last_attempt).total_seconds() < retry_seconds
+        if not self._retry_due(
+            record,
+            "last_bark_attempt_at",
+            now=now,
+            force=force,
         ):
             return
-        record["last_pushover_attempt_at"] = iso_time(now)
-        record["pushover_attempts"] = int(record.get("pushover_attempts") or 0) + 1
-        result = self.pushover.send(
+        record["last_bark_attempt_at"] = iso_time(now)
+        record["bark_attempts"] = int(record.get("bark_attempts") or 0) + 1
+        result = self.bark.send(
             title=incident.title,
             message=incident.message,
-            emergency=True,
+            critical=incident.severity == "critical",
         )
-        record["pushover_status"] = result.detail
+        record["bark_status"] = result.detail
         if result.ok:
-            record["pushover_sent_at"] = iso_time(now)
-            record["pushover_receipt"] = result.receipt
+            record["bark_sent_at"] = iso_time(now)
 
-    def _maybe_escalate_voice(
+    def _send_feishu_message(
         self,
         incident: Incident,
         record: dict[str, Any],
@@ -623,70 +615,73 @@ class RiskWakeupWatchdog:
         now: datetime,
         force: bool = False,
     ) -> None:
-        if incident.severity != "critical" or self.dry_run:
+        if self.dry_run or record.get("feishu_message_status") == "sent":
             return
-        self._send_pushover_emergency(incident, record, now=now)
-        receipt = str(record.get("pushover_receipt") or "")
-        if receipt and not record.get("pushover_acknowledged_at"):
-            ok, acknowledged, detail = self.pushover.receipt_status(receipt)
-            record["pushover_receipt_status"] = detail
-            if ok and acknowledged:
-                record["pushover_acknowledged_at"] = iso_time(now)
-                return
-            if ok and detail == "expired":
-                record["pushover_receipt"] = None
-                record["pushover_expired_at"] = iso_time(now)
-                self._send_pushover_emergency(
-                    incident,
-                    record,
-                    now=now,
-                    force=True,
-                )
-        if record.get("pushover_acknowledged_at"):
+        if not self._retry_due(
+            record,
+            "last_feishu_message_attempt_at",
+            now=now,
+            force=force,
+        ):
             return
-        first_seen = (
-            parse_time(record.get("critical_since_at"))
-            or parse_time(record.get("first_seen_at"))
-            or now
+        record["last_feishu_message_attempt_at"] = iso_time(now)
+        record["feishu_message_attempts"] = int(
+            record.get("feishu_message_attempts") or 0
+        ) + 1
+        result = self.feishu.send_message(
+            title=incident.title,
+            message=incident.message,
         )
-        if not force and (now - first_seen).total_seconds() < self.config.voice_escalation_seconds:
-            return
-        if (
-            self.config.voice_only_at_night
-            and not force
-            and not is_night_window(
-                now,
-                start=self.config.night_start,
-                end=self.config.night_end,
-            )
-        ):
-            return
-        calls = int(record.get("voice_calls") or 0)
-        attempts = int(record.get("voice_attempts") or 0)
-        if attempts >= self.config.max_voice_calls_per_incident:
-            return
-        last_call = parse_time(record.get("last_voice_call_at"))
-        if (
-            not force
-            and last_call is not None
-            and (now - last_call).total_seconds() < self.config.voice_repeat_seconds
-        ):
-            return
-        last_attempt = parse_time(record.get("last_voice_attempt_at"))
-        if (
-            not force
-            and last_call is None
-            and last_attempt is not None
-            and (now - last_attempt).total_seconds() < 60.0
-        ):
-            return
-        record["voice_attempts"] = attempts + 1
-        record["last_voice_attempt_at"] = iso_time(now)
-        result = self.voice.send(list(incident.voice_params))
-        record["voice_status"] = result.detail
+        record["feishu_message_status"] = result.detail
         if result.ok:
-            record["voice_calls"] = calls + 1
-            record["last_voice_call_at"] = iso_time(now)
+            record["feishu_message_sent_at"] = iso_time(now)
+            record["feishu_message_id"] = result.receipt
+
+    def _send_feishu_phone(
+        self,
+        incident: Incident,
+        record: dict[str, Any],
+        *,
+        now: datetime,
+        force: bool = False,
+    ) -> None:
+        if (
+            incident.severity != "critical"
+            or self.dry_run
+            or record.get("feishu_phone_status") == "sent"
+        ):
+            return
+        message_id = str(record.get("feishu_message_id") or "")
+        if not message_id:
+            return
+        attempts = int(record.get("feishu_phone_attempts") or 0)
+        if attempts >= self.config.max_phone_attempts_per_incident:
+            return
+        if not self._retry_due(
+            record,
+            "last_feishu_phone_attempt_at",
+            now=now,
+            force=force,
+        ):
+            return
+        record["feishu_phone_attempts"] = attempts + 1
+        record["last_feishu_phone_attempt_at"] = iso_time(now)
+        result = self.feishu.phone_urgent(message_id)
+        record["feishu_phone_status"] = result.detail
+        if result.ok:
+            record["feishu_phone_sent_at"] = iso_time(now)
+
+    def _deliver_incident(
+        self,
+        incident: Incident,
+        record: dict[str, Any],
+        *,
+        now: datetime,
+        force: bool = False,
+    ) -> None:
+        self._send_feishu_message(incident, record, now=now, force=force)
+        self._send_feishu_phone(incident, record, now=now, force=force)
+        self._send_bark(incident, record, now=now, force=force)
 
     def _recover_incident(
         self,
@@ -695,24 +690,31 @@ class RiskWakeupWatchdog:
         *,
         now: datetime,
     ) -> None:
-        receipt = str(record.get("pushover_receipt") or "")
-        if receipt and not record.get("pushover_acknowledged_at") and not self.dry_run:
-            self.pushover.cancel(receipt)
-        self._notify_telegram(
-            "\n".join(
-                [
-                    "[Var/Lighter] 夜间风险已恢复",
-                    f"事件：{key}",
-                    f"恢复时间：{iso_time(now)}",
-                ]
-            )
+        message = "\n".join(
+            [
+                "[Var/Lighter] 风险监控已恢复",
+                f"事件：{key}",
+                f"恢复时间：{iso_time(now)}",
+            ]
+        )
+        self._notify_telegram(message)
+        if self.dry_run:
+            return
+        self.bark.send(
+            title="Var/Lighter 风险已恢复",
+            message=message,
+            critical=False,
+        )
+        self.feishu.send_message(
+            title="Var/Lighter 风险已恢复",
+            message=message,
         )
 
     def run_once(
         self,
         *,
         synthetic: Incident | None = None,
-        force_voice: bool = False,
+        force_delivery: bool = False,
     ) -> list[Incident]:
         now = self.clock()
         state = read_json(self.state_path)
@@ -724,10 +726,9 @@ class RiskWakeupWatchdog:
         except (TypeError, ValueError):
             pid = None
         strategy_running = self.strategy_check(pid)
-        incidents = (
-            [synthetic]
-            if synthetic is not None
-            else evaluate_incidents(
+        incidents = [synthetic] if synthetic is not None else []
+        if synthetic is None and self.monitor_strategy_enabled():
+            incidents = evaluate_incidents(
                 state=state,
                 risk_health=risk_health,
                 events=events,
@@ -735,7 +736,6 @@ class RiskWakeupWatchdog:
                 config=self.config,
                 now=now,
             )
-        )
         active = self.memory["active_incidents"]
         if not any(item.severity == "critical" for item in incidents):
             promoted: list[Incident] = []
@@ -759,9 +759,9 @@ class RiskWakeupWatchdog:
                         title="持仓期间双边账户数据持续失联",
                         message=incident.message
                         + " 数据持续不可用，请立即检查双边账户。",
-                        voice_params=(
-                            incident.voice_params[0]
-                            if incident.voice_params
+                        alert_params=(
+                            incident.alert_params[0]
+                            if incident.alert_params
                             else "ETH",
                             "持仓期间账户数据持续失联",
                         ),
@@ -776,7 +776,6 @@ class RiskWakeupWatchdog:
                     "first_seen_at": iso_time(now),
                     "severity": incident.severity,
                     "title": incident.title,
-                    "voice_calls": 0,
                 }
                 active[incident.key] = record
                 self._send_new_incident(incident, record, now=now)
@@ -791,6 +790,29 @@ class RiskWakeupWatchdog:
                 and previous_signature
                 and previous_signature != signature
             ):
+                for key in (
+                    "bark_status",
+                    "bark_sent_at",
+                    "last_bark_attempt_at",
+                    "feishu_message_status",
+                    "feishu_message_sent_at",
+                    "feishu_message_id",
+                    "last_feishu_message_attempt_at",
+                    "feishu_phone_status",
+                    "feishu_phone_sent_at",
+                    "last_feishu_phone_attempt_at",
+                ):
+                    record.pop(key, None)
+                record["bark_attempts"] = 0
+                record["feishu_message_attempts"] = 0
+                record["feishu_phone_attempts"] = 0
+                record["critical_since_at"] = iso_time(now)
+                self._deliver_incident(
+                    incident,
+                    record,
+                    now=now,
+                    force=True,
+                )
                 self._notify_telegram(
                     "\n".join(
                         [
@@ -799,20 +821,6 @@ class RiskWakeupWatchdog:
                         ]
                     )
                 )
-                if record.get("pushover_acknowledged_at"):
-                    for key in (
-                        "pushover_receipt",
-                        "pushover_acknowledged_at",
-                        "pushover_sent_at",
-                        "last_pushover_attempt_at",
-                        "last_voice_attempt_at",
-                        "last_voice_call_at",
-                    ):
-                        record.pop(key, None)
-                    record["pushover_attempts"] = 0
-                    record["voice_attempts"] = 0
-                    record["voice_calls"] = 0
-                    record["critical_since_at"] = iso_time(now)
             if (
                 incident.severity == "critical"
                 and record.get("severity") != "critical"
@@ -822,11 +830,11 @@ class RiskWakeupWatchdog:
             record["incident_signature"] = signature
             record["title"] = incident.title
             record["last_seen_at"] = iso_time(now)
-            self._maybe_escalate_voice(
+            self._deliver_incident(
                 incident,
                 record,
                 now=now,
-                force=force_voice,
+                force=force_delivery,
             )
         for key in list(active):
             if key in current_keys:
@@ -862,36 +870,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--test-alert", action="store_true")
-    parser.add_argument("--include-voice", action="store_true")
-    parser.add_argument(
-        "--wait-for-ack-seconds",
-        type=float,
-        default=0.0,
-        help="wait for a real Pushover acknowledgement during a test",
-    )
+    monitor = parser.add_mutually_exclusive_group()
+    monitor.add_argument("--enable-strategy-monitor", action="store_true")
+    monitor.add_argument("--disable-strategy-monitor", action="store_true")
     return parser
-
-
-def wait_for_test_acknowledgement(
-    watchdog: RiskWakeupWatchdog,
-    incident: Incident,
-    *,
-    timeout_seconds: float,
-    poll_seconds: float = 5.0,
-    monotonic_fn: Callable[[], float] = time.monotonic,
-    sleep_fn: Callable[[float], None] = time.sleep,
-) -> bool:
-    timeout = max(0.0, timeout_seconds)
-    deadline = monotonic_fn() + timeout
-    while True:
-        record = watchdog.memory["active_incidents"].get(incident.key, {})
-        if record.get("pushover_acknowledged_at"):
-            return True
-        remaining = deadline - monotonic_fn()
-        if remaining <= 0:
-            return False
-        sleep_fn(min(max(0.1, poll_seconds), remaining))
-        watchdog.run_once(synthetic=incident, force_voice=False)
 
 
 def main() -> int:
@@ -903,12 +885,27 @@ def main() -> int:
     )
     config = WatchdogConfig.from_env()
     watchdog = RiskWakeupWatchdog(config=config, dry_run=args.dry_run)
+    if args.enable_strategy_monitor or args.disable_strategy_monitor:
+        enabled = bool(args.enable_strategy_monitor)
+        write_json_atomic(
+            WATCHDOG_CONTROL_PATH,
+            {
+                "schema_version": 1,
+                "updated_at": iso_time(utc_now()),
+                "monitor_strategy": enabled,
+            },
+        )
+        print(
+            "strategy_monitor="
+            + ("ENABLED" if enabled else "DISABLED_HEARTBEAT_ONLY")
+        )
+        return 0
     if args.check:
         errors = watchdog.configuration_errors()
         print(f"watchdog_enabled={config.enabled}")
-        print(f"pushover_configured={watchdog.pushover.enabled}")
-        print(f"tencent_voice_configured={watchdog.voice.enabled}")
-        print(f"tencent_voice_sdk_available={watchdog.voice.sdk_available}")
+        print(f"strategy_monitor={watchdog.monitor_strategy_enabled()}")
+        print(f"bark_configured={watchdog.bark.enabled}")
+        print(f"feishu_configured={watchdog.feishu.enabled}")
         print(f"telegram_configured={watchdog.telegram.enabled}")
         print(f"configuration_ready={not errors}")
         for error in errors:
@@ -918,68 +915,37 @@ def main() -> int:
         print("watchdog_disabled set RISK_WAKEUP_ENABLED=true")
         return 2
     if args.test_alert:
-        wait_for_ack_seconds = max(0.0, args.wait_for_ack_seconds)
         incident = Incident(
             key=f"end_to_end_test:{int(time.time())}",
             severity="critical",
-            title="套利夜间叫醒测试",
+            title="套利风险叫醒测试",
             message="ETH：这是端到端测试，不代表真实账户风险。",
-            voice_params=("ETH", "夜间风险叫醒测试"),
+            alert_params=("ETH", "风险叫醒测试"),
         )
-        watchdog.run_once(
-            synthetic=incident,
-            force_voice=args.include_voice and wait_for_ack_seconds <= 0,
-        )
+        watchdog.run_once(synthetic=incident, force_delivery=True)
         if args.dry_run:
             print("test_alert=DRY_RUN")
             return 0
-        acknowledgement_passed = False
-        if wait_for_ack_seconds > 0:
-            acknowledgement_passed = wait_for_test_acknowledgement(
-                watchdog,
-                incident,
-                timeout_seconds=wait_for_ack_seconds,
-            )
-            print(
-                "pushover_ack_test="
-                + ("PASS" if acknowledgement_passed else "TIMEOUT")
-            )
-            if not acknowledgement_passed and args.include_voice:
-                watchdog.run_once(synthetic=incident, force_voice=True)
         record = watchdog.memory["active_incidents"].get(incident.key, {})
-        pushover_passed = record.get("pushover_status") == "sent"
+        bark_passed = record.get("bark_status") == "sent"
         print(
-            "pushover_test="
-            + ("PASS" if pushover_passed else "FAIL")
-            + f" detail={record.get('pushover_status') or 'not_attempted'}"
+            "bark_test="
+            + ("PASS" if bark_passed else "FAIL")
+            + f" detail={record.get('bark_status') or 'not_attempted'}"
         )
-        voice_passed = True
-        if args.include_voice:
-            voice_status = str(record.get("voice_status") or "not_attempted")
-            if wait_for_ack_seconds > 0 and acknowledgement_passed:
-                voice_passed = voice_status == "not_attempted"
-                print(
-                    "tencent_voice_suppression_test="
-                    + ("PASS" if voice_passed else "FAIL")
-                    + f" detail={voice_status}"
-                )
-            else:
-                voice_passed = voice_status == "sent" or voice_status.startswith("sent:")
-                print(
-                    "tencent_voice_test="
-                    + ("PASS" if voice_passed else "FAIL")
-                    + f" detail={voice_status}"
-                )
-        acknowledgement_result = (
-            acknowledgement_passed
-            if wait_for_ack_seconds > 0 and not args.include_voice
-            else True
+        message_passed = record.get("feishu_message_status") == "sent"
+        phone_passed = record.get("feishu_phone_status") == "sent"
+        print(
+            "feishu_message_test="
+            + ("PASS" if message_passed else "FAIL")
+            + f" detail={record.get('feishu_message_status') or 'not_attempted'}"
         )
-        return (
-            0
-            if pushover_passed and voice_passed and acknowledgement_result
-            else 1
+        print(
+            "feishu_phone_test="
+            + ("PASS" if phone_passed else "FAIL")
+            + f" detail={record.get('feishu_phone_status') or 'not_attempted'}"
         )
+        return 0 if bark_passed and message_passed and phone_passed else 1
     if args.once:
         incidents = watchdog.run_once()
         print(f"incidents={len(incidents)}")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, time as clock_time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -12,8 +12,6 @@ from tools.risk_wakeup_watchdog import (
     RiskWakeupWatchdog,
     WatchdogConfig,
     evaluate_incidents,
-    is_night_window,
-    wait_for_test_acknowledgement,
 )
 from tools.lib.wakeup_notifiers import NotificationResult
 
@@ -26,50 +24,54 @@ def config(**overrides) -> WatchdogConfig:
         "risk_heartbeat_max_age_seconds": 45,
         "pending_action_max_age_seconds": 30,
         "data_unavailable_critical_seconds": 300,
-        "voice_escalation_seconds": 120,
-        "voice_repeat_seconds": 900,
-        "max_voice_calls_per_incident": 3,
-        "voice_only_at_night": True,
-        "night_start": clock_time(23, 0),
-        "night_end": clock_time(8, 0),
+        "max_phone_attempts_per_incident": 3,
     }
     values.update(overrides)
     return WatchdogConfig(**values)
 
 
-class FakePushover:
+class FakeBark:
     enabled = True
+    config_path = None
 
     def __init__(self):
         self.sent = []
-        self.cancelled = []
-        self.acknowledged = False
-        self.expired = False
+        self.failures_remaining = 0
 
     def send(self, **kwargs):
         self.sent.append(kwargs)
-        return NotificationResult(True, "sent", "receipt-1")
-
-    def receipt_status(self, receipt):
-        return (
-            True,
-            self.acknowledged,
-            "expired" if self.expired else "checked",
-        )
-
-    def cancel(self, receipt):
-        self.cancelled.append(receipt)
-        return NotificationResult(True, "cancelled")
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            return NotificationResult(False, "temporary_failure")
+        return NotificationResult(True, "sent")
 
 
-class FakeVoice:
+class FakeFeishu:
     enabled = True
+    config_path = None
 
     def __init__(self):
-        self.sent = []
+        self.messages = []
+        self.phones = []
+        self.message_failures_remaining = 0
+        self.phone_failures_remaining = 0
 
-    def send(self, params):
-        self.sent.append(params)
+    def send_message(self, **kwargs):
+        self.messages.append(kwargs)
+        if self.message_failures_remaining:
+            self.message_failures_remaining -= 1
+            return NotificationResult(False, "temporary_message_failure")
+        return NotificationResult(
+            True,
+            "sent",
+            f"message-{len(self.messages)}",
+        )
+
+    def phone_urgent(self, message_id):
+        self.phones.append(message_id)
+        if self.phone_failures_remaining:
+            self.phone_failures_remaining -= 1
+            return NotificationResult(False, "temporary_phone_failure")
         return NotificationResult(True, "sent")
 
 
@@ -150,176 +152,107 @@ def test_force_reduce_margin_and_position_mismatch_are_critical() -> None:
     assert "maintenance_margin_usage_reduce" in critical.message
 
 
-def test_pushover_repeats_then_voice_escalates_only_when_unacknowledged(tmp_path) -> None:
-    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
-    pushover = FakePushover()
-    voice = FakeVoice()
-    telegram = FakeTelegram()
-    watchdog = RiskWakeupWatchdog(
-        config=config(),
+def build_watchdog(tmp_path, *, current, bark=None, feishu=None):
+    return RiskWakeupWatchdog(
+        config=config(channel_retry_seconds=10),
         state_path=tmp_path / "state.json",
         risk_health_path=tmp_path / "risk.json",
         metrics_path=tmp_path / "metrics.jsonl",
         watchdog_state_path=tmp_path / "watchdog.json",
         watchdog_health_path=tmp_path / "health.json",
-        pushover=pushover,
-        voice=voice,
-        telegram=telegram,
-        clock=lambda: current[0],
-        strategy_check=lambda _pid: False,
-    )
-    incident = Incident(
-        key="test",
-        severity="critical",
-        title="test",
-        message="test",
-        voice_params=("ETH", "test"),
-    )
-
-    watchdog.run_once(synthetic=incident)
-    assert len(pushover.sent) == 1
-    assert pushover.sent[0]["emergency"] is True
-    assert voice.sent == []
-
-    current[0] += timedelta(seconds=121)
-    watchdog.run_once(synthetic=incident)
-    assert voice.sent == [["ETH", "test"]]
-
-    current[0] += timedelta(seconds=901)
-    pushover.acknowledged = True
-    watchdog.run_once(synthetic=incident)
-    assert len(voice.sent) == 1
-
-    current[0] += timedelta(seconds=1)
-    watchdog.run_once(synthetic=None)
-    assert pushover.cancelled == []
-    assert any("已恢复" in text for text in telegram.sent)
-
-
-def test_recovery_cancels_unacknowledged_emergency(tmp_path) -> None:
-    now = datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)
-    pushover = FakePushover()
-    watchdog = RiskWakeupWatchdog(
-        config=config(),
-        state_path=tmp_path / "state.json",
-        risk_health_path=tmp_path / "risk.json",
-        metrics_path=tmp_path / "metrics.jsonl",
-        watchdog_state_path=tmp_path / "watchdog.json",
-        watchdog_health_path=tmp_path / "health.json",
-        pushover=pushover,
-        voice=FakeVoice(),
+        watchdog_control_path=tmp_path / "control.json",
+        bark=bark or FakeBark(),
+        feishu=feishu or FakeFeishu(),
         telegram=FakeTelegram(),
-        clock=lambda: now,
+        clock=lambda: current[0],
         strategy_check=lambda _pid: True,
+    )
+
+
+def test_critical_incident_immediately_sends_bark_message_and_phone(tmp_path) -> None:
+    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
+    bark = FakeBark()
+    feishu = FakeFeishu()
+    watchdog = build_watchdog(
+        tmp_path,
+        current=current,
+        bark=bark,
+        feishu=feishu,
     )
     incident = Incident("test", "critical", "title", "message", ("ETH", "test"))
 
     watchdog.run_once(synthetic=incident)
-    write_json(tmp_path / "state.json", {"status": "flat", "open_lots": []})
-    write_json(
-        tmp_path / "risk.json",
-        {"updated_at": now.isoformat(), "risk_action": "normal"},
-    )
-    watchdog.run_once()
+    watchdog.run_once(synthetic=incident)
 
-    assert pushover.cancelled == ["receipt-1"]
+    assert len(bark.sent) == 1
+    assert bark.sent[0]["critical"] is True
+    assert len(feishu.messages) == 1
+    assert feishu.phones == ["message-1"]
 
 
-def test_expired_pushover_emergency_is_reissued(tmp_path) -> None:
+def test_failed_channel_retries_without_repeating_successful_channels(tmp_path) -> None:
     current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
-    pushover = FakePushover()
-    watchdog = RiskWakeupWatchdog(
-        config=config(),
-        state_path=tmp_path / "state.json",
-        risk_health_path=tmp_path / "risk.json",
-        metrics_path=tmp_path / "metrics.jsonl",
-        watchdog_state_path=tmp_path / "watchdog.json",
-        watchdog_health_path=tmp_path / "health.json",
-        pushover=pushover,
-        voice=FakeVoice(),
-        telegram=FakeTelegram(),
-        clock=lambda: current[0],
-        strategy_check=lambda _pid: True,
+    bark = FakeBark()
+    bark.failures_remaining = 1
+    feishu = FakeFeishu()
+    watchdog = build_watchdog(
+        tmp_path,
+        current=current,
+        bark=bark,
+        feishu=feishu,
     )
     incident = Incident("test", "critical", "title", "message", ("ETH", "test"))
 
     watchdog.run_once(synthetic=incident)
-    pushover.expired = True
-    current[0] += timedelta(seconds=61)
+    current[0] += timedelta(seconds=11)
     watchdog.run_once(synthetic=incident)
 
-    assert len(pushover.sent) == 2
+    assert len(bark.sent) == 2
+    assert len(feishu.messages) == 1
+    assert len(feishu.phones) == 1
 
 
-def test_new_critical_reason_realerts_after_previous_acknowledgement(tmp_path) -> None:
+def test_new_critical_reason_realerts_all_channels(tmp_path) -> None:
     current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
-    pushover = FakePushover()
-    watchdog = RiskWakeupWatchdog(
-        config=config(),
-        state_path=tmp_path / "state.json",
-        risk_health_path=tmp_path / "risk.json",
-        metrics_path=tmp_path / "metrics.jsonl",
-        watchdog_state_path=tmp_path / "watchdog.json",
-        watchdog_health_path=tmp_path / "health.json",
-        pushover=pushover,
-        voice=FakeVoice(),
-        telegram=FakeTelegram(),
-        clock=lambda: current[0],
-        strategy_check=lambda _pid: True,
+    bark = FakeBark()
+    feishu = FakeFeishu()
+    watchdog = build_watchdog(
+        tmp_path,
+        current=current,
+        bark=bark,
+        feishu=feishu,
     )
     first = Incident("critical", "critical", "risk", "reason one", ("ETH", "one"))
     second = Incident("critical", "critical", "risk", "reason two", ("ETH", "two"))
 
     watchdog.run_once(synthetic=first)
-    pushover.acknowledged = True
-    current[0] += timedelta(seconds=5)
-    watchdog.run_once(synthetic=first)
-    assert len(pushover.sent) == 1
-
-    pushover.acknowledged = False
     current[0] += timedelta(seconds=5)
     watchdog.run_once(synthetic=second)
 
-    assert len(pushover.sent) == 2
+    assert len(bark.sent) == 2
+    assert len(feishu.messages) == 2
+    assert len(feishu.phones) == 2
 
 
-def test_real_ack_wait_path_suppresses_voice(tmp_path) -> None:
+def test_recovery_sends_non_phone_recovery_notifications(tmp_path) -> None:
     current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
-    monotonic = [0.0]
-    pushover = FakePushover()
-    voice = FakeVoice()
-    watchdog = RiskWakeupWatchdog(
-        config=config(),
-        state_path=tmp_path / "state.json",
-        risk_health_path=tmp_path / "risk.json",
-        metrics_path=tmp_path / "metrics.jsonl",
-        watchdog_state_path=tmp_path / "watchdog.json",
-        watchdog_health_path=tmp_path / "health.json",
-        pushover=pushover,
-        voice=voice,
-        telegram=FakeTelegram(),
-        clock=lambda: current[0],
-        strategy_check=lambda _pid: True,
+    bark = FakeBark()
+    feishu = FakeFeishu()
+    watchdog = build_watchdog(
+        tmp_path,
+        current=current,
+        bark=bark,
+        feishu=feishu,
     )
     incident = Incident("test", "critical", "title", "message", ("ETH", "test"))
+
     watchdog.run_once(synthetic=incident)
+    watchdog.run_once()
 
-    def sleep(seconds):
-        monotonic[0] += seconds
-        current[0] += timedelta(seconds=seconds)
-        pushover.acknowledged = True
-
-    acknowledged = wait_for_test_acknowledgement(
-        watchdog,
-        incident,
-        timeout_seconds=20,
-        poll_seconds=5,
-        monotonic_fn=lambda: monotonic[0],
-        sleep_fn=sleep,
-    )
-
-    assert acknowledged is True
-    assert voice.sent == []
+    assert len(bark.sent) == 2
+    assert bark.sent[-1]["critical"] is False
+    assert len(feishu.messages) == 2
+    assert len(feishu.phones) == 1
 
 
 def test_persistent_account_data_loss_with_position_escalates(tmp_path) -> None:
@@ -339,25 +272,20 @@ def test_persistent_account_data_loss_with_position_escalates(tmp_path) -> None:
             "open_lots_total": 1,
         },
     )
-    pushover = FakePushover()
-    voice = FakeVoice()
-    watchdog = RiskWakeupWatchdog(
-        config=config(),
-        state_path=state_path,
-        risk_health_path=risk_path,
-        metrics_path=tmp_path / "metrics.jsonl",
-        watchdog_state_path=tmp_path / "watchdog.json",
-        watchdog_health_path=tmp_path / "health.json",
-        pushover=pushover,
-        voice=voice,
-        telegram=FakeTelegram(),
-        clock=lambda: current[0],
-        strategy_check=lambda _pid: True,
+    bark = FakeBark()
+    feishu = FakeFeishu()
+    watchdog = build_watchdog(
+        tmp_path,
+        current=current,
+        bark=bark,
+        feishu=feishu,
     )
 
     first = watchdog.run_once()
     assert first[0].severity == "warning"
-    assert pushover.sent == []
+    assert len(bark.sent) == 1
+    assert bark.sent[0]["critical"] is False
+    assert len(feishu.phones) == 0
 
     current[0] += timedelta(seconds=301)
     write_json(
@@ -371,34 +299,33 @@ def test_persistent_account_data_loss_with_position_escalates(tmp_path) -> None:
     )
     promoted = watchdog.run_once()
     assert promoted[0].severity == "critical"
-    assert len(pushover.sent) == 1
-    assert voice.sent == []
+    assert bark.sent[-1]["critical"] is True
+    assert len(feishu.phones) == 1
 
-    current[0] += timedelta(seconds=121)
+
+def test_heartbeat_only_mode_suppresses_strategy_incidents(tmp_path) -> None:
+    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
+    bark = FakeBark()
+    feishu = FakeFeishu()
+    watchdog = build_watchdog(
+        tmp_path,
+        current=current,
+        bark=bark,
+        feishu=feishu,
+    )
+    write_json(tmp_path / "control.json", {"monitor_strategy": False})
     write_json(
-        risk_path,
-        {
-            "updated_at": current[0].isoformat(),
-            "risk_action": "block_entry",
-            "risk_reason": "variational_account_snapshot_stale",
-            "open_lots_total": 1,
-        },
+        tmp_path / "state.json",
+        {"status": "manual_review_required", "open_lots": [{"lot_id": 1}]},
     )
-    watchdog.run_once()
-    assert voice.sent == [["ETH", "持仓期间账户数据持续失联"]]
 
+    incidents = watchdog.run_once()
+    health = json.loads((tmp_path / "health.json").read_text())
 
-def test_night_window_crosses_midnight() -> None:
-    assert is_night_window(
-        datetime(2026, 8, 30, 16, 30, tzinfo=timezone.utc),
-        start=clock_time(23, 0),
-        end=clock_time(8, 0),
-    )
-    assert not is_night_window(
-        datetime(2026, 8, 30, 5, 0, tzinfo=timezone.utc),
-        start=clock_time(23, 0),
-        end=clock_time(8, 0),
-    )
+    assert incidents == []
+    assert bark.sent == []
+    assert feishu.phones == []
+    assert health["mode"] == "heartbeat_only"
 
 
 def test_main_risk_loop_writes_sanitized_heartbeat(tmp_path) -> None:

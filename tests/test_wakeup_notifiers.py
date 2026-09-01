@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from tools.lib.wakeup_notifiers import PushoverNotifier, TencentVoiceNotifier
+from tools.lib.wakeup_notifiers import (
+    BarkNotifier,
+    FeishuUrgentNotifier,
+    NotificationResult,
+    PushoverNotifier,
+    TencentVoiceNotifier,
+)
 
 
 class FakeResponse:
@@ -101,3 +107,88 @@ def test_tencent_voice_builds_official_request_fields_without_leaking_secrets() 
     assert request.TemplateParamSet == ["ETH", "保证金风险"]
     assert request.PlayTimes == 3
     assert "secret-key" not in result.detail
+
+
+def test_bark_critical_push_uses_call_and_does_not_leak_key() -> None:
+    class BarkSession:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return FakeResponse({"code": 200, "message": "success"})
+
+    session = BarkSession()
+    notifier = BarkNotifier(
+        server="https://api.day.app/",
+        key="private-device-key",
+        sound="minuet",
+        volume=20,
+        group="risk",
+        session=session,
+    )
+
+    result = notifier.send(title="risk", message="wake", critical=True)
+    url, kwargs = session.calls[0]
+    payload = kwargs["json"]
+
+    assert result.ok is True
+    assert result.detail == "sent"
+    assert url == "https://api.day.app/push"
+    assert payload["device_key"] == "private-device-key"
+    assert payload["level"] == "critical"
+    assert payload["call"] == 1
+    assert payload["volume"] == 10
+    assert "private-device-key" not in result.detail
+
+
+def test_feishu_message_then_phone_urgent_reuses_cached_token() -> None:
+    class FeishuSession:
+        def __init__(self):
+            self.posts = []
+            self.patches = []
+
+        def post(self, url, **kwargs):
+            self.posts.append((url, kwargs))
+            if "tenant_access_token" in url:
+                return FakeResponse(
+                    {
+                        "code": 0,
+                        "tenant_access_token": "private-token",
+                        "expire": 7200,
+                    }
+                )
+            return FakeResponse(
+                {"code": 0, "data": {"message_id": "om_message-1"}}
+            )
+
+        def patch(self, url, **kwargs):
+            self.patches.append((url, kwargs))
+            return FakeResponse(
+                {"code": 0, "data": {"invalid_user_id_list": []}}
+            )
+
+    session = FeishuSession()
+    notifier = FeishuUrgentNotifier(
+        app_id="app-id",
+        app_secret="private-secret",
+        open_id="ou_receiver",
+        session=session,
+        monotonic=lambda: 100.0,
+    )
+
+    message = notifier.send_message(title="risk", message="wake")
+    phone = notifier.phone_urgent(message.receipt or "")
+
+    assert message == NotificationResult(True, "sent", "om_message-1")
+    assert phone == NotificationResult(True, "sent")
+    assert len(session.posts) == 2
+    assert len(session.patches) == 1
+    assert session.patches[0][0].endswith(
+        "/om_message-1/urgent_phone"
+    )
+    assert session.patches[0][1]["json"] == {
+        "user_id_list": ["ou_receiver"]
+    }
+    assert "private-secret" not in message.detail
+    assert "private-token" not in phone.detail

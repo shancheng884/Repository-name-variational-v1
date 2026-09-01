@@ -1,154 +1,132 @@
-# 夜间账户风险叫醒系统
+# 独立账户风险看门狗
 
-`tools/risk_wakeup_watchdog.py` 是独立于主策略的只读监控进程。它不会请求交易所行情、不会提交订单，也不会进入开仓和平仓的延迟路径。
+`tools/risk_wakeup_watchdog.py` 独立于主策略运行。它只读取本地状态和风险心跳，不请求交易所行情、不提交订单，也不进入开仓和平仓的延迟路径。
+
+## 当前通知链路
+
+- 普通风险：Telegram、Bark、飞书机器人消息。
+- 紧急风险：Telegram、Bark 严重警告、飞书消息，并立即调用飞书电话加急。
+- 单个通知渠道失败后每 10 秒重试；已经成功的渠道不重复发送。
+- 同一事件使用固定事件键和内容签名去重。风险原因改变时视为新的紧急状态并重新报警。
+- 风险恢复后发送 Bark、飞书和 Telegram 恢复通知，不再拨打电话。
+
+飞书电话加急无法向程序返回“用户已接听”的可靠确认，因此当前设计不根据接听状态取消其他渠道。一个事件在飞书电话接口返回成功后不会重复拨号；接口失败最多重试 3 次。
 
 ## 监控范围
 
-- 主策略停止但本地仍有未平仓或待确认动作。
+- 主策略停止但仍有未平仓或待确认动作。
 - 风险心跳过旧，同时账户仍有仓位。
 - 双边成交待确认超时。
-- `manual_review_required`、双边仓位不一致、单腿提交失败且尚未成功重新核对。
+- `manual_review_required`、双边仓位不一致、单腿提交失败且尚未重新核对。
 - 维持保证金风险进入 `force_reduce` 或 `emergency_exit`。
-- `warning` 和 `block_entry` 只发普通提醒，不触发电话。
+- 账户数据短暂不可用先普通提醒；持仓期间持续 300 秒后升级为紧急风险。
 
-主策略原有账户风险循环把已经取得的数据写入 `log/live_inventory_risk_health.json`。这只是一次小型本地原子写入，不增加任何交易所请求。watchdog 读取该文件、`log/live_inventory_state.json` 和最新关键事件。
+主策略把已经取得的数据原子写入 `log/live_inventory_risk_health.json`。看门狗读取该文件、`log/live_inventory_state.json` 和最新关键事件，不增加交易 API 压力。
 
-同一次故障若同时命中多个条件，只建立一个紧急事件，避免多组 Pushover 铃声和电话同时触发。
+## 两个模式
 
-## 通知顺序
+看门狗安装后默认进入 `heartbeat_only`：进程持续运行并写自己的健康文件，但不判断主策略是否停止，适合更新和维护。
 
-1. 紧急事件立即发送 Pushover Emergency。Pushover 按 `retry` 周期重复提醒，直到用户确认或达到 `expire`。
-2. watchdog 轮询 Emergency 回执。用户已确认后，不再拨打电话。
-3. 未确认且持续超过升级时间时，腾讯云语音电话开始拨打。默认只在北京时间 `23:00-08:00` 启用电话。
-4. 风险恢复后，watchdog 取消尚未确认的 Pushover Emergency，并发送恢复消息。
+明确开始实盘监听：
 
-Pushover Emergency 参数遵循官方约束：`retry` 不低于 30 秒，`expire` 不高于 10800 秒。腾讯云使用 `SendTtsVoice`，号码使用 E.164 格式，单次播放次数不高于 3 次。
+```bash
+python tools/risk_wakeup_watchdog.py --enable-strategy-monitor
+```
 
-- Pushover API：<https://pushover.net/api>
-- 腾讯云语音通知 `SendTtsVoice`：<https://cloud.tencent.com/document/product/1128/51558>
-- 腾讯云 Python SDK：<https://cloud.tencent.com/document/product/1128/37716>
+更新策略前关闭监听，但不停止看门狗：
 
-## 需要准备
+```bash
+python tools/risk_wakeup_watchdog.py --disable-strategy-monitor
+```
 
-### Pushover
+开关保存在 `log/risk_wakeup_watchdog_control.json`，服务重启后仍保留。
 
-1. 在 Pushover 创建应用，取得应用 Token。
-2. 从账户页面取得 User Key。
-3. 手机安装 Pushover、登录并允许紧急通知、声音和后台运行。
+## 私密配置
 
-### 腾讯云语音通知
+Bark 配置保存到：
 
-1. 开通语音消息服务并完成适用的账号认证。
-2. 创建语音应用，取得 `VoiceSdkAppid`。
-3. 提交并通过一个 TTS 模板。模板参数按顺序接收资产和风险说明。
-4. 准备接听号码，使用 `+86...` 形式。
+```text
+~/.config/var-risk-alarm-a/bark.json
+```
 
-服务是否可用以及模板审核要求以腾讯云控制台当前显示为准。
+内容字段：`server`、`key`、`sound`、`volume`、`group`。
 
-## VPS 安全配置
+飞书配置保存到：
 
-所有密钥只写到 VPS 的 `.env`。不要在聊天、截图、Git 提交或命令输出中发送密钥。推荐使用本地交互向导；敏感字段不会回显，全部校验通过后才会原子更新文件，并自动设置权限为 `600`：
+```text
+~/.config/var-risk-alarm-a/feishu.json
+```
+
+内容字段：`app_id`、`app_secret`、`open_id`。
+
+两个文件必须设置为当前用户私有：
+
+```bash
+chmod 600 ~/.config/var-risk-alarm-a/bark.json
+chmod 600 ~/.config/var-risk-alarm-a/feishu.json
+chmod 600 .env
+```
+
+不要把完整 Key、Secret 或 Open ID 放进聊天、截图、日志或 Git。
+
+## 初始化
+
+以下命令只补充看门狗的非敏感参数，不修改 Bark、飞书或交易凭证：
 
 ```bash
 cd ~/Repository-name-variational-v1
 source .venv/bin/activate
 python tools/setup_risk_wakeup.py
-```
-
-向导只更新本节列出的风险叫醒字段，不改变现有交易所、钱包和 Telegram 配置。已配置的字段可直接留空保留。
-
-如需手工配置：
-
-```bash
-cd ~/Repository-name-variational-v1
-nano .env
-chmod 600 .env
-```
-
-加入以下配置，等号右侧由用户在 VPS 本地填写：
-
-```dotenv
-RISK_WAKEUP_ENABLED=true
-RISK_WAKEUP_ALERT_WHEN_FLAT_STRATEGY_STOPPED=true
-RISK_WAKEUP_POLL_SECONDS=5
-RISK_WAKEUP_HEARTBEAT_MAX_AGE_SECONDS=45
-RISK_WAKEUP_PENDING_MAX_AGE_SECONDS=30
-RISK_WAKEUP_DATA_UNAVAILABLE_CRITICAL_SECONDS=300
-RISK_WAKEUP_VOICE_ESCALATION_SECONDS=120
-RISK_WAKEUP_VOICE_REPEAT_SECONDS=900
-RISK_WAKEUP_MAX_VOICE_CALLS=3
-RISK_WAKEUP_VOICE_ONLY_AT_NIGHT=true
-RISK_WAKEUP_NIGHT_START=23:00
-RISK_WAKEUP_NIGHT_END=08:00
-
-PUSHOVER_APP_TOKEN=
-PUSHOVER_USER_KEY=
-PUSHOVER_DEVICE=
-PUSHOVER_RETRY_SECONDS=60
-PUSHOVER_EXPIRE_SECONDS=1800
-PUSHOVER_EMERGENCY_SOUND=siren
-
-TENCENTCLOUD_SECRET_ID=
-TENCENTCLOUD_SECRET_KEY=
-TENCENT_VMS_REGION=ap-guangzhou
-TENCENT_VMS_SDK_APP_ID=
-TENCENT_VMS_TEMPLATE_ID=
-TENCENT_VMS_CALLED_NUMBER=+86
-TENCENT_VMS_PLAY_TIMES=2
-```
-
-watchdog 只在健康文件中记录各渠道是否配置完成，不记录 Token、Secret、完整手机号。
-
-## 分阶段端到端测试
-
-安装最新依赖并检查配置：
-
-```bash
-cd ~/Repository-name-variational-v1
-source .venv/bin/activate
-pip install -r requirements.txt
 set -a
 source .env
 set +a
 python tools/risk_wakeup_watchdog.py --check
 ```
 
-预期 watchdog、Pushover、腾讯云语音配置、腾讯云 SDK 和
-`configuration_ready` 均为 `True`。任一项缺失时，正式守护服务拒绝伪装成
-“已保护”状态。
+默认参数：
 
-先进行完全不联网的逻辑测试：
+```dotenv
+RISK_WAKEUP_ENABLED=true
+RISK_WAKEUP_MONITOR_STRATEGY=false
+RISK_WAKEUP_ALERT_WHEN_FLAT_STRATEGY_STOPPED=true
+RISK_WAKEUP_POLL_SECONDS=3
+RISK_WAKEUP_HEARTBEAT_MAX_AGE_SECONDS=45
+RISK_WAKEUP_PENDING_MAX_AGE_SECONDS=30
+RISK_WAKEUP_DATA_UNAVAILABLE_CRITICAL_SECONDS=300
+RISK_WAKEUP_CHANNEL_RETRY_SECONDS=10
+RISK_WAKEUP_MAX_PHONE_ATTEMPTS=3
+```
+
+`--check` 必须显示：
+
+```text
+bark_configured=True
+feishu_configured=True
+configuration_ready=True
+```
+
+## 测试
+
+先做完全不联网的逻辑测试，不消耗飞书电话额度：
 
 ```bash
 python tools/risk_wakeup_watchdog.py --dry-run --test-alert
 cat log/risk_wakeup_watchdog_health.json
 ```
 
-再发真实 Pushover Emergency，不拨电话：
+再做一次真实端到端测试。它会发送一条 Bark、一个飞书消息并使用一次飞书电话加急额度：
 
 ```bash
 python tools/risk_wakeup_watchdog.py --test-alert
 ```
 
-命令必须显示 `pushover_test=PASS`。确认手机会持续发声，然后在 Pushover
-中点确认。用以下命令现场验证回执被 watchdog 收到，并且电话未被触发：
+预期结果：
 
-```bash
-python tools/risk_wakeup_watchdog.py --test-alert --wait-for-ack-seconds 180 --include-voice
+```text
+bark_test=PASS
+feishu_message_test=PASS
+feishu_phone_test=PASS
 ```
-
-在 180 秒内点击 Pushover 确认，命令必须显示
-`pushover_ack_test=PASS` 和 `tencent_voice_suppression_test=PASS`。
-
-最后显式测试一次语音电话：
-
-```bash
-python tools/risk_wakeup_watchdog.py --test-alert --include-voice
-```
-
-命令必须同时显示 `pushover_test=PASS` 和 `tencent_voice_test=PASS`。
-
-测试消息会明确标注“不代表真实账户风险”。只有以上两项都收到，才进入守护服务部署。
 
 ## 安装独立服务
 
@@ -161,13 +139,13 @@ sudo systemctl status risk-wakeup-watchdog.service --no-pager
 cat log/risk_wakeup_watchdog_health.json
 ```
 
-服务独立于主策略。主策略退出、tmux 断开或远程桌面关闭都不会自动停止 watchdog。VPS 重启后由 systemd 自动恢复。
+服务独立于主策略。主策略退出、tmux 断开或远程桌面关闭不会停止看门狗；VPS 重启后由 systemd 自动恢复。确认服务正常后，再显式开启策略监听。
 
 ## 验收条件
 
-- 主策略正常且空仓时无紧急通知。
-- 测试紧急事件能触发 Pushover Emergency 重复提醒。
-- Pushover 确认后不会升级语音电话。
-- 未确认测试可显式触发腾讯云语音电话。
-- 恢复后 Emergency 被取消并收到恢复消息。
-- 健康文件持续更新，且不含任何密钥和完整手机号。
+- `heartbeat_only` 模式下停止或更新策略不会触发电话。
+- 开启策略监听后，紧急测试同时收到 Bark、飞书消息和飞书电话。
+- 相同事件连续轮询不会重复拨号。
+- 单个渠道失败时仅重试失败渠道。
+- 风险恢复后收到恢复通知且不拨电话。
+- 健康文件持续更新，且不含任何密钥。
