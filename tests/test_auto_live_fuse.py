@@ -17,6 +17,7 @@ from main import (
     OrderLifecycle,
     PendingAutoLiveMatch,
     PendingLiveInventoryVarFillMatch,
+    VariationalMonitor,
     VariationalToLighterRuntime,
     account_risk_context,
     adaptive_margin_thresholds,
@@ -681,6 +682,64 @@ def test_account_risk_blocks_entries_when_variational_snapshot_is_stale() -> Non
         assert context["variational_account_snapshot_fresh"] is False
         assert context["variational_equity_usd"] is None
         assert context["variational_raw_equity_usd"] == "100"
+
+    asyncio.run(run())
+
+
+def test_account_risk_refreshes_stale_variational_snapshot_via_api() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_open_lots = []
+        runtime.live_inventory_max_venue_leverage = Decimal("5")
+        runtime.live_inventory_margin_warning_pct = Decimal("40")
+        runtime.live_inventory_margin_block_entry_pct = Decimal("50")
+        runtime.live_inventory_margin_reduce_pct = Decimal("60")
+        runtime.live_inventory_margin_emergency_pct = Decimal("75")
+        runtime.live_inventory_equity_balance_warning_ratio = Decimal("0.82")
+        runtime.live_inventory_equity_balance_block_ratio = Decimal("0.74")
+        runtime.live_inventory_account_recovery_required = False
+        runtime.live_inventory_account_recovery_confirm_count = 0
+        runtime.live_inventory_account_recovery_confirm_samples = 3
+        runtime.live_inventory_account_recovery_reason = None
+        monitor = VariationalMonitor()
+        monitor.portfolio_summary = {
+            "balance": "100",
+            "upnl": "0",
+            "published_at": "2026-01-01T00:00:00+00:00",
+        }
+        runtime.runtime = SimpleNamespace(monitor=monitor)
+
+        async def fetch_variational_portfolio():
+            return {
+                "ok": True,
+                "result": {
+                    "ok": True,
+                    "httpStatus": 200,
+                    "portfolio": {
+                        "balance": "101",
+                        "upnl": "1",
+                        "margin_usage": {},
+                    },
+                },
+            }
+
+        async def fetch_lighter_account():
+            return {"accounts": [{"collateral": "102"}]}
+
+        runtime.fetch_variational_portfolio = fetch_variational_portfolio
+        runtime.fetch_lighter_account = fetch_lighter_account
+
+        context = await runtime.live_inventory_account_risk_context(
+            proposed_notional_usd=Decimal("20")
+        )
+
+        assert context["risk_action"] == "normal"
+        assert context["variational_account_snapshot_fresh"] is True
+        assert context["variational_equity_usd"] == "102"
+        assert context["variational_portfolio_refresh_attempted"] is True
+        assert context["variational_portfolio_refresh_ok"] is True
+        assert context["variational_portfolio_refresh_reason"] == "api_fallback"
 
     asyncio.run(run())
 

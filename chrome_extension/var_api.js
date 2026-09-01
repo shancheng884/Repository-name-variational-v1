@@ -72,6 +72,14 @@ export function buildVariationalApiScript(action, params) {
       return { ok: true, positions: response.json, httpStatus: response.status, addressUsed: Boolean(address) };
     }
 
+    if (action === "PORTFOLIO") {
+      const response = await request("GET", "/api/portfolio", undefined);
+      if (!response.ok || !response.json) {
+        return fail("portfolio", response);
+      }
+      return { ok: true, portfolio: response.json, httpStatus: response.status, addressUsed: Boolean(address) };
+    }
+
     if (action === "ORDERS") {
       const params = new URLSearchParams();
       params.set("status", o.status || "pending,canceled,cleared,rejected");

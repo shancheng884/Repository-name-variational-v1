@@ -169,6 +169,7 @@ LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_INTERVAL_SECONDS = 0.20
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
 LIVE_INVENTORY_ACCOUNT_RISK_INTERVAL_SECONDS = 15.0
 LIVE_INVENTORY_ACCOUNT_RISK_OPEN_INTERVAL_SECONDS = 5.0
+LIVE_INVENTORY_VARIATIONAL_PORTFOLIO_REFRESH_COOLDOWN_SECONDS = 3.0
 LIVE_INVENTORY_VARIATIONAL_MAINTENANCE_RATE_FALLBACK = Decimal("0.10")
 LIVE_INVENTORY_LIGHTER_MAINTENANCE_RATE_FALLBACK = Decimal("0.012")
 LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_NORMAL_PER_MINUTE = 30
@@ -2336,6 +2337,8 @@ class VariationalToLighterRuntime:
         self._lighter_submit_ws_lock = asyncio.Lock()
         self._var_command_ws: Any | None = None
         self._var_command_ws_lock = asyncio.Lock()
+        self._variational_portfolio_refresh_lock = asyncio.Lock()
+        self._variational_portfolio_refresh_last_attempt_monotonic = 0.0
 
         self.lighter_market_index = 0
         self.base_amount_multiplier = 0
@@ -3974,6 +3977,27 @@ class VariationalToLighterRuntime:
         variational_freshness = account_snapshot_freshness(
             portfolio_summary.get("published_at")
         )
+        portfolio_refresh_context: dict[str, Any] = {}
+        if not variational_freshness["fresh"]:
+            portfolio_refresh_context = (
+                await self.refresh_variational_portfolio_summary()
+            )
+            if portfolio_refresh_context.get("variational_portfolio_refresh_ok"):
+                if monitor_lock is not None:
+                    async with monitor_lock:
+                        portfolio_summary = dict(
+                            getattr(monitor, "portfolio_summary", {}) or {}
+                        )
+                else:
+                    portfolio_summary = getattr(monitor, "portfolio_summary", {})
+                if not isinstance(portfolio_summary, dict):
+                    portfolio_summary = {}
+                variational_metrics = extract_variational_account_metrics(
+                    portfolio_summary
+                )
+                variational_freshness = account_snapshot_freshness(
+                    portfolio_summary.get("published_at")
+                )
         raw_variational_equity = to_decimal(
             variational_metrics.get("equity_usd")
         )
@@ -4018,6 +4042,7 @@ class VariationalToLighterRuntime:
         context["variational_raw_equity_usd"] = decimal_to_str(
             raw_variational_equity
         )
+        context.update(portfolio_refresh_context)
         if not variational_freshness["fresh"]:
             context["risk_action"] = "block_entry"
             context["risk_reason"] = "variational_account_snapshot_stale"
@@ -4027,6 +4052,93 @@ class VariationalToLighterRuntime:
             context,
             advance_confirmation=advance_recovery_confirmation,
         )
+
+    async def refresh_variational_portfolio_summary(self) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "variational_portfolio_refresh_attempted": False,
+            "variational_portfolio_refresh_ok": False,
+        }
+        lock = getattr(self, "_variational_portfolio_refresh_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._variational_portfolio_refresh_lock = lock
+        async with lock:
+            now_monotonic = time.monotonic()
+            last_attempt = float(
+                getattr(
+                    self,
+                    "_variational_portfolio_refresh_last_attempt_monotonic",
+                    0.0,
+                )
+                or 0.0
+            )
+            if (
+                last_attempt > 0
+                and now_monotonic - last_attempt
+                < LIVE_INVENTORY_VARIATIONAL_PORTFOLIO_REFRESH_COOLDOWN_SECONDS
+            ):
+                context["variational_portfolio_refresh_reason"] = "cooldown"
+                return context
+            self._variational_portfolio_refresh_last_attempt_monotonic = (
+                now_monotonic
+            )
+            context["variational_portfolio_refresh_attempted"] = True
+            try:
+                result = await self.fetch_variational_portfolio()
+                if not isinstance(result, dict) or result.get("ok") is False:
+                    raise RuntimeError(
+                        str(
+                            result.get("error")
+                            if isinstance(result, dict)
+                            else "invalid_response"
+                        )
+                    )
+                payload = (
+                    result.get("result")
+                    if isinstance(result.get("result"), dict)
+                    else result
+                )
+                portfolio = (
+                    payload.get("portfolio")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if not isinstance(portfolio, dict):
+                    raise RuntimeError("portfolio_payload_missing")
+                normalized = portfolio.get("pool_portfolio_result")
+                if not isinstance(normalized, dict):
+                    normalized = portfolio
+                metrics = extract_variational_account_metrics(normalized)
+                if metrics.get("equity_usd") is None:
+                    raise RuntimeError("portfolio_equity_missing")
+                monitor = getattr(getattr(self, "runtime", None), "monitor", None)
+                if monitor is None:
+                    raise RuntimeError("variational_monitor_missing")
+                monitor_lock = getattr(monitor, "_lock", None)
+                if monitor_lock is not None:
+                    async with monitor_lock:
+                        monitor._update_portfolio_summary_from_rest(normalized)
+                else:
+                    monitor._update_portfolio_summary_from_rest(normalized)
+                context.update(
+                    {
+                        "variational_portfolio_refresh_ok": True,
+                        "variational_portfolio_refresh_reason": "api_fallback",
+                        "variational_portfolio_refresh_http_status": payload.get(
+                            "httpStatus"
+                        ),
+                    }
+                )
+            except Exception as exc:
+                context.update(
+                    {
+                        "variational_portfolio_refresh_reason": "api_fallback_failed",
+                        "variational_portfolio_refresh_error": (
+                            f"{type(exc).__name__}:{exc}"
+                        ),
+                    }
+                )
+            return context
 
     async def live_inventory_account_risk_loop(self) -> None:
         while not self.stop_flag:
@@ -10269,6 +10381,17 @@ class VariationalToLighterRuntime:
             "requestId": request_id,
         }
         return await self.send_variational_command(payload=payload, request_id=request_id)
+
+    async def fetch_variational_portfolio(self) -> dict[str, Any]:
+        request_id = str(int(time.time() * 1000))
+        payload = {
+            "type": "VAR_API_PORTFOLIO",
+            "requestId": request_id,
+        }
+        return await self.send_variational_command(
+            payload=payload,
+            request_id=request_id,
+        )
 
     async def fetch_variational_orders(
         self,

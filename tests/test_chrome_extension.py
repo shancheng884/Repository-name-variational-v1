@@ -19,3 +19,13 @@ def test_extension_has_persistent_keepalive_and_recovery() -> None:
     assert "saveForwarderSession(true" in background
     assert "restoreForwarding" in background
     assert "Page.setWebLifecycleState" in background
+    assert 'type === "VAR_API_PORTFOLIO"' in background
+
+
+def test_extension_can_fetch_portfolio_through_authenticated_page() -> None:
+    api_script = (ROOT / "chrome_extension" / "var_api.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'action === "PORTFOLIO"' in api_script
+    assert 'request("GET", "/api/portfolio"' in api_script
