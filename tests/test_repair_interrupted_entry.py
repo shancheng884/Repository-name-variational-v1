@@ -1,6 +1,50 @@
 from decimal import Decimal
 
-from tools.repair_interrupted_entry import build_repaired_state
+import json
+
+from tools.repair_interrupted_entry import (
+    _recovery_rows_from_end,
+    build_repaired_state,
+)
+
+
+def test_recovery_rows_reads_from_end_and_stops_after_evidence(tmp_path) -> None:
+    path = tmp_path / "orders.jsonl"
+    rows = [
+        {"event": "unrelated", "value": index}
+        for index in range(20)
+    ]
+    rows.extend(
+        [
+            {
+                "event": "lighter_fill",
+                "trade_key": "lighter-2",
+            },
+            {
+                "event": "live_inventory_var_entry_submitted",
+                "run_id": "run-1",
+                "lot_id": 2,
+            },
+            {"event": "newer_unrelated"},
+        ]
+    )
+    path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    found = _recovery_rows_from_end(
+        path,
+        limit=5,
+        lot_id=2,
+        lighter_record_key="lighter-2",
+        run_id="run-1",
+    )
+
+    assert {row["event"] for row in found} == {
+        "lighter_fill",
+        "live_inventory_var_entry_submitted",
+    }
 
 
 def test_build_repaired_state_promotes_verified_completed_entry() -> None:

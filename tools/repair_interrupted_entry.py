@@ -19,13 +19,79 @@ from tools.lib.runtime_files import (  # noqa: E402
     LIVE_STATE,
     ORDER_METRICS,
     read_json,
-    tail_jsonl,
     to_decimal,
     write_json_atomic,
 )
 
 DIRECTION_LONG = "long_var_short_lighter"
 DIRECTION_SHORT = "short_var_long_lighter"
+
+
+def _reverse_lines(path: Path, *, block_size: int = 1024 * 1024):
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        remainder = b""
+        while position > 0:
+            size = min(block_size, position)
+            position -= size
+            handle.seek(position)
+            parts = (handle.read(size) + remainder).split(b"\n")
+            remainder = parts[0]
+            for line in reversed(parts[1:]):
+                if line:
+                    yield line
+        if remainder:
+            yield remainder
+
+
+def _recovery_rows_from_end(
+    path: Path,
+    *,
+    limit: int,
+    lot_id: Any,
+    lighter_record_key: str,
+    run_id: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    submit_found = False
+    lighter_found = False
+    try:
+        lines = _reverse_lines(path)
+        for index, raw in enumerate(lines, 1):
+            if index > max(1, limit):
+                break
+            try:
+                row = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            is_submit = (
+                row.get("event") == "live_inventory_var_entry_submitted"
+                and str(row.get("lot_id")) == str(lot_id)
+                and str(row.get("run_id") or "") == run_id
+            )
+            is_lighter = (
+                row.get("event") == "lighter_fill"
+                and str(row.get("trade_key") or "") == lighter_record_key
+            )
+            if is_submit and not submit_found:
+                rows.append(row)
+                submit_found = True
+            elif is_lighter and not lighter_found:
+                rows.append(row)
+                lighter_found = True
+            if submit_found and lighter_found:
+                return rows
+    except FileNotFoundError:
+        pass
+    missing = []
+    if not submit_found:
+        missing.append("Variational submit")
+    if not lighter_found:
+        missing.append("Lighter fill")
+    raise ValueError(
+        f"recovery evidence not found in last {limit} log lines: {', '.join(missing)}"
+    )
 
 
 def _find_pending_backup(state_file: Path) -> tuple[Path, dict[str, Any]]:
@@ -392,7 +458,7 @@ def main() -> int:
     parser.add_argument("--asset", default="ETH")
     parser.add_argument("--state-file", type=Path, default=LIVE_STATE)
     parser.add_argument("--orders-file", type=Path, default=ORDER_METRICS)
-    parser.add_argument("--tail", type=int, default=100000)
+    parser.add_argument("--tail", type=int, default=10000)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
 
@@ -400,10 +466,22 @@ def main() -> int:
         raise SystemExit("repair=REFUSED reason=strategy_process_running")
     current = read_json(args.state_file)
     backup_path, interrupted = _find_pending_backup(args.state_file)
+    pending_actions = interrupted.get("pending_actions")
+    if not isinstance(pending_actions, list) or len(pending_actions) != 1:
+        raise SystemExit("repair=REFUSED reason=backup_pending_action_count")
+    pending = pending_actions[0]
+    interrupted_run_id = str(interrupted.get("run_id") or "")
+    rows = _recovery_rows_from_end(
+        args.orders_file,
+        limit=args.tail,
+        lot_id=pending.get("lot_id"),
+        lighter_record_key=str(pending.get("lighter_record_key") or ""),
+        run_id=interrupted_run_id,
+    )
     repaired, summary = build_repaired_state(
         current=current,
         interrupted=interrupted,
-        rows=tail_jsonl(args.orders_file, args.tail),
+        rows=rows,
         asset=args.asset,
     )
     print("repair_validation=PASS")
