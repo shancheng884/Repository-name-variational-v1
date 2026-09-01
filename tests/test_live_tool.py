@@ -500,6 +500,26 @@ def test_live_tool_resume_accepts_only_clean_recoverable_open_state(
     state_path.write_text(
         json.dumps(
             {
+                **base_state,
+                "manual_review_reason": "runtime_stopped_with_unresolved_entry_submission",
+                "pending_actions": [
+                    {"role": "live_inventory_entry_pending_var_fill"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    interrupted_ok, interrupted_message = validate_state(
+        LiveConfig(v4_live_mode=True),
+        resume_open_position=True,
+    )
+    assert interrupted_ok is True
+    assert "pending_actions=1" in interrupted_message
+    assert "strict_exchange_reconcile_required=true" in interrupted_message
+
+    state_path.write_text(
+        json.dumps(
+            {
                 "status": "pending",
                 "asset": "ETH",
                 "open_lots": [],
