@@ -23,6 +23,13 @@ DEFAULT_PERCENTILES = (
     Decimal("99.8"),
 )
 
+DIRECTION_LONG_VAR_SHORT_LIGHTER = "long_var_short_lighter"
+DIRECTION_SHORT_VAR_LONG_LIGHTER = "short_var_long_lighter"
+DIRECTION_EDGE_KEYS = {
+    DIRECTION_LONG_VAR_SHORT_LIGHTER: "long_edge_bps",
+    DIRECTION_SHORT_VAR_LONG_LIGHTER: "short_edge_bps",
+}
+
 
 def percentile(values: list[Decimal], value: Decimal) -> Decimal:
     ordered = sorted(values)
@@ -35,20 +42,47 @@ def percentile(values: list[Decimal], value: Decimal) -> Decimal:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
 
 
-def parse_sample(row: dict[str, Any]) -> tuple[datetime, Decimal] | None:
+def parse_sample(
+    row: dict[str, Any],
+    *,
+    direction: str = DIRECTION_SHORT_VAR_LONG_LIGHTER,
+) -> tuple[datetime, Decimal] | None:
+    edge_key = DIRECTION_EDGE_KEYS[direction]
     try:
         observed_at = datetime.fromisoformat(
             str(row["logged_at"]).replace("Z", "+00:00")
         )
-        edge = Decimal(str(row["short_edge_bps"]))
+        edge = Decimal(str(row[edge_key]))
     except (KeyError, ValueError, TypeError):
         return None
     return observed_at, edge
 
 
+def confirmed_crossing_indexes(
+    samples: list[tuple[datetime, Decimal]],
+    *,
+    threshold: Decimal,
+) -> list[int]:
+    """Return independent latest-and-2-of-3 threshold confirmations."""
+    crossings: list[int] = []
+    armed = True
+    for index, (_, edge) in enumerate(samples):
+        if edge < threshold:
+            armed = True
+        if index < 2 or edge < threshold:
+            continue
+        window = samples[index - 2 : index + 1]
+        confirmed = sum(value >= threshold for _, value in window) >= 2
+        if armed and confirmed:
+            crossings.append(index)
+            armed = False
+    return crossings
+
+
 def evaluate_tier_holdout(
     samples: list[tuple[datetime, Decimal]],
     *,
+    direction: str = DIRECTION_SHORT_VAR_LONG_LIGHTER,
     train_ratio: Decimal = Decimal("0.70"),
     horizon_seconds: int = 6 * 3600,
     targets_bps: tuple[Decimal, ...] = (
@@ -66,13 +100,7 @@ def evaluate_tier_holdout(
     tiers: list[dict[str, Any]] = []
     for tier_index, percentile_value in enumerate(DEFAULT_PERCENTILES, start=1):
         threshold = percentile(train_edges, percentile_value)
-        crossings: list[int] = []
-        previous = test[0][1]
-        for index in range(1, len(test)):
-            edge = test[index][1]
-            if previous < threshold <= edge:
-                crossings.append(index)
-            previous = edge
+        crossings = confirmed_crossing_indexes(test, threshold=threshold)
         hits = {target: 0 for target in targets_bps}
         favorable_moves: list[Decimal] = []
         for index in crossings:
@@ -107,6 +135,7 @@ def evaluate_tier_holdout(
             }
         )
     return {
+        "direction": direction,
         "samples": len(samples),
         "train_samples": len(train),
         "holdout_samples": len(test),
@@ -126,34 +155,54 @@ def main() -> int:
     parser.add_argument("--asset", default="ETH")
     parser.add_argument("--limit", type=int, default=500000)
     parser.add_argument("--root", type=Path, default=Path("log/basis_samples"))
+    parser.add_argument(
+        "--direction",
+        choices=("both", *DIRECTION_EDGE_KEYS),
+        default="both",
+        help="Direction to validate. Default: both.",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
-    parsed = [
-        sample
-        for row in read_basis_samples(
-            args.root,
-            limit=args.limit,
-            asset_filter=args.asset,
-        )
-        if (sample := parse_sample(row)) is not None
-    ]
-    result = evaluate_tier_holdout(parsed)
-    if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
-    print(
-        f"samples={result['samples']} train={result['train_samples']} "
-        f"holdout={result['holdout_samples']} horizon_hours="
-        f"{result['horizon_seconds'] / 3600:g}"
+    rows = read_basis_samples(
+        args.root,
+        limit=args.limit,
+        asset_filter=args.asset,
+        sample_kind_filter="baseline",
+        sample_quality_filter="valid",
     )
-    for tier in result["tiers"]:
-        print(
-            f"tier={tier['tier']} p={tier['percentile']} "
-            f"threshold_bps={tier['threshold_bps']} "
-            f"crossings={tier['holdout_crossings']} "
-            f"median_reversion_bps={tier['median_favorable_reversion_bps']} "
-            f"hit_rates={tier['target_hit_rates']}"
+    directions = (
+        tuple(DIRECTION_EDGE_KEYS)
+        if args.direction == "both"
+        else (args.direction,)
+    )
+    results: dict[str, dict[str, Any]] = {}
+    for direction in directions:
+        parsed = [
+            sample
+            for row in rows
+            if (sample := parse_sample(row, direction=direction)) is not None
+        ]
+        results[direction] = evaluate_tier_holdout(
+            parsed,
+            direction=direction,
         )
+    if args.json:
+        print(json.dumps({"asset": args.asset.upper(), "directions": results}, ensure_ascii=False, indent=2))
+        return 0
+    for direction, result in results.items():
+        print(
+            f"direction={direction} samples={result['samples']} "
+            f"train={result['train_samples']} holdout={result['holdout_samples']} "
+            f"horizon_hours={result['horizon_seconds'] / 3600:g}"
+        )
+        for tier in result["tiers"]:
+            print(
+                f"direction={direction} tier={tier['tier']} "
+                f"p={tier['percentile']} threshold_bps={tier['threshold_bps']} "
+                f"confirmed_crossings={tier['holdout_crossings']} "
+                f"median_reversion_bps={tier['median_favorable_reversion_bps']} "
+                f"hit_rates={tier['target_hit_rates']}"
+            )
     return 0
 
 
