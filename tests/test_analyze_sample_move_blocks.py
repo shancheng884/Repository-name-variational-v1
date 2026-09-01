@@ -1,3 +1,4 @@
+import json
 from decimal import Decimal
 
 from tools.analyze_sample_move_blocks import (
@@ -5,7 +6,57 @@ from tools.analyze_sample_move_blocks import (
     DIRECTION_SHORT,
     _shadow_pnl_bps,
     analyze_sample_move_blocks,
+    load_recent_compact_rows,
 )
+
+
+def test_recent_loader_reads_backward_and_discards_large_payloads(tmp_path) -> None:
+    path = tmp_path / "orders.jsonl"
+    rows = [
+        {
+            "event": "unrelated",
+            "logged_at": f"2026-09-01T00:00:{index:02d}+00:00",
+            "large": "x" * 10000,
+        }
+        for index in range(20)
+    ]
+    rows.extend(
+        [
+            {
+                "event": "live_inventory_entry_blocked",
+                "reason": "basis_sample_move_too_large",
+                "logged_at": "2026-09-01T00:00:20+00:00",
+                "asset": "ETH",
+                "direction": DIRECTION_LONG,
+                "large": "x" * 10000,
+            },
+            {
+                "event": "live_inventory_basis_state",
+                "logged_at": "2026-09-01T00:00:21+00:00",
+                "asset": "ETH",
+                "long_edge_bps": "7",
+                "large": "x" * 10000,
+            },
+        ]
+    )
+    path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_recent_compact_rows(
+        path,
+        asset="ETH",
+        hours=24,
+        limit=5,
+        include_rotated=False,
+    )
+
+    assert [row["event"] for row in loaded] == [
+        "live_inventory_entry_blocked",
+        "live_inventory_basis_state",
+    ]
+    assert all("large" not in row for row in loaded)
 
 
 def test_shadow_pnl_uses_executable_prices_for_both_directions() -> None:

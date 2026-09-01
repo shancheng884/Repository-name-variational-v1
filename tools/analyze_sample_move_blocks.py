@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import timedelta
 from decimal import Decimal
+import gzip
+import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -18,14 +21,142 @@ from tools.lib.runtime_files import (
     fmt_decimal,
     parse_time,
     rotated_jsonl_paths,
-    tail_jsonl,
-    tail_jsonl_many,
     to_decimal,
 )
 
 DIRECTION_LONG = "long_var_short_lighter"
 DIRECTION_SHORT = "short_var_long_lighter"
 HORIZONS_SECONDS = (5, 10, 30, 60)
+
+COMPACT_FIELDS = {
+    "asset",
+    "basis_sample_move_bps",
+    "direction",
+    "dynamic_entry_threshold_bps",
+    "edge_bps",
+    "event",
+    "lighter_book_age_seconds",
+    "lighter_buy_price",
+    "lighter_sell_price",
+    "logged_at",
+    "long_edge_bps",
+    "min_abs_entry_bps",
+    "min_entry_edge_bps",
+    "reason",
+    "run_id",
+    "sample_index",
+    "short_edge_bps",
+    "v4_entry_threshold_bps",
+    "var_ask",
+    "var_bid",
+    "var_quote_age_seconds",
+}
+
+
+def _compact_relevant_row(
+    row: dict[str, Any], *, asset: str | None
+) -> dict[str, Any] | None:
+    event = row.get("event")
+    if event == "live_inventory_entry_blocked":
+        if row.get("reason") != "basis_sample_move_too_large":
+            return None
+    elif event != "live_inventory_basis_state":
+        return None
+    if asset and str(row.get("asset") or "").upper() != asset.upper():
+        return None
+    return {key: row.get(key) for key in COMPACT_FIELDS if key in row}
+
+
+def _reverse_plain_lines(path: Path, *, block_size: int = 1024 * 1024):
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        remainder = b""
+        while position > 0:
+            size = min(block_size, position)
+            position -= size
+            handle.seek(position)
+            parts = (handle.read(size) + remainder).split(b"\n")
+            remainder = parts[0]
+            for line in reversed(parts[1:]):
+                if line:
+                    yield line
+        if remainder:
+            yield remainder
+
+
+def _reverse_parsed_rows(
+    path: Path,
+    *,
+    limit: int,
+    asset: str | None,
+):
+    if path.suffix != ".gz":
+        for raw in _reverse_plain_lines(path):
+            try:
+                row = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            yield parse_time(row.get("logged_at")), _compact_relevant_row(
+                row, asset=asset
+            )
+        return
+
+    # Gzip files cannot be read backward. Keep only compact metadata for the
+    # last requested lines rather than retaining the large source payloads.
+    buffered = deque(maxlen=max(1, limit))
+    with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            buffered.append(
+                (
+                    parse_time(row.get("logged_at")),
+                    _compact_relevant_row(row, asset=asset),
+                )
+            )
+    yield from reversed(buffered)
+
+
+def load_recent_compact_rows(
+    log_file: Path,
+    *,
+    asset: str | None,
+    hours: float,
+    limit: int,
+    include_rotated: bool,
+) -> list[dict[str, Any]]:
+    paths = (
+        rotated_jsonl_paths(log_file)
+        if include_rotated
+        else ([log_file] if log_file.exists() else [])
+    )
+    newest_first = list(reversed(paths))
+    compact_rows: list[dict[str, Any]] = []
+    latest = None
+    cutoff = None
+    observed_lines = 0
+    for path in newest_first:
+        remaining = max(1, limit - observed_lines)
+        for logged_at, compact in _reverse_parsed_rows(
+            path,
+            limit=remaining,
+            asset=asset,
+        ):
+            observed_lines += 1
+            if latest is None and logged_at is not None:
+                latest = logged_at
+                if hours > 0:
+                    cutoff = latest - timedelta(hours=hours)
+            if cutoff is not None and logged_at is not None and logged_at < cutoff:
+                return list(reversed(compact_rows))
+            if compact is not None:
+                compact_rows.append(compact)
+            if observed_lines >= max(1, limit):
+                return list(reversed(compact_rows))
+    return list(reversed(compact_rows))
 
 
 def _required_edge_bps(row: dict[str, Any]) -> Decimal | None:
@@ -270,21 +401,13 @@ def main() -> int:
     parser.add_argument("--log-file", type=Path, default=ORDER_METRICS)
     args = parser.parse_args()
 
-    rows = (
-        tail_jsonl_many(rotated_jsonl_paths(args.log_file), args.tail)
-        if args.include_rotated
-        else tail_jsonl(args.log_file, args.tail)
+    rows = load_recent_compact_rows(
+        args.log_file,
+        asset=args.asset,
+        hours=args.hours,
+        limit=args.tail,
+        include_rotated=args.include_rotated,
     )
-    timed = [parse_time(row.get("logged_at")) for row in rows]
-    latest = max((value for value in timed if value is not None), default=None)
-    if latest is not None and args.hours > 0:
-        cutoff = latest - timedelta(hours=args.hours)
-        rows = [
-            row
-            for row in rows
-            if (logged_at := parse_time(row.get("logged_at"))) is not None
-            and logged_at >= cutoff
-        ]
     results = analyze_sample_move_blocks(rows, asset=args.asset)
     _print_report(results)
     return 0
