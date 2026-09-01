@@ -12226,7 +12226,9 @@ class VariationalToLighterRuntime:
         )
         self.live_inventory_last_basis_state_crossing = crossing
         now = time.monotonic()
-        if crossing and not previous_crossing:
+        # Keep both edges of a crossing so offline diagnostics can measure
+        # how long a rejected opportunity remained executable.
+        if crossing != previous_crossing:
             self.live_inventory_last_basis_state_log_monotonic = now
             return True
         interval = (

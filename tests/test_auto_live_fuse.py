@@ -7160,6 +7160,9 @@ def test_v4_basis_state_logging_is_adaptive_but_keeps_crossings(tmp_path) -> Non
     assert not runtime.should_log_live_inventory_basis_state(
         {"short_edge_bps": "-7", "v4_entry_threshold_bps": "-8"}
     )
+    assert runtime.should_log_live_inventory_basis_state(
+        {"short_edge_bps": "-9", "v4_entry_threshold_bps": "-8"}
+    )
 
 
 def test_v4_negative_direction_shadow_logging_is_throttled(tmp_path) -> None:
