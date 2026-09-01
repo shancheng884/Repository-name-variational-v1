@@ -10469,6 +10469,7 @@ class VariationalToLighterRuntime:
                             "variational_extension_disconnected",
                             "variational_html_response",
                             "startup_reconcile_open_state_but_variational_flat",
+                            "startup_reconcile_exchange_position_check_failed",
                             "runtime_stopped_with_unresolved_entry_submission",
                         }
                         and bool(open_lots)

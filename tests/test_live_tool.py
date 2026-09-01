@@ -520,6 +520,22 @@ def test_live_tool_resume_accepts_only_clean_recoverable_open_state(
     state_path.write_text(
         json.dumps(
             {
+                **base_state,
+                "manual_review_reason": "startup_reconcile_exchange_position_check_failed",
+            }
+        ),
+        encoding="utf-8",
+    )
+    transient_check_ok, transient_check_message = validate_state(
+        LiveConfig(v4_live_mode=True),
+        resume_open_position=True,
+    )
+    assert transient_check_ok is True
+    assert "strict_exchange_reconcile_required=true" in transient_check_message
+
+    state_path.write_text(
+        json.dumps(
+            {
                 "status": "pending",
                 "asset": "ETH",
                 "open_lots": [],

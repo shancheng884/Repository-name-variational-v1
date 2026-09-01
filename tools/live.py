@@ -222,6 +222,7 @@ def validate_state(
             "variational_extension_disconnected",
             "variational_html_response",
             "startup_reconcile_open_state_but_variational_flat",
+            "startup_reconcile_exchange_position_check_failed",
             "runtime_stopped_with_unresolved_entry_submission",
         }
         state_is_resumable = status in {"open", "pending"} or (
