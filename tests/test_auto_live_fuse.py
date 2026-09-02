@@ -29,6 +29,7 @@ from main import (
     v4_real_gradient_capacity_notional_usd,
     v4_real_gradient_confirmed_tier,
     v4_real_gradient_eligible_tier,
+    v4_real_gradient_entry_activation,
     v4_real_gradient_lot_groups,
     v4_real_gradient_slot_caps,
     v4_real_gradient_thresholds,
@@ -232,6 +233,50 @@ def test_v4_real_gradient_entry_uses_latest_and_two_of_three() -> None:
     assert v4_real_gradient_confirmed_tier([0, 3], latest_tier=3) == 0
     assert v4_real_gradient_confirmed_tier([3, 0, 3], latest_tier=3) == 3
     assert v4_real_gradient_confirmed_tier([3, 3, 0], latest_tier=0) == 0
+
+
+def test_v4_real_gradient_high_tier_single_sample_is_one_layer_probe() -> None:
+    assert v4_real_gradient_entry_activation([3], latest_tier=3) == (
+        1,
+        "strong_single_probe",
+    )
+    assert v4_real_gradient_entry_activation([0, 3], latest_tier=3) == (
+        1,
+        "strong_single_probe",
+    )
+    assert v4_real_gradient_entry_activation([3, 0, 3], latest_tier=3) == (
+        3,
+        "two_of_three",
+    )
+    assert v4_real_gradient_entry_activation([2], latest_tier=2) == (
+        0,
+        "pending_two_of_three",
+    )
+
+
+def test_v4_real_gradient_active_tier_promotes_probe_only_after_confirmation() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_bidirectional = False
+    runtime.live_inventory_v4_gradient_entry_tier_window = deque(maxlen=3)
+    runtime.live_inventory_v4_gradient_tier_states = {}
+    thresholds = [
+        Decimal("1"),
+        Decimal("2"),
+        Decimal("3"),
+        Decimal("4"),
+        Decimal("5"),
+    ]
+
+    assert runtime.live_inventory_basis_v4_active_gradient_tier(
+        raw_tier=3,
+        edge_bps=Decimal("3"),
+        thresholds_bps=thresholds,
+    ) == 1
+    assert runtime.live_inventory_basis_v4_active_gradient_tier(
+        raw_tier=3,
+        edge_bps=Decimal("3"),
+        thresholds_bps=thresholds,
+    ) == 3
 
 
 def test_v4_real_gradient_closed_tier_requires_reset_before_rearm() -> None:

@@ -152,6 +152,7 @@ LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
         "basis-v4-live-v14",
         "basis-v4-live-test-v14",
         "basis-v4-live-v15-bidirectional",
+        "basis-v4-live-v16-bidirectional",
     }
 )
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
@@ -184,6 +185,7 @@ LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_CHILD_LOTS = 25
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MIN_TIER_SPACING_BPS = Decimal("0.25")
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_SAMPLES = 2
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_WINDOW_SAMPLES = 3
+LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_STRONG_SINGLE_MIN_TIER = 3
 LIVE_INVENTORY_BASIS_V4_WEEKEND_TRANSITION_SECONDS = 6 * 3600
 LIVE_INVENTORY_EQUITY_REBALANCE_TARGET_IMBALANCE_PCT = Decimal("6.5")
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_PERCENTILES = (
@@ -810,6 +812,23 @@ def v4_real_gradient_confirmed_tier(
         ),
         default=0,
     )
+
+
+def v4_real_gradient_entry_activation(
+    tier_window: Iterable[int],
+    *,
+    latest_tier: int,
+) -> tuple[int, str]:
+    """Return normal confirmation or a capped high-tier single-sample probe."""
+    confirmed_tier = v4_real_gradient_confirmed_tier(
+        tier_window,
+        latest_tier=latest_tier,
+    )
+    if confirmed_tier > 0:
+        return confirmed_tier, "two_of_three"
+    if latest_tier >= LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_STRONG_SINGLE_MIN_TIER:
+        return 1, "strong_single_probe"
+    return 0, "pending_two_of_three"
 
 
 def v4_real_gradient_slot_caps(
@@ -2103,7 +2122,7 @@ class VariationalToLighterRuntime:
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
-            else "basis-v4-live-v15-bidirectional"
+            else "basis-v4-live-v16-bidirectional"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_bidirectional
@@ -2152,6 +2171,7 @@ class VariationalToLighterRuntime:
             )
         if self.live_inventory_basis_v4_real_gradient:
             self.live_inventory_strategy_variant += "-real-gradient-5-tier-20usd"
+            self.live_inventory_strategy_variant += "-tier3-single-probe"
         if self.live_inventory_basis_v4_reverse_test:
             self.live_inventory_strategy_variant += "-reverse-bounded-20usd"
         if self.live_inventory_basis_v4_bidirectional:
@@ -7563,7 +7583,7 @@ class VariationalToLighterRuntime:
             else:
                 self.live_inventory_v4_gradient_entry_tier_window = window
         window.append(max(0, int(raw_tier)))
-        confirmed_tier = v4_real_gradient_confirmed_tier(
+        activation_tier, _confirmation_mode = v4_real_gradient_entry_activation(
             window,
             latest_tier=raw_tier,
         )
@@ -7593,11 +7613,11 @@ class VariationalToLighterRuntime:
             if not state.get("armed", True):
                 if edge_bps < threshold:
                     state["reset_seen"] = True
-                if state.get("reset_seen") and confirmed_tier >= tier:
+                if state.get("reset_seen") and activation_tier >= tier:
                     state["armed"] = True
                     state["reset_seen"] = False
                     state["rearmed_at"] = utc_now()
-            if state.get("armed", True) and confirmed_tier >= tier:
+            if state.get("armed", True) and activation_tier >= tier:
                 active_tier = tier
         return active_tier
 
@@ -12672,7 +12692,7 @@ class VariationalToLighterRuntime:
                         "independent_tier_group_net_profit_no_cross_tier_subsidy"
                     ),
                     "real_gradient_entry_confirmation": (
-                        "latest_and_2_of_3"
+                        "latest_and_2_of_3_or_tier3_single_probe_with_fresh_tier2_recheck"
                     ),
                     "max_venue_leverage": decimal_to_str(
                         self.live_inventory_max_venue_leverage
@@ -14762,6 +14782,10 @@ class VariationalToLighterRuntime:
         real_gradient_thresholds_by_direction: dict[str, list[Decimal]] = {}
         raw_real_gradient_tiers: dict[str, int] = {}
         real_gradient_tiers: dict[str, int] = {}
+        real_gradient_confirmation_modes: dict[str, str] = {}
+        bidirectional_gradient = bool(
+            getattr(self, "live_inventory_basis_v4_bidirectional", False)
+        )
         for direction in v4_entry_directions:
             thresholds = [
                 value
@@ -14793,12 +14817,31 @@ class VariationalToLighterRuntime:
                     thresholds_bps=thresholds,
                     direction=(
                         direction
-                        if self.live_inventory_basis_v4_bidirectional
+                        if bidirectional_gradient
                         else None
                     ),
                 )
                 if self.live_inventory_basis_v4_real_gradient
                 else 0
+            )
+            direction_window = (
+                getattr(
+                    self,
+                    "live_inventory_v4_gradient_entry_tier_windows_by_direction",
+                    {},
+                ).get(direction)
+                if bidirectional_gradient
+                else getattr(
+                    self, "live_inventory_v4_gradient_entry_tier_window", ()
+                )
+            )
+            _, real_gradient_confirmation_modes[direction] = (
+                v4_real_gradient_entry_activation(
+                    direction_window or (),
+                    latest_tier=raw_tier,
+                )
+                if self.live_inventory_basis_v4_real_gradient
+                else (0, "disabled")
             )
         real_gradient_thresholds = real_gradient_thresholds_by_direction.get(
             v4_entry_direction,
@@ -14809,6 +14852,10 @@ class VariationalToLighterRuntime:
             0,
         )
         real_gradient_tier = real_gradient_tiers.get(v4_entry_direction, 0)
+        real_gradient_confirmation_mode = real_gradient_confirmation_modes.get(
+            v4_entry_direction,
+            "disabled",
+        )
         variational_rate = self.live_inventory_order_limiter(
             "variational"
         ).snapshot()
@@ -14898,6 +14945,8 @@ class VariationalToLighterRuntime:
             "open_lots_total": len(self.live_inventory_open_lots),
             "v4_real_gradient_market_tier": raw_real_gradient_tier,
             "v4_real_gradient_active_tier": real_gradient_tier,
+            "v4_real_gradient_confirmation_mode": real_gradient_confirmation_mode,
+            "v4_direction_confirmation_modes": real_gradient_confirmation_modes,
             "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
             "completed_cycles": self.live_inventory_completed_cycles,
             "basis_collect_only": collect_only,
@@ -14975,6 +15024,7 @@ class VariationalToLighterRuntime:
         addon_direction: str | None = None
         gradient_capacity_usd: Decimal | None = None
         gradient_capacity_child_lots: int | None = None
+        strong_single_probe = False
         if (
             self.live_inventory_open_lots
             and not getattr(
@@ -15190,6 +15240,15 @@ class VariationalToLighterRuntime:
                         if real_gradient_tier <= 0:
                             self.live_inventory_basis_entry_confirm_counts[direction] = 0
                             continue
+                        strong_single_probe = (
+                            real_gradient_confirmation_mode == "strong_single_probe"
+                            and direction == v4_entry_direction
+                        )
+                        if strong_single_probe and raw_real_gradient_tier < (
+                            LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_STRONG_SINGLE_MIN_TIER
+                        ):
+                            self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                            continue
                     # Existing common guards use >=. Add a negligible epsilon to
                     # preserve the replay's strict edge > percentile condition.
                     min_entry_edge_bps = v4_entry_threshold_bps + Decimal("0.000000001")
@@ -15198,6 +15257,14 @@ class VariationalToLighterRuntime:
                         "v4_entry_enabled": True,
                         "v4_profile": self.live_inventory_basis_v4_profile,
                         "v4_real_gradient_tier": real_gradient_tier,
+                        "v4_real_gradient_confirmation_mode": (
+                            real_gradient_confirmation_mode
+                            if v4_mode
+                            else None
+                        ),
+                        "v4_strong_single_probe": strong_single_probe
+                        if v4_mode
+                        else False,
                         "v4_real_gradient_tier_thresholds_bps": [
                             decimal_to_str(value)
                             for value in real_gradient_thresholds
@@ -15741,6 +15808,20 @@ class VariationalToLighterRuntime:
                                     real_gradient_thresholds,
                                 )
                             )
+                            if strong_single_probe and refreshed_raw_gradient_tier < 2:
+                                await self.append_live_inventory_log(
+                                    "live_inventory_entry_blocked",
+                                    {
+                                        **state_payload,
+                                        "reason": "basis_entry_refreshed_strong_single_below_tier_2",
+                                        "direction": direction,
+                                        "refreshed_edge_bps": decimal_to_str(edge_bps),
+                                        "refreshed_raw_gradient_tier": refreshed_raw_gradient_tier,
+                                        "required_refreshed_raw_gradient_tier": 2,
+                                        "entry_gradient_confirmation_mode": "strong_single_probe",
+                                    },
+                                )
+                                return
                             real_gradient_tier = min(
                                 real_gradient_tier,
                                 refreshed_raw_gradient_tier,
@@ -15829,6 +15910,25 @@ class VariationalToLighterRuntime:
                         )
                         return
                     if self.live_inventory_basis_v4_real_gradient:
+                        if strong_single_probe:
+                            quantized_raw_gradient_tier = v4_real_gradient_eligible_tier(
+                                edge_bps,
+                                real_gradient_thresholds,
+                            )
+                            if quantized_raw_gradient_tier < 2:
+                                await self.append_live_inventory_log(
+                                    "live_inventory_entry_blocked",
+                                    {
+                                        **state_payload,
+                                        "reason": "basis_entry_quantized_strong_single_below_tier_2",
+                                        "direction": direction,
+                                        "edge_bps": decimal_to_str(edge_bps),
+                                        "quantized_raw_gradient_tier": quantized_raw_gradient_tier,
+                                        "required_quantized_raw_gradient_tier": 2,
+                                        "entry_gradient_confirmation_mode": "strong_single_probe",
+                                    },
+                                )
+                                return
                         var_equity = to_decimal(
                             account_risk.get("variational_equity_usd")
                         )
@@ -15853,6 +15953,15 @@ class VariationalToLighterRuntime:
                             if gradient_capacity_child_lots is not None
                             else None
                         )
+                        if strong_single_probe:
+                            gradient_capacity_child_lots = min(
+                                gradient_capacity_child_lots or 0,
+                                len(self.live_inventory_open_lots) + 1,
+                            )
+                            gradient_capacity_usd = (
+                                Decimal(gradient_capacity_child_lots)
+                                * self.live_inventory_lot_notional_usd
+                            )
                         proposed_child_lots = len(self.live_inventory_open_lots) + 1
                         if (
                             real_gradient_tier <= 0
@@ -16279,6 +16388,11 @@ class VariationalToLighterRuntime:
                         ),
                         "entry_gradient_tier": (
                             real_gradient_tier
+                            if self.live_inventory_basis_v4_real_gradient
+                            else None
+                        ),
+                        "entry_gradient_confirmation_mode": (
+                            real_gradient_confirmation_mode
                             if self.live_inventory_basis_v4_real_gradient
                             else None
                         ),
