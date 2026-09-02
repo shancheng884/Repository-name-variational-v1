@@ -14246,14 +14246,13 @@ class VariationalToLighterRuntime:
         }
         if (
             not collect_only
-            and not self.live_inventory_open_lots
             and self.has_pending_live_inventory_var_fill_match(
                 asset=asset,
                 roles=pending_entry_roles,
             )
         ):
-            # A submitted entry may already exist on both exchanges. Resolve
-            # it before cycle caps or batch-PnL gates can block the loop.
+            # A submitted entry may already exist on both exchanges. Resolve it
+            # before position-dependent add-on, exit, cycle, or batch gates run.
             if await self.maybe_timeout_pending_live_inventory_var_entry(
                 asset=asset
             ):
@@ -15039,14 +15038,6 @@ class VariationalToLighterRuntime:
             )
         ):
             watch_now = time.monotonic()
-            if self.has_pending_live_inventory_var_fill_match(asset=asset, roles={"live_inventory_entry_pending_lighter", "live_inventory_entry_pending_var_fill"}):
-                if await self.maybe_timeout_pending_live_inventory_var_entry(asset=asset):
-                    return
-                await self.append_live_inventory_log(
-                    "live_inventory_entry_blocked",
-                    {**state_payload, "reason": "basis_var_entry_pending_fill"},
-                )
-                return
             if (
                 not warm
                 and not self.live_inventory_basis_reversion_mode
