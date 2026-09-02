@@ -22,6 +22,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.lib.runtime_files import read_json, write_json_atomic
+from tools.lib.risk_wakeup_remote import (
+    RemoteHeartbeatPublisher,
+    build_heartbeat_payload,
+)
 from tools.lib.telegram_notifier import TelegramNotifier
 from tools.lib.wakeup_notifiers import (
     BarkNotifier,
@@ -446,6 +450,7 @@ class RiskWakeupWatchdog:
         bark: BarkNotifier | None = None,
         feishu: FeishuUrgentNotifier | None = None,
         telegram: TelegramNotifier | None = None,
+        remote_publisher: RemoteHeartbeatPublisher | None = None,
         clock: Callable[[], datetime] = utc_now,
         strategy_check: Callable[[int | None], bool] = process_is_strategy,
         dry_run: bool = False,
@@ -460,6 +465,9 @@ class RiskWakeupWatchdog:
         self.feishu = feishu or FeishuUrgentNotifier.from_config()
         self.telegram = telegram or TelegramNotifier.from_env(
             logger=logging.getLogger("risk_wakeup_watchdog.telegram")
+        )
+        self.remote_publisher = remote_publisher or RemoteHeartbeatPublisher.from_env(
+            logger=logging.getLogger("risk_wakeup_watchdog.remote")
         )
         self.clock = clock
         self.strategy_check = strategy_check
@@ -848,6 +856,16 @@ class RiskWakeupWatchdog:
             strategy_running=strategy_running,
             incidents=incidents,
         )
+        self.remote_publisher.publish(
+            build_heartbeat_payload(
+                node_id=self.remote_publisher.node_id,
+                state=state,
+                risk_health=risk_health,
+                strategy_running=strategy_running,
+                watchdog_memory=self.memory,
+                sent_at=now,
+            )
+        )
         return incidents
 
     def run_forever(self) -> None:
@@ -907,6 +925,7 @@ def main() -> int:
         print(f"bark_configured={watchdog.bark.enabled}")
         print(f"feishu_configured={watchdog.feishu.enabled}")
         print(f"telegram_configured={watchdog.telegram.enabled}")
+        print(f"remote_backup_configured={watchdog.remote_publisher.enabled}")
         print(f"configuration_ready={not errors}")
         for error in errors:
             print(f"configuration_error={error}")

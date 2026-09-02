@@ -141,6 +141,93 @@ cat log/risk_wakeup_watchdog_health.json
 
 服务独立于主策略。主策略退出、tmux 断开或远程桌面关闭不会停止看门狗；VPS 重启后由 systemd 自动恢复。确认服务正常后，再显式开启策略监听。
 
+## VPS B 备用报警
+
+本机看门狗只读取本机文件。VPS B 不能直接复制本服务后期待它看到 VPS A 的状态；B
+需要运行独立的 `tools/risk_wakeup_backup.py` 接收 A 的签名心跳。B 不需要交易所
+API、Variational 浏览器、Lighter 私钥或任何下单配置。
+
+心跳只携带运行摘要：节点状态、仓位层数、待确认动作、风险动作以及 A 端关键通知
+渠道的送达状态。请求使用共享随机令牌进行 HMAC 签名，B 拒绝错误节点、篡改内容和
+过期请求。优先使用 VPS 内网、WireGuard/Tailscale 或 HTTPS 反向代理；如果暂时使用
+公网 HTTP，必须把 B 的端口防火墙限制为仅允许 VPS A 的公网地址访问。
+
+### B 端配置
+
+在 B 端只安装代码和通知配置，不复制 A 的完整 `.env`：
+
+```bash
+cd ~/Repository-name-variational-v1
+source .venv/bin/activate
+
+cat >> .env <<'EOF'
+RISK_WAKEUP_BACKUP_ENABLED=true
+RISK_WAKEUP_BACKUP_BIND=0.0.0.0
+RISK_WAKEUP_BACKUP_PORT=8769
+RISK_WAKEUP_BACKUP_TOKEN=CHANGE_ME_TO_THE_SAME_RANDOM_TOKEN
+RISK_WAKEUP_BACKUP_NODE_ID=vps-a
+RISK_WAKEUP_BACKUP_MAX_AGE_SECONDS=45
+RISK_WAKEUP_BACKUP_DELIVERY_GRACE_SECONDS=15
+RISK_WAKEUP_BACKUP_POLL_SECONDS=3
+EOF
+chmod 600 .env
+python tools/risk_wakeup_backup.py --check
+```
+
+将 A 端的 Bark/飞书私密 JSON 通过安全方式复制到 B，并在 B 的 `.env` 中设置
+`BARK_CONFIG_FILE`、`FEISHU_CONFIG_FILE`；只复制 Telegram 的通知变量，不复制交易
+凭证。两个 JSON 文件和 `.env` 均必须是 `600` 权限。
+
+安装 B 端服务：
+
+```bash
+sudo cp deploy/systemd/risk-wakeup-backup.service \
+  /etc/systemd/system/risk-wakeup-backup.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now risk-wakeup-backup.service
+sudo systemctl status risk-wakeup-backup.service --no-pager
+```
+
+放行端口时只允许 A 访问，例如：
+
+```bash
+sudo ufw allow from VPS_A_PUBLIC_IP to any port 8769 proto tcp
+```
+
+### A 端配置
+
+在 A 端 `.env` 增加 B 的心跳地址和同一个随机令牌。地址必须指向固定的 B
+端点，例如 `https://backup.example.com/v1/risk-heartbeat`：
+
+```dotenv
+RISK_WAKEUP_BACKUP_URL=https://backup.example.com/v1/risk-heartbeat
+RISK_WAKEUP_BACKUP_TOKEN=同一个随机令牌
+RISK_WAKEUP_BACKUP_NODE_ID=vps-a
+RISK_WAKEUP_BACKUP_INTERVAL_SECONDS=10
+RISK_WAKEUP_BACKUP_TIMEOUT_SECONDS=4
+```
+
+重启 A 端看门狗即可，不要重启交易策略：
+
+```bash
+sudo systemctl restart risk-wakeup-watchdog.service
+python tools/risk_wakeup_watchdog.py --check
+```
+
+### 验收
+
+先在 B 端运行 `python tools/risk_wakeup_backup.py --check`，再让 A 端看门狗运行约
+20 秒。B 的 `log/risk_wakeup_remote_heartbeat.json` 应出现最近心跳。然后在 B 端执行：
+
+```bash
+python tools/risk_wakeup_backup.py --once
+```
+
+必须没有备用事件。模拟 A 停止发送后，超过 `45` 秒 B 才发送一次备用紧急报警；A
+恢复后发送恢复通知。同一事件不会重复拨打超过 `RISK_WAKEUP_MAX_PHONE_ATTEMPTS`。
+
+B 端服务只监听心跳和发送报警，永远不运行 `main.py`、`tools/live.py` 或行情采集器。
+
 ## 验收条件
 
 - `heartbeat_only` 模式下停止或更新策略不会触发电话。
