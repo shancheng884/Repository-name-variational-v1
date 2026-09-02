@@ -831,6 +831,20 @@ def v4_real_gradient_entry_activation(
     return 0, "pending_two_of_three"
 
 
+def v4_real_gradient_sample_move_decision(
+    *,
+    sample_move_ok: bool,
+    strong_single_probe: bool,
+    refresh_entry_quote_enabled: bool,
+) -> str:
+    """Choose whether a basis move blocks or gets one high-tier recheck."""
+    if sample_move_ok:
+        return "normal"
+    if strong_single_probe and refresh_entry_quote_enabled:
+        return "shock_recheck"
+    return "block"
+
+
 def v4_real_gradient_slot_caps(
     *,
     variational_equity_usd: Decimal | None,
@@ -15025,6 +15039,7 @@ class VariationalToLighterRuntime:
         gradient_capacity_usd: Decimal | None = None
         gradient_capacity_child_lots: int | None = None
         strong_single_probe = False
+        strong_single_sample_move_recheck = False
         if (
             self.live_inventory_open_lots
             and not getattr(
@@ -15249,6 +15264,16 @@ class VariationalToLighterRuntime:
                         ):
                             self.live_inventory_basis_entry_confirm_counts[direction] = 0
                             continue
+                        strong_single_sample_move_recheck = (
+                            v4_real_gradient_sample_move_decision(
+                                sample_move_ok=basis_sample_move_ok,
+                                strong_single_probe=strong_single_probe,
+                                refresh_entry_quote_enabled=(
+                                    self.live_inventory_basis_refresh_entry_quote_before_submit
+                                ),
+                            )
+                            == "shock_recheck"
+                        )
                     # Existing common guards use >=. Add a negligible epsilon to
                     # preserve the replay's strict edge > percentile condition.
                     min_entry_edge_bps = v4_entry_threshold_bps + Decimal("0.000000001")
@@ -15561,7 +15586,36 @@ class VariationalToLighterRuntime:
                 if not v4_mode and roundtrip_bps < -max_entry_roundtrip_cost_bps:
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     continue
-                if not basis_sample_move_ok:
+                sample_move_decision = v4_real_gradient_sample_move_decision(
+                    sample_move_ok=basis_sample_move_ok,
+                    strong_single_probe=strong_single_probe,
+                    refresh_entry_quote_enabled=(
+                        self.live_inventory_basis_refresh_entry_quote_before_submit
+                    ),
+                )
+                if sample_move_decision == "shock_recheck":
+                    await self.append_live_inventory_log(
+                        "live_inventory_v4_entry_shock_recheck",
+                        {
+                            **state_payload,
+                            "reason": "strong_single_sample_move_recheck",
+                            "direction": direction,
+                            "edge_bps": decimal_to_str(edge_bps),
+                            "raw_edge_bps": decimal_to_str(raw_edge_bps),
+                            "basis_sample_move_bps": decimal_to_str(basis_sample_move_bps),
+                            "basis_max_sample_move_bps": decimal_to_str(
+                                basis_dynamic_max_sample_move_bps
+                            ),
+                            "entry_gradient_confirmation_mode": (
+                                "strong_single_probe"
+                            ),
+                            "required_refreshed_raw_gradient_tier": (
+                                LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_STRONG_SINGLE_MIN_TIER
+                            ),
+                            **basis_sample_move_context,
+                        },
+                    )
+                if sample_move_decision == "block":
                     self.live_inventory_basis_entry_confirm_counts.clear()
                     await self.append_live_inventory_log(
                         "live_inventory_entry_blocked",
@@ -15808,16 +15862,29 @@ class VariationalToLighterRuntime:
                                     real_gradient_thresholds,
                                 )
                             )
-                            if strong_single_probe and refreshed_raw_gradient_tier < 2:
+                            required_refreshed_raw_gradient_tier = (
+                                LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_STRONG_SINGLE_MIN_TIER
+                                if strong_single_sample_move_recheck
+                                else 2
+                            )
+                            if (
+                                strong_single_probe
+                                and refreshed_raw_gradient_tier
+                                < required_refreshed_raw_gradient_tier
+                            ):
                                 await self.append_live_inventory_log(
                                     "live_inventory_entry_blocked",
                                     {
                                         **state_payload,
-                                        "reason": "basis_entry_refreshed_strong_single_below_tier_2",
+                                        "reason": (
+                                            "basis_entry_refreshed_shock_single_below_tier_3"
+                                            if strong_single_sample_move_recheck
+                                            else "basis_entry_refreshed_strong_single_below_tier_2"
+                                        ),
                                         "direction": direction,
                                         "refreshed_edge_bps": decimal_to_str(edge_bps),
                                         "refreshed_raw_gradient_tier": refreshed_raw_gradient_tier,
-                                        "required_refreshed_raw_gradient_tier": 2,
+                                        "required_refreshed_raw_gradient_tier": required_refreshed_raw_gradient_tier,
                                         "entry_gradient_confirmation_mode": "strong_single_probe",
                                     },
                                 )
@@ -15915,16 +15982,25 @@ class VariationalToLighterRuntime:
                                 edge_bps,
                                 real_gradient_thresholds,
                             )
-                            if quantized_raw_gradient_tier < 2:
+                            required_quantized_raw_gradient_tier = (
+                                LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_STRONG_SINGLE_MIN_TIER
+                                if strong_single_sample_move_recheck
+                                else 2
+                            )
+                            if quantized_raw_gradient_tier < required_quantized_raw_gradient_tier:
                                 await self.append_live_inventory_log(
                                     "live_inventory_entry_blocked",
                                     {
                                         **state_payload,
-                                        "reason": "basis_entry_quantized_strong_single_below_tier_2",
+                                        "reason": (
+                                            "basis_entry_quantized_shock_single_below_tier_3"
+                                            if strong_single_sample_move_recheck
+                                            else "basis_entry_quantized_strong_single_below_tier_2"
+                                        ),
                                         "direction": direction,
                                         "edge_bps": decimal_to_str(edge_bps),
                                         "quantized_raw_gradient_tier": quantized_raw_gradient_tier,
-                                        "required_quantized_raw_gradient_tier": 2,
+                                        "required_quantized_raw_gradient_tier": required_quantized_raw_gradient_tier,
                                         "entry_gradient_confirmation_mode": "strong_single_probe",
                                     },
                                 )

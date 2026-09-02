@@ -30,6 +30,7 @@ from main import (
     v4_real_gradient_confirmed_tier,
     v4_real_gradient_eligible_tier,
     v4_real_gradient_entry_activation,
+    v4_real_gradient_sample_move_decision,
     v4_real_gradient_lot_groups,
     v4_real_gradient_slot_caps,
     v4_real_gradient_thresholds,
@@ -252,6 +253,29 @@ def test_v4_real_gradient_high_tier_single_sample_is_one_layer_probe() -> None:
         0,
         "pending_two_of_three",
     )
+
+
+def test_v4_real_gradient_sample_move_only_rechecks_high_tier_single_probe() -> None:
+    assert v4_real_gradient_sample_move_decision(
+        sample_move_ok=True,
+        strong_single_probe=False,
+        refresh_entry_quote_enabled=False,
+    ) == "normal"
+    assert v4_real_gradient_sample_move_decision(
+        sample_move_ok=False,
+        strong_single_probe=False,
+        refresh_entry_quote_enabled=True,
+    ) == "block"
+    assert v4_real_gradient_sample_move_decision(
+        sample_move_ok=False,
+        strong_single_probe=True,
+        refresh_entry_quote_enabled=True,
+    ) == "shock_recheck"
+    assert v4_real_gradient_sample_move_decision(
+        sample_move_ok=False,
+        strong_single_probe=True,
+        refresh_entry_quote_enabled=False,
+    ) == "block"
 
 
 def test_v4_real_gradient_active_tier_promotes_probe_only_after_confirmation() -> None:
