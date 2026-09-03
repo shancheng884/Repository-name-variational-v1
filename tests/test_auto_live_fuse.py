@@ -2393,7 +2393,7 @@ def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> Non
     assert context["quote_size_mode"] == "exact_base_qty_v1"
 
 
-def test_v4_history_loader_excludes_legacy_quote_size_rows(tmp_path) -> None:
+def test_v4_history_loader_uses_legacy_quote_size_rows_for_anchor(tmp_path) -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.output_dir = Path(tmp_path)
     runtime.live_inventory_basis_v4_profile = (
@@ -2452,6 +2452,15 @@ def test_v4_history_loader_excludes_legacy_quote_size_rows(tmp_path) -> None:
     assert context["directions"]["short_var_long_lighter"][
         "incompatible_quote_size_rows"
     ] == 10
+    assert context["directions"]["short_var_long_lighter"][
+        "anchor_legacy_samples"
+    ] == 10
+    assert context["directions"]["short_var_long_lighter"][
+        "anchor_compatible_samples"
+    ] == 5760
+    assert context["directions"]["short_var_long_lighter"][
+        "v4_anchor_source_mode"
+    ] == "mixed_legacy_and_current"
     assert context["ready"] is True
 
 
@@ -2487,7 +2496,7 @@ def test_v4_history_loader_reports_quote_size_warmup_without_compatible_rows(
     context = runtime.load_live_inventory_basis_v4_history(asset="ETH")
 
     assert context["ready"] is False
-    assert context["reason"] == "quote_size_mode_warmup"
+    assert context["reason"] == "insufficient_rolling_7d_anchor"
     assert context["compatible_source_rows"] == 0
     assert context["incompatible_quote_size_rows"] == 1
 
@@ -2533,19 +2542,41 @@ def test_v4_history_loader_does_not_use_legacy_health_during_size_migration(
     context = runtime.load_live_inventory_basis_v4_history(asset="ETH")
 
     assert context["ready"] is False
-    assert context["reason"] == "quote_size_mode_warmup"
+    assert context["reason"] == "recent_1h_health_not_ready"
     assert context["compatible_source_rows"] == 0
     assert context["incompatible_quote_size_rows"] == 5760
     assert context["directions"]["short_var_long_lighter"]["ready"] is False
     assert context["directions"]["short_var_long_lighter"][
         "reason"
-    ] == "quote_size_mode_warmup"
+    ] == "recent_1h_health_not_ready"
     assert context["directions"]["short_var_long_lighter"][
         "v4_health_ready"
     ] is False
     assert context["directions"]["short_var_long_lighter"][
-        "v4_quote_size_migration"
-    ] == "legacy_frozen"
+        "v4_anchor_ready"
+    ] is True
+    assert context["directions"]["short_var_long_lighter"][
+        "v4_anchor_source_mode"
+    ] == "legacy_compatibility"
+    assert context["directions"]["short_var_long_lighter"][
+        "v4_anchor_legacy_samples"
+    ] == 5760
+    assert context["directions"]["short_var_long_lighter"][
+        "v4_health_count"
+    ] == 0
+
+    runtime.live_inventory_basis_v4_test_skip_recent_health = True
+    threshold, bypassed_context = runtime.live_inventory_basis_v4_entry_threshold(
+        now=now,
+        direction="short_var_long_lighter",
+        health_history_override=runtime.live_inventory_basis_v4_health_histories[
+            "short_var_long_lighter"
+        ],
+        cache_result=False,
+    )
+    assert threshold is not None
+    assert bypassed_context["v4_anchor_ready"] is True
+    assert bypassed_context["v4_health_ready"] is True
 
 
 def test_extension_disconnect_fuse_stops_flat_runtime_after_three_failures() -> None:

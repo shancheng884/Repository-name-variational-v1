@@ -2397,6 +2397,12 @@ class VariationalToLighterRuntime:
             DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(),
             DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(),
         }
+        self.live_inventory_basis_v4_health_histories: dict[
+            str, deque[tuple[float, Decimal]]
+        ] = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(),
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(),
+        }
         self.live_inventory_basis_v4_next_history_sample_at_by_direction = {
             DIRECTION_LONG_VAR_SHORT_LIGHTER: 0.0,
             DIRECTION_SHORT_VAR_LONG_LIGHTER: 0.0,
@@ -6988,6 +6994,35 @@ class VariationalToLighterRuntime:
                 return history
         return self.live_inventory_basis_v4_history
 
+    def live_inventory_basis_v4_health_history_for_direction(
+        self,
+        direction: str | None = None,
+    ) -> deque[tuple[float, Decimal]]:
+        """Return the current quote-size history used by live health gates.
+
+        The rolling anchor can span quote-size migrations, but health and
+        execution windows must only describe the currently traded quantity.
+        Older test doubles do not define this split, so they intentionally
+        fall back to the original history.
+        """
+        bidirectional = bool(
+            getattr(self, "live_inventory_basis_v4_bidirectional", False)
+        )
+        if direction is not None or not bidirectional:
+            histories = getattr(
+                self,
+                "live_inventory_basis_v4_health_histories",
+                None,
+            )
+            if isinstance(histories, dict):
+                selected_direction = (
+                    direction or self.live_inventory_basis_v4_entry_direction()
+                )
+                history = histories.get(selected_direction)
+                if isinstance(history, deque):
+                    return history
+        return self.live_inventory_basis_v4_history_for_direction(direction)
+
     def live_inventory_basis_v4_window_stats(
         self,
         *,
@@ -7162,6 +7197,13 @@ class VariationalToLighterRuntime:
             self.live_inventory_basis_v4_histories = {
                 direction: deque() for direction in directions
             }
+        if not isinstance(
+            getattr(self, "live_inventory_basis_v4_health_histories", None),
+            dict,
+        ):
+            self.live_inventory_basis_v4_health_histories = {
+                direction: deque() for direction in directions
+            }
         for attribute, default in (
             ("live_inventory_basis_v4_next_history_sample_at_by_direction", 0.0),
             ("live_inventory_basis_v4_history_ready_by_direction", False),
@@ -7193,6 +7235,14 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_shadow_cache = {}
         for history in self.live_inventory_basis_v4_histories.values():
             history.clear()
+        for history in self.live_inventory_basis_v4_health_histories.values():
+            history.clear()
+        self.live_inventory_basis_v4_anchor_legacy_count_by_direction = {
+            direction: 0 for direction in directions
+        }
+        self.live_inventory_basis_v4_anchor_compatible_count_by_direction = {
+            direction: 0 for direction in directions
+        }
         self.live_inventory_basis_v4_threshold_cached_at_by_direction.clear()
         self.live_inventory_basis_v4_threshold_cache_by_direction.clear()
         self.live_inventory_basis_v4_shadow_cached_at_by_direction.clear()
@@ -7250,19 +7300,33 @@ class VariationalToLighterRuntime:
         incompatible_quote_size_rows = len(source_rows) - len(
             compatible_source_rows
         )
-        legacy_histories: dict[str, deque[tuple[float, Decimal]]] = {
-            direction: deque()
-            for direction in entry_directions
-        }
-        for direction in entry_directions:
+        def row_timestamp(row: dict[str, Any]) -> float:
+            logged_at = self._parse_iso_ts(str(row.get("logged_at") or ""))
+            return logged_at.timestamp() if logged_at is not None else float("inf")
+
+        def populate_sampled_history(
+            rows: list[dict[str, Any]],
+            *,
+            direction: str,
+            history: deque[tuple[float, Decimal]],
+        ) -> dict[str, int]:
             edge_key = (
                 "long_edge_bps"
                 if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
                 else "short_edge_bps"
             )
+            counts = {"compatible": 0, "legacy": 0}
             next_sample_at = cutoff
-            history = legacy_histories[direction]
-            for row in legacy_source_rows:
+            ordered_rows = sorted(
+                rows,
+                key=lambda row: (
+                    row_timestamp(row),
+                    0
+                    if str(row.get("quote_size_mode") or "") == quote_size_mode
+                    else 1,
+                ),
+            )
+            for row in ordered_rows:
                 logged_at = self._parse_iso_ts(str(row.get("logged_at") or ""))
                 edge_bps = to_decimal(row.get(edge_key))
                 if logged_at is None or edge_bps is None:
@@ -7275,14 +7339,33 @@ class VariationalToLighterRuntime:
                 ):
                     continue
                 history.append((timestamp, edge_bps))
+                mode_key = (
+                    "compatible"
+                    if str(row.get("quote_size_mode") or "") == quote_size_mode
+                    else "legacy"
+                )
+                counts[mode_key] += 1
                 next_sample_at = (
                     timestamp + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
                 )
+            return counts
+
+        legacy_histories: dict[str, deque[tuple[float, Decimal]]] = {
+            direction: deque() for direction in entry_directions
+        }
+        for direction in entry_directions:
+            history = legacy_histories[direction]
+            populate_sampled_history(
+                legacy_source_rows,
+                direction=direction,
+                history=history,
+            )
             fallback_threshold, fallback_context = (
                 self.live_inventory_basis_v4_entry_threshold(
                     now=now,
                     direction=direction,
                     history_override=history,
+                    health_history_override=deque(),
                     cache_result=False,
                 )
             )
@@ -7324,23 +7407,25 @@ class VariationalToLighterRuntime:
                 else "short_edge_bps"
             )
             history = self.live_inventory_basis_v4_history_for_direction(direction)
-            next_sample_at = cutoff
-            for row in compatible_source_rows:
-                logged_at = self._parse_iso_ts(str(row.get("logged_at") or ""))
-                edge_bps = to_decimal(row.get(edge_key))
-                if logged_at is None or edge_bps is None:
-                    continue
-                timestamp = logged_at.timestamp()
-                if (
-                    timestamp < cutoff
-                    or timestamp >= now
-                    or timestamp < next_sample_at
-                ):
-                    continue
-                history.append((timestamp, edge_bps))
-                next_sample_at = (
-                    timestamp + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
-                )
+            health_history = self.live_inventory_basis_v4_health_history_for_direction(
+                direction
+            )
+            combined_counts = populate_sampled_history(
+                source_rows,
+                direction=direction,
+                history=history,
+            )
+            populate_sampled_history(
+                compatible_source_rows,
+                direction=direction,
+                history=health_history,
+            )
+            self.live_inventory_basis_v4_anchor_legacy_count_by_direction[
+                direction
+            ] = combined_counts["legacy"]
+            self.live_inventory_basis_v4_anchor_compatible_count_by_direction[
+                direction
+            ] = combined_counts["compatible"]
             latest_at = history[-1][0] if history else None
             latest_age_seconds = (
                 None if latest_at is None else max(0.0, now - latest_at)
@@ -7354,6 +7439,7 @@ class VariationalToLighterRuntime:
                 threshold, context = self.live_inventory_basis_v4_entry_threshold(
                     now=now,
                     direction=direction,
+                    health_history_override=health_history,
                 )
                 ready = threshold is not None
                 reason = (
@@ -7410,6 +7496,9 @@ class VariationalToLighterRuntime:
                 "compatible_source_rows": len(compatible_source_rows),
                 "incompatible_quote_size_rows": incompatible_quote_size_rows,
                 "legacy_source_rows": len(legacy_source_rows),
+                "anchor_legacy_samples": combined_counts["legacy"],
+                "anchor_compatible_samples": combined_counts["compatible"],
+                "health_quote_size_mode": quote_size_mode,
                 "latest_age_seconds": latest_age_seconds,
                 "ready": ready,
                 "reason": reason,
@@ -7451,6 +7540,7 @@ class VariationalToLighterRuntime:
         now: float,
         direction: str | None = None,
         history_override: deque[tuple[float, Decimal]] | None = None,
+        health_history_override: deque[tuple[float, Decimal]] | None = None,
         cache_result: bool = True,
     ) -> tuple[Decimal | None, dict[str, Any]]:
         bidirectional = bool(
@@ -7461,6 +7551,22 @@ class VariationalToLighterRuntime:
             history_override
             if history_override is not None
             else self.live_inventory_basis_v4_history_for_direction(direction)
+        )
+        health_history = (
+            health_history_override
+            if health_history_override is not None
+            else self.live_inventory_basis_v4_health_history_for_direction(direction)
+        )
+        context_direction = direction or self.live_inventory_basis_v4_entry_direction()
+        anchor_legacy_counts = getattr(
+            self,
+            "live_inventory_basis_v4_anchor_legacy_count_by_direction",
+            {},
+        )
+        anchor_compatible_counts = getattr(
+            self,
+            "live_inventory_basis_v4_anchor_compatible_count_by_direction",
+            {},
         )
         if bidirectional:
             cached = getattr(
@@ -7555,7 +7661,11 @@ class VariationalToLighterRuntime:
         )
 
         health_cutoff = now - LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS
-        health_rows = [row for row in anchor_rows if row[0] > health_cutoff]
+        health_rows = [
+            row
+            for row in health_history
+            if health_cutoff < row[0] <= now
+        ]
         health_coverage_seconds = (
             max(0.0, now - health_rows[0][0]) if health_rows else 0.0
         )
@@ -7589,7 +7699,7 @@ class VariationalToLighterRuntime:
             min_effective_seconds=LIVE_INVENTORY_BASIS_V4_FAST_MIN_EFFECTIVE_SECONDS,
             min_coverage_seconds=LIVE_INVENTORY_BASIS_V4_FAST_MIN_EFFECTIVE_SECONDS,
             require_contiguous=True,
-            history=history,
+            history=health_history,
         )
         if bidirectional:
             shadow_cached_at = float(
@@ -7633,7 +7743,7 @@ class VariationalToLighterRuntime:
                     * float(LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE)
                 ),
                 require_contiguous=False,
-                history=history,
+                history=health_history,
             )
             long_context = self.live_inventory_basis_v4_window_stats(
                 now=now,
@@ -7645,7 +7755,7 @@ class VariationalToLighterRuntime:
                     * float(LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE)
                 ),
                 require_contiguous=False,
-                history=history,
+                history=health_history,
             )
             if bidirectional:
                 self.live_inventory_basis_v4_shadow_cached_at_by_direction[
@@ -7668,6 +7778,22 @@ class VariationalToLighterRuntime:
             "v4_history_samples": len(history),
             "v4_anchor_window_seconds": LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS,
             "v4_anchor_count": len(anchor_rows),
+            "v4_anchor_legacy_samples": anchor_legacy_counts.get(
+                context_direction,
+                0,
+            ),
+            "v4_anchor_compatible_samples": anchor_compatible_counts.get(
+                context_direction,
+                0,
+            ),
+            "v4_anchor_source_mode": (
+                "mixed_legacy_and_current"
+                if anchor_legacy_counts.get(context_direction, 0)
+                and anchor_compatible_counts.get(context_direction, 0)
+                else "legacy_compatibility"
+                if anchor_legacy_counts.get(context_direction, 0)
+                else "current_quote_size"
+            ),
             "v4_anchor_coverage_seconds": f"{anchor_coverage_seconds:.3f}",
             "v4_anchor_effective_seconds": anchor_effective_seconds,
             "v4_anchor_min_effective_seconds": LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS,
@@ -7677,6 +7803,11 @@ class VariationalToLighterRuntime:
             "v4_anchor_ready": anchor_ready,
             "v4_health_window_seconds": LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS,
             "v4_health_count": len(health_rows),
+            "v4_health_source_mode": (
+                "current_quote_size_only"
+                if health_history is not history
+                else "history_compatibility_fallback"
+            ),
             "v4_health_coverage_seconds": f"{health_coverage_seconds:.3f}",
             "v4_health_max_sample_gap_seconds": f"{health_max_gap_seconds:.3f}",
             "v4_health_ready": health_ready,
@@ -7890,6 +8021,11 @@ class VariationalToLighterRuntime:
             selected_direction if bidirectional else None
         )
         history.append((now, selected_edge_bps))
+        health_history = self.live_inventory_basis_v4_health_history_for_direction(
+            selected_direction if bidirectional else None
+        )
+        if health_history is not history:
+            health_history.append((now, selected_edge_bps))
         next_sample_at = now + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
         if bidirectional:
             self.live_inventory_basis_v4_next_history_sample_at_by_direction[
@@ -7903,6 +8039,11 @@ class VariationalToLighterRuntime:
             and history[0][0] <= cutoff
         ):
             history.popleft()
+        while (
+            health_history
+            and health_history[0][0] <= cutoff
+        ):
+            health_history.popleft()
         return True
 
     def live_inventory_basis_v4_update_rearm(
