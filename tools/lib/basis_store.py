@@ -149,6 +149,7 @@ def read_basis_samples(
     asset_filter: str | None = None,
     sample_kind_filter: str | None = None,
     sample_quality_filter: str | None = None,
+    quote_size_mode_filter: str | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     paths_by_asset: dict[str, list[Path]] = {}
@@ -177,6 +178,12 @@ def read_basis_samples(
                             sample_quality_filter is not None
                             and str(row.get("sample_quality") or "")
                             != sample_quality_filter
+                        ):
+                            continue
+                        if (
+                            quote_size_mode_filter is not None
+                            and str(row.get("quote_size_mode") or "")
+                            != quote_size_mode_filter
                         ):
                             continue
                         asset_rows.append(row)

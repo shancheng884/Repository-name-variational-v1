@@ -608,6 +608,10 @@ async function handleCommandSocketMessage(data) {
     await handleVariationalApiCommand(payload, "POSITIONS", "VAR_API_POSITIONS_RESULT");
     return;
   }
+  if (type === "VAR_API_READY") {
+    await handleVariationalApiCommand(payload, "READY", "VAR_API_READY_RESULT");
+    return;
+  }
   if (type === "VAR_API_PORTFOLIO") {
     await handleVariationalApiCommand(payload, "PORTFOLIO", "VAR_API_PORTFOLIO_RESULT");
     return;

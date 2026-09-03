@@ -935,6 +935,7 @@ class CommandBroker:
             return
         if msg_type in {
             "VAR_API_POSITIONS",
+            "VAR_API_READY",
             "VAR_API_PORTFOLIO",
             "VAR_API_ORDERS",
             "VAR_API_QUOTE",
@@ -953,6 +954,7 @@ class CommandBroker:
             "PREPARE_ORDER_KEYBOARD_DRY_RUN_RESULT",
             "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN_RESULT",
             "VAR_API_POSITIONS_RESULT",
+            "VAR_API_READY_RESULT",
             "VAR_API_PORTFOLIO_RESULT",
             "VAR_API_ORDERS_RESULT",
             "VAR_API_QUOTE_RESULT",

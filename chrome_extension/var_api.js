@@ -4,6 +4,9 @@ export function buildVariationalApiScript(action, params) {
     if (!host.includes("variational.io")) {
       return { ok: false, step: "precheck", error: "Attached tab is not a variational.io page." };
     }
+    if (action === "READY") {
+      return { ok: true, ready: true };
+    }
 
     let address = (o.account && /^0x[0-9a-fA-F]{40}$/.test(o.account)) ? o.account : null;
     if (!address) {
@@ -27,27 +30,86 @@ export function buildVariationalApiScript(action, params) {
       headers["vr-connected-address"] = address;
     }
 
+    const requestTimeoutMs = Number(o.requestTimeoutMs);
+    const operationTimeoutMs = Number(o.operationTimeoutMs);
+    const operationStarted = performance.now();
     const request = async (method, path, body) => {
       const options = { method, credentials: "include", headers };
       if (body !== undefined) {
         options.body = JSON.stringify(body);
       }
-      const response = await fetch("https://omni.variational.io" + path, options);
-      const text = await response.text();
-      let json = null;
-      try {
-        json = text ? JSON.parse(text) : null;
-      } catch (_error) {
-        // Keep raw response text for diagnostics.
+      const elapsedMs = performance.now() - operationStarted;
+      const remainingOperationMs = Number.isFinite(operationTimeoutMs) && operationTimeoutMs > 0
+        ? operationTimeoutMs - elapsedMs
+        : Infinity;
+      if (remainingOperationMs <= 0) {
+        return {
+          ok: false,
+          status: 0,
+          json: null,
+          text: "request_timeout",
+          rateLimitResetMs: null,
+          timedOut: true
+        };
       }
-      const rateLimitResetMs = response.headers.get("x-rate-limit-resets-in-ms");
-      return {
-        ok: response.ok,
-        status: response.status,
-        json,
-        text,
-        rateLimitResetMs: rateLimitResetMs ? Number(rateLimitResetMs) : null
-      };
+      const effectiveTimeoutMs = Math.min(
+        Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0 ? requestTimeoutMs : Infinity,
+        remainingOperationMs
+      );
+      const controller = Number.isFinite(effectiveTimeoutMs) && effectiveTimeoutMs > 0
+        ? new AbortController()
+        : null;
+      let timeoutHandle = null;
+      if (controller) {
+        options.signal = controller.signal;
+        timeoutHandle = setTimeout(() => controller.abort(), effectiveTimeoutMs);
+      }
+      try {
+        const response = await fetch("https://omni.variational.io" + path, options);
+        const text = await response.text();
+        if (
+          Number.isFinite(operationTimeoutMs)
+          && operationTimeoutMs > 0
+          && performance.now() - operationStarted > operationTimeoutMs
+        ) {
+          return {
+            ok: false,
+            status: response.status,
+            json: null,
+            text: "request_timeout",
+            rateLimitResetMs: null,
+            timedOut: true
+          };
+        }
+        let json = null;
+        try {
+          json = text ? JSON.parse(text) : null;
+        } catch (_error) {
+          // Keep raw response text for diagnostics.
+        }
+        const rateLimitResetMs = response.headers.get("x-rate-limit-resets-in-ms");
+        return {
+          ok: response.ok,
+          status: response.status,
+          json,
+          text,
+          rateLimitResetMs: rateLimitResetMs ? Number(rateLimitResetMs) : null
+        };
+      } catch (error) {
+        const timedOut = Boolean(controller?.signal?.aborted);
+        return {
+          ok: false,
+          status: 0,
+          json: null,
+          text: timedOut ? "request_timeout" : `fetch_error:${error?.message || error}`,
+          rateLimitResetMs: null,
+          timedOut
+        };
+      } finally {
+        if (timeoutHandle !== null) {
+          clearTimeout(timeoutHandle);
+        }
+      }
     };
     const fail = (step, response, extra) => ({
       ok: false,
@@ -55,6 +117,8 @@ export function buildVariationalApiScript(action, params) {
       httpStatus: response.status,
       error: response.text || ("HTTP " + response.status),
       addressUsed: Boolean(address),
+      timedOut: Boolean(response.timedOut),
+      rateLimitResetMs: response.rateLimitResetMs,
       ...(extra || {})
     });
     const instrument = {

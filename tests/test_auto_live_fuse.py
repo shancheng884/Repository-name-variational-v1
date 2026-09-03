@@ -10,6 +10,10 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from tools.lib.rolling_rate_limiter import RollingWindowRateLimiter
+
 from main import (
     AutoLivePositionState,
     CrossSpreadSnapshot,
@@ -676,6 +680,58 @@ def test_state_restore_clears_stale_portfolio_exit_lock(tmp_path) -> None:
     assert runtime.live_inventory_v4_portfolio_exit_context == {}
 
 
+def test_state_restore_rehydrates_pending_submission_for_reconciliation(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.auto_live_match_window_seconds = 30.0
+    runtime.live_inventory_state_file.write_text(
+        json.dumps(
+            {
+                "pending_actions": [
+                    {
+                        "asset": "ETH",
+                        "side": "sell",
+                        "qty": "0.00820",
+                        "lot_id": 2,
+                        "role": "live_inventory_entry_pending_var_fill",
+                        "direction": "short_var_long_lighter",
+                        "submitted_at": "2026-09-02T18:00:00+00:00",
+                        "rfq_id": "rfq-restart",
+                        "submitted_order_id": "order-restart",
+                        "lighter_started": True,
+                        "context": {
+                            "entry_kind": "basis_v4_eth_short_p97_5",
+                            "lighter_submitted_before_var_fill": True,
+                            "orders_v2_last_check_monotonic": 999999999.0,
+                        },
+                        "execution_unknown": True,
+                        "reconciliation_required": True,
+                        "execution_unknown_reason": "process_restart_before_fill_confirmation",
+                    }
+                ],
+                "open_lots": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    runtime.sync_live_inventory_memory_from_state()
+
+    assert len(runtime.pending_live_inventory_var_fill_matches) == 1
+    match = runtime.pending_live_inventory_var_fill_matches[0]
+    assert match.asset == "ETH"
+    assert match.side == "sell"
+    assert match.qty == Decimal("0.00820")
+    assert match.lot_id == 2
+    assert match.role == "live_inventory_entry_pending_var_fill"
+    assert match.context["rfq_id"] == "rfq-restart"
+    assert match.context["entry_kind"] == "basis_v4_eth_short_p97_5"
+    assert match.context["lighter_submitted_before_var_fill"] is True
+    assert "orders_v2_last_check_monotonic" not in match.context
+    assert match.context["execution_unknown"] is True
+    assert match.context["reconciliation_required"] is True
+    assert match.context["restored_from_state"] is True
+
+
 def test_robinhood_regime_is_independent_observation_only(tmp_path) -> None:
     runtime = _live_inventory_runtime(tmp_path)
     runtime.output_dir = tmp_path
@@ -1214,11 +1270,20 @@ def test_live_inventory_persists_pending_entry_submission(tmp_path) -> None:
                 "direction": "short_var_long_lighter",
                 "submitted_at": "2026-08-06T12:03:09Z",
                 "rfq_id": "rfq-2",
-                "submitted_order_id": None,
-                "lighter_started": True,
-                "lighter_record_key": None,
-            }
-        ]
+                    "submitted_order_id": None,
+                    "lighter_started": True,
+                    "lighter_record_key": None,
+                    "execution_unknown": False,
+                    "reconciliation_required": False,
+                    "execution_unknown_reason": None,
+                    "context": {
+                        "direction": "short_var_long_lighter",
+                        "submitted_at": "2026-08-06T12:03:09Z",
+                        "rfq_id": "rfq-2",
+                        "lighter_started": True,
+                    },
+                }
+            ]
 
     asyncio.run(run())
 
@@ -2304,6 +2369,7 @@ def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> Non
             ).isoformat(),
             "sample_kind": "baseline",
             "sample_quality": "valid",
+            "quote_size_mode": "exact_base_qty_v1",
             "short_edge_bps": str(edge_bps),
         }
         for timestamp, edge_bps in sample_rows
@@ -2322,6 +2388,164 @@ def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> Non
     assert context["v4_baseline_window_seconds"] == 604800
     assert context["v4_anchor_effective_seconds"] == 172800
     assert context["v4_entry_threshold_bps"] == "98.50"
+    assert context["compatible_source_rows"] == 5760
+    assert context["incompatible_quote_size_rows"] == 0
+    assert context["quote_size_mode"] == "exact_base_qty_v1"
+
+
+def test_v4_history_loader_excludes_legacy_quote_size_rows(tmp_path) -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.output_dir = Path(tmp_path)
+    runtime.live_inventory_basis_v4_profile = (
+        "eth_short_execution_calibrated_20260724_n10"
+    )
+    runtime.live_inventory_basis_v4_history = deque()
+    runtime.live_inventory_basis_v4_next_history_sample_at = 0.0
+    runtime.live_inventory_basis_v4_history_ready = False
+    runtime.live_inventory_basis_v4_history_reason = "not_loaded"
+    asset_dir = Path(tmp_path) / "basis_samples" / "ETH"
+    asset_dir.mkdir(parents=True)
+    now = datetime.now(timezone.utc).timestamp()
+    rows = []
+    sample_rows = _v4_rolling_anchor_rows(
+        now,
+        [
+            (now - 3001 + index * 30, Decimal(index))
+            for index in range(101)
+        ],
+    )
+    for index in range(10):
+        rows.append(
+            {
+                "asset": "ETH",
+                "logged_at": datetime.fromtimestamp(
+                    now - 5000 + index * 30, tz=timezone.utc
+                ).isoformat(),
+                "sample_kind": "baseline",
+                "sample_quality": "valid",
+                "short_edge_bps": str(index),
+            }
+        )
+    for timestamp, edge_bps in sample_rows:
+        rows.append(
+            {
+                "asset": "ETH",
+                "logged_at": datetime.fromtimestamp(
+                    timestamp, tz=timezone.utc
+                ).isoformat(),
+                "sample_kind": "baseline",
+                "sample_quality": "valid",
+                "quote_size_mode": "exact_base_qty_v1",
+                "short_edge_bps": str(edge_bps),
+            }
+        )
+    (asset_dir / "2026-07-24.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    context = runtime.load_live_inventory_basis_v4_history(asset="ETH")
+
+    assert context["source_rows"] == 5770
+    assert context["compatible_source_rows"] == 5760
+    assert context["incompatible_quote_size_rows"] == 10
+    assert context["directions"]["short_var_long_lighter"][
+        "incompatible_quote_size_rows"
+    ] == 10
+    assert context["ready"] is True
+
+
+def test_v4_history_loader_reports_quote_size_warmup_without_compatible_rows(
+    tmp_path,
+) -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.output_dir = Path(tmp_path)
+    runtime.live_inventory_basis_v4_profile = (
+        "eth_short_execution_calibrated_20260724_n10"
+    )
+    runtime.live_inventory_basis_v4_history = deque()
+    runtime.live_inventory_basis_v4_next_history_sample_at = 0.0
+    runtime.live_inventory_basis_v4_history_ready = False
+    runtime.live_inventory_basis_v4_history_reason = "not_loaded"
+    asset_dir = Path(tmp_path) / "basis_samples" / "ETH"
+    asset_dir.mkdir(parents=True)
+    now = datetime.now(timezone.utc).timestamp()
+    row = {
+        "asset": "ETH",
+        "logged_at": datetime.fromtimestamp(
+            now - 30, tz=timezone.utc
+        ).isoformat(),
+        "sample_kind": "baseline",
+        "sample_quality": "valid",
+        "short_edge_bps": "10",
+    }
+    (asset_dir / "2026-07-24.jsonl").write_text(
+        json.dumps(row) + "\n",
+        encoding="utf-8",
+    )
+
+    context = runtime.load_live_inventory_basis_v4_history(asset="ETH")
+
+    assert context["ready"] is False
+    assert context["reason"] == "quote_size_mode_warmup"
+    assert context["compatible_source_rows"] == 0
+    assert context["incompatible_quote_size_rows"] == 1
+
+
+def test_v4_history_loader_does_not_use_legacy_health_during_size_migration(
+    tmp_path,
+) -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.output_dir = Path(tmp_path)
+    runtime.live_inventory_basis_v4_profile = (
+        "eth_short_execution_calibrated_20260724_n10"
+    )
+    runtime.live_inventory_basis_v4_history = deque()
+    runtime.live_inventory_basis_v4_next_history_sample_at = 0.0
+    runtime.live_inventory_basis_v4_history_ready = False
+    runtime.live_inventory_basis_v4_history_reason = "not_loaded"
+    asset_dir = Path(tmp_path) / "basis_samples" / "ETH"
+    asset_dir.mkdir(parents=True)
+    now = datetime.now(timezone.utc).timestamp()
+    rows = [
+        {
+            "asset": "ETH",
+            "logged_at": datetime.fromtimestamp(
+                timestamp, tz=timezone.utc
+            ).isoformat(),
+            "sample_kind": "baseline",
+            "sample_quality": "valid",
+            "short_edge_bps": str(edge_bps),
+        }
+        for timestamp, edge_bps in _v4_rolling_anchor_rows(
+            now,
+            [
+                (now - 3001 + index * 30, Decimal(index))
+                for index in range(101)
+            ],
+        )
+    ]
+    (asset_dir / "2026-07-24.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    context = runtime.load_live_inventory_basis_v4_history(asset="ETH")
+
+    assert context["ready"] is False
+    assert context["reason"] == "quote_size_mode_warmup"
+    assert context["compatible_source_rows"] == 0
+    assert context["incompatible_quote_size_rows"] == 5760
+    assert context["directions"]["short_var_long_lighter"]["ready"] is False
+    assert context["directions"]["short_var_long_lighter"][
+        "reason"
+    ] == "quote_size_mode_warmup"
+    assert context["directions"]["short_var_long_lighter"][
+        "v4_health_ready"
+    ] is False
+    assert context["directions"]["short_var_long_lighter"][
+        "v4_quote_size_migration"
+    ] == "legacy_frozen"
 
 
 def test_extension_disconnect_fuse_stops_flat_runtime_after_three_failures() -> None:
@@ -2573,6 +2797,7 @@ def test_v4_history_loader_does_not_authorize_recent_1h_without_7d_anchor(
             ).isoformat(),
             "sample_kind": "baseline",
             "sample_quality": "valid",
+            "quote_size_mode": "exact_base_qty_v1",
             "short_edge_bps": str(index),
         }
         for index in range(101)
@@ -3843,6 +4068,20 @@ def _eth_inventory_snapshot() -> CrossSpreadSnapshot:
     return snapshot
 
 
+def _test_basis_quote_with_metadata(
+    quote: dict[str, object],
+    *,
+    asset: str,
+    qty: object,
+) -> dict[str, object]:
+    return {
+        **quote,
+        "quote_asset": asset,
+        "quote_request_qty": str(qty),
+        "quote_size_mode": "exact_base_qty_v1",
+    }
+
+
 def _set_test_lighter_book(
     runtime: VariationalToLighterRuntime,
     *,
@@ -3859,7 +4098,172 @@ def _set_test_lighter_book(
     runtime.lighter_best_ask = ask_price
 
 
-def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tmp_path) -> None:
+def test_basis_quote_uses_exact_base_qty_and_records_quote_size_mode(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_lot_notional_usd = Decimal("20")
+        runtime.live_inventory_extension_disconnect_failures = 0
+        runtime.live_inventory_extension_failure_started_monotonic = 0.0
+        calls: list[dict] = []
+
+        async def fake_send_variational_place_order(**kwargs):
+            calls.append(kwargs)
+            return {
+                "ok": True,
+                "result": {
+                    "quoteId": "quote-1",
+                    "bid": "2499",
+                    "ask": "2501",
+                    "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+                },
+            }
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+
+        quote, elapsed_ms = await runtime.fetch_live_inventory_basis_quote(
+            asset="ETH",
+            qty=Decimal("0.00800"),
+            priority="background",
+        )
+
+        assert quote is not None
+        assert elapsed_ms is not None
+        assert Decimal(calls[0]["amount"]) == Decimal("0.008")
+        assert calls[0]["priority"] == "background"
+        assert Decimal(quote["quote_request_qty"]) == Decimal("0.008")
+        assert quote["quote_size_mode"] == "exact_base_qty_v1"
+
+    asyncio.run(run())
+
+
+def test_background_variational_quote_times_out_without_using_trade_lane(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_variational_order_limiter = RollingWindowRateLimiter(
+            normal_limit=30,
+            hard_limit=36,
+        )
+        runtime.variational_submit_transport = "api"
+        runtime.variational_api_max_slippage = 0.005
+        captured: dict = {}
+
+        async def slow_send_variational_command(**kwargs):
+            captured.update(kwargs)
+            await asyncio.sleep(1)
+            return {"ok": True}
+
+        runtime.send_variational_command = slow_send_variational_command
+        monkeypatch.setattr(
+            "main.LIVE_INVENTORY_VARIATIONAL_BACKGROUND_QUOTE_TIMEOUT_SECONDS",
+            0.01,
+        )
+        monkeypatch.setattr(
+            "main.LIVE_INVENTORY_VARIATIONAL_BACKGROUND_COMMAND_TIMEOUT_SECONDS",
+            0.01,
+        )
+
+        result = await runtime.send_variational_place_order(
+            asset="ETH",
+            side="BUY",
+            amount="0.008",
+            expected_min_btc_qty=None,
+            confirm=False,
+            reduce_only=False,
+            priority="background",
+        )
+
+        assert result["background_timeout"] is True
+        assert captured["lane"] == "background"
+
+    asyncio.run(run())
+
+
+def test_background_quote_cache_request_does_not_wait_for_rfq(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        started = asyncio.Event()
+
+        async def slow_fetch_live_inventory_basis_quote(**_kwargs):
+            started.set()
+            await asyncio.sleep(1)
+            return {"quoteId": "background-quote"}, Decimal("1000")
+
+        runtime.fetch_live_inventory_basis_quote = slow_fetch_live_inventory_basis_quote
+        start = time.monotonic()
+
+        quote, quote_ms = await runtime.get_live_inventory_basis_quote(
+            asset="ETH",
+            qty=Decimal("0.008"),
+            priority="background",
+        )
+
+        elapsed = time.monotonic() - start
+        assert quote is None
+        assert quote_ms is None
+        assert elapsed < 0.2
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+
+        task = runtime.live_inventory_basis_background_quote_task
+        assert task is not None
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        runtime.live_inventory_basis_background_quote_task = None
+
+    asyncio.run(run())
+
+
+def test_variational_order_reuses_final_quote_id(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_variational_order_limiter = RollingWindowRateLimiter(
+            normal_limit=30,
+            hard_limit=36,
+        )
+        runtime.variational_submit_transport = "api"
+        runtime.variational_api_max_slippage = 0.005
+        captured: dict = {}
+
+        async def fake_send_variational_command(**kwargs):
+            captured.update(kwargs)
+            return {"ok": True, "type": "VAR_API_ORDER_RESULT"}
+
+        runtime.send_variational_command = fake_send_variational_command
+
+        result = await runtime.send_variational_place_order(
+            asset="ETH",
+            side="SELL",
+            amount="0.008",
+            expected_min_btc_qty=None,
+            confirm=True,
+            reduce_only=False,
+            reuse_quote_id="quote-final",
+        )
+
+        assert result["ok"] is True
+        assert captured["payload"]["type"] == "VAR_API_ORDER"
+        assert captured["payload"]["reuseQuoteId"] == "quote-final"
+        assert captured["payload"]["requestId"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("refresh_entry_quote", "expected_quote_id", "lighter_started"),
+    [
+        (True, "refresh-quote", True),
+        (False, "signal-quote", True),
+        (False, "signal-quote", False),
+    ],
+)
+def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(
+    tmp_path,
+    refresh_entry_quote,
+    expected_quote_id,
+    lighter_started,
+) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
         runtime.live_inventory_signal_mode = "basis"
@@ -3897,16 +4301,33 @@ def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tm
         runtime.live_inventory_basis_max_entry_roundtrip_cost_bps = Decimal("4")
         runtime.live_inventory_basis_z_exit = Decimal("999")
         runtime.live_inventory_basis_min_exit_pnl_bps = Decimal("-999")
+        runtime.live_inventory_basis_refresh_entry_quote_before_submit = refresh_entry_quote
         runtime.pending_live_inventory_var_fill_matches = []
         calls: list[dict] = []
+        quote_calls = 0
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
+            nonlocal quote_calls
+            quote_calls += 1
+            if quote_calls == 1 or not refresh_entry_quote:
+                return {
+                    "quoteId": "signal-quote",
+                    "bid": "1753.00",
+                    "ask": "1753.25",
+                    "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+                    "quote_request_qty": "0.01139",
+                    "quote_size_mode": "exact_base_qty_v1",
+                    "quote_asset": "ETH",
+                }, Decimal("10")
             return {
-                "quoteId": "entry-quote",
-                "bid": "1753.00",
-                "ask": "1753.25",
-                "quoteTimestamp": "2999-06-16T03:25:20.000Z",
-            }, Decimal("10")
+                "quoteId": "refresh-quote",
+                "bid": "1753.10",
+                "ask": "1753.35",
+                    "quoteTimestamp": "2999-06-16T03:25:21.000Z",
+                    "quote_request_qty": "0.01139",
+                    "quote_size_mode": "exact_base_qty_v1",
+                    "quote_asset": "ETH",
+                }, Decimal("10")
 
         async def fake_send_variational_place_order(**kwargs):
             calls.append({"venue": "var", **kwargs})
@@ -3923,15 +4344,25 @@ def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tm
                 mode="live",
                 last_variational_status="",
             )
-            record.processing_stage = "live_submit_sent"
-            record.lighter_fill_ts_iso = "2999-06-16T03:25:21.000Z"
-            record.lighter_fill_price = Decimal("1755.00")
+            record.processing_stage = (
+                "live_submit_sent" if lighter_started else "planned"
+            )
+            if lighter_started:
+                record.lighter_fill_ts_iso = "2999-06-16T03:25:21.000Z"
+                record.lighter_fill_price = Decimal("1755.00")
             runtime.records[record.trade_key] = record
             return record, {"trade_key": "entry-1"}
 
         runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
         runtime.send_variational_place_order = fake_send_variational_place_order
         runtime.place_lighter_order_from_plan = fake_place_lighter_order_from_plan
+        if not lighter_started:
+            async def fail_auto_close(**_kwargs):
+                raise AssertionError(
+                    "must not compensate before the accepted Var order is reconciled"
+                )
+
+            runtime.try_auto_close_unhedged_live_inventory_leg = fail_auto_close
 
         await runtime.maybe_run_live_inventory_basis(_eth_inventory_snapshot())
 
@@ -3940,10 +4371,37 @@ def test_live_inventory_basis_real_entry_submits_var_and_lighter_concurrently(tm
         assert {call["venue"] for call in calls} == {"var", "lighter"}
         var_call = next(call for call in calls if call["venue"] == "var")
         assert var_call["confirm"] is True
-        assert var_call["reuse_quote_id"] is None
+        assert var_call["reuse_quote_id"] == expected_quote_id
         assert runtime.live_inventory_open_lots == []
         assert len(runtime.pending_live_inventory_var_fill_matches) == 1
         assert runtime.pending_live_inventory_var_fill_matches[0].role == "live_inventory_entry_pending_var_fill"
+        pending_context = runtime.pending_live_inventory_var_fill_matches[0].context
+        if not lighter_started:
+            state = json.loads(
+                runtime.live_inventory_state_file.read_text(encoding="utf-8")
+            )
+            assert runtime.stop_flag is True
+            assert pending_context["execution_unknown"] is True
+            assert pending_context["reconciliation_required"] is True
+            assert pending_context["lighter_submit_failed"] is True
+            assert state["status"] == "manual_review_required"
+            assert state["pending_actions"][0]["reconciliation_required"] is True
+            return
+        assert pending_context["quote_id"] == expected_quote_id
+        assert pending_context["signal_quote_id"] == "signal-quote"
+        assert pending_context["entry_order_reuses_quote_id"] is True
+        assert pending_context["entry_order_reuses_signal_quote"] is (not refresh_entry_quote)
+        assert pending_context["quote_timestamp"] == (
+            "2999-06-16T03:25:21.000Z"
+            if refresh_entry_quote
+            else "2999-06-16T03:25:20.000Z"
+        )
+        assert pending_context["var_bid"] == (
+            "1753.10" if refresh_entry_quote else "1753.00"
+        )
+        assert pending_context["var_ask"] == (
+            "1753.35" if refresh_entry_quote else "1753.25"
+        )
         runtime.pending_live_inventory_var_fill_matches[0].context.update(
             {
                 "entry_gradient_tier": 3,
@@ -4035,12 +4493,16 @@ def test_live_inventory_basis_abs_entry_threshold_blocks_thin_basis(tmp_path) ->
         runtime.live_inventory_basis_state.last_ts = time.monotonic()
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {
-                "quoteId": "entry-quote",
-                "bid": "1753.00",
-                "ask": "1753.25",
-                "quoteTimestamp": "2999-06-16T03:25:20.000Z",
-            }, Decimal("10")
+            return _test_basis_quote_with_metadata(
+                {
+                    "quoteId": "entry-quote",
+                    "bid": "1753.00",
+                    "ask": "1753.25",
+                    "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+                },
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
 
@@ -4105,12 +4567,16 @@ def test_live_inventory_basis_collect_only_logs_state_without_touching_inventory
             return {}
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {
-                "quoteId": "collect-quote",
-                "bid": "1753.00",
-                "ask": "1753.25",
-                "quoteTimestamp": "2999-06-16T03:25:20.000Z",
-            }, Decimal("10")
+            return _test_basis_quote_with_metadata(
+                {
+                    "quoteId": "collect-quote",
+                    "bid": "1753.00",
+                    "ask": "1753.25",
+                    "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+                },
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         async def refuse_submit(**_kwargs):
             raise AssertionError("collect-only must not submit orders")
@@ -4156,12 +4622,16 @@ def test_live_inventory_basis_var_quote_age_guard_blocks_entry(tmp_path) -> None
         runtime.live_inventory_basis_state.last_ts = time.monotonic()
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {
-                "quoteId": "entry-quote",
-                "bid": "1753.00",
-                "ask": "1753.25",
-                "quoteTimestamp": "2000-01-01T00:00:00.000Z",
-            }, Decimal("10")
+            return _test_basis_quote_with_metadata(
+                {
+                    "quoteId": "entry-quote",
+                    "bid": "1753.00",
+                    "ask": "1753.25",
+                    "quoteTimestamp": "2000-01-01T00:00:00.000Z",
+                },
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
 
@@ -4214,12 +4684,16 @@ def test_live_inventory_basis_real_entry_rejected_after_concurrent_lighter_requi
         calls: list[dict] = []
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {
-                "quoteId": "entry-quote",
-                "bid": "1753.00",
-                "ask": "1753.25",
-                "quoteTimestamp": "2999-06-16T03:25:20.000Z",
-            }, Decimal("10")
+            return _test_basis_quote_with_metadata(
+                {
+                    "quoteId": "entry-quote",
+                    "bid": "1753.00",
+                    "ask": "1753.25",
+                    "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+                },
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         async def fake_send_variational_place_order(**kwargs):
             calls.append({"venue": "var", **kwargs})
@@ -4359,12 +4833,16 @@ def test_live_inventory_basis_addon_submits_when_basis_expands(tmp_path) -> None
         calls: list[dict] = []
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {
-                "quoteId": "addon-quote",
-                "bid": "1724.00",
-                "ask": "1724.30",
-                "quoteTimestamp": "2999-06-16T03:25:20.000Z",
-            }, Decimal("10")
+            return _test_basis_quote_with_metadata(
+                {
+                    "quoteId": "addon-quote",
+                    "bid": "1724.00",
+                    "ask": "1724.30",
+                    "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+                },
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         async def fake_send_variational_place_order(**kwargs):
             calls.append(kwargs)
@@ -4441,12 +4919,16 @@ def test_live_inventory_basis_max_hold_warn_does_not_exit(tmp_path) -> None:
         submit_calls: list[str] = []
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {
-                "quoteId": "exit-quote",
-                "bid": "1723.01",
-                "ask": "1723.43",
-                "quoteTimestamp": "2999-06-16T03:25:20.000Z",
-            }, Decimal("10")
+            return _test_basis_quote_with_metadata(
+                {
+                    "quoteId": "exit-quote",
+                    "bid": "1723.01",
+                    "ask": "1723.43",
+                    "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+                },
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         async def fake_send_variational_place_order(**_kwargs):
             submit_calls.append("var")
@@ -4509,7 +4991,11 @@ def test_live_inventory_basis_exit_submits_var_before_lighter(tmp_path) -> None:
         calls: list[str] = []
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"}, Decimal("10")
+            return _test_basis_quote_with_metadata(
+                {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"},
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         async def fake_send_variational_place_order(**_kwargs):
             calls.append("var")
@@ -4588,7 +5074,11 @@ def test_live_inventory_basis_exit_reconciles_var_no_position_before_lighter(tmp
         calls: list[str] = []
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"}, Decimal("10")
+            return _test_basis_quote_with_metadata(
+                {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"},
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         async def fake_send_variational_place_order(**_kwargs):
             calls.append("var")
@@ -4687,7 +5177,11 @@ def test_live_inventory_basis_exit_can_skip_blocked_first_lot(tmp_path) -> None:
         exited_lots: list[int] = []
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"}, Decimal("10")
+            return _test_basis_quote_with_metadata(
+                {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"},
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         async def fake_send_variational_place_order(**kwargs):
             return {"ok": True, "result": {"quoteId": "exit-quote", "amount": kwargs["amount"]}}
@@ -4768,7 +5262,11 @@ def test_live_inventory_basis_exit_safety_buffer_raises_effective_threshold(tmp_
         runtime.live_inventory_sample_index = 500
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"}, Decimal("10")
+            return _test_basis_quote_with_metadata(
+                {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"},
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
         snapshot = _eth_inventory_snapshot()
@@ -4826,7 +5324,11 @@ def test_live_inventory_basis_dynamic_exit_buffer_uses_recent_shortfall(tmp_path
         runtime.live_inventory_sample_index = 500
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"}, Decimal("10")
+            return _test_basis_quote_with_metadata(
+                {"quoteId": "exit-quote", "bid": "1710", "ask": "1710.5"},
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
         snapshot = _eth_inventory_snapshot()
@@ -4892,7 +5394,11 @@ def test_live_inventory_basis_refresh_exit_quote_blocks_stale_profitable_exit(tm
         ]
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return quotes.pop(0), Decimal("10")
+            return _test_basis_quote_with_metadata(
+                quotes.pop(0),
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         async def fake_get_lighter_best_bid_ask():
             _set_test_lighter_book(runtime, bid="1719", ask="1720")
@@ -4920,6 +5426,84 @@ def test_live_inventory_basis_refresh_exit_quote_blocks_stale_profitable_exit(tm
     asyncio.run(run())
 
 
+def test_live_inventory_basis_refresh_exit_quote_requires_quote_id(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_signal_mode = "basis"
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.accepted_assets = {"ETH"}
+        runtime.live_inventory_basis_z_exit = Decimal("999")
+        runtime.live_inventory_basis_min_exit_pnl_bps = Decimal("1")
+        runtime.live_inventory_basis_refresh_exit_quote_before_submit = True
+        runtime.live_inventory_basis_state = LiveInventoryBasisState(
+            half_life_seconds=300,
+            warmup_samples=1,
+            gap_reset_seconds=30,
+            sigma_floor_bps=0,
+        )
+        runtime.live_inventory_basis_state.mean = -10.0
+        runtime.live_inventory_basis_state.var = 1.0
+        runtime.live_inventory_basis_state.seen = 10
+        runtime.live_inventory_basis_state.last_ts = time.monotonic()
+        runtime.live_inventory_open_lots = [
+            {
+                "lot_id": 1,
+                "signal_mode": "basis",
+                "direction": "long_var_short_lighter",
+                "qty": "0.01",
+                "entry_var_side": "BUY",
+                "entry_var_fill_price": "1700",
+                "entry_lighter_fill_price": "1720",
+                "entry_cost_status": "final_fills_confirmed",
+                "entered_sample_index": 1,
+                "status": "open",
+            }
+        ]
+        quotes = [
+            {
+                "quoteId": "signal-quote",
+                "bid": "1753",
+                "ask": "1753.5",
+            },
+            {"bid": "1730", "ask": "1730.5"},
+        ]
+
+        async def fake_fetch_live_inventory_basis_quote(**_kwargs):
+            return _test_basis_quote_with_metadata(
+                quotes.pop(0),
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
+
+        async def fake_get_lighter_best_bid_ask():
+            _set_test_lighter_book(runtime, bid="1719", ask="1720")
+            return Decimal("1719"), Decimal("1720")
+
+        async def fake_send_variational_place_order(**_kwargs):
+            raise AssertionError("must not submit after a refreshed quote lost its quote id")
+
+        runtime.fetch_live_inventory_basis_quote = fake_fetch_live_inventory_basis_quote
+        runtime.get_lighter_best_bid_ask = fake_get_lighter_best_bid_ask
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        _set_test_lighter_book(runtime, bid="1719", ask="1720")
+
+        snapshot = _eth_inventory_snapshot()
+        snapshot.var_sell_price = Decimal("1753")
+        snapshot.lighter_buy_price = Decimal("1755.1")
+        snapshot.lighter_buy_fill_price = Decimal("1755.1")
+        await runtime.maybe_run_live_inventory_basis(snapshot)
+
+        rows = [
+            json.loads(line)
+            for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()
+        ]
+        assert runtime.live_inventory_open_lots
+        assert rows[-1]["event"] == "live_inventory_exit_blocked"
+        assert rows[-1]["reason"] == "basis_exit_refresh_quote_id_missing"
+
+    asyncio.run(run())
+
+
 def test_live_inventory_basis_refreshed_exit_context_uses_lighter_depth(
     tmp_path,
 ) -> None:
@@ -4927,9 +5511,11 @@ def test_live_inventory_basis_refreshed_exit_context_uses_lighter_depth(
         runtime = _live_inventory_runtime(tmp_path)
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {"quoteId": "refresh-1", "bid": "99.8", "ask": "99.9"}, Decimal(
-                "12"
-            )
+            return _test_basis_quote_with_metadata(
+                {"quoteId": "refresh-1", "bid": "99.8", "ask": "99.9"},
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("12")
 
         async def fake_get_lighter_best_bid_ask():
             return Decimal("100.2"), Decimal("100.3")
@@ -5271,12 +5857,17 @@ def test_live_inventory_basis_pending_entry_timeout_requires_manual_review(tmp_p
         state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
         rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
         assert timed_out is True
-        assert runtime.pending_live_inventory_var_fill_matches == []
+        assert len(runtime.pending_live_inventory_var_fill_matches) == 1
+        pending_context = runtime.pending_live_inventory_var_fill_matches[0].context
+        assert pending_context["execution_unknown"] is True
+        assert pending_context["reconciliation_required"] is True
+        assert pending_context["execution_unknown_reason"] == "basis_entry_var_fill_timeout"
         assert runtime.stop_flag is True
         assert state["status"] == "manual_review_required"
         assert state["manual_review_reason"] == "basis_entry_var_fill_timeout"
         assert state["manual_review_context"]["lot_id"] == 1
         assert state["manual_review_context"]["variational_position_qty"] == "0"
+        assert state["pending_actions"][0]["reconciliation_required"] is True
         assert rows[-1]["event"] == "live_inventory_manual_review_required"
         assert rows[-1]["reason"] == "basis_entry_var_fill_timeout"
 
@@ -5311,7 +5902,13 @@ def test_live_inventory_basis_pending_entry_timeout_detects_var_position(tmp_pat
         assert state["status"] == "manual_review_required"
         assert state["manual_review_reason"] == "basis_entry_var_fill_timeout_position_detected"
         assert state["manual_review_context"]["variational_position_qty"] == "0.011535"
-        assert runtime.pending_live_inventory_var_fill_matches == []
+        assert len(runtime.pending_live_inventory_var_fill_matches) == 1
+        pending_context = runtime.pending_live_inventory_var_fill_matches[0].context
+        assert pending_context["execution_unknown"] is True
+        assert pending_context["reconciliation_required"] is True
+        assert pending_context["execution_unknown_reason"] == (
+            "basis_entry_var_fill_timeout_position_detected"
+        )
         assert runtime.stop_flag is True
 
     asyncio.run(run())
@@ -5439,12 +6036,16 @@ def test_live_inventory_basis_taker_funding_reject_cooldown_blocks_next_entry(tm
             }
 
         async def fake_fetch_live_inventory_basis_quote(**_kwargs):
-            return {
-                "quoteId": "entry-quote",
-                "bid": "1753.00",
-                "ask": "1753.25",
-                "quoteTimestamp": "2999-06-16T03:25:20.000Z",
-            }, Decimal("10")
+            return _test_basis_quote_with_metadata(
+                {
+                    "quoteId": "entry-quote",
+                    "bid": "1753.00",
+                    "ask": "1753.25",
+                    "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+                },
+                asset="ETH",
+                qty=_kwargs["qty"],
+            ), Decimal("10")
 
         async def fake_send_variational_place_order(**_kwargs):
             calls.append("var")
@@ -5465,6 +6066,62 @@ def test_live_inventory_basis_taker_funding_reject_cooldown_blocks_next_entry(tm
         assert state["last_blocked_reason"] == "variational_taker_funding_reject_cooldown_active"
         assert rows[-1]["event"] == "live_inventory_entry_blocked"
         assert rows[-1]["reason"] == "variational_taker_funding_reject_cooldown_active"
+
+    asyncio.run(run())
+
+
+def test_live_inventory_basis_pending_entry_cleared_without_fill_details_is_retained(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.stop_flag = False
+        runtime.auto_live_match_window_seconds = 30
+        runtime.pending_live_inventory_var_fill_matches = [
+            PendingLiveInventoryVarFillMatch(
+                asset="ETH",
+                side="buy",
+                qty=Decimal("0.011535"),
+                lot_id=1,
+                role="live_inventory_entry_pending_var_fill",
+                created_at_monotonic=time.monotonic() - 31,
+                context={"rfq_id": "rfq-cleared-missing"},
+            )
+        ]
+
+        async def fake_fetch_variational_orders(**_kwargs):
+            return {
+                "ok": True,
+                "result": {
+                    "orders": {
+                        "result": [
+                            {
+                                "rfq_id": "rfq-cleared-missing",
+                                "order_id": "order-cleared-missing",
+                                "status": "cleared",
+                            }
+                        ]
+                    }
+                },
+            }
+
+        runtime.fetch_variational_orders = fake_fetch_variational_orders
+
+        resolved = await runtime.maybe_timeout_pending_live_inventory_var_entry(
+            asset="ETH"
+        )
+
+        state = json.loads(
+            runtime.live_inventory_state_file.read_text(encoding="utf-8")
+        )
+        assert resolved is True
+        assert len(runtime.pending_live_inventory_var_fill_matches) == 1
+        pending_context = runtime.pending_live_inventory_var_fill_matches[0].context
+        assert pending_context["execution_unknown"] is True
+        assert pending_context["reconciliation_required"] is True
+        assert state["status"] == "manual_review_required"
+        assert state["pending_actions"][0]["rfq_id"] == "rfq-cleared-missing"
+        assert state["pending_actions"][0]["reconciliation_required"] is True
 
     asyncio.run(run())
 
