@@ -35,3 +35,14 @@ def test_extension_can_fetch_portfolio_through_authenticated_page() -> None:
     assert "request_timeout" in api_script
     assert "operationTimeoutMs" in api_script
     assert "timedOut: Boolean(response.timedOut)" in api_script
+
+
+def test_extension_supports_explicit_variational_instrument_types() -> None:
+    api_script = (ROOT / "chrome_extension" / "var_api.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'o.instrumentType || o.instrument_type || "perpetual_future"' in api_script
+    assert '["perpetual_future", "swap"]' in api_script
+    assert 'instrument_type: instrumentType' in api_script
+    assert 'instrumentType: instrument.instrument_type' in api_script

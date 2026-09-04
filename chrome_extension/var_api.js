@@ -121,9 +121,17 @@ export function buildVariationalApiScript(action, params) {
       rateLimitResetMs: response.rateLimitResetMs,
       ...(extra || {})
     });
+    const instrumentType = String(o.instrumentType || o.instrument_type || "perpetual_future");
+    if (!["perpetual_future", "swap"].includes(instrumentType)) {
+      return {
+        ok: false,
+        step: "precheck",
+        error: "Unsupported Variational instrument type: " + instrumentType
+      };
+    }
     const instrument = {
       underlying: o.market || "BTC",
-      instrument_type: "perpetual_future",
+      instrument_type: instrumentType,
       settlement_asset: o.settlementAsset || "USDC",
       funding_interval_s: o.fundingIntervalS || 3600
     };
@@ -174,6 +182,7 @@ export function buildVariationalApiScript(action, params) {
         ask: quote.ask,
         markPrice: quote.mark_price,
         indexPrice: quote.index_price,
+        instrumentType: instrument.instrument_type,
         quoteTimestamp: quote.timestamp,
         raw: quote,
         httpStatus: response.status,
