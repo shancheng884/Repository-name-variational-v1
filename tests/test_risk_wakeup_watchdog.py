@@ -125,6 +125,28 @@ def test_flat_stopped_strategy_is_warning_only() -> None:
     ]
 
 
+def test_recent_degraded_account_snapshot_does_not_raise_incident() -> None:
+    now = datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc)
+    incidents = evaluate_incidents(
+        state={"status": "flat", "asset": "ETH", "open_lots": []},
+        risk_health={
+            "updated_at": now.isoformat(),
+            "risk_action": "normal",
+            "risk_reason": "account_risk_normal",
+            "variational_account_snapshot_fresh": False,
+            "variational_account_snapshot_usable": True,
+            "variational_account_snapshot_degraded": True,
+            "variational_account_snapshot_age_seconds": 120,
+        },
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=now,
+    )
+
+    assert incidents == []
+
+
 def test_force_reduce_margin_and_position_mismatch_are_critical() -> None:
     now = datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc)
     incidents = evaluate_incidents(

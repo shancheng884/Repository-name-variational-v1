@@ -191,6 +191,7 @@ LIVE_INVENTORY_LIGHTER_ORDER_RATE_NORMAL_PER_MINUTE = 30
 LIVE_INVENTORY_LIGHTER_ORDER_RATE_HARD_PER_MINUTE = 36
 LIVE_INVENTORY_BASIS_QUOTE_SIZE_MODE = "exact_base_qty_v1"
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_MAX_AGE_SECONDS = 60.0
+LIVE_INVENTORY_VARIATIONAL_ACCOUNT_USABLE_MAX_AGE_SECONDS = 300.0
 LIVE_INVENTORY_ACCOUNT_RECOVERY_CONFIRM_SAMPLES = 3
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS = 5
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_CHILD_LOTS = 25
@@ -4345,8 +4346,16 @@ class VariationalToLighterRuntime:
         advance_confirmation: bool = False,
     ) -> dict[str, Any]:
         result = dict(context)
-        fresh = bool(
+        strictly_fresh = bool(
             result.get("variational_account_snapshot_fresh")
+            and result.get("variational_equity_usd") not in (None, "")
+            and result.get("lighter_equity_usd") not in (None, "")
+        )
+        usable = bool(
+            result.get(
+                "variational_account_snapshot_usable",
+                result.get("variational_account_snapshot_fresh"),
+            )
             and result.get("variational_equity_usd") not in (None, "")
             and result.get("lighter_equity_usd") not in (None, "")
         )
@@ -4360,17 +4369,40 @@ class VariationalToLighterRuntime:
                 )
             ),
         )
-        if not fresh:
+        recovery_reason = str(
+            getattr(self, "live_inventory_account_recovery_reason", None) or ""
+        )
+        startup_confirmation = recovery_reason == "startup_confirmation_required"
+        healthy_for_gate = strictly_fresh if startup_confirmation else usable
+        if not healthy_for_gate:
             self.live_inventory_account_recovery_required = True
             self.live_inventory_account_recovery_confirm_count = 0
-            self.live_inventory_account_recovery_reason = str(
-                result.get("risk_reason")
-                or result.get("variational_account_snapshot_freshness_reason")
-                or "variational_account_snapshot_stale"
-            )
+            if not startup_confirmation:
+                self.live_inventory_account_recovery_reason = str(
+                    result.get("risk_reason")
+                    or result.get("variational_account_snapshot_freshness_reason")
+                    or "variational_account_snapshot_stale"
+                )
+            elif result.get("risk_action") == "normal":
+                result["risk_action"] = "block_entry"
+                result["risk_reason"] = (
+                    "variational_account_recovery_confirmation_pending"
+                )
             self.clear_live_inventory_entry_confirmations_after_account_recovery()
         elif getattr(self, "live_inventory_account_recovery_required", False):
-            if advance_confirmation:
+            recovery_reason = str(
+                getattr(self, "live_inventory_account_recovery_reason", None) or ""
+            )
+            stale_snapshot_recovered = bool(
+                recovery_reason == "variational_account_snapshot_stale"
+                and strictly_fresh
+            )
+            if stale_snapshot_recovered:
+                # A successful fresh API/account update is already a direct
+                # recovery confirmation. Do not hold entries for three more
+                # monitor cycles or generate a second, misleading incident.
+                self.live_inventory_account_recovery_confirm_count = required_samples
+            elif advance_confirmation:
                 self.live_inventory_account_recovery_confirm_count = min(
                     required_samples,
                     int(
@@ -4487,7 +4519,15 @@ class VariationalToLighterRuntime:
         raw_variational_equity = to_decimal(
             variational_metrics.get("equity_usd")
         )
-        if not variational_freshness["fresh"]:
+        variational_snapshot_age_seconds = variational_freshness["age_seconds"]
+        variational_snapshot_usable = bool(
+            raw_variational_equity is not None
+            and variational_snapshot_age_seconds is not None
+            and variational_snapshot_age_seconds >= -5.0
+            and variational_snapshot_age_seconds
+            <= LIVE_INVENTORY_VARIATIONAL_ACCOUNT_USABLE_MAX_AGE_SECONDS
+        )
+        if not variational_snapshot_usable:
             variational_metrics = dict(variational_metrics)
             variational_metrics["equity_usd"] = None
         lighter_metrics: dict[str, Any]
@@ -4525,11 +4565,20 @@ class VariationalToLighterRuntime:
         context["variational_account_snapshot_freshness_reason"] = (
             variational_freshness["reason"]
         )
+        context["variational_account_snapshot_usable"] = (
+            variational_snapshot_usable
+        )
+        context["variational_account_snapshot_degraded"] = bool(
+            variational_snapshot_usable and not variational_freshness["fresh"]
+        )
+        context["variational_account_snapshot_usable_max_age_seconds"] = (
+            LIVE_INVENTORY_VARIATIONAL_ACCOUNT_USABLE_MAX_AGE_SECONDS
+        )
         context["variational_raw_equity_usd"] = decimal_to_str(
             raw_variational_equity
         )
         context.update(portfolio_refresh_context)
-        if not variational_freshness["fresh"]:
+        if not variational_snapshot_usable:
             context["risk_action"] = "block_entry"
             context["risk_reason"] = "variational_account_snapshot_stale"
         if lighter_metrics.get("risk_fetch_error"):
@@ -6739,6 +6788,23 @@ class VariationalToLighterRuntime:
         reference_price: Decimal | None,
     ) -> Decimal | None:
         """Return the base quantity used by both the RFQ and the order."""
+        open_qty_counts: dict[Decimal, int] = {}
+        for lot in list(getattr(self, "live_inventory_open_lots", []) or []):
+            lot_qty = to_decimal(lot.get("qty"))
+            if lot_qty is None or lot_qty <= 0:
+                continue
+            common_qty = self.live_inventory_common_order_qty(
+                asset=asset,
+                qty=lot_qty,
+            )
+            if common_qty <= 0:
+                continue
+            open_qty_counts[common_qty] = open_qty_counts.get(common_qty, 0) + 1
+        if open_qty_counts:
+            # Most V4 child lots share one exact quantity. Quoting that quantity
+            # lets a confirmed exit reuse the current RFQ instead of waiting for
+            # another multi-second browser round trip.
+            return max(open_qty_counts, key=lambda qty: open_qty_counts[qty])
         if reference_price is None or reference_price <= 0:
             return None
         planned_qty = self.live_inventory_lot_notional_usd / reference_price
@@ -13884,6 +13950,9 @@ class VariationalToLighterRuntime:
                     "variational_account_max_age_seconds": (
                         LIVE_INVENTORY_VARIATIONAL_ACCOUNT_MAX_AGE_SECONDS
                     ),
+                    "variational_account_usable_max_age_seconds": (
+                        LIVE_INVENTORY_VARIATIONAL_ACCOUNT_USABLE_MAX_AGE_SECONDS
+                    ),
                     "execution_policy": "adaptive_execution_v4_gradient",
                     "shadow_features": [
                         "stablecoin_alignment",
@@ -15585,6 +15654,10 @@ class VariationalToLighterRuntime:
         if var_bid is None or var_ask is None:
             return
         quote_request_qty = to_decimal(quote.get("quote_request_qty"))
+        quote_id = quote.get("quoteId") or quote.get("quote_id")
+        quote_timestamp = quote.get("quoteTimestamp") or quote.get(
+            "quote_timestamp"
+        )
         quote_asset = str(quote.get("quote_asset") or "").upper()
         quote_size_mode = str(quote.get("quote_size_mode") or "")
         if (
@@ -18897,6 +18970,37 @@ class VariationalToLighterRuntime:
             entry_var_price = to_decimal(candidate_lot.get("entry_var_fill_price")) or var_exit_price
             entry_lighter_price = to_decimal(candidate_lot.get("entry_lighter_fill_price")) or lighter_exit_price
             qty = to_decimal(candidate_lot.get("qty")) or Decimal("0")
+            current_exit_lighter_depth = (
+                long_exit_lighter_depth
+                if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                else short_exit_lighter_depth
+                if direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
+                else None
+            )
+            current_quote_reuse_ok, _, current_quote_reuse_context = (
+                self.live_inventory_basis_quote_reuse_validation(
+                    asset=asset,
+                    quote_id=str(quote_id) if quote_id else None,
+                    quote_qty=quote_request_qty,
+                    submitted_qty=qty,
+                    quote_size_mode=quote_size_mode,
+                    quote_timestamp=(
+                        str(quote_timestamp) if quote_timestamp else None
+                    ),
+                    quote_asset=quote_asset,
+                )
+            )
+            current_quote_matches_lot = bool(
+                not portfolio_exit_selected
+                and current_quote_reuse_ok
+                and var_quote_age_ok
+                and lighter_book_age_ok
+                and current_exit_lighter_depth is not None
+                and to_decimal(
+                    current_exit_lighter_depth.get("estimated_fill_price")
+                )
+                is not None
+            )
             _, _, pnl = self.live_inventory_pair_pnl(
                 direction=direction,
                 qty=qty,
@@ -18907,6 +19011,15 @@ class VariationalToLighterRuntime:
             )
             notional = qty * entry_var_price
             pnl_bps = pnl / notional * Decimal("10000") if notional else None
+            if current_quote_matches_lot and pnl_bps is not None:
+                prior_executable_mfe = to_decimal(
+                    candidate_lot.get("executable_exit_mfe_pnl_bps")
+                )
+                candidate_lot["executable_exit_mfe_pnl_bps"] = decimal_to_str(
+                    pnl_bps
+                    if prior_executable_mfe is None
+                    else max(prior_executable_mfe, pnl_bps)
+                )
             convergence_velocity_bps_per_minute: Decimal | None = None
             if pnl_bps is not None:
                 prior_pnl_bps = to_decimal(candidate_lot.get("shadow_last_pnl_bps"))
@@ -19021,10 +19134,56 @@ class VariationalToLighterRuntime:
                     and pnl_bps >= effective_min_exit_pnl_bps
                 ) or portfolio_exit_selected
                 should_exit = raw_should_exit and var_quote_age_ok and lighter_book_age_ok
-                if not should_exit and not portfolio_exit_selected:
-                    self.live_inventory_basis_v4_reset_exit_confirmation(
-                        candidate_lot
+                current_quote_confirmation_pending = False
+                if (
+                    current_quote_matches_lot
+                    and not portfolio_exit_selected
+                ):
+                    current_quote_eligible = should_exit
+                    should_exit, confirmation_count = (
+                        self.live_inventory_basis_v4_confirm_exit_candidate(
+                            candidate_lot,
+                            eligible=current_quote_eligible,
+                        )
                     )
+                    current_quote_confirmation_pending = bool(
+                        current_quote_eligible and not should_exit
+                    )
+                    if current_quote_confirmation_pending and (
+                        self.should_log_live_inventory_exit_blocked(
+                            lot_id=candidate_lot.get("lot_id"),
+                            reason="v4_exact_quote_confirmation_pending",
+                        )
+                    ):
+                        await self.append_live_inventory_log(
+                            "live_inventory_exit_blocked",
+                            {
+                                **state_payload,
+                                "lot_id": candidate_lot.get("lot_id"),
+                                "basis_trace_id": candidate_lot.get(
+                                    "basis_trace_id"
+                                ),
+                                "direction": direction,
+                                "reason": "v4_exact_quote_confirmation_pending",
+                                "pnl_bps": decimal_to_str(pnl_bps),
+                                "effective_min_exit_pnl_bps": decimal_to_str(
+                                    effective_min_exit_pnl_bps
+                                ),
+                                "confirmation_count": confirmation_count,
+                                "confirmation_required": (
+                                    LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
+                                ),
+                                "confirmation_window": (
+                                    LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_WINDOW_SAMPLES
+                                ),
+                                "quote_reuse_eligible": True,
+                            },
+                        )
+                if not should_exit and not portfolio_exit_selected:
+                    if not current_quote_matches_lot:
+                        self.live_inventory_basis_v4_reset_exit_confirmation(
+                            candidate_lot
+                        )
                 # V4 has no time-driven exit or target relaxation. Account risk,
                 # executable profit, and the independent loss fuse are the only exits.
                 should_timeout = False
@@ -19114,7 +19273,15 @@ class VariationalToLighterRuntime:
                         ),
                     },
                 )
-            if raw_should_exit and not should_exit:
+            if (
+                raw_should_exit
+                and not should_exit
+                and not (
+                    v4_mode
+                    and current_quote_matches_lot
+                    and not portfolio_exit_selected
+                )
+            ):
                 await self.append_live_inventory_log(
                     "live_inventory_exit_blocked",
                     {
@@ -19159,6 +19326,23 @@ class VariationalToLighterRuntime:
                     "effective_min_exit_pnl_bps": effective_min_exit_pnl_bps,
                     "dynamic_exit_buffer_bps": dynamic_exit_buffer_bps,
                     "v4_exit_shortfall_reserve_bps": v4_exit_shortfall_reserve_bps,
+                    "reuse_current_quote": bool(
+                        v4_mode
+                        and current_quote_matches_lot
+                        and should_exit
+                        and not portfolio_exit_selected
+                    ),
+                    "current_quote_id": str(quote_id) if quote_id else None,
+                    "current_quote_request_qty": decimal_to_str(
+                        quote_request_qty
+                    ),
+                    "current_quote_size_mode": quote_size_mode,
+                    "current_quote_timestamp": quote_timestamp,
+                    "current_quote_asset": quote_asset,
+                    "current_quote_reuse_validation": (
+                        current_quote_reuse_context
+                    ),
+                    "current_exit_lighter_depth": current_exit_lighter_depth,
                     "shadow_mfe_pnl_bps": candidate_lot.get("shadow_mfe_pnl_bps"),
                     "shadow_mae_pnl_bps": candidate_lot.get("shadow_mae_pnl_bps"),
                     "shadow_convergence_velocity_bps_per_minute": candidate_lot.get(
@@ -19245,6 +19429,12 @@ class VariationalToLighterRuntime:
         exit_confirmation_mode = None
         exit_var_order_quote: dict[str, Any] = {}
         exit_lighter_depth: dict[str, Any] | None = None
+        exit_quote_id: str | None = None
+        reuse_current_quote = bool(selected_exit.get("reuse_current_quote"))
+        if reuse_current_quote:
+            exit_quote_id = selected_exit.get("current_quote_id")
+            exit_lighter_depth = selected_exit.get("current_exit_lighter_depth")
+            exit_confirmation_mode = "main_loop_two_of_three"
         if not self.live_inventory_dry_decisions:
             if (
                 should_exit
@@ -19267,7 +19457,6 @@ class VariationalToLighterRuntime:
                 return
             exit_side = self._opposite_var_side(str(lot.get("entry_var_side") or self._auto_live_direction_to_var_side(direction)))
             exit_lighter_side = "BUY" if exit_side.strip().upper() == "SELL" else "SELL"
-            exit_quote_id: str | None = None
             use_fast_refresh_window = bool(
                 v4_mode
                 and should_exit
@@ -19276,6 +19465,7 @@ class VariationalToLighterRuntime:
                 and not should_timeout_exit
                 and not should_account_risk_exit
                 and self.live_inventory_basis_refresh_exit_quote_before_submit
+                and not reuse_current_quote
             )
             if use_fast_refresh_window:
                 fast_refresh = (
@@ -19371,6 +19561,22 @@ class VariationalToLighterRuntime:
                 )
             else:
                 refresh_context: dict[str, Any] | None = None
+                if reuse_current_quote:
+                    refresh_context = {
+                        "quote_id": exit_quote_id,
+                        "quote_request_qty": selected_exit.get(
+                            "current_quote_request_qty"
+                        ),
+                        "quote_size_mode": selected_exit.get(
+                            "current_quote_size_mode"
+                        ),
+                        "quote_timestamp": selected_exit.get(
+                            "current_quote_timestamp"
+                        ),
+                        "quote_asset": selected_exit.get(
+                            "current_quote_asset"
+                        ),
+                    }
                 if (
                     (
                         should_exit
@@ -19378,6 +19584,7 @@ class VariationalToLighterRuntime:
                     )
                     and not should_account_risk_exit
                     and self.live_inventory_basis_refresh_exit_quote_before_submit
+                    and not reuse_current_quote
                 ):
                     refresh_context = (
                         await self.live_inventory_basis_refreshed_exit_context(
@@ -19479,6 +19686,27 @@ class VariationalToLighterRuntime:
                             },
                         )
                         return
+                if reuse_current_quote:
+                    await self.append_live_inventory_log(
+                        "live_inventory_v4_exit_current_quote_confirmed",
+                        {
+                            **state_payload,
+                            "lot_id": lot.get("lot_id"),
+                            "direction": direction,
+                            "qty": decimal_to_str(qty),
+                            "executable_pnl_bps": decimal_to_str(pnl_bps),
+                            "effective_min_exit_pnl_bps": decimal_to_str(
+                                effective_min_exit_pnl_bps
+                            ),
+                            "exit_confirmation_mode": exit_confirmation_mode,
+                            "quote_id_present": bool(exit_quote_id),
+                            "quote_request_qty": selected_exit.get(
+                                "current_quote_request_qty"
+                            ),
+                            "var_quote_age_seconds": var_quote_age_seconds,
+                            "lighter_book_age_seconds": lighter_book_age_seconds,
+                        },
+                    )
                 else:
                     exit_lighter_depth = (
                         await self.live_inventory_lighter_depth_context(
@@ -19550,6 +19778,7 @@ class VariationalToLighterRuntime:
                     and not should_stop
                     and not should_timeout_exit
                     and not should_account_risk_exit
+                    and not reuse_current_quote
                 ):
                     exit_confirmed, confirmation_count = (
                         self.live_inventory_basis_v4_confirm_exit_candidate(
@@ -19615,6 +19844,7 @@ class VariationalToLighterRuntime:
                     )
                 )
                 if not exit_quote_ok:
+                    self.live_inventory_basis_v4_reset_exit_confirmation(lot)
                     await self.append_live_inventory_log(
                         "live_inventory_exit_quote_reuse_fallback",
                         {
@@ -22972,8 +23202,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--live-inventory-exit-blocked-log-throttle-seconds",
         type=float,
-        default=0.0,
-        help="Throttle repeated live_inventory_exit_blocked logs by lot/reason. Set 0 to disable. Default: 0",
+        default=300.0,
+        help="Throttle repeated live_inventory_exit_blocked logs by lot/reason. Set 0 to disable. Default: 300",
     )
     parser.add_argument("--live-inventory-min-hold-samples", type=int, default=3)
     parser.add_argument("--live-inventory-max-hold-samples", type=int, default=300)

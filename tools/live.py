@@ -47,6 +47,7 @@ class LiveConfig:
     max_lighter_slippage_bps: str = "6"
     lighter_submit_slippage_bps: str = "15"
     lighter_exit_submit_slippage_bps: str = "30"
+    exit_blocked_log_throttle_seconds: str = "300"
     min_entry_edge_bps: str = "7"
     min_abs_entry_bps: str = "7"
     max_entry_roundtrip_cost_bps: str = "0"
@@ -404,6 +405,10 @@ def load_config(path: Path) -> LiveConfig:
         max_lighter_slippage_bps=_positive_decimal(raw, "max_lighter_slippage_bps"),
         lighter_submit_slippage_bps=_positive_decimal(raw, "lighter_submit_slippage_bps"),
         lighter_exit_submit_slippage_bps=_positive_decimal(raw, "lighter_exit_submit_slippage_bps"),
+        exit_blocked_log_throttle_seconds=_non_negative_decimal(
+            raw,
+            "exit_blocked_log_throttle_seconds",
+        ),
         min_entry_edge_bps=_positive_decimal(raw, "min_entry_edge_bps"),
         min_abs_entry_bps=_positive_decimal(raw, "min_abs_entry_bps"),
         max_entry_roundtrip_cost_bps=_non_negative_decimal(raw, "max_entry_roundtrip_cost_bps"),
@@ -573,6 +578,8 @@ def build_main_command(
         config.lighter_submit_slippage_bps,
         "--live-inventory-lighter-exit-submit-slippage-bps",
         config.lighter_exit_submit_slippage_bps,
+        "--live-inventory-exit-blocked-log-throttle-seconds",
+        config.exit_blocked_log_throttle_seconds,
         "--live-inventory-basis-min-entry-edge-bps",
         effective_min_entry_edge_bps,
         "--live-inventory-basis-min-abs-entry-bps",

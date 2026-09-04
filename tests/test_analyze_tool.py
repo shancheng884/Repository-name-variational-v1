@@ -199,14 +199,18 @@ def test_v4_live_funnel_prefers_latest_account_risk_freshness() -> None:
                 "risk_action": "block_entry",
                 "risk_reason": "variational_account_snapshot_stale",
                 "variational_account_snapshot_fresh": False,
-                "variational_account_snapshot_age_seconds": 62.6,
+                "variational_account_snapshot_usable": False,
+                "variational_account_snapshot_degraded": False,
+                "variational_account_snapshot_age_seconds": 362.6,
             },
         ]
     )
 
     assert funnel is not None
     assert funnel["variational_snapshot_fresh"] is False
-    assert funnel["variational_snapshot_age_seconds"] == 62.6
+    assert funnel["variational_snapshot_usable"] is False
+    assert funnel["variational_snapshot_degraded"] is False
+    assert funnel["variational_snapshot_age_seconds"] == 362.6
     assert funnel["variational_snapshot_status_source"] == "account_risk"
 
 

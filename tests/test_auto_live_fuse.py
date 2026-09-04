@@ -5,7 +5,7 @@ import os
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -166,6 +166,60 @@ def test_account_recovery_resets_after_an_incomplete_check() -> None:
     assert result["risk_action"] == "block_entry"
     assert result["account_recovery_confirm_count"] == 0
     assert result["account_recovery_required"] is True
+
+
+def test_startup_recovery_requires_strictly_fresh_snapshot() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_account_recovery_required = True
+    runtime.live_inventory_account_recovery_confirm_count = 0
+    runtime.live_inventory_account_recovery_confirm_samples = 3
+    runtime.live_inventory_account_recovery_reason = "startup_confirmation_required"
+    runtime.live_inventory_basis_entry_confirm_counts = {}
+    runtime.live_inventory_v4_gradient_entry_tier_window = deque(maxlen=3)
+    degraded = {
+        "risk_action": "normal",
+        "risk_reason": "account_risk_normal",
+        "variational_account_snapshot_fresh": False,
+        "variational_account_snapshot_usable": True,
+        "variational_equity_usd": "100",
+        "lighter_equity_usd": "100",
+    }
+
+    result = runtime.apply_live_inventory_account_recovery_gate(
+        degraded,
+        advance_confirmation=True,
+    )
+
+    assert result["risk_action"] == "block_entry"
+    assert result["risk_reason"] == "variational_account_recovery_confirmation_pending"
+    assert result["account_recovery_confirm_count"] == 0
+    assert result["account_recovery_required"] is True
+
+
+def test_stale_snapshot_recovery_releases_on_first_strictly_fresh_update() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_account_recovery_required = True
+    runtime.live_inventory_account_recovery_confirm_count = 0
+    runtime.live_inventory_account_recovery_confirm_samples = 3
+    runtime.live_inventory_account_recovery_reason = (
+        "variational_account_snapshot_stale"
+    )
+    runtime.live_inventory_basis_entry_confirm_counts = {}
+    runtime.live_inventory_v4_gradient_entry_tier_window = deque(maxlen=3)
+    fresh = {
+        "risk_action": "normal",
+        "risk_reason": "account_risk_normal",
+        "variational_account_snapshot_fresh": True,
+        "variational_account_snapshot_usable": True,
+        "variational_equity_usd": "100",
+        "lighter_equity_usd": "100",
+    }
+
+    result = runtime.apply_live_inventory_account_recovery_gate(fresh)
+
+    assert result["risk_action"] == "normal"
+    assert result["account_recovery_required"] is False
+    assert result["account_recovery_confirm_count"] == 3
 
 
 def test_live_inventory_state_status_follows_actual_positions_and_actions() -> None:
@@ -807,6 +861,59 @@ def test_account_risk_blocks_entries_when_variational_snapshot_is_stale() -> Non
         assert context["variational_account_snapshot_fresh"] is False
         assert context["variational_equity_usd"] is None
         assert context["variational_raw_equity_usd"] == "100"
+
+    asyncio.run(run())
+
+
+def test_account_risk_uses_recent_cached_snapshot_without_blocking_entry() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_open_lots = []
+        runtime.live_inventory_max_venue_leverage = Decimal("5")
+        runtime.live_inventory_margin_warning_pct = Decimal("40")
+        runtime.live_inventory_margin_block_entry_pct = Decimal("50")
+        runtime.live_inventory_margin_reduce_pct = Decimal("60")
+        runtime.live_inventory_margin_emergency_pct = Decimal("75")
+        runtime.live_inventory_equity_balance_warning_ratio = Decimal("0.82")
+        runtime.live_inventory_equity_balance_block_ratio = Decimal("0.74")
+        runtime.live_inventory_account_recovery_required = False
+        runtime.live_inventory_account_recovery_confirm_count = 0
+        runtime.live_inventory_account_recovery_confirm_samples = 3
+        runtime.live_inventory_account_recovery_reason = None
+        runtime.live_inventory_basis_entry_confirm_counts = {}
+        runtime.live_inventory_v4_gradient_entry_tier_window = deque(maxlen=3)
+        published_at = datetime.now(timezone.utc) - timedelta(seconds=120)
+        runtime.runtime = SimpleNamespace(
+            monitor=SimpleNamespace(
+                _lock=asyncio.Lock(),
+                portfolio_summary={
+                    "balance": "100",
+                    "upnl": "0",
+                    "published_at": published_at.isoformat(),
+                },
+            )
+        )
+
+        async def fetch_variational_portfolio():
+            return {"ok": False, "error": "temporary_http_503"}
+
+        async def fetch_lighter_account():
+            return {"accounts": [{"collateral": "100"}]}
+
+        runtime.fetch_variational_portfolio = fetch_variational_portfolio
+        runtime.fetch_lighter_account = fetch_lighter_account
+
+        context = await runtime.live_inventory_account_risk_context(
+            proposed_notional_usd=Decimal("20")
+        )
+
+        assert context["risk_action"] == "normal"
+        assert context["variational_account_snapshot_fresh"] is False
+        assert context["variational_account_snapshot_usable"] is True
+        assert context["variational_account_snapshot_degraded"] is True
+        assert context["variational_equity_usd"] == "100"
+        assert context["account_recovery_required"] is False
 
     asyncio.run(run())
 
@@ -4167,6 +4274,23 @@ def test_basis_quote_uses_exact_base_qty_and_records_quote_size_mode(tmp_path) -
     asyncio.run(run())
 
 
+def test_basis_quote_prefers_most_common_exact_open_lot_qty(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_allowed_assets = {"ETH"}
+    runtime.live_inventory_open_lots = [
+        {"qty": "0.00820"},
+        {"qty": "0.00810"},
+        {"qty": "0.00820"},
+    ]
+
+    quote_qty = runtime.live_inventory_basis_quote_qty(
+        asset="ETH",
+        reference_price=Decimal("2500"),
+    )
+
+    assert quote_qty == Decimal("0.00820")
+
+
 def test_background_variational_quote_times_out_without_using_trade_lane(
     tmp_path,
     monkeypatch,
@@ -5064,6 +5188,201 @@ def test_live_inventory_basis_exit_submits_var_before_lighter(tmp_path) -> None:
         assert calls == ["var", "lighter"]
         assert runtime.live_inventory_open_lots == []
         assert runtime.live_inventory_completed_cycles == 1
+
+    asyncio.run(run())
+
+
+def test_v4_exit_reuses_latest_exact_main_loop_quote_after_two_of_three(
+    tmp_path,
+) -> None:
+    class ExitSubmitted(RuntimeError):
+        pass
+
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_signal_mode = "basis"
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.accepted_assets = {"ETH"}
+        runtime.pending_live_inventory_var_fill_matches = []
+        runtime.live_inventory_basis_v4_mode = True
+        runtime.live_inventory_basis_v4_profile = "test-v4"
+        runtime.live_inventory_basis_v4_bidirectional = False
+        runtime.live_inventory_basis_v4_real_gradient = False
+        runtime.live_inventory_basis_v4_tier_independent_exit = True
+        runtime.live_inventory_basis_v4_history_ready = True
+        runtime.live_inventory_basis_v4_history_reason = "ready"
+        runtime.live_inventory_basis_v4_history_ready_by_direction = {}
+        runtime.live_inventory_basis_v4_history_reason_by_direction = {}
+        runtime.live_inventory_v4_rearm_required = False
+        runtime.live_inventory_v4_rearm_direction = None
+        runtime.live_inventory_v4_episode_id = "episode-1"
+        runtime.live_inventory_v4_next_tranche_index = 2
+        runtime.live_inventory_v4_last_entry_submit_monotonic = 0.0
+        runtime.live_inventory_v4_gradient_tier_exit_confirmations = {}
+        runtime.live_inventory_v4_portfolio_exit_lot_ids = set()
+        runtime.live_inventory_v4_portfolio_exit_context = {}
+        runtime.live_inventory_v4_portfolio_exit_confirmations = deque(maxlen=3)
+        runtime.live_inventory_v4_partial_detier_confirmations = deque(maxlen=3)
+        runtime.live_inventory_basis_refresh_exit_quote_before_submit = True
+        runtime.live_inventory_basis_max_var_quote_age_ms = 1500.0
+        runtime.live_inventory_basis_z_exit = Decimal("0")
+        runtime.live_inventory_basis_min_exit_pnl_bps = Decimal("0")
+        runtime.live_inventory_basis_state = LiveInventoryBasisState(
+            half_life_seconds=300,
+            warmup_samples=1,
+            gap_reset_seconds=30,
+            sigma_floor_bps=0,
+        )
+        runtime.live_inventory_basis_state.mean = 0.0
+        runtime.live_inventory_basis_state.var = 1.0
+        runtime.live_inventory_basis_state.seen = 10
+        runtime.live_inventory_basis_state.last_ts = time.monotonic()
+        runtime.live_inventory_open_lots = [
+            {
+                "asset": "ETH",
+                "lot_id": 1,
+                "episode_id": "episode-1",
+                "signal_mode": "basis",
+                "direction": "short_var_long_lighter",
+                "entry_kind": "basis_v4_eth_short_p97_5",
+                "qty": "0.20000",
+                "entry_var_side": "SELL",
+                "entry_var_fill_price": "100",
+                "entry_lighter_fill_price": "100",
+                "entry_cost_status": "final_fills_confirmed",
+                "entered_sample_index": 1,
+                "status": "open",
+            }
+        ]
+        runtime.live_inventory_sample_index = 5
+        runtime.live_inventory_basis_quote_priority = lambda _snapshot: "trade"
+        runtime.live_inventory_basis_v4_entry_directions = lambda: [
+            "short_var_long_lighter"
+        ]
+        runtime.live_inventory_basis_v4_entry_direction = (
+            lambda: "short_var_long_lighter"
+        )
+        runtime.live_inventory_basis_v4_select_entry_direction = (
+            lambda **_kwargs: "short_var_long_lighter"
+        )
+        runtime.live_inventory_basis_v4_entry_threshold = lambda **_kwargs: (
+            Decimal("999"),
+            {"v4_anchor_ready": True, "v4_health_ready": True},
+        )
+        runtime.record_live_inventory_basis_v4_edge = lambda **_kwargs: False
+        runtime.live_inventory_basis_v4_update_rearm = lambda **_kwargs: (
+            False,
+            {},
+        )
+        runtime.live_inventory_basis_v4_exit_shortfall_reserve_bps = (
+            lambda: Decimal("0.5")
+        )
+        runtime.live_inventory_basis_v4_exit_calibration_payload = (
+            lambda **_kwargs: {"v4_exit_shortfall_reserve_bps": "0.5"}
+        )
+        runtime.live_inventory_order_limiter = lambda _venue: SimpleNamespace(
+            snapshot=lambda: {
+                "used": 0,
+                "normal_limit": 30,
+                "hard_limit": 36,
+                "backoff_seconds": 0,
+            }
+        )
+        runtime.live_inventory_external_reference_context = lambda **_kwargs: {}
+
+        async def fake_stablecoin_context():
+            return {}
+
+        async def fake_account_risk_context(**_kwargs):
+            return {"risk_action": "normal", "risk_reason": "account_risk_normal"}
+
+        async def fake_shadow_gradient(**_kwargs):
+            return None
+
+        async def fake_persist(**_kwargs):
+            return None
+
+        quotes = iter(
+            (
+                ("main-loop-1", "99.97", "99.98"),
+                ("main-loop-2", "100.02", "100.03"),
+                ("main-loop-3", "99.97", "99.98"),
+            )
+        )
+
+        async def fake_fetch_live_inventory_basis_quote(**kwargs):
+            quote_id, bid, ask = next(quotes)
+            return _test_basis_quote_with_metadata(
+                {
+                    "quoteId": quote_id,
+                    "bid": bid,
+                    "ask": ask,
+                    "quoteTimestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                asset="ETH",
+                qty=kwargs["qty"],
+            ), Decimal("50")
+
+        submitted: list[dict] = []
+
+        async def fake_submit_live_inventory_exit_pair(**kwargs):
+            submitted.append(kwargs)
+            raise ExitSubmitted
+
+        async def refuse_fast_refresh(**_kwargs):
+            raise AssertionError("exact current quote must bypass slow refresh")
+
+        runtime.fetch_live_inventory_stablecoin_context = fake_stablecoin_context
+        runtime.live_inventory_account_risk_context = fake_account_risk_context
+        runtime.maybe_update_live_inventory_basis_v4_shadow_gradient = (
+            fake_shadow_gradient
+        )
+        runtime.persist_live_inventory_memory = fake_persist
+        runtime.fetch_live_inventory_basis_quote = (
+            fake_fetch_live_inventory_basis_quote
+        )
+        runtime.submit_live_inventory_exit_pair = (
+            fake_submit_live_inventory_exit_pair
+        )
+        runtime.live_inventory_basis_v4_fast_refresh_exit_context = (
+            refuse_fast_refresh
+        )
+        snapshot = _eth_inventory_snapshot()
+        snapshot.var_bid = Decimal("99.97")
+        snapshot.var_ask = Decimal("99.98")
+        snapshot.var_mid = Decimal("99.975")
+        snapshot.lighter_bid = Decimal("100.02")
+        snapshot.lighter_ask = Decimal("100.03")
+        snapshot.lighter_mid = Decimal("100.025")
+        snapshot.lighter_buy_price = Decimal("100.03")
+        snapshot.lighter_sell_price = Decimal("100.02")
+        snapshot.lighter_buy_fill_price = Decimal("100.03")
+        snapshot.lighter_sell_fill_price = Decimal("100.02")
+        _set_test_lighter_book(runtime, bid="100.02", ask="100.03")
+
+        await runtime.maybe_run_live_inventory_basis(snapshot)
+
+        assert submitted == []
+        assert runtime.live_inventory_open_lots[0][
+            "v4_exit_confirmation_window"
+        ] == [True]
+
+        await runtime.maybe_run_live_inventory_basis(snapshot)
+
+        assert submitted == []
+        assert runtime.live_inventory_open_lots[0][
+            "v4_exit_confirmation_window"
+        ] == [True, False]
+
+        with pytest.raises(ExitSubmitted):
+            await runtime.maybe_run_live_inventory_basis(snapshot)
+
+        assert len(submitted) == 1
+        assert submitted[0]["reuse_quote_id"] == "main-loop-3"
+        assert submitted[0]["qty"] == Decimal("0.20000")
+        assert Decimal(
+            submitted[0]["exit_lighter_depth"]["requested_qty"]
+        ) == Decimal("0.2")
 
     asyncio.run(run())
 

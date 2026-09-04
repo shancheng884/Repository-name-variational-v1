@@ -192,6 +192,12 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     risk_snapshot_fresh = latest_account_risk.get(
         "variational_account_snapshot_fresh"
     )
+    risk_snapshot_usable = latest_account_risk.get(
+        "variational_account_snapshot_usable"
+    )
+    risk_snapshot_degraded = latest_account_risk.get(
+        "variational_account_snapshot_degraded"
+    )
     risk_snapshot_age = latest_account_risk.get(
         "variational_account_snapshot_age_seconds"
     )
@@ -414,6 +420,8 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
             "max_venue_leverage"
         ),
         "variational_snapshot_fresh": variational_snapshot_fresh,
+        "variational_snapshot_usable": risk_snapshot_usable,
+        "variational_snapshot_degraded": risk_snapshot_degraded,
         "variational_snapshot_age_seconds": variational_snapshot_age_seconds,
         "variational_snapshot_status_source": (
             variational_snapshot_status_source
@@ -812,6 +820,8 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
     )
     print(
         f"variational_snapshot_fresh={funnel['variational_snapshot_fresh']} "
+        f"variational_snapshot_usable={funnel['variational_snapshot_usable']} "
+        f"variational_snapshot_degraded={funnel['variational_snapshot_degraded']} "
         f"variational_snapshot_age_seconds="
         f"{funnel['variational_snapshot_age_seconds']} "
         f"variational_snapshot_status_source="

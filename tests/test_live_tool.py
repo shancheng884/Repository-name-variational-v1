@@ -199,6 +199,7 @@ def test_live_tool_v4_profile_is_bounded_and_passes_main_cli_guards(monkeypatch)
     assert args.live_inventory_basis_max_hold_action == "exit"
     assert args.live_inventory_basis_refresh_exit_quote_before_submit is True
     assert args.live_inventory_basis_dynamic_exit_buffer is True
+    assert args.live_inventory_exit_blocked_log_throttle_seconds == 300
     assert args.live_inventory_basis_use_normalized_edge_for_entry is False
     assert args.live_inventory_basis_size_ladder_notionals_usd == "20,40,60"
     assert "--live-inventory-basis-reversion" not in command
