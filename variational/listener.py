@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import base64
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -359,6 +360,7 @@ class VariationalMonitor:
         underlying_price = payload.get("underlying_price")
         ts = payload.get("timestamp") or payload.get("updated_at") or payload.get("created_at")
         received_at = utc_now()
+        received_monotonic = time.monotonic()
 
         if bid is None and ask is None and mark is not None:
             bid = mark
@@ -379,6 +381,7 @@ class VariationalMonitor:
             "mark_price": mark,
             "timestamp": ts,
             "received_at": received_at,
+            "received_monotonic": received_monotonic,
             "raw": payload,
         }
         self.current_quote_asset = asset

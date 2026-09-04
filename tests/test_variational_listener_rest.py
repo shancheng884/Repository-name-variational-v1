@@ -1,6 +1,7 @@
 import base64
 import asyncio
 import json
+import time
 
 from variational.listener import EventSink, VariationalMonitor
 
@@ -75,3 +76,4 @@ def test_quote_records_local_receive_time_when_exchange_timestamp_is_missing() -
     assert updated is True
     assert monitor.quotes["ETH"]["timestamp"] is None
     assert monitor.quotes["ETH"]["received_at"]
+    assert monitor.quotes["ETH"]["received_monotonic"] <= time.monotonic()

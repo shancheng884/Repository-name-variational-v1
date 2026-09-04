@@ -4253,6 +4253,8 @@ def test_basis_quote_uses_exact_base_qty_and_records_quote_size_mode(tmp_path) -
                     "bid": "2499",
                     "ask": "2501",
                     "quoteTimestamp": "2999-06-16T03:25:20.000Z",
+                    "quote_source": "passive_browser_stream",
+                    "received_monotonic": time.monotonic(),
                 },
             }
 
@@ -4270,6 +4272,9 @@ def test_basis_quote_uses_exact_base_qty_and_records_quote_size_mode(tmp_path) -
         assert calls[0]["priority"] == "background"
         assert Decimal(quote["quote_request_qty"]) == Decimal("0.008")
         assert quote["quote_size_mode"] == "exact_base_qty_v1"
+        assert quote["quote_source"] == "direct_rfq"
+        assert quote["quote_freshness_source"] == "exchange_quote_timestamp"
+        assert quote["quote_latency_kind"] == "exact_rfq_roundtrip"
 
     asyncio.run(run())
 
@@ -4345,6 +4350,8 @@ def test_v4_background_quote_uses_passive_stream_without_rfq(tmp_path) -> None:
                 "bid": "2400.10",
                 "ask": "2400.30",
                 "quoteTimestamp": "2026-09-04T00:00:00Z",
+                "received_at": "2026-09-04T00:00:01Z",
+                "received_monotonic": time.monotonic(),
             }
 
         async def refuse_rfq(**_kwargs):
@@ -4359,6 +4366,8 @@ def test_v4_background_quote_uses_passive_stream_without_rfq(tmp_path) -> None:
         )
 
         assert quote["quote_source"] == "passive_browser_stream"
+        assert quote["quoteTimestamp"] == "2026-09-04T00:00:01Z"
+        assert quote["source_quote_timestamp"] == "2026-09-04T00:00:00Z"
         assert Decimal(quote["quote_request_qty"]) == Decimal("0.008")
         assert quote["rfq_consumed"] is False
         assert quote_ms == Decimal("0")

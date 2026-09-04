@@ -192,6 +192,7 @@ LIVE_INVENTORY_LIGHTER_ORDER_RATE_HARD_PER_MINUTE = 36
 LIVE_INVENTORY_BASIS_QUOTE_SIZE_MODE = "exact_base_qty_v1"
 LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE = "passive_browser_stream"
 LIVE_INVENTORY_BASIS_V4_PORTFOLIO_EXIT_EXTRA_BPS = Decimal("1.00")
+LIVE_INVENTORY_ENTRY_BLOCKED_LOG_THROTTLE_SECONDS = 30.0
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_MAX_AGE_SECONDS = 60.0
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_USABLE_MAX_AGE_SECONDS = 300.0
 LIVE_INVENTORY_ACCOUNT_RECOVERY_CONFIRM_SAMPLES = 3
@@ -2524,6 +2525,7 @@ class VariationalToLighterRuntime:
         self.auto_live_manual_review_required = False
         self.auto_live_manual_review_reason: str | None = None
         self._last_auto_live_guard_log: tuple[str, int, int] | None = None
+        self._last_live_inventory_entry_blocked_log: dict[tuple[str, str], float] = {}
         self._last_live_inventory_exit_blocked_log: dict[tuple[Any, str], float] = {}
         self._last_auto_live_precheck_failure_log: dict[tuple[str, int, str, str, str], float] = {}
         self.paper_last_closed_monotonic: float | None = None
@@ -3660,6 +3662,22 @@ class VariationalToLighterRuntime:
         if last is not None and now - last < throttle:
             return False
         self._last_live_inventory_exit_blocked_log[key] = now
+        return True
+
+    def should_log_live_inventory_entry_blocked(self, *, direction: str, reason: str) -> bool:
+        logs = getattr(self, "_last_live_inventory_entry_blocked_log", None)
+        if not isinstance(logs, dict):
+            logs = {}
+            self._last_live_inventory_entry_blocked_log = logs
+        key = (str(direction or "unknown"), str(reason or "unknown"))
+        now = time.monotonic()
+        last = logs.get(key)
+        if (
+            last is not None
+            and now - last < LIVE_INVENTORY_ENTRY_BLOCKED_LOG_THROTTLE_SECONDS
+        ):
+            return False
+        logs[key] = now
         return True
 
     @staticmethod
@@ -9021,16 +9039,20 @@ class VariationalToLighterRuntime:
         ask = to_decimal(quote.get("ask"))
         if bid is None or ask is None or bid <= 0 or ask <= 0:
             return None, None
-        quote_timestamp = (
+        source_timestamp = (
             quote.get("quoteTimestamp")
             or quote.get("quote_timestamp")
             or quote.get("timestamp")
-            or quote.get("received_at")
         )
+        received_at = quote.get("received_at")
         return (
             {
                 **quote,
-                "quoteTimestamp": quote_timestamp,
+                # Passive stream freshness is measured from arrival on this
+                # process. The source timestamp may describe a slower upstream
+                # snapshot and is retained only for diagnostics.
+                "quoteTimestamp": received_at,
+                "source_quote_timestamp": source_timestamp,
                 "quote_asset": asset.upper(),
                 "quote_request_qty": variational_api_amount_to_str(
                     Decimal(str(qty)),
@@ -9038,6 +9060,12 @@ class VariationalToLighterRuntime:
                 ),
                 "quote_size_mode": LIVE_INVENTORY_BASIS_QUOTE_SIZE_MODE,
                 "quote_source": LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE,
+                "quote_freshness_source": (
+                    "local_monotonic_receive_time"
+                    if quote.get("received_monotonic") is not None
+                    else "local_receive_time"
+                ),
+                "quote_latency_kind": "passive_stream_no_rfq",
                 "rfq_consumed": False,
             },
             Decimal("0"),
@@ -9133,6 +9161,12 @@ class VariationalToLighterRuntime:
                 asset=asset,
             ),
             "quote_size_mode": LIVE_INVENTORY_BASIS_QUOTE_SIZE_MODE,
+            # This method always performs an RFQ. Do not allow extension
+            # response metadata to make an exact quote look like a passive
+            # stream update and bypass exchange timestamp validation.
+            "quote_source": "direct_rfq",
+            "quote_freshness_source": "exchange_quote_timestamp",
+            "quote_latency_kind": "exact_rfq_roundtrip",
         }
         bid = to_decimal(payload.get("bid"))
         ask = to_decimal(payload.get("ask"))
@@ -12881,9 +12915,34 @@ class VariationalToLighterRuntime:
             return True, age
         return age is not None and age <= limit, age
 
-    def live_inventory_var_quote_age_ok(self, quote: dict[str, Any]) -> tuple[bool, float | None]:
+    def live_inventory_var_quote_freshness(
+        self,
+        quote: dict[str, Any],
+    ) -> tuple[bool, float | None, str]:
         limit_ms = self.live_inventory_basis_max_var_quote_age_ms
-        ts = quote.get("quoteTimestamp") or quote.get("quote_timestamp")
+        quote_source = str(quote.get("quote_source") or "direct_rfq")
+        if quote_source == LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE:
+            received_monotonic = quote.get("received_monotonic")
+            try:
+                received_monotonic_value = float(received_monotonic)
+            except (TypeError, ValueError):
+                received_monotonic_value = None
+            if received_monotonic_value is not None:
+                age_seconds = time.monotonic() - received_monotonic_value
+                if age_seconds < 0:
+                    return False, age_seconds, "local_monotonic_receive_time"
+                if limit_ms <= 0:
+                    return True, age_seconds, "local_monotonic_receive_time"
+                return (
+                    age_seconds * 1000.0 <= limit_ms,
+                    age_seconds,
+                    "local_monotonic_receive_time",
+                )
+            ts = quote.get("received_at")
+            freshness_source = "local_receive_time"
+        else:
+            ts = quote.get("quoteTimestamp") or quote.get("quote_timestamp")
+            freshness_source = "exchange_quote_timestamp"
         parsed = self._parse_iso_ts(str(ts) if ts else None)
         if parsed is None:
             age_seconds = None
@@ -12893,11 +12952,19 @@ class VariationalToLighterRuntime:
                 limit_ms > 0
                 and age_seconds < -LIVE_INVENTORY_VARIATIONAL_MAX_FUTURE_SKEW_SECONDS
             ):
-                return False, age_seconds
+                return False, age_seconds, freshness_source
             age_seconds = max(0.0, age_seconds)
         if limit_ms <= 0:
-            return True, age_seconds
-        return age_seconds is not None and (age_seconds * 1000.0) <= limit_ms, age_seconds
+            return True, age_seconds, freshness_source
+        return (
+            age_seconds is not None and (age_seconds * 1000.0) <= limit_ms,
+            age_seconds,
+            freshness_source,
+        )
+
+    def live_inventory_var_quote_age_ok(self, quote: dict[str, Any]) -> tuple[bool, float | None]:
+        age_ok, age_seconds, _ = self.live_inventory_var_quote_freshness(quote)
+        return age_ok, age_seconds
 
     def live_inventory_basis_quote_reuse_validation(
         self,
@@ -15550,7 +15617,11 @@ class VariationalToLighterRuntime:
             return
         basis_bps = (basis_mid - lighter_mid) / lighter_mid * Decimal("10000")
         lighter_book_age_ok, lighter_book_age_seconds = self.live_inventory_lighter_book_age_ok()
-        var_quote_age_ok, var_quote_age_seconds = self.live_inventory_var_quote_age_ok(quote)
+        (
+            var_quote_age_ok,
+            var_quote_age_seconds,
+            var_quote_freshness_source,
+        ) = self.live_inventory_var_quote_freshness(quote)
         previous_basis_bps = getattr(self, "live_inventory_basis_last_basis_bps", None)
         basis_sample_move_bps = abs(basis_bps - previous_basis_bps) if previous_basis_bps is not None else None
         if basis_sample_move_bps is not None:
@@ -15968,6 +16039,9 @@ class VariationalToLighterRuntime:
             ),
             "quote_priority": quote_priority,
             "quote_source": quote.get("quote_source", "direct_rfq"),
+            "quote_freshness_source": var_quote_freshness_source,
+            "source_quote_timestamp": quote.get("source_quote_timestamp"),
+            "quote_received_at": quote.get("received_at"),
             "quote_cache_age_seconds": quote.get("quote_cache_age_seconds"),
             "quote_timestamp": quote.get("quoteTimestamp") or quote.get("quote_timestamp"),
             "quote_ms": decimal_to_str(quote_ms),
@@ -16524,10 +16598,19 @@ class VariationalToLighterRuntime:
                     continue
                 if not var_quote_age_ok:
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
-                    await self.append_live_inventory_log(
-                        "live_inventory_entry_blocked",
-                        {**state_payload, "reason": "basis_var_quote_too_old", "direction": direction, "max_var_quote_age_ms": self.live_inventory_basis_max_var_quote_age_ms},
-                    )
+                    if self.should_log_live_inventory_entry_blocked(
+                        direction=direction,
+                        reason="basis_var_quote_too_old",
+                    ):
+                        await self.append_live_inventory_log(
+                            "live_inventory_entry_blocked",
+                            {
+                                **state_payload,
+                                "reason": "basis_var_quote_too_old",
+                                "direction": direction,
+                                "max_var_quote_age_ms": self.live_inventory_basis_max_var_quote_age_ms,
+                            },
+                        )
                     continue
                 if not lighter_book_age_ok:
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
