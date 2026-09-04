@@ -110,6 +110,9 @@ def build_heartbeat_payload(
                     "incident_signature": _safe_text(
                         value.get("incident_signature"), limit=32
                     ),
+                    "acknowledged_at": _safe_text(
+                        value.get("acknowledged_at"), limit=80
+                    ),
                     "bark_status": _safe_text(value.get("bark_status"), limit=80),
                     "feishu_message_status": _safe_text(
                         value.get("feishu_message_status"), limit=80

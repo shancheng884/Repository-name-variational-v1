@@ -9,6 +9,7 @@ from tools.lib.wakeup_notifiers import (
     PushoverNotifier,
     TencentVoiceNotifier,
 )
+from tools.lib.telegram_notifier import TelegramNotifier
 
 
 class FakeResponse:
@@ -193,3 +194,58 @@ def test_feishu_message_then_phone_urgent_reuses_cached_token() -> None:
     }
     assert "private-secret" not in message.detail
     assert "private-token" not in phone.detail
+
+
+def test_telegram_inline_acknowledgement_api(monkeypatch) -> None:
+    calls = []
+
+    class TelegramResponse:
+        status_code = 200
+
+        def __init__(self, body=None):
+            self._body = body or {"ok": True, "result": True}
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, **kwargs):
+        calls.append(("post", url, kwargs))
+        return TelegramResponse()
+
+    def fake_get(url, **kwargs):
+        calls.append(("get", url, kwargs))
+        return TelegramResponse(
+            {
+                "ok": True,
+                "result": [{"update_id": 7, "callback_query": {"id": "cb"}}],
+            }
+        )
+
+    monkeypatch.setattr("tools.lib.telegram_notifier.requests.post", fake_post)
+    monkeypatch.setattr("tools.lib.telegram_notifier.requests.get", fake_get)
+    notifier = TelegramNotifier(
+        bot_token="private-token",
+        chat_id="123",
+        logger=SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None),
+    )
+    markup = {
+        "inline_keyboard": [
+            [{"text": "ack", "callback_data": "risk_ack:token"}]
+        ]
+    }
+
+    assert notifier.send_now("risk", reply_markup=markup) == (True, "sent")
+    updates, detail = notifier.get_updates(offset=5)
+    assert detail == "ok"
+    assert updates[0]["update_id"] == 7
+    assert notifier.answer_callback_query("cb", text="acknowledged") == (
+        True,
+        "sent",
+    )
+    assert notifier.clear_inline_keyboard(chat_id="123", message_id=88) == (
+        True,
+        "sent",
+    )
+    assert calls[0][2]["json"]["reply_markup"] == markup
+    assert calls[1][2]["params"]["offset"] == 5
+    assert calls[-1][2]["json"]["reply_markup"] == {"inline_keyboard": []}

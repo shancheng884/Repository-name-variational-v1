@@ -166,7 +166,7 @@ LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MAX_DEPTH_SLIPPAGE_BPS = Decimal("1.0
 LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SHORTFALL_MIN_SAMPLES = 3
 LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SHORTFALL_PRIOR_BPS = Decimal("6.00")
 LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SHORTFALL_CAP_BPS = Decimal("12.00")
-LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_ATTEMPTS = 6
+LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_ATTEMPTS = 1
 LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_INTERVAL_SECONDS = 0.20
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
 LIVE_INVENTORY_ACCOUNT_RISK_INTERVAL_SECONDS = 15.0
@@ -174,12 +174,12 @@ LIVE_INVENTORY_ACCOUNT_RISK_OPEN_INTERVAL_SECONDS = 5.0
 LIVE_INVENTORY_VARIATIONAL_PORTFOLIO_REFRESH_COOLDOWN_SECONDS = 3.0
 LIVE_INVENTORY_VARIATIONAL_MAINTENANCE_RATE_FALLBACK = Decimal("0.10")
 LIVE_INVENTORY_LIGHTER_MAINTENANCE_RATE_FALLBACK = Decimal("0.012")
-# The last ten tokens remain available for reduce-only work. A confirmed
-# Variational order costs two tokens when it must obtain a fresh quote.
-LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_NORMAL_PER_MINUTE = 20
+# Only /quotes/indicative calls consume this budget. The last five RFQs are
+# reserved for reduce-only emergency work.
+LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_NORMAL_PER_MINUTE = 25
 LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_HARD_PER_MINUTE = 30
-# Keep a majority of the rolling window available for final entry/exit work.
-# Background RFQs are best-effort and must never make the live loop wait.
+# Legacy background RFQ controls remain for non-V4 modes. V4 observations use
+# the passive browser stream and therefore consume no RFQ capacity.
 LIVE_INVENTORY_VARIATIONAL_BACKGROUND_QUOTE_RATE_PER_MINUTE = 12
 LIVE_INVENTORY_VARIATIONAL_BACKGROUND_QUOTE_TIMEOUT_SECONDS = 1.5
 LIVE_INVENTORY_VARIATIONAL_BACKGROUND_COMMAND_TIMEOUT_SECONDS = 3.0
@@ -190,6 +190,8 @@ LIVE_INVENTORY_VARIATIONAL_READ_HTTP_TIMEOUT_MS = 5000
 LIVE_INVENTORY_LIGHTER_ORDER_RATE_NORMAL_PER_MINUTE = 30
 LIVE_INVENTORY_LIGHTER_ORDER_RATE_HARD_PER_MINUTE = 36
 LIVE_INVENTORY_BASIS_QUOTE_SIZE_MODE = "exact_base_qty_v1"
+LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE = "passive_browser_stream"
+LIVE_INVENTORY_BASIS_V4_PORTFOLIO_EXIT_EXTRA_BPS = Decimal("1.00")
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_MAX_AGE_SECONDS = 60.0
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_USABLE_MAX_AGE_SECONDS = 300.0
 LIVE_INVENTORY_ACCOUNT_RECOVERY_CONFIRM_SAMPLES = 3
@@ -2490,9 +2492,6 @@ class VariationalToLighterRuntime:
         self._variational_portfolio_refresh_lock = asyncio.Lock()
         self._variational_portfolio_refresh_last_attempt_monotonic = 0.0
         self.live_inventory_basis_last_background_quote_skip_monotonic = 0.0
-        self.live_inventory_basis_background_quote_task: asyncio.Task[None] | None = None
-        self.live_inventory_basis_background_quote_cache: dict[str, Any] | None = None
-        self.live_inventory_basis_background_quote_last_started_monotonic = 0.0
         self.live_inventory_basis_background_quote_cooldown_until_monotonic = 0.0
         self.live_inventory_basis_quote_size_mode = LIVE_INVENTORY_BASIS_QUOTE_SIZE_MODE
 
@@ -6815,99 +6814,9 @@ class VariationalToLighterRuntime:
         self,
         snapshot: CrossSpreadSnapshot,
     ) -> str:
-        """Use the rolling budget for RFQs only when the stream is actionable."""
+        """Keep V4 signal confirmation off the RFQ path."""
         if not getattr(self, "live_inventory_basis_v4_mode", False):
             return "trade"
-
-        stream_edges = {
-            DIRECTION_LONG_VAR_SHORT_LIGHTER: decimal_percent_to_bps(
-                snapshot.long_var_short_lighter_pct
-            ),
-            DIRECTION_SHORT_VAR_LONG_LIGHTER: decimal_percent_to_bps(
-                snapshot.short_var_long_lighter_pct
-            ),
-        }
-        bidirectional = bool(
-            getattr(self, "live_inventory_basis_v4_bidirectional", False)
-        )
-        thresholds = getattr(
-            self,
-            "live_inventory_basis_v4_threshold_cache_by_direction",
-            {},
-        ) if bidirectional else {}
-        for direction, edge in stream_edges.items():
-            if bidirectional:
-                cached = thresholds.get(direction)
-            elif direction == self.live_inventory_basis_v4_entry_direction():
-                cached = getattr(
-                    self,
-                    "live_inventory_basis_v4_threshold_cache",
-                    None,
-                )
-            else:
-                cached = None
-            threshold = to_decimal(cached[0]) if cached else None
-            if threshold is None:
-                fallback = getattr(
-                    self,
-                    "live_inventory_basis_v4_migration_fallback_by_direction",
-                    {},
-                ).get(direction)
-                if isinstance(fallback, dict):
-                    # Recompute the current health gate instead of trusting
-                    # the frozen legacy context when prioritizing an RFQ.
-                    migration_threshold, migration_context = (
-                        self.live_inventory_basis_v4_entry_threshold(
-                            now=datetime.now(timezone.utc).timestamp(),
-                            direction=direction,
-                            cache_result=False,
-                        )
-                    )
-                    if migration_context.get("v4_health_ready"):
-                        threshold = migration_threshold
-            if threshold is not None and edge is not None and edge >= threshold - Decimal("2"):
-                return "trade"
-
-        # A held lot gets a final RFQ when the cheap stream estimate is near a
-        # profit, stop-loss, or timeout boundary. Otherwise a background RFQ is
-        # sufficient and must not consume the whole order window.
-        for lot in list(getattr(self, "live_inventory_open_lots", []) or []):
-            direction = str(lot.get("direction") or "")
-            qty = to_decimal(lot.get("qty"))
-            entry_var = to_decimal(lot.get("entry_var_fill_price"))
-            entry_lighter = to_decimal(lot.get("entry_lighter_fill_price"))
-            if not direction or qty is None or entry_var is None or entry_lighter is None:
-                continue
-            exit_var = (
-                snapshot.var_bid
-                if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
-                else snapshot.var_ask
-            )
-            exit_lighter = (
-                snapshot.lighter_buy_fill_price
-                if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
-                else snapshot.lighter_sell_fill_price
-            )
-            _, _, pnl = self.live_inventory_pair_pnl(
-                direction=direction,
-                qty=qty,
-                entry_var_price=entry_var,
-                entry_lighter_price=entry_lighter,
-                exit_var_price=exit_var,
-                exit_lighter_price=exit_lighter,
-            )
-            notional = qty * entry_var
-            pnl_bps = pnl / notional * Decimal("10000") if notional else None
-            if pnl_bps is not None and (
-                pnl_bps >= self.live_inventory_basis_min_exit_pnl_bps - Decimal("1")
-                or pnl_bps <= -self.live_inventory_max_unrealized_loss_bps + Decimal("1")
-            ):
-                return "trade"
-            entered_at = self._parse_iso_ts(str(lot.get("entered_at") or lot.get("entered_at_iso") or ""))
-            if entered_at is not None and (
-                datetime.now(timezone.utc) - entered_at
-            ).total_seconds() >= LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS:
-                return "trade"
         return "background"
 
     @staticmethod
@@ -8483,7 +8392,7 @@ class VariationalToLighterRuntime:
         started = time.monotonic()
         observations: list[dict[str, Any]] = []
         selected_context: dict[str, Any] | None = None
-        last_block_reason = "v4_exit_confirmation_pending"
+        last_block_reason = "v4_passive_exit_confirmation_pending"
         max_refreshed_pnl_bps: Decimal | None = None
         max_executable_pnl_bps: Decimal | None = None
         confirmation_count = int(lot.get("v4_exit_confirmation_count") or 0)
@@ -8511,6 +8420,29 @@ class VariationalToLighterRuntime:
             )
             if value is not None
         ][-LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_STABILITY_SAMPLES:]
+
+        passive_window = list(lot.get("v4_exit_confirmation_window") or [])
+        passive_confirmed = bool(
+            passive_window
+            and passive_window[-1]
+            and sum(1 for value in passive_window if value)
+            >= LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
+        )
+        if not passive_confirmed:
+            return {
+                "confirmed": False,
+                "selected_context": None,
+                "observations": [],
+                "attempts": 0,
+                "window_ms": Decimal("0"),
+                "last_block_reason": last_block_reason,
+                "max_refreshed_pnl_bps": None,
+                "max_executable_pnl_bps": None,
+                "confirmation_count": confirmation_count,
+                "confirmation_mode": None,
+                "strong_single_threshold_bps": strong_single_threshold_bps,
+                "strong_single_context": strong_single_context,
+            }
 
         for attempt in range(
             1, LIVE_INVENTORY_BASIS_V4_EXIT_FAST_REFRESH_ATTEMPTS + 1
@@ -9067,37 +8999,6 @@ class VariationalToLighterRuntime:
         )
         self.stop_flag = True
 
-    async def _run_live_inventory_basis_background_quote(
-        self,
-        *,
-        asset: str,
-        qty: Decimal,
-    ) -> None:
-        try:
-            quote, quote_ms = await self.fetch_live_inventory_basis_quote(
-                asset=asset,
-                qty=qty,
-                priority="background",
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.logger.warning(
-                "live_inventory_background_quote_failed asset=%s error=%s",
-                asset,
-                type(exc).__name__,
-            )
-            return
-        if quote is None:
-            return
-        self.live_inventory_basis_background_quote_cache = {
-            "asset": asset.upper(),
-            "requested_qty": str(qty),
-            "quote": dict(quote),
-            "quote_ms": quote_ms,
-            "completed_monotonic": time.monotonic(),
-        }
-
     async def get_live_inventory_basis_quote(
         self,
         *,
@@ -9105,7 +9006,7 @@ class VariationalToLighterRuntime:
         qty: Decimal,
         priority: str,
     ) -> tuple[dict[str, Any] | None, Decimal | None]:
-        """Return a trade quote immediately or a fresh best-effort cache entry."""
+        """Return one exact RFQ for execution or a zero-RFQ stream observation."""
         if priority != "background":
             return await self.fetch_live_inventory_basis_quote(
                 asset=asset,
@@ -9113,85 +9014,34 @@ class VariationalToLighterRuntime:
                 priority=priority,
             )
 
-        requested_qty = Decimal(str(qty))
-        now = time.monotonic()
-        cache = getattr(
-            self,
-            "live_inventory_basis_background_quote_cache",
-            None,
-        )
-        if isinstance(cache, dict):
-            cached_quote = cache.get("quote")
-            cache_age = now - float(cache.get("completed_monotonic") or 0.0)
-            cached_qty = to_decimal(cache.get("requested_qty"))
-            cache_asset = str(cache.get("asset") or "").upper()
-            max_quote_age_ms = float(
-                getattr(self, "live_inventory_basis_max_var_quote_age_ms", 0.0)
-                or 0.0
-            )
-            max_cache_age = max_quote_age_ms / 1000.0 if max_quote_age_ms > 0 else 5.0
-            quote_age_ok = False
-            if isinstance(cached_quote, dict):
-                quote_age_ok, _ = self.live_inventory_var_quote_age_ok(
-                    cached_quote
-                )
-            if (
-                cache_asset == asset.upper()
-                and cached_qty == requested_qty
-                and cache_age >= 0
-                and cache_age <= max_cache_age
-                and isinstance(cached_quote, dict)
-                and quote_age_ok
-            ):
-                # A background RFQ is a single observation, not a reusable
-                # stream sample. Consuming it prevents repeated calls from
-                # advancing V4 confirmation on the same quote.
-                self.live_inventory_basis_background_quote_cache = None
-                return (
-                    {
-                        **cached_quote,
-                        "quote_source": "background_cache",
-                        "quote_cache_age_seconds": f"{cache_age:.6f}",
-                    },
-                    to_decimal(cache.get("quote_ms")),
-                )
-
-        task = getattr(
-            self,
-            "live_inventory_basis_background_quote_task",
-            None,
-        )
-        if task is not None and task.done():
-            self.live_inventory_basis_background_quote_task = None
-            task = None
-        cooldown_until = float(
-            getattr(
-                self,
-                "live_inventory_basis_background_quote_cooldown_until_monotonic",
-                0.0,
-            )
-            or 0.0
-        )
-        if now < cooldown_until:
+        quote = await self.get_variational_quote(asset.upper())
+        if not isinstance(quote, dict):
             return None, None
-        min_interval = 60.0 / LIVE_INVENTORY_VARIATIONAL_BACKGROUND_QUOTE_RATE_PER_MINUTE
-        last_started = float(
-            getattr(
-                self,
-                "live_inventory_basis_background_quote_last_started_monotonic",
-                0.0,
-            )
-            or 0.0
+        bid = to_decimal(quote.get("bid"))
+        ask = to_decimal(quote.get("ask"))
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            return None, None
+        quote_timestamp = (
+            quote.get("quoteTimestamp")
+            or quote.get("quote_timestamp")
+            or quote.get("timestamp")
+            or quote.get("received_at")
         )
-        if task is None and now - last_started >= min_interval:
-            self.live_inventory_basis_background_quote_last_started_monotonic = now
-            self.live_inventory_basis_background_quote_task = asyncio.create_task(
-                self._run_live_inventory_basis_background_quote(
+        return (
+            {
+                **quote,
+                "quoteTimestamp": quote_timestamp,
+                "quote_asset": asset.upper(),
+                "quote_request_qty": variational_api_amount_to_str(
+                    Decimal(str(qty)),
                     asset=asset,
-                    qty=requested_qty,
-                )
-            )
-        return None, None
+                ),
+                "quote_size_mode": LIVE_INVENTORY_BASIS_QUOTE_SIZE_MODE,
+                "quote_source": LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE,
+                "rfq_consumed": False,
+            },
+            Decimal("0"),
+        )
 
     async def fetch_live_inventory_basis_quote(
         self,
@@ -11995,12 +11845,13 @@ class VariationalToLighterRuntime:
         limiter = self.live_inventory_order_limiter("variational")
         urgent = bool(reduce_only and confirm)
         use_api = self.variational_submit_transport == VARIATIONAL_SUBMIT_TRANSPORT_API
-        request_cost = 2 if confirm and reuse_quote_id is None else 1
-        if priority == "background" and not urgent:
+        rfq_cost = int(not confirm or not reuse_quote_id)
+        limiter_wait_seconds = 0.0
+        if rfq_cost and priority == "background" and not urgent:
             acquired, limiter_wait_seconds = await limiter.try_acquire(
                 limit=LIVE_INVENTORY_VARIATIONAL_BACKGROUND_QUOTE_RATE_PER_MINUTE,
                 category="background_quote",
-                cost=request_cost,
+                cost=rfq_cost,
             )
             if not acquired:
                 return {
@@ -12010,10 +11861,16 @@ class VariationalToLighterRuntime:
                     "rate_limit_skipped": True,
                     "rate_limit": limiter.snapshot(),
                 }
-        else:
+        elif rfq_cost:
             limiter_wait_seconds = await limiter.acquire(
                 urgent=urgent,
-                cost=request_cost,
+                cost=rfq_cost,
+                category="emergency_exit" if urgent else "execution_quote",
+                category_limit=(
+                    LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_HARD_PER_MINUTE
+                    if urgent
+                    else LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_NORMAL_PER_MINUTE
+                ),
             )
         request_id = uuid.uuid4().hex
         request_timeout_ms = (
@@ -12112,7 +11969,8 @@ class VariationalToLighterRuntime:
                 **result,
                 "rate_limit_wait_ms": f"{limiter_wait_seconds * 1000:.3f}",
                 "rate_limit_priority": priority,
-                "rate_limit_cost": request_cost,
+                "rate_limit_cost": rfq_cost,
+                "rfq_consumed": bool(rfq_cost),
             }
         return result
 
@@ -12201,7 +12059,6 @@ class VariationalToLighterRuntime:
             payload=payload,
             request_id=request_id,
             lane="read",
-            rate_limit_cost=1,
             rate_limit_priority="read",
         )
 
@@ -12216,7 +12073,6 @@ class VariationalToLighterRuntime:
             payload=payload,
             request_id=request_id,
             lane="read",
-            rate_limit_cost=1,
             rate_limit_priority="read",
         )
 
@@ -12245,7 +12101,6 @@ class VariationalToLighterRuntime:
             payload=payload,
             request_id=request_id,
             lane="read",
-            rate_limit_cost=1,
             rate_limit_priority="read",
         )
 
@@ -18438,6 +18293,128 @@ class VariationalToLighterRuntime:
             and self.live_inventory_basis_v4_real_gradient
             and len(self.live_inventory_open_lots) > 1
             and not portfolio_exit_lot_ids
+            and not self.pending_live_inventory_var_fill_matches
+            and not self.live_inventory_v4_exit_reconciliation_lot_ids
+            and not getattr(
+                self,
+                "live_inventory_account_risk_exit_reason",
+                None,
+            )
+            and all(
+                self.live_inventory_entry_cost_confirmed(open_lot)
+                for open_lot in self.live_inventory_open_lots
+            )
+        ):
+            portfolio_directions = {
+                str(open_lot.get("direction") or "")
+                for open_lot in self.live_inventory_open_lots
+            }
+            portfolio_qty = sum(
+                (
+                    to_decimal(open_lot.get("qty")) or Decimal("0")
+                    for open_lot in self.live_inventory_open_lots
+                ),
+                Decimal("0"),
+            )
+            portfolio_context: dict[str, Any] = {
+                "ready": False,
+                "reason": "portfolio_exit_context_unavailable",
+            }
+            if len(portfolio_directions) == 1 and portfolio_qty > 0:
+                portfolio_direction = next(iter(portfolio_directions))
+                portfolio_depth = await self.live_inventory_lighter_depth_context(
+                    lighter_side=(
+                        "BUY"
+                        if portfolio_direction
+                        == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                        else "SELL"
+                    ),
+                    qty=portfolio_qty,
+                )
+                portfolio_lighter_exit_price = to_decimal(
+                    portfolio_depth.get("estimated_fill_price")
+                )
+                portfolio_var_exit_price = (
+                    var_bid
+                    if portfolio_direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                    else var_ask
+                )
+                if portfolio_lighter_exit_price is not None:
+                    portfolio_context = (
+                        self.live_inventory_v4_aggregate_exit_context(
+                            lots=self.live_inventory_open_lots,
+                            var_exit_price=portfolio_var_exit_price,
+                            lighter_exit_price=portfolio_lighter_exit_price,
+                        )
+                    )
+                    portfolio_context["exit_lighter_depth"] = portfolio_depth
+            portfolio_target_bps = (
+                v4_exit_shortfall_reserve_bps
+                + LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS
+                + LIVE_INVENTORY_BASIS_V4_PORTFOLIO_EXIT_EXTRA_BPS
+            )
+            portfolio_pnl_bps = to_decimal(
+                portfolio_context.get("aggregate_executable_pnl_bps")
+            )
+            portfolio_eligible = bool(
+                portfolio_context.get("ready")
+                and portfolio_pnl_bps is not None
+                and portfolio_pnl_bps >= portfolio_target_bps
+                and var_quote_age_ok
+                and lighter_book_age_ok
+            )
+            confirmations = getattr(
+                self,
+                "live_inventory_v4_portfolio_exit_confirmations",
+                None,
+            )
+            if not isinstance(confirmations, deque):
+                confirmations = deque(
+                    maxlen=LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_WINDOW_SAMPLES
+                )
+                self.live_inventory_v4_portfolio_exit_confirmations = confirmations
+            confirmations.append(portfolio_eligible)
+            portfolio_confirmed = bool(
+                confirmations
+                and confirmations[-1]
+                and sum(1 for value in confirmations if value)
+                >= LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
+            )
+            if portfolio_confirmed:
+                self.live_inventory_v4_portfolio_exit_lot_ids = set(
+                    portfolio_context.get("lot_ids") or []
+                )
+                self.live_inventory_v4_portfolio_exit_context = {
+                    **portfolio_context,
+                    "hybrid_high_profit_exit": True,
+                    "partial_detier": False,
+                    "effective_min_exit_pnl_bps": decimal_to_str(
+                        portfolio_target_bps
+                    ),
+                    "confirmation_count": sum(
+                        1 for value in confirmations if value
+                    ),
+                    "locked_at": utc_now(),
+                }
+                portfolio_exit_lot_ids = (
+                    self.live_inventory_v4_portfolio_exit_lot_ids
+                )
+                await self.persist_live_inventory_memory(
+                    reason="v4_hybrid_portfolio_exit_locked"
+                )
+                await self.append_live_inventory_log(
+                    "live_inventory_v4_portfolio_exit_locked",
+                    {
+                        **state_payload,
+                        **self.live_inventory_v4_portfolio_exit_context,
+                    },
+                )
+        if (
+            v4_mode
+            and self.live_inventory_basis_v4_real_gradient
+            and len(self.live_inventory_open_lots) > 1
+            and not portfolio_exit_lot_ids
+            and not portfolio_eligible
             and not maintenance_drain_uses_individual_legacy_exits(
                 requested=bool(
                     getattr(
@@ -19125,6 +19102,14 @@ class VariationalToLighterRuntime:
                     v4_exit_shortfall_reserve_bps
                     + LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS
                 )
+                if portfolio_exit_selected:
+                    locked_portfolio_target = to_decimal(
+                        self.live_inventory_v4_portfolio_exit_context.get(
+                            "effective_min_exit_pnl_bps"
+                        )
+                    )
+                    if locked_portfolio_target is not None:
+                        effective_min_exit_pnl_bps = locked_portfolio_target
                 signal_reverted = False
                 signal_exit_watch_timeout = False
                 signal_exit_watch_timeout_ok = False
@@ -19134,25 +19119,18 @@ class VariationalToLighterRuntime:
                     and pnl_bps >= effective_min_exit_pnl_bps
                 ) or portfolio_exit_selected
                 should_exit = raw_should_exit and var_quote_age_ok and lighter_book_age_ok
-                current_quote_confirmation_pending = False
-                if (
-                    current_quote_matches_lot
-                    and not portfolio_exit_selected
-                ):
-                    current_quote_eligible = should_exit
+                if not portfolio_exit_selected:
+                    passive_quote_eligible = should_exit
                     should_exit, confirmation_count = (
                         self.live_inventory_basis_v4_confirm_exit_candidate(
                             candidate_lot,
-                            eligible=current_quote_eligible,
+                            eligible=passive_quote_eligible,
                         )
                     )
-                    current_quote_confirmation_pending = bool(
-                        current_quote_eligible and not should_exit
-                    )
-                    if current_quote_confirmation_pending and (
+                    if passive_quote_eligible and not should_exit and (
                         self.should_log_live_inventory_exit_blocked(
                             lot_id=candidate_lot.get("lot_id"),
-                            reason="v4_exact_quote_confirmation_pending",
+                            reason="v4_passive_quote_confirmation_pending",
                         )
                     ):
                         await self.append_live_inventory_log(
@@ -19164,7 +19142,7 @@ class VariationalToLighterRuntime:
                                     "basis_trace_id"
                                 ),
                                 "direction": direction,
-                                "reason": "v4_exact_quote_confirmation_pending",
+                                "reason": "v4_passive_quote_confirmation_pending",
                                 "pnl_bps": decimal_to_str(pnl_bps),
                                 "effective_min_exit_pnl_bps": decimal_to_str(
                                     effective_min_exit_pnl_bps
@@ -19176,13 +19154,8 @@ class VariationalToLighterRuntime:
                                 "confirmation_window": (
                                     LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_WINDOW_SAMPLES
                                 ),
-                                "quote_reuse_eligible": True,
+                                "quote_source": quote.get("quote_source"),
                             },
-                        )
-                if not should_exit and not portfolio_exit_selected:
-                    if not current_quote_matches_lot:
-                        self.live_inventory_basis_v4_reset_exit_confirmation(
-                            candidate_lot
                         )
                 # V4 has no time-driven exit or target relaxation. Account risk,
                 # executable profit, and the independent loss fuse are the only exits.
@@ -22712,19 +22685,6 @@ class VariationalToLighterRuntime:
                 size_ladder_shadow_task,
                 return_exceptions=True,
             )
-
-        background_quote_task = getattr(
-            self,
-            "live_inventory_basis_background_quote_task",
-            None,
-        )
-        if background_quote_task is not None and not background_quote_task.done():
-            background_quote_task.cancel()
-            await asyncio.gather(
-                background_quote_task,
-                return_exceptions=True,
-            )
-        self.live_inventory_basis_background_quote_task = None
 
         account_risk_task = getattr(
             self,

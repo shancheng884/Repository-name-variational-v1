@@ -216,3 +216,47 @@ def test_backup_waits_for_delivery_grace_then_sends_only_failed_channels(
     assert [kind for kind, _ in bark.calls] == ["bark"]
     assert feishu.calls == []
     assert telegram.calls == []
+
+
+def test_backup_does_not_redeliver_acknowledged_incident(tmp_path: Path) -> None:
+    config = _config()
+    now = datetime(2026, 9, 2, 0, 0, 30, tzinfo=timezone.utc)
+    heartbeat = {
+        "schema_version": 1,
+        "received_at": now.isoformat(),
+        "node_id": "vps-a",
+        "payload": {
+            "schema_version": 1,
+            "node_id": "vps-a",
+            "watchdog": {
+                "active_incidents": [
+                    {
+                        "key": "critical_account_risk",
+                        "severity": "critical",
+                        "title": "critical",
+                        "message": "acknowledged failure",
+                        "incident_signature": "sig-ack",
+                        "acknowledged_at": now.isoformat(),
+                        "bark_status": "bark_http_400",
+                        "feishu_message_status": "sent",
+                        "feishu_phone_status": "sent",
+                    }
+                ]
+            },
+        },
+    }
+    heartbeat_path = tmp_path / "heartbeat.json"
+    heartbeat_path.write_text(json.dumps(heartbeat), encoding="utf-8")
+    bark = FakeNotifier()
+    monitor = BackupAlertMonitor(
+        config=config,
+        heartbeat_path=heartbeat_path,
+        state_path=tmp_path / "state.json",
+        bark=bark,
+        feishu=FakeNotifier(),
+        telegram=FakeNotifier(),
+        clock=lambda: now + timedelta(seconds=16),
+    )
+
+    assert monitor.run_once() == []
+    assert bark.calls == []

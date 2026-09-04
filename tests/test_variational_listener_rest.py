@@ -59,3 +59,19 @@ def test_trading_raw_event_policy_skips_market_noise_but_keeps_orders(
     ]
     assert len(rows) == 1
     assert rows[0]["payload"]["url"].endswith("/api/orders/v2")
+
+
+def test_quote_records_local_receive_time_when_exchange_timestamp_is_missing() -> None:
+    monitor = VariationalMonitor()
+
+    updated = monitor._update_quote(
+        {
+            "asset": "ETH",
+            "bid": "2400.10",
+            "ask": "2400.20",
+        }
+    )
+
+    assert updated is True
+    assert monitor.quotes["ETH"]["timestamp"] is None
+    assert monitor.quotes["ETH"]["received_at"]

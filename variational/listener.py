@@ -358,6 +358,7 @@ class VariationalMonitor:
         mark = payload.get("mark_price") or payload.get("price") or payload.get("mid")
         underlying_price = payload.get("underlying_price")
         ts = payload.get("timestamp") or payload.get("updated_at") or payload.get("created_at")
+        received_at = utc_now()
 
         if bid is None and ask is None and mark is not None:
             bid = mark
@@ -377,6 +378,7 @@ class VariationalMonitor:
             "ask": ask,
             "mark_price": mark,
             "timestamp": ts,
+            "received_at": received_at,
             "raw": payload,
         }
         self.current_quote_asset = asset

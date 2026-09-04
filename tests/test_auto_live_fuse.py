@@ -4336,36 +4336,32 @@ def test_background_variational_quote_times_out_without_using_trade_lane(
     asyncio.run(run())
 
 
-def test_background_quote_cache_request_does_not_wait_for_rfq(tmp_path) -> None:
+def test_v4_background_quote_uses_passive_stream_without_rfq(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
-        started = asyncio.Event()
 
-        async def slow_fetch_live_inventory_basis_quote(**_kwargs):
-            started.set()
-            await asyncio.sleep(1)
-            return {"quoteId": "background-quote"}, Decimal("1000")
+        async def passive_quote(_asset):
+            return {
+                "bid": "2400.10",
+                "ask": "2400.30",
+                "quoteTimestamp": "2026-09-04T00:00:00Z",
+            }
 
-        runtime.fetch_live_inventory_basis_quote = slow_fetch_live_inventory_basis_quote
-        start = time.monotonic()
+        async def refuse_rfq(**_kwargs):
+            raise AssertionError("passive V4 observation must not request an RFQ")
 
+        runtime.get_variational_quote = passive_quote
+        runtime.fetch_live_inventory_basis_quote = refuse_rfq
         quote, quote_ms = await runtime.get_live_inventory_basis_quote(
             asset="ETH",
             qty=Decimal("0.008"),
             priority="background",
         )
 
-        elapsed = time.monotonic() - start
-        assert quote is None
-        assert quote_ms is None
-        assert elapsed < 0.2
-        await asyncio.wait_for(started.wait(), timeout=0.2)
-
-        task = runtime.live_inventory_basis_background_quote_task
-        assert task is not None
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        runtime.live_inventory_basis_background_quote_task = None
+        assert quote["quote_source"] == "passive_browser_stream"
+        assert Decimal(quote["quote_request_qty"]) == Decimal("0.008")
+        assert quote["rfq_consumed"] is False
+        assert quote_ms == Decimal("0")
 
     asyncio.run(run())
 
@@ -4401,6 +4397,60 @@ def test_variational_order_reuses_final_quote_id(tmp_path) -> None:
         assert captured["payload"]["type"] == "VAR_API_ORDER"
         assert captured["payload"]["reuseQuoteId"] == "quote-final"
         assert captured["payload"]["requestId"]
+        assert result["rfq_consumed"] is False
+        assert result["rate_limit_cost"] == 0
+        assert runtime.live_inventory_variational_order_limiter.snapshot()["used"] == 0
+
+    asyncio.run(run())
+
+
+def test_variational_implicit_execution_quote_consumes_one_rfq(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_variational_order_limiter = RollingWindowRateLimiter(
+            normal_limit=25,
+            hard_limit=30,
+        )
+        runtime.variational_submit_transport = "api"
+        runtime.variational_api_max_slippage = 0.005
+
+        async def fake_send_variational_command(**_kwargs):
+            return {"ok": True, "type": "VAR_API_ORDER_RESULT"}
+
+        runtime.send_variational_command = fake_send_variational_command
+        result = await runtime.send_variational_place_order(
+            asset="ETH",
+            side="SELL",
+            amount="0.008",
+            expected_min_btc_qty=None,
+            confirm=True,
+            reduce_only=False,
+        )
+
+        assert result["rfq_consumed"] is True
+        assert result["rate_limit_cost"] == 1
+        assert runtime.live_inventory_variational_order_limiter.snapshot()["used"] == 1
+
+    asyncio.run(run())
+
+
+def test_variational_account_reads_do_not_consume_rfq_budget(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        captured = []
+
+        async def fake_send_variational_command(**kwargs):
+            captured.append(kwargs)
+            return {"ok": True}
+
+        runtime.send_variational_command = fake_send_variational_command
+        await runtime.fetch_variational_positions()
+        await runtime.fetch_variational_portfolio()
+        await runtime.fetch_variational_orders(asset="ETH", status="any")
+
+        assert len(captured) == 3
+        assert all(item["lane"] == "read" for item in captured)
+        assert all("rate_limit_cost" not in item for item in captured)
 
     asyncio.run(run())
 
@@ -5909,7 +5959,10 @@ def test_v4_fast_refresh_accepts_latest_and_two_of_three_executable_quotes(
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
         runtime.live_inventory_v4_strong_single_enabled = False
-        lot: dict[str, object] = {}
+        lot: dict[str, object] = {
+            "v4_exit_confirmation_window": [True, True],
+            "v4_exit_confirmation_count": 2,
+        }
         contexts = [
             {
                 "reason": None,
@@ -5959,21 +6012,19 @@ def test_v4_fast_refresh_accepts_latest_and_two_of_three_executable_quotes(
         )
 
         assert result["confirmed"] is True
-        assert result["attempts"] == 3
-        assert result["confirmation_count"] == 2
-        assert result["observations"][0]["confirmation_count"] == 1
-        assert result["observations"][1]["confirmation_count"] == 1
-        assert result["observations"][2]["confirmation_count"] == 2
+        assert result["attempts"] == 1
+        assert result["confirmation_count"] == 3
+        assert result["observations"][0]["confirmation_count"] == 3
         assert result["confirmation_mode"] == "two_of_three"
         assert result["selected_context"]["executable_pnl_bps"] == Decimal(
-            "4.9"
+            "4.8"
         )
-        assert lot["executable_exit_mfe_pnl_bps"] == "4.9"
+        assert lot["executable_exit_mfe_pnl_bps"] == "4.8"
 
     asyncio.run(run())
 
 
-def test_v4_fast_refresh_accepts_strong_single_executable_quote(
+def test_v4_fast_refresh_requires_passive_confirmation_before_rfq(
     tmp_path,
 ) -> None:
     async def run() -> None:
@@ -6021,14 +6072,13 @@ def test_v4_fast_refresh_accepts_strong_single_executable_quote(
             effective_min_exit_pnl_bps=Decimal("2.50"),
         )
 
-        assert result["confirmed"] is True
-        assert result["attempts"] == 2
-        assert result["confirmation_count"] == 1
-        assert result["confirmation_mode"] == "strong_single"
+        assert result["confirmed"] is False
+        assert result["attempts"] == 0
+        assert result["confirmation_count"] == 0
+        assert result["confirmation_mode"] is None
         assert result["strong_single_threshold_bps"] == Decimal("3.50")
-        assert result["observations"][1]["confirmation_mode"] == "strong_single"
-        assert result["observations"][1]["strong_single_stable"] is True
-        assert calls == 2
+        assert result["observations"] == []
+        assert calls == 0
 
     asyncio.run(run())
 
@@ -6082,9 +6132,9 @@ def test_v4_fast_refresh_rejects_unstable_strong_single_spike(tmp_path) -> None:
         )
 
         assert result["confirmed"] is False
-        assert result["attempts"] == 6
-        assert result["max_executable_pnl_bps"] == Decimal("5.00")
-        assert result["observations"][1]["strong_single_stable"] is False
+        assert result["attempts"] == 0
+        assert result["max_executable_pnl_bps"] is None
+        assert result["observations"] == []
 
     asyncio.run(run())
 
@@ -6094,14 +6144,12 @@ def test_v4_fast_refresh_exhausts_with_only_one_eligible_quote_per_window(
 ) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
-        lot: dict[str, object] = {}
+        lot: dict[str, object] = {
+            "v4_exit_confirmation_window": [True, True],
+            "v4_exit_confirmation_count": 2,
+        }
         executable_values = iter(
             (
-                Decimal("4.8"),
-                Decimal("4.4"),
-                Decimal("4.4"),
-                Decimal("4.8"),
-                Decimal("4.4"),
                 Decimal("4.4"),
             )
         )
@@ -6132,12 +6180,12 @@ def test_v4_fast_refresh_exhausts_with_only_one_eligible_quote_per_window(
         )
 
         assert result["confirmed"] is False
-        assert result["attempts"] == 6
-        assert result["confirmation_count"] == 1
+        assert result["attempts"] == 1
+        assert result["confirmation_count"] == 2
         assert result["last_block_reason"] == (
             "basis_exit_lighter_depth_pnl_below_threshold"
         )
-        assert result["max_executable_pnl_bps"] == Decimal("4.8")
+        assert result["max_executable_pnl_bps"] == Decimal("4.4")
 
     asyncio.run(run())
 
@@ -6161,7 +6209,10 @@ def test_v4_fast_refresh_does_not_retry_unavailable_quote(tmp_path) -> None:
 
         result = await runtime.live_inventory_basis_v4_fast_refresh_exit_context(
             asset="ETH",
-            lot={},
+            lot={
+                "v4_exit_confirmation_window": [True, True],
+                "v4_exit_confirmation_count": 2,
+            },
             direction="short_var_long_lighter",
             qty=Decimal("0.01"),
             entry_var_price=Decimal("100"),

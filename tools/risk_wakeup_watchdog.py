@@ -115,6 +115,7 @@ class Incident:
     title: str
     message: str
     alert_params: tuple[str, ...]
+    fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -419,6 +420,16 @@ def evaluate_incidents(
     critical = [item for item in incidents if item.severity == "critical"]
     if critical:
         messages = list(dict.fromkeys(item.message for item in critical))
+        fingerprint_keys: set[str] = set()
+        for item in critical:
+            fingerprint_key = item.key
+            if fingerprint_key.startswith("unreconciled_manual_review:"):
+                fingerprint_key = "manual_review:" + fingerprint_key.split(":", 1)[1]
+            fingerprint_keys.add(fingerprint_key)
+        if len(fingerprint_keys) > 1:
+            # A stale heartbeat is normally a consequence of another explicit
+            # fault. Do not turn its changing age into a second alarm episode.
+            fingerprint_keys.discard("risk_heartbeat_stale_with_exposure")
         incidents = [item for item in incidents if item.severity != "critical"]
         incidents.append(
             Incident(
@@ -427,6 +438,7 @@ def evaluate_incidents(
                 title="Var/Lighter 账户紧急风险",
                 message="\n".join(messages),
                 alert_params=(asset, "账户出现紧急风险，请立即检查"),
+                fingerprint="|".join(sorted(fingerprint_keys)),
             )
         )
 
@@ -511,10 +523,166 @@ class RiskWakeupWatchdog:
             return value
         return self.config.monitor_strategy
 
-    def _notify_telegram(self, message: str) -> None:
+    def _notify_telegram(
+        self,
+        message: str,
+        *,
+        acknowledgement_token: str | None = None,
+    ) -> None:
         if self.dry_run or not self.telegram.enabled:
             return
-        self.telegram.send_now(message)
+        reply_markup = None
+        if acknowledgement_token:
+            reply_markup = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "我已知晓，停止重复提醒",
+                            "callback_data": (
+                                f"risk_ack:{acknowledgement_token}"
+                            ),
+                        }
+                    ]
+                ]
+            }
+        try:
+            self.telegram.send_now(message, reply_markup=reply_markup)
+        except TypeError:
+            # Keeps custom notifiers compatible while the built-in notifier
+            # supports Telegram inline keyboards.
+            self.telegram.send_now(message)
+
+    @staticmethod
+    def _incident_signature(incident: Incident) -> str:
+        source = (
+            f"{incident.severity}\n{incident.fingerprint}"
+            if incident.fingerprint is not None
+            else f"{incident.severity}\n{incident.title}\n{incident.message}"
+        )
+        return hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _new_acknowledgement_token(
+        incident: Incident,
+        *,
+        now: datetime,
+    ) -> str:
+        source = f"{incident.key}\n{iso_time(now)}\n{time.time_ns()}"
+        return hashlib.sha256(source.encode("utf-8")).hexdigest()[:20]
+
+    @staticmethod
+    def _reset_delivery_state(record: dict[str, Any]) -> None:
+        for key in (
+            "bark_status",
+            "bark_sent_at",
+            "last_bark_attempt_at",
+            "feishu_message_status",
+            "feishu_message_sent_at",
+            "feishu_message_id",
+            "last_feishu_message_attempt_at",
+            "feishu_phone_status",
+            "feishu_phone_sent_at",
+            "last_feishu_phone_attempt_at",
+            "acknowledged_at",
+            "acknowledged_by",
+            "acknowledged_signature",
+        ):
+            record.pop(key, None)
+        record["bark_attempts"] = 0
+        record["feishu_message_attempts"] = 0
+        record["feishu_phone_attempts"] = 0
+
+    def _poll_telegram_acknowledgements(self, *, now: datetime) -> None:
+        if self.dry_run or not self.telegram.enabled:
+            return
+        get_updates = getattr(self.telegram, "get_updates", None)
+        if not callable(get_updates):
+            return
+        offset_value = self.memory.get("telegram_update_offset")
+        try:
+            offset = int(offset_value) if offset_value is not None else None
+        except (TypeError, ValueError):
+            offset = None
+        try:
+            updates, detail = get_updates(offset=offset)
+        except Exception as exc:
+            logging.getLogger("risk_wakeup_watchdog").warning(
+                "telegram_ack_poll_failed detail=exception:%s",
+                type(exc).__name__,
+            )
+            return
+        if detail != "ok":
+            logging.getLogger("risk_wakeup_watchdog").warning(
+                "telegram_ack_poll_failed detail=%s",
+                detail,
+            )
+            return
+        next_offset = offset
+        active = self.memory["active_incidents"]
+        for update in updates:
+            try:
+                update_id = int(update.get("update_id"))
+            except (TypeError, ValueError):
+                continue
+            next_offset = max(next_offset or 0, update_id + 1)
+            callback = update.get("callback_query")
+            if not isinstance(callback, dict):
+                continue
+            data = str(callback.get("data") or "")
+            if not data.startswith("risk_ack:"):
+                continue
+            message = callback.get("message")
+            message = message if isinstance(message, dict) else {}
+            chat = message.get("chat")
+            chat = chat if isinstance(chat, dict) else {}
+            callback_chat_id = str(chat.get("id") or "")
+            if callback_chat_id != str(getattr(self.telegram, "chat_id", "")):
+                continue
+            token = data.split(":", 1)[1]
+            acknowledged = False
+            for record in active.values():
+                if not isinstance(record, dict):
+                    continue
+                if str(record.get("acknowledgement_token") or "") != token:
+                    continue
+                record["acknowledged_at"] = iso_time(now)
+                record["acknowledged_by"] = callback_chat_id
+                record["acknowledged_signature"] = record.get(
+                    "incident_signature"
+                )
+                acknowledged = True
+                break
+            answer = getattr(self.telegram, "answer_callback_query", None)
+            if callable(answer):
+                try:
+                    answer(
+                        str(callback.get("id") or ""),
+                        text=("已停止本次故障的重复提醒" if acknowledged else "该故障已恢复或失效"),
+                    )
+                except Exception as exc:
+                    logging.getLogger("risk_wakeup_watchdog").warning(
+                        "telegram_ack_answer_failed detail=exception:%s",
+                        type(exc).__name__,
+                    )
+            clear_keyboard = getattr(self.telegram, "clear_inline_keyboard", None)
+            if acknowledged and callable(clear_keyboard):
+                try:
+                    message_id = int(message.get("message_id"))
+                except (TypeError, ValueError):
+                    message_id = 0
+                if message_id:
+                    try:
+                        clear_keyboard(
+                            chat_id=callback_chat_id,
+                            message_id=message_id,
+                        )
+                    except Exception as exc:
+                        logging.getLogger("risk_wakeup_watchdog").warning(
+                            "telegram_ack_keyboard_clear_failed detail=exception:%s",
+                            type(exc).__name__,
+                        )
+        if next_offset is not None:
+            self.memory["telegram_update_offset"] = next_offset
 
     def _persist(self, *, now: datetime) -> None:
         self.memory["schema_version"] = 1
@@ -569,7 +737,10 @@ class RiskWakeupWatchdog:
                     f"级别：{'紧急' if incident.severity == 'critical' else '提醒'}",
                     incident.message,
                 ]
-            )
+            ),
+            acknowledgement_token=str(
+                record.get("acknowledgement_token") or ""
+            ),
         )
 
     def _retry_due(
@@ -687,6 +858,12 @@ class RiskWakeupWatchdog:
         now: datetime,
         force: bool = False,
     ) -> None:
+        if (
+            record.get("acknowledged_at")
+            and record.get("acknowledged_signature")
+            == record.get("incident_signature")
+        ):
+            return
         self._send_feishu_message(incident, record, now=now, force=force)
         self._send_feishu_phone(incident, record, now=now, force=force)
         self._send_bark(incident, record, now=now, force=force)
@@ -725,6 +902,7 @@ class RiskWakeupWatchdog:
         force_delivery: bool = False,
     ) -> list[Incident]:
         now = self.clock()
+        self._poll_telegram_acknowledgements(now=now)
         state = read_json(self.state_path)
         risk_health = read_json(self.risk_health_path)
         events = self.metrics.read()
@@ -778,43 +956,30 @@ class RiskWakeupWatchdog:
             incidents = promoted
         current_keys = {item.key for item in incidents}
         for incident in incidents:
+            signature = self._incident_signature(incident)
             record = active.get(incident.key)
             if not isinstance(record, dict):
                 record = {
                     "first_seen_at": iso_time(now),
                     "severity": incident.severity,
                     "title": incident.title,
+                    "message": incident.message,
+                    "incident_signature": signature,
+                    "acknowledgement_token": (
+                        self._new_acknowledgement_token(incident, now=now)
+                    ),
                 }
                 active[incident.key] = record
                 self._send_new_incident(incident, record, now=now)
-            signature = hashlib.sha256(
-                f"{incident.severity}\n{incident.title}\n{incident.message}".encode(
-                    "utf-8"
-                )
-            ).hexdigest()[:16]
             previous_signature = record.get("incident_signature")
-            if (
-                incident.severity == "critical"
-                and previous_signature
-                and previous_signature != signature
-            ):
-                for key in (
-                    "bark_status",
-                    "bark_sent_at",
-                    "last_bark_attempt_at",
-                    "feishu_message_status",
-                    "feishu_message_sent_at",
-                    "feishu_message_id",
-                    "last_feishu_message_attempt_at",
-                    "feishu_phone_status",
-                    "feishu_phone_sent_at",
-                    "last_feishu_phone_attempt_at",
-                ):
-                    record.pop(key, None)
-                record["bark_attempts"] = 0
-                record["feishu_message_attempts"] = 0
-                record["feishu_phone_attempts"] = 0
-                record["critical_since_at"] = iso_time(now)
+            if previous_signature and previous_signature != signature:
+                self._reset_delivery_state(record)
+                record["acknowledgement_token"] = (
+                    self._new_acknowledgement_token(incident, now=now)
+                )
+                if incident.severity == "critical":
+                    record["critical_since_at"] = iso_time(now)
+                record["incident_signature"] = signature
                 self._deliver_incident(
                     incident,
                     record,
@@ -827,7 +992,25 @@ class RiskWakeupWatchdog:
                             "[Var/Lighter] 紧急风险原因已变化",
                             incident.message,
                         ]
-                    )
+                    ),
+                    acknowledgement_token=str(
+                        record.get("acknowledgement_token") or ""
+                    ),
+                )
+            elif not record.get("acknowledgement_token"):
+                record["acknowledgement_token"] = (
+                    self._new_acknowledgement_token(incident, now=now)
+                )
+                self._notify_telegram(
+                    "\n".join(
+                        [
+                            "[Var/Lighter] 当前风险确认入口",
+                            incident.message,
+                        ]
+                    ),
+                    acknowledgement_token=str(
+                        record["acknowledgement_token"]
+                    ),
                 )
             if (
                 incident.severity == "critical"
@@ -837,6 +1020,7 @@ class RiskWakeupWatchdog:
             record["severity"] = incident.severity
             record["incident_signature"] = signature
             record["title"] = incident.title
+            record["message"] = incident.message
             record["last_seen_at"] = iso_time(now)
             self._deliver_incident(
                 incident,

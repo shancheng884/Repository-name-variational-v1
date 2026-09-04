@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -625,16 +626,99 @@ class TelegramNotifier:
                 await asyncio.gather(task, return_exceptions=True)
         self.worker_task = None
 
-    def send_now(self, text: str) -> tuple[bool, str]:
+    def send_now(
+        self,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        if not self.enabled:
+            return False, "missing_TELEGRAM_BOT_TOKEN_or_TELEGRAM_CHAT_ID"
+        payload: dict[str, Any] = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
+                json=payload,
+                timeout=(3.0, 5.0),
+            )
+        except Exception as exc:
+            return False, f"request_failed:{type(exc).__name__}"
+        if response.status_code != 200:
+            return False, f"http_status_{response.status_code}"
+        return True, "sent"
+
+    def get_updates(
+        self,
+        *,
+        offset: int | None = None,
+    ) -> tuple[list[dict[str, Any]], str]:
+        if not self.enabled:
+            return [], "missing_TELEGRAM_BOT_TOKEN_or_TELEGRAM_CHAT_ID"
+        params: dict[str, Any] = {
+            "timeout": 0,
+            "allowed_updates": json.dumps(["callback_query"]),
+        }
+        if offset is not None:
+            params["offset"] = int(offset)
+        try:
+            response = requests.get(
+                f"https://api.telegram.org/bot{self.bot_token}/getUpdates",
+                params=params,
+                timeout=(3.0, 5.0),
+            )
+        except Exception as exc:
+            return [], f"request_failed:{type(exc).__name__}"
+        if response.status_code != 200:
+            return [], f"http_status_{response.status_code}"
+        try:
+            body = response.json()
+        except Exception:
+            return [], "invalid_json_response"
+        if not body.get("ok") or not isinstance(body.get("result"), list):
+            return [], "telegram_api_error"
+        return [item for item in body["result"] if isinstance(item, dict)], "ok"
+
+    def answer_callback_query(
+        self,
+        callback_query_id: str,
+        *,
+        text: str,
+    ) -> tuple[bool, str]:
         if not self.enabled:
             return False, "missing_TELEGRAM_BOT_TOKEN_or_TELEGRAM_CHAT_ID"
         try:
             response = requests.post(
-                f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
+                f"https://api.telegram.org/bot{self.bot_token}/answerCallbackQuery",
+                json={"callback_query_id": callback_query_id, "text": text},
+                timeout=(3.0, 5.0),
+            )
+        except Exception as exc:
+            return False, f"request_failed:{type(exc).__name__}"
+        if response.status_code != 200:
+            return False, f"http_status_{response.status_code}"
+        return True, "sent"
+
+    def clear_inline_keyboard(
+        self,
+        *,
+        chat_id: str,
+        message_id: int,
+    ) -> tuple[bool, str]:
+        if not self.enabled:
+            return False, "missing_TELEGRAM_BOT_TOKEN_or_TELEGRAM_CHAT_ID"
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{self.bot_token}/editMessageReplyMarkup",
                 json={
-                    "chat_id": self.chat_id,
-                    "text": text,
-                    "disable_web_page_preview": True,
+                    "chat_id": chat_id,
+                    "message_id": int(message_id),
+                    "reply_markup": {"inline_keyboard": []},
                 },
                 timeout=(3.0, 5.0),
             )

@@ -77,12 +77,32 @@ class FakeFeishu:
 
 class FakeTelegram:
     enabled = True
+    chat_id = "123"
 
     def __init__(self):
         self.sent = []
+        self.updates = []
+        self.answered = []
+        self.cleared = []
 
-    def send_now(self, text):
-        self.sent.append(text)
+    def send_now(self, text, *, reply_markup=None):
+        self.sent.append((text, reply_markup))
+        return True, "sent"
+
+    def get_updates(self, *, offset=None):
+        updates = [
+            update
+            for update in self.updates
+            if offset is None or update["update_id"] >= offset
+        ]
+        return updates, "ok"
+
+    def answer_callback_query(self, callback_query_id, *, text):
+        self.answered.append((callback_query_id, text))
+        return True, "sent"
+
+    def clear_inline_keyboard(self, *, chat_id, message_id):
+        self.cleared.append((chat_id, message_id))
         return True, "sent"
 
 
@@ -174,6 +194,43 @@ def test_force_reduce_margin_and_position_mismatch_are_critical() -> None:
     assert "maintenance_margin_usage_reduce" in critical.message
 
 
+def test_critical_fingerprint_ignores_changing_wait_and_heartbeat_age() -> None:
+    started = datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc)
+    state = {
+        "status": "manual_review_required",
+        "asset": "ETH",
+        "open_lots": [{"lot_id": 1}],
+        "pending_actions": [{"submitted_at": started.isoformat()}],
+        "manual_review_reason": "variational_html_response",
+    }
+    risk_health = {
+        "updated_at": started.isoformat(),
+        "risk_action": "normal",
+    }
+
+    first = evaluate_incidents(
+        state=state,
+        risk_health=risk_health,
+        events=[],
+        strategy_running=False,
+        config=config(),
+        now=started + timedelta(seconds=63),
+    )
+    second = evaluate_incidents(
+        state=state,
+        risk_health=risk_health,
+        events=[],
+        strategy_running=False,
+        config=config(),
+        now=started + timedelta(seconds=81),
+    )
+    first_critical = next(item for item in first if item.severity == "critical")
+    second_critical = next(item for item in second if item.severity == "critical")
+
+    assert first_critical.message != second_critical.message
+    assert first_critical.fingerprint == second_critical.fingerprint
+
+
 def build_watchdog(tmp_path, *, current, bark=None, feishu=None):
     return RiskWakeupWatchdog(
         config=config(channel_retry_seconds=10),
@@ -254,6 +311,157 @@ def test_new_critical_reason_realerts_all_channels(tmp_path) -> None:
     assert len(bark.sent) == 2
     assert len(feishu.messages) == 2
     assert len(feishu.phones) == 2
+
+
+def test_dynamic_message_does_not_realert_same_root_cause(tmp_path) -> None:
+    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
+    bark = FakeBark()
+    feishu = FakeFeishu()
+    watchdog = build_watchdog(
+        tmp_path,
+        current=current,
+        bark=bark,
+        feishu=feishu,
+    )
+    first = Incident(
+        "critical",
+        "critical",
+        "risk",
+        "heartbeat age 63 seconds",
+        ("ETH", "risk"),
+        fingerprint="variational_html_response",
+    )
+    second = Incident(
+        "critical",
+        "critical",
+        "risk",
+        "heartbeat age 81 seconds",
+        ("ETH", "risk"),
+        fingerprint="variational_html_response",
+    )
+
+    watchdog.run_once(synthetic=first)
+    current[0] += timedelta(seconds=20)
+    watchdog.run_once(synthetic=second)
+
+    assert len(bark.sent) == 1
+    assert len(feishu.messages) == 1
+    assert len(feishu.phones) == 1
+
+
+def test_telegram_acknowledgement_stops_failed_channel_retries(tmp_path) -> None:
+    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
+    bark = FakeBark()
+    bark.failures_remaining = 2
+    feishu = FakeFeishu()
+    telegram = FakeTelegram()
+    watchdog = RiskWakeupWatchdog(
+        config=config(channel_retry_seconds=10),
+        state_path=tmp_path / "state.json",
+        risk_health_path=tmp_path / "risk.json",
+        metrics_path=tmp_path / "metrics.jsonl",
+        watchdog_state_path=tmp_path / "watchdog.json",
+        watchdog_health_path=tmp_path / "health.json",
+        watchdog_control_path=tmp_path / "control.json",
+        bark=bark,
+        feishu=feishu,
+        telegram=telegram,
+        clock=lambda: current[0],
+        strategy_check=lambda _pid: True,
+    )
+    incident = Incident(
+        "critical",
+        "critical",
+        "risk",
+        "failure",
+        ("ETH", "risk"),
+        fingerprint="root-failure",
+    )
+
+    watchdog.run_once(synthetic=incident)
+    record = watchdog.memory["active_incidents"][incident.key]
+    token = record["acknowledgement_token"]
+    telegram.updates.append(
+        {
+            "update_id": 10,
+            "callback_query": {
+                "id": "callback-1",
+                "data": f"risk_ack:{token}",
+                "message": {
+                    "message_id": 88,
+                    "chat": {"id": 123},
+                },
+            },
+        }
+    )
+    current[0] += timedelta(seconds=11)
+    watchdog.run_once(synthetic=incident)
+
+    assert len(bark.sent) == 1
+    assert record["acknowledged_signature"] == record["incident_signature"]
+    assert telegram.answered[-1][0] == "callback-1"
+    assert telegram.cleared == [("123", 88)]
+    assert telegram.sent[0][1]["inline_keyboard"][0][0]["callback_data"] == (
+        f"risk_ack:{token}"
+    )
+
+
+def test_severity_escalation_realerts_after_acknowledgement(tmp_path) -> None:
+    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
+    bark = FakeBark()
+    feishu = FakeFeishu()
+    telegram = FakeTelegram()
+    watchdog = RiskWakeupWatchdog(
+        config=config(channel_retry_seconds=10),
+        state_path=tmp_path / "state.json",
+        risk_health_path=tmp_path / "risk.json",
+        metrics_path=tmp_path / "metrics.jsonl",
+        watchdog_state_path=tmp_path / "watchdog.json",
+        watchdog_health_path=tmp_path / "health.json",
+        watchdog_control_path=tmp_path / "control.json",
+        bark=bark,
+        feishu=feishu,
+        telegram=telegram,
+        clock=lambda: current[0],
+        strategy_check=lambda _pid: True,
+    )
+    warning = Incident(
+        "data_visibility",
+        "warning",
+        "risk",
+        "temporarily unavailable",
+        ("ETH", "risk"),
+        fingerprint="account-data-unavailable",
+    )
+    critical = Incident(
+        "data_visibility",
+        "critical",
+        "risk",
+        "unavailable too long",
+        ("ETH", "risk"),
+        fingerprint="account-data-unavailable",
+    )
+
+    watchdog.run_once(synthetic=warning)
+    record = watchdog.memory["active_incidents"][warning.key]
+    telegram.updates.append(
+        {
+            "update_id": 11,
+            "callback_query": {
+                "id": "callback-2",
+                "data": f"risk_ack:{record['acknowledgement_token']}",
+                "message": {"message_id": 89, "chat": {"id": 123}},
+            },
+        }
+    )
+    current[0] += timedelta(seconds=5)
+    watchdog.run_once(synthetic=critical)
+
+    assert len(bark.sent) == 2
+    assert bark.sent[-1]["critical"] is True
+    assert len(feishu.messages) == 2
+    assert len(feishu.phones) == 1
+    assert "acknowledged_at" not in record
 
 
 def test_recovery_sends_non_phone_recovery_notifications(tmp_path) -> None:

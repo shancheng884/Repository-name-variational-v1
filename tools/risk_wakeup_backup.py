@@ -396,6 +396,8 @@ class BackupAlertMonitor:
                     continue
                 if str(incident.get("severity") or "") != "critical":
                     continue
+                if incident.get("acknowledged_at"):
+                    continue
                 channels = _failed_channels(incident)
                 if not channels:
                     continue

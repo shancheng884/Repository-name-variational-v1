@@ -1,5 +1,4 @@
 import asyncio
-import time
 from decimal import Decimal
 
 from main import VariationalToLighterRuntime
@@ -71,25 +70,17 @@ def test_quote_reuse_rejects_missing_asset_metadata() -> None:
     assert reason == "quote_asset_missing"
 
 
-def test_background_quote_cache_is_consumed_once() -> None:
+def test_background_quote_reads_passive_browser_stream() -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
-        runtime.live_inventory_basis_background_quote_cache = {
-            "asset": "ETH",
-            "requested_qty": "0.01",
-            "quote": {
-                "quoteId": "one-shot",
-                "quoteTimestamp": "2026-01-01T00:00:00Z",
-            },
-            "quote_ms": "10",
-            "completed_monotonic": time.monotonic(),
-        }
-        runtime.live_inventory_basis_max_var_quote_age_ms = 0
-        runtime.live_inventory_basis_background_quote_task = None
-        runtime.live_inventory_basis_background_quote_cooldown_until_monotonic = 0
-        runtime.live_inventory_basis_background_quote_last_started_monotonic = (
-            time.monotonic()
-        )
+        async def get_variational_quote(_asset):
+            return {
+                "bid": "2400.1",
+                "ask": "2400.2",
+                "quoteTimestamp": "2026-09-04T00:00:00Z",
+            }
+
+        runtime.get_variational_quote = get_variational_quote
 
         quote, _ = await runtime.get_live_inventory_basis_quote(
             asset="ETH",
@@ -98,8 +89,33 @@ def test_background_quote_cache_is_consumed_once() -> None:
         )
 
         assert quote is not None
-        assert quote["quoteId"] == "one-shot"
-        assert runtime.live_inventory_basis_background_quote_cache is None
+        assert quote["quote_source"] == "passive_browser_stream"
+        assert quote["rfq_consumed"] is False
+
+    asyncio.run(run())
+
+
+def test_background_quote_uses_stream_receive_time_when_exchange_timestamp_missing() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+
+        async def get_variational_quote(_asset):
+            return {
+                "bid": "2400.1",
+                "ask": "2400.2",
+                "received_at": "2026-09-04T00:00:00Z",
+            }
+
+        runtime.get_variational_quote = get_variational_quote
+
+        quote, _ = await runtime.get_live_inventory_basis_quote(
+            asset="ETH",
+            qty=Decimal("0.01"),
+            priority="background",
+        )
+
+        assert quote is not None
+        assert quote["quoteTimestamp"] == "2026-09-04T00:00:00Z"
 
     asyncio.run(run())
 
