@@ -77,3 +77,102 @@ def test_quote_records_local_receive_time_when_exchange_timestamp_is_missing() -
     assert monitor.quotes["ETH"]["timestamp"] is None
     assert monitor.quotes["ETH"]["received_at"]
     assert monitor.quotes["ETH"]["received_monotonic"] <= time.monotonic()
+
+
+def test_prices_stream_stays_in_reference_cache_without_fake_bid_ask() -> None:
+    monitor = VariationalMonitor()
+    payload = {
+        "kind": "ws_frame",
+        "direction": "received",
+        "url": "wss://omni-ws-server.prod.ap-northeast-1.variational.io/prices",
+        "timestamp": "2026-09-04T00:00:01.000Z",
+        "payloadData": json.dumps(
+            {
+                "channel": "instrument_price:P-ETH-USDC-3600",
+                "pricing": {
+                    "price": "2500.25",
+                    "underlying_price": "2500.40",
+                    "timestamp": "2026-09-04T00:00:00.900Z",
+                },
+            }
+        ),
+    }
+
+    asyncio.run(monitor.process_ws_event(payload))
+
+    assert "ETH" not in monitor.quotes
+    assert monitor.reference_quotes["ETH"]["reference_price"] == "2500.25"
+    assert "bid" not in monitor.reference_quotes["ETH"]
+    assert "ask" not in monitor.reference_quotes["ETH"]
+
+
+def test_reference_stream_rejects_duplicate_source_timestamp() -> None:
+    monitor = VariationalMonitor()
+
+    assert monitor._update_quote(
+        {
+            "asset": "ETH",
+            "price": "2500.25",
+            "timestamp": "2026-09-04T00:00:00Z",
+            "channel": "instrument_price:P-ETH-USDC-3600",
+        }
+    )
+    assert not monitor._update_quote(
+        {
+            "asset": "ETH",
+            "price": "2500.25",
+            "timestamp": "2026-09-04T00:00:00Z",
+            "channel": "instrument_price:P-ETH-USDC-3600",
+        }
+    )
+
+    assert monitor.reference_quotes["ETH"]["reference_price"] == "2500.25"
+
+
+def test_reference_stream_accepts_changed_price_at_same_source_timestamp() -> None:
+    monitor = VariationalMonitor()
+
+    assert monitor._update_quote(
+        {
+            "asset": "ETH",
+            "price": "2500.25",
+            "timestamp": "2026-09-04T00:00:00Z",
+            "channel": "instrument_price:P-ETH-USDC-3600",
+        }
+    )
+    assert monitor._update_quote(
+        {
+            "asset": "ETH",
+            "price": "2600.25",
+            "timestamp": "2026-09-04T00:00:00Z",
+            "channel": "instrument_price:P-ETH-USDC-3600",
+        }
+    )
+
+    assert monitor.reference_quotes["ETH"]["reference_price"] == "2600.25"
+
+
+def test_rest_and_ws_quote_caches_do_not_overwrite_each_other() -> None:
+    monitor = VariationalMonitor()
+
+    assert monitor._update_quote(
+        {
+            "asset": "ETH",
+            "price": "2500.25",
+            "timestamp": "2026-09-04T00:00:00Z",
+            "channel": "instrument_price:P-ETH-USDC-3600",
+        }
+    )
+    assert monitor._update_quote(
+        {
+            "asset": "ETH",
+            "bid": "2499.90",
+            "ask": "2500.10",
+            "timestamp": "2026-09-04T00:00:01Z",
+            "__source_endpoint": "/api/quotes/indicative",
+        }
+    )
+
+    assert monitor.reference_quotes["ETH"]["reference_price"] == "2500.25"
+    assert monitor.quotes["ETH"]["bid"] == "2499.90"
+    assert monitor.quotes["ETH"]["ask"] == "2500.10"

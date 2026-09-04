@@ -115,10 +115,16 @@ def test_heartbeat_payload_contains_only_operational_summary() -> None:
         },
         strategy_running=True,
         watchdog_memory={"active_incidents": {}},
+        alert_control={
+            "notifications_enabled": False,
+            "silenced_until": "2026-09-04T02:00:00+00:00",
+            "reason": "operator_silence",
+        },
     )
 
     encoded = json.dumps(payload, ensure_ascii=False)
     assert payload["strategy"]["open_lots_total"] == 1
+    assert payload["alert_control"]["notifications_enabled"] is False
     assert "must-not-leave-a" not in encoded
     assert "0.0081" not in encoded
 
@@ -256,6 +262,104 @@ def test_backup_does_not_redeliver_acknowledged_incident(tmp_path: Path) -> None
         feishu=FakeNotifier(),
         telegram=FakeNotifier(),
         clock=lambda: now + timedelta(seconds=16),
+    )
+
+    assert monitor.run_once() == []
+    assert bark.calls == []
+
+
+def test_backup_does_not_repeat_feishu_message_when_phone_retry_fails(
+    tmp_path: Path,
+) -> None:
+    class PhoneFailureNotifier(FakeNotifier):
+        def phone_urgent(self, message_id: str) -> NotificationResult:
+            self.calls.append(("phone", message_id))
+            return NotificationResult(False, "phone_failed")
+
+    config = _config()
+    config.delivery_grace_seconds = 0
+    config.channel_retry_seconds = 10
+    config.max_phone_attempts = 2
+    now = datetime(2026, 9, 2, 0, 0, 30, tzinfo=timezone.utc)
+    heartbeat = {
+        "schema_version": 1,
+        "received_at": now.isoformat(),
+        "node_id": "vps-a",
+        "payload": {
+            "schema_version": 1,
+            "node_id": "vps-a",
+            "watchdog": {
+                "active_incidents": [
+                    {
+                        "key": "critical_account_risk",
+                        "severity": "critical",
+                        "title": "critical",
+                        "message": "phone failure",
+                        "incident_signature": "sig-phone",
+                        "bark_status": "sent",
+                        "feishu_message_status": "failed",
+                        "feishu_phone_status": "failed",
+                    }
+                ]
+            },
+        },
+    }
+    heartbeat_path = tmp_path / "heartbeat.json"
+    heartbeat_path.write_text(json.dumps(heartbeat), encoding="utf-8")
+    feishu = PhoneFailureNotifier()
+    monitor = BackupAlertMonitor(
+        config=config,
+        heartbeat_path=heartbeat_path,
+        state_path=tmp_path / "state.json",
+        alert_control_path=tmp_path / "alert-control.json",
+        bark=FakeNotifier(),
+        feishu=feishu,
+        telegram=FakeNotifier(),
+        clock=lambda: now,
+    )
+
+    monitor.run_once()
+    monitor.clock = lambda: now + timedelta(seconds=1)
+    monitor.run_once()
+
+    assert [kind for kind, _ in feishu.calls] == ["message", "phone"]
+
+
+def test_backup_suppresses_stale_heartbeat_during_remote_silence(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    now = datetime(2026, 9, 2, 0, 2, 0, tzinfo=timezone.utc)
+    heartbeat_path = tmp_path / "heartbeat.json"
+    heartbeat_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "received_at": (now - timedelta(seconds=120)).isoformat(),
+                "node_id": "vps-a",
+                "payload": {
+                    "schema_version": 1,
+                    "node_id": "vps-a",
+                    "alert_control": {
+                        "notifications_enabled": False,
+                        "silenced_until": (now + timedelta(minutes=5)).isoformat(),
+                        "reason": "planned_maintenance",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    bark = FakeNotifier()
+    monitor = BackupAlertMonitor(
+        config=config,
+        heartbeat_path=heartbeat_path,
+        state_path=tmp_path / "state.json",
+        alert_control_path=tmp_path / "alert-control.json",
+        bark=bark,
+        feishu=FakeNotifier(),
+        telegram=FakeNotifier(),
+        clock=lambda: now,
     )
 
     assert monitor.run_once() == []

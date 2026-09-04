@@ -6,9 +6,15 @@ import logging
 import os
 import time
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
 import requests
+
+from tools.lib.risk_alert_control import notifications_allowed, read_alert_control
+
+
+ALERT_CONTROL_PATH = Path(__file__).resolve().parents[2] / "log" / "risk_wakeup_alert_control.json"
 
 
 TELEGRAM_EVENT_TYPES = {
@@ -535,6 +541,10 @@ class TelegramNotifier:
 
     def enqueue(self, event_type: str, payload: dict[str, Any]) -> bool:
         if not self.enabled or event_type not in TELEGRAM_EVENT_TYPES:
+            return False
+        # The operator control is shared with the independent watchdog so a
+        # single silence action also suppresses queued strategy notifications.
+        if not notifications_allowed(read_alert_control(ALERT_CONTROL_PATH)):
             return False
         if (
             event_type == "live_inventory_account_snapshot"

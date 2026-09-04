@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
@@ -15,6 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows development hosts
+    fcntl = None
+
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +28,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.lib.runtime_files import read_json, write_json_atomic
+from tools.lib.risk_alert_control import (
+    notifications_allowed,
+    read_alert_control,
+    resume_alerts,
+    silence_alerts,
+    suppression_reason,
+)
 from tools.lib.risk_wakeup_remote import (
     RemoteHeartbeatPublisher,
     build_heartbeat_payload,
@@ -40,6 +53,8 @@ ORDER_METRICS_PATH = ROOT / "log" / "order_metrics.jsonl"
 WATCHDOG_STATE_PATH = ROOT / "log" / "risk_wakeup_watchdog_state.json"
 WATCHDOG_HEALTH_PATH = ROOT / "log" / "risk_wakeup_watchdog_health.json"
 WATCHDOG_CONTROL_PATH = ROOT / "log" / "risk_wakeup_watchdog_control.json"
+ALERT_CONTROL_PATH = ROOT / "log" / "risk_wakeup_alert_control.json"
+WATCHDOG_LOCK_PATH = ROOT / "log" / "risk_wakeup_watchdog.lock"
 
 
 CRITICAL_MANUAL_REVIEW_MARKERS = (
@@ -108,6 +123,27 @@ def process_is_strategy(pid: int | None) -> bool:
     return "main.py" in command and "python" in command.lower()
 
 
+@contextlib.contextmanager
+def watchdog_process_lock(path: Path = WATCHDOG_LOCK_PATH):
+    """Prevent two watchdogs from polling and delivering the same incident."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError("risk_wakeup_watchdog_already_running") from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\n")
+        handle.flush()
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 @dataclass(frozen=True)
 class Incident:
     key: str
@@ -129,6 +165,7 @@ class WatchdogConfig:
     max_phone_attempts_per_incident: int
     monitor_strategy: bool = True
     channel_retry_seconds: float = 10.0
+    max_channel_attempts_per_incident: int = 3
 
     @classmethod
     def from_env(cls) -> "WatchdogConfig":
@@ -156,15 +193,19 @@ class WatchdogConfig:
             ),
             max_phone_attempts_per_incident=max(
                 1,
-                env_int("RISK_WAKEUP_MAX_PHONE_ATTEMPTS", 3),
+                env_int("RISK_WAKEUP_MAX_PHONE_ATTEMPTS", 1),
             ),
             monitor_strategy=env_bool(
                 "RISK_WAKEUP_MONITOR_STRATEGY",
                 False,
             ),
             channel_retry_seconds=max(
-                5.0,
-                env_float("RISK_WAKEUP_CHANNEL_RETRY_SECONDS", 10.0),
+                30.0,
+                env_float("RISK_WAKEUP_CHANNEL_RETRY_SECONDS", 60.0),
+            ),
+            max_channel_attempts_per_incident=max(
+                1,
+                env_int("RISK_WAKEUP_MAX_CHANNEL_ATTEMPTS", 3),
             ),
         )
 
@@ -420,16 +461,34 @@ def evaluate_incidents(
     critical = [item for item in incidents if item.severity == "critical"]
     if critical:
         messages = list(dict.fromkeys(item.message for item in critical))
-        fingerprint_keys: set[str] = set()
-        for item in critical:
-            fingerprint_key = item.key
-            if fingerprint_key.startswith("unreconciled_manual_review:"):
-                fingerprint_key = "manual_review:" + fingerprint_key.split(":", 1)[1]
-            fingerprint_keys.add(fingerprint_key)
-        if len(fingerprint_keys) > 1:
-            # A stale heartbeat is normally a consequence of another explicit
-            # fault. Do not turn its changing age into a second alarm episode.
-            fingerprint_keys.discard("risk_heartbeat_stale_with_exposure")
+        # The incident identity must describe the fault episode, never its
+        # changing age, lot count, or the set of secondary consequences.  The
+        # durable manual-review reason is the strongest root cause when it is
+        # available; this keeps a stopped strategy from becoming a new alert
+        # every polling cycle.
+        episode_id = str(
+            state.get("run_id")
+            or risk_health.get("run_id")
+            or state.get("started_at")
+            or "unknown"
+        )
+        if status == "manual_review_required" and reason != "unknown":
+            fingerprint_keys = {f"manual_review:{reason}"}
+        else:
+            fingerprint_keys = set()
+            for item in critical:
+                fingerprint_key = item.key
+                if fingerprint_key.startswith("unreconciled_manual_review:"):
+                    fingerprint_key = "manual_review:" + fingerprint_key.split(":", 1)[1]
+                fingerprint_keys.add(fingerprint_key)
+            if len(fingerprint_keys) > 1:
+                # A stale heartbeat is normally a consequence of another
+                # explicit fault. Do not turn its changing age into a second
+                # alarm episode.
+                fingerprint_keys.discard("risk_heartbeat_stale_with_exposure")
+        stable_fingerprint = "|".join(
+            [asset, episode_id, *sorted(fingerprint_keys)]
+        )
         incidents = [item for item in incidents if item.severity != "critical"]
         incidents.append(
             Incident(
@@ -438,7 +497,7 @@ def evaluate_incidents(
                 title="Var/Lighter 账户紧急风险",
                 message="\n".join(messages),
                 alert_params=(asset, "账户出现紧急风险，请立即检查"),
-                fingerprint="|".join(sorted(fingerprint_keys)),
+                fingerprint=stable_fingerprint,
             )
         )
 
@@ -459,6 +518,7 @@ class RiskWakeupWatchdog:
         watchdog_state_path: Path = WATCHDOG_STATE_PATH,
         watchdog_health_path: Path = WATCHDOG_HEALTH_PATH,
         watchdog_control_path: Path = WATCHDOG_CONTROL_PATH,
+        alert_control_path: Path = ALERT_CONTROL_PATH,
         bark: BarkNotifier | None = None,
         feishu: FeishuUrgentNotifier | None = None,
         telegram: TelegramNotifier | None = None,
@@ -473,6 +533,7 @@ class RiskWakeupWatchdog:
         self.watchdog_state_path = watchdog_state_path
         self.watchdog_health_path = watchdog_health_path
         self.watchdog_control_path = watchdog_control_path
+        self.alert_control_path = alert_control_path
         self.bark = bark or BarkNotifier.from_config()
         self.feishu = feishu or FeishuUrgentNotifier.from_config()
         self.telegram = telegram or TelegramNotifier.from_env(
@@ -523,13 +584,29 @@ class RiskWakeupWatchdog:
             return value
         return self.config.monitor_strategy
 
+    def alert_suppression_reason(self, *, now: datetime) -> str | None:
+        return suppression_reason(
+            read_alert_control(self.alert_control_path),
+            now=now,
+        )
+
+    def alerts_allowed(self, *, now: datetime) -> bool:
+        return notifications_allowed(
+            read_alert_control(self.alert_control_path),
+            now=now,
+        )
+
     def _notify_telegram(
         self,
         message: str,
         *,
         acknowledgement_token: str | None = None,
     ) -> None:
-        if self.dry_run or not self.telegram.enabled:
+        if (
+            self.dry_run
+            or not self.telegram.enabled
+            or not self.alerts_allowed(now=self.clock())
+        ):
             return
         reply_markup = None
         if acknowledgement_token:
@@ -541,7 +618,15 @@ class RiskWakeupWatchdog:
                             "callback_data": (
                                 f"risk_ack:{acknowledgement_token}"
                             ),
-                        }
+                        },
+                    ],
+                    [
+                        {
+                            "text": "全局静默 2 小时",
+                            "callback_data": (
+                                f"risk_silence:{acknowledgement_token}"
+                            ),
+                        },
                     ]
                 ]
             }
@@ -629,7 +714,10 @@ class RiskWakeupWatchdog:
             if not isinstance(callback, dict):
                 continue
             data = str(callback.get("data") or "")
-            if not data.startswith("risk_ack:"):
+            if not (
+                data.startswith("risk_ack:")
+                or data.startswith("risk_silence:")
+            ):
                 continue
             message = callback.get("message")
             message = message if isinstance(message, dict) else {}
@@ -638,26 +726,48 @@ class RiskWakeupWatchdog:
             callback_chat_id = str(chat.get("id") or "")
             if callback_chat_id != str(getattr(self.telegram, "chat_id", "")):
                 continue
-            token = data.split(":", 1)[1]
-            acknowledged = False
+            action, token = data.split(":", 1)
+            matched = False
             for record in active.values():
                 if not isinstance(record, dict):
                     continue
                 if str(record.get("acknowledgement_token") or "") != token:
                     continue
-                record["acknowledged_at"] = iso_time(now)
-                record["acknowledged_by"] = callback_chat_id
-                record["acknowledged_signature"] = record.get(
-                    "incident_signature"
-                )
-                acknowledged = True
+                matched = True
+                if action == "risk_ack":
+                    record["acknowledged_at"] = iso_time(now)
+                    record["acknowledged_by"] = callback_chat_id
+                    record["acknowledged_signature"] = record.get(
+                        "incident_signature"
+                    )
                 break
+            if matched and action == "risk_silence":
+                silence_alerts(
+                    self.alert_control_path,
+                    minutes=120,
+                    reason="telegram_global_silence",
+                    now=now,
+                )
+                for record in active.values():
+                    if not isinstance(record, dict):
+                        continue
+                    record["acknowledged_at"] = iso_time(now)
+                    record["acknowledged_by"] = callback_chat_id
+                    record["acknowledged_signature"] = record.get(
+                        "incident_signature"
+                    )
             answer = getattr(self.telegram, "answer_callback_query", None)
             if callable(answer):
                 try:
                     answer(
                         str(callback.get("id") or ""),
-                        text=("已停止本次故障的重复提醒" if acknowledged else "该故障已恢复或失效"),
+                        text=(
+                            "已全局静默 2 小时"
+                            if matched and action == "risk_silence"
+                            else "已停止本次故障的重复提醒"
+                            if matched
+                            else "该故障已恢复或失效"
+                        ),
                     )
                 except Exception as exc:
                     logging.getLogger("risk_wakeup_watchdog").warning(
@@ -665,7 +775,7 @@ class RiskWakeupWatchdog:
                         type(exc).__name__,
                     )
             clear_keyboard = getattr(self.telegram, "clear_inline_keyboard", None)
-            if acknowledged and callable(clear_keyboard):
+            if matched and callable(clear_keyboard):
                 try:
                     message_id = int(message.get("message_id"))
                 except (TypeError, ValueError):
@@ -696,6 +806,7 @@ class RiskWakeupWatchdog:
         strategy_running: bool,
         incidents: list[Incident],
     ) -> None:
+        control = read_alert_control(self.alert_control_path)
         write_json_atomic(
             self.watchdog_health_path,
             {
@@ -717,6 +828,10 @@ class RiskWakeupWatchdog:
                 "feishu_configured": self.feishu.enabled,
                 "telegram_configured": self.telegram.enabled,
                 "dry_run": self.dry_run,
+                "alerts_allowed": notifications_allowed(control, now=now),
+                "alert_suppression_reason": suppression_reason(control, now=now),
+                "alert_control_updated_at": control.get("updated_at"),
+                "pid": os.getpid(),
             },
         )
 
@@ -766,7 +881,13 @@ class RiskWakeupWatchdog:
         now: datetime,
         force: bool = False,
     ) -> None:
-        if self.dry_run or record.get("bark_status") == "sent":
+        if (
+            self.dry_run
+            or record.get("bark_status") == "sent"
+            or not self.alerts_allowed(now=now)
+            or int(record.get("bark_attempts") or 0)
+            >= self.config.max_channel_attempts_per_incident
+        ):
             return
         if not self._retry_due(
             record,
@@ -794,7 +915,13 @@ class RiskWakeupWatchdog:
         now: datetime,
         force: bool = False,
     ) -> None:
-        if self.dry_run or record.get("feishu_message_status") == "sent":
+        if (
+            self.dry_run
+            or record.get("feishu_message_status") == "sent"
+            or not self.alerts_allowed(now=now)
+            or int(record.get("feishu_message_attempts") or 0)
+            >= self.config.max_channel_attempts_per_incident
+        ):
             return
         if not self._retry_due(
             record,
@@ -828,6 +955,7 @@ class RiskWakeupWatchdog:
             incident.severity != "critical"
             or self.dry_run
             or record.get("feishu_phone_status") == "sent"
+            or not self.alerts_allowed(now=now)
         ):
             return
         message_id = str(record.get("feishu_message_id") or "")
@@ -859,6 +987,8 @@ class RiskWakeupWatchdog:
         force: bool = False,
     ) -> None:
         if (
+            not self.alerts_allowed(now=now)
+            or
             record.get("acknowledged_at")
             and record.get("acknowledged_signature")
             == record.get("incident_signature")
@@ -875,6 +1005,8 @@ class RiskWakeupWatchdog:
         *,
         now: datetime,
     ) -> None:
+        if not self.alerts_allowed(now=now):
+            return
         message = "\n".join(
             [
                 "[Var/Lighter] 风险监控已恢复",
@@ -885,15 +1017,17 @@ class RiskWakeupWatchdog:
         self._notify_telegram(message)
         if self.dry_run:
             return
-        self.bark.send(
-            title="Var/Lighter 风险已恢复",
-            message=message,
-            critical=False,
-        )
-        self.feishu.send_message(
-            title="Var/Lighter 风险已恢复",
-            message=message,
-        )
+        if record.get("bark_status") == "sent":
+            self.bark.send(
+                title="Var/Lighter 风险已恢复",
+                message=message,
+                critical=False,
+            )
+        if record.get("feishu_message_status") == "sent":
+            self.feishu.send_message(
+                title="Var/Lighter 风险已恢复",
+                message=message,
+            )
 
     def run_once(
         self,
@@ -1047,6 +1181,7 @@ class RiskWakeupWatchdog:
                 risk_health=risk_health,
                 strategy_running=strategy_running,
                 watchdog_memory=self.memory,
+                alert_control=read_alert_control(self.alert_control_path),
                 sent_at=now,
             )
         )
@@ -1072,6 +1207,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--test-alert", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--silence-alerts", action="store_true")
+    parser.add_argument("--resume-alerts", action="store_true")
+    parser.add_argument("--ack-active-incidents", action="store_true")
+    parser.add_argument("--silence-minutes", type=float, default=120.0)
+    parser.add_argument("--maintenance-start", action="store_true")
+    parser.add_argument("--maintenance-stop", action="store_true")
     monitor = parser.add_mutually_exclusive_group()
     monitor.add_argument("--enable-strategy-monitor", action="store_true")
     monitor.add_argument("--disable-strategy-monitor", action="store_true")
@@ -1087,6 +1229,66 @@ def main() -> int:
     )
     config = WatchdogConfig.from_env()
     watchdog = RiskWakeupWatchdog(config=config, dry_run=args.dry_run)
+    control_actions = sum(
+        bool(value)
+        for value in (
+            args.silence_alerts,
+            args.resume_alerts,
+            args.ack_active_incidents,
+            args.maintenance_start,
+            args.maintenance_stop,
+        )
+    )
+    if control_actions > 1:
+        print("choose_only_one_alert_control_action")
+        return 2
+    if args.silence_alerts or args.maintenance_start:
+        control = silence_alerts(
+            watchdog.alert_control_path,
+            minutes=args.silence_minutes,
+            reason=(
+                "planned_maintenance"
+                if args.maintenance_start
+                else "operator_silence"
+            ),
+            maintenance=args.maintenance_start,
+        )
+        print(
+            "alerts_silenced_until="
+            + str(control.get("silenced_until"))
+            + " maintenance="
+            + str(bool(control.get("maintenance_until")))
+        )
+        return 0
+    if args.resume_alerts or args.maintenance_stop:
+        resume_alerts(watchdog.alert_control_path)
+        print("alerts=RESUMED")
+        return 0
+    if args.ack_active_incidents:
+        now = utc_now()
+        active = watchdog.memory.get("active_incidents")
+        count = 0
+        if isinstance(active, dict):
+            for record in active.values():
+                if not isinstance(record, dict):
+                    continue
+                record["acknowledged_at"] = iso_time(now)
+                record["acknowledged_by"] = "operator_cli"
+                record["acknowledged_signature"] = record.get(
+                    "incident_signature"
+                )
+                count += 1
+        watchdog._persist(now=now)
+        print(f"acknowledged_incidents={count}")
+        return 0
+    if args.status:
+        control = read_alert_control(watchdog.alert_control_path)
+        print(f"alerts_allowed={notifications_allowed(control)}")
+        print(f"suppression_reason={suppression_reason(control) or '-'}")
+        print(f"silenced_until={control.get('silenced_until')}")
+        print(f"maintenance_until={control.get('maintenance_until')}")
+        print(f"active_incidents={len(watchdog.memory.get('active_incidents') or {})}")
+        return 0
     if args.enable_strategy_monitor or args.disable_strategy_monitor:
         enabled = bool(args.enable_strategy_monitor)
         write_json_atomic(
@@ -1125,7 +1327,8 @@ def main() -> int:
             message="ETH：这是端到端测试，不代表真实账户风险。",
             alert_params=("ETH", "风险叫醒测试"),
         )
-        watchdog.run_once(synthetic=incident, force_delivery=True)
+        with watchdog_process_lock():
+            watchdog.run_once(synthetic=incident, force_delivery=True)
         if args.dry_run:
             print("test_alert=DRY_RUN")
             return 0
@@ -1150,7 +1353,8 @@ def main() -> int:
         )
         return 0 if bark_passed and message_passed and phone_passed else 1
     if args.once:
-        incidents = watchdog.run_once()
+        with watchdog_process_lock():
+            incidents = watchdog.run_once()
         print(f"incidents={len(incidents)}")
         for incident in incidents:
             print(f"{incident.severity} {incident.key}")
@@ -1167,7 +1371,12 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, stop_handler)
     signal.signal(signal.SIGTERM, stop_handler)
-    watchdog.run_forever()
+    try:
+        with watchdog_process_lock():
+            watchdog.run_forever()
+    except RuntimeError as exc:
+        print(f"watchdog_start_failed={exc}")
+        return 3
     return 0
 
 

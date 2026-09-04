@@ -91,6 +91,7 @@ def build_heartbeat_payload(
     risk_health: Mapping[str, Any],
     strategy_running: bool,
     watchdog_memory: Mapping[str, Any],
+    alert_control: Mapping[str, Any] | None = None,
     sent_at: datetime | None = None,
 ) -> dict[str, Any]:
     incidents: list[dict[str, Any]] = []
@@ -157,6 +158,29 @@ def build_heartbeat_payload(
         "watchdog": {
             "updated_at": _safe_text(watchdog_memory.get("updated_at"), limit=80),
             "active_incidents": incidents,
+        },
+        "alert_control": {
+            "notifications_enabled": (
+                True
+                if not isinstance(alert_control, Mapping)
+                else bool(alert_control.get("notifications_enabled", True))
+            ),
+            "silenced_until": _safe_text(
+                alert_control.get("silenced_until") if isinstance(alert_control, Mapping) else None,
+                limit=80,
+            ),
+            "maintenance_until": _safe_text(
+                alert_control.get("maintenance_until") if isinstance(alert_control, Mapping) else None,
+                limit=80,
+            ),
+            "reason": _safe_text(
+                alert_control.get("reason") if isinstance(alert_control, Mapping) else None,
+                limit=120,
+            ),
+            "updated_at": _safe_text(
+                alert_control.get("updated_at") if isinstance(alert_control, Mapping) else None,
+                limit=80,
+            ),
         },
     }
 

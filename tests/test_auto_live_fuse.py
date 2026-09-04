@@ -4345,11 +4345,10 @@ def test_v4_background_quote_uses_passive_stream_without_rfq(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
 
-        async def passive_quote(_asset):
+        async def passive_reference_quote(_asset):
             return {
-                "bid": "2400.10",
-                "ask": "2400.30",
-                "quoteTimestamp": "2026-09-04T00:00:00Z",
+                "reference_price": "2400.20",
+                "timestamp": "2026-09-04T00:00:00Z",
                 "received_at": "2026-09-04T00:00:01Z",
                 "received_monotonic": time.monotonic(),
             }
@@ -4357,7 +4356,7 @@ def test_v4_background_quote_uses_passive_stream_without_rfq(tmp_path) -> None:
         async def refuse_rfq(**_kwargs):
             raise AssertionError("passive V4 observation must not request an RFQ")
 
-        runtime.get_variational_quote = passive_quote
+        runtime.get_variational_reference_quote = passive_reference_quote
         runtime.fetch_live_inventory_basis_quote = refuse_rfq
         quote, quote_ms = await runtime.get_live_inventory_basis_quote(
             asset="ETH",
@@ -4368,11 +4367,135 @@ def test_v4_background_quote_uses_passive_stream_without_rfq(tmp_path) -> None:
         assert quote["quote_source"] == "passive_browser_stream"
         assert quote["quoteTimestamp"] == "2026-09-04T00:00:01Z"
         assert quote["source_quote_timestamp"] == "2026-09-04T00:00:00Z"
+        assert quote["quote_semantics"] == "reference_price_only"
+        assert quote["bid"] == "2400.20"
+        assert quote["ask"] == "2400.20"
         assert Decimal(quote["quote_request_qty"]) == Decimal("0.008")
         assert quote["rfq_consumed"] is False
         assert quote_ms == Decimal("0")
 
     asyncio.run(run())
+
+
+def test_v4_entry_rfq_bias_is_directional_bounded_and_zero_until_ready() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    direction = "short_var_long_lighter"
+    runtime.live_inventory_entry_rfq_bias_samples_by_direction = {
+        direction: deque(
+            [
+                Decimal("-1"),
+                Decimal("-2"),
+                Decimal("-3"),
+                Decimal("-4"),
+                Decimal("-3"),
+                Decimal("-3"),
+                Decimal("-3"),
+                Decimal("-3"),
+                Decimal("-3"),
+            ]
+        )
+    }
+
+    cold = runtime.live_inventory_basis_v4_entry_rfq_bias_context(direction)
+    assert cold["v4_entry_rfq_bias_ready"] is False
+    assert cold["v4_entry_rfq_bias_applied_bps"] == "0"
+
+    sample = runtime.record_live_inventory_entry_rfq_bias_sample(
+        asset="ETH",
+        direction=direction,
+        passive_edge_bps=Decimal("10"),
+        exact_edge_bps=Decimal("5"),
+        passive_var_price=Decimal("2500"),
+        exact_var_price=Decimal("2499"),
+        reference_lighter_price=Decimal("2501"),
+    )
+
+    assert sample is not None
+    assert sample["directional_bias_bps"] == "-5"
+    assert sample["v4_entry_rfq_bias_ready"] is True
+    assert sample["v4_entry_rfq_bias_applied_bps"] == "-3.0"
+    assert sample["calibration_basis"] == "same_lighter_reference_var_price_delta_v1"
+
+
+def test_v4_entry_rfq_bias_loader_reads_persisted_calibration(tmp_path) -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.orders_file = tmp_path / "order_metrics.jsonl"
+    runtime.orders_file.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "event": "live_inventory_entry_rfq_calibration",
+                    "logged_at": datetime.now(timezone.utc).isoformat(),
+                    "calibration_basis": "same_lighter_reference_var_price_delta_v1",
+                    "asset": "ETH",
+                    "direction": "long_var_short_lighter",
+                    "passive_edge_bps": "8",
+                    "exact_edge_bps": "7",
+                }
+            )
+            for _ in range(10)
+        ),
+        encoding="utf-8",
+    )
+    runtime.live_inventory_entry_rfq_bias_samples_by_direction = {
+        "long_var_short_lighter": deque(maxlen=100),
+        "short_var_long_lighter": deque(maxlen=100),
+    }
+    runtime.logger = logging.getLogger("test_v4_entry_rfq_bias_loader")
+
+    runtime.load_recent_live_inventory_entry_rfq_bias()
+
+    context = runtime.live_inventory_basis_v4_entry_rfq_bias_context(
+        "long_var_short_lighter"
+    )
+    assert context["v4_entry_rfq_bias_sample_count"] == 10
+    assert context["v4_entry_rfq_bias_applied_bps"] == "-1"
+
+
+def test_v4_entry_rfq_bias_ignores_stale_samples() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    direction = "short_var_long_lighter"
+    runtime.live_inventory_entry_rfq_bias_samples_by_direction = {
+        direction: deque([Decimal("-1")] * 10, maxlen=100)
+    }
+    runtime.live_inventory_entry_rfq_bias_sample_times_by_direction = {
+        direction: deque([time.time() - 86401] * 10, maxlen=100)
+    }
+
+    context = runtime.live_inventory_basis_v4_entry_rfq_bias_context(direction)
+
+    assert context["v4_entry_rfq_bias_sample_count"] == 0
+    assert context["v4_entry_rfq_bias_ready"] is False
+    assert context["v4_entry_rfq_bias_applied_bps"] == "0"
+
+
+def test_v4_entry_rfq_bias_rejects_unstable_samples() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    direction = "short_var_long_lighter"
+    runtime.live_inventory_entry_rfq_bias_samples_by_direction = {
+        direction: deque(
+            [Decimal("-5"), Decimal("5")] * 5,
+            maxlen=100,
+        )
+    }
+    runtime.live_inventory_entry_rfq_bias_sample_times_by_direction = {
+        direction: deque([time.time()] * 10, maxlen=100)
+    }
+
+    context = runtime.live_inventory_basis_v4_entry_rfq_bias_context(direction)
+
+    assert context["v4_entry_rfq_bias_ready"] is False
+    assert context["v4_entry_rfq_bias_ready_reason"] == "mad_exceeds_limit"
+    assert context["v4_entry_rfq_bias_applied_bps"] == "0"
+
+
+def test_v4_entry_rfq_exploration_is_rate_limited() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    direction = "short_var_long_lighter"
+
+    assert runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, 100.0)
+    assert not runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, 101.0)
+    assert runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, 400.0)
 
 
 def test_variational_order_reuses_final_quote_id(tmp_path) -> None:

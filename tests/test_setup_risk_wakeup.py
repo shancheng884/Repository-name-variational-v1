@@ -51,4 +51,7 @@ def test_write_env_updates_is_atomic_and_private(tmp_path) -> None:
 def test_defaults_start_in_heartbeat_only_mode() -> None:
     assert DEFAULT_SETTINGS["RISK_WAKEUP_ENABLED"] == "true"
     assert DEFAULT_SETTINGS["RISK_WAKEUP_MONITOR_STRATEGY"] == "false"
-    assert DEFAULT_SETTINGS["RISK_WAKEUP_CHANNEL_RETRY_SECONDS"] == "10"
+    assert DEFAULT_SETTINGS["RISK_WAKEUP_CHANNEL_RETRY_SECONDS"] == "60"
+    assert DEFAULT_SETTINGS["RISK_WAKEUP_BACKUP_CHANNEL_RETRY_SECONDS"] == "60"
+    assert DEFAULT_SETTINGS["RISK_WAKEUP_MAX_CHANNEL_ATTEMPTS"] == "3"
+    assert DEFAULT_SETTINGS["RISK_WAKEUP_MAX_PHONE_ATTEMPTS"] == "1"

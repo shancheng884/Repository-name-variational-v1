@@ -27,6 +27,13 @@ from tools.lib.risk_wakeup_remote import (  # noqa: E402
     verify_signature,
 )
 from tools.lib.runtime_files import read_json, write_json_atomic  # noqa: E402
+from tools.lib.risk_alert_control import (  # noqa: E402
+    notifications_allowed,
+    read_alert_control,
+    resume_alerts,
+    silence_alerts,
+    suppression_reason,
+)
 from tools.lib.telegram_notifier import TelegramNotifier  # noqa: E402
 from tools.lib.wakeup_notifiers import (  # noqa: E402
     BarkNotifier,
@@ -37,6 +44,7 @@ from tools.lib.wakeup_notifiers import (  # noqa: E402
 
 REMOTE_HEARTBEAT_PATH_FILE = ROOT / "log" / "risk_wakeup_remote_heartbeat.json"
 BACKUP_STATE_PATH = ROOT / "log" / "risk_wakeup_backup_state.json"
+ALERT_CONTROL_PATH = ROOT / "log" / "risk_wakeup_alert_control.json"
 DEFAULT_PORT = 8769
 
 
@@ -103,12 +111,19 @@ class BackupConfig:
             env_float("RISK_WAKEUP_BACKUP_POLL_SECONDS", 3.0),
         )
         self.channel_retry_seconds = max(
-            5.0,
-            env_float("RISK_WAKEUP_BACKUP_CHANNEL_RETRY_SECONDS", 10.0),
+            30.0,
+            env_float(
+                "RISK_WAKEUP_BACKUP_CHANNEL_RETRY_SECONDS",
+                env_float("RISK_WAKEUP_CHANNEL_RETRY_SECONDS", 60.0),
+            ),
         )
         self.max_phone_attempts = max(
             1,
-            env_int("RISK_WAKEUP_MAX_PHONE_ATTEMPTS", 3),
+            env_int("RISK_WAKEUP_MAX_PHONE_ATTEMPTS", 1),
+        )
+        self.max_channel_attempts = max(
+            1,
+            env_int("RISK_WAKEUP_MAX_CHANNEL_ATTEMPTS", 3),
         )
 
 
@@ -204,6 +219,7 @@ class BackupAlertMonitor:
         config: BackupConfig,
         heartbeat_path: Path = REMOTE_HEARTBEAT_PATH_FILE,
         state_path: Path = BACKUP_STATE_PATH,
+        alert_control_path: Path = ALERT_CONTROL_PATH,
         bark: BarkNotifier | None = None,
         feishu: FeishuUrgentNotifier | None = None,
         telegram: TelegramNotifier | None = None,
@@ -214,6 +230,7 @@ class BackupAlertMonitor:
         self.config = config
         self.heartbeat_path = heartbeat_path
         self.state_path = state_path
+        self.alert_control_path = alert_control_path
         self.bark = bark or BarkNotifier.from_config()
         self.feishu = feishu or FeishuUrgentNotifier.from_config()
         self.telegram = telegram or TelegramNotifier.from_env(
@@ -226,6 +243,7 @@ class BackupAlertMonitor:
         if not isinstance(self.memory.get("active_incidents"), dict):
             self.memory["active_incidents"] = {}
         self.memory.setdefault("seen_heartbeat", False)
+        self.suppressed_reason: str | None = None
 
     def configuration_errors(self) -> list[str]:
         errors: list[str] = []
@@ -276,11 +294,16 @@ class BackupAlertMonitor:
     def _send_telegram(self, record: dict[str, Any], now: datetime) -> None:
         if record.get("telegram_status") == "sent":
             return
+        if not self.telegram.enabled:
+            record["telegram_status"] = "not_configured"
+            return
+        if int(record.get("telegram_attempts") or 0) >= self.config.max_channel_attempts:
+            return
         if not self._retry_due(record, "last_telegram_attempt_at", now):
             return
         record["last_telegram_attempt_at"] = iso_time(now)
-        if self.dry_run or not self.telegram.enabled:
-            record["telegram_status"] = "not_configured" if not self.telegram.enabled else "dry_run"
+        if self.dry_run:
+            record["telegram_status"] = "dry_run"
             return
         ok, detail = self.telegram.send_now(
             "[VPS B 备用报警]\n" + self._record_message(record)
@@ -290,6 +313,8 @@ class BackupAlertMonitor:
 
     def _send_bark(self, record: dict[str, Any], now: datetime) -> None:
         if record.get("bark_status") == "sent":
+            return
+        if int(record.get("bark_attempts") or 0) >= self.config.max_channel_attempts:
             return
         if not self._retry_due(record, "last_bark_attempt_at", now):
             return
@@ -308,26 +333,38 @@ class BackupAlertMonitor:
     def _send_feishu(self, record: dict[str, Any], now: datetime) -> None:
         if record.get("feishu_status") == "sent":
             return
-        if not self._retry_due(record, "last_feishu_attempt_at", now):
-            return
-        record["last_feishu_attempt_at"] = iso_time(now)
-        if self.dry_run:
-            record["feishu_status"] = "dry_run"
-            return
-        result = self.feishu.send_message(
-            title="VPS B 备用风险报警",
-            message=self._record_message(record),
-        )
-        record["feishu_message_attempts"] = int(
-            record.get("feishu_message_attempts") or 0
-        ) + 1
-        record["feishu_message_status"] = result.detail
-        if not result.ok or not result.receipt:
+        message_id = str(record.get("feishu_message_id") or "")
+        if record.get("feishu_message_status") != "sent":
+            if int(record.get("feishu_message_attempts") or 0) >= self.config.max_channel_attempts:
+                return
+            if not self._retry_due(record, "last_feishu_attempt_at", now):
+                return
+            record["last_feishu_attempt_at"] = iso_time(now)
+            if self.dry_run:
+                record["feishu_status"] = "dry_run"
+                return
+            result = self.feishu.send_message(
+                title="VPS B 备用风险报警",
+                message=self._record_message(record),
+            )
+            record["feishu_message_attempts"] = int(
+                record.get("feishu_message_attempts") or 0
+            ) + 1
+            record["feishu_message_status"] = result.detail
+            if not result.ok or not result.receipt:
+                return
+            message_id = str(result.receipt)
+            record["feishu_message_id"] = message_id
+        if record.get("feishu_phone_status") == "sent":
+            record["feishu_status"] = "sent"
             return
         phone_attempts = int(record.get("feishu_phone_attempts") or 0)
-        if phone_attempts >= self.config.max_phone_attempts:
+        if phone_attempts >= self.config.max_phone_attempts or not message_id:
             return
-        phone = self.feishu.phone_urgent(result.receipt)
+        if not self._retry_due(record, "last_feishu_phone_attempt_at", now):
+            return
+        record["last_feishu_phone_attempt_at"] = iso_time(now)
+        phone = self.feishu.phone_urgent(message_id)
         record["feishu_phone_attempts"] = phone_attempts + 1
         record["feishu_phone_status"] = phone.detail
         if phone.ok:
@@ -349,7 +386,13 @@ class BackupAlertMonitor:
             self._send_telegram(record, current)
 
     def _desired_incidents(self, now: datetime) -> dict[str, dict[str, Any]]:
+        self.suppressed_reason = suppression_reason(
+            read_alert_control(self.alert_control_path),
+            now=now,
+        )
         envelope = read_json(self.heartbeat_path)
+        if self.suppressed_reason:
+            return {}
         if not envelope:
             if self.memory.get("seen_heartbeat"):
                 return {
@@ -370,6 +413,17 @@ class BackupAlertMonitor:
             return {}
         self.memory["seen_heartbeat"] = True
         age = max(0.0, (now - received_at).total_seconds())
+        payload = envelope.get("payload")
+        if not isinstance(payload, Mapping):
+            return {}
+        remote_control = payload.get("alert_control")
+        if isinstance(remote_control, Mapping):
+            self.suppressed_reason = suppression_reason(
+                dict(remote_control),
+                now=now,
+            )
+            if self.suppressed_reason:
+                return {}
         if age > self.config.max_age_seconds:
             return {
                 "remote_heartbeat_stale": {
@@ -384,9 +438,6 @@ class BackupAlertMonitor:
                 }
             }
 
-        payload = envelope.get("payload")
-        if not isinstance(payload, Mapping):
-            return {}
         desired: dict[str, dict[str, Any]] = {}
         watchdog = payload.get("watchdog")
         active = watchdog.get("active_incidents") if isinstance(watchdog, Mapping) else []
@@ -418,14 +469,19 @@ class BackupAlertMonitor:
         return desired
 
     def _recover(self, key: str, record: Mapping[str, Any], now: datetime) -> None:
+        if self.suppressed_reason:
+            return
         message = f"[VPS B 备用报警已恢复]\n事件：{key}\n恢复时间：{iso_time(now)}"
         record_copy = dict(record)
         record_copy["message"] = message
-        self._send_telegram(record_copy, now)
+        if record.get("telegram_status") not in {None, "not_configured"}:
+            self._send_telegram(record_copy, now)
         if self.dry_run:
             return
-        self.bark.send(title="VPS B 备用报警已恢复", message=message, critical=False)
-        self.feishu.send_message(title="VPS B 备用报警已恢复", message=message)
+        if record.get("bark_status") == "sent":
+            self.bark.send(title="VPS B 备用报警已恢复", message=message, critical=False)
+        if record.get("feishu_message_status") == "sent":
+            self.feishu.send_message(title="VPS B 备用报警已恢复", message=message)
 
     def run_once(self) -> list[str]:
         now = self.clock()
@@ -464,7 +520,7 @@ class BackupAlertMonitor:
             if key in current_keys:
                 continue
             record = active.pop(key)
-            if isinstance(record, Mapping):
+            if isinstance(record, Mapping) and not self.suppressed_reason:
                 self._recover(key, record, now)
         self._persist(now)
         return reported
@@ -476,6 +532,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--test-alert", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--silence-alerts", action="store_true")
+    parser.add_argument("--resume-alerts", action="store_true")
+    parser.add_argument("--silence-minutes", type=float, default=120.0)
     return parser
 
 
@@ -503,6 +563,29 @@ def main() -> int:
     )
     config = BackupConfig()
     monitor = BackupAlertMonitor(config=config, dry_run=args.dry_run)
+    if args.silence_alerts and args.resume_alerts:
+        print("choose_only_one_alert_control_action")
+        return 2
+    if args.silence_alerts:
+        control = silence_alerts(
+            monitor.alert_control_path,
+            minutes=args.silence_minutes,
+            reason="operator_silence",
+        )
+        print(f"alerts_silenced_until={control.get('silenced_until')}")
+        return 0
+    if args.resume_alerts:
+        resume_alerts(monitor.alert_control_path)
+        print("alerts=RESUMED")
+        return 0
+    if args.status:
+        control = read_alert_control(monitor.alert_control_path)
+        print(f"alerts_allowed={notifications_allowed(control)}")
+        print(f"suppression_reason={suppression_reason(control) or '-'}")
+        print(f"silenced_until={control.get('silenced_until')}")
+        print(f"maintenance_until={control.get('maintenance_until')}")
+        print(f"active_incidents={len(monitor.memory.get('active_incidents') or {})}")
+        return 0
     if args.check:
         return _print_check(monitor)
     if args.test_alert:

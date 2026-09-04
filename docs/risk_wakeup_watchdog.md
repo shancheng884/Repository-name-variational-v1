@@ -6,11 +6,11 @@
 
 - 普通风险：Telegram、Bark、飞书机器人消息。
 - 紧急风险：Telegram、Bark 严重警告、飞书消息，并立即调用飞书电话加急。
-- 单个通知渠道失败后每 10 秒重试；已经成功的渠道不重复发送。
+- 单个通知渠道失败后默认每 60 秒重试，最多 3 次；已经成功的渠道不重复发送。
 - 同一事件使用固定事件键和内容签名去重。风险原因改变时视为新的紧急状态并重新报警。
 - 风险恢复后发送 Bark、飞书和 Telegram 恢复通知，不再拨打电话。
 
-飞书电话加急无法向程序返回“用户已接听”的可靠确认，因此当前设计不根据接听状态取消其他渠道。一个事件在飞书电话接口返回成功后不会重复拨号；接口失败最多重试 3 次。
+飞书电话加急无法向程序返回“用户已接听”的可靠确认，因此当前设计不根据接听状态取消其他渠道。一个事件在飞书电话接口返回成功后不会重复拨号；接口失败默认不重复拨号。
 
 ## 监控范围
 
@@ -40,6 +40,23 @@ python tools/risk_wakeup_watchdog.py --disable-strategy-monitor
 ```
 
 开关保存在 `log/risk_wakeup_watchdog_control.json`，服务重启后仍保留。
+
+## 场外确认与静默
+
+Telegram 紧急报警带有两个按钮：确认当前事件，或全局静默 2 小时。确认只停止当前
+事件的重复提醒；如果风险签名发生变化，仍会重新报警。全局静默同时通过 A 的签名心跳
+通知 B，避免 A、B 在维护或人工处理期间同时重复报警。
+
+命令行也可以控制：
+
+```bash
+python tools/risk_wakeup_watchdog.py --ack-active-incidents
+python tools/risk_wakeup_watchdog.py --silence-alerts --silence-minutes 120
+python tools/risk_wakeup_watchdog.py --resume-alerts
+python tools/risk_wakeup_watchdog.py --status
+```
+
+静默只影响通知发送，不停止交易策略、不改变仓位，也不改变风险状态记录。
 
 ## 私密配置
 
@@ -93,8 +110,10 @@ RISK_WAKEUP_POLL_SECONDS=3
 RISK_WAKEUP_HEARTBEAT_MAX_AGE_SECONDS=45
 RISK_WAKEUP_PENDING_MAX_AGE_SECONDS=30
 RISK_WAKEUP_DATA_UNAVAILABLE_CRITICAL_SECONDS=300
-RISK_WAKEUP_CHANNEL_RETRY_SECONDS=10
-RISK_WAKEUP_MAX_PHONE_ATTEMPTS=3
+RISK_WAKEUP_CHANNEL_RETRY_SECONDS=60
+RISK_WAKEUP_BACKUP_CHANNEL_RETRY_SECONDS=60
+RISK_WAKEUP_MAX_CHANNEL_ATTEMPTS=3
+RISK_WAKEUP_MAX_PHONE_ATTEMPTS=1
 ```
 
 `--check` 必须显示：
@@ -224,7 +243,8 @@ python tools/risk_wakeup_backup.py --once
 ```
 
 必须没有备用事件。模拟 A 停止发送后，超过 `45` 秒 B 才发送一次备用紧急报警；A
-恢复后发送恢复通知。同一事件不会重复拨打超过 `RISK_WAKEUP_MAX_PHONE_ATTEMPTS`。
+恢复后发送恢复通知。同一事件每个渠道最多尝试
+`RISK_WAKEUP_MAX_CHANNEL_ATTEMPTS` 次；飞书电话默认只拨打一次，避免渠道故障时重复打扰。
 
 B 端服务只监听心跳和发送报警，永远不运行 `main.py`、`tools/live.py` 或行情采集器。
 

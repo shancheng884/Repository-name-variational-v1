@@ -406,6 +406,58 @@ def test_telegram_acknowledgement_stops_failed_channel_retries(tmp_path) -> None
     )
 
 
+def test_telegram_global_silence_persists_and_stops_delivery(tmp_path) -> None:
+    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
+    bark = FakeBark()
+    feishu = FakeFeishu()
+    telegram = FakeTelegram()
+    watchdog = RiskWakeupWatchdog(
+        config=config(channel_retry_seconds=10),
+        state_path=tmp_path / "state.json",
+        risk_health_path=tmp_path / "risk.json",
+        metrics_path=tmp_path / "metrics.jsonl",
+        watchdog_state_path=tmp_path / "watchdog.json",
+        watchdog_health_path=tmp_path / "health.json",
+        watchdog_control_path=tmp_path / "control.json",
+        alert_control_path=tmp_path / "alert-control.json",
+        bark=bark,
+        feishu=feishu,
+        telegram=telegram,
+        clock=lambda: current[0],
+        strategy_check=lambda _pid: True,
+    )
+    incident = Incident(
+        "critical",
+        "critical",
+        "risk",
+        "failure",
+        ("ETH", "risk"),
+        fingerprint="root-failure",
+    )
+
+    watchdog.run_once(synthetic=incident)
+    token = watchdog.memory["active_incidents"][incident.key][
+        "acknowledgement_token"
+    ]
+    telegram.updates.append(
+        {
+            "update_id": 12,
+            "callback_query": {
+                "id": "callback-silence",
+                "data": f"risk_silence:{token}",
+                "message": {"message_id": 90, "chat": {"id": 123}},
+            },
+        }
+    )
+    current[0] += timedelta(seconds=11)
+    watchdog.run_once(synthetic=incident)
+
+    assert len(bark.sent) == 1
+    assert len(feishu.messages) == 1
+    assert len(telegram.sent) == 1
+    assert telegram.answered[-1][1] == "已全局静默 2 小时"
+
+
 def test_severity_escalation_realerts_after_acknowledgement(tmp_path) -> None:
     current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
     bark = FakeBark()

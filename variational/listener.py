@@ -56,6 +56,7 @@ class VariationalMonitor:
     trade_event_limit: int = 2000
     rest_response_limit: int = 200
     quotes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    reference_quotes: dict[str, dict[str, Any]] = field(default_factory=dict)
     current_quote_asset: str | None = None
     positions: dict[str, dict[str, Any]] = field(default_factory=dict)
     recent_trades: list[dict[str, Any]] = field(default_factory=list)
@@ -230,7 +231,7 @@ class VariationalMonitor:
                     self._mark_heartbeat(now_ts, payload.get("timestamp"))
 
             if not lines and stream != WS_PORTFOLIO_PATH:
-                if stream != WS_PRICES_PATH or not self.quotes:
+                if stream != WS_PRICES_PATH or not (self.quotes or self.reference_quotes):
                     return []
 
             self.last_update_at = utc_now()
@@ -334,6 +335,18 @@ class VariationalMonitor:
 
         return lines, alerts
 
+    @staticmethod
+    def _source_timestamp_seconds(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+
     def _update_quote(self, payload: Any) -> bool:
         if not isinstance(payload, dict):
             return False
@@ -362,17 +375,86 @@ class VariationalMonitor:
         received_at = utc_now()
         received_monotonic = time.monotonic()
 
-        if bid is None and ask is None and mark is not None:
-            bid = mark
-            ask = mark
-
         if mark is None and underlying_price is not None:
             mark = underlying_price
 
-        if not asset or (bid is None and ask is None and mark is None):
+        if not asset:
             return False
 
         asset = str(asset).upper()
+
+        # The /prices stream publishes a reference price, not executable
+        # bid/ask. Keep it separate so it cannot be mistaken for an RFQ.
+        is_reference_stream = (
+            payload.get("__source_stream") == WS_PRICES_PATH
+            or (
+                isinstance(channel, str)
+                and channel.startswith("instrument_price:")
+            )
+        )
+        if is_reference_stream:
+            if mark is None:
+                return False
+            previous = self.reference_quotes.get(asset)
+            previous_ts = self._source_timestamp_seconds(
+                previous.get("timestamp") if previous else None
+            )
+            current_ts = self._source_timestamp_seconds(ts)
+            if (
+                previous_ts is not None
+                and current_ts is not None
+                and current_ts < previous_ts
+            ):
+                return False
+            if (
+                previous_ts is not None
+                and current_ts is not None
+                and current_ts == previous_ts
+                and previous is not None
+                and previous.get("reference_price") == mark
+            ):
+                return False
+            self.reference_quotes[asset] = {
+                "asset": asset,
+                "reference_price": mark,
+                "mark_price": mark,
+                "timestamp": ts,
+                "received_at": received_at,
+                "received_monotonic": received_monotonic,
+                "quote_kind": "reference_price_only",
+                "quote_source": "passive_browser_stream",
+                "quote_semantics": "reference_price_only",
+                "quote_latency_kind": "passive_stream_no_rfq",
+                "raw": payload,
+            }
+            self.current_quote_asset = asset
+            return True
+
+        # Only a complete explicit bid/ask pair belongs in the executable
+        # quote cache. A single price is never promoted to both sides.
+        if bid is None or ask is None:
+            return False
+        previous = self.quotes.get(asset)
+        previous_ts = self._source_timestamp_seconds(
+            previous.get("timestamp") if previous else None
+        )
+        current_ts = self._source_timestamp_seconds(ts)
+        if (
+            previous_ts is not None
+            and current_ts is not None
+            and current_ts < previous_ts
+        ):
+            return False
+        if (
+            previous_ts is not None
+            and current_ts is not None
+            and current_ts == previous_ts
+            and previous is not None
+            and previous.get("bid") == bid
+            and previous.get("ask") == ask
+            and previous.get("mark_price") == mark
+        ):
+            return False
 
         self.quotes[asset] = {
             "asset": asset,
@@ -382,6 +464,7 @@ class VariationalMonitor:
             "timestamp": ts,
             "received_at": received_at,
             "received_monotonic": received_monotonic,
+            "quote_kind": "indicative_bid_ask",
             "raw": payload,
         }
         self.current_quote_asset = asset
@@ -734,6 +817,7 @@ class VariationalMonitor:
             "current_quote_asset": self.current_quote_asset,
             "last_heartbeat_iso": self.last_heartbeat_iso,
             "quotes": self.quotes,
+            "reference_quotes": self.reference_quotes,
             "positions": self.positions,
             "recent_trades": self.recent_trades,
             "trade_events": self.trade_events,
@@ -750,6 +834,7 @@ class VariationalMonitor:
 
             asset = self.current_quote_asset
             quote = self.quotes.get(asset) if asset else None
+            reference_quote = self.reference_quotes.get(asset) if asset else None
             row = self.positions.get(asset) if asset else None
             qty = 0.0
             if isinstance(row, dict):
@@ -763,6 +848,8 @@ class VariationalMonitor:
                 "position_row": row,
                 "quote": quote,
                 "has_quote": quote is not None,
+                "reference_quote": reference_quote,
+                "has_reference_quote": reference_quote is not None,
                 "has_portfolio": bool(self.portfolio_summary),
                 "last_update_at": self.last_update_at,
                 "last_heartbeat_iso": self.last_heartbeat_iso,

@@ -178,6 +178,11 @@ LIVE_INVENTORY_LIGHTER_MAINTENANCE_RATE_FALLBACK = Decimal("0.012")
 # reserved for reduce-only emergency work.
 LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_NORMAL_PER_MINUTE = 25
 LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_HARD_PER_MINUTE = 30
+# Normal exact RFQs share the 25-token window. These per-purpose caps stop a
+# noisy entry stream from consuming the entire normal exit budget.
+LIVE_INVENTORY_VARIATIONAL_ENTRY_RFQ_RATE_PER_MINUTE = 20
+LIVE_INVENTORY_VARIATIONAL_PROFIT_EXIT_RFQ_RATE_PER_MINUTE = 25
+LIVE_INVENTORY_VARIATIONAL_ENTRY_RFQ_COOLDOWN_SECONDS = 15.0
 # Legacy background RFQ controls remain for non-V4 modes. V4 observations use
 # the passive browser stream and therefore consume no RFQ capacity.
 LIVE_INVENTORY_VARIATIONAL_BACKGROUND_QUOTE_RATE_PER_MINUTE = 12
@@ -202,6 +207,16 @@ LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MIN_TIER_SPACING_BPS = Decimal("0.25")
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_SAMPLES = 2
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_WINDOW_SAMPLES = 3
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_STRONG_SINGLE_MIN_TIER = 3
+# A passive /prices edge is only a candidate estimate. These bounded samples
+# calibrate its directional error against the exact entry RFQ without allowing
+# the estimate to bypass the final exact-quote checks.
+LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_SAMPLES = 100
+LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MIN_SAMPLES = 10
+LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_CLAMP_BPS = Decimal("3.0")
+LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_AGE_SECONDS = 24 * 3600
+LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_MAD_BPS = Decimal("2.0")
+LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_INTERVAL_SECONDS = 300.0
+LIVE_INVENTORY_ENTRY_RFQ_BIAS_STATE_FILE_NAME = "live_inventory_entry_rfq_bias.json"
 LIVE_INVENTORY_BASIS_V4_WEEKEND_TRANSITION_SECONDS = 6 * 3600
 LIVE_INVENTORY_EQUITY_REBALANCE_TARGET_IMBALANCE_PCT = Decimal("6.5")
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_PERCENTILES = (
@@ -2122,6 +2137,11 @@ class VariationalToLighterRuntime:
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
         self.auto_live_state_file = output_dir / AUTO_LIVE_STATE_FILE.name if output_dir else None
         self.live_inventory_state_file = output_dir / LIVE_INVENTORY_STATE_FILE.name if output_dir else None
+        self.live_inventory_entry_rfq_bias_state_file = (
+            output_dir / LIVE_INVENTORY_ENTRY_RFQ_BIAS_STATE_FILE_NAME
+            if output_dir
+            else None
+        )
         self.live_inventory_control_file = (
             output_dir / LIVE_INVENTORY_CONTROL_FILE.name if output_dir else None
         )
@@ -2250,6 +2270,10 @@ class VariationalToLighterRuntime:
             state_path=self.output_dir / "lighter_rate_limiter.json",
         )
         self.live_inventory_v4_last_entry_submit_monotonic = 0.0
+        self.live_inventory_basis_entry_rfq_cooldown_until_monotonic: dict[
+            str, float
+        ] = {}
+        self.live_inventory_basis_entry_rfq_last_skip_log_monotonic = 0.0
         self.live_inventory_v4_episode_id: str | None = None
         self.live_inventory_v4_next_tranche_index = 1
         self.live_inventory_v4_shadow_tranche: dict[str, Any] | None = None
@@ -2338,6 +2362,26 @@ class VariationalToLighterRuntime:
             DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(maxlen=20),
             DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(maxlen=20),
         }
+        self.live_inventory_entry_rfq_bias_samples_by_direction = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(
+                maxlen=LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_SAMPLES
+            ),
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(
+                maxlen=LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_SAMPLES
+            ),
+        }
+        self.live_inventory_entry_rfq_bias_sample_times_by_direction = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(
+                maxlen=LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_SAMPLES
+            ),
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(
+                maxlen=LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_SAMPLES
+            ),
+        }
+        self.live_inventory_entry_rfq_bias_last_exploration_monotonic_by_direction = {
+            DIRECTION_LONG_VAR_SHORT_LIGHTER: 0.0,
+            DIRECTION_SHORT_VAR_LONG_LIGHTER: 0.0,
+        }
         self.live_inventory_exit_shortfall_bps_samples_by_direction = {
             DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(maxlen=20),
             DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(maxlen=20),
@@ -2352,6 +2396,7 @@ class VariationalToLighterRuntime:
         }
         self.live_inventory_var_quote_age_seconds_samples: deque[Decimal] = deque(maxlen=50)
         self.load_recent_live_inventory_execution_loss_bps()
+        self.load_recent_live_inventory_entry_rfq_bias()
         self.load_recent_live_inventory_exit_shortfall_bps()
         self.load_recent_live_inventory_actual_pnl_stats()
         self.pending_live_inventory_var_fill_matches: list[PendingLiveInventoryVarFillMatch] = []
@@ -2602,6 +2647,308 @@ class VariationalToLighterRuntime:
         self.live_inventory_execution_loss_bps_samples.extend(
             samples_by_direction[DIRECTION_SHORT_VAR_LONG_LIGHTER]
         )
+
+    def load_recent_live_inventory_entry_rfq_bias(self) -> None:
+        """Load passive-to-exact entry edge deltas for bounded pre-RFQ prediction."""
+        targets = getattr(
+            self,
+            "live_inventory_entry_rfq_bias_samples_by_direction",
+            None,
+        )
+        if not isinstance(targets, dict):
+            targets = {
+                DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(
+                    maxlen=LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_SAMPLES
+                ),
+                DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(
+                    maxlen=LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_SAMPLES
+                ),
+            }
+            self.live_inventory_entry_rfq_bias_samples_by_direction = targets
+        timestamp_targets = getattr(
+            self,
+            "live_inventory_entry_rfq_bias_sample_times_by_direction",
+            None,
+        )
+        if not isinstance(timestamp_targets, dict):
+            timestamp_targets = {
+                DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(
+                    maxlen=LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_SAMPLES
+                ),
+                DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(
+                    maxlen=LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_SAMPLES
+                ),
+            }
+            self.live_inventory_entry_rfq_bias_sample_times_by_direction = timestamp_targets
+        for direction in targets:
+            targets[direction].clear()
+            timestamp_targets.setdefault(direction, deque(
+                maxlen=LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_SAMPLES
+            )).clear()
+
+        state_file = getattr(self, "live_inventory_entry_rfq_bias_state_file", None)
+        if state_file is not None and state_file.exists():
+            state = read_json(state_file)
+            state_samples = state.get("samples") if isinstance(state, dict) else None
+            if isinstance(state_samples, dict):
+                loaded = False
+                for direction, records in state_samples.items():
+                    if direction not in targets or not isinstance(records, list):
+                        continue
+                    for record in records:
+                        if not isinstance(record, dict):
+                            continue
+                        bias_bps = to_decimal(record.get("bias_bps"))
+                        logged_at = parse_utc_iso(record.get("logged_at"))
+                        if bias_bps is None or logged_at is None:
+                            continue
+                        targets[direction].append(bias_bps)
+                        timestamp_targets[direction].append(logged_at.timestamp())
+                        loaded = True
+                if loaded or not state_samples:
+                    return
+
+        orders_file = getattr(self, "orders_file", None)
+        if orders_file is None or not orders_file.exists():
+            return
+        try:
+            with orders_file.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if '"event": "live_inventory_entry_rfq_calibration"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    # Earlier calibration rows compared an exact Lighter depth
+                    # quote with a passive quote from a different market moment.
+                    # They are not safe inputs for the predictor.
+                    if row.get(
+                        "calibration_basis"
+                    ) != "same_lighter_reference_var_price_delta_v1":
+                        continue
+                    if str(row.get("asset") or "").upper() != "ETH":
+                        continue
+                    direction = str(row.get("direction") or "")
+                    if direction not in targets:
+                        continue
+                    passive_edge_bps = to_decimal(row.get("passive_edge_bps"))
+                    exact_edge_bps = to_decimal(row.get("exact_edge_bps"))
+                    logged_at = parse_utc_iso(row.get("logged_at"))
+                    if (
+                        passive_edge_bps is None
+                        or exact_edge_bps is None
+                        or logged_at is None
+                    ):
+                        continue
+                    targets[direction].append(exact_edge_bps - passive_edge_bps)
+                    timestamp_targets[direction].append(logged_at.timestamp())
+        except OSError as exc:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.warning(
+                    "Could not load recent live inventory entry RFQ bias samples: %s",
+                    exc,
+                )
+
+    def live_inventory_basis_v4_entry_rfq_bias_context(
+        self,
+        direction: str,
+    ) -> dict[str, Any]:
+        targets = getattr(
+            self,
+            "live_inventory_entry_rfq_bias_samples_by_direction",
+            {},
+        )
+        samples = list(targets.get(direction, ())) if isinstance(targets, dict) else []
+        now = time.time()
+        timestamp_targets = getattr(
+            self,
+            "live_inventory_entry_rfq_bias_sample_times_by_direction",
+            {},
+        )
+        timestamps = (
+            list(timestamp_targets.get(direction, ()))
+            if isinstance(timestamp_targets, dict)
+            else []
+        )
+        if len(timestamps) != len(samples):
+            # Unit callers and old in-memory state may only provide values. Treat
+            # those values as current rather than silently making the predictor
+            # permanently cold; persisted production data always has timestamps.
+            timestamps = [now] * len(samples)
+        recent_samples = [
+            value
+            for value, timestamp in zip(samples, timestamps)
+            if 0 <= now - timestamp <= LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_AGE_SECONDS
+        ]
+        recent_ages = [
+            now - timestamp
+            for timestamp in timestamps
+            if 0 <= now - timestamp <= LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_AGE_SECONDS
+        ]
+        raw_bias_bps = median(recent_samples) if recent_samples else Decimal("0")
+        absolute_errors = [abs(value - raw_bias_bps) for value in recent_samples]
+        raw_mad_bps = median(absolute_errors) if absolute_errors else Decimal("0")
+        ready = bool(
+            len(recent_samples) >= LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MIN_SAMPLES
+            and raw_mad_bps <= LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_MAD_BPS
+        )
+        applied_bias_bps = (
+            max(
+                -LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_CLAMP_BPS,
+                min(LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_CLAMP_BPS, raw_bias_bps),
+            )
+            if ready
+            else Decimal("0")
+        )
+        return {
+            "v4_entry_rfq_bias_direction": direction,
+            "v4_entry_rfq_bias_sample_count": len(recent_samples),
+            "v4_entry_rfq_bias_min_samples": LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MIN_SAMPLES,
+            "v4_entry_rfq_bias_ready": ready,
+            "v4_entry_rfq_bias_ready_reason": (
+                "ready"
+                if ready
+                else "insufficient_recent_samples"
+                if len(recent_samples) < LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MIN_SAMPLES
+                else "mad_exceeds_limit"
+            ),
+            "v4_entry_rfq_bias_latest_age_seconds": decimal_to_str(
+                Decimal(str(min(recent_ages))) if recent_ages else None
+            ),
+            "v4_entry_rfq_bias_raw_median_bps": decimal_to_str(raw_bias_bps),
+            "v4_entry_rfq_bias_mad_bps": decimal_to_str(raw_mad_bps),
+            "v4_entry_rfq_bias_applied_bps": decimal_to_str(applied_bias_bps),
+            "v4_entry_rfq_bias_clamp_bps": decimal_to_str(
+                LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_CLAMP_BPS
+            ),
+            "v4_entry_rfq_prediction": "passive_edge_plus_directional_bias",
+        }
+
+    def persist_live_inventory_entry_rfq_bias(self) -> None:
+        state_file = getattr(self, "live_inventory_entry_rfq_bias_state_file", None)
+        if state_file is None:
+            return
+        samples_by_direction = getattr(
+            self, "live_inventory_entry_rfq_bias_samples_by_direction", {}
+        )
+        times_by_direction = getattr(
+            self, "live_inventory_entry_rfq_bias_sample_times_by_direction", {}
+        )
+        state_samples: dict[str, list[dict[str, Any]]] = {}
+        for direction, samples in samples_by_direction.items():
+            timestamps = list(times_by_direction.get(direction, ()))
+            values = list(samples)
+            if len(timestamps) != len(values):
+                timestamps = [time.time()] * len(values)
+            state_samples[direction] = [
+                {
+                    "bias_bps": decimal_to_str(value),
+                    "logged_at": datetime.fromtimestamp(
+                        timestamp, tz=timezone.utc
+                    ).isoformat(),
+                }
+                for value, timestamp in zip(values, timestamps)
+            ]
+        try:
+            write_json_atomic(
+                state_file,
+                {
+                    "schema_version": 1,
+                    "updated_at": self.now_iso(),
+                    "samples": state_samples,
+                },
+            )
+        except OSError as exc:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.warning("Could not persist entry RFQ bias state: %s", exc)
+
+    def live_inventory_basis_v4_entry_rfq_exploration_due(
+        self,
+        direction: str,
+        now: float | None = None,
+        *,
+        consume: bool = True,
+    ) -> bool:
+        now = time.monotonic() if now is None else now
+        last_by_direction = getattr(
+            self,
+            "live_inventory_entry_rfq_bias_last_exploration_monotonic_by_direction",
+            None,
+        )
+        if not isinstance(last_by_direction, dict):
+            last_by_direction = {}
+            self.live_inventory_entry_rfq_bias_last_exploration_monotonic_by_direction = last_by_direction
+        last = float(last_by_direction.get(direction, 0.0))
+        if now - last < LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_INTERVAL_SECONDS:
+            return False
+        if consume:
+            last_by_direction[direction] = now
+        return True
+
+    def record_live_inventory_entry_rfq_bias_sample(
+        self,
+        *,
+        asset: str,
+        direction: str,
+        passive_edge_bps: Decimal | None,
+        exact_edge_bps: Decimal | None,
+        passive_var_price: Decimal | None = None,
+        exact_var_price: Decimal | None = None,
+        reference_lighter_price: Decimal | None = None,
+    ) -> dict[str, Any] | None:
+        if (
+            str(asset).upper() != "ETH"
+            or direction
+            not in {
+                DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                DIRECTION_SHORT_VAR_LONG_LIGHTER,
+            }
+            or passive_edge_bps is None
+            or exact_edge_bps is None
+        ):
+            return None
+        targets = getattr(
+            self,
+            "live_inventory_entry_rfq_bias_samples_by_direction",
+            None,
+        )
+        if not isinstance(targets, dict):
+            targets = {}
+            self.live_inventory_entry_rfq_bias_samples_by_direction = targets
+        target = targets.setdefault(
+            direction,
+            deque(maxlen=LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_SAMPLES),
+        )
+        bias_bps = exact_edge_bps - passive_edge_bps
+        target.append(bias_bps)
+        timestamp_targets = getattr(
+            self,
+            "live_inventory_entry_rfq_bias_sample_times_by_direction",
+            None,
+        )
+        if not isinstance(timestamp_targets, dict):
+            timestamp_targets = {}
+            self.live_inventory_entry_rfq_bias_sample_times_by_direction = timestamp_targets
+        timestamp_targets.setdefault(
+            direction,
+            deque(maxlen=LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_SAMPLES),
+        ).append(time.time())
+        self.persist_live_inventory_entry_rfq_bias()
+        return {
+            "asset": str(asset).upper(),
+            "direction": direction,
+            "passive_edge_bps": decimal_to_str(passive_edge_bps),
+            "exact_edge_bps": decimal_to_str(exact_edge_bps),
+            "directional_bias_bps": decimal_to_str(bias_bps),
+            "calibration_basis": "same_lighter_reference_var_price_delta_v1",
+            "passive_var_price": decimal_to_str(passive_var_price),
+            "exact_var_price": decimal_to_str(exact_var_price),
+            "reference_lighter_price": decimal_to_str(reference_lighter_price),
+            **self.live_inventory_basis_v4_entry_rfq_bias_context(direction),
+        }
 
     @staticmethod
     def percentile_decimal(values: Iterable[Decimal], percentile: int) -> Decimal | None:
@@ -8317,6 +8664,7 @@ class VariationalToLighterRuntime:
             asset=asset,
             qty=qty,
             priority="trade",
+            rfq_category="profit_exit_rfq",
         )
         refreshed_var_bid = (
             to_decimal(refreshed_quote.get("bid")) if refreshed_quote else None
@@ -9023,6 +9371,7 @@ class VariationalToLighterRuntime:
         asset: str,
         qty: Decimal,
         priority: str,
+        rfq_category: str = "execution_quote",
     ) -> tuple[dict[str, Any] | None, Decimal | None]:
         """Return one exact RFQ for execution or a zero-RFQ stream observation."""
         if priority != "background":
@@ -9030,14 +9379,19 @@ class VariationalToLighterRuntime:
                 asset=asset,
                 qty=qty,
                 priority=priority,
+                rfq_category=rfq_category,
             )
 
-        quote = await self.get_variational_quote(asset.upper())
+        quote = await self.get_variational_reference_quote(asset.upper())
         if not isinstance(quote, dict):
             return None, None
-        bid = to_decimal(quote.get("bid"))
-        ask = to_decimal(quote.get("ask"))
-        if bid is None or ask is None or bid <= 0 or ask <= 0:
+        reference_price = to_decimal(quote.get("reference_price"))
+        if reference_price is None:
+            bid = to_decimal(quote.get("bid"))
+            ask = to_decimal(quote.get("ask"))
+            if bid is not None and ask is not None:
+                reference_price = (bid + ask) / Decimal("2")
+        if reference_price is None or reference_price <= 0:
             return None, None
         source_timestamp = (
             quote.get("quoteTimestamp")
@@ -9048,6 +9402,11 @@ class VariationalToLighterRuntime:
         return (
             {
                 **quote,
+                # The snapshot fields below are neutral internal bounds for
+                # signal math only; they are never reused for an order.
+                "bid": decimal_to_str(reference_price),
+                "ask": decimal_to_str(reference_price),
+                "mark_price": decimal_to_str(reference_price),
                 # Passive stream freshness is measured from arrival on this
                 # process. The source timestamp may describe a slower upstream
                 # snapshot and is retained only for diagnostics.
@@ -9060,6 +9419,7 @@ class VariationalToLighterRuntime:
                 ),
                 "quote_size_mode": LIVE_INVENTORY_BASIS_QUOTE_SIZE_MODE,
                 "quote_source": LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE,
+                "quote_semantics": "reference_price_only",
                 "quote_freshness_source": (
                     "local_monotonic_receive_time"
                     if quote.get("received_monotonic") is not None
@@ -9067,6 +9427,7 @@ class VariationalToLighterRuntime:
                 ),
                 "quote_latency_kind": "passive_stream_no_rfq",
                 "rfq_consumed": False,
+                "rfq_category": "passive_reference",
             },
             Decimal("0"),
         )
@@ -9077,6 +9438,7 @@ class VariationalToLighterRuntime:
         asset: str,
         qty: Decimal,
         priority: str = "trade",
+        rfq_category: str = "execution_quote",
     ) -> tuple[dict[str, Any] | None, Decimal | None]:
         requested_qty = Decimal(str(qty))
         if requested_qty <= 0:
@@ -9099,6 +9461,7 @@ class VariationalToLighterRuntime:
                     confirm=False,
                     reduce_only=False,
                     priority=priority,
+                    rfq_category=rfq_category,
                 )
             )
         except Exception as exc:
@@ -9137,9 +9500,10 @@ class VariationalToLighterRuntime:
                     "live_inventory_basis_quote_skipped",
                     {
                         "asset": asset,
-                        "reason": "background_rate_limit_budget",
+                        "reason": result.get("error") or "rate_limit_budget",
                         "requested_qty": decimal_to_str(requested_qty),
                         "priority": priority,
+                        "rfq_category": rfq_category,
                         "rate_limit": result.get("rate_limit"),
                     },
                 )
@@ -9167,6 +9531,8 @@ class VariationalToLighterRuntime:
             "quote_source": "direct_rfq",
             "quote_freshness_source": "exchange_quote_timestamp",
             "quote_latency_kind": "exact_rfq_roundtrip",
+            "rfq_category": rfq_category,
+            "rfq_consumed": True,
         }
         bid = to_decimal(payload.get("bid"))
         ask = to_decimal(payload.get("ask"))
@@ -9181,6 +9547,31 @@ class VariationalToLighterRuntime:
         self.live_inventory_extension_disconnect_failures = 0
         self.live_inventory_extension_failure_started_monotonic = 0.0
         return payload, Decimal(str(elapsed_ms))
+
+    async def get_variational_reference_quote(
+        self,
+        preferred_asset: str | None,
+    ) -> dict[str, Any] | None:
+        runtime = getattr(self, "runtime", None)
+        if runtime is None:
+            # Keep lightweight test/recovery runtimes compatible without
+            # reintroducing an executable RFQ fallback.
+            fallback = getattr(self, "get_variational_quote", None)
+            if callable(fallback):
+                quote = await fallback(preferred_asset)
+                return dict(quote) if isinstance(quote, dict) else None
+            return None
+        async with runtime.monitor._lock:
+            quote = None
+            if preferred_asset:
+                quote = runtime.monitor.reference_quotes.get(preferred_asset)
+            if quote is None and self.variational_ticker:
+                quote = runtime.monitor.reference_quotes.get(self.variational_ticker)
+            if quote is None and runtime.monitor.current_quote_asset:
+                quote = runtime.monitor.reference_quotes.get(
+                    runtime.monitor.current_quote_asset
+                )
+            return dict(quote) if isinstance(quote, dict) else None
 
     async def try_auto_close_unhedged_live_inventory_leg(
         self,
@@ -11393,6 +11784,14 @@ class VariationalToLighterRuntime:
                     and to_decimal(quote.get("ask")) is not None
                 ):
                     return asset
+                reference_quote = self.runtime.monitor.reference_quotes.get(asset)
+                if (
+                    asset
+                    and asset != "UNKNOWN"
+                    and isinstance(reference_quote, dict)
+                    and to_decimal(reference_quote.get("reference_price")) is not None
+                ):
+                    return asset
 
         return None
 
@@ -11875,6 +12274,7 @@ class VariationalToLighterRuntime:
         reduce_only: bool = False,
         reuse_quote_id: str | None = None,
         priority: str = "trade",
+        rfq_category: str = "execution_quote",
     ) -> dict[str, Any]:
         limiter = self.live_inventory_order_limiter("variational")
         urgent = bool(reduce_only and confirm)
@@ -11893,19 +12293,44 @@ class VariationalToLighterRuntime:
                     "step": "rate_limit",
                     "error": "client_rate_limit_background_skip",
                     "rate_limit_skipped": True,
+                    "rate_limit_category": "background_quote",
                     "rate_limit": limiter.snapshot(),
                 }
         elif rfq_cost:
-            limiter_wait_seconds = await limiter.acquire(
-                urgent=urgent,
-                cost=rfq_cost,
-                category="emergency_exit" if urgent else "execution_quote",
-                category_limit=(
-                    LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_HARD_PER_MINUTE
-                    if urgent
+            category = "emergency_exit" if urgent else rfq_category
+            category_limit = (
+                LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_HARD_PER_MINUTE
+                if urgent
+                else (
+                    LIVE_INVENTORY_VARIATIONAL_ENTRY_RFQ_RATE_PER_MINUTE
+                    if rfq_category == "entry_rfq"
+                    else LIVE_INVENTORY_VARIATIONAL_PROFIT_EXIT_RFQ_RATE_PER_MINUTE
+                    if rfq_category == "profit_exit_rfq"
                     else LIVE_INVENTORY_VARIATIONAL_ORDER_RATE_NORMAL_PER_MINUTE
-                ),
+                )
             )
+            if not urgent and rfq_category in {"entry_rfq", "profit_exit_rfq"}:
+                acquired, limiter_wait_seconds = await limiter.try_acquire(
+                    limit=category_limit,
+                    category=category,
+                    cost=rfq_cost,
+                )
+                if not acquired:
+                    return {
+                        "ok": False,
+                        "step": "rate_limit",
+                        "error": f"client_rate_limit_{rfq_category}_skip",
+                        "rate_limit_skipped": True,
+                        "rate_limit_category": category,
+                        "rate_limit": limiter.snapshot(),
+                    }
+            else:
+                limiter_wait_seconds = await limiter.acquire(
+                    urgent=urgent,
+                    cost=rfq_cost,
+                    category=category,
+                    category_limit=category_limit,
+                )
         request_id = uuid.uuid4().hex
         request_timeout_ms = (
             int(LIVE_INVENTORY_VARIATIONAL_BACKGROUND_QUOTE_TIMEOUT_SECONDS * 1000)
@@ -12003,6 +12428,7 @@ class VariationalToLighterRuntime:
                 **result,
                 "rate_limit_wait_ms": f"{limiter_wait_seconds * 1000:.3f}",
                 "rate_limit_priority": priority,
+                "rate_limit_category": rfq_category,
                 "rate_limit_cost": rfq_cost,
                 "rfq_consumed": bool(rfq_cost),
             }
@@ -13115,6 +13541,19 @@ class VariationalToLighterRuntime:
                 quote = self.runtime.monitor.quotes.get(self.variational_ticker)
             if quote is None and self.runtime.monitor.current_quote_asset:
                 quote = self.runtime.monitor.quotes.get(self.runtime.monitor.current_quote_asset)
+
+            # Preserve the legacy dashboard/paper fallback, but keep the
+            # reference stream isolated from the executable quote cache. V4
+            # live inventory uses get_variational_reference_quote directly.
+            if quote is None:
+                if preferred_asset:
+                    quote = self.runtime.monitor.reference_quotes.get(preferred_asset)
+                if quote is None and self.variational_ticker:
+                    quote = self.runtime.monitor.reference_quotes.get(self.variational_ticker)
+                if quote is None and self.runtime.monitor.current_quote_asset:
+                    quote = self.runtime.monitor.reference_quotes.get(
+                        self.runtime.monitor.current_quote_asset
+                    )
 
             if quote is None:
                 return None
@@ -14948,12 +15387,27 @@ class VariationalToLighterRuntime:
             await asyncio.sleep(DASHBOARD_REFRESH_SECONDS)
 
     async def get_cross_spread_snapshot(self) -> CrossSpreadSnapshot | None:
-        quote = await self.get_variational_quote(self.variational_ticker)
+        reference_quote = None
+        if getattr(self, "live_inventory_basis_v4_mode", False):
+            reference_quote = await self.get_variational_reference_quote(
+                self.variational_ticker
+            )
+            # V4 signal observations must come from the passive reference
+            # stream. Falling back to an ad-hoc quote here would silently
+            # reintroduce RFQ consumption into the decision loop.
+            quote = reference_quote
+        else:
+            quote = await self.get_variational_quote(self.variational_ticker)
         if quote is None:
             await self.log_live_inventory_snapshot_unavailable("variational_quote_unavailable")
             return None
-        var_bid = to_decimal(quote.get("bid"))
-        var_ask = to_decimal(quote.get("ask"))
+        reference_price = (
+            to_decimal(quote.get("reference_price"))
+            if reference_quote is not None
+            else None
+        )
+        var_bid = reference_price or to_decimal(quote.get("bid"))
+        var_ask = reference_price or to_decimal(quote.get("ask"))
         quote_asset = str(quote.get("asset", ""))
         lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
         if var_bid is None or var_ask is None or lighter_bid is None or lighter_ask is None:
@@ -14967,7 +15421,11 @@ class VariationalToLighterRuntime:
             )
             return None
 
-        var_buy_price, var_sell_price, var_spread_source = self.extract_variational_button_prices(quote)
+        var_buy_price, var_sell_price, var_spread_source = (
+            (reference_price, reference_price, "reference_price_only")
+            if reference_price is not None
+            else self.extract_variational_button_prices(quote)
+        )
         if var_buy_price is None or var_sell_price is None:
             var_buy_price = max(var_bid, var_ask)
             var_sell_price = min(var_bid, var_ask)
@@ -15368,6 +15826,13 @@ class VariationalToLighterRuntime:
 
     async def maybe_run_live_inventory_basis(self, snapshot: CrossSpreadSnapshot) -> None:
         asset = snapshot.asset.upper()
+        if not isinstance(
+            getattr(self, "live_inventory_basis_entry_rfq_cooldown_until_monotonic", None),
+            dict,
+        ):
+            self.live_inventory_basis_entry_rfq_cooldown_until_monotonic = {}
+        if not hasattr(self, "live_inventory_basis_entry_rfq_last_skip_log_monotonic"):
+            self.live_inventory_basis_entry_rfq_last_skip_log_monotonic = 0.0
         calibration_mode = bool(getattr(self, "live_inventory_execution_calibration", False))
         v4_mode = bool(getattr(self, "live_inventory_basis_v4_mode", False))
         collect_only = bool(getattr(self, "live_inventory_collect_only", False))
@@ -15944,6 +16409,28 @@ class VariationalToLighterRuntime:
                 else None
             ),
         )
+        v4_entry_rfq_bias_contexts: dict[str, dict[str, Any]] = {}
+        v4_predicted_entry_edges: dict[str, Decimal] = dict(v4_signal_edges)
+        if v4_mode:
+            for direction in v4_entry_directions:
+                bias_context = self.live_inventory_basis_v4_entry_rfq_bias_context(
+                    direction
+                )
+                v4_entry_rfq_bias_contexts[direction] = bias_context
+                applied_bias_bps = to_decimal(
+                    bias_context.get("v4_entry_rfq_bias_applied_bps")
+                ) or Decimal("0")
+                v4_predicted_entry_edges[direction] = (
+                    v4_signal_edges[direction] + applied_bias_bps
+                )
+            v4_entry_context = {
+                **v4_entry_context,
+                **v4_entry_rfq_bias_contexts.get(v4_entry_direction, {}),
+                "v4_entry_rfq_predicted_edges_bps": {
+                    direction: decimal_to_str(edge)
+                    for direction, edge in v4_predicted_entry_edges.items()
+                },
+            }
         real_gradient_thresholds_by_direction: dict[str, list[Decimal]] = {}
         raw_real_gradient_tiers: dict[str, int] = {}
         real_gradient_tiers: dict[str, int] = {}
@@ -16039,9 +16526,11 @@ class VariationalToLighterRuntime:
             ),
             "quote_priority": quote_priority,
             "quote_source": quote.get("quote_source", "direct_rfq"),
+            "quote_semantics": quote.get("quote_semantics"),
             "quote_freshness_source": var_quote_freshness_source,
             "source_quote_timestamp": quote.get("source_quote_timestamp"),
             "quote_received_at": quote.get("received_at"),
+            "reference_price": quote.get("reference_price"),
             "quote_cache_age_seconds": quote.get("quote_cache_age_seconds"),
             "quote_timestamp": quote.get("quoteTimestamp") or quote.get("quote_timestamp"),
             "quote_ms": decimal_to_str(quote_ms),
@@ -16073,6 +16562,16 @@ class VariationalToLighterRuntime:
             "basis_v4_profile": getattr(self, "live_inventory_basis_v4_profile", "") or None,
             "v4_entry_direction": v4_entry_direction if v4_mode else None,
             "v4_signal_edge_bps": decimal_to_str(v4_signal_edge_bps) if v4_mode else None,
+            "v4_predicted_exact_edge_bps": (
+                decimal_to_str(v4_predicted_entry_edges.get(v4_entry_direction))
+                if v4_mode
+                else None
+            ),
+            **(
+                v4_entry_rfq_bias_contexts.get(v4_entry_direction, {})
+                if v4_mode
+                else {}
+            ),
             **v4_entry_context,
             "basis_reversion_min_deviation_bps": decimal_to_str(self.live_inventory_basis_reversion_min_deviation_bps),
             "basis_reversion_exit_deviation_bps": decimal_to_str(self.live_inventory_basis_reversion_exit_deviation_bps),
@@ -16333,6 +16832,8 @@ class VariationalToLighterRuntime:
                 stablecoin_filter_ok,
                 stablecoin_edge_context,
             ) in candidates:
+                passive_var_price = var_price
+                passive_lighter_price = lighter_price
                 signal_quote_id = quote.get("quoteId") or quote.get("quote_id")
                 entry_quote_id: str | None = signal_quote_id
                 entry_quote_qty = quote_request_qty
@@ -16710,7 +17211,55 @@ class VariationalToLighterRuntime:
                             **entry_quality_context,
                         },
                     )
-                if edge_bps < min_entry_edge_bps:
+                entry_rfq_bias_context = (
+                    v4_entry_rfq_bias_contexts.get(direction, {})
+                    if v4_mode
+                    else {}
+                )
+                predicted_exact_edge_bps = edge_bps
+                if v4_mode:
+                    predicted_exact_edge_bps = v4_predicted_entry_edges.get(
+                        direction,
+                        edge_bps,
+                    )
+                predicted_entry_candidate = bool(
+                    v4_mode
+                    and self.live_inventory_basis_refresh_entry_quote_before_submit
+                    and predicted_exact_edge_bps >= min_entry_edge_bps
+                )
+                entry_rfq_exploration_candidate = bool(
+                    v4_mode
+                    and self.live_inventory_basis_refresh_entry_quote_before_submit
+                    and entry_rfq_bias_context.get("v4_entry_rfq_bias_ready") is True
+                    and predicted_exact_edge_bps < min_entry_edge_bps
+                    and self.live_inventory_basis_v4_entry_rfq_exploration_due(
+                        direction,
+                        consume=False,
+                    )
+                )
+                entry_rfq_probe_candidate = (
+                    predicted_entry_candidate or entry_rfq_exploration_candidate
+                )
+                if predicted_entry_candidate:
+                    entry_quality_score_bps = max(
+                        entry_quality_score_bps,
+                        predicted_exact_edge_bps - min_entry_edge_bps,
+                    )
+                    entry_quality_context = {
+                        **entry_quality_context,
+                        "entry_rfq_prediction_used": True,
+                        "entry_rfq_predicted_exact_edge_bps": decimal_to_str(
+                            predicted_exact_edge_bps
+                        ),
+                        **entry_rfq_bias_context,
+                    }
+                if entry_rfq_exploration_candidate:
+                    entry_quality_context = {
+                        **entry_quality_context,
+                        "entry_rfq_exploration_used": True,
+                        **entry_rfq_bias_context,
+                    }
+                if edge_bps < min_entry_edge_bps and not entry_rfq_probe_candidate:
                     promoted, watch_context = self.live_inventory_update_watch_candidate(
                         direction=direction,
                         edge_bps=edge_bps,
@@ -16726,7 +17275,11 @@ class VariationalToLighterRuntime:
                         continue
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     continue
-                if entry_quality_score_bps < self.live_inventory_basis_min_entry_quality_score_bps:
+                if (
+                    entry_quality_score_bps
+                    < self.live_inventory_basis_min_entry_quality_score_bps
+                    and not predicted_entry_candidate
+                ):
                     promoted, watch_context = self.live_inventory_update_watch_candidate(
                         direction=direction,
                         edge_bps=edge_bps,
@@ -16891,10 +17444,37 @@ class VariationalToLighterRuntime:
                     )
                     return
                 if self.live_inventory_basis_refresh_entry_quote_before_submit:
+                    cooldown_until = self.live_inventory_basis_entry_rfq_cooldown_until_monotonic.get(
+                        direction,
+                        0.0,
+                    )
+                    now_monotonic = time.monotonic()
+                    if cooldown_until > now_monotonic:
+                        if (
+                            now_monotonic
+                            - self.live_inventory_basis_entry_rfq_last_skip_log_monotonic
+                            >= 5.0
+                        ):
+                            self.live_inventory_basis_entry_rfq_last_skip_log_monotonic = now_monotonic
+                            await self.append_live_inventory_log(
+                                "live_inventory_entry_blocked",
+                                {
+                                    **state_payload,
+                                    "reason": "basis_entry_exact_rfq_cooldown",
+                                    "direction": direction,
+                                    "cooldown_remaining_seconds": f"{cooldown_until - now_monotonic:.3f}",
+                                },
+                            )
+                        return
+                    if entry_rfq_exploration_candidate:
+                        self.live_inventory_basis_v4_entry_rfq_exploration_due(
+                            direction
+                        )
                     refreshed_quote, refreshed_quote_ms = await self.fetch_live_inventory_basis_quote(
                         asset=asset,
                         qty=signal_quote_qty,
                         priority="trade",
+                        rfq_category="entry_rfq",
                     )
                     refreshed_var_bid = to_decimal(refreshed_quote.get("bid")) if refreshed_quote else None
                     refreshed_var_ask = to_decimal(refreshed_quote.get("ask")) if refreshed_quote else None
@@ -16978,6 +17558,11 @@ class VariationalToLighterRuntime:
                     entry_quote_asset = refreshed_quote.get("quote_asset")
                     entry_quote_size_mode = refreshed_quote.get("quote_size_mode")
                     qty = entry_quote_qty
+                    passive_calibration_edge_bps = self.live_inventory_pair_edge_bps(
+                        direction=direction,
+                        var_price=passive_var_price,
+                        lighter_price=passive_lighter_price,
+                    )
                     entry_depth = await self.live_inventory_lighter_depth_context(lighter_side=entry_lighter_side, qty=qty)
                     depth_entry_price = to_decimal(entry_depth.get("estimated_fill_price"))
                     exit_depth = await self.live_inventory_lighter_depth_context(lighter_side=exit_lighter_side_for_roundtrip, qty=qty)
@@ -16996,6 +17581,42 @@ class VariationalToLighterRuntime:
                         return
                     lighter_price = depth_entry_price
                     raw_refreshed_edge_bps = self.live_inventory_pair_edge_bps(direction=direction, var_price=var_price, lighter_price=lighter_price) or Decimal("0")
+                    if v4_mode:
+                        exact_calibration_edge_bps = self.live_inventory_pair_edge_bps(
+                            direction=direction,
+                            var_price=var_price,
+                            lighter_price=passive_lighter_price,
+                        )
+                        entry_rfq_calibration = (
+                            self.record_live_inventory_entry_rfq_bias_sample(
+                                asset=asset,
+                                direction=direction,
+                                passive_edge_bps=passive_calibration_edge_bps,
+                                exact_edge_bps=exact_calibration_edge_bps,
+                                passive_var_price=passive_var_price,
+                                exact_var_price=var_price,
+                                reference_lighter_price=passive_lighter_price,
+                            )
+                        )
+                        if entry_rfq_calibration is not None:
+                            await self.append_live_inventory_log(
+                                "live_inventory_entry_rfq_calibration",
+                                {
+                                    **state_payload,
+                                    **entry_rfq_calibration,
+                                    "refresh_quote_ms": decimal_to_str(
+                                        refreshed_quote_ms
+                                    ),
+                                    "exact_quote_id": refreshed_quote.get(
+                                        "quoteId"
+                                    )
+                                    or refreshed_quote.get("quote_id"),
+                                    "exact_quote_timestamp": refreshed_quote.get(
+                                        "quoteTimestamp"
+                                    )
+                                    or refreshed_quote.get("quote_timestamp"),
+                                },
+                            )
                     edge_bps = raw_refreshed_edge_bps
                     raw_refreshed_roundtrip_bps = self.live_inventory_roundtrip_pnl_bps(
                         direction=direction,
@@ -17111,6 +17732,12 @@ class VariationalToLighterRuntime:
                                 and refreshed_raw_gradient_tier
                                 < required_refreshed_raw_gradient_tier
                             ):
+                                self.live_inventory_basis_entry_rfq_cooldown_until_monotonic[
+                                    direction
+                                ] = (
+                                    time.monotonic()
+                                    + LIVE_INVENTORY_VARIATIONAL_ENTRY_RFQ_COOLDOWN_SECONDS
+                                )
                                 await self.append_live_inventory_log(
                                     "live_inventory_entry_blocked",
                                     {
@@ -17156,6 +17783,12 @@ class VariationalToLighterRuntime:
                             roundtrip_bps=roundtrip_bps,
                         )
                     if not calibration_mode and edge_bps < min_entry_edge_bps:
+                        self.live_inventory_basis_entry_rfq_cooldown_until_monotonic[
+                            direction
+                        ] = (
+                            time.monotonic()
+                            + LIVE_INVENTORY_VARIATIONAL_ENTRY_RFQ_COOLDOWN_SECONDS
+                        )
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
@@ -17167,6 +17800,11 @@ class VariationalToLighterRuntime:
                                 "normalized_refreshed_edge_bps": decimal_to_str(refreshed_normalized_edge_bps),
                                 "entry_edge_source": "normalized" if self.live_inventory_basis_use_normalized_edge_for_entry else "raw",
                                 "min_entry_edge_bps": decimal_to_str(min_entry_edge_bps),
+                                "refresh_quote_ms": decimal_to_str(refreshed_quote_ms),
+                                "refreshed_quote_id": refreshed_quote.get("quoteId") or refreshed_quote.get("quote_id"),
+                                "refreshed_quote_timestamp": refreshed_quote.get("quoteTimestamp") or refreshed_quote.get("quote_timestamp"),
+                                "refreshed_var_bid": decimal_to_str(refreshed_var_bid),
+                                "refreshed_var_ask": decimal_to_str(refreshed_var_ask),
                                 **stablecoin_edge_context,
                                 **negative_context,
                                 **entry_quality_context,
@@ -17178,6 +17816,12 @@ class VariationalToLighterRuntime:
                         not calibration_mode
                         and entry_quality_score_bps < self.live_inventory_basis_min_entry_quality_score_bps
                     ):
+                        self.live_inventory_basis_entry_rfq_cooldown_until_monotonic[
+                            direction
+                        ] = (
+                            time.monotonic()
+                            + LIVE_INVENTORY_VARIATIONAL_ENTRY_RFQ_COOLDOWN_SECONDS
+                        )
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
@@ -17201,6 +17845,12 @@ class VariationalToLighterRuntime:
                         else self.live_inventory_basis_max_entry_roundtrip_cost_bps
                     )
                     if not v4_mode and roundtrip_bps < -max_entry_roundtrip_cost_bps:
+                        self.live_inventory_basis_entry_rfq_cooldown_until_monotonic[
+                            direction
+                        ] = (
+                            time.monotonic()
+                            + LIVE_INVENTORY_VARIATIONAL_ENTRY_RFQ_COOLDOWN_SECONDS
+                        )
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {
@@ -17330,6 +17980,12 @@ class VariationalToLighterRuntime:
                     and self.live_inventory_basis_refresh_entry_quote_before_submit
                     and not entry_quote_id
                 ):
+                    self.live_inventory_basis_entry_rfq_cooldown_until_monotonic[
+                        direction
+                    ] = (
+                        time.monotonic()
+                        + LIVE_INVENTORY_VARIATIONAL_ENTRY_RFQ_COOLDOWN_SECONDS
+                    )
                     await self.block_live_inventory_entry(
                         asset=asset,
                         reason="basis_entry_refresh_quote_id_missing",
@@ -17340,6 +17996,10 @@ class VariationalToLighterRuntime:
                         },
                     )
                     return
+                self.live_inventory_basis_entry_rfq_cooldown_until_monotonic.pop(
+                    direction,
+                    None,
+                )
                 lot_id = self.live_inventory_next_lot_id
                 basis_trace_id = f"{self.live_inventory_run_id}:basis:{lot_id}:{uuid.uuid4().hex[:8]}"
                 if v4_mode and self.live_inventory_v4_episode_id is None:
@@ -19332,10 +19992,15 @@ class VariationalToLighterRuntime:
             if (
                 raw_should_exit
                 and not should_exit
+                and (not var_quote_age_ok or not lighter_book_age_ok)
                 and not (
                     v4_mode
                     and current_quote_matches_lot
                     and not portfolio_exit_selected
+                )
+                and self.should_log_live_inventory_exit_blocked(
+                    lot_id=candidate_lot.get("lot_id"),
+                    reason="basis_exit_market_data_too_old",
                 )
             ):
                 await self.append_live_inventory_log(
@@ -19739,6 +20404,13 @@ class VariationalToLighterRuntime:
                                 "effective_min_exit_pnl_bps": decimal_to_str(
                                     effective_min_exit_pnl_bps
                                 ),
+                                "refresh_quote_ms": decimal_to_str(
+                                    to_decimal(refresh_context.get("refresh_quote_ms"))
+                                ),
+                                "refreshed_var_exit_price": decimal_to_str(
+                                    to_decimal(refresh_context.get("refreshed_var_exit_price"))
+                                ),
+                                "executable_pnl_bps": decimal_to_str(pnl_bps),
                             },
                         )
                         return
