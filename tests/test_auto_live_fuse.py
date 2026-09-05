@@ -4492,10 +4492,11 @@ def test_v4_entry_rfq_bias_rejects_unstable_samples() -> None:
 def test_v4_entry_rfq_exploration_is_rate_limited() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     direction = "short_var_long_lighter"
+    now = time.monotonic()
 
-    assert runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, 100.0)
-    assert not runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, 101.0)
-    assert runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, 400.0)
+    assert runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, now)
+    assert not runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, now + 1.0)
+    assert runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, now + 300.0)
 
 
 def test_variational_order_reuses_final_quote_id(tmp_path) -> None:
@@ -7805,6 +7806,45 @@ def test_live_inventory_pending_consumption_is_checkpointed(tmp_path) -> None:
         assert persisted["state_revision"] == 2
 
     asyncio.run(run())
+
+
+def test_live_inventory_exit_pending_matches_clear_all_component_lots() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.pending_live_inventory_var_fill_matches = [
+        PendingLiveInventoryVarFillMatch(
+            asset="ETH",
+            side="buy",
+            qty=Decimal("0.0082"),
+            lot_id=2,
+            role="live_inventory_exit",
+            created_at_monotonic=time.monotonic(),
+        ),
+        PendingLiveInventoryVarFillMatch(
+            asset="ETH",
+            side="buy",
+            qty=Decimal("0.0082"),
+            lot_id=3,
+            role="live_inventory_exit",
+            created_at_monotonic=time.monotonic(),
+        ),
+        PendingLiveInventoryVarFillMatch(
+            asset="ETH",
+            side="buy",
+            qty=Decimal("0.0082"),
+            lot_id=4,
+            role="live_inventory_exit",
+            created_at_monotonic=time.monotonic(),
+        ),
+    ]
+
+    removed = runtime.remove_pending_live_inventory_var_fill_matches(
+        asset="eth",
+        lot_ids=("2.0", 3),
+        role="live_inventory_exit",
+    )
+
+    assert removed == 2
+    assert [item.lot_id for item in runtime.pending_live_inventory_var_fill_matches] == [4]
 
 
 def test_live_inventory_state_writer_freezes_mutable_snapshot(tmp_path) -> None:

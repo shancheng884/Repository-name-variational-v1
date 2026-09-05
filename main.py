@@ -12804,17 +12804,45 @@ class VariationalToLighterRuntime:
         return False
 
     def remove_pending_live_inventory_var_fill_match(self, *, asset: str, lot_id: Any, role: str) -> None:
+        self.remove_pending_live_inventory_var_fill_matches(
+            asset=asset,
+            lot_ids=(lot_id,),
+            role=role,
+        )
+
+    def remove_pending_live_inventory_var_fill_matches(
+        self,
+        *,
+        asset: str,
+        lot_ids: Iterable[Any],
+        role: str,
+    ) -> int:
+        normalized_asset = str(asset).strip().upper()
+        normalized_lot_ids = {
+            self.live_inventory_normalized_lot_id(lot_id)
+            for lot_id in lot_ids
+        }
         pending_matches = getattr(self, "pending_live_inventory_var_fill_matches", [])
         retained_matches = [
             item
             for item in pending_matches
-            if not (item.asset == asset and item.lot_id == lot_id and item.role == role)
+            if not (
+                str(item.asset).strip().upper() == normalized_asset
+                and self.live_inventory_normalized_lot_id(item.lot_id)
+                in normalized_lot_ids
+                and item.role == role
+            )
         ]
         self.pending_live_inventory_var_fill_matches = retained_matches
-        if len(retained_matches) != len(pending_matches):
+        removed_count = len(pending_matches) - len(retained_matches)
+        if removed_count:
             self.mark_live_inventory_state_dirty(
-                reason=f"pending_action_removed:{role}:{lot_id}"
+                reason=(
+                    f"pending_actions_removed:{role}:"
+                    f"{','.join(sorted(normalized_lot_ids))}"
+                )
             )
+        return removed_count
 
     def _rekey_record_locked(self, record: OrderLifecycle, new_trade_key: str) -> None:
         old_trade_key = record.trade_key
@@ -20876,6 +20904,14 @@ class VariationalToLighterRuntime:
             if self.live_inventory_normalized_lot_id(open_lot.get("lot_id"))
             not in component_exit_lot_ids
         ]
+        # A confirmed exit has no remaining fill to reconcile. Remove the
+        # reduce-only intent for every lot in an atomic portfolio exit before
+        # checkpointing the updated open-lot state.
+        self.remove_pending_live_inventory_var_fill_matches(
+            asset=asset,
+            lot_ids=component_exit_lot_ids,
+            role="live_inventory_exit",
+        )
         if self.live_inventory_basis_v4_real_gradient:
             self.mark_live_inventory_gradient_tier_closed(
                 tier=closed_gradient_tier,

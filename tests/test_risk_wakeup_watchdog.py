@@ -167,6 +167,76 @@ def test_recent_degraded_account_snapshot_does_not_raise_incident() -> None:
     assert incidents == []
 
 
+def test_empty_pending_intent_does_not_raise_stale_action_incident() -> None:
+    now = datetime(2026, 8, 30, 0, 1, tzinfo=timezone.utc)
+    incidents = evaluate_incidents(
+        state={
+            "status": "open",
+            "asset": "ETH",
+            "open_lots": [{"lot_id": 1}],
+            "updated_at": (now - timedelta(minutes=10)).isoformat(),
+            "pending_actions": [
+                {
+                    "asset": "ETH",
+                    "lot_id": 2,
+                    "role": "live_inventory_exit",
+                    "submitted_at": None,
+                    "rfq_id": None,
+                    "submitted_order_id": None,
+                    "lighter_started": False,
+                    "lighter_record_key": None,
+                    "execution_unknown": False,
+                    "reconciliation_required": False,
+                    "context": {},
+                }
+            ],
+        },
+        risk_health={
+            "updated_at": now.isoformat(),
+            "pending_actions_total": 1,
+            "risk_action": "normal",
+        },
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=now,
+    )
+
+    assert not any(item.key == "pending_action_stale" for item in incidents)
+
+
+def test_submitted_pending_action_still_raises_after_timeout() -> None:
+    now = datetime(2026, 8, 30, 0, 1, tzinfo=timezone.utc)
+    incidents = evaluate_incidents(
+        state={
+            "status": "flat",
+            "asset": "ETH",
+            "open_lots": [],
+            "pending_actions": [
+                {
+                    "asset": "ETH",
+                    "lot_id": 2,
+                    "role": "live_inventory_exit",
+                    "submitted_at": (now - timedelta(seconds=31)).isoformat(),
+                }
+            ],
+        },
+        risk_health={
+            "updated_at": now.isoformat(),
+            "risk_action": "normal",
+        },
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=now,
+    )
+
+    stale = next(
+        item for item in incidents if "pending_action_stale" in item.fingerprint
+    )
+    assert stale.severity == "critical"
+
+
 def test_force_reduce_margin_and_position_mismatch_are_critical() -> None:
     now = datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc)
     incidents = evaluate_incidents(

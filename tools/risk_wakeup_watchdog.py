@@ -259,6 +259,33 @@ def _pending_age_seconds(item: dict[str, Any], now: datetime) -> float | None:
     return None
 
 
+def _pending_action_is_actionable(item: Any) -> bool:
+    """Return whether a pending entry represents an order that was touched."""
+    if not isinstance(item, dict):
+        return False
+    context = item.get("context") if isinstance(item.get("context"), dict) else {}
+    for key in (
+        "submitted_at",
+        "created_at",
+        "record_created_at",
+        "last_updated_at",
+        "rfq_id",
+        "submitted_order_id",
+        "lighter_record_key",
+        "execution_unknown_reason",
+    ):
+        if item.get(key) not in (None, "") or context.get(key) not in (None, ""):
+            return True
+    return any(
+        bool(item.get(key)) or bool(context.get(key))
+        for key in (
+            "lighter_started",
+            "execution_unknown",
+            "reconciliation_required",
+        )
+    )
+
+
 def evaluate_incidents(
     *,
     state: dict[str, Any],
@@ -270,11 +297,11 @@ def evaluate_incidents(
 ) -> list[Incident]:
     incidents: list[Incident] = []
     open_lots = state.get("open_lots") if isinstance(state.get("open_lots"), list) else []
-    pending = (
-        state.get("pending_actions")
-        if isinstance(state.get("pending_actions"), list)
-        else []
-    )
+    state_pending = state.get("pending_actions")
+    pending = state_pending if isinstance(state_pending, list) else []
+    actionable_pending = [
+        item for item in pending if _pending_action_is_actionable(item)
+    ]
     try:
         heartbeat_open_lots = int(risk_health.get("open_lots_total") or 0)
     except (TypeError, ValueError):
@@ -284,7 +311,14 @@ def evaluate_incidents(
     except (TypeError, ValueError):
         heartbeat_pending = 0
     open_lot_count = max(len(open_lots), heartbeat_open_lots)
-    pending_count = max(len(pending), heartbeat_pending)
+    # A state-file list is authoritative when present. The runtime records an
+    # intent before touching either venue; those empty intents are not stale
+    # executions and must not be revived by the heartbeat aggregate.
+    pending_count = (
+        len(actionable_pending)
+        if isinstance(state_pending, list)
+        else heartbeat_pending
+    )
     exposure = bool(open_lot_count or pending_count)
     asset = str(state.get("asset") or risk_health.get("asset") or "ETH")
     status = str(state.get("status") or "unknown")
@@ -338,7 +372,9 @@ def evaluate_incidents(
     if pending_count:
         ages = [
             age
-            for age in (_pending_age_seconds(item, now) for item in pending)
+            for age in (
+                _pending_age_seconds(item, now) for item in actionable_pending
+            )
             if age is not None
         ]
         state_updated_at = parse_time(state.get("updated_at"))
