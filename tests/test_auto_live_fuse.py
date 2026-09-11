@@ -976,6 +976,111 @@ def test_account_risk_refreshes_stale_variational_snapshot_via_api() -> None:
     asyncio.run(run())
 
 
+def test_account_risk_nested_api_refresh_clears_stale_recovery_lock() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_open_lots = []
+        runtime.live_inventory_max_venue_leverage = Decimal("5")
+        runtime.live_inventory_margin_warning_pct = Decimal("40")
+        runtime.live_inventory_margin_block_entry_pct = Decimal("50")
+        runtime.live_inventory_margin_reduce_pct = Decimal("60")
+        runtime.live_inventory_margin_emergency_pct = Decimal("75")
+        runtime.live_inventory_equity_balance_warning_ratio = Decimal("0.82")
+        runtime.live_inventory_equity_balance_block_ratio = Decimal("0.74")
+        runtime.live_inventory_account_recovery_required = True
+        runtime.live_inventory_account_recovery_confirm_count = 0
+        runtime.live_inventory_account_recovery_confirm_samples = 3
+        runtime.live_inventory_account_recovery_reason = (
+            "variational_account_snapshot_stale"
+        )
+        runtime.live_inventory_basis_entry_confirm_counts = {}
+        runtime.live_inventory_v4_gradient_entry_tier_window = deque(maxlen=3)
+        monitor = VariationalMonitor()
+        monitor.portfolio_summary = {
+            "balance": "100",
+            "upnl": "0",
+            "published_at": "2026-01-01T00:00:00+00:00",
+        }
+        runtime.runtime = SimpleNamespace(monitor=monitor)
+
+        async def fetch_variational_portfolio():
+            return {
+                "ok": True,
+                "result": {
+                    "ok": True,
+                    "httpStatus": 200,
+                    "portfolio": {
+                        "data": {
+                            "pool_portfolio_result": {
+                                "balance": "101",
+                                "upnl": "1",
+                                "margin_usage": {},
+                            }
+                        }
+                    },
+                },
+            }
+
+        async def fetch_lighter_account():
+            return {"accounts": [{"collateral": "102"}]}
+
+        runtime.fetch_variational_portfolio = fetch_variational_portfolio
+        runtime.fetch_lighter_account = fetch_lighter_account
+
+        context = await runtime.live_inventory_account_risk_context(
+            proposed_notional_usd=Decimal("20")
+        )
+
+        assert context["risk_action"] == "normal"
+        assert context["variational_portfolio_refresh_ok"] is True
+        assert context["variational_account_snapshot_fresh"] is True
+        assert context["account_recovery_required"] is False
+        assert context["account_recovery_confirm_count"] == 3
+
+    asyncio.run(run())
+
+
+def test_v4_history_filter_rejects_stale_and_duplicate_passive_pairs() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_max_lighter_book_age_seconds = 2.0
+    runtime.live_inventory_basis_max_var_quote_age_ms = 1500
+    base = {
+        "logged_at": "2026-09-11T00:00:00+00:00",
+        "quote_source": "passive_browser_stream",
+        "quote_received_at": "2026-09-11T00:00:00+00:00",
+        "reference_price": "2400",
+        "var_quote_age_seconds": "0.2",
+        "lighter_book_age_seconds": "0.1",
+    }
+
+    accepted, counts = runtime.filter_live_inventory_basis_v4_history_rows(
+        [
+            base,
+            {**base, "logged_at": "2026-09-11T00:00:30+00:00"},
+            {
+                **base,
+                "logged_at": "2026-09-11T00:01:00+00:00",
+                "quote_received_at": "2026-09-11T00:01:00+00:00",
+                "var_quote_age_seconds": "6.0",
+            },
+            {
+                **base,
+                "logged_at": "2026-09-11T00:01:30+00:00",
+                "quote_received_at": "2026-09-11T00:01:30+00:00",
+                "lighter_book_age_seconds": "3.0",
+            },
+        ]
+    )
+
+    assert accepted == [base]
+    assert counts["duplicate_passive_reference"] == 1
+    assert counts["var_quote_too_old"] == 1
+    assert counts["lighter_book_too_old"] == 1
+    assert counts["accepted"] == 1
+    assert counts["rejected"] == 3
+
+
 def test_manual_review_sets_runtime_level_auto_live_fuse() -> None:
     runtime = _runtime_for_fuse_test()
     position = _position()

@@ -75,6 +75,53 @@ def test_exact_rfq_keeps_exchange_timestamp_freshness_guard() -> None:
     assert source == "exchange_quote_timestamp"
 
 
+def test_passive_signal_ttl_does_not_weaken_exact_rfq_ttl(monkeypatch) -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_max_var_quote_age_ms = 1500
+    monkeypatch.setattr("main.time.monotonic", lambda: 103.0)
+    quote = {
+        "quote_source": "passive_browser_stream",
+        "received_monotonic": 100.0,
+    }
+
+    signal_ok, signal_age, _ = runtime.live_inventory_signal_quote_freshness(
+        quote
+    )
+    execution_ok, execution_age, _ = runtime.live_inventory_var_quote_freshness(
+        quote
+    )
+
+    assert signal_ok is True
+    assert signal_age == 3.0
+    assert execution_ok is False
+    assert execution_age == 3.0
+
+
+def test_passive_reference_key_changes_only_with_a_new_stream_update() -> None:
+    quote = {
+        "quote_source": "passive_browser_stream",
+        "received_monotonic": 100.0,
+        "source_quote_timestamp": "2026-09-11T00:00:00Z",
+        "reference_price": "2400.10",
+    }
+
+    first = VariationalToLighterRuntime.live_inventory_passive_reference_key(
+        asset="ETH",
+        quote=quote,
+    )
+    repeated = VariationalToLighterRuntime.live_inventory_passive_reference_key(
+        asset="ETH",
+        quote=dict(quote),
+    )
+    updated = VariationalToLighterRuntime.live_inventory_passive_reference_key(
+        asset="ETH",
+        quote={**quote, "received_monotonic": 101.0},
+    )
+
+    assert first == repeated
+    assert updated != first
+
+
 def test_entry_blocked_log_throttle_is_scoped_by_direction_and_reason(monkeypatch) -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     now = iter((100.0, 100.0, 100.0, 131.0))

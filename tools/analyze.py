@@ -426,6 +426,28 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "variational_snapshot_status_source": (
             variational_snapshot_status_source
         ),
+        "variational_portfolio_refresh_attempted": latest_account_risk.get(
+            "variational_portfolio_refresh_attempted"
+        ),
+        "variational_portfolio_refresh_ok": latest_account_risk.get(
+            "variational_portfolio_refresh_ok"
+        ),
+        "variational_portfolio_refresh_reason": latest_account_risk.get(
+            "variational_portfolio_refresh_reason"
+        ),
+        "variational_portfolio_refresh_error": latest_account_risk.get(
+            "variational_portfolio_refresh_error"
+        ),
+        "sample_quality_version": latest_state.get("sample_quality_version"),
+        "sample_pair_valid": latest_state.get("sample_pair_valid"),
+        "quote_source": latest_state.get("quote_source"),
+        "var_quote_age_seconds": latest_state.get("var_quote_age_seconds"),
+        "var_signal_max_age_seconds": latest_state.get(
+            "var_signal_max_age_seconds"
+        ),
+        "lighter_book_age_seconds": latest_state.get(
+            "lighter_book_age_seconds"
+        ),
         "portfolio_exit_locks": len(portfolio_exit_locks),
         "portfolio_exit_last_lot_ids": latest_portfolio_exit_lock.get("lot_ids"),
         "portfolio_exit_last_pnl_bps": latest_portfolio_exit_lock.get(
@@ -826,6 +848,24 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"{funnel['variational_snapshot_age_seconds']} "
         f"variational_snapshot_status_source="
         f"{funnel['variational_snapshot_status_source']}"
+    )
+    print(
+        f"variational_portfolio_refresh_attempted="
+        f"{funnel['variational_portfolio_refresh_attempted']} "
+        f"variational_portfolio_refresh_ok="
+        f"{funnel['variational_portfolio_refresh_ok']} "
+        f"variational_portfolio_refresh_reason="
+        f"{funnel['variational_portfolio_refresh_reason']} "
+        f"variational_portfolio_refresh_error="
+        f"{funnel['variational_portfolio_refresh_error']}"
+    )
+    print(
+        f"basis_sample_quality_version={funnel['sample_quality_version']} "
+        f"basis_sample_pair_valid={funnel['sample_pair_valid']} "
+        f"quote_source={funnel['quote_source']} "
+        f"var_quote_age_seconds={funnel['var_quote_age_seconds']} "
+        f"var_signal_max_age_seconds={funnel['var_signal_max_age_seconds']} "
+        f"lighter_book_age_seconds={funnel['lighter_book_age_seconds']}"
     )
     print(
         f"portfolio_exit_locks={funnel['portfolio_exit_locks']} "

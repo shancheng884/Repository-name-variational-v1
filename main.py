@@ -196,6 +196,8 @@ LIVE_INVENTORY_LIGHTER_ORDER_RATE_NORMAL_PER_MINUTE = 30
 LIVE_INVENTORY_LIGHTER_ORDER_RATE_HARD_PER_MINUTE = 36
 LIVE_INVENTORY_BASIS_QUOTE_SIZE_MODE = "exact_base_qty_v1"
 LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE = "passive_browser_stream"
+LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_MAX_AGE_SECONDS = 5.0
+LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION = 2
 LIVE_INVENTORY_BASIS_V4_PORTFOLIO_EXIT_EXTRA_BPS = Decimal("1.00")
 LIVE_INVENTORY_ENTRY_BLOCKED_LOG_THROTTLE_SECONDS = 30.0
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_MAX_AGE_SECONDS = 60.0
@@ -2416,6 +2418,8 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_entry_confirm_counts: dict[str, int] = {}
         self.live_inventory_basis_last_basis_bps: Decimal | None = None
         self._last_live_inventory_snapshot_unavailable_log = 0.0
+        self.live_inventory_last_passive_reference_key_by_asset: dict[str, str] = {}
+        self.live_inventory_last_passive_reference_skip_log_monotonic = 0.0
         self.live_inventory_basis_watch_candidates: dict[str, dict[str, Any]] = {}
         self.live_inventory_stablecoin_rate_cache: dict[str, Any] = {}
         self.live_inventory_external_reference_cache: dict[str, Any] = {}
@@ -4880,6 +4884,19 @@ class VariationalToLighterRuntime:
                 variational_freshness = account_snapshot_freshness(
                     portfolio_summary.get("published_at")
                 )
+                portfolio_refresh_context.update(
+                    {
+                        "variational_portfolio_refresh_snapshot_fresh": (
+                            variational_freshness["fresh"]
+                        ),
+                        "variational_portfolio_refresh_snapshot_age_seconds": (
+                            variational_freshness["age_seconds"]
+                        ),
+                        "variational_portfolio_refresh_equity_usd": (
+                            variational_metrics.get("equity_usd")
+                        ),
+                    }
+                )
         raw_variational_equity = to_decimal(
             variational_metrics.get("equity_usd")
         )
@@ -4997,19 +5014,37 @@ class VariationalToLighterRuntime:
                     if isinstance(result.get("result"), dict)
                     else result
                 )
-                portfolio = (
-                    payload.get("portfolio")
-                    if isinstance(payload, dict)
-                    else None
-                )
-                if not isinstance(portfolio, dict):
-                    raise RuntimeError("portfolio_payload_missing")
-                normalized = portfolio.get("pool_portfolio_result")
-                if not isinstance(normalized, dict):
-                    normalized = portfolio
-                metrics = extract_variational_account_metrics(normalized)
-                if metrics.get("equity_usd") is None:
+                normalized: dict[str, Any] | None = None
+                candidate = payload
+                for _ in range(5):
+                    if not isinstance(candidate, dict):
+                        break
+                    metrics = extract_variational_account_metrics(candidate)
+                    if metrics.get("equity_usd") is not None:
+                        normalized = candidate
+                        break
+                    next_candidate = next(
+                        (
+                            candidate.get(key)
+                            for key in (
+                                "portfolio",
+                                "pool_portfolio_result",
+                                "result",
+                                "data",
+                            )
+                            if isinstance(candidate.get(key), dict)
+                        ),
+                        None,
+                    )
+                    if next_candidate is None or next_candidate is candidate:
+                        break
+                    candidate = next_candidate
+                if normalized is None:
                     raise RuntimeError("portfolio_equity_missing")
+                pool_portfolio = normalized.get("pool_portfolio_result")
+                if isinstance(pool_portfolio, dict):
+                    normalized = pool_portfolio
+                metrics = extract_variational_account_metrics(normalized)
                 monitor = getattr(getattr(self, "runtime", None), "monitor", None)
                 if monitor is None:
                     raise RuntimeError("variational_monitor_missing")
@@ -5026,6 +5061,9 @@ class VariationalToLighterRuntime:
                         "variational_portfolio_refresh_http_status": payload.get(
                             "httpStatus"
                         ),
+                        "variational_portfolio_refresh_payload_shape": sorted(
+                            str(key) for key in normalized.keys()
+                        )[:20],
                     }
                 )
             except Exception as exc:
@@ -7525,6 +7563,87 @@ class VariationalToLighterRuntime:
             self.live_inventory_basis_v4_projection_cache = dict(result)
         return result
 
+    def filter_live_inventory_basis_v4_history_rows(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Remove stale or repeatedly paired passive observations from anchors."""
+        accepted: list[dict[str, Any]] = []
+        counts: dict[str, int] = {}
+        seen_passive_keys: set[str] = set()
+        lighter_age_limit = float(
+            getattr(self, "live_inventory_max_lighter_book_age_seconds", 2.0)
+            or 2.0
+        )
+        exact_age_limit = float(
+            getattr(self, "live_inventory_basis_max_var_quote_age_ms", 1500.0)
+            or 1500.0
+        ) / 1000.0
+
+        def reject(reason: str) -> None:
+            counts[reason] = counts.get(reason, 0) + 1
+
+        for row in sorted(
+            rows,
+            key=lambda item: str(item.get("logged_at") or ""),
+        ):
+            quality_version = int(to_decimal(row.get("sample_quality_version")) or 0)
+            if (
+                quality_version >= LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION
+                and row.get("sample_pair_valid") is not True
+            ):
+                reject("invalid_sample_pair")
+                continue
+            quote_source = str(row.get("quote_source") or "")
+            var_age = to_decimal(row.get("var_quote_age_seconds"))
+            lighter_age = to_decimal(row.get("lighter_book_age_seconds"))
+            has_freshness_metadata = bool(
+                quote_source
+                or var_age is not None
+                or lighter_age is not None
+                or row.get("quote_received_at")
+            )
+            if not has_freshness_metadata:
+                accepted.append(row)
+                counts["accepted_legacy_unverifiable"] = (
+                    counts.get("accepted_legacy_unverifiable", 0) + 1
+                )
+                continue
+            if var_age is None or var_age < 0:
+                reject("var_quote_age_missing_or_invalid")
+                continue
+            var_age_limit = (
+                LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_MAX_AGE_SECONDS
+                if quote_source == LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE
+                else exact_age_limit
+            )
+            if var_age > Decimal(str(var_age_limit)):
+                reject("var_quote_too_old")
+                continue
+            if lighter_age is None or lighter_age < 0:
+                reject("lighter_book_age_missing_or_invalid")
+                continue
+            if lighter_age_limit > 0 and lighter_age > Decimal(str(lighter_age_limit)):
+                reject("lighter_book_too_old")
+                continue
+            if quote_source == LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE:
+                identity = row.get("quote_received_at") or row.get(
+                    "source_quote_timestamp"
+                )
+                reference_price = row.get("reference_price") or row.get("var_bid")
+                if identity in (None, "") or reference_price in (None, ""):
+                    reject("passive_reference_identity_missing")
+                    continue
+                passive_key = ":".join((str(identity), str(reference_price)))
+                if passive_key in seen_passive_keys:
+                    reject("duplicate_passive_reference")
+                    continue
+                seen_passive_keys.add(passive_key)
+            accepted.append(row)
+        counts["accepted"] = len(accepted)
+        counts["rejected"] = len(rows) - len(accepted)
+        return accepted, counts
+
     def load_live_inventory_basis_v4_history(self, *, asset: str) -> dict[str, Any]:
         directions = (
             DIRECTION_LONG_VAR_SHORT_LIGHTER,
@@ -7595,7 +7714,11 @@ class VariationalToLighterRuntime:
         migration_path = self.output_dir / "basis_v4_migration_fallback.json"
         persisted_migration = read_json(migration_path)
         if (
-            persisted_migration.get("asset") == asset.upper()
+            persisted_migration.get("schema_version")
+            == LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION
+            and persisted_migration.get("sample_quality_version")
+            == LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION
+            and persisted_migration.get("asset") == asset.upper()
             and persisted_migration.get("profile") == self.live_inventory_basis_v4_profile
             and persisted_migration.get("quote_size_mode")
             == getattr(
@@ -7612,12 +7735,15 @@ class VariationalToLighterRuntime:
                         self.live_inventory_basis_v4_migration_fallback_by_direction[
                             direction
                         ] = fallback
-        source_rows = read_basis_samples(
+        raw_source_rows = read_basis_samples(
             self.output_dir / "basis_samples",
             limit=100000,
             asset_filter=asset,
             sample_kind_filter="baseline",
             sample_quality_filter="valid",
+        )
+        source_rows, sample_quality_counts = (
+            self.filter_live_inventory_basis_v4_history_rows(raw_source_rows)
         )
         quote_size_mode = str(
             getattr(
@@ -7728,7 +7854,8 @@ class VariationalToLighterRuntime:
         write_json_atomic(
             migration_path,
             {
-                "schema_version": 1,
+                "schema_version": LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION,
+                "sample_quality_version": LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION,
                 "asset": asset.upper(),
                 "profile": self.live_inventory_basis_v4_profile,
                 "quote_size_mode": quote_size_mode,
@@ -7866,7 +7993,9 @@ class VariationalToLighterRuntime:
                 getattr(self, "live_inventory_basis_v4_bidirectional", False)
             ),
             "asset": asset,
+            "raw_source_rows": len(raw_source_rows),
             "source_rows": len(source_rows),
+            "sample_quality_counts": sample_quality_counts,
             "compatible_source_rows": len(compatible_source_rows),
             "incompatible_quote_size_rows": incompatible_quote_size_rows,
             "quote_size_mode": quote_size_mode,
@@ -13416,6 +13545,58 @@ class VariationalToLighterRuntime:
             freshness_source,
         )
 
+    def live_inventory_signal_quote_freshness(
+        self,
+        quote: dict[str, Any],
+    ) -> tuple[bool, float | None, str]:
+        """Validate a signal observation without weakening executable RFQ TTLs."""
+        if str(quote.get("quote_source") or "") != LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE:
+            return self.live_inventory_var_quote_freshness(quote)
+        received_monotonic = quote.get("received_monotonic")
+        try:
+            received_monotonic_value = float(received_monotonic)
+        except (TypeError, ValueError):
+            received_monotonic_value = None
+        if received_monotonic_value is not None:
+            age_seconds = time.monotonic() - received_monotonic_value
+            return (
+                0 <= age_seconds <= LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_MAX_AGE_SECONDS,
+                age_seconds,
+                "local_monotonic_receive_time",
+            )
+        received_at = self._parse_iso_ts(str(quote.get("received_at") or ""))
+        if received_at is None:
+            return False, None, "local_receive_time"
+        age_seconds = (datetime.now(timezone.utc) - received_at).total_seconds()
+        return (
+            -LIVE_INVENTORY_VARIATIONAL_MAX_FUTURE_SKEW_SECONDS
+            <= age_seconds
+            <= LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_MAX_AGE_SECONDS,
+            max(0.0, age_seconds),
+            "local_receive_time",
+        )
+
+    @staticmethod
+    def live_inventory_passive_reference_key(
+        *,
+        asset: str,
+        quote: dict[str, Any],
+    ) -> str | None:
+        if str(quote.get("quote_source") or "") != LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE:
+            return None
+        identity = quote.get("received_monotonic") or quote.get("received_at")
+        reference_price = quote.get("reference_price") or quote.get("mark_price")
+        if identity in (None, "") or reference_price in (None, ""):
+            return None
+        return ":".join(
+            (
+                asset.upper(),
+                str(identity),
+                str(quote.get("source_quote_timestamp") or ""),
+                str(reference_price),
+            )
+        )
+
     def live_inventory_var_quote_age_ok(self, quote: dict[str, Any]) -> tuple[bool, float | None]:
         age_ok, age_seconds, _ = self.live_inventory_var_quote_freshness(quote)
         return age_ok, age_seconds
@@ -16094,6 +16275,93 @@ class VariationalToLighterRuntime:
                 },
             )
             return
+        (
+            var_quote_age_ok,
+            var_quote_age_seconds,
+            var_quote_freshness_source,
+        ) = (
+            self.live_inventory_signal_quote_freshness(quote)
+            if v4_mode
+            else self.live_inventory_var_quote_freshness(quote)
+        )
+        lighter_book_age_ok, lighter_book_age_seconds = (
+            self.live_inventory_lighter_book_age_ok()
+        )
+        passive_reference_key = self.live_inventory_passive_reference_key(
+            asset=asset,
+            quote=quote,
+        )
+        sample_skip_reason: str | None = None
+        if v4_mode:
+            if not var_quote_age_ok:
+                sample_skip_reason = "passive_reference_too_old"
+            elif not lighter_book_age_ok:
+                sample_skip_reason = "basis_lighter_book_too_old"
+            elif (
+                str(quote.get("quote_source") or "")
+                == LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE
+                and passive_reference_key is None
+            ):
+                sample_skip_reason = "passive_reference_identity_missing"
+            elif passive_reference_key is not None and passive_reference_key == (
+                getattr(
+                    self,
+                    "live_inventory_last_passive_reference_key_by_asset",
+                    {},
+                ).get(asset.upper())
+            ):
+                sample_skip_reason = "duplicate_passive_reference"
+        if sample_skip_reason is not None:
+            now_monotonic = time.monotonic()
+            last_log = float(
+                getattr(
+                    self,
+                    "live_inventory_last_passive_reference_skip_log_monotonic",
+                    0.0,
+                )
+                or 0.0
+            )
+            if now_monotonic - last_log >= 30.0 or last_log == 0.0:
+                self.live_inventory_last_passive_reference_skip_log_monotonic = (
+                    now_monotonic
+                )
+                await self.append_live_inventory_log(
+                    "live_inventory_basis_quote_skipped",
+                    {
+                        "asset": asset,
+                        "sample_index": index,
+                        "reason": sample_skip_reason,
+                        "quote_source": quote.get("quote_source"),
+                        "quote_received_at": quote.get("received_at"),
+                        "source_quote_timestamp": quote.get(
+                            "source_quote_timestamp"
+                        ),
+                        "var_quote_age_seconds": var_quote_age_seconds,
+                        "var_signal_max_age_seconds": (
+                            LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_MAX_AGE_SECONDS
+                        ),
+                        "lighter_book_age_seconds": lighter_book_age_seconds,
+                        "max_lighter_book_age_seconds": (
+                            self.live_inventory_max_lighter_book_age_seconds
+                        ),
+                        "sample_quality_version": (
+                            LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION
+                        ),
+                    },
+                )
+            return
+        if passive_reference_key is not None:
+            reference_keys = getattr(
+                self,
+                "live_inventory_last_passive_reference_key_by_asset",
+                None,
+            )
+            if not isinstance(reference_keys, dict):
+                reference_keys = {}
+                self.live_inventory_last_passive_reference_key_by_asset = (
+                    reference_keys
+                )
+            reference_keys[asset.upper()] = passive_reference_key
         long_entry_qty = quote_request_qty
         short_entry_qty = quote_request_qty
         long_entry_lighter_depth = await self.live_inventory_lighter_depth_context(lighter_side="SELL", qty=long_entry_qty)
@@ -16109,12 +16377,6 @@ class VariationalToLighterRuntime:
         if basis_mid <= 0 or lighter_mid <= 0:
             return
         basis_bps = (basis_mid - lighter_mid) / lighter_mid * Decimal("10000")
-        lighter_book_age_ok, lighter_book_age_seconds = self.live_inventory_lighter_book_age_ok()
-        (
-            var_quote_age_ok,
-            var_quote_age_seconds,
-            var_quote_freshness_source,
-        ) = self.live_inventory_var_quote_freshness(quote)
         previous_basis_bps = getattr(self, "live_inventory_basis_last_basis_bps", None)
         basis_sample_move_bps = abs(basis_bps - previous_basis_bps) if previous_basis_bps is not None else None
         if basis_sample_move_bps is not None:
@@ -16555,14 +16817,26 @@ class VariationalToLighterRuntime:
             "quote_priority": quote_priority,
             "quote_source": quote.get("quote_source", "direct_rfq"),
             "quote_semantics": quote.get("quote_semantics"),
+            "sample_quality_version": LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION,
+            "sample_pair_valid": True,
             "quote_freshness_source": var_quote_freshness_source,
             "source_quote_timestamp": quote.get("source_quote_timestamp"),
             "quote_received_at": quote.get("received_at"),
+            "passive_reference_key": passive_reference_key,
             "reference_price": quote.get("reference_price"),
             "quote_cache_age_seconds": quote.get("quote_cache_age_seconds"),
             "quote_timestamp": quote.get("quoteTimestamp") or quote.get("quote_timestamp"),
             "quote_ms": decimal_to_str(quote_ms),
             "var_quote_age_seconds": None if var_quote_age_seconds is None else f"{var_quote_age_seconds:.6f}",
+            "var_signal_max_age_seconds": (
+                LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_MAX_AGE_SECONDS
+                if quote.get("quote_source")
+                == LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE
+                else self.live_inventory_basis_max_var_quote_age_ms / 1000.0
+            ),
+            "execution_var_quote_max_age_ms": (
+                self.live_inventory_basis_max_var_quote_age_ms
+            ),
             "lighter_book_age_seconds": None if lighter_book_age_seconds is None else f"{lighter_book_age_seconds:.6f}",
             "var_bid": decimal_to_str(var_bid),
             "var_ask": decimal_to_str(var_ask),
@@ -16700,6 +16974,10 @@ class VariationalToLighterRuntime:
                     ).isoformat(),
                     "sample_kind": "baseline",
                     "sample_quality": "valid",
+                    "sample_quality_version": (
+                        LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION
+                    ),
+                    "sample_pair_valid": True,
                     "record_kind": "basis_market_sample",
                     "execution_mode": "live",
                     "run_id": self.live_inventory_run_id,
