@@ -38,6 +38,8 @@ from main import (
     v4_real_gradient_lot_groups,
     v4_real_gradient_slot_caps,
     v4_real_gradient_thresholds,
+    v4_exact_rfq_entry_threshold,
+    v4_exact_rfq_gradient_thresholds,
     v4_partial_detier_selection,
     v4_weekend_regime_context,
 )
@@ -4602,6 +4604,19 @@ def test_v4_entry_rfq_exploration_is_rate_limited() -> None:
     assert runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, now)
     assert not runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, now + 1.0)
     assert runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, now + 300.0)
+
+
+def test_v4_exact_rfq_threshold_translates_passive_threshold_by_directional_bias() -> None:
+    assert v4_exact_rfq_entry_threshold(Decimal("5.10"), Decimal("-3.00")) == Decimal("2.10")
+    assert v4_exact_rfq_entry_threshold(Decimal("5.10"), None) == Decimal("5.10")
+    assert v4_exact_rfq_entry_threshold(None, Decimal("-3.00")) is None
+
+
+def test_v4_exact_rfq_gradient_thresholds_use_the_same_translation() -> None:
+    assert v4_exact_rfq_gradient_thresholds(
+        [Decimal("5.10"), Decimal("5.96"), Decimal("6.82")],
+        Decimal("-3.00"),
+    ) == [Decimal("2.10"), Decimal("2.96"), Decimal("3.82")]
 
 
 def test_variational_order_reuses_final_quote_id(tmp_path) -> None:

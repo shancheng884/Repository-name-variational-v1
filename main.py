@@ -828,6 +828,25 @@ def v4_real_gradient_eligible_tier(
     return sum(1 for threshold in thresholds_bps if edge_bps >= threshold)
 
 
+def v4_exact_rfq_entry_threshold(
+    passive_threshold_bps: Decimal | None,
+    directional_bias_bps: Decimal | None,
+) -> Decimal | None:
+    """Translate a passive trigger into the exact-RFQ decision domain."""
+    if passive_threshold_bps is None:
+        return None
+    return passive_threshold_bps + (directional_bias_bps or Decimal("0"))
+
+
+def v4_exact_rfq_gradient_thresholds(
+    passive_thresholds_bps: Iterable[Decimal],
+    directional_bias_bps: Decimal | None,
+) -> list[Decimal]:
+    """Apply the same RFQ translation to every real-gradient tier."""
+    bias_bps = directional_bias_bps or Decimal("0")
+    return [threshold + bias_bps for threshold in passive_thresholds_bps]
+
+
 def v4_real_gradient_confirmed_tier(
     tier_window: Iterable[int],
     *,
@@ -16311,6 +16330,9 @@ class VariationalToLighterRuntime:
                 ).get(asset.upper())
             ):
                 sample_skip_reason = "duplicate_passive_reference"
+        duplicate_passive_reference = (
+            sample_skip_reason == "duplicate_passive_reference"
+        )
         if sample_skip_reason is not None:
             now_monotonic = time.monotonic()
             last_log = float(
@@ -16349,8 +16371,14 @@ class VariationalToLighterRuntime:
                         ),
                     },
                 )
-            return
-        if passive_reference_key is not None:
+            # A duplicate passive reference is not a new history sample, but
+            # the Lighter book may have changed since the last observation.
+            # Keep evaluating the live candidate on the new book instead of
+            # returning before the execution gates. Other skip reasons remain
+            # hard skips because they indicate stale or invalid data.
+            if not duplicate_passive_reference:
+                return
+        if passive_reference_key is not None and not duplicate_passive_reference:
             reference_keys = getattr(
                 self,
                 "live_inventory_last_passive_reference_key_by_asset",
@@ -16378,7 +16406,11 @@ class VariationalToLighterRuntime:
             return
         basis_bps = (basis_mid - lighter_mid) / lighter_mid * Decimal("10000")
         previous_basis_bps = getattr(self, "live_inventory_basis_last_basis_bps", None)
-        basis_sample_move_bps = abs(basis_bps - previous_basis_bps) if previous_basis_bps is not None else None
+        basis_sample_move_bps = (
+            abs(basis_bps - previous_basis_bps)
+            if previous_basis_bps is not None and not duplicate_passive_reference
+            else None
+        )
         if basis_sample_move_bps is not None:
             self.live_inventory_basis_sample_move_bps_samples.append(basis_sample_move_bps)
         basis_dynamic_max_sample_move_bps, basis_sample_move_context = self.live_inventory_basis_dynamic_sample_move_threshold_bps()
@@ -16387,14 +16419,37 @@ class VariationalToLighterRuntime:
             if basis_dynamic_max_sample_move_bps <= 0 or basis_sample_move_bps is None
             else basis_sample_move_bps <= basis_dynamic_max_sample_move_bps
         )
-        self.live_inventory_basis_last_basis_bps = basis_bps
+        if not duplicate_passive_reference:
+            self.live_inventory_basis_last_basis_bps = basis_bps
         var_spread_bps = self.spread_bps_from_bid_ask(var_bid, var_ask)
         lighter_spread_bps = self.spread_bps_from_bid_ask(snapshot.lighter_bid, snapshot.lighter_ask)
-        if var_spread_bps is not None:
+        if var_spread_bps is not None and not duplicate_passive_reference:
             self.live_inventory_basis_var_spread_bps_samples.append(var_spread_bps)
-        if lighter_spread_bps is not None:
+        if lighter_spread_bps is not None and not duplicate_passive_reference:
             self.live_inventory_basis_lighter_spread_bps_samples.append(lighter_spread_bps)
-        z_float, warm = self.live_inventory_basis_state.update(time.monotonic(), float(basis_bps))
+        if duplicate_passive_reference:
+            basis_state = self.live_inventory_basis_state
+            state_mean = basis_state.mean
+            state_sigma = (
+                math.sqrt(basis_state.var)
+                if state_mean is not None
+                else None
+            )
+            if (
+                state_mean is not None
+                and basis_state.seen >= basis_state.warmup_samples
+                and state_sigma is not None
+                and state_sigma > basis_state.sigma_floor_bps
+            ):
+                z_float = (float(basis_bps) - state_mean) / state_sigma
+                warm = True
+            else:
+                z_float = 0.0
+                warm = False
+        else:
+            z_float, warm = self.live_inventory_basis_state.update(
+                time.monotonic(), float(basis_bps)
+            )
         z = Decimal(str(z_float))
         long_edge_bps = self.live_inventory_pair_edge_bps(
             direction=DIRECTION_LONG_VAR_SHORT_LIGHTER,
@@ -16464,7 +16519,7 @@ class VariationalToLighterRuntime:
                     self.live_inventory_basis_v4_history_reason_by_direction[
                         direction
                     ] = reason
-                if self.record_live_inventory_basis_v4_edge(
+                if not duplicate_passive_reference and self.record_live_inventory_basis_v4_edge(
                     now=v4_now,
                     direction=(
                         direction
@@ -16594,7 +16649,7 @@ class VariationalToLighterRuntime:
             if reversion_short_medians[300] is not None and reversion_short_medians[3600] is not None
             else None
         )
-        if self.live_inventory_basis_reversion_mode:
+        if self.live_inventory_basis_reversion_mode and not duplicate_passive_reference:
             self.record_live_inventory_basis_reversion_edges(
                 now=reversion_now,
                 long_edge_bps=long_edge_bps,
@@ -16615,7 +16670,8 @@ class VariationalToLighterRuntime:
             lighter_exit_price=short_exit_lighter_price,
         )
         stablecoin_context = await self.fetch_live_inventory_stablecoin_context()
-        self.live_inventory_record_stablecoin_basis_sample(stablecoin_context)
+        if not duplicate_passive_reference:
+            self.live_inventory_record_stablecoin_basis_sample(stablecoin_context)
         normalized_var_bid = self.normalize_usdc_price_to_usdt(var_bid, stablecoin_context)
         normalized_var_ask = self.normalize_usdc_price_to_usdt(var_ask, stablecoin_context)
         normalized_basis_bps = None
@@ -16701,6 +16757,8 @@ class VariationalToLighterRuntime:
         )
         v4_entry_rfq_bias_contexts: dict[str, dict[str, Any]] = {}
         v4_predicted_entry_edges: dict[str, Decimal] = dict(v4_signal_edges)
+        v4_exact_entry_thresholds: dict[str, Decimal | None] = {}
+        v4_exact_gradient_thresholds_by_direction: dict[str, list[Decimal]] = {}
         if v4_mode:
             for direction in v4_entry_directions:
                 bias_context = self.live_inventory_basis_v4_entry_rfq_bias_context(
@@ -16713,8 +16771,49 @@ class VariationalToLighterRuntime:
                 v4_predicted_entry_edges[direction] = (
                     v4_signal_edges[direction] + applied_bias_bps
                 )
+                passive_threshold_bps = v4_entry_thresholds.get(direction)
+                exact_threshold_bps = v4_exact_rfq_entry_threshold(
+                    passive_threshold_bps,
+                    applied_bias_bps,
+                )
+                v4_exact_entry_thresholds[direction] = exact_threshold_bps
+                passive_gradient_thresholds = [
+                    value
+                    for item in list(
+                        v4_entry_contexts.get(direction, {}).get(
+                            "v4_real_gradient_tier_thresholds_bps"
+                        )
+                        or []
+                    )
+                    if (value := to_decimal(item)) is not None
+                ]
+                v4_exact_gradient_thresholds_by_direction[direction] = (
+                    v4_exact_rfq_gradient_thresholds(
+                        passive_gradient_thresholds,
+                        applied_bias_bps,
+                    )
+                )
+                v4_entry_contexts[direction] = {
+                    **v4_entry_contexts.get(direction, {}),
+                    "v4_passive_entry_threshold_bps": decimal_to_str(
+                        passive_threshold_bps
+                    ),
+                    "v4_exact_rfq_entry_threshold_bps": decimal_to_str(
+                        exact_threshold_bps
+                    ),
+                    "v4_exact_rfq_gradient_tier_thresholds_bps": [
+                        decimal_to_str(value)
+                        for value in v4_exact_gradient_thresholds_by_direction[
+                            direction
+                        ]
+                    ],
+                    "v4_entry_threshold_translation_bps": decimal_to_str(
+                        applied_bias_bps
+                    ),
+                }
             v4_entry_context = {
                 **v4_entry_context,
+                **v4_entry_contexts.get(v4_entry_direction, {}),
                 **v4_entry_rfq_bias_contexts.get(v4_entry_direction, {}),
                 "v4_entry_rfq_predicted_edges_bps": {
                     direction: decimal_to_str(edge)
@@ -16789,6 +16888,14 @@ class VariationalToLighterRuntime:
             v4_entry_direction,
             [],
         )
+        exact_real_gradient_thresholds = (
+            v4_exact_gradient_thresholds_by_direction.get(
+                v4_entry_direction,
+                [],
+            )
+            if v4_mode
+            else []
+        )
         raw_real_gradient_tier = raw_real_gradient_tiers.get(
             v4_entry_direction,
             0,
@@ -16798,6 +16905,20 @@ class VariationalToLighterRuntime:
             v4_entry_direction,
             "disabled",
         )
+        v4_single_lot_exact_rfq_probe = bool(
+            v4_mode
+            and self.live_inventory_basis_v4_real_gradient
+            and not self.live_inventory_open_lots
+            and self.live_inventory_basis_refresh_entry_quote_before_submit
+            and v4_entry_threshold_bps is not None
+            and v4_signal_edge_bps >= v4_entry_threshold_bps
+        )
+        if v4_single_lot_exact_rfq_probe and real_gradient_tier <= 0:
+            # A flat account needs one exact RFQ to validate the first lot.
+            # Do not require the passive stream to already pass the later-lot
+            # 2-of-3 gradient activation window.
+            real_gradient_tier = 1
+            real_gradient_confirmation_mode = "exact_rfq_single_lot"
         variational_rate = self.live_inventory_order_limiter(
             "variational"
         ).snapshot()
@@ -16817,6 +16938,7 @@ class VariationalToLighterRuntime:
             "quote_priority": quote_priority,
             "quote_source": quote.get("quote_source", "direct_rfq"),
             "quote_semantics": quote.get("quote_semantics"),
+            "passive_reference_duplicate": duplicate_passive_reference,
             "sample_quality_version": LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION,
             "sample_pair_valid": True,
             "quote_freshness_source": var_quote_freshness_source,
@@ -16864,6 +16986,22 @@ class VariationalToLighterRuntime:
             "basis_v4_profile": getattr(self, "live_inventory_basis_v4_profile", "") or None,
             "v4_entry_direction": v4_entry_direction if v4_mode else None,
             "v4_signal_edge_bps": decimal_to_str(v4_signal_edge_bps) if v4_mode else None,
+            "v4_passive_entry_threshold_bps": (
+                decimal_to_str(v4_entry_threshold_bps) if v4_mode else None
+            ),
+            "v4_exact_rfq_entry_threshold_bps": (
+                decimal_to_str(
+                    v4_exact_entry_thresholds.get(v4_entry_direction)
+                )
+                if v4_mode
+                else None
+            ),
+            "v4_exact_rfq_gradient_tier_thresholds_bps": (
+                [decimal_to_str(value) for value in exact_real_gradient_thresholds]
+                if v4_mode
+                else []
+            ),
+            "v4_single_lot_exact_rfq_probe": v4_single_lot_exact_rfq_probe,
             "v4_predicted_exact_edge_bps": (
                 decimal_to_str(v4_predicted_entry_edges.get(v4_entry_direction))
                 if v4_mode
@@ -16986,7 +17124,7 @@ class VariationalToLighterRuntime:
                     "asset": asset,
                 },
             )
-        if v4_mode:
+        if v4_mode and not duplicate_passive_reference:
             await self.maybe_update_live_inventory_basis_v4_shadow_gradient(
                 asset=asset,
                 sample_index=index,
@@ -17201,6 +17339,9 @@ class VariationalToLighterRuntime:
                         "calibration_alpha_filters_bypassed": True,
                     }
                 elif v4_mode:
+                    exact_entry_threshold_bps = v4_exact_entry_thresholds.get(
+                        direction
+                    )
                     if (
                         not self.live_inventory_basis_v4_history_ready
                         or v4_entry_threshold_bps is None
@@ -17236,7 +17377,13 @@ class VariationalToLighterRuntime:
                             edge_bps,
                             real_gradient_thresholds,
                         )
-                        if real_gradient_tier <= 0:
+                        if (
+                            real_gradient_tier <= 0
+                            and not (
+                                v4_single_lot_exact_rfq_probe
+                                and direction == v4_entry_direction
+                            )
+                        ):
                             self.live_inventory_basis_entry_confirm_counts[direction] = 0
                             continue
                         strong_single_probe = (
@@ -17278,6 +17425,17 @@ class VariationalToLighterRuntime:
                             decimal_to_str(value)
                             for value in real_gradient_thresholds
                         ],
+                        "v4_exact_rfq_entry_threshold_bps": decimal_to_str(
+                            exact_entry_threshold_bps
+                        ),
+                        "v4_exact_rfq_gradient_tier_thresholds_bps": [
+                            decimal_to_str(value)
+                            for value in exact_real_gradient_thresholds
+                        ],
+                        "v4_single_lot_exact_rfq_probe": (
+                            v4_single_lot_exact_rfq_probe
+                            and direction == v4_entry_direction
+                        ),
                         **v4_entry_context,
                     }
                 elif self.live_inventory_basis_reversion_mode:
@@ -17523,21 +17681,27 @@ class VariationalToLighterRuntime:
                     else {}
                 )
                 predicted_exact_edge_bps = edge_bps
+                exact_entry_threshold_bps = min_entry_edge_bps
                 if v4_mode:
                     predicted_exact_edge_bps = v4_predicted_entry_edges.get(
                         direction,
                         edge_bps,
                     )
+                    exact_entry_threshold_bps = v4_exact_entry_thresholds.get(
+                        direction
+                    )
+                    if exact_entry_threshold_bps is None:
+                        exact_entry_threshold_bps = min_entry_edge_bps
                 predicted_entry_candidate = bool(
                     v4_mode
                     and self.live_inventory_basis_refresh_entry_quote_before_submit
-                    and predicted_exact_edge_bps >= min_entry_edge_bps
+                    and predicted_exact_edge_bps >= exact_entry_threshold_bps
                 )
                 entry_rfq_exploration_candidate = bool(
                     v4_mode
                     and self.live_inventory_basis_refresh_entry_quote_before_submit
                     and entry_rfq_bias_context.get("v4_entry_rfq_bias_ready") is True
-                    and predicted_exact_edge_bps < min_entry_edge_bps
+                    and predicted_exact_edge_bps < exact_entry_threshold_bps
                     and self.live_inventory_basis_v4_entry_rfq_exploration_due(
                         direction,
                         consume=False,
@@ -17549,7 +17713,7 @@ class VariationalToLighterRuntime:
                 if predicted_entry_candidate:
                     entry_quality_score_bps = max(
                         entry_quality_score_bps,
-                        predicted_exact_edge_bps - min_entry_edge_bps,
+                        predicted_exact_edge_bps - exact_entry_threshold_bps,
                     )
                     entry_quality_context = {
                         **entry_quality_context,
@@ -18021,11 +18185,22 @@ class VariationalToLighterRuntime:
                             "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
                         }
                     elif v4_mode:
+                        exact_entry_threshold_bps = v4_exact_entry_thresholds.get(
+                            direction
+                        )
+                        if exact_entry_threshold_bps is None:
+                            exact_entry_threshold_bps = min_entry_edge_bps
+                        # The passive threshold decides when to spend an RFQ;
+                        # the translated threshold decides whether that exact
+                        # RFQ is executable after the quote refresh.
+                        min_entry_edge_bps = (
+                            exact_entry_threshold_bps + Decimal("0.000000001")
+                        )
                         if self.live_inventory_basis_v4_real_gradient:
                             refreshed_raw_gradient_tier = (
                                 v4_real_gradient_eligible_tier(
                                     edge_bps,
-                                    real_gradient_thresholds,
+                                    exact_real_gradient_thresholds,
                                 )
                             )
                             required_refreshed_raw_gradient_tier = (
@@ -18175,7 +18350,7 @@ class VariationalToLighterRuntime:
                         if strong_single_probe:
                             quantized_raw_gradient_tier = v4_real_gradient_eligible_tier(
                                 edge_bps,
-                                real_gradient_thresholds,
+                                exact_real_gradient_thresholds,
                             )
                             required_quantized_raw_gradient_tier = (
                                 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_STRONG_SINGLE_MIN_TIER
