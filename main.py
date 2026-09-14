@@ -7704,16 +7704,12 @@ class VariationalToLighterRuntime:
                 rows.popleft()
             if elapsed:
                 rows.append((future, Decimal("0")))
-            coverage_seconds = max(0.0, future - rows[0][0]) if rows else 0.0
             effective_seconds = min(
                 len(rows) * LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
                 LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS,
             )
             if (
                 len(rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
-                and Decimal(str(coverage_seconds))
-                >= Decimal(LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS)
-                * LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
                 and effective_seconds
                 >= LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS
             ):
@@ -8307,11 +8303,14 @@ class VariationalToLighterRuntime:
             LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS
             - anchor_effective_seconds,
         )
+        anchor_gap_excluded_seconds = max(
+            0.0,
+            anchor_coverage_seconds - anchor_effective_seconds,
+        )
+        # A missing interval is not valid market data and must not force the
+        # strategy to wait for that same wall-clock interval again.
         anchor_ready = (
             len(anchor_rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
-            and Decimal(str(anchor_coverage_seconds))
-            >= Decimal(LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS)
-            * LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
             and anchor_effective_seconds
             >= LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS
         )
@@ -8451,6 +8450,9 @@ class VariationalToLighterRuntime:
                 else "current_quote_size"
             ),
             "v4_anchor_coverage_seconds": f"{anchor_coverage_seconds:.3f}",
+            "v4_anchor_valid_coverage_seconds": anchor_effective_seconds,
+            "v4_anchor_gap_excluded_seconds": f"{anchor_gap_excluded_seconds:.3f}",
+            "v4_anchor_coverage_mode": "gap_excluded_valid_samples",
             "v4_anchor_effective_seconds": anchor_effective_seconds,
             "v4_anchor_min_effective_seconds": LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS,
             "v4_anchor_missing_effective_seconds": anchor_missing_effective_seconds,

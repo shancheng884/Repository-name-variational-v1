@@ -2625,18 +2625,18 @@ def test_v4_history_loader_joins_samples_across_long_gap(tmp_path) -> None:
     asset_dir.mkdir(parents=True)
     now = datetime.now(timezone.utc).timestamp()
     pre_gap = [
-        (now - 604_700 + index * 30, Decimal(index % 10))
-        for index in range(3_000)
+        (now - 418_000 + index * 30, Decimal(index % 10))
+        for index in range(1_000)
     ]
-    post_gap_start = now - 280_000
+    post_gap_start = now - 154_000
     post_gap_end = now - 120
-    post_gap_step = (post_gap_end - post_gap_start) / (2_759 - 1)
+    post_gap_step = (post_gap_end - post_gap_start) / (4_495 - 1)
     post_gap = [
         (
             post_gap_start + index * post_gap_step,
-            Decimal((index + 3_000) % 10),
+            Decimal((index + 1_000) % 10),
         )
-        for index in range(2_759)
+        for index in range(4_495)
     ]
     rows = [
         {
@@ -2663,6 +2663,9 @@ def test_v4_history_loader_joins_samples_across_long_gap(tmp_path) -> None:
     assert context["reason"] == "ready"
     assert context["v4_anchor_ready"] is True
     assert Decimal(context["v4_anchor_max_sample_gap_seconds"]) > Decimal("200000")
+    assert Decimal(context["v4_anchor_coverage_seconds"]) < Decimal("483840")
+    assert context["v4_anchor_valid_coverage_seconds"] == 164850
+    assert context["v4_anchor_coverage_mode"] == "gap_excluded_valid_samples"
     assert direction_context["v4_history_latest_sample_fresh"] is False
     assert Decimal(
         direction_context["v4_history_latest_sample_age_seconds"]
