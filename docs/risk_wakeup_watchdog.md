@@ -114,6 +114,9 @@ RISK_WAKEUP_CHANNEL_RETRY_SECONDS=60
 RISK_WAKEUP_BACKUP_CHANNEL_RETRY_SECONDS=60
 RISK_WAKEUP_MAX_CHANNEL_ATTEMPTS=3
 RISK_WAKEUP_MAX_PHONE_ATTEMPTS=1
+RISK_WAKEUP_REFERENCE_FEED_FLAT_STALE_SECONDS=120
+RISK_WAKEUP_REFERENCE_FEED_EXPOSURE_STALE_SECONDS=60
+RISK_WAKEUP_REFERENCE_FEED_REARM_SECONDS=1800
 ```
 
 `--check` 必须显示：
@@ -243,8 +246,10 @@ python tools/risk_wakeup_backup.py --once
 ```
 
 必须没有备用事件。模拟 A 停止发送后，超过 `45` 秒 B 才发送一次备用紧急报警；A
-恢复后发送恢复通知。同一事件每个渠道最多尝试
+恢复后通常发送恢复通知。同一事件每个渠道最多尝试
 `RISK_WAKEUP_MAX_CHANNEL_ATTEMPTS` 次；飞书电话默认只拨打一次，避免渠道故障时重复打扰。
+
+Variational 被动参考价流单独按持续失联判断：空仓连续 120 秒才发送一次提醒，持仓连续 60 秒升级为紧急事件。事件指纹不包含持续时间，因此等待时间变化不会制造新告警；参考价恢复后不发送恢复通知，并在 30 分钟内抑制同一故障的再次提醒。策略仅在空仓且无待处理动作时，持续失联 120 秒后请求扩展重载页面一次；持仓期间绝不自动重载页面。
 
 B 端服务只监听心跳和发送报警，永远不运行 `main.py`、`tools/live.py` 或行情采集器。
 

@@ -84,6 +84,14 @@ def _safe_count(value: Any) -> int:
         return 0
 
 
+def _safe_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result == result else None
+
+
 def build_heartbeat_payload(
     *,
     node_id: str,
@@ -148,6 +156,17 @@ def build_heartbeat_payload(
             ),
             "manual_review_reason": _safe_text(
                 state.get("manual_review_reason"), limit=200
+            ),
+            "reference_quote_present": bool(
+                risk_health.get("variational_reference_quote_present", False)
+            ),
+            "reference_quote_fresh": (
+                bool(risk_health.get("variational_reference_quote_fresh"))
+                if "variational_reference_quote_fresh" in risk_health
+                else None
+            ),
+            "reference_quote_stale_seconds": _safe_float(
+                risk_health.get("variational_reference_quote_stale_seconds")
             ),
         },
         "risk": {

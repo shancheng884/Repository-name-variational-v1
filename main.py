@@ -172,6 +172,8 @@ LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
 LIVE_INVENTORY_ACCOUNT_RISK_INTERVAL_SECONDS = 15.0
 LIVE_INVENTORY_ACCOUNT_RISK_OPEN_INTERVAL_SECONDS = 5.0
 LIVE_INVENTORY_VARIATIONAL_PORTFOLIO_REFRESH_COOLDOWN_SECONDS = 3.0
+LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_AFTER_SECONDS = 120.0
+LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_COOLDOWN_SECONDS = 1800.0
 LIVE_INVENTORY_VARIATIONAL_MAINTENANCE_RATE_FALLBACK = Decimal("0.10")
 LIVE_INVENTORY_LIGHTER_MAINTENANCE_RATE_FALLBACK = Decimal("0.012")
 # Only /quotes/indicative calls consume this budget. The last five RFQs are
@@ -2563,6 +2565,10 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_last_background_quote_skip_monotonic = 0.0
         self.live_inventory_basis_background_quote_cooldown_until_monotonic = 0.0
         self.live_inventory_basis_quote_size_mode = LIVE_INVENTORY_BASIS_QUOTE_SIZE_MODE
+        self.live_inventory_reference_feed_stale_since_monotonic: dict[str, float] = {}
+        self.live_inventory_reference_feed_stale_since_at: dict[str, str] = {}
+        self.live_inventory_reference_feed_last_recovery_monotonic: dict[str, float] = {}
+        self.live_inventory_reference_feed_recovery_inflight: set[str] = set()
 
         self.lighter_market_index = 0
         self.base_amount_multiplier = 0
@@ -5161,12 +5167,16 @@ class VariationalToLighterRuntime:
             ),
             Decimal("0"),
         )
+        asset = self.live_inventory_state_asset()
+        reference_feed = await self.live_inventory_reference_feed_health(
+            asset=asset,
+        )
         payload = {
             "schema_version": 1,
             "updated_at": utc_now(),
             "pid": os.getpid(),
             "run_id": getattr(self, "live_inventory_run_id", None),
-            "asset": self.live_inventory_state_asset(),
+            "asset": asset,
             "status": live_inventory_state_status(
                 open_lots=open_lots,
                 pending_actions=pending_actions,
@@ -5175,8 +5185,158 @@ class VariationalToLighterRuntime:
             "pending_actions_total": len(pending_actions),
             "expected_open_qty": decimal_to_str(expected_open_qty),
             **context,
+            **reference_feed,
         }
         await asyncio.to_thread(write_json_atomic, path, payload)
+
+    async def live_inventory_reference_feed_health(
+        self,
+        *,
+        asset: str,
+    ) -> dict[str, Any]:
+        """Publish reference-stream health without exposing quote contents."""
+        quote = await self.get_variational_reference_quote(asset.upper())
+        if isinstance(quote, dict):
+            fresh, age_seconds, freshness_source = (
+                self.live_inventory_signal_quote_freshness(quote)
+            )
+            received_at = quote.get("received_at")
+        else:
+            fresh = False
+            age_seconds = None
+            freshness_source = "reference_quote_unavailable"
+            received_at = None
+
+        now_monotonic = time.monotonic()
+        stale_since = getattr(
+            self,
+            "live_inventory_reference_feed_stale_since_monotonic",
+            None,
+        )
+        if not isinstance(stale_since, dict):
+            stale_since = {}
+            self.live_inventory_reference_feed_stale_since_monotonic = stale_since
+        stale_since_at = getattr(
+            self,
+            "live_inventory_reference_feed_stale_since_at",
+            None,
+        )
+        if not isinstance(stale_since_at, dict):
+            stale_since_at = {}
+            self.live_inventory_reference_feed_stale_since_at = stale_since_at
+
+        key = asset.upper()
+        if fresh:
+            stale_since.pop(key, None)
+            stale_since_at.pop(key, None)
+            stale_seconds = 0.0
+        else:
+            if key not in stale_since:
+                stale_since[key] = now_monotonic
+                stale_since_at[key] = utc_now()
+            stale_seconds = max(0.0, now_monotonic - stale_since[key])
+
+        return {
+            "variational_reference_quote_present": isinstance(quote, dict),
+            "variational_reference_quote_fresh": bool(fresh),
+            "variational_reference_quote_age_seconds": age_seconds,
+            "variational_reference_quote_stale_seconds": stale_seconds,
+            "variational_reference_quote_stale_since": stale_since_at.get(key),
+            "variational_reference_quote_received_at": received_at,
+            "variational_reference_quote_freshness_source": freshness_source,
+            "variational_reference_quote_max_age_seconds": (
+                LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_MAX_AGE_SECONDS
+            ),
+        }
+
+    async def maybe_recover_stale_variational_reference_feed(
+        self,
+        *,
+        asset: str,
+        quote_age_ok: bool,
+    ) -> None:
+        """Attempt one guarded page reload after a prolonged empty-book outage."""
+        if not getattr(self, "live_inventory_basis_v4_mode", False):
+            return
+        if getattr(self, "live_inventory_collect_only", False):
+            return
+        pending = self.pending_live_inventory_actions_payload()
+        if self.live_inventory_open_lots or pending:
+            return
+
+        key = asset.upper()
+        stale_since = getattr(
+            self,
+            "live_inventory_reference_feed_stale_since_monotonic",
+            None,
+        )
+        if not isinstance(stale_since, dict):
+            stale_since = {}
+            self.live_inventory_reference_feed_stale_since_monotonic = stale_since
+        last_recovery = getattr(
+            self,
+            "live_inventory_reference_feed_last_recovery_monotonic",
+            None,
+        )
+        if not isinstance(last_recovery, dict):
+            last_recovery = {}
+            self.live_inventory_reference_feed_last_recovery_monotonic = last_recovery
+        inflight = getattr(
+            self,
+            "live_inventory_reference_feed_recovery_inflight",
+            None,
+        )
+        if not isinstance(inflight, set):
+            inflight = set()
+            self.live_inventory_reference_feed_recovery_inflight = inflight
+
+        now_monotonic = time.monotonic()
+        if quote_age_ok:
+            stale_since.pop(key, None)
+            last_recovery.pop(key, None)
+            return
+        stale_started = stale_since.setdefault(key, now_monotonic)
+        if now_monotonic - stale_started < LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_AFTER_SECONDS:
+            return
+        if (
+            now_monotonic - last_recovery.get(key, 0.0)
+            < LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_COOLDOWN_SECONDS
+        ):
+            return
+        if key in inflight:
+            return
+
+        inflight.add(key)
+        last_recovery[key] = now_monotonic
+        request_id = uuid.uuid4().hex
+        try:
+            result = await asyncio.wait_for(
+                self.send_variational_command(
+                    payload={
+                        "type": "VAR_API_RELOAD_PAGE",
+                        "requestId": request_id,
+                    },
+                    request_id=request_id,
+                    lane="read",
+                ),
+                timeout=5.0,
+            )
+            self.logger.info(
+                "live_inventory_reference_feed_recovery_attempt asset=%s ok=%s error=%s",
+                key,
+                bool(result.get("ok")) if isinstance(result, dict) else False,
+                result.get("error") if isinstance(result, dict) else "invalid_result",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.warning(
+                "live_inventory_reference_feed_recovery_failed asset=%s error=%s",
+                key,
+                f"{type(exc).__name__}:{exc}",
+            )
+        finally:
+            inflight.discard(key)
 
     async def capture_live_inventory_account_snapshot(
         self,
@@ -9705,7 +9865,10 @@ class VariationalToLighterRuntime:
             # Keep lightweight test/recovery runtimes compatible without
             # reintroducing an executable RFQ fallback.
             fallback = getattr(self, "get_variational_quote", None)
-            if callable(fallback):
+            if callable(fallback) and (
+                hasattr(self, "runtime")
+                or "get_variational_quote" in getattr(self, "__dict__", {})
+            ):
                 quote = await fallback(preferred_asset)
                 return dict(quote) if isinstance(quote, dict) else None
             return None
@@ -16255,6 +16418,11 @@ class VariationalToLighterRuntime:
                 error="invalid_signal_reference_price",
                 failure_kind="invalid_request",
             )
+            if v4_mode:
+                await self.maybe_recover_stale_variational_reference_feed(
+                    asset=asset,
+                    quote_age_ok=False,
+                )
             return
         quote_priority = self.live_inventory_basis_quote_priority(snapshot)
         quote, quote_ms = await self.get_live_inventory_basis_quote(
@@ -16263,6 +16431,10 @@ class VariationalToLighterRuntime:
             priority=quote_priority,
         )
         if quote is None:
+            await self.maybe_recover_stale_variational_reference_feed(
+                asset=asset,
+                quote_age_ok=False,
+            )
             return
         var_bid = to_decimal(quote.get("bid"))
         var_ask = to_decimal(quote.get("ask"))
@@ -16330,6 +16502,11 @@ class VariationalToLighterRuntime:
                 ).get(asset.upper())
             ):
                 sample_skip_reason = "duplicate_passive_reference"
+        if v4_mode:
+            await self.maybe_recover_stale_variational_reference_feed(
+                asset=asset,
+                quote_age_ok=var_quote_age_ok,
+            )
         duplicate_passive_reference = (
             sample_skip_reason == "duplicate_passive_reference"
         )

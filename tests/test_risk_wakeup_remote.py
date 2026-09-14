@@ -112,6 +112,9 @@ def test_heartbeat_payload_contains_only_operational_summary() -> None:
             "pending_actions_total": 0,
             "risk_action": "normal",
             "risk_reason": "account_risk_normal",
+            "variational_reference_quote_present": True,
+            "variational_reference_quote_fresh": True,
+            "variational_reference_quote_stale_seconds": 0,
         },
         strategy_running=True,
         watchdog_memory={"active_incidents": {}},
@@ -124,6 +127,8 @@ def test_heartbeat_payload_contains_only_operational_summary() -> None:
 
     encoded = json.dumps(payload, ensure_ascii=False)
     assert payload["strategy"]["open_lots_total"] == 1
+    assert payload["strategy"]["reference_quote_fresh"] is True
+    assert payload["strategy"]["reference_quote_stale_seconds"] == 0
     assert payload["alert_control"]["notifications_enabled"] is False
     assert "must-not-leave-a" not in encoded
     assert "0.0081" not in encoded

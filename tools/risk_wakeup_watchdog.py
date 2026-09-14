@@ -12,7 +12,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -152,6 +152,8 @@ class Incident:
     message: str
     alert_params: tuple[str, ...]
     fingerprint: str | None = None
+    rearm_seconds: float = 0.0
+    notify_recovery: bool = True
 
 
 @dataclass(frozen=True)
@@ -166,6 +168,9 @@ class WatchdogConfig:
     monitor_strategy: bool = True
     channel_retry_seconds: float = 10.0
     max_channel_attempts_per_incident: int = 3
+    reference_feed_flat_stale_seconds: float = 120.0
+    reference_feed_exposure_stale_seconds: float = 60.0
+    reference_feed_rearm_seconds: float = 1800.0
 
     @classmethod
     def from_env(cls) -> "WatchdogConfig":
@@ -206,6 +211,21 @@ class WatchdogConfig:
             max_channel_attempts_per_incident=max(
                 1,
                 env_int("RISK_WAKEUP_MAX_CHANNEL_ATTEMPTS", 3),
+            ),
+            reference_feed_flat_stale_seconds=max(
+                30.0,
+                env_float("RISK_WAKEUP_REFERENCE_FEED_FLAT_STALE_SECONDS", 120.0),
+            ),
+            reference_feed_exposure_stale_seconds=max(
+                30.0,
+                env_float(
+                    "RISK_WAKEUP_REFERENCE_FEED_EXPOSURE_STALE_SECONDS",
+                    60.0,
+                ),
+            ),
+            reference_feed_rearm_seconds=max(
+                0.0,
+                env_float("RISK_WAKEUP_REFERENCE_FEED_REARM_SECONDS", 1800.0),
             ),
         )
 
@@ -494,6 +514,68 @@ def evaluate_incidents(
                 )
             )
 
+    # The strategy deliberately rejects an old passive reference. Alert only
+    # after the persisted health file proves that the reference stream has
+    # been stale for a sustained interval, not on every changing age value.
+    reference_fresh_raw = risk_health.get("variational_reference_quote_fresh")
+    if "variational_reference_quote_fresh" in risk_health:
+        if isinstance(reference_fresh_raw, bool):
+            reference_fresh = reference_fresh_raw
+        else:
+            reference_fresh = str(reference_fresh_raw).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        try:
+            reference_stale_seconds = float(
+                risk_health.get("variational_reference_quote_stale_seconds")
+            )
+        except (TypeError, ValueError):
+            reference_stale_seconds = None
+        stale_limit = (
+            config.reference_feed_exposure_stale_seconds
+            if exposure
+            else config.reference_feed_flat_stale_seconds
+        )
+        if (
+            not reference_fresh
+            and reference_stale_seconds is not None
+            and reference_stale_seconds >= stale_limit
+        ):
+            incident_message = (
+                f"{asset}：Variational 参考价流已连续失联，"
+                + (
+                    f"当前存在{lot_text}，无法安全继续执行。"
+                    if exposure
+                    else "策略暂时无法安全判断开仓机会。"
+                )
+            )
+            incidents.append(
+                Incident(
+                    key="variational_reference_feed_stale",
+                    severity="critical" if exposure else "warning",
+                    title=(
+                        "持仓期间参考价流失联"
+                        if exposure
+                        else "Variational 参考价流失联"
+                    ),
+                    message=incident_message,
+                    alert_params=(
+                        asset,
+                        "持仓期间参考价流失联"
+                        if exposure
+                        else "参考价流失联，无法判断开仓",
+                    ),
+                    fingerprint=(
+                        f"{asset}:variational_reference_feed_stale:"
+                        f"{'exposure' if exposure else 'flat'}"
+                    ),
+                    rearm_seconds=config.reference_feed_rearm_seconds,
+                    notify_recovery=False,
+                )
+            )
     critical = [item for item in incidents if item.severity == "critical"]
     if critical:
         messages = list(dict.fromkeys(item.message for item in critical))
@@ -534,6 +616,18 @@ def evaluate_incidents(
                 message="\n".join(messages),
                 alert_params=(asset, "账户出现紧急风险，请立即检查"),
                 fingerprint=stable_fingerprint,
+                rearm_seconds=(
+                    config.reference_feed_rearm_seconds
+                    if all(
+                        item.key == "variational_reference_feed_stale"
+                        for item in critical
+                    )
+                    else 0.0
+                ),
+                notify_recovery=not all(
+                    item.key == "variational_reference_feed_stale"
+                    for item in critical
+                ),
             )
         )
 
@@ -585,6 +679,8 @@ class RiskWakeupWatchdog:
         self.memory = read_json(watchdog_state_path)
         if not isinstance(self.memory.get("active_incidents"), dict):
             self.memory["active_incidents"] = {}
+        if not isinstance(self.memory.get("incident_rearm_until"), dict):
+            self.memory["incident_rearm_until"] = {}
         self.stop_requested = False
 
     def configuration_errors(self) -> list[str]:
@@ -1041,6 +1137,8 @@ class RiskWakeupWatchdog:
         *,
         now: datetime,
     ) -> None:
+        if not bool(record.get("notify_recovery", True)):
+            return
         if not self.alerts_allowed(now=now):
             return
         message = "\n".join(
@@ -1092,6 +1190,19 @@ class RiskWakeupWatchdog:
                 config=self.config,
                 now=now,
             )
+            rearm_until = self.memory["incident_rearm_until"]
+            for key, value in list(rearm_until.items()):
+                deadline = parse_time(value)
+                if deadline is None or deadline <= now:
+                    rearm_until.pop(key, None)
+            incidents = [
+                incident
+                for incident in incidents
+                if (
+                    (deadline := parse_time(rearm_until.get(incident.key))) is None
+                    or deadline <= now
+                )
+            ]
         active = self.memory["active_incidents"]
         if not any(item.severity == "critical" for item in incidents):
             promoted: list[Incident] = []
@@ -1138,6 +1249,8 @@ class RiskWakeupWatchdog:
                     "acknowledgement_token": (
                         self._new_acknowledgement_token(incident, now=now)
                     ),
+                    "rearm_seconds": incident.rearm_seconds,
+                    "notify_recovery": incident.notify_recovery,
                 }
                 active[incident.key] = record
                 self._send_new_incident(incident, record, now=now)
@@ -1191,6 +1304,8 @@ class RiskWakeupWatchdog:
             record["incident_signature"] = signature
             record["title"] = incident.title
             record["message"] = incident.message
+            record["rearm_seconds"] = incident.rearm_seconds
+            record["notify_recovery"] = incident.notify_recovery
             record["last_seen_at"] = iso_time(now)
             self._deliver_incident(
                 incident,
@@ -1203,6 +1318,20 @@ class RiskWakeupWatchdog:
                 continue
             record = active.pop(key)
             if isinstance(record, dict):
+                try:
+                    rearm_seconds = max(0.0, float(record.get("rearm_seconds") or 0.0))
+                except (TypeError, ValueError):
+                    rearm_seconds = 0.0
+                if rearm_seconds > 0:
+                    deadline = iso_time(now + timedelta(seconds=rearm_seconds))
+                    self.memory["incident_rearm_until"][key] = deadline
+                    if key == "critical_account_risk":
+                        # A feed-only critical event is aggregated under the
+                        # generic critical key. Suppress its flat warning too
+                        # while the same outage is in the rearm window.
+                        self.memory["incident_rearm_until"][
+                            "variational_reference_feed_stale"
+                        ] = deadline
                 self._recover_incident(key, record, now=now)
         self._persist(now=now)
         self._write_health(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -301,9 +302,222 @@ def test_critical_fingerprint_ignores_changing_wait_and_heartbeat_age() -> None:
     assert first_critical.fingerprint == second_critical.fingerprint
 
 
-def build_watchdog(tmp_path, *, current, bark=None, feishu=None):
+def test_stale_reference_feed_has_stable_flat_warning() -> None:
+    now = datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc)
+    base_risk = {
+        "updated_at": now.isoformat(),
+        "risk_action": "normal",
+        "variational_reference_quote_fresh": False,
+    }
+    before_limit = evaluate_incidents(
+        state={"status": "flat", "asset": "ETH", "open_lots": []},
+        risk_health={**base_risk, "variational_reference_quote_stale_seconds": 119},
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=now,
+    )
+    first = evaluate_incidents(
+        state={"status": "flat", "asset": "ETH", "open_lots": []},
+        risk_health={**base_risk, "variational_reference_quote_stale_seconds": 121},
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=now,
+    )
+    second = evaluate_incidents(
+        state={"status": "flat", "asset": "ETH", "open_lots": []},
+        risk_health={**base_risk, "variational_reference_quote_stale_seconds": 900},
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=now,
+    )
+
+    assert before_limit == []
+    assert first[0].key == "variational_reference_feed_stale"
+    assert first[0].severity == "warning"
+    assert first[0].fingerprint == second[0].fingerprint
+    assert first[0].message == second[0].message
+    assert first[0].notify_recovery is False
+
+
+def test_stale_reference_feed_is_critical_with_exposure() -> None:
+    now = datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc)
+    incidents = evaluate_incidents(
+        state={"status": "open", "asset": "ETH", "open_lots": [{"lot_id": 1}]},
+        risk_health={
+            "updated_at": now.isoformat(),
+            "risk_action": "normal",
+            "variational_reference_quote_fresh": False,
+            "variational_reference_quote_stale_seconds": 61,
+        },
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=now,
+    )
+
+    critical = next(item for item in incidents if item.severity == "critical")
+    assert critical.key == "critical_account_risk"
+    assert critical.notify_recovery is False
+    assert critical.rearm_seconds == 1800
+    assert "参考价流已连续失联" in critical.message
+
+
+def test_feed_only_critical_rearm_also_suppresses_flat_warning(tmp_path) -> None:
+    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
+    watchdog = build_watchdog(
+        tmp_path,
+        current=current,
+        watchdog_config=config(reference_feed_rearm_seconds=1800),
+    )
+    write_json(
+        tmp_path / "state.json",
+        {"status": "open", "asset": "ETH", "open_lots": [{"lot_id": 1}]},
+    )
+    write_json(
+        tmp_path / "risk.json",
+        {
+            "updated_at": current[0].isoformat(),
+            "risk_action": "normal",
+            "variational_reference_quote_fresh": False,
+            "variational_reference_quote_stale_seconds": 61,
+        },
+    )
+    assert watchdog.run_once()
+
+    current[0] += timedelta(seconds=1)
+    write_json(
+        tmp_path / "state.json",
+        {"status": "flat", "asset": "ETH", "open_lots": []},
+    )
+    write_json(
+        tmp_path / "risk.json",
+        {
+            "updated_at": current[0].isoformat(),
+            "risk_action": "normal",
+            "variational_reference_quote_fresh": False,
+            "variational_reference_quote_stale_seconds": 61,
+        },
+    )
+
+    assert watchdog.run_once() == []
+
+
+def test_stale_reference_feed_rearms_without_recovery_spam(tmp_path) -> None:
+    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
+    bark = FakeBark()
+    feishu = FakeFeishu()
+    watchdog = build_watchdog(
+        tmp_path,
+        current=current,
+        bark=bark,
+        feishu=feishu,
+        watchdog_config=config(reference_feed_rearm_seconds=1800),
+    )
+    state = {"status": "flat", "asset": "ETH", "open_lots": []}
+    risk_path = tmp_path / "risk.json"
+    write_json(tmp_path / "state.json", state)
+
+    def write_health(*, fresh: bool, stale_seconds: float) -> None:
+        write_json(
+            risk_path,
+            {
+                "updated_at": current[0].isoformat(),
+                "risk_action": "normal",
+                "variational_reference_quote_fresh": fresh,
+                "variational_reference_quote_stale_seconds": stale_seconds,
+            },
+        )
+
+    write_health(fresh=False, stale_seconds=121)
+    assert watchdog.run_once()[0].key == "variational_reference_feed_stale"
+    assert len(bark.sent) == 1
+    assert feishu.phones == []
+
+    current[0] += timedelta(seconds=1)
+    write_health(fresh=True, stale_seconds=0)
+    assert watchdog.run_once() == []
+    assert len(bark.sent) == 1
+    assert feishu.messages == [] or len(feishu.messages) == 1
+
+    current[0] += timedelta(minutes=10)
+    write_health(fresh=False, stale_seconds=121)
+    assert watchdog.run_once() == []
+    assert len(bark.sent) == 1
+
+    current[0] += timedelta(minutes=31)
+    write_health(fresh=False, stale_seconds=121)
+    assert watchdog.run_once()[0].key == "variational_reference_feed_stale"
+    assert len(bark.sent) == 2
+
+
+def test_stale_reference_reload_is_one_shot_and_exposure_guarded() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_collect_only = False
+    runtime.live_inventory_open_lots = []
+    runtime.pending_live_inventory_actions_payload = lambda: []
+    runtime.live_inventory_reference_feed_stale_since_monotonic = {
+        "ETH": time.monotonic() - 121,
+    }
+    runtime.live_inventory_reference_feed_last_recovery_monotonic = {}
+    runtime.live_inventory_reference_feed_recovery_inflight = set()
+    runtime.logger = type(
+        "Logger",
+        (),
+        {"info": lambda *args, **kwargs: None, "warning": lambda *args, **kwargs: None},
+    )()
+    calls = []
+
+    async def send_command(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True}
+
+    runtime.send_variational_command = send_command
+
+    asyncio.run(
+        runtime.maybe_recover_stale_variational_reference_feed(
+            asset="ETH",
+            quote_age_ok=False,
+        )
+    )
+    asyncio.run(
+        runtime.maybe_recover_stale_variational_reference_feed(
+            asset="ETH",
+            quote_age_ok=False,
+        )
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["payload"]["type"] == "VAR_API_RELOAD_PAGE"
+
+    runtime.live_inventory_open_lots = [{"lot_id": 1}]
+    runtime.live_inventory_reference_feed_last_recovery_monotonic = {}
+    asyncio.run(
+        runtime.maybe_recover_stale_variational_reference_feed(
+            asset="ETH",
+            quote_age_ok=False,
+        )
+    )
+    assert len(calls) == 1
+
+
+def build_watchdog(
+    tmp_path,
+    *,
+    current,
+    bark=None,
+    feishu=None,
+    watchdog_config=None,
+):
     return RiskWakeupWatchdog(
-        config=config(channel_retry_seconds=10),
+        config=(
+            watchdog_config
+            if watchdog_config is not None
+            else config(channel_retry_seconds=10)
+        ),
         state_path=tmp_path / "state.json",
         risk_health_path=tmp_path / "risk.json",
         metrics_path=tmp_path / "metrics.jsonl",
@@ -704,4 +918,6 @@ def test_main_risk_loop_writes_sanitized_heartbeat(tmp_path) -> None:
     assert body["expected_open_qty"] == "0.01"
     assert body["open_lots_total"] == 1
     assert body["risk_action"] == "normal"
+    assert body["variational_reference_quote_present"] is False
+    assert body["variational_reference_quote_fresh"] is False
     assert "private" not in json.dumps(body).lower()

@@ -14,13 +14,16 @@ def test_extension_has_persistent_keepalive_and_recovery() -> None:
     )
 
     assert "alarms" in manifest["permissions"]
-    assert manifest["version"] == "1.1.0"
+    assert manifest["version"] == "1.1.1"
     assert "variationalForwarderKeepalive" in background
     assert "saveForwarderSession(true" in background
     assert "restoreForwarding" in background
     assert "Page.setWebLifecycleState" in background
     assert 'type === "VAR_API_PORTFOLIO"' in background
     assert 'type === "VAR_API_READY"' in background
+    assert 'type === "VAR_API_RELOAD_PAGE"' in background
+    assert 'type: "VAR_API_RELOAD_PAGE_RESULT"' in background
+    assert "EXPLICIT_RELOAD_COOLDOWN_MS" in background
 
 
 def test_extension_can_fetch_portfolio_through_authenticated_page() -> None:

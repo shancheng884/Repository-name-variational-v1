@@ -3,6 +3,7 @@ import { buildVariationalApiScript } from "./var_api.js";
 const DEBUGGER_VERSION = "1.3";
 const MAX_QUEUE_SIZE = 1000;
 const AUTO_RELOAD_COOLDOWN_MS = 5000;
+const EXPLICIT_RELOAD_COOLDOWN_MS = 30000;
 const FORWARDER_SESSION_KEY = "forwarderSession";
 const KEEPALIVE_ALARM_NAME = "variationalForwarderKeepalive";
 const KEEPALIVE_PERIOD_MINUTES = 0.5;
@@ -30,7 +31,8 @@ const state = {
   pendingResponses: new Map(),
   websocketMeta: new Map(),
   lastError: null,
-  lastAutoReloadAt: 0
+  lastAutoReloadAt: 0,
+  lastExplicitReloadAt: 0
 };
 
 let restorePromise = null;
@@ -628,9 +630,52 @@ async function handleCommandSocketMessage(data) {
     await handleVariationalApiCommand(payload, "ORDER", "VAR_API_ORDER_RESULT");
     return;
   }
+  if (type === "VAR_API_RELOAD_PAGE") {
+    await handleVariationalPageReload(payload);
+    return;
+  }
   if (type === "PLACE_ORDER") {
     await handlePlaceOrder(payload);
     return;
+  }
+}
+
+async function handleVariationalPageReload(payload) {
+  const requestId = payload.requestId;
+  try {
+    if (state.attachedTabId == null) {
+      throw new Error("No attached tab.");
+    }
+    const now = Date.now();
+    if (now - state.lastExplicitReloadAt < EXPLICIT_RELOAD_COOLDOWN_MS) {
+      throw new Error("Explicit page reload is cooling down.");
+    }
+    state.lastExplicitReloadAt = now;
+    await new Promise((resolve, reject) => {
+      chrome.tabs.reload(state.attachedTabId, {}, () => {
+        const error = chrome.runtime.lastError;
+        if (error) {
+          reject(new Error(error.message));
+        } else {
+          resolve();
+        }
+      });
+    });
+    commandForwarder.send({
+      type: "VAR_API_RELOAD_PAGE_RESULT",
+      requestId,
+      ok: true,
+      result: { reloaded: true },
+      timestamp: nowIso()
+    });
+  } catch (error) {
+    commandForwarder.send({
+      type: "VAR_API_RELOAD_PAGE_RESULT",
+      requestId,
+      ok: false,
+      error: error.message,
+      timestamp: nowIso()
+    });
   }
 }
 
