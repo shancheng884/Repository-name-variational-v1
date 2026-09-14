@@ -8077,16 +8077,22 @@ class VariationalToLighterRuntime:
                 None if latest_at is None else max(0.0, now - latest_at)
             )
             context: dict[str, Any] = {}
-            if (
-                latest_age_seconds is not None
-                and latest_age_seconds
-                <= LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
-            ):
+            if latest_age_seconds is not None:
                 threshold, context = self.live_inventory_basis_v4_entry_threshold(
                     now=now,
                     direction=direction,
                     health_history_override=health_history,
                 )
+                context = {
+                    **context,
+                    # A historical gap is allowed in the rolling anchor. The
+                    # live quote freshness guard remains in the entry path.
+                    "v4_history_latest_sample_age_seconds": f"{latest_age_seconds:.3f}",
+                    "v4_history_latest_sample_fresh": (
+                        latest_age_seconds
+                        <= LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
+                    ),
+                }
                 ready = threshold is not None
                 reason = (
                     "legacy_quote_size_migration"
@@ -8117,6 +8123,8 @@ class VariationalToLighterRuntime:
                     "v4_exact_history_ready": False,
                     "v4_exact_history_reason": "warming_up",
                     "v4_quote_size_migration": "legacy_frozen",
+                    "v4_history_latest_sample_age_seconds": None,
+                    "v4_history_latest_sample_fresh": False,
                 }
                 ready = False
                 reason = "quote_size_mode_warmup"

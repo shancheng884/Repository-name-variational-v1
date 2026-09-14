@@ -2607,6 +2607,68 @@ def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> Non
     assert context["quote_size_mode"] == "exact_base_qty_v1"
 
 
+def test_v4_history_loader_joins_samples_across_long_gap(tmp_path) -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.output_dir = Path(tmp_path)
+    runtime.live_inventory_basis_v4_profile = (
+        "eth_short_execution_calibrated_20260724_n10"
+    )
+    runtime.live_inventory_basis_v4_history = deque()
+    runtime.live_inventory_basis_v4_next_history_sample_at = 0.0
+    runtime.live_inventory_basis_v4_history_ready = False
+    runtime.live_inventory_basis_v4_history_reason = "not_loaded"
+    # The current health window is intentionally unavailable. This test
+    # isolates rolling-anchor stitching from the separate health gate.
+    runtime.live_inventory_basis_v4_test_skip_recent_health = True
+
+    asset_dir = Path(tmp_path) / "basis_samples" / "ETH"
+    asset_dir.mkdir(parents=True)
+    now = datetime.now(timezone.utc).timestamp()
+    pre_gap = [
+        (now - 604_700 + index * 30, Decimal(index % 10))
+        for index in range(3_000)
+    ]
+    post_gap_start = now - 280_000
+    post_gap_end = now - 120
+    post_gap_step = (post_gap_end - post_gap_start) / (2_759 - 1)
+    post_gap = [
+        (
+            post_gap_start + index * post_gap_step,
+            Decimal((index + 3_000) % 10),
+        )
+        for index in range(2_759)
+    ]
+    rows = [
+        {
+            "asset": "ETH",
+            "logged_at": datetime.fromtimestamp(
+                timestamp, tz=timezone.utc
+            ).isoformat(),
+            "sample_kind": "baseline",
+            "sample_quality": "valid",
+            "quote_size_mode": "exact_base_qty_v1",
+            "short_edge_bps": str(edge_bps),
+        }
+        for timestamp, edge_bps in [*pre_gap, *post_gap]
+    ]
+    (asset_dir / "2026-07-24.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    context = runtime.load_live_inventory_basis_v4_history(asset="ETH")
+    direction_context = context["directions"]["short_var_long_lighter"]
+
+    assert context["ready"] is True
+    assert context["reason"] == "ready"
+    assert context["v4_anchor_ready"] is True
+    assert Decimal(context["v4_anchor_max_sample_gap_seconds"]) > Decimal("200000")
+    assert direction_context["v4_history_latest_sample_fresh"] is False
+    assert Decimal(
+        direction_context["v4_history_latest_sample_age_seconds"]
+    ) > Decimal("60")
+
+
 def test_v4_history_loader_uses_legacy_quote_size_rows_for_anchor(tmp_path) -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.output_dir = Path(tmp_path)
