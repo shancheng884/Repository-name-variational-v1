@@ -4671,6 +4671,64 @@ def test_v4_entry_rfq_exploration_is_rate_limited() -> None:
     assert runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, now + 300.0)
 
 
+def test_v4_entry_rfq_exploration_requires_near_threshold_edge() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+
+    assert runtime.live_inventory_basis_v4_entry_rfq_exploration_allowed(
+        predicted_exact_edge_bps=Decimal("1.50"),
+        exact_entry_threshold_bps=Decimal("2.00"),
+        bias_ready=True,
+    )
+    assert not runtime.live_inventory_basis_v4_entry_rfq_exploration_allowed(
+        predicted_exact_edge_bps=Decimal("1.00"),
+        exact_entry_threshold_bps=Decimal("2.00"),
+        bias_ready=True,
+    )
+    assert not runtime.live_inventory_basis_v4_entry_rfq_exploration_allowed(
+        predicted_exact_edge_bps=Decimal("2.00"),
+        exact_entry_threshold_bps=Decimal("2.00"),
+        bias_ready=True,
+    )
+
+
+def test_variational_stream_health_is_cached_and_reports_prices_stream() -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        calls = 0
+        last_frame_at = datetime.now(timezone.utc).isoformat()
+
+        async def fake_fetch() -> dict:
+            nonlocal calls
+            calls += 1
+            return {
+                "ok": True,
+                "result": {
+                    "active": True,
+                    "sockets": {"websocket": "connected"},
+                    "streams": [
+                        {
+                            "url": "wss://example.test/prices",
+                            "frameCount": 12,
+                            "lastFrameAt": last_frame_at,
+                        }
+                    ],
+                },
+            }
+
+        runtime.fetch_variational_stream_health = fake_fetch
+
+        first = await runtime.live_inventory_variational_stream_health()
+        second = await runtime.live_inventory_variational_stream_health()
+
+        assert calls == 1
+        assert first["variational_stream_health_ok"] is True
+        assert first["variational_prices_stream_present"] is True
+        assert first["variational_prices_stream_frame_count"] == 12
+        assert first == second
+
+    asyncio.run(run())
+
+
 def test_v4_exact_rfq_threshold_translates_passive_threshold_by_directional_bias() -> None:
     assert v4_exact_rfq_entry_threshold(Decimal("5.10"), Decimal("-3.00")) == Decimal("2.10")
     assert v4_exact_rfq_entry_threshold(Decimal("5.10"), None) == Decimal("5.10")
@@ -8174,6 +8232,40 @@ def test_v4_exit_pair_preserves_one_leg_exception_outcome(tmp_path) -> None:
         assert result[2] is not None
         assert result[7]["lighter_submit_started"] is True
         assert result[7]["var_submit_exception"] == "var timeout unknown"
+
+    asyncio.run(run())
+
+
+def test_v4_exit_pair_timeout_returns_execution_unknown_without_hanging(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_v4_mode = True
+
+        async def slow_submit(**_kwargs):
+            await asyncio.sleep(1)
+
+        runtime.send_variational_place_order = slow_submit
+        runtime.place_lighter_order_from_plan = slow_submit
+        monkeypatch.setattr("main.LIVE_INVENTORY_PAIR_SUBMIT_TIMEOUT_SECONDS", 0.01)
+
+        result = await runtime.submit_live_inventory_exit_pair(
+            asset="ETH",
+            lot={"lot_id": 9},
+            direction="short_var_long_lighter",
+            exit_side="BUY",
+            qty=Decimal("0.01"),
+            var_amount="0.01",
+            var_exit_price=Decimal("1900"),
+            exit_lighter_depth=None,
+        )
+
+        assert isinstance(result[5], TimeoutError)
+        assert isinstance(result[6], TimeoutError)
+        assert result[7]["execution_stage"] == "submit_timeout"
+        assert result[7]["execution_unknown"] is True
 
     asyncio.run(run())
 

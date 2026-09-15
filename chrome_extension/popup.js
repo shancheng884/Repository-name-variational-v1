@@ -5,7 +5,8 @@ const inputs = {
   wsEndpoint: $("wsEndpoint"),
   restEndpoint: $("restEndpoint"),
   commandEndpoint: $("commandEndpoint"),
-  restAllowlist: $("restAllowlist")
+  restAllowlist: $("restAllowlist"),
+  wsAllowlist: $("wsAllowlist")
 };
 
 const statusEl = $("status");
@@ -19,6 +20,8 @@ function toStatusText(status) {
     `REST socket (${status.config.restEndpoint}): ${status.sockets.rest}`,
     `COMMAND socket (${status.config.commandEndpoint}): ${status.sockets.command}`,
     `REST allowlist entries: ${(status.config.restAllowlist || []).length}`,
+    `WS allowlist entries: ${(status.config.wsAllowlist || []).length}`,
+    `Captured WS streams: ${(status.streams || []).length}`,
     `Last error: ${status.lastError || "-"}`
   ].join("\n");
 }
@@ -29,6 +32,7 @@ function updateFormFromStatus(status) {
   inputs.restEndpoint.value = status.config.restEndpoint || "";
   inputs.commandEndpoint.value = status.config.commandEndpoint || "";
   inputs.restAllowlist.value = (status.config.restAllowlist || []).join("\n");
+  inputs.wsAllowlist.value = (status.config.wsAllowlist || []).join("\n");
 }
 
 function updateStatus(status) {
@@ -51,13 +55,18 @@ function readConfig() {
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
+  const wsAllowlist = inputs.wsAllowlist.value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
 
   return {
     domainFilter: inputs.domainFilter.value.trim(),
     wsEndpoint: inputs.wsEndpoint.value.trim(),
     restEndpoint: inputs.restEndpoint.value.trim(),
     commandEndpoint: inputs.commandEndpoint.value.trim(),
-    restAllowlist
+    restAllowlist,
+    wsAllowlist
   };
 }
 

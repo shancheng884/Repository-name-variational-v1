@@ -20,6 +20,9 @@
 - `manual_review_required`、双边仓位不一致、单腿提交失败且尚未重新核对。
 - 维持保证金风险进入 `force_reduce` 或 `emergency_exit`。
 - 账户数据短暂不可用先普通提醒；持仓期间持续 300 秒后升级为紧急风险。
+- 浏览器参考价流的 `/prices` 连接状态只作为诊断信息写入风险心跳；它不会触发交易请求，
+  也不会把正常的开仓、平仓中间状态当成故障。认证失效（例如 `No token`）会固定为一次
+  “需要重新登录”事件，页面重载不会反复尝试。
 
 主策略把已经取得的数据原子写入 `log/live_inventory_risk_health.json`。看门狗读取该文件、`log/live_inventory_state.json` 和最新关键事件，不增加交易 API 压力。
 
@@ -57,6 +60,10 @@ python tools/risk_wakeup_watchdog.py --status
 ```
 
 静默只影响通知发送，不停止交易策略、不改变仓位，也不改变风险状态记录。
+
+Telegram 按钮确认的是当前事件签名。确认后同一故障不会再次发送；只有根因改变或故障
+恢复后重新出现，才会生成新的通知。并发开仓、平仓若超过 8 秒仍未返回，会保留待核对
+状态并要求双边仓位核对，不会在执行结果未知时自动补单或修改本地仓位。
 
 ## 私密配置
 
@@ -198,7 +205,16 @@ python tools/risk_wakeup_backup.py --check
 
 将 A 端的 Bark/飞书私密 JSON 通过安全方式复制到 B，并在 B 的 `.env` 中设置
 `BARK_CONFIG_FILE`、`FEISHU_CONFIG_FILE`；只复制 Telegram 的通知变量，不复制交易
-凭证。两个 JSON 文件和 `.env` 均必须是 `600` 权限。
+凭证。若 B 也启用 Telegram 按钮确认，B 必须使用独立的 Telegram Bot；A 和 B 不能
+同时用同一个 Bot 轮询回调。两个 JSON 文件和 `.env` 均必须是 `600` 权限。
+
+B 端同样支持 Telegram 的“停止重复提醒”和“全局静默 2 小时”按钮；没有按钮或 Bot
+暂不可用时，可在 B 端执行：
+
+```bash
+python tools/risk_wakeup_backup.py --ack-active-incidents
+python tools/risk_wakeup_backup.py --silence-alerts --silence-minutes 120
+```
 
 安装 B 端服务：
 

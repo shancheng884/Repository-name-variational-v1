@@ -14,7 +14,7 @@ def test_extension_has_persistent_keepalive_and_recovery() -> None:
     )
 
     assert "alarms" in manifest["permissions"]
-    assert manifest["version"] == "1.1.1"
+    assert manifest["version"] == "1.1.2"
     assert "variationalForwarderKeepalive" in background
     assert "saveForwarderSession(true" in background
     assert "restoreForwarding" in background
@@ -24,6 +24,9 @@ def test_extension_has_persistent_keepalive_and_recovery() -> None:
     assert 'type === "VAR_API_RELOAD_PAGE"' in background
     assert 'type: "VAR_API_RELOAD_PAGE_RESULT"' in background
     assert "EXPLICIT_RELOAD_COOLDOWN_MS" in background
+    assert "/prices" in background
+    assert "queueWhenDisconnected: false" in background
+    assert "autoReloadAttachedTab" not in background
 
 
 def test_extension_can_fetch_portfolio_through_authenticated_page() -> None:

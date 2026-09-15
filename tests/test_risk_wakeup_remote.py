@@ -28,6 +28,11 @@ class FakeNotifier:
         self.enabled = True
         self.config_path = None
         self.calls: list[tuple[str, str]] = []
+        self.chat_id = "123"
+        self.updates: list[dict] = []
+        self.reply_markups: list[dict | None] = []
+        self.answered: list[tuple[str, str]] = []
+        self.cleared: list[tuple[str, int]] = []
 
     def send(self, *, title: str, message: str, critical: bool) -> NotificationResult:
         self.calls.append(("bark", message))
@@ -41,8 +46,30 @@ class FakeNotifier:
         self.calls.append(("phone", message_id))
         return NotificationResult(True, "sent")
 
-    def send_now(self, message: str) -> tuple[bool, str]:
+    def send_now(
+        self,
+        message: str,
+        *,
+        reply_markup: dict | None = None,
+    ) -> tuple[bool, str]:
         self.calls.append(("telegram", message))
+        self.reply_markups.append(reply_markup)
+        return True, "sent"
+
+    def get_updates(self, *, offset=None):
+        updates = [
+            update
+            for update in self.updates
+            if offset is None or update["update_id"] >= offset
+        ]
+        return updates, "ok"
+
+    def answer_callback_query(self, callback_query_id: str, *, text: str):
+        self.answered.append((callback_query_id, text))
+        return True, "sent"
+
+    def clear_inline_keyboard(self, *, chat_id: str, message_id: int):
+        self.cleared.append((chat_id, message_id))
         return True, "sent"
 
 
@@ -369,3 +396,44 @@ def test_backup_suppresses_stale_heartbeat_during_remote_silence(
 
     assert monitor.run_once() == []
     assert bark.calls == []
+
+
+def test_backup_telegram_button_acknowledges_stale_heartbeat(tmp_path: Path) -> None:
+    config = _config()
+    now = datetime(2026, 9, 2, 0, 0, 30, tzinfo=timezone.utc)
+    telegram = FakeNotifier()
+    monitor = BackupAlertMonitor(
+        config=config,
+        heartbeat_path=tmp_path / "missing-heartbeat.json",
+        state_path=tmp_path / "state.json",
+        bark=FakeNotifier(),
+        feishu=FakeNotifier(),
+        telegram=telegram,
+        clock=lambda: now,
+    )
+    monitor.memory["seen_heartbeat"] = True
+
+    assert monitor.run_once() == ["remote_heartbeat_stale"]
+    record = monitor.memory["active_incidents"]["remote_heartbeat_stale"]
+    token = record["acknowledgement_token"]
+    assert telegram.reply_markups[0]["inline_keyboard"][0][0][
+        "callback_data"
+    ] == f"risk_ack:{token}"
+
+    telegram.updates.append(
+        {
+            "update_id": 10,
+            "callback_query": {
+                "id": "callback-b",
+                "data": f"risk_ack:{token}",
+                "message": {"message_id": 88, "chat": {"id": 123}},
+            },
+        }
+    )
+    monitor.clock = lambda: now + timedelta(seconds=1)
+    assert monitor.run_once() == []
+
+    assert record["acknowledged_signature"] == record["incident_signature"]
+    assert telegram.answered == [("callback-b", "已停止本次故障的重复提醒")]
+    assert telegram.cleared == [("123", 88)]
+    assert len(telegram.calls) == 1

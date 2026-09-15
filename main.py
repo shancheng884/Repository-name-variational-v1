@@ -176,6 +176,9 @@ LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_AFTER_SECONDS = 30.0
 LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_RETRY_SECONDS = 45.0
 LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_MAX_ATTEMPTS = 2
 LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_EXECUTION_QUIET_SECONDS = 30.0
+LIVE_INVENTORY_VARIATIONAL_STREAM_HEALTH_INTERVAL_SECONDS = 15.0
+LIVE_INVENTORY_VARIATIONAL_STREAM_HEALTH_TIMEOUT_SECONDS = 3.0
+LIVE_INVENTORY_PAIR_SUBMIT_TIMEOUT_SECONDS = 8.0
 LIVE_INVENTORY_VARIATIONAL_MAINTENANCE_RATE_FALLBACK = Decimal("0.10")
 LIVE_INVENTORY_LIGHTER_MAINTENANCE_RATE_FALLBACK = Decimal("0.012")
 # Only /quotes/indicative calls consume this budget. The last five RFQs are
@@ -222,6 +225,9 @@ LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_CLAMP_BPS = Decimal("3.0")
 LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_AGE_SECONDS = 24 * 3600
 LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_MAD_BPS = Decimal("2.0")
 LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_INTERVAL_SECONDS = 300.0
+# A scheduled exact RFQ is useful only when the passive estimate is close
+# enough to the translated threshold to have a realistic chance of passing.
+LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_BAND_BPS = Decimal("0.75")
 LIVE_INVENTORY_ENTRY_RFQ_BIAS_STATE_FILE_NAME = "live_inventory_entry_rfq_bias.json"
 LIVE_INVENTORY_BASIS_V4_WEEKEND_TRANSITION_SECONDS = 6 * 3600
 LIVE_INVENTORY_EQUITY_REBALANCE_TARGET_IMBALANCE_PCT = Decimal("6.5")
@@ -2577,6 +2583,8 @@ class VariationalToLighterRuntime:
         self.live_inventory_reference_feed_recovery_reconcile_pending: set[str] = set()
         self.live_inventory_reference_feed_recovery_inflight: set[str] = set()
         self.live_inventory_reference_feed_recovery_tasks: set[asyncio.Task[None]] = set()
+        self.live_inventory_variational_stream_health_cache: dict[str, Any] = {}
+        self.live_inventory_variational_stream_health_cache_monotonic = 0.0
 
         self.lighter_market_index = 0
         self.base_amount_multiplier = 0
@@ -2924,6 +2932,27 @@ class VariationalToLighterRuntime:
         if consume:
             last_by_direction[direction] = now
         return True
+
+    @staticmethod
+    def live_inventory_basis_v4_entry_rfq_exploration_allowed(
+        *,
+        predicted_exact_edge_bps: Decimal | None,
+        exact_entry_threshold_bps: Decimal | None,
+        bias_ready: bool,
+    ) -> bool:
+        """Allow calibration RFQs only inside a bounded near-threshold band."""
+        if (
+            not bias_ready
+            or predicted_exact_edge_bps is None
+            or exact_entry_threshold_bps is None
+        ):
+            return False
+        return (
+            predicted_exact_edge_bps < exact_entry_threshold_bps
+            and predicted_exact_edge_bps
+            >= exact_entry_threshold_bps
+            - LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_BAND_BPS
+        )
 
     def record_live_inventory_entry_rfq_bias_sample(
         self,
@@ -5253,6 +5282,7 @@ class VariationalToLighterRuntime:
                 stale_since_at[key] = utc_now()
             stale_seconds = max(0.0, now_monotonic - stale_since[key])
 
+        stream_health = await self.live_inventory_variational_stream_health()
         return {
             "variational_reference_quote_present": isinstance(quote, dict),
             "variational_reference_quote_fresh": bool(fresh),
@@ -5264,7 +5294,124 @@ class VariationalToLighterRuntime:
             "variational_reference_quote_max_age_seconds": (
                 LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_MAX_AGE_SECONDS
             ),
+            **stream_health,
         }
+
+    async def fetch_variational_stream_health(self) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        return await self.send_variational_command(
+            payload={
+                "type": "VAR_API_STREAM_HEALTH",
+                "requestId": request_id,
+            },
+            request_id=request_id,
+            lane="read",
+        )
+
+    async def live_inventory_variational_stream_health(self) -> dict[str, Any]:
+        """Read browser-captured stream metadata at a bounded low frequency."""
+        now = time.monotonic()
+        cached = getattr(
+            self,
+            "live_inventory_variational_stream_health_cache",
+            None,
+        )
+        cached_at = float(
+            getattr(
+                self,
+                "live_inventory_variational_stream_health_cache_monotonic",
+                0.0,
+            )
+            or 0.0
+        )
+        if (
+            isinstance(cached, dict)
+            and now - cached_at
+            < LIVE_INVENTORY_VARIATIONAL_STREAM_HEALTH_INTERVAL_SECONDS
+        ):
+            return dict(cached)
+
+        try:
+            result = await asyncio.wait_for(
+                self.fetch_variational_stream_health(),
+                timeout=LIVE_INVENTORY_VARIATIONAL_STREAM_HEALTH_TIMEOUT_SECONDS,
+            )
+            result_payload = (
+                result.get("result")
+                if isinstance(result, dict)
+                and isinstance(result.get("result"), dict)
+                else {}
+            )
+            streams = result_payload.get("streams")
+            if not isinstance(streams, list):
+                streams = []
+            price_streams = [
+                stream
+                for stream in streams
+                if isinstance(stream, dict)
+                and (
+                    "/prices" in str(stream.get("url") or "").lower()
+                    or "/prices"
+                    in str(stream.get("matchedPattern") or "").lower()
+                )
+            ]
+            latest_price_stream = max(
+                price_streams,
+                key=lambda stream: parse_utc_iso(stream.get("lastFrameAt"))
+                or datetime.min.replace(tzinfo=timezone.utc),
+                default=None,
+            )
+            last_frame_at = (
+                latest_price_stream.get("lastFrameAt")
+                if isinstance(latest_price_stream, dict)
+                else None
+            )
+            last_frame_dt = parse_utc_iso(last_frame_at)
+            last_frame_age = (
+                max(
+                    0.0,
+                    (datetime.now(timezone.utc) - last_frame_dt).total_seconds(),
+                )
+                if last_frame_dt is not None
+                else None
+            )
+            context = {
+                "variational_stream_health_ok": bool(
+                    isinstance(result, dict) and result.get("ok") is True
+                ),
+                "variational_stream_active": bool(result_payload.get("active")),
+                "variational_stream_sockets": result_payload.get("sockets") or {},
+                "variational_stream_count": len(streams),
+                "variational_prices_stream_present": bool(price_streams),
+                "variational_prices_stream_frame_count": sum(
+                    int(stream.get("frameCount") or 0)
+                    for stream in price_streams
+                ),
+                "variational_prices_stream_last_frame_at": last_frame_at,
+                "variational_prices_stream_last_frame_age_seconds": last_frame_age,
+                "variational_stream_health_error": (
+                    result.get("error") if isinstance(result, dict) else None
+                ),
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            context = {
+                "variational_stream_health_ok": False,
+                "variational_stream_active": False,
+                "variational_stream_sockets": {},
+                "variational_stream_count": 0,
+                "variational_prices_stream_present": False,
+                "variational_prices_stream_frame_count": 0,
+                "variational_prices_stream_last_frame_at": None,
+                "variational_prices_stream_last_frame_age_seconds": None,
+                "variational_stream_health_error": (
+                    f"{type(exc).__name__}:{exc}"
+                ),
+            }
+        self.live_inventory_variational_stream_health_cache = dict(context)
+        self.live_inventory_variational_stream_health_cache_monotonic = now
+        return context
 
     def live_inventory_reference_feed_recovery_context(
         self,
@@ -5365,7 +5512,16 @@ class VariationalToLighterRuntime:
                 not isinstance(variational_result, dict)
                 or variational_result.get("ok") is False
             ):
-                raise RuntimeError("invalid_variational_positions_response")
+                reason = (
+                    "authentication_required"
+                    if self.variational_error_is_auth_required(variational_result)
+                    else "reference_recovery_position_check_failed"
+                )
+                return (
+                    False,
+                    reason,
+                    {"error": str(variational_result)},
+                )
             variational_qty = self.extract_variational_position_qty(
                 variational_result,
                 asset=asset,
@@ -5376,9 +5532,14 @@ class VariationalToLighterRuntime:
                 asset=asset,
             )
         except Exception as exc:
+            reason = (
+                "authentication_required"
+                if self.variational_error_is_auth_required(exc)
+                else "reference_recovery_position_check_failed"
+            )
             return (
                 False,
-                "reference_recovery_position_check_failed",
+                reason,
                 {"error": f"{type(exc).__name__}:{exc}"},
             )
 
@@ -5539,8 +5700,18 @@ class VariationalToLighterRuntime:
                     )
                 )
                 if not verified:
+                    previous_state = states.get(key)
                     states[key] = "reconciling"
                     last_errors[key] = reason
+                    if reason == "authentication_required":
+                        states[key] = "authentication_required"
+                        reconcile_pending.discard(key)
+                        if previous_state != "authentication_required":
+                            await self.append_live_inventory_log(
+                                "live_inventory_reference_feed_auth_required",
+                                {"asset": key, **context},
+                            )
+                        return
                     if reason == "reference_recovery_position_mismatch":
                         states[key] = "failed"
                         reconcile_pending.discard(key)
@@ -5563,6 +5734,11 @@ class VariationalToLighterRuntime:
             return
 
         pending = self.pending_live_inventory_actions_payload()
+        if states.get(key) == "authentication_required":
+            # Authentication cannot be repaired by a page reload. Keep this
+            # state stable until the user refreshes the authenticated session.
+            block_reasons[key] = "authentication_required"
+            return
         if pending:
             states[key] = "blocked_pending_action"
             block_reasons[key] = "pending_live_inventory_action"
@@ -5610,15 +5786,24 @@ class VariationalToLighterRuntime:
                 )
             )
             if not verified:
+                previous_state = states.get(key)
                 last_recovery[key] = now_monotonic
                 last_errors[key] = reason
                 block_reasons[key] = reason
                 states[key] = (
                     "failed"
                     if reason == "reference_recovery_position_mismatch"
+                    else "authentication_required"
+                    if reason == "authentication_required"
                     else "blocked_position_check"
                 )
-                if reason == "reference_recovery_position_mismatch":
+                if reason == "authentication_required":
+                    if previous_state != "authentication_required":
+                        await self.append_live_inventory_log(
+                            "live_inventory_reference_feed_auth_required",
+                            {"asset": key, **context},
+                        )
+                elif reason == "reference_recovery_position_mismatch":
                     await self.append_live_inventory_log(
                         "live_inventory_reference_feed_recovery_position_mismatch",
                         {"asset": key, **context},
@@ -13132,6 +13317,7 @@ class VariationalToLighterRuntime:
                     f"ws://{self.forwarder_host}:{self.forwarder_command_port}",
                     ping_interval=20,
                     ping_timeout=20,
+                    open_timeout=5.0,
                 )
                 setattr(self, ws_attribute, websocket)
             try:
@@ -13309,6 +13495,34 @@ class VariationalToLighterRuntime:
     def variational_error_is_no_position(error: Any) -> bool:
         text = str(error or "").lower()
         return "no position exists" in text
+
+    @staticmethod
+    def variational_error_is_auth_required(error: Any) -> bool:
+        """Recognize session loss without treating it as a market-data outage."""
+        if isinstance(error, dict):
+            status = error.get("httpStatus", error.get("status"))
+            if str(status or "") == "401":
+                return True
+            return any(
+                VariationalToLighterRuntime.variational_error_is_auth_required(item)
+                for item in error.values()
+            )
+        if isinstance(error, (list, tuple)):
+            return any(
+                VariationalToLighterRuntime.variational_error_is_auth_required(item)
+                for item in error
+            )
+        text = str(error or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "no token",
+                "unauthorized",
+                "authentication required",
+                "session expired",
+                "login required",
+            )
+        )
 
     async def place_lighter_order_from_plan(
         self,
@@ -13542,6 +13756,7 @@ class VariationalToLighterRuntime:
             self.build_lighter_ws_url(),
             ping_interval=LIGHTER_WS_PING_INTERVAL_SECONDS,
             ping_timeout=LIGHTER_WS_PING_TIMEOUT_SECONDS,
+            open_timeout=5.0,
         )
         try:
             while True:
@@ -13644,11 +13859,49 @@ class VariationalToLighterRuntime:
             "live_inventory_execution_ledger",
             {**ledger_context, "execution_stage": "submit_started"},
         )
-        var_outcome, lighter_outcome = await asyncio.gather(
-            var_task,
-            lighter_task,
-            return_exceptions=True,
-        )
+        try:
+            var_outcome, lighter_outcome = await asyncio.wait_for(
+                asyncio.gather(
+                    var_task,
+                    lighter_task,
+                    return_exceptions=True,
+                ),
+                timeout=LIVE_INVENTORY_PAIR_SUBMIT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            # A timed-out concurrent submit is execution-unknown. Do not
+            # mutate the lot here; the caller persists the intent and forces
+            # venue reconciliation before changing local state.
+            timeout_error = TimeoutError(
+                "live_inventory_pair_submit_timeout"
+            )
+            pair_context = {
+                **ledger_context,
+                "execution_stage": "submit_timeout",
+                "pair_submit_completed_at": utc_now(),
+                "pair_submit_elapsed_ms": elapsed_ms_str(pair_started_monotonic),
+                "pair_submit_timeout_seconds": (
+                    LIVE_INVENTORY_PAIR_SUBMIT_TIMEOUT_SECONDS
+                ),
+                "var_submit_exception": str(timeout_error),
+                "lighter_submit_exception": str(timeout_error),
+                "execution_unknown": True,
+                "timeout": str(exc),
+            }
+            await self.append_live_inventory_log(
+                "live_inventory_execution_ledger",
+                pair_context,
+            )
+            return (
+                None,
+                None,
+                None,
+                None,
+                None,
+                timeout_error,
+                timeout_error,
+                pair_context,
+            )
 
         if isinstance(var_outcome, asyncio.CancelledError):
             raise var_outcome
@@ -18228,7 +18481,16 @@ class VariationalToLighterRuntime:
                     v4_mode
                     and self.live_inventory_basis_refresh_entry_quote_before_submit
                     and entry_rfq_bias_context.get("v4_entry_rfq_bias_ready") is True
-                    and predicted_exact_edge_bps < exact_entry_threshold_bps
+                    and self.live_inventory_basis_v4_entry_rfq_exploration_allowed(
+                        predicted_exact_edge_bps=predicted_exact_edge_bps,
+                        exact_entry_threshold_bps=exact_entry_threshold_bps,
+                        bias_ready=(
+                            entry_rfq_bias_context.get(
+                                "v4_entry_rfq_bias_ready"
+                            )
+                            is True
+                        ),
+                    )
                     and self.live_inventory_basis_v4_entry_rfq_exploration_due(
                         direction,
                         consume=False,
@@ -18254,6 +18516,15 @@ class VariationalToLighterRuntime:
                     entry_quality_context = {
                         **entry_quality_context,
                         "entry_rfq_exploration_used": True,
+                        "entry_rfq_exploration_band_bps": decimal_to_str(
+                            LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_BAND_BPS
+                        ),
+                        "entry_rfq_exploration_predicted_edge_bps": decimal_to_str(
+                            predicted_exact_edge_bps
+                        ),
+                        "entry_rfq_exploration_threshold_bps": decimal_to_str(
+                            exact_entry_threshold_bps
+                        ),
                         **entry_rfq_bias_context,
                     }
                 if edge_bps < min_entry_edge_bps and not entry_rfq_probe_candidate:
@@ -19549,7 +19820,14 @@ class VariationalToLighterRuntime:
                             )
                         )
                         try:
-                            var_outcome, lighter_outcome = await asyncio.gather(entry_var_task, lighter_task, return_exceptions=True)
+                            var_outcome, lighter_outcome = await asyncio.wait_for(
+                                asyncio.gather(
+                                    entry_var_task,
+                                    lighter_task,
+                                    return_exceptions=True,
+                                ),
+                                timeout=LIVE_INVENTORY_PAIR_SUBMIT_TIMEOUT_SECONDS,
+                            )
                         except Exception as exc:
                             pending_context.update(
                                 {
@@ -22357,10 +22635,13 @@ class VariationalToLighterRuntime:
                                 )
                             )
                         )
-                        var_outcome, lighter_outcome = await asyncio.gather(
-                            var_task,
-                            lighter_task,
-                            return_exceptions=True,
+                        var_outcome, lighter_outcome = await asyncio.wait_for(
+                            asyncio.gather(
+                                var_task,
+                                lighter_task,
+                                return_exceptions=True,
+                            ),
+                            timeout=LIVE_INVENTORY_PAIR_SUBMIT_TIMEOUT_SECONDS,
                         )
                     except Exception as exc:
                         pending_match = next(
@@ -22750,10 +23031,13 @@ class VariationalToLighterRuntime:
                         )
                     )
                 )
-                var_outcome, lighter_outcome = await asyncio.gather(
-                    var_task,
-                    lighter_task,
-                    return_exceptions=True,
+                var_outcome, lighter_outcome = await asyncio.wait_for(
+                    asyncio.gather(
+                        var_task,
+                        lighter_task,
+                        return_exceptions=True,
+                    ),
+                    timeout=LIVE_INVENTORY_PAIR_SUBMIT_TIMEOUT_SECONDS,
                 )
             except Exception as exc:
                 pending_exit_match.context = {

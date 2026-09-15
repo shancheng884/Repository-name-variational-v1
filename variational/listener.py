@@ -945,6 +945,7 @@ class CommandBroker:
         self._roles: dict[websockets.ServerConnection, str] = {}
         self._extension: websockets.ServerConnection | None = None
         self._pending_requests: dict[str, websockets.ServerConnection] = {}
+        self._pending_request_results: dict[str, str] = {}
 
     async def on_connect(self, websocket: websockets.ServerConnection) -> None:
         async with self._lock:
@@ -958,10 +959,14 @@ class CommandBroker:
                 failures = list(self._pending_requests.items())
                 self._pending_requests.clear()
                 for request_id, requester in failures:
+                    result_type = self._pending_request_results.pop(
+                        request_id,
+                        "ORDER_RESULT",
+                    )
                     await self._send(
                         requester,
                         {
-                            "type": "ORDER_RESULT",
+                            "type": result_type,
                             "requestId": request_id,
                             "ok": False,
                             "error": "Extension disconnected before order result.",
@@ -972,6 +977,7 @@ class CommandBroker:
             stale_request_ids = [req for req, requester in self._pending_requests.items() if requester is websocket]
             for req in stale_request_ids:
                 self._pending_requests.pop(req, None)
+                self._pending_request_results.pop(req, None)
 
             if not self.quiet:
                 print(f"[COMMAND] disconnected role={role}", flush=True)
@@ -1028,6 +1034,7 @@ class CommandBroker:
         if msg_type in {
             "VAR_API_POSITIONS",
             "VAR_API_READY",
+            "VAR_API_STREAM_HEALTH",
             "VAR_API_PORTFOLIO",
             "VAR_API_ORDERS",
             "VAR_API_QUOTE",
@@ -1048,6 +1055,7 @@ class CommandBroker:
             "PREPARE_ORDER_INPUT_SWEEP_DRY_RUN_RESULT",
             "VAR_API_POSITIONS_RESULT",
             "VAR_API_READY_RESULT",
+            "VAR_API_STREAM_HEALTH_RESULT",
             "VAR_API_PORTFOLIO_RESULT",
             "VAR_API_ORDERS_RESULT",
             "VAR_API_QUOTE_RESULT",
@@ -1171,6 +1179,7 @@ class CommandBroker:
                 return
 
             self._pending_requests[request_id] = websocket
+            self._pending_request_results[request_id] = result_type
             forward_payload = dict(payload)
             forward_payload.update({"type": command_type, "requestId": request_id, "timestamp": utc_now()})
             await self._send(extension, forward_payload)
@@ -1230,6 +1239,7 @@ class CommandBroker:
                 return
 
             self._pending_requests[request_id] = websocket
+            self._pending_request_results[request_id] = result_type
             forward_payload = dict(payload)
             forward_payload.update(
                 {
@@ -1248,6 +1258,7 @@ class CommandBroker:
             return
         async with self._lock:
             requester = self._pending_requests.pop(request_id, None)
+            self._pending_request_results.pop(request_id, None)
 
         if requester is not None:
             await self._send(requester, payload)

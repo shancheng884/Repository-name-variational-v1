@@ -67,6 +67,59 @@ CRITICAL_MANUAL_REVIEW_MARKERS = (
 )
 
 
+def authentication_failure(value: Any) -> bool:
+    text = json.dumps(value, ensure_ascii=True, default=str).lower()
+    return any(
+        marker in text
+        for marker in (
+            "no token",
+            "unauthorized",
+            "authentication required",
+            "session expired",
+            "login required",
+            '"httpstatus": 401',
+        )
+    )
+
+
+def stable_manual_review_reason(reason: Any, context: Any = None) -> str:
+    if authentication_failure(context if context is not None else reason):
+        return "authentication_required"
+    text = str(reason or "unknown").strip()
+    lowered = text.lower()
+    if "extension" in lowered or "no token" in lowered:
+        return "variational_extension_disconnected"
+    if "reference" in lowered and "feed" in lowered:
+        return "variational_reference_feed_stale"
+    return text or "unknown"
+
+
+def stable_incident_root_key(key: str) -> str:
+    if key.startswith("manual_review:"):
+        return "manual_review:" + stable_manual_review_reason(
+            key.split(":", 1)[1]
+        )
+    if key.startswith("unreconciled_manual_review:"):
+        return "manual_review:" + stable_manual_review_reason(
+            key.split(":", 1)[1]
+        )
+    return key
+
+
+def is_persistent_incident_root(key: str) -> bool:
+    root = stable_incident_root_key(key)
+    return root in {
+        "variational_authentication_required",
+        "variational_extension_disconnected",
+        "variational_reference_feed_stale",
+        "manual_review:authentication_required",
+        "manual_review:variational_extension_disconnected",
+        "manual_review:variational_reference_feed_stale",
+        "manual_review:variational_html_response",
+        "risk_heartbeat_stale_with_exposure",
+    }
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -352,6 +405,11 @@ def evaluate_incidents(
         or state.get("last_blocked_reason")
         or "unknown"
     )
+    manual_review_context = state.get("manual_review_context")
+    manual_review_root = stable_manual_review_reason(
+        reason,
+        manual_review_context,
+    )
     lot_text = f"未平子单 {open_lot_count}，待确认动作 {pending_count}"
 
     if (
@@ -381,18 +439,32 @@ def evaluate_incidents(
         )
 
     if status == "manual_review_required":
-        critical = exposure or any(
-            marker in reason for marker in CRITICAL_MANUAL_REVIEW_MARKERS
-        )
-        incidents.append(
-            Incident(
-                key=f"manual_review:{reason}",
-                severity="critical" if critical else "warning",
-                title="套利账户需要人工核对",
-                message=f"{asset}：原因 {reason}；{lot_text}。",
-                alert_params=(asset, "双边账户需要人工核对"),
+        if manual_review_root == "authentication_required":
+            incidents.append(
+                Incident(
+                    key="variational_authentication_required",
+                    severity="critical" if exposure else "warning",
+                    title="Variational 需要重新登录",
+                    message=(
+                        f"{asset}：Variational 会话已失效（{reason}）。"
+                        "请重新登录 Variational、刷新页面和扩展后再继续执行。"
+                    ),
+                    alert_params=(asset, "请重新登录 Variational"),
+                )
             )
-        )
+        else:
+            critical = exposure or any(
+                marker in reason for marker in CRITICAL_MANUAL_REVIEW_MARKERS
+            )
+            incidents.append(
+                Incident(
+                    key=f"manual_review:{manual_review_root}",
+                    severity="critical" if critical else "warning",
+                    title="套利账户需要人工核对",
+                    message=f"{asset}：原因 {reason}；{lot_text}。",
+                    alert_params=(asset, "双边账户需要人工核对"),
+                )
+            )
 
     if pending_count:
         ages = [
@@ -509,9 +581,13 @@ def evaluate_incidents(
             reconcile_at is None or manual_at > reconcile_at
         ):
             event_reason = str(latest_manual_review.get("reason") or "unknown")
+            event_root = stable_manual_review_reason(
+                event_reason,
+                latest_manual_review.get("manual_review_context"),
+            )
             incidents.append(
                 Incident(
-                    key=f"unreconciled_manual_review:{event_reason}",
+                    key=f"unreconciled_manual_review:{event_root}",
                     severity="critical",
                     title="套利双边状态尚未重新核对",
                     message=f"{asset}：故障 {event_reason} 后尚无成功双边核对；{lot_text}。",
@@ -557,12 +633,26 @@ def evaluate_incidents(
             )
         except (TypeError, ValueError):
             recovery_attempt = 0
+        if recovery_state == "authentication_required":
+            incidents.append(
+                Incident(
+                    key="variational_authentication_required",
+                    severity="critical" if exposure else "warning",
+                    title="Variational 需要重新登录",
+                    message=(
+                        f"{asset}：Variational 会话已失效。"
+                        "请重新登录 Variational、刷新页面和扩展后再继续执行。"
+                    ),
+                    alert_params=(asset, "请重新登录 Variational"),
+                )
+            )
         recovery_in_progress = recovery_state in {
             "stale_grace",
             "repairing",
             "waiting_for_fresh_data",
             "reconciling",
             "reload_failed",
+            "authentication_required",
         } and recovery_attempt <= config.reference_feed_recovery_max_attempts
         if (
             not reference_fresh
@@ -610,18 +700,12 @@ def evaluate_incidents(
         # durable manual-review reason is the strongest root cause when it is
         # available; this keeps a stopped strategy from becoming a new alert
         # every polling cycle.
-        episode_id = str(
-            state.get("run_id")
-            or risk_health.get("run_id")
-            or state.get("started_at")
-            or "unknown"
-        )
-        if status == "manual_review_required" and reason != "unknown":
-            fingerprint_keys = {f"manual_review:{reason}"}
+        if status == "manual_review_required" and manual_review_root != "unknown":
+            fingerprint_keys = {f"manual_review:{manual_review_root}"}
         else:
             fingerprint_keys = set()
             for item in critical:
-                fingerprint_key = item.key
+                fingerprint_key = stable_incident_root_key(item.key)
                 if fingerprint_key.startswith("unreconciled_manual_review:"):
                     fingerprint_key = "manual_review:" + fingerprint_key.split(":", 1)[1]
                 fingerprint_keys.add(fingerprint_key)
@@ -630,6 +714,19 @@ def evaluate_incidents(
                 # explicit fault. Do not turn its changing age into a second
                 # alarm episode.
                 fingerprint_keys.discard("risk_heartbeat_stale_with_exposure")
+        episode_id = (
+            "persistent"
+            if fingerprint_keys and all(
+                is_persistent_incident_root(key)
+                for key in fingerprint_keys
+            )
+            else str(
+                state.get("run_id")
+                or risk_health.get("run_id")
+                or state.get("started_at")
+                or "unknown"
+            )
+        )
         stable_fingerprint = "|".join(
             [asset, episode_id, *sorted(fingerprint_keys)]
         )

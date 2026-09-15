@@ -291,8 +291,29 @@ class BackupAlertMonitor:
             now - attempted_at
         ).total_seconds() >= self.config.channel_retry_seconds
 
+    @staticmethod
+    def _acknowledgement_token(record: Mapping[str, Any]) -> str:
+        existing = str(record.get("acknowledgement_token") or "").strip()
+        if existing:
+            return existing
+        source = "\n".join(
+            (
+                str(record.get("node_id") or ""),
+                str(record.get("key") or "remote_critical"),
+                str(record.get("incident_signature") or ""),
+            )
+        )
+        return hashlib.sha256(source.encode("utf-8")).hexdigest()[:20]
+
+    def _acknowledged(self, record: Mapping[str, Any]) -> bool:
+        return bool(
+            record.get("acknowledged_at")
+            and record.get("acknowledged_signature")
+            == record.get("incident_signature")
+        )
+
     def _send_telegram(self, record: dict[str, Any], now: datetime) -> None:
-        if record.get("telegram_status") == "sent":
+        if record.get("telegram_status") == "sent" or self._acknowledged(record):
             return
         if not self.telegram.enabled:
             record["telegram_status"] = "not_configured"
@@ -305,11 +326,143 @@ class BackupAlertMonitor:
         if self.dry_run:
             record["telegram_status"] = "dry_run"
             return
-        ok, detail = self.telegram.send_now(
-            "[VPS B 备用报警]\n" + self._record_message(record)
-        )
+        token = self._acknowledgement_token(record)
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "我已知晓，停止重复提醒",
+                        "callback_data": f"risk_ack:{token}",
+                    }
+                ],
+                [
+                    {
+                        "text": "全局静默 2 小时",
+                        "callback_data": f"risk_silence:{token}",
+                    }
+                ],
+            ]
+        }
+        message = "[VPS B 备用报警]\n" + self._record_message(record)
+        try:
+            ok, detail = self.telegram.send_now(
+                message,
+                reply_markup=reply_markup,
+            )
+        except TypeError:
+            # Keep compatibility with custom notifiers that predate buttons.
+            ok, detail = self.telegram.send_now(message)
         record["telegram_attempts"] = int(record.get("telegram_attempts") or 0) + 1
         record["telegram_status"] = "sent" if ok else detail
+
+    def _poll_telegram_acknowledgements(self, *, now: datetime) -> None:
+        if self.dry_run or not self.telegram.enabled:
+            return
+        get_updates = getattr(self.telegram, "get_updates", None)
+        if not callable(get_updates):
+            return
+        offset_value = self.memory.get("telegram_update_offset")
+        try:
+            offset = int(offset_value) if offset_value is not None else None
+        except (TypeError, ValueError):
+            offset = None
+        try:
+            updates, _detail = get_updates(offset=offset)
+        except Exception as exc:
+            logging.getLogger("risk_wakeup_backup.telegram").warning(
+                "telegram_ack_poll_failed detail=%s",
+                type(exc).__name__,
+            )
+            return
+        if not isinstance(updates, list):
+            return
+        active = self.memory["active_incidents"]
+        next_offset = offset
+        for update in updates:
+            if not isinstance(update, Mapping):
+                continue
+            try:
+                update_id = int(update.get("update_id"))
+            except (TypeError, ValueError):
+                continue
+            next_offset = max(next_offset or 0, update_id + 1)
+            callback = update.get("callback_query")
+            if not isinstance(callback, Mapping):
+                continue
+            data = str(callback.get("data") or "")
+            if not (data.startswith("risk_ack:") or data.startswith("risk_silence:")):
+                continue
+            message = callback.get("message")
+            message = message if isinstance(message, Mapping) else {}
+            chat = message.get("chat")
+            chat = chat if isinstance(chat, Mapping) else {}
+            callback_chat_id = str(chat.get("id") or "")
+            if callback_chat_id != str(getattr(self.telegram, "chat_id", "")):
+                continue
+            action, token = data.split(":", 1)
+            matched = False
+            for record in active.values():
+                if not isinstance(record, dict):
+                    continue
+                if self._acknowledgement_token(record) != token:
+                    continue
+                matched = True
+                if action == "risk_ack":
+                    record["acknowledged_at"] = iso_time(now)
+                    record["acknowledged_by"] = callback_chat_id
+                    record["acknowledged_signature"] = record.get(
+                        "incident_signature"
+                    )
+                break
+            if matched and action == "risk_silence":
+                silence_alerts(
+                    self.alert_control_path,
+                    minutes=120,
+                    reason="telegram_global_silence",
+                    now=now,
+                )
+                for record in active.values():
+                    if not isinstance(record, dict):
+                        continue
+                    record["acknowledged_at"] = iso_time(now)
+                    record["acknowledged_by"] = callback_chat_id
+                    record["acknowledged_signature"] = record.get(
+                        "incident_signature"
+                    )
+            answer = getattr(self.telegram, "answer_callback_query", None)
+            if callable(answer):
+                try:
+                    answer(
+                        str(callback.get("id") or ""),
+                        text=(
+                            "已全局静默 2 小时"
+                            if matched and action == "risk_silence"
+                            else "已停止本次故障的重复提醒"
+                            if matched
+                            else "该故障已恢复或失效"
+                        ),
+                    )
+                except Exception as exc:
+                    logging.getLogger("risk_wakeup_backup.telegram").warning(
+                        "telegram_ack_answer_failed detail=%s",
+                        type(exc).__name__,
+                    )
+            clear_keyboard = getattr(self.telegram, "clear_inline_keyboard", None)
+            if matched and callable(clear_keyboard):
+                message_id = message.get("message_id")
+                if message_id is not None:
+                    try:
+                        clear_keyboard(
+                            chat_id=callback_chat_id,
+                            message_id=int(message_id),
+                        )
+                    except Exception as exc:
+                        logging.getLogger("risk_wakeup_backup.telegram").warning(
+                            "telegram_ack_keyboard_clear_failed detail=%s",
+                            type(exc).__name__,
+                        )
+        if next_offset is not None:
+            self.memory["telegram_update_offset"] = next_offset
 
     def _send_bark(self, record: dict[str, Any], now: datetime) -> None:
         if record.get("bark_status") == "sent":
@@ -395,6 +548,7 @@ class BackupAlertMonitor:
             return {}
         if not envelope:
             if self.memory.get("seen_heartbeat"):
+                signature = f"remote_heartbeat_stale:{self.config.expected_node_id}"
                 return {
                     "remote_heartbeat_stale": {
                         "node_id": self.config.expected_node_id,
@@ -405,6 +559,8 @@ class BackupAlertMonitor:
                         ),
                         "channels": ["bark", "feishu", "telegram"],
                         "stale": True,
+                        "incident_signature": signature,
+                        "key": "remote_heartbeat_stale",
                     }
                 }
             return {}
@@ -425,6 +581,7 @@ class BackupAlertMonitor:
             if self.suppressed_reason:
                 return {}
         if age > self.config.max_age_seconds:
+            signature = f"remote_heartbeat_stale:{self.config.expected_node_id}"
             return {
                 "remote_heartbeat_stale": {
                     "node_id": self.config.expected_node_id,
@@ -435,6 +592,8 @@ class BackupAlertMonitor:
                     ),
                     "channels": ["bark", "feishu", "telegram"],
                     "stale": True,
+                    "incident_signature": signature,
+                    "key": "remote_heartbeat_stale",
                 }
             }
 
@@ -455,9 +614,11 @@ class BackupAlertMonitor:
                 key = str(incident.get("key") or "remote_critical")
                 signature = str(incident.get("incident_signature") or "")
                 if not signature:
-                    signature = hashlib.sha256(
-                        json.dumps(incident, sort_keys=True).encode("utf-8")
-                    ).hexdigest()[:16]
+                    # A changing message (for example a growing age) is not
+                    # a new incident. Use the stable remote key as fallback.
+                    signature = (
+                        f"remote:{self.config.expected_node_id}:{key}"
+                    )
                 incident_key = f"remote_delivery:{key}:{signature}"
                 desired[incident_key] = {
                     "node_id": self.config.expected_node_id,
@@ -465,6 +626,8 @@ class BackupAlertMonitor:
                     "message": incident.get("message") or "A 节点严重事件存在未送达通知。",
                     "channels": sorted(channels),
                     "stale": False,
+                    "key": incident_key,
+                    "incident_signature": signature,
                 }
         return desired
 
@@ -485,6 +648,7 @@ class BackupAlertMonitor:
 
     def run_once(self) -> list[str]:
         now = self.clock()
+        self._poll_telegram_acknowledgements(now=now)
         desired = self._desired_incidents(now)
         active = self.memory["active_incidents"]
         current_keys = set(desired)
@@ -497,16 +661,29 @@ class BackupAlertMonitor:
                     "first_seen_at": iso_time(now),
                     "last_seen_at": iso_time(now),
                 }
+                record["acknowledgement_token"] = self._acknowledgement_token(
+                    record
+                )
                 active[key] = record
             else:
                 record.update(
                     {
+                        "key": incident.get("key", key),
+                        "incident_signature": incident.get(
+                            "incident_signature"
+                        ),
+                        "acknowledgement_token": incident.get(
+                            "acknowledgement_token"
+                        )
+                        or self._acknowledgement_token(incident),
                         "message": incident["message"],
                         "channels": sorted(incident["channels"]),
                         "last_seen_at": iso_time(now),
                     }
                 )
             first_seen = parse_time(record.get("first_seen_at")) or now
+            if self._acknowledged(record):
+                continue
             if incident.get("stale") or (
                 now - first_seen
             ).total_seconds() >= self.config.delivery_grace_seconds:
@@ -535,6 +712,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--silence-alerts", action="store_true")
     parser.add_argument("--resume-alerts", action="store_true")
+    parser.add_argument("--ack-active-incidents", action="store_true")
     parser.add_argument("--silence-minutes", type=float, default=120.0)
     return parser
 
@@ -563,7 +741,14 @@ def main() -> int:
     )
     config = BackupConfig()
     monitor = BackupAlertMonitor(config=config, dry_run=args.dry_run)
-    if args.silence_alerts and args.resume_alerts:
+    if sum(
+        bool(value)
+        for value in (
+            args.silence_alerts,
+            args.resume_alerts,
+            args.ack_active_incidents,
+        )
+    ) > 1:
         print("choose_only_one_alert_control_action")
         return 2
     if args.silence_alerts:
@@ -577,6 +762,23 @@ def main() -> int:
     if args.resume_alerts:
         resume_alerts(monitor.alert_control_path)
         print("alerts=RESUMED")
+        return 0
+    if args.ack_active_incidents:
+        now = utc_now()
+        active = monitor.memory.get("active_incidents")
+        count = 0
+        if isinstance(active, dict):
+            for record in active.values():
+                if not isinstance(record, dict):
+                    continue
+                record["acknowledged_at"] = iso_time(now)
+                record["acknowledged_by"] = "operator_cli"
+                record["acknowledged_signature"] = record.get(
+                    "incident_signature"
+                )
+                count += 1
+        monitor._persist(now)
+        print(f"acknowledged_incidents={count}")
         return 0
     if args.status:
         control = read_alert_control(monitor.alert_control_path)

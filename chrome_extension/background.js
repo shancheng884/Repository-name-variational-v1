@@ -2,7 +2,6 @@ import { buildVariationalApiScript } from "./var_api.js";
 
 const DEBUGGER_VERSION = "1.3";
 const MAX_QUEUE_SIZE = 1000;
-const AUTO_RELOAD_COOLDOWN_MS = 5000;
 const EXPLICIT_RELOAD_COOLDOWN_MS = 30000;
 const FORWARDER_SESSION_KEY = "forwarderSession";
 const KEEPALIVE_ALARM_NAME = "variationalForwarderKeepalive";
@@ -19,7 +18,8 @@ const DEFAULT_CONFIG = {
   ],
   wsAllowlist: [
     "wss://omni-ws-server.prod.ap-northeast-1.variational.io/events",
-    "wss://omni-ws-server.prod.ap-northeast-1.variational.io/portfolio"
+    "wss://omni-ws-server.prod.ap-northeast-1.variational.io/portfolio",
+    "wss://omni-ws-server.prod.ap-northeast-1.variational.io/prices"
   ]
 };
 
@@ -31,7 +31,6 @@ const state = {
   pendingResponses: new Map(),
   websocketMeta: new Map(),
   lastError: null,
-  lastAutoReloadAt: 0,
   lastExplicitReloadAt: 0
 };
 
@@ -43,6 +42,7 @@ class ForwardSocket {
     this.configKey = configKey;
     this.onOpen = options.onOpen || null;
     this.onMessage = options.onMessage || null;
+    this.queueWhenDisconnected = options.queueWhenDisconnected !== false;
     this.ws = null;
     this.status = "disconnected";
     this.queue = [];
@@ -84,9 +84,6 @@ class ForwardSocket {
         this.flush();
         if (this.onOpen) {
           this.onOpen(this);
-        }
-        if (this.configKey === "wsEndpoint") {
-          autoReloadAttachedTab("forward receiver connected");
         }
         notifyStatus();
       };
@@ -130,6 +127,9 @@ class ForwardSocket {
       return;
     }
 
+    if (!this.queueWhenDisconnected) {
+      return false;
+    }
     this.queue.push(data);
     if (this.queue.length > MAX_QUEUE_SIZE) {
       this.queue.shift();
@@ -175,33 +175,16 @@ class ForwardSocket {
   }
 }
 
-const wsForwarder = new ForwardSocket("websocket", "wsEndpoint");
-const restForwarder = new ForwardSocket("rest", "restEndpoint");
+const wsForwarder = new ForwardSocket("websocket", "wsEndpoint", {
+  queueWhenDisconnected: false
+});
+const restForwarder = new ForwardSocket("rest", "restEndpoint", {
+  queueWhenDisconnected: false
+});
 const commandForwarder = new ForwardSocket("command", "commandEndpoint", {
   onOpen: (socket) => socket.send({ type: "REGISTER", role: "extension", timestamp: nowIso() }),
   onMessage: (data) => handleCommandSocketMessage(data)
 });
-
-function autoReloadAttachedTab(reason) {
-  if (!state.active || state.attachedTabId == null) {
-    return;
-  }
-  const now = Date.now();
-  if (now - state.lastAutoReloadAt < AUTO_RELOAD_COOLDOWN_MS) {
-    return;
-  }
-  state.lastAutoReloadAt = now;
-
-  chrome.tabs.reload(state.attachedTabId, {}, () => {
-    const err = chrome.runtime.lastError;
-    if (err) {
-      state.lastError = `Auto reload failed (${reason}): ${err.message}`;
-    } else {
-      state.lastError = null;
-    }
-    notifyStatus();
-  });
-}
 
 async function ensureConfigLoaded() {
   if (state.configLoaded) {
@@ -219,7 +202,7 @@ function sanitizeConfig(incoming = {}) {
     commandEndpoint: asStringOrDefault(incoming.commandEndpoint, DEFAULT_CONFIG.commandEndpoint),
     domainFilter: asStringOrDefault(incoming.domainFilter, DEFAULT_CONFIG.domainFilter),
     restAllowlist: sanitizeRestAllowlist(incoming.restAllowlist),
-    wsAllowlist: sanitizeAllowlist(incoming.wsAllowlist, DEFAULT_CONFIG.wsAllowlist)
+    wsAllowlist: sanitizeWsAllowlist(incoming.wsAllowlist)
   };
 }
 
@@ -256,6 +239,11 @@ function sanitizeRestAllowlist(value) {
     return [...DEFAULT_CONFIG.restAllowlist];
   }
   return strict;
+}
+
+function sanitizeWsAllowlist(value) {
+  const cleaned = sanitizeAllowlist(value, DEFAULT_CONFIG.wsAllowlist);
+  return [...new Set([...DEFAULT_CONFIG.wsAllowlist, ...cleaned])];
 }
 
 function matchesDomainFilter(url) {
@@ -295,7 +283,11 @@ function isLikelyVariationalWsUrl(url) {
   if (!target.hostname.includes("variational.io")) {
     return false;
   }
-  return target.pathname.includes("/events") || target.pathname.includes("/portfolio");
+  return (
+    target.pathname.includes("/events") ||
+    target.pathname.includes("/portfolio") ||
+    target.pathname.includes("/prices")
+  );
 }
 
 function getMatchedRestPattern(url) {
@@ -470,7 +462,6 @@ async function startForwarding(tabId = null, options = {}) {
   wsForwarder.connect();
   restForwarder.connect();
   commandForwarder.connect();
-  autoReloadAttachedTab("forwarder started");
   if (options.persist !== false) {
     await saveForwarderSession(true, targetTabId);
   }
@@ -563,7 +554,6 @@ function cleanupForwardingState() {
   state.pendingResponses.clear();
   state.websocketMeta.clear();
   state.attachedTabId = null;
-  state.lastAutoReloadAt = 0;
   wsForwarder.close();
   restForwarder.close();
   commandForwarder.close();
@@ -1405,6 +1395,18 @@ async function handlePageProbe(payload) {
 }
 
 function getStatus() {
+  const streams = Array.from(state.websocketMeta.entries()).map(
+    ([requestId, meta]) => ({
+      requestId,
+      url: meta.url,
+      matchedPattern: meta.matchedPattern || "",
+      createdAt: meta.createdAt || null,
+      lastFrameAt: meta.lastFrameAt || null,
+      frameCount: meta.frameCount || 0,
+      lastFrameDirection: meta.lastFrameDirection || null,
+      lastFrameError: meta.lastFrameError || null
+    })
+  );
   return {
     active: state.active,
     attachedTabId: state.attachedTabId,
@@ -1414,6 +1416,7 @@ function getStatus() {
       rest: restForwarder.status,
       command: commandForwarder.status
     },
+    streams,
     lastError: state.lastError
   };
 }

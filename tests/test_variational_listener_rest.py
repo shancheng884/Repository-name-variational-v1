@@ -3,7 +3,7 @@ import asyncio
 import json
 import time
 
-from variational.listener import EventSink, VariationalMonitor
+from variational.listener import CommandBroker, EventSink, VariationalMonitor
 
 
 def test_listener_remembers_unknown_variational_rest_response() -> None:
@@ -176,3 +176,44 @@ def test_rest_and_ws_quote_caches_do_not_overwrite_each_other() -> None:
     assert monitor.reference_quotes["ETH"]["reference_price"] == "2500.25"
     assert monitor.quotes["ETH"]["bid"] == "2499.90"
     assert monitor.quotes["ETH"]["ask"] == "2500.10"
+
+
+def test_stream_health_command_round_trips_with_its_result_type() -> None:
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send(self, raw: str) -> None:
+            self.sent.append(json.loads(raw))
+
+    async def run() -> None:
+        broker = CommandBroker(quiet=True)
+        extension = FakeSocket()
+        requester = FakeSocket()
+        broker._extension = extension
+
+        await broker.handle_raw_message(
+            requester,
+            json.dumps(
+                {
+                    "type": "VAR_API_STREAM_HEALTH",
+                    "requestId": "health-1",
+                }
+            ),
+        )
+        assert extension.sent[-1]["type"] == "VAR_API_STREAM_HEALTH"
+
+        await broker.handle_raw_message(
+            extension,
+            json.dumps(
+                {
+                    "type": "VAR_API_STREAM_HEALTH_RESULT",
+                    "requestId": "health-1",
+                    "ok": True,
+                    "result": {"streams": []},
+                }
+            ),
+        )
+        assert requester.sent[-1]["type"] == "VAR_API_STREAM_HEALTH_RESULT"
+
+    asyncio.run(run())

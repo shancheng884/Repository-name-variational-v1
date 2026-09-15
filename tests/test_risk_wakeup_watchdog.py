@@ -284,7 +284,7 @@ def test_critical_fingerprint_ignores_changing_wait_and_heartbeat_age() -> None:
         risk_health=risk_health,
         events=[],
         strategy_running=False,
-        config=config(),
+        config=config(alert_when_flat_strategy_stopped=False),
         now=started + timedelta(seconds=63),
     )
     second = evaluate_incidents(
@@ -292,7 +292,7 @@ def test_critical_fingerprint_ignores_changing_wait_and_heartbeat_age() -> None:
         risk_health=risk_health,
         events=[],
         strategy_running=False,
-        config=config(),
+        config=config(alert_when_flat_strategy_stopped=False),
         now=started + timedelta(seconds=81),
     )
     first_critical = next(item for item in first if item.severity == "critical")
@@ -363,6 +363,72 @@ def test_stale_reference_feed_is_critical_with_exposure() -> None:
     assert critical.notify_recovery is False
     assert critical.rearm_seconds == 1800
     assert "参考价流已连续失联" in critical.message
+
+
+def test_authentication_failure_is_one_stable_actionable_incident() -> None:
+    now = datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc)
+    state = {
+        "status": "manual_review_required",
+        "run_id": "run-changes-on-restart",
+        "asset": "ETH",
+        "open_lots": [],
+        "manual_review_reason": "startup_reconcile_exchange_position_check_failed",
+        "manual_review_context": {
+            "errors": {
+                "variational": (
+                    "VAR_API_POSITIONS_RESULT httpStatus=401 {message: No token}"
+                )
+            }
+        },
+    }
+    first = evaluate_incidents(
+        state=state,
+        risk_health={"updated_at": now.isoformat(), "risk_action": "normal"},
+        events=[],
+        strategy_running=False,
+        config=config(alert_when_flat_strategy_stopped=False),
+        now=now,
+    )
+    state["run_id"] = "another-run-id"
+    second = evaluate_incidents(
+        state=state,
+        risk_health={"updated_at": now.isoformat(), "risk_action": "normal"},
+        events=[],
+        strategy_running=False,
+        config=config(alert_when_flat_strategy_stopped=False),
+        now=now,
+    )
+
+    assert [item.key for item in first] == ["variational_authentication_required"]
+    assert [item.key for item in second] == ["variational_authentication_required"]
+    assert "重新登录" in first[0].message
+
+
+def test_remote_heartbeat_stale_key_does_not_change_with_age(tmp_path) -> None:
+    current = [datetime(2026, 8, 30, 0, 0, 30, tzinfo=timezone.utc)]
+    # This test uses the remote monitor's stable identity directly so the
+    # assertion covers the failure mode where only the elapsed age changes.
+    from tools.risk_wakeup_backup import BackupAlertMonitor, BackupConfig
+
+    remote_config = BackupConfig()
+    remote_config.enabled = True
+    remote_config.token = "token"
+    remote_config.expected_node_id = "vps-a"
+    remote = BackupAlertMonitor(
+        config=remote_config,
+        heartbeat_path=tmp_path / "missing-heartbeat.json",
+        state_path=tmp_path / "remote-state.json",
+        bark=FakeBark(),
+        feishu=FakeFeishu(),
+        telegram=FakeTelegram(),
+        clock=lambda: current[0],
+    )
+    remote.memory["seen_heartbeat"] = True
+    first = remote._desired_incidents(current[0])["remote_heartbeat_stale"]
+    current[0] += timedelta(seconds=60)
+    second = remote._desired_incidents(current[0])["remote_heartbeat_stale"]
+
+    assert first["incident_signature"] == second["incident_signature"]
 
 
 def test_stale_reference_alert_waits_while_recovery_is_in_progress() -> None:
