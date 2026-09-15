@@ -365,6 +365,27 @@ def test_stale_reference_feed_is_critical_with_exposure() -> None:
     assert "参考价流已连续失联" in critical.message
 
 
+def test_stale_reference_alert_waits_while_recovery_is_in_progress() -> None:
+    now = datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc)
+    incidents = evaluate_incidents(
+        state={"status": "open", "asset": "ETH", "open_lots": [{"lot_id": 1}]},
+        risk_health={
+            "updated_at": now.isoformat(),
+            "risk_action": "normal",
+            "variational_reference_quote_fresh": False,
+            "variational_reference_quote_stale_seconds": 900,
+            "variational_reference_feed_recovery_state": "waiting_for_fresh_data",
+            "variational_reference_feed_recovery_attempt": 1,
+        },
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=now,
+    )
+
+    assert incidents == []
+
+
 def test_feed_only_critical_rearm_also_suppresses_flat_warning(tmp_path) -> None:
     current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
     watchdog = build_watchdog(
@@ -453,7 +474,7 @@ def test_stale_reference_feed_rearms_without_recovery_spam(tmp_path) -> None:
     assert len(bark.sent) == 2
 
 
-def test_stale_reference_reload_is_one_shot_and_exposure_guarded() -> None:
+def test_stale_reference_reload_is_bounded_and_exposure_verified() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_basis_v4_mode = True
     runtime.live_inventory_collect_only = False
@@ -463,6 +484,11 @@ def test_stale_reference_reload_is_one_shot_and_exposure_guarded() -> None:
         "ETH": time.monotonic() - 121,
     }
     runtime.live_inventory_reference_feed_last_recovery_monotonic = {}
+    runtime.live_inventory_reference_feed_recovery_attempts = {}
+    runtime.live_inventory_reference_feed_recovery_state = {}
+    runtime.live_inventory_reference_feed_recovery_block_reason = {}
+    runtime.live_inventory_reference_feed_recovery_last_error = {}
+    runtime.live_inventory_reference_feed_recovery_reconcile_pending = set()
     runtime.live_inventory_reference_feed_recovery_inflight = set()
     runtime.logger = type(
         "Logger",
@@ -493,15 +519,93 @@ def test_stale_reference_reload_is_one_shot_and_exposure_guarded() -> None:
     assert len(calls) == 1
     assert calls[0]["payload"]["type"] == "VAR_API_RELOAD_PAGE"
 
-    runtime.live_inventory_open_lots = [{"lot_id": 1}]
+    runtime.live_inventory_open_lots = [
+        {
+            "lot_id": 1,
+            "qty": "0.01",
+            "direction": "short_var_long_lighter",
+        }
+    ]
     runtime.live_inventory_reference_feed_last_recovery_monotonic = {}
+    runtime.live_inventory_reference_feed_recovery_attempts = {}
+    runtime.fetch_variational_positions = lambda: _resolved(
+        {"ok": True, "positions": [{"asset": "ETH", "qty": "-0.01"}]}
+    )
+    runtime.fetch_lighter_account = lambda: _resolved(
+        {
+            "accounts": [
+                {
+                    "positions": [
+                        {"symbol": "ETH", "position": "0.01", "sign": 1}
+                    ]
+                }
+            ]
+        }
+    )
     asyncio.run(
         runtime.maybe_recover_stale_variational_reference_feed(
             asset="ETH",
             quote_age_ok=False,
         )
     )
-    assert len(calls) == 1
+    assert len(calls) == 2
+
+
+async def _resolved(value):
+    return value
+
+
+def test_reference_recovery_requires_post_reload_position_reconcile() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_collect_only = False
+    runtime.live_inventory_open_lots = [
+        {
+            "lot_id": 1,
+            "qty": "0.01",
+            "direction": "short_var_long_lighter",
+        }
+    ]
+    runtime.pending_live_inventory_actions_payload = lambda: []
+    runtime.live_inventory_reference_feed_stale_since_monotonic = {
+        "ETH": time.monotonic() - 121,
+    }
+    runtime.live_inventory_reference_feed_stale_since_at = {}
+    runtime.live_inventory_reference_feed_last_recovery_monotonic = {}
+    runtime.live_inventory_reference_feed_recovery_attempts = {"ETH": 1}
+    runtime.live_inventory_reference_feed_recovery_state = {
+        "ETH": "waiting_for_fresh_data"
+    }
+    runtime.live_inventory_reference_feed_recovery_block_reason = {}
+    runtime.live_inventory_reference_feed_recovery_last_error = {}
+    runtime.live_inventory_reference_feed_recovery_reconcile_pending = {"ETH"}
+    runtime.live_inventory_reference_feed_recovery_inflight = set()
+
+    runtime.fetch_variational_positions = lambda: _resolved(
+        {"ok": True, "positions": [{"asset": "ETH", "qty": "-0.01"}]}
+    )
+    runtime.fetch_lighter_account = lambda: _resolved(
+        {
+            "accounts": [
+                {
+                    "positions": [
+                        {"symbol": "ETH", "position": "0.01", "sign": 1}
+                    ]
+                }
+            ]
+        }
+    )
+
+    asyncio.run(
+        runtime.maybe_recover_stale_variational_reference_feed(
+            asset="ETH",
+            quote_age_ok=True,
+        )
+    )
+
+    assert runtime.live_inventory_reference_feed_recovery_reconcile_pending == set()
+    assert runtime.live_inventory_reference_feed_recovery_state["ETH"] == "healthy"
+    assert runtime.live_inventory_reference_feed_recovery_attempts == {}
 
 
 def build_watchdog(

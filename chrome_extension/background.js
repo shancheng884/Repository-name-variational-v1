@@ -614,6 +614,10 @@ async function handleCommandSocketMessage(data) {
     await handleVariationalApiCommand(payload, "READY", "VAR_API_READY_RESULT");
     return;
   }
+  if (type === "VAR_API_STREAM_HEALTH") {
+    handleVariationalStreamHealth(payload);
+    return;
+  }
   if (type === "VAR_API_PORTFOLIO") {
     await handleVariationalApiCommand(payload, "PORTFOLIO", "VAR_API_PORTFOLIO_RESULT");
     return;
@@ -677,6 +681,38 @@ async function handleVariationalPageReload(payload) {
       timestamp: nowIso()
     });
   }
+}
+
+function handleVariationalStreamHealth(payload) {
+  const requestId = payload.requestId;
+  const streams = Array.from(state.websocketMeta.entries()).map(
+    ([requestId, meta]) => ({
+      requestId,
+      url: meta.url,
+      matchedPattern: meta.matchedPattern || "",
+      createdAt: meta.createdAt || null,
+      lastFrameAt: meta.lastFrameAt || null,
+      frameCount: meta.frameCount || 0,
+      lastFrameDirection: meta.lastFrameDirection || null,
+      lastFrameError: meta.lastFrameError || null
+    })
+  );
+  commandForwarder.send({
+    type: "VAR_API_STREAM_HEALTH_RESULT",
+    requestId,
+    ok: true,
+    result: {
+      active: state.active,
+      attachedTabId: state.attachedTabId,
+      sockets: {
+        websocket: wsForwarder.status,
+        rest: restForwarder.status,
+        command: commandForwarder.status
+      },
+      streams
+    },
+    timestamp: nowIso()
+  });
 }
 
 async function handleVariationalApiCommand(payload, action, resultType) {
@@ -1449,6 +1485,10 @@ function forwardWebSocketFrame(direction, params) {
     return;
   }
 
+  meta.lastFrameAt = nowIso();
+  meta.lastFrameDirection = direction;
+  meta.frameCount = (meta.frameCount || 0) + 1;
+
   wsForwarder.send({
     kind: "ws_frame",
     direction,
@@ -1525,6 +1565,7 @@ async function handleDebuggerEvent(source, method, params) {
     if (!meta) {
       return;
     }
+    meta.lastFrameError = params.errorMessage || "Unknown WebSocket frame error";
     wsForwarder.send({
       kind: "ws_frame_error",
       requestId: params.requestId,

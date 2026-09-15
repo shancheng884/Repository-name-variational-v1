@@ -172,8 +172,10 @@ LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS = 21600
 LIVE_INVENTORY_ACCOUNT_RISK_INTERVAL_SECONDS = 15.0
 LIVE_INVENTORY_ACCOUNT_RISK_OPEN_INTERVAL_SECONDS = 5.0
 LIVE_INVENTORY_VARIATIONAL_PORTFOLIO_REFRESH_COOLDOWN_SECONDS = 3.0
-LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_AFTER_SECONDS = 120.0
-LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_COOLDOWN_SECONDS = 1800.0
+LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_AFTER_SECONDS = 30.0
+LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_RETRY_SECONDS = 45.0
+LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_MAX_ATTEMPTS = 2
+LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_EXECUTION_QUIET_SECONDS = 30.0
 LIVE_INVENTORY_VARIATIONAL_MAINTENANCE_RATE_FALLBACK = Decimal("0.10")
 LIVE_INVENTORY_LIGHTER_MAINTENANCE_RATE_FALLBACK = Decimal("0.012")
 # Only /quotes/indicative calls consume this budget. The last five RFQs are
@@ -2568,7 +2570,13 @@ class VariationalToLighterRuntime:
         self.live_inventory_reference_feed_stale_since_monotonic: dict[str, float] = {}
         self.live_inventory_reference_feed_stale_since_at: dict[str, str] = {}
         self.live_inventory_reference_feed_last_recovery_monotonic: dict[str, float] = {}
+        self.live_inventory_reference_feed_recovery_attempts: dict[str, int] = {}
+        self.live_inventory_reference_feed_recovery_state: dict[str, str] = {}
+        self.live_inventory_reference_feed_recovery_block_reason: dict[str, str] = {}
+        self.live_inventory_reference_feed_recovery_last_error: dict[str, str] = {}
+        self.live_inventory_reference_feed_recovery_reconcile_pending: set[str] = set()
         self.live_inventory_reference_feed_recovery_inflight: set[str] = set()
+        self.live_inventory_reference_feed_recovery_tasks: set[asyncio.Task[None]] = set()
 
         self.lighter_market_index = 0
         self.base_amount_multiplier = 0
@@ -5171,6 +5179,15 @@ class VariationalToLighterRuntime:
         reference_feed = await self.live_inventory_reference_feed_health(
             asset=asset,
         )
+        self.schedule_stale_variational_reference_feed_recovery(
+            asset=asset,
+            quote_age_ok=bool(
+                reference_feed.get("variational_reference_quote_fresh")
+            ),
+        )
+        reference_feed.update(
+            self.live_inventory_reference_feed_recovery_context(asset)
+        )
         payload = {
             "schema_version": 1,
             "updated_at": utc_now(),
@@ -5249,19 +5266,192 @@ class VariationalToLighterRuntime:
             ),
         }
 
+    def live_inventory_reference_feed_recovery_context(
+        self,
+        asset: str,
+    ) -> dict[str, Any]:
+        key = asset.upper()
+        attempts = getattr(
+            self,
+            "live_inventory_reference_feed_recovery_attempts",
+            {},
+        )
+        states = getattr(
+            self,
+            "live_inventory_reference_feed_recovery_state",
+            {},
+        )
+        block_reasons = getattr(
+            self,
+            "live_inventory_reference_feed_recovery_block_reason",
+            {},
+        )
+        last_errors = getattr(
+            self,
+            "live_inventory_reference_feed_recovery_last_error",
+            {},
+        )
+        return {
+            "variational_reference_feed_recovery_state": (
+                states.get(key) or "healthy"
+            ),
+            "variational_reference_feed_recovery_attempt": int(
+                attempts.get(key, 0) or 0
+            ),
+            "variational_reference_feed_recovery_block_reason": (
+                block_reasons.get(key)
+            ),
+            "variational_reference_feed_recovery_last_error": (
+                last_errors.get(key)
+            ),
+        }
+
+    def schedule_stale_variational_reference_feed_recovery(
+        self,
+        *,
+        asset: str,
+        quote_age_ok: bool,
+    ) -> None:
+        """Run recovery outside the account-risk writer so health stays fresh."""
+        if (
+            quote_age_ok
+            or not getattr(self, "live_inventory_basis_v4_mode", False)
+            or getattr(self, "live_inventory_collect_only", False)
+        ):
+            return
+        tasks = getattr(
+            self,
+            "live_inventory_reference_feed_recovery_tasks",
+            None,
+        )
+        if not isinstance(tasks, set):
+            tasks = set()
+            self.live_inventory_reference_feed_recovery_tasks = tasks
+        tasks.difference_update({task for task in tasks if task.done()})
+        if tasks:
+            return
+        task = asyncio.create_task(
+            self.maybe_recover_stale_variational_reference_feed(
+                asset=asset,
+                quote_age_ok=quote_age_ok,
+            )
+        )
+        tasks.add(task)
+
+        def recovery_task_done(completed: asyncio.Task[None]) -> None:
+            tasks.discard(completed)
+            if completed.cancelled():
+                return
+            with contextlib.suppress(Exception):
+                error = completed.exception()
+                if error is not None:
+                    self.logger.warning(
+                        "live_inventory_reference_feed_recovery_task_failed error=%s",
+                        f"{type(error).__name__}:{error}",
+                    )
+
+        task.add_done_callback(recovery_task_done)
+
+    async def verify_live_inventory_reference_recovery_positions(
+        self,
+        *,
+        asset: str,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """Verify read-only venue quantities before/after a page reload."""
+        asset = asset.upper()
+        try:
+            variational_result = await self.fetch_variational_positions()
+            if (
+                not isinstance(variational_result, dict)
+                or variational_result.get("ok") is False
+            ):
+                raise RuntimeError("invalid_variational_positions_response")
+            variational_qty = self.extract_variational_position_qty(
+                variational_result,
+                asset=asset,
+            )
+            lighter_result = await self.fetch_lighter_account()
+            lighter_qty = self.extract_lighter_position_qty(
+                lighter_result,
+                asset=asset,
+            )
+        except Exception as exc:
+            return (
+                False,
+                "reference_recovery_position_check_failed",
+                {"error": f"{type(exc).__name__}:{exc}"},
+            )
+
+        if variational_qty is None or lighter_qty is None:
+            return (
+                False,
+                "reference_recovery_position_check_failed",
+                {
+                    "variational_position_qty": decimal_to_str(variational_qty),
+                    "lighter_position_qty": decimal_to_str(lighter_qty),
+                },
+            )
+
+        open_lots = list(getattr(self, "live_inventory_open_lots", []) or [])
+        expected_qty = sum(
+            (to_decimal(lot.get("qty")) or Decimal("0") for lot in open_lots),
+            Decimal("0"),
+        )
+        tolerance = self.live_inventory_position_qty_tolerance(expected_qty)
+        context = {
+            "expected_open_qty": decimal_to_str(expected_qty),
+            "variational_position_qty": decimal_to_str(variational_qty),
+            "lighter_position_qty": decimal_to_str(lighter_qty),
+            "qty_tolerance": decimal_to_str(tolerance),
+        }
+        if not open_lots:
+            if abs(variational_qty) <= tolerance and abs(lighter_qty) <= tolerance:
+                return True, "verified_flat", context
+            return False, "reference_recovery_position_mismatch", context
+
+        directions = {
+            str(lot.get("direction") or "") for lot in open_lots
+        }
+        direction = next(iter(directions)) if len(directions) == 1 else None
+        expected_lighter_sign = (
+            Decimal("1")
+            if direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
+            else Decimal("-1")
+            if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+            else None
+        )
+        lighter_direction_matches = (
+            expected_lighter_sign is not None
+            and lighter_qty * expected_lighter_sign > 0
+        )
+        context.update(
+            {
+                "expected_direction": direction,
+                "lighter_direction_matches": lighter_direction_matches,
+            }
+        )
+        if (
+            expected_qty <= 0
+            or direction is None
+            or abs(variational_qty) - expected_qty > tolerance
+            or expected_qty - abs(variational_qty) > tolerance
+            or abs(lighter_qty) - expected_qty > tolerance
+            or expected_qty - abs(lighter_qty) > tolerance
+            or not lighter_direction_matches
+        ):
+            return False, "reference_recovery_position_mismatch", context
+        return True, "verified_open_state", context
+
     async def maybe_recover_stale_variational_reference_feed(
         self,
         *,
         asset: str,
         quote_age_ok: bool,
     ) -> None:
-        """Attempt one guarded page reload after a prolonged empty-book outage."""
+        """Recover a silent upstream stream without touching an active order."""
         if not getattr(self, "live_inventory_basis_v4_mode", False):
             return
         if getattr(self, "live_inventory_collect_only", False):
-            return
-        pending = self.pending_live_inventory_actions_payload()
-        if self.live_inventory_open_lots or pending:
             return
 
         key = asset.upper()
@@ -5273,6 +5463,14 @@ class VariationalToLighterRuntime:
         if not isinstance(stale_since, dict):
             stale_since = {}
             self.live_inventory_reference_feed_stale_since_monotonic = stale_since
+        stale_since_at = getattr(
+            self,
+            "live_inventory_reference_feed_stale_since_at",
+            None,
+        )
+        if not isinstance(stale_since_at, dict):
+            stale_since_at = {}
+            self.live_inventory_reference_feed_stale_since_at = stale_since_at
         last_recovery = getattr(
             self,
             "live_inventory_reference_feed_last_recovery_monotonic",
@@ -5281,6 +5479,46 @@ class VariationalToLighterRuntime:
         if not isinstance(last_recovery, dict):
             last_recovery = {}
             self.live_inventory_reference_feed_last_recovery_monotonic = last_recovery
+        attempts = getattr(
+            self,
+            "live_inventory_reference_feed_recovery_attempts",
+            None,
+        )
+        if not isinstance(attempts, dict):
+            attempts = {}
+            self.live_inventory_reference_feed_recovery_attempts = attempts
+        states = getattr(
+            self,
+            "live_inventory_reference_feed_recovery_state",
+            None,
+        )
+        if not isinstance(states, dict):
+            states = {}
+            self.live_inventory_reference_feed_recovery_state = states
+        block_reasons = getattr(
+            self,
+            "live_inventory_reference_feed_recovery_block_reason",
+            None,
+        )
+        if not isinstance(block_reasons, dict):
+            block_reasons = {}
+            self.live_inventory_reference_feed_recovery_block_reason = block_reasons
+        last_errors = getattr(
+            self,
+            "live_inventory_reference_feed_recovery_last_error",
+            None,
+        )
+        if not isinstance(last_errors, dict):
+            last_errors = {}
+            self.live_inventory_reference_feed_recovery_last_error = last_errors
+        reconcile_pending = getattr(
+            self,
+            "live_inventory_reference_feed_recovery_reconcile_pending",
+            None,
+        )
+        if not isinstance(reconcile_pending, set):
+            reconcile_pending = set()
+            self.live_inventory_reference_feed_recovery_reconcile_pending = reconcile_pending
         inflight = getattr(
             self,
             "live_inventory_reference_feed_recovery_inflight",
@@ -5293,21 +5531,110 @@ class VariationalToLighterRuntime:
         now_monotonic = time.monotonic()
         if quote_age_ok:
             stale_since.pop(key, None)
+            stale_since_at.pop(key, None)
+            if key in reconcile_pending:
+                verified, reason, context = (
+                    await self.verify_live_inventory_reference_recovery_positions(
+                        asset=key
+                    )
+                )
+                if not verified:
+                    states[key] = "reconciling"
+                    last_errors[key] = reason
+                    if reason == "reference_recovery_position_mismatch":
+                        states[key] = "failed"
+                        reconcile_pending.discard(key)
+                        await self.append_live_inventory_log(
+                            "live_inventory_reference_feed_recovery_position_mismatch",
+                            {"asset": key, **context},
+                        )
+                        await self.require_live_inventory_manual_review(
+                            asset=key,
+                            reason="reference_recovery_position_mismatch",
+                            context=context,
+                        )
+                    return
+                reconcile_pending.discard(key)
+            attempts.pop(key, None)
             last_recovery.pop(key, None)
+            block_reasons.pop(key, None)
+            last_errors.pop(key, None)
+            states[key] = "healthy"
             return
+
+        pending = self.pending_live_inventory_actions_payload()
+        if pending:
+            states[key] = "blocked_pending_action"
+            block_reasons[key] = "pending_live_inventory_action"
+            return
+        last_submit = getattr(
+            self,
+            "last_live_submit_monotonic_by_asset",
+            {},
+        ).get(key)
+        if last_submit is not None and (
+            now_monotonic - last_submit
+            < LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_EXECUTION_QUIET_SECONDS
+        ):
+            states[key] = "blocked_recent_submission"
+            block_reasons[key] = "recent_live_submission"
+            return
+
         stale_started = stale_since.setdefault(key, now_monotonic)
-        if now_monotonic - stale_started < LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_AFTER_SECONDS:
+        if (
+            now_monotonic - stale_started
+            < LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_AFTER_SECONDS
+        ):
+            states[key] = "stale_grace"
+            block_reasons.pop(key, None)
+            return
+        if key in inflight:
+            states[key] = "repairing"
+            return
+        attempt = int(attempts.get(key, 0) or 0)
+        if attempt >= LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_MAX_ATTEMPTS:
+            states[key] = "failed"
+            block_reasons[key] = "max_recovery_attempts_exhausted"
             return
         if (
             now_monotonic - last_recovery.get(key, 0.0)
-            < LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_COOLDOWN_SECONDS
+            < LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_RETRY_SECONDS
         ):
-            return
-        if key in inflight:
+            states[key] = "waiting_for_fresh_data"
             return
 
+        if getattr(self, "live_inventory_open_lots", None):
+            verified, reason, context = (
+                await self.verify_live_inventory_reference_recovery_positions(
+                    asset=key
+                )
+            )
+            if not verified:
+                last_recovery[key] = now_monotonic
+                last_errors[key] = reason
+                block_reasons[key] = reason
+                states[key] = (
+                    "failed"
+                    if reason == "reference_recovery_position_mismatch"
+                    else "blocked_position_check"
+                )
+                if reason == "reference_recovery_position_mismatch":
+                    await self.append_live_inventory_log(
+                        "live_inventory_reference_feed_recovery_position_mismatch",
+                        {"asset": key, **context},
+                    )
+                    await self.require_live_inventory_manual_review(
+                        asset=key,
+                        reason=reason,
+                        context=context,
+                    )
+                return
+
         inflight.add(key)
+        attempts[key] = attempt + 1
         last_recovery[key] = now_monotonic
+        states[key] = "repairing"
+        block_reasons.pop(key, None)
         request_id = uuid.uuid4().hex
         try:
             result = await asyncio.wait_for(
@@ -5321,19 +5648,32 @@ class VariationalToLighterRuntime:
                 ),
                 timeout=5.0,
             )
+            ok = bool(result.get("ok")) if isinstance(result, dict) else False
+            error = result.get("error") if isinstance(result, dict) else "invalid_result"
+            if ok:
+                states[key] = "waiting_for_fresh_data"
+                reconcile_pending.add(key)
+                last_errors.pop(key, None)
+            else:
+                states[key] = "reload_failed"
+                last_errors[key] = str(error)
             self.logger.info(
-                "live_inventory_reference_feed_recovery_attempt asset=%s ok=%s error=%s",
+                "live_inventory_reference_feed_recovery_attempt asset=%s attempt=%s ok=%s error=%s",
                 key,
-                bool(result.get("ok")) if isinstance(result, dict) else False,
-                result.get("error") if isinstance(result, dict) else "invalid_result",
+                attempts[key],
+                ok,
+                error,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            states[key] = "reload_failed"
+            last_errors[key] = f"{type(exc).__name__}:{exc}"
             self.logger.warning(
-                "live_inventory_reference_feed_recovery_failed asset=%s error=%s",
+                "live_inventory_reference_feed_recovery_failed asset=%s attempt=%s error=%s",
                 key,
-                f"{type(exc).__name__}:{exc}",
+                attempts[key],
+                last_errors[key],
             )
         finally:
             inflight.discard(key)
@@ -24092,6 +24432,22 @@ class VariationalToLighterRuntime:
                     *account_snapshot_tasks,
                     return_exceptions=True,
                 )
+
+        reference_feed_recovery_tasks = list(
+            getattr(
+                self,
+                "live_inventory_reference_feed_recovery_tasks",
+                set(),
+            )
+        )
+        for task in reference_feed_recovery_tasks:
+            if not task.done():
+                task.cancel()
+        if reference_feed_recovery_tasks:
+            await asyncio.gather(
+                *reference_feed_recovery_tasks,
+                return_exceptions=True,
+            )
 
         external_reference_task = getattr(
             self,

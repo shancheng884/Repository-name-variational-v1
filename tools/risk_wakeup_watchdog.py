@@ -171,6 +171,7 @@ class WatchdogConfig:
     reference_feed_flat_stale_seconds: float = 120.0
     reference_feed_exposure_stale_seconds: float = 60.0
     reference_feed_rearm_seconds: float = 1800.0
+    reference_feed_recovery_max_attempts: int = 2
 
     @classmethod
     def from_env(cls) -> "WatchdogConfig":
@@ -226,6 +227,10 @@ class WatchdogConfig:
             reference_feed_rearm_seconds=max(
                 0.0,
                 env_float("RISK_WAKEUP_REFERENCE_FEED_REARM_SECONDS", 1800.0),
+            ),
+            reference_feed_recovery_max_attempts=max(
+                1,
+                env_int("RISK_WAKEUP_REFERENCE_FEED_RECOVERY_MAX_ATTEMPTS", 2),
             ),
         )
 
@@ -539,10 +544,31 @@ def evaluate_incidents(
             if exposure
             else config.reference_feed_flat_stale_seconds
         )
+        recovery_state = str(
+            risk_health.get("variational_reference_feed_recovery_state") or ""
+        ).strip().lower()
+        try:
+            recovery_attempt = int(
+                risk_health.get(
+                    "variational_reference_feed_recovery_attempt",
+                    0,
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            recovery_attempt = 0
+        recovery_in_progress = recovery_state in {
+            "stale_grace",
+            "repairing",
+            "waiting_for_fresh_data",
+            "reconciling",
+            "reload_failed",
+        } and recovery_attempt <= config.reference_feed_recovery_max_attempts
         if (
             not reference_fresh
             and reference_stale_seconds is not None
             and reference_stale_seconds >= stale_limit
+            and not recovery_in_progress
         ):
             incident_message = (
                 f"{asset}：Variational 参考价流已连续失联，"
