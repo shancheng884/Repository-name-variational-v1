@@ -784,7 +784,7 @@ def test_live_tool_reset_state_allows_next_reversion_cycle(tmp_path, monkeypatch
     assert "--live-inventory-reset-state-after-manual-flat" in command
 
 
-def test_live_tool_explicit_reset_refuses_open_lots_and_pending_actions(
+def test_live_tool_explicit_reset_allows_confirmed_flat_cleanup_of_old_state(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -808,8 +808,11 @@ def test_live_tool_explicit_reset_refuses_open_lots_and_pending_actions(
         reset_state_after_manual_flat=True,
     )
 
-    assert ok is False
-    assert message == "reset_refuses_open_lots count=1 asset=ETH"
+    assert ok is True
+    assert "state=manual_review_required" in message
+    assert "open_lots=1" in message
+    assert "pending_actions=1" in message
+    assert "local_state_backup_required=true" in message
 
 
 def test_live_tool_corrects_flat_status_when_open_lots_exist(
@@ -839,8 +842,8 @@ def test_live_tool_corrects_flat_status_when_open_lots_exist(
         resume_open_position=True,
     )
 
-    assert reset_ok is False
-    assert "reset_refuses_open_lots" in reset_message
+    assert reset_ok is True
+    assert "local_state_backup_required=true" in reset_message
     assert resume_ok is True
     assert "state=open" in resume_message
 

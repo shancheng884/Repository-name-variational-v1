@@ -12233,6 +12233,22 @@ class VariationalToLighterRuntime:
         tmp_path.write_text(json.dumps(row, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         tmp_path.replace(self.live_inventory_state_file)
 
+    def backup_live_inventory_state_for_manual_flat_reset(self) -> Path | None:
+        state_file = self.live_inventory_state_file
+        if state_file is None or not state_file.exists():
+            return None
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = state_file.with_name(
+            f"{state_file.name}.before_manual_flat_reset.{timestamp}.bak"
+        )
+        if backup_path.exists():
+            backup_path = state_file.with_name(
+                f"{state_file.name}.before_manual_flat_reset."
+                f"{timestamp}.{uuid.uuid4().hex[:8]}.bak"
+            )
+        shutil.copy2(state_file, backup_path)
+        return backup_path
+
     async def write_live_inventory_state_async(self, state: dict[str, Any]) -> None:
         # Freeze mutable lot/pending lists before the first await. Otherwise a
         # later trade callback can mutate the object while the file writer is
@@ -12491,6 +12507,7 @@ class VariationalToLighterRuntime:
         passed: list[str] = []
         warnings: list[str] = []
         blocking_errors: list[str] = []
+        manual_flat_reset_requested = False
 
         output_dir = getattr(self, "output_dir", OUTPUT_DIR.expanduser().resolve())
         forwarder_host = getattr(self, "forwarder_host", FORWARDER_HOST)
@@ -12651,26 +12668,16 @@ class VariationalToLighterRuntime:
                         else []
                     )
                     if self.live_inventory_reset_state_after_manual_flat:
-                        if open_lots or pending_actions:
+                        if state_status not in {"flat", "open", "pending", "manual_review_required"}:
                             blocking_errors.append(
-                                "live_inventory_state_reset_refuses_positions_or_actions: "
+                                "live_inventory_state_reset_refuses_state: "
                                 + self.live_inventory_state_summary(state)
-                                + f" pending_actions={len(pending_actions)}"
                             )
                         else:
-                            self.write_live_inventory_state(
-                                {
-                                    "status": "flat",
-                                    "asset": self.live_inventory_state_asset(),
-                                    "next_lot_id": 1,
-                                    "open_lots": [],
-                                    "pending_actions": [],
-                                    "realized_pnl_usd": "0",
-                                    "completed_cycles": 0,
-                                    "reason": "manual_flat_start_reset",
-                                }
+                            manual_flat_reset_requested = True
+                            passed.append(
+                                "live_inventory_state_reset_after_manual_flat_pending_strict_reconcile"
                             )
-                            passed.append("live_inventory_state_reset_after_manual_flat")
                     elif state_status == "flat":
                         passed.append("live_inventory_state_flat")
                     else:
@@ -12735,6 +12742,32 @@ class VariationalToLighterRuntime:
                 passed.append("lighter_private_key_present")
             else:
                 blocking_errors.append("LIGHTER_PRIVATE_KEY or API_KEY_PRIVATE_KEY is not set")
+
+        if manual_flat_reset_requested and not blocking_errors:
+            try:
+                backup_path = self.backup_live_inventory_state_for_manual_flat_reset()
+                self.write_live_inventory_state(
+                    {
+                        "status": "flat",
+                        "asset": self.live_inventory_state_asset(),
+                        "next_lot_id": 1,
+                        "open_lots": [],
+                        "pending_actions": [],
+                        "realized_pnl_usd": "0",
+                        "completed_cycles": 0,
+                        "reason": "manual_flat_start_reset",
+                        "reset_source_status": state_status,
+                    }
+                )
+                passed.append("live_inventory_state_reset_after_manual_flat")
+                passed.append(
+                    "live_inventory_state_backup="
+                    + (str(backup_path) if backup_path is not None else "not_needed")
+                )
+            except Exception as exc:
+                blocking_errors.append(
+                    f"live_inventory_state_reset_failed: {type(exc).__name__}: {exc}"
+                )
 
         return StartupDiagnostics(
             passed=passed,

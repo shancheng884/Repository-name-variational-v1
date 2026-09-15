@@ -337,6 +337,12 @@ python tools/live.py --asset ETH --v4-live --v4-real-gradient \
   --reset-state-after-manual-flat
 ```
 
+`--reset-state-after-manual-flat` is an explicit operator confirmation that both
+venues were manually checked flat. When an old local journal still contains
+lots or pending actions, startup backs it up, resets it to flat, and then runs
+the strict two-venue reconciliation before enabling entries. If either venue
+is not flat or cannot be queried, startup remains fail-closed.
+
 Continuous mode records a checkpoint every time the whole portfolio returns to
 flat, then rearms and starts another episode. `max_cycles=0` is accepted only
 with this explicit real-gradient mode. The cumulative run-loss fuse, account

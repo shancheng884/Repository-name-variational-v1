@@ -178,7 +178,14 @@ def test_live_inventory_state_reset_allows_startup_after_manual_flat(tmp_path, m
     runtime.live_inventory_dry_decisions = True
     runtime.live_inventory_i_confirm_flat_start = True
     runtime.live_inventory_reset_state_after_manual_flat = True
-    runtime.write_live_inventory_state({"status": "manual_review_required", "asset": "BTC", "open_lots": []})
+    runtime.write_live_inventory_state(
+        {
+            "status": "manual_review_required",
+            "asset": "BTC",
+            "open_lots": [{"lot_id": 1, "qty": "0.0001"}],
+            "pending_actions": [{"lot_id": 1, "role": "live_inventory_exit"}],
+        }
+    )
 
     diagnostics = runtime.run_startup_diagnostics()
     state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
@@ -188,6 +195,7 @@ def test_live_inventory_state_reset_allows_startup_after_manual_flat(tmp_path, m
     assert state["status"] == "flat"
     assert state["asset"] == runtime.live_inventory_state_asset()
     assert state["open_lots"] == []
+    assert list(tmp_path.glob("live_inventory_state.json.before_manual_flat_reset.*.bak"))
 
 
 def test_live_inventory_real_submit_allows_startup_when_state_flat(tmp_path, monkeypatch) -> None:

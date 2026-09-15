@@ -245,22 +245,17 @@ def validate_state(
         )
 
     if reset_state_after_manual_flat and not collect_only:
-        if open_lots:
+        if status not in {"flat", "open", "pending", "manual_review_required"}:
             return (
                 False,
-                f"reset_refuses_open_lots count={len(open_lots)} asset={asset}",
-            )
-        if pending_actions:
-            return (
-                False,
-                "reset_refuses_pending_actions "
-                f"count={len(pending_actions)} asset={asset}",
+                f"reset_refuses_state status={status} asset={asset}",
             )
         return (
             True,
             f"state={status} asset={asset} open_lots={len(open_lots)} "
             f"pending_actions={len(pending_actions)} completed_cycles={completed_cycles} "
-            "reset_after_manual_flat_requested exchange_reconcile_required=true",
+            "reset_after_manual_flat_requested local_state_backup_required=true "
+            "exchange_reconcile_required=true",
         )
     if status != "flat":
         return False, f"state_not_flat status={status} asset={asset}"
