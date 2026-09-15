@@ -225,6 +225,7 @@ class WatchdogConfig:
     reference_feed_exposure_stale_seconds: float = 60.0
     reference_feed_rearm_seconds: float = 1800.0
     reference_feed_recovery_max_attempts: int = 2
+    account_risk_rearm_seconds: float = 900.0
 
     @classmethod
     def from_env(cls) -> "WatchdogConfig":
@@ -284,6 +285,10 @@ class WatchdogConfig:
             reference_feed_recovery_max_attempts=max(
                 1,
                 env_int("RISK_WAKEUP_REFERENCE_FEED_RECOVERY_MAX_ATTEMPTS", 2),
+            ),
+            account_risk_rearm_seconds=max(
+                0.0,
+                env_float("RISK_WAKEUP_ACCOUNT_RISK_REARM_SECONDS", 900.0),
             ),
         )
 
@@ -517,9 +522,25 @@ def evaluate_incidents(
             )
         )
 
-    action = str(risk_health.get("risk_action") or "normal")
-    risk_reason = str(risk_health.get("risk_reason") or "account_risk_normal")
-    if action in {"force_reduce", "emergency_exit"}:
+    raw_action = str(risk_health.get("risk_action") or "normal")
+    raw_reason = str(risk_health.get("risk_reason") or "account_risk_normal")
+    notification_action = str(
+        risk_health.get("risk_notification_action") or raw_action
+    )
+    notification_reason = str(
+        risk_health.get("risk_notification_reason") or raw_reason
+    )
+    action = (
+        raw_action
+        if raw_action in {"force_reduce", "emergency_exit"}
+        else notification_action
+    )
+    risk_reason = (
+        raw_reason
+        if raw_action in {"force_reduce", "emergency_exit"}
+        else notification_reason
+    )
+    if raw_action in {"force_reduce", "emergency_exit"}:
         margin = risk_health.get("max_maintenance_margin_usage_pct")
         leverage = risk_health.get("max_projected_venue_leverage")
         incidents.append(
@@ -551,6 +572,7 @@ def evaluate_incidents(
                 title="套利账户风险提醒",
                 message=f"{asset}：动作 {action}，原因 {risk_reason}。",
                 alert_params=(asset, "账户风险提醒"),
+                rearm_seconds=config.account_risk_rearm_seconds,
             )
         )
 

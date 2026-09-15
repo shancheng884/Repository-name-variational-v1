@@ -168,6 +168,45 @@ def test_recent_degraded_account_snapshot_does_not_raise_incident() -> None:
     assert incidents == []
 
 
+def test_watchdog_uses_debounced_account_risk_notification_state() -> None:
+    now = datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc)
+    base = {
+        "updated_at": now.isoformat(),
+        "risk_action": "warning",
+        "risk_reason": "venue_equity_imbalance_warning",
+    }
+
+    assert evaluate_incidents(
+        state={"status": "flat", "asset": "ETH", "open_lots": []},
+        risk_health={
+            **base,
+            "risk_notification_action": "normal",
+            "risk_notification_reason": "account_risk_normal",
+        },
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=now,
+    ) == []
+
+    incidents = evaluate_incidents(
+        state={"status": "flat", "asset": "ETH", "open_lots": []},
+        risk_health={
+            **base,
+            "risk_notification_action": "warning",
+            "risk_notification_reason": "venue_equity_imbalance_warning",
+        },
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=now,
+    )
+    assert [item.key for item in incidents] == [
+        "account_risk:warning:venue_equity_imbalance_warning"
+    ]
+    assert incidents[0].rearm_seconds == 900
+
+
 def test_empty_pending_intent_does_not_raise_stale_action_incident() -> None:
     now = datetime(2026, 8, 30, 0, 1, tzinfo=timezone.utc)
     incidents = evaluate_incidents(

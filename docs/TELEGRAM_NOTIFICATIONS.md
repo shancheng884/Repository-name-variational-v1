@@ -21,6 +21,11 @@ code:
 TELEGRAM_ALERT_THROTTLE_SECONDS=1800
 ```
 
+Account-risk warning and recovery notifications are owned by the independent
+risk watchdog. The live strategy records those events but does not send a
+second Telegram copy, preventing duplicate messages when both monitors are
+running.
+
 Notification delivery uses a background queue. Telegram latency or failure does
 not block exchange submission, change strategy decisions, or stop the runtime.
 

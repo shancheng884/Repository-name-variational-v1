@@ -210,6 +210,15 @@ LIVE_INVENTORY_ENTRY_BLOCKED_LOG_THROTTLE_SECONDS = 30.0
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_MAX_AGE_SECONDS = 60.0
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_USABLE_MAX_AGE_SECONDS = 300.0
 LIVE_INVENTORY_ACCOUNT_RECOVERY_CONFIRM_SAMPLES = 3
+LIVE_INVENTORY_ACCOUNT_RISK_NOTIFICATION_CONFIRM_SAMPLES = 2
+LIVE_INVENTORY_ACCOUNT_RISK_NOTIFICATION_RECOVERY_SAMPLES = 3
+LIVE_INVENTORY_ACCOUNT_RISK_IMBALANCE_CLEAR_BUFFER = Decimal("0.02")
+LIVE_INVENTORY_WATCHDOG_OWNED_NOTIFICATION_EVENTS = frozenset(
+    {
+        "live_inventory_account_risk_alert",
+        "live_inventory_account_risk_recovered",
+    }
+)
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS = 5
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_CHILD_LOTS = 25
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MIN_TIER_SPACING_BPS = Decimal("0.25")
@@ -746,6 +755,146 @@ def account_risk_context(
         "margin_emergency_pct": decimal_to_str(margin_emergency_pct),
         "balance_warning_ratio": decimal_to_str(balance_warning_ratio),
         "balance_block_ratio": decimal_to_str(balance_block_ratio),
+    }
+
+
+def account_risk_notification_transition(
+    *,
+    current_action: str,
+    current_reason: str,
+    pending_reason: str | None,
+    warning_confirm_count: int,
+    recovery_confirm_count: int,
+    risk_action: str,
+    risk_reason: str,
+    context: dict[str, Any],
+    warning_confirm_samples: int = (
+        LIVE_INVENTORY_ACCOUNT_RISK_NOTIFICATION_CONFIRM_SAMPLES
+    ),
+    recovery_confirm_samples: int = (
+        LIVE_INVENTORY_ACCOUNT_RISK_NOTIFICATION_RECOVERY_SAMPLES
+    ),
+    imbalance_clear_buffer: Decimal = (
+        LIVE_INVENTORY_ACCOUNT_RISK_IMBALANCE_CLEAR_BUFFER
+    ),
+) -> dict[str, Any]:
+    """Debounce advisory account-risk notifications without weakening safety actions."""
+    current_action = str(current_action or "normal")
+    current_reason = str(current_reason or "account_risk_normal")
+    risk_action = str(risk_action or "normal")
+    risk_reason = str(risk_reason or "account_risk_normal")
+    warning_confirm_samples = max(1, int(warning_confirm_samples))
+    recovery_confirm_samples = max(1, int(recovery_confirm_samples))
+
+    critical_actions = {"force_reduce", "emergency_exit"}
+    advisory_actions = {"warning", "block_entry"}
+    event: str | None = None
+
+    if risk_action in critical_actions:
+        if current_action != risk_action or current_reason != risk_reason:
+            event = "alert"
+        return {
+            "notification_action": risk_action,
+            "notification_reason": risk_reason,
+            "notification_pending_reason": None,
+            "notification_warning_confirm_count": 0,
+            "notification_recovery_confirm_count": 0,
+            "notification_event": event,
+        }
+
+    if risk_action in advisory_actions:
+        if current_action in critical_actions:
+            return {
+                "notification_action": current_action,
+                "notification_reason": current_reason,
+                "notification_pending_reason": None,
+                "notification_warning_confirm_count": 0,
+                "notification_recovery_confirm_count": 0,
+                "notification_event": None,
+            }
+        if current_action in advisory_actions and current_reason == risk_reason:
+            return {
+                "notification_action": current_action,
+                "notification_reason": current_reason,
+                "notification_pending_reason": None,
+                "notification_warning_confirm_count": warning_confirm_count,
+                "notification_recovery_confirm_count": 0,
+                "notification_event": None,
+            }
+
+        next_warning_count = (
+            warning_confirm_count + 1
+            if pending_reason == risk_reason
+            else 1
+        )
+        if next_warning_count < warning_confirm_samples:
+            return {
+                "notification_action": (
+                    current_action
+                    if current_action in advisory_actions
+                    else "normal"
+                ),
+                "notification_reason": (
+                    current_reason
+                    if current_action in advisory_actions
+                    else "account_risk_normal"
+                ),
+                "notification_pending_reason": risk_reason,
+                "notification_warning_confirm_count": next_warning_count,
+                "notification_recovery_confirm_count": 0,
+                "notification_event": None,
+            }
+        return {
+            "notification_action": risk_action,
+            "notification_reason": risk_reason,
+            "notification_pending_reason": None,
+            "notification_warning_confirm_count": next_warning_count,
+            "notification_recovery_confirm_count": 0,
+            "notification_event": "alert",
+        }
+
+    if current_action in critical_actions or current_action in advisory_actions:
+        clear = True
+        if current_reason in {
+            "venue_equity_imbalance_warning",
+            "venue_equity_imbalance_blocks_entry",
+        }:
+            balance_ratio = to_decimal(context.get("equity_balance_ratio"))
+            warning_ratio = to_decimal(context.get("balance_warning_ratio"))
+            clear = bool(
+                balance_ratio is not None
+                and warning_ratio is not None
+                and balance_ratio
+                >= min(Decimal("0.99"), warning_ratio + imbalance_clear_buffer)
+            )
+        if not clear:
+            return {
+                "notification_action": current_action,
+                "notification_reason": current_reason,
+                "notification_pending_reason": None,
+                "notification_warning_confirm_count": warning_confirm_count,
+                "notification_recovery_confirm_count": 0,
+                "notification_event": None,
+            }
+        next_recovery_count = recovery_confirm_count + 1
+        if next_recovery_count < recovery_confirm_samples:
+            return {
+                "notification_action": current_action,
+                "notification_reason": current_reason,
+                "notification_pending_reason": None,
+                "notification_warning_confirm_count": warning_confirm_count,
+                "notification_recovery_confirm_count": next_recovery_count,
+                "notification_event": None,
+            }
+        event = "recovered"
+
+    return {
+        "notification_action": "normal",
+        "notification_reason": "account_risk_normal",
+        "notification_pending_reason": None,
+        "notification_warning_confirm_count": 0,
+        "notification_recovery_confirm_count": 0,
+        "notification_event": event,
     }
 
 
@@ -2272,7 +2421,11 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_batch_halted_reason: str | None = None
         self.live_inventory_account_risk_exit_reason: str | None = None
         self.live_inventory_account_risk_exit_action: str | None = None
-        self.live_inventory_account_risk_last_alert_key: tuple[str, str] | None = None
+        self.live_inventory_account_risk_notification_action = "normal"
+        self.live_inventory_account_risk_notification_reason = "account_risk_normal"
+        self.live_inventory_account_risk_notification_pending_reason: str | None = None
+        self.live_inventory_account_risk_notification_warning_confirm_count = 0
+        self.live_inventory_account_risk_notification_recovery_confirm_count = 0
         self.live_inventory_account_risk_task: asyncio.Task[None] | None = None
         self.live_inventory_account_risk_latest_context: dict[str, Any] = {}
         self.live_inventory_account_recovery_required = bool(
@@ -4898,6 +5051,79 @@ class VariationalToLighterRuntime:
             if hasattr(direction_window, "clear"):
                 direction_window.clear()
 
+    def update_live_inventory_account_risk_notification(
+        self,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        transition = account_risk_notification_transition(
+            current_action=(
+                getattr(
+                    self,
+                    "live_inventory_account_risk_notification_action",
+                    "normal",
+                )
+            ),
+            current_reason=(
+                getattr(
+                    self,
+                    "live_inventory_account_risk_notification_reason",
+                    "account_risk_normal",
+                )
+            ),
+            pending_reason=getattr(
+                self,
+                "live_inventory_account_risk_notification_pending_reason",
+                None,
+            ),
+            warning_confirm_count=int(
+                getattr(
+                    self,
+                    "live_inventory_account_risk_notification_warning_confirm_count",
+                    0,
+                )
+            ),
+            recovery_confirm_count=int(
+                getattr(
+                    self,
+                    "live_inventory_account_risk_notification_recovery_confirm_count",
+                    0,
+                )
+            ),
+            risk_action=str(context.get("risk_action") or "normal"),
+            risk_reason=str(context.get("risk_reason") or "account_risk_normal"),
+            context=context,
+        )
+        self.live_inventory_account_risk_notification_action = str(
+            transition["notification_action"]
+        )
+        self.live_inventory_account_risk_notification_reason = str(
+            transition["notification_reason"]
+        )
+        self.live_inventory_account_risk_notification_pending_reason = (
+            transition.get("notification_pending_reason")
+        )
+        self.live_inventory_account_risk_notification_warning_confirm_count = int(
+            transition["notification_warning_confirm_count"]
+        )
+        self.live_inventory_account_risk_notification_recovery_confirm_count = int(
+            transition["notification_recovery_confirm_count"]
+        )
+        return {
+            **context,
+            "risk_notification_action": transition["notification_action"],
+            "risk_notification_reason": transition["notification_reason"],
+            "risk_notification_pending_reason": transition.get(
+                "notification_pending_reason"
+            ),
+            "risk_notification_warning_confirm_count": transition[
+                "notification_warning_confirm_count"
+            ],
+            "risk_notification_recovery_confirm_count": transition[
+                "notification_recovery_confirm_count"
+            ],
+            "risk_notification_event": transition.get("notification_event"),
+        }
+
     async def live_inventory_account_risk_context(
         self,
         *,
@@ -5142,8 +5368,11 @@ class VariationalToLighterRuntime:
     async def live_inventory_account_risk_loop(self) -> None:
         while not self.stop_flag:
             try:
-                context = await self.live_inventory_account_risk_context(
+                raw_context = await self.live_inventory_account_risk_context(
                     advance_recovery_confirmation=True
+                )
+                context = self.update_live_inventory_account_risk_notification(
+                    raw_context
                 )
                 self.live_inventory_account_risk_latest_context = dict(context)
                 try:
@@ -5161,20 +5390,17 @@ class VariationalToLighterRuntime:
                 elif action not in {"force_reduce", "emergency_exit"}:
                     self.live_inventory_account_risk_exit_reason = None
                     self.live_inventory_account_risk_exit_action = None
-                alert_key = (action, reason)
-                if action != "normal" and alert_key != self.live_inventory_account_risk_last_alert_key:
-                    self.live_inventory_account_risk_last_alert_key = alert_key
+                notification_event = context.get("risk_notification_event")
+                if notification_event == "alert":
                     await self.append_live_inventory_log(
                         "live_inventory_account_risk_alert",
                         context,
                     )
-                elif action == "normal":
-                    if self.live_inventory_account_risk_last_alert_key is not None:
-                        await self.append_live_inventory_log(
-                            "live_inventory_account_risk_recovered",
-                            context,
-                        )
-                    self.live_inventory_account_risk_last_alert_key = None
+                elif notification_event == "recovered":
+                    await self.append_live_inventory_log(
+                        "live_inventory_account_risk_recovered",
+                        context,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -14753,6 +14979,7 @@ class VariationalToLighterRuntime:
         if (
             notifier is not None
             and not getattr(self, "live_inventory_dry_decisions", False)
+            and event_type not in LIVE_INVENTORY_WATCHDOG_OWNED_NOTIFICATION_EVENTS
         ):
             try:
                 notifier.enqueue(event_type, enriched_payload)
@@ -18674,12 +18901,7 @@ class VariationalToLighterRuntime:
                     proposed_notional_usd=proposed_total_notional_usd
                 )
                 risk_action = str(account_risk.get("risk_action") or "block_entry")
-                if risk_action == "warning":
-                    await self.append_live_inventory_log(
-                        "live_inventory_account_risk_alert",
-                        {**account_risk, "direction": direction},
-                    )
-                elif risk_action != "normal":
+                if risk_action != "normal":
                     self.live_inventory_basis_entry_confirm_counts.clear()
                     await self.block_live_inventory_entry(
                         asset=asset,

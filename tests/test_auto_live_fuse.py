@@ -24,6 +24,7 @@ from main import (
     VariationalMonitor,
     VariationalToLighterRuntime,
     account_risk_context,
+    account_risk_notification_transition,
     adaptive_margin_thresholds,
     account_snapshot_freshness,
     live_inventory_state_status,
@@ -608,6 +609,68 @@ def test_account_risk_recommends_rebalance_at_warning_threshold() -> None:
     assert context["rebalance_from_venue"] == "variational"
     assert context["rebalance_to_venue"] == "lighter"
     assert Decimal(context["rebalance_suggested_amount_usd"]) == Decimal("6.75")
+
+
+def test_account_risk_notification_debounces_and_uses_imbalance_hysteresis() -> None:
+    warning_context = {
+        "equity_balance_ratio": "0.8201",
+        "balance_warning_ratio": "0.82",
+    }
+    first = account_risk_notification_transition(
+        current_action="normal",
+        current_reason="account_risk_normal",
+        pending_reason=None,
+        warning_confirm_count=0,
+        recovery_confirm_count=0,
+        risk_action="warning",
+        risk_reason="venue_equity_imbalance_warning",
+        context=warning_context,
+    )
+    assert first["notification_event"] is None
+    assert first["notification_action"] == "normal"
+    assert first["notification_warning_confirm_count"] == 1
+
+    second = account_risk_notification_transition(
+        current_action=first["notification_action"],
+        current_reason=first["notification_reason"],
+        pending_reason=first["notification_pending_reason"],
+        warning_confirm_count=first["notification_warning_confirm_count"],
+        recovery_confirm_count=first["notification_recovery_confirm_count"],
+        risk_action="warning",
+        risk_reason="venue_equity_imbalance_warning",
+        context=warning_context,
+    )
+    assert second["notification_event"] == "alert"
+    assert second["notification_action"] == "warning"
+
+    not_clear = account_risk_notification_transition(
+        current_action=second["notification_action"],
+        current_reason=second["notification_reason"],
+        pending_reason=None,
+        warning_confirm_count=second["notification_warning_confirm_count"],
+        recovery_confirm_count=0,
+        risk_action="normal",
+        risk_reason="account_risk_normal",
+        context={**warning_context, "equity_balance_ratio": "0.83"},
+    )
+    assert not_clear["notification_action"] == "warning"
+    assert not_clear["notification_event"] is None
+
+    recovery = {**warning_context, "equity_balance_ratio": "0.84"}
+    current = not_clear
+    for expected_event in (None, None, "recovered"):
+        current = account_risk_notification_transition(
+            current_action=current["notification_action"],
+            current_reason=current["notification_reason"],
+            pending_reason=current["notification_pending_reason"],
+            warning_confirm_count=current["notification_warning_confirm_count"],
+            recovery_confirm_count=current["notification_recovery_confirm_count"],
+            risk_action="normal",
+            risk_reason="account_risk_normal",
+            context=recovery,
+        )
+        assert current["notification_event"] == expected_event
+    assert current["notification_action"] == "normal"
 
 
 def test_account_risk_blocks_new_notional_above_five_x_but_does_not_immediately_reduce() -> None:
@@ -4357,6 +4420,34 @@ def test_telegram_enqueue_failure_does_not_escape_live_log(tmp_path) -> None:
         ).splitlines()
     ]
     assert rows[-1]["event"] == "live_inventory_entered"
+
+
+def test_account_risk_notifications_are_owned_by_watchdog(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    telegram_events = []
+    runtime.telegram_notifier = SimpleNamespace(
+        enqueue=lambda event_type, payload: telegram_events.append(
+            (event_type, payload)
+        )
+    )
+
+    asyncio.run(
+        runtime.append_live_inventory_log(
+            "live_inventory_account_risk_alert",
+            {
+                "asset": "ETH",
+                "risk_action": "warning",
+                "risk_reason": "venue_equity_imbalance_warning",
+            },
+        )
+    )
+
+    assert telegram_events == []
+    rows = [
+        json.loads(line)
+        for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows[-1]["event"] == "live_inventory_account_risk_alert"
 
 
 def _eth_inventory_snapshot() -> CrossSpreadSnapshot:
