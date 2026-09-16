@@ -229,11 +229,18 @@ requires a fresh quote and confirmation of the previous pair of fills. There is
 no fixed delay between children. Each venue uses a rolling 60-second request
 window with normal capacity reserved below the hard capacity so reduce-only
 exits remain available. It is mutually exclusive with `--v4-shadow-gradient`.
+The optional `--v4-elastic-capacity` flag allows one additional USD 20 child
+order after cumulative tier 1 is full. That reserve slot is available only for
+the same locked direction, after the refreshed exact RFQ remains at least
+`0.25 bps` above the first-tier exact threshold and all normal fill and risk
+checks pass.
 
 Tier activation requires the latest observation and at least two of the latest
 three observations to reach that tier. The spacing between adjacent tiers is
 the maximum of the historical percentile difference, observed market noise,
-incremental depth cost, and recent paired-execution error. After a tier closes,
+and incremental depth cost. The total paired-execution error is already included
+in the first-tier execution reserve and is not charged again at every tier.
+After a tier closes,
 that tier must first fall below its threshold and then satisfy activation again
 before it can add new children.
 
@@ -333,7 +340,7 @@ continuous operation after acceptance, use the explicit continuous mode:
 
 ```bash
 python tools/live.py --asset ETH --v4-live --v4-real-gradient \
-  --v4-continuous --v4-test-skip-recent-health \
+  --v4-continuous --v4-elastic-capacity --v4-test-skip-recent-health \
   --reset-state-after-manual-flat
 ```
 

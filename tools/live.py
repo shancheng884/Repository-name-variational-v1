@@ -467,6 +467,7 @@ def build_main_command(
     v4_test_allow_weekend: bool = False,
     v4_shadow_gradient: bool = False,
     v4_real_gradient: bool = False,
+    v4_elastic_capacity: bool = False,
     v4_reverse_test: bool = False,
     v4_bidirectional: bool = False,
     v4_continuous: bool = False,
@@ -667,6 +668,8 @@ def build_main_command(
             command.append("--live-inventory-basis-v4-shadow-gradient")
         if v4_real_gradient:
             command.append("--live-inventory-basis-v4-real-gradient")
+        if v4_elastic_capacity:
+            command.append("--live-inventory-basis-v4-elastic-capacity")
         if v4_reverse_test:
             command.append("--live-inventory-basis-v4-reverse-test")
         if v4_bidirectional:
@@ -782,6 +785,14 @@ def main() -> int:
         "--v4-real-gradient",
         action="store_true",
         help="Enable five dynamic V4 leverage tiers using confirmed 20 USD child orders.",
+    )
+    parser.add_argument(
+        "--v4-elastic-capacity",
+        action="store_true",
+        help=(
+            "V4 real-gradient only: allow one guarded extra 20 USD child order "
+            "after the first cumulative tier is full."
+        ),
     )
     parser.add_argument(
         "--v4-reverse-test",
@@ -998,6 +1009,8 @@ def main() -> int:
         parser.error("--v4-real-gradient requires --v4-live")
     if args.v4_real_gradient and args.v4_shadow_gradient:
         parser.error("use only one of --v4-real-gradient or --v4-shadow-gradient")
+    if args.v4_elastic_capacity and not args.v4_real_gradient:
+        parser.error("--v4-elastic-capacity requires --v4-real-gradient")
     if args.v4_reverse_test and not config.v4_live_mode:
         parser.error("--v4-reverse-test requires --v4-live")
     if args.v4_reverse_test and (
@@ -1084,6 +1097,7 @@ def main() -> int:
             v4_test_allow_weekend=args.v4_test_allow_weekend,
             v4_shadow_gradient=args.v4_shadow_gradient,
             v4_real_gradient=args.v4_real_gradient,
+            v4_elastic_capacity=args.v4_elastic_capacity,
             v4_reverse_test=args.v4_reverse_test,
             v4_bidirectional=args.v4_bidirectional,
             v4_continuous=args.v4_continuous,

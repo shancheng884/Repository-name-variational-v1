@@ -35,6 +35,7 @@ from main import (
     v4_real_gradient_confirmed_tier,
     v4_real_gradient_eligible_tier,
     v4_real_gradient_entry_activation,
+    v4_real_gradient_elastic_capacity_child_lots,
     v4_real_gradient_sample_move_decision,
     v4_real_gradient_lot_groups,
     v4_real_gradient_slot_caps,
@@ -291,6 +292,31 @@ def test_v4_real_gradient_thresholds_respect_noise_and_depth_spacing() -> None:
     )
 
 
+def test_v4_real_gradient_thresholds_do_not_repeat_total_execution_error() -> None:
+    kwargs = {
+        "history_values": [Decimal(index) / Decimal("10") for index in range(1000)],
+        "base_threshold_bps": Decimal("97.4"),
+        "entry_execution_reserve_bps": Decimal("0.5"),
+        "actual_market_noise_bps": Decimal("0.3"),
+        "incremental_depth_cost_bps": Decimal("0.4"),
+    }
+
+    without_execution_error = v4_real_gradient_thresholds(
+        **kwargs,
+        recent_pair_execution_error_bps=None,
+    )
+    with_execution_error = v4_real_gradient_thresholds(
+        **kwargs,
+        recent_pair_execution_error_bps=Decimal("4.0"),
+    )
+
+    assert with_execution_error == without_execution_error
+    assert all(
+        right - left >= Decimal("0.4")
+        for left, right in zip(with_execution_error, with_execution_error[1:])
+    )
+
+
 def test_v4_real_gradient_entry_uses_latest_and_two_of_three() -> None:
     assert v4_real_gradient_confirmed_tier([0, 3], latest_tier=3) == 0
     assert v4_real_gradient_confirmed_tier([3, 0, 3], latest_tier=3) == 3
@@ -439,6 +465,39 @@ def test_v4_real_gradient_slot_caps_follow_dynamic_smaller_equity() -> None:
         child_notional_usd=Decimal("20"),
         max_venue_leverage=Decimal("5"),
     ) == [6, 12, 18, 24, 30]
+
+
+def test_v4_real_gradient_elastic_capacity_borrows_one_guarded_slot() -> None:
+    slot_caps = [5, 10, 15, 20, 25]
+
+    assert v4_real_gradient_elastic_capacity_child_lots(
+        tier=1,
+        slot_caps=slot_caps,
+        open_child_lots=4,
+        enabled=True,
+        addon_eligible=True,
+    ) == 5
+    assert v4_real_gradient_elastic_capacity_child_lots(
+        tier=1,
+        slot_caps=slot_caps,
+        open_child_lots=5,
+        enabled=True,
+        addon_eligible=True,
+    ) == 6
+    assert v4_real_gradient_elastic_capacity_child_lots(
+        tier=1,
+        slot_caps=slot_caps,
+        open_child_lots=5,
+        enabled=True,
+        addon_eligible=False,
+    ) == 5
+    assert v4_real_gradient_elastic_capacity_child_lots(
+        tier=2,
+        slot_caps=slot_caps,
+        open_child_lots=10,
+        enabled=True,
+        addon_eligible=True,
+    ) == 10
 
 
 def test_v4_partial_detier_selects_entire_highest_tier_only() -> None:

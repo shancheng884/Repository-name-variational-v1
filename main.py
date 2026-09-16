@@ -225,6 +225,8 @@ LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MIN_TIER_SPACING_BPS = Decimal("0.25")
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_SAMPLES = 2
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ENTRY_CONFIRM_WINDOW_SAMPLES = 3
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_STRONG_SINGLE_MIN_TIER = 3
+LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ELASTIC_MAX_BORROWED_CHILD_LOTS = 1
+LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ELASTIC_MIN_SURPLUS_BPS = Decimal("0.25")
 # A passive /prices edge is only a candidate estimate. These bounded samples
 # calibrate its directional error against the exact entry RFQ without allowing
 # the estimate to bypass the final exact-quote checks.
@@ -959,11 +961,13 @@ def v4_real_gradient_thresholds(
     incremental_depth_cost_bps: Decimal | None = None,
     recent_pair_execution_error_bps: Decimal | None = None,
 ) -> list[Decimal]:
+    # The absolute pair-execution error is already represented in the base
+    # execution reserve. Reusing it as every tier's spacing double-counts the
+    # same risk and makes upper tiers effectively unreachable.
     spacing_bps = max(
         LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MIN_TIER_SPACING_BPS,
         abs(actual_market_noise_bps or Decimal("0")),
         abs(incremental_depth_cost_bps or Decimal("0")),
-        abs(recent_pair_execution_error_bps or Decimal("0")),
     )
     thresholds = [base_threshold_bps]
     for percentile in LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_PERCENTILES[1:]:
@@ -1119,6 +1123,32 @@ def v4_real_gradient_capacity_notional_usd(
     if caps is None:
         return None
     return Decimal(caps[min(tier, len(caps)) - 1]) * child_notional_usd
+
+
+def v4_real_gradient_elastic_capacity_child_lots(
+    *,
+    tier: int,
+    slot_caps: list[int] | None,
+    open_child_lots: int,
+    enabled: bool,
+    addon_eligible: bool,
+) -> int | None:
+    """Allow one guarded reserve slot after the first cumulative tier is full."""
+    if not slot_caps or tier <= 0:
+        return None
+    base_capacity = slot_caps[min(tier, len(slot_caps)) - 1]
+    if (
+        not enabled
+        or not addon_eligible
+        or tier != 1
+        or open_child_lots < base_capacity
+    ):
+        return base_capacity
+    hard_next_capacity = slot_caps[min(2, len(slot_caps)) - 1]
+    return min(
+        hard_next_capacity,
+        base_capacity + LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ELASTIC_MAX_BORROWED_CHILD_LOTS,
+    )
 
 
 def v4_real_gradient_lot_groups(
@@ -2156,6 +2186,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_real_gradient = bool(
             args.live_inventory_basis_v4_real_gradient
         )
+        self.live_inventory_basis_v4_elastic_capacity = bool(
+            args.live_inventory_basis_v4_elastic_capacity
+        )
         self.live_inventory_basis_v4_reverse_test = bool(
             args.live_inventory_basis_v4_reverse_test
         )
@@ -2408,6 +2441,8 @@ class VariationalToLighterRuntime:
         if self.live_inventory_basis_v4_real_gradient:
             self.live_inventory_strategy_variant += "-real-gradient-5-tier-20usd"
             self.live_inventory_strategy_variant += "-tier3-single-probe"
+            if self.live_inventory_basis_v4_elastic_capacity:
+                self.live_inventory_strategy_variant += "-elastic-capacity-1lot"
         if self.live_inventory_basis_v4_reverse_test:
             self.live_inventory_strategy_variant += "-reverse-bounded-20usd"
         if self.live_inventory_basis_v4_bidirectional:
@@ -15471,6 +15506,7 @@ class VariationalToLighterRuntime:
             "live_inventory_basis_v4_test_allow_weekend",
             "live_inventory_basis_v4_shadow_gradient",
             "live_inventory_basis_v4_real_gradient",
+            "live_inventory_basis_v4_elastic_capacity",
             "live_inventory_basis_v4_reverse_test",
             "live_inventory_basis_v4_bidirectional",
             "live_inventory_basis_v4_continuous",
@@ -15608,7 +15644,9 @@ class VariationalToLighterRuntime:
                         "fresh_quote_previous_pair_final_fills_confirmed_rolling_rate_limit"
                     ),
                     "real_gradient_capacity_mode": (
-                        "dynamic_20usd_child_slots_from_fresh_smaller_equity"
+                        "dynamic_20usd_child_slots_from_fresh_smaller_equity_plus_one_guarded_elastic_slot"
+                        if self.live_inventory_basis_v4_elastic_capacity
+                        else "dynamic_20usd_child_slots_from_fresh_smaller_equity"
                     ),
                     "real_gradient_exit_mode": (
                         "independent_tier_group_net_profit_no_cross_tier_subsidy"
@@ -18299,6 +18337,9 @@ class VariationalToLighterRuntime:
         addon_direction: str | None = None
         gradient_capacity_usd: Decimal | None = None
         gradient_capacity_child_lots: int | None = None
+        base_gradient_capacity_child_lots: int | None = None
+        elastic_capacity_addon_eligible = False
+        elastic_capacity_surplus_bps: Decimal | None = None
         strong_single_probe = False
         strong_single_sample_move_recheck = False
         if (
@@ -19553,11 +19594,36 @@ class VariationalToLighterRuntime:
                             child_notional_usd=self.live_inventory_lot_notional_usd,
                             max_venue_leverage=self.live_inventory_max_venue_leverage,
                         )
-                        gradient_capacity_child_lots = (
+                        base_gradient_capacity_child_lots = (
                             gradient_slot_caps[real_gradient_tier - 1]
                             if gradient_slot_caps is not None
                             and real_gradient_tier > 0
                             else None
+                        )
+                        if (
+                            self.live_inventory_basis_v4_elastic_capacity
+                            and addon_direction == direction
+                            and real_gradient_tier == 1
+                            and base_gradient_capacity_child_lots is not None
+                            and len(self.live_inventory_open_lots)
+                            >= base_gradient_capacity_child_lots
+                            and exact_real_gradient_thresholds
+                        ):
+                            elastic_capacity_surplus_bps = (
+                                edge_bps - exact_real_gradient_thresholds[0]
+                            )
+                            elastic_capacity_addon_eligible = (
+                                elastic_capacity_surplus_bps
+                                >= LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ELASTIC_MIN_SURPLUS_BPS
+                            )
+                        gradient_capacity_child_lots = (
+                            v4_real_gradient_elastic_capacity_child_lots(
+                                tier=real_gradient_tier,
+                                slot_caps=gradient_slot_caps,
+                                open_child_lots=len(self.live_inventory_open_lots),
+                                enabled=self.live_inventory_basis_v4_elastic_capacity,
+                                addon_eligible=elastic_capacity_addon_eligible,
+                            )
                         )
                         gradient_capacity_usd = (
                             Decimal(gradient_capacity_child_lots)
@@ -19606,8 +19672,32 @@ class VariationalToLighterRuntime:
                                     ),
                                     "proposed_child_lots": proposed_child_lots,
                                     "gradient_slot_caps": gradient_slot_caps,
+                                    "gradient_base_capacity_child_lots": (
+                                        base_gradient_capacity_child_lots
+                                    ),
                                     "gradient_capacity_child_lots": (
                                         gradient_capacity_child_lots
+                                    ),
+                                    "gradient_elastic_capacity_enabled": (
+                                        self.live_inventory_basis_v4_elastic_capacity
+                                    ),
+                                    "gradient_elastic_capacity_addon_eligible": (
+                                        elastic_capacity_addon_eligible
+                                    ),
+                                    "gradient_elastic_capacity_surplus_bps": (
+                                        decimal_to_str(elastic_capacity_surplus_bps)
+                                    ),
+                                    "gradient_elastic_capacity_min_surplus_bps": (
+                                        decimal_to_str(
+                                            LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_ELASTIC_MIN_SURPLUS_BPS
+                                        )
+                                    ),
+                                    "gradient_elastic_capacity_borrowed_child_lots": (
+                                        max(
+                                            0,
+                                            (gradient_capacity_child_lots or 0)
+                                            - (base_gradient_capacity_child_lots or 0),
+                                        )
                                     ),
                                     "gradient_capacity_notional_usd": decimal_to_str(
                                         gradient_capacity_usd
@@ -20082,6 +20172,26 @@ class VariationalToLighterRuntime:
                             if self.live_inventory_basis_v4_real_gradient
                             else None
                         ),
+                        "entry_gradient_base_capacity_child_lots": (
+                            base_gradient_capacity_child_lots
+                            if self.live_inventory_basis_v4_real_gradient
+                            else None
+                        ),
+                        "entry_gradient_elastic_capacity_enabled": (
+                            self.live_inventory_basis_v4_elastic_capacity
+                            if self.live_inventory_basis_v4_real_gradient
+                            else False
+                        ),
+                        "entry_gradient_elastic_capacity_addon_eligible": (
+                            elastic_capacity_addon_eligible
+                            if self.live_inventory_basis_v4_real_gradient
+                            else False
+                        ),
+                        "entry_gradient_elastic_capacity_surplus_bps": (
+                            decimal_to_str(elastic_capacity_surplus_bps)
+                            if self.live_inventory_basis_v4_real_gradient
+                            else None
+                        ),
                         "entry_v4_baseline_window_seconds": (
                             v4_entry_context.get("v4_baseline_window_seconds")
                             if v4_mode
@@ -20482,6 +20592,26 @@ class VariationalToLighterRuntime:
                     ),
                     "entry_gradient_capacity_child_lots": (
                         gradient_capacity_child_lots
+                        if self.live_inventory_basis_v4_real_gradient
+                        else None
+                    ),
+                    "entry_gradient_base_capacity_child_lots": (
+                        base_gradient_capacity_child_lots
+                        if self.live_inventory_basis_v4_real_gradient
+                        else None
+                    ),
+                    "entry_gradient_elastic_capacity_enabled": (
+                        self.live_inventory_basis_v4_elastic_capacity
+                        if self.live_inventory_basis_v4_real_gradient
+                        else False
+                    ),
+                    "entry_gradient_elastic_capacity_addon_eligible": (
+                        elastic_capacity_addon_eligible
+                        if self.live_inventory_basis_v4_real_gradient
+                        else False
+                    ),
+                    "entry_gradient_elastic_capacity_surplus_bps": (
+                        decimal_to_str(elastic_capacity_surplus_bps)
                         if self.live_inventory_basis_v4_real_gradient
                         else None
                     ),
@@ -25767,6 +25897,15 @@ def parse_args() -> argparse.Namespace:
         help="Enable five dynamic leverage tiers using confirmed 20 USD child orders.",
     )
     parser.add_argument(
+        "--live-inventory-basis-v4-elastic-capacity",
+        action="store_true",
+        help=(
+            "V4 real-gradient only: after the first cumulative tier is full, "
+            "allow at most one extra 20 USD child order when the refreshed "
+            "exact RFQ remains above the first-tier threshold."
+        ),
+    )
+    parser.add_argument(
         "--live-inventory-basis-v4-reverse-test",
         action="store_true",
         help=(
@@ -26283,6 +26422,14 @@ def parse_args() -> argparse.Namespace:
                 parser.error("--live-inventory-basis-reversion does not allow basis addon diagnostics")
             if args.live_inventory_basis_use_normalized_edge_for_entry:
                 parser.error("--live-inventory-basis-reversion cannot use normalized edge as the primary entry edge")
+        if args.live_inventory_basis_v4_elastic_capacity and not (
+            args.live_inventory_basis_v4_profile
+            and args.live_inventory_basis_v4_real_gradient
+        ):
+            parser.error(
+                "--live-inventory-basis-v4-elastic-capacity requires "
+                "a V4 real-gradient profile"
+            )
         if args.live_inventory_basis_v4_profile:
             if allowed_assets != {"ETH"}:
                 parser.error("basis V4 profile requires --live-allowed-assets ETH")

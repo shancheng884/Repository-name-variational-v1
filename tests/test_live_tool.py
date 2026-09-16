@@ -296,6 +296,21 @@ def test_live_tool_v4_real_gradient_enables_five_dynamic_tiers(monkeypatch) -> N
     assert args.live_inventory_equity_balance_block_ratio == 0.74
 
 
+def test_live_tool_v4_elastic_capacity_is_explicit(monkeypatch) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(v4_live_mode=True),
+        v4_real_gradient=True,
+        v4_elastic_capacity=True,
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_basis_v4_elastic_capacity is True
+    assert "--live-inventory-basis-v4-elastic-capacity" in command
+
+
 def test_live_tool_v4_reverse_test_is_one_bounded_lot(monkeypatch) -> None:
     command = build_main_command(
         "ETH",
