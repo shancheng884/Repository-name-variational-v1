@@ -85,9 +85,13 @@ class FakeTelegram:
         self.updates = []
         self.answered = []
         self.cleared = []
+        self.failures_remaining = 0
 
     def send_now(self, text, *, reply_markup=None):
         self.sent.append((text, reply_markup))
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            return False, "temporary_telegram_failure"
         return True, "sent"
 
     def get_updates(self, *, offset=None):
@@ -300,8 +304,8 @@ def test_force_reduce_margin_and_position_mismatch_are_critical() -> None:
 
     critical = next(item for item in incidents if item.severity == "critical")
     assert critical.key == "critical_account_risk"
-    assert "startup_reconcile_exchange_position_mismatch" in critical.message
-    assert "maintenance_margin_usage_reduce" in critical.message
+    assert "启动时本地与交易所仓位不一致" in critical.message
+    assert "维持保证金使用率过高，执行降杠杆" in critical.message
 
 
 def test_critical_fingerprint_ignores_changing_wait_and_heartbeat_age() -> None:
@@ -559,24 +563,24 @@ def test_stale_reference_feed_rearms_without_recovery_spam(tmp_path) -> None:
 
     write_health(fresh=False, stale_seconds=121)
     assert watchdog.run_once()[0].key == "variational_reference_feed_stale"
-    assert len(bark.sent) == 1
+    assert bark.sent == []
     assert feishu.phones == []
 
     current[0] += timedelta(seconds=1)
     write_health(fresh=True, stale_seconds=0)
     assert watchdog.run_once() == []
-    assert len(bark.sent) == 1
+    assert bark.sent == []
     assert feishu.messages == [] or len(feishu.messages) == 1
 
     current[0] += timedelta(minutes=10)
     write_health(fresh=False, stale_seconds=121)
     assert watchdog.run_once() == []
-    assert len(bark.sent) == 1
+    assert bark.sent == []
 
     current[0] += timedelta(minutes=31)
     write_health(fresh=False, stale_seconds=121)
     assert watchdog.run_once()[0].key == "variational_reference_feed_stale"
-    assert len(bark.sent) == 2
+    assert bark.sent == []
 
 
 def test_stale_reference_reload_is_bounded_and_exposure_verified() -> None:
@@ -741,7 +745,7 @@ def build_watchdog(
     )
 
 
-def test_critical_incident_immediately_sends_bark_message_and_phone(tmp_path) -> None:
+def test_critical_incident_uses_feishu_phone_without_routine_bark(tmp_path) -> None:
     current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
     bark = FakeBark()
     feishu = FakeFeishu()
@@ -756,32 +760,105 @@ def test_critical_incident_immediately_sends_bark_message_and_phone(tmp_path) ->
     watchdog.run_once(synthetic=incident)
     watchdog.run_once(synthetic=incident)
 
-    assert len(bark.sent) == 1
-    assert bark.sent[0]["critical"] is True
+    assert bark.sent == []
     assert len(feishu.messages) == 1
     assert feishu.phones == ["message-1"]
 
 
-def test_failed_channel_retries_without_repeating_successful_channels(tmp_path) -> None:
+def test_warning_incident_is_telegram_only_and_localized(tmp_path) -> None:
     current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
     bark = FakeBark()
-    bark.failures_remaining = 1
     feishu = FakeFeishu()
+    telegram = FakeTelegram()
     watchdog = build_watchdog(
         tmp_path,
         current=current,
         bark=bark,
         feishu=feishu,
     )
+    watchdog.telegram = telegram
+    incidents = evaluate_incidents(
+        state={"status": "flat", "asset": "ETH", "open_lots": []},
+        risk_health={
+            "updated_at": current[0].isoformat(),
+            "risk_action": "warning",
+            "risk_reason": "venue_equity_imbalance_warning",
+            "risk_notification_action": "warning",
+            "risk_notification_reason": "venue_equity_imbalance_warning",
+        },
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=current[0],
+    )
+
+    watchdog.run_once(synthetic=incidents[0])
+
+    assert bark.sent == []
+    assert feishu.messages == []
+    assert feishu.phones == []
+    assert len(telegram.sent) == 1
+    assert "仅提醒" in telegram.sent[0][0]
+    assert "双边权益不均衡" in telegram.sent[0][0]
+    assert "venue_equity_imbalance_warning" not in telegram.sent[0][0]
+
+
+def test_failed_channel_retries_without_repeating_successful_channels(tmp_path) -> None:
+    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
+    bark = FakeBark()
+    feishu = FakeFeishu()
+    telegram = FakeTelegram()
+    telegram.failures_remaining = 1
+    watchdog = build_watchdog(
+        tmp_path,
+        current=current,
+        bark=bark,
+        feishu=feishu,
+    )
+    watchdog.telegram = telegram
     incident = Incident("test", "critical", "title", "message", ("ETH", "test"))
 
     watchdog.run_once(synthetic=incident)
     current[0] += timedelta(seconds=11)
     watchdog.run_once(synthetic=incident)
 
-    assert len(bark.sent) == 2
+    assert bark.sent == []
     assert len(feishu.messages) == 1
     assert len(feishu.phones) == 1
+    assert len(telegram.sent) == 1
+
+
+def test_critical_incident_falls_back_to_bark_only_when_primary_paths_fail(
+    tmp_path,
+) -> None:
+    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
+    bark = FakeBark()
+    feishu = FakeFeishu()
+    feishu.message_failures_remaining = 1
+    telegram = FakeTelegram()
+    telegram.failures_remaining = 1
+    watchdog = RiskWakeupWatchdog(
+        config=config(),
+        state_path=tmp_path / "state.json",
+        risk_health_path=tmp_path / "risk.json",
+        metrics_path=tmp_path / "metrics.jsonl",
+        watchdog_state_path=tmp_path / "watchdog.json",
+        watchdog_health_path=tmp_path / "health.json",
+        watchdog_control_path=tmp_path / "control.json",
+        bark=bark,
+        feishu=feishu,
+        telegram=telegram,
+        clock=lambda: current[0],
+        strategy_check=lambda _pid: True,
+    )
+    incident = Incident("test", "critical", "title", "message", ("ETH", "test"))
+
+    watchdog.run_once(synthetic=incident)
+
+    assert len(bark.sent) == 1
+    assert bark.sent[0]["critical"] is True
+    assert feishu.phones == []
+    assert len(telegram.sent) == 1
 
 
 def test_new_critical_reason_realerts_all_channels(tmp_path) -> None:
@@ -801,7 +878,7 @@ def test_new_critical_reason_realerts_all_channels(tmp_path) -> None:
     current[0] += timedelta(seconds=5)
     watchdog.run_once(synthetic=second)
 
-    assert len(bark.sent) == 2
+    assert bark.sent == []
     assert len(feishu.messages) == 2
     assert len(feishu.phones) == 2
 
@@ -837,7 +914,7 @@ def test_dynamic_message_does_not_realert_same_root_cause(tmp_path) -> None:
     current[0] += timedelta(seconds=20)
     watchdog.run_once(synthetic=second)
 
-    assert len(bark.sent) == 1
+    assert bark.sent == []
     assert len(feishu.messages) == 1
     assert len(feishu.phones) == 1
 
@@ -890,7 +967,7 @@ def test_telegram_acknowledgement_stops_failed_channel_retries(tmp_path) -> None
     current[0] += timedelta(seconds=11)
     watchdog.run_once(synthetic=incident)
 
-    assert len(bark.sent) == 1
+    assert bark.sent == []
     assert record["acknowledged_signature"] == record["incident_signature"]
     assert telegram.answered[-1][0] == "callback-1"
     assert telegram.cleared == [("123", 88)]
@@ -945,7 +1022,7 @@ def test_telegram_global_silence_persists_and_stops_delivery(tmp_path) -> None:
     current[0] += timedelta(seconds=11)
     watchdog.run_once(synthetic=incident)
 
-    assert len(bark.sent) == 1
+    assert bark.sent == []
     assert len(feishu.messages) == 1
     assert len(telegram.sent) == 1
     assert telegram.answered[-1][1] == "已全局静默 2 小时"
@@ -1002,9 +1079,8 @@ def test_severity_escalation_realerts_after_acknowledgement(tmp_path) -> None:
     current[0] += timedelta(seconds=5)
     watchdog.run_once(synthetic=critical)
 
-    assert len(bark.sent) == 2
-    assert bark.sent[-1]["critical"] is True
-    assert len(feishu.messages) == 2
+    assert bark.sent == []
+    assert len(feishu.messages) == 1
     assert len(feishu.phones) == 1
     assert "acknowledged_at" not in record
 
@@ -1024,9 +1100,8 @@ def test_recovery_sends_non_phone_recovery_notifications(tmp_path) -> None:
     watchdog.run_once(synthetic=incident)
     watchdog.run_once()
 
-    assert len(bark.sent) == 2
-    assert bark.sent[-1]["critical"] is False
-    assert len(feishu.messages) == 2
+    assert bark.sent == []
+    assert len(feishu.messages) == 1
     assert len(feishu.phones) == 1
 
 
@@ -1058,8 +1133,7 @@ def test_persistent_account_data_loss_with_position_escalates(tmp_path) -> None:
 
     first = watchdog.run_once()
     assert first[0].severity == "warning"
-    assert len(bark.sent) == 1
-    assert bark.sent[0]["critical"] is False
+    assert bark.sent == []
     assert len(feishu.phones) == 0
 
     current[0] += timedelta(seconds=301)
@@ -1074,7 +1148,7 @@ def test_persistent_account_data_loss_with_position_escalates(tmp_path) -> None:
     )
     promoted = watchdog.run_once()
     assert promoted[0].severity == "critical"
-    assert bark.sent[-1]["critical"] is True
+    assert bark.sent == []
     assert len(feishu.phones) == 1
 
 

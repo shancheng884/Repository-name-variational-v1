@@ -12,6 +12,7 @@ from typing import Any
 import requests
 
 from tools.lib.risk_alert_control import notifications_allowed, read_alert_control
+from tools.lib.alert_localization import action_cn, reason_cn
 
 
 ALERT_CONTROL_PATH = Path(__file__).resolve().parents[2] / "log" / "risk_wakeup_alert_control.json"
@@ -100,50 +101,11 @@ def _direction_cn(value: Any) -> str:
 
 
 def _reason_cn(value: Any) -> str:
-    return {
-        "v4_executable_net_target_reached": "可执行净收益达到目标",
-        "v4_tier_net_target_reached": "本档可执行净收益达到目标",
-        "v4_partial_detier_executable_net_target_reached": "本档可执行净收益达到目标",
-        "v4_portfolio_executable_net_target_reached": "组合可执行净收益达到目标",
-        "max_unrealized_loss_bps": "触发最大未实现亏损保护",
-        "v4_max_hold_timeout": "旧版最长持仓超时",
-        "operator_requested_exit": "人工请求安全退出",
-        "basis_exit_refresh_pnl_below_threshold": "刷新后可执行收益低于平仓目标",
-        "v4_exit_confirmation_pending": "等待平仓价格确认",
-        "basis_var_quote_too_old": "Variational 报价过旧",
-        "basis_lighter_book_too_old": "Lighter 盘口过旧",
-        "basis_sample_move_too_large": "价差瞬时变化过大",
-        "basis_entry_refreshed_edge_below_threshold": "刷新后价差低于开仓阈值",
-        "variational_html_response": "Variational 返回网页而非行情数据",
-        "variational_extension_disconnected": "Variational 浏览器扩展断开",
-        "account_equity_unavailable": "账户权益暂不可用，禁止新开仓",
-        "variational_account_snapshot_stale": "Variational 账户快照过旧，暂停开仓和加仓",
-        "variational_account_recovery_confirmation_pending": "Variational 账户链路已恢复，正在重新确认",
-        "v4_real_gradient_tier_capacity_reached": "当前价差档位的累计仓位已满",
-        "venue_leverage_exceeds_hard_limit": "单个平台杠杆超过硬上限",
-        "maintenance_margin_usage_warning": "维持保证金使用率进入预警区",
-        "maintenance_margin_usage_blocks_entry": "维持保证金使用率过高，禁止加仓",
-        "maintenance_margin_usage_reduce": "维持保证金使用率过高，执行降杠杆",
-        "maintenance_margin_usage_emergency": "维持保证金使用率进入紧急平仓区",
-        "venue_equity_imbalance_warning": "双边权益不均衡，建议补齐较少一侧",
-        "venue_equity_imbalance_blocks_entry": "双边权益严重失衡，禁止新开仓",
-        "account_risk_normal": "账户风险正常",
-        "exchange_flat_confirmation_failed": "双边空仓确认暂时失败",
-        "exchange_positions_not_flat": "交易所仍有未平仓仓位",
-    }.get(str(value), str(value))
+    return reason_cn(value)
 
 
 def _action_cn(value: Any) -> str:
-    return {
-        "normal": "正常运行",
-        "warning": "仅提醒",
-        "block_entry": "禁止新开仓和加仓",
-        "force_reduce": "降低一层仓位",
-        "emergency_exit": "紧急退出全部仓位",
-        "auto_stop_flat": "空仓自动停机",
-        "manual_exchange_review_required": "需要人工核对双边账户",
-        "relax_exit_target_without_forced_loss_close": "降低收益目标，不因时间强制亏损平仓",
-    }.get(str(value), str(value))
+    return action_cn(value)
 
 
 def _venue_name(value: Any) -> str:

@@ -300,7 +300,7 @@ def test_telegram_strong_single_fallback_message_contains_action() -> None:
     assert "[Var/Lighter] 平仓确认模式已降级" in message
     assert "实际收益：-2.50 bps" in message
     assert "强单次确认预留：6.00 bps" in message
-    assert "动作：fallback_to_latest_and_2_of_3" in message
+    assert "动作：回退到最新报价，并采用三次确认中至少两次通过" in message
 
 
 def test_telegram_account_risk_alert_is_chinese() -> None:
@@ -429,7 +429,7 @@ def test_telegram_only_pushes_critical_exit_cost_block() -> None:
     event_type, payload = notifier.queue.get_nowait()
     message = format_telegram_trade_message(event_type, payload)
     assert "[Var/Lighter] 平仓条件未满足" in message
-    assert "原因：entry_final_fill_cost_pending" in message
+    assert "原因：等待开仓最终成交成本确认" in message
     assert "当前预计收益：4.37 bps" in message
 
 

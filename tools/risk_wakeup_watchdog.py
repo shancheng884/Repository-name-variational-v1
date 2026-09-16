@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.lib.runtime_files import read_json, write_json_atomic
+from tools.lib.alert_localization import action_cn, incident_key_cn, reason_cn
 from tools.lib.risk_alert_control import (
     notifications_allowed,
     read_alert_control,
@@ -451,7 +452,7 @@ def evaluate_incidents(
                     severity="critical" if exposure else "warning",
                     title="Variational 需要重新登录",
                     message=(
-                        f"{asset}：Variational 会话已失效（{reason}）。"
+                        f"{asset}：Variational 会话已失效（{reason_cn(reason)}）。"
                         "请重新登录 Variational、刷新页面和扩展后再继续执行。"
                     ),
                     alert_params=(asset, "请重新登录 Variational"),
@@ -466,7 +467,7 @@ def evaluate_incidents(
                     key=f"manual_review:{manual_review_root}",
                     severity="critical" if critical else "warning",
                     title="套利账户需要人工核对",
-                    message=f"{asset}：原因 {reason}；{lot_text}。",
+                    message=f"{asset}：原因 {reason_cn(reason)}；{lot_text}。",
                     alert_params=(asset, "双边账户需要人工核对"),
                 )
             )
@@ -549,7 +550,7 @@ def evaluate_incidents(
                 severity="critical",
                 title="套利账户触发强风险动作",
                 message=(
-                    f"{asset}：动作 {action}，原因 {risk_reason}，"
+                    f"{asset}：动作 {action_cn(action)}，原因 {reason_cn(risk_reason)}，"
                     f"最高保证金使用率 {margin or '-'}%，"
                     f"最高单边杠杆 {leverage or '-'}x。"
                 ),
@@ -570,7 +571,7 @@ def evaluate_incidents(
                 ),
                 severity="warning",
                 title="套利账户风险提醒",
-                message=f"{asset}：动作 {action}，原因 {risk_reason}。",
+                message=f"{asset}：动作 {action_cn(action)}，原因 {reason_cn(risk_reason)}。",
                 alert_params=(asset, "账户风险提醒"),
                 rearm_seconds=config.account_risk_rearm_seconds,
             )
@@ -612,7 +613,7 @@ def evaluate_incidents(
                     key=f"unreconciled_manual_review:{event_root}",
                     severity="critical",
                     title="套利双边状态尚未重新核对",
-                    message=f"{asset}：故障 {event_reason} 后尚无成功双边核对；{lot_text}。",
+                    message=f"{asset}：故障 {reason_cn(event_reason)} 后尚无成功双边核对；{lot_text}。",
                     alert_params=(asset, "双边仓位尚未重新核对"),
                 )
             )
@@ -878,13 +879,21 @@ class RiskWakeupWatchdog:
         message: str,
         *,
         acknowledgement_token: str | None = None,
-    ) -> None:
-        if (
-            self.dry_run
-            or not self.telegram.enabled
-            or not self.alerts_allowed(now=self.clock())
-        ):
-            return
+        record: dict[str, Any] | None = None,
+    ) -> bool:
+        now = self.clock()
+        if self.dry_run:
+            if record is not None:
+                record["telegram_status"] = "dry_run"
+            return False
+        if not self.telegram.enabled:
+            if record is not None:
+                record["telegram_status"] = "not_configured"
+            return False
+        if not self.alerts_allowed(now=now):
+            if record is not None:
+                record["telegram_status"] = "suppressed"
+            return False
         reply_markup = None
         if acknowledgement_token:
             reply_markup = {
@@ -908,11 +917,42 @@ class RiskWakeupWatchdog:
                 ]
             }
         try:
-            self.telegram.send_now(message, reply_markup=reply_markup)
-        except TypeError:
-            # Keeps custom notifiers compatible while the built-in notifier
-            # supports Telegram inline keyboards.
-            self.telegram.send_now(message)
+            try:
+                result = self.telegram.send_now(
+                    message,
+                    reply_markup=reply_markup,
+                )
+            except TypeError:
+                # Keeps custom notifiers compatible while the built-in notifier
+                # supports Telegram inline keyboards.
+                result = self.telegram.send_now(message)
+        except Exception as exc:
+            if record is not None:
+                record["telegram_attempts"] = int(
+                    record.get("telegram_attempts") or 0
+                ) + 1
+                record["last_telegram_attempt_at"] = iso_time(now)
+                record["telegram_status"] = (
+                    f"telegram_failed:{type(exc).__name__}"
+                )
+            return False
+        if isinstance(result, (tuple, list)):
+            ok = bool(result[0]) if result else False
+            detail = str(result[1]) if len(result) > 1 else (
+                "sent" if ok else "telegram_failed"
+            )
+        else:
+            ok = bool(result)
+            detail = "sent" if ok else "telegram_failed"
+        if record is not None:
+            record["telegram_attempts"] = int(
+                record.get("telegram_attempts") or 0
+            ) + 1
+            record["last_telegram_attempt_at"] = iso_time(now)
+            record["telegram_status"] = "sent" if ok else detail
+            if ok:
+                record["telegram_sent_at"] = iso_time(now)
+        return ok
 
     @staticmethod
     def _incident_signature(incident: Incident) -> str:
@@ -945,6 +985,9 @@ class RiskWakeupWatchdog:
             "feishu_phone_status",
             "feishu_phone_sent_at",
             "last_feishu_phone_attempt_at",
+            "telegram_status",
+            "telegram_sent_at",
+            "last_telegram_attempt_at",
             "acknowledged_at",
             "acknowledged_by",
             "acknowledged_signature",
@@ -953,6 +996,7 @@ class RiskWakeupWatchdog:
         record["bark_attempts"] = 0
         record["feishu_message_attempts"] = 0
         record["feishu_phone_attempts"] = 0
+        record["telegram_attempts"] = 0
 
     def _poll_telegram_acknowledgements(self, *, now: datetime) -> None:
         if self.dry_run or not self.telegram.enabled:
@@ -1119,9 +1163,6 @@ class RiskWakeupWatchdog:
         *,
         now: datetime,
     ) -> None:
-        if not self.dry_run:
-            # The phone path runs first so a slow fallback channel cannot delay it.
-            self._deliver_incident(incident, record, now=now, force=True)
         self._notify_telegram(
             "\n".join(
                 [
@@ -1133,7 +1174,10 @@ class RiskWakeupWatchdog:
             acknowledgement_token=str(
                 record.get("acknowledgement_token") or ""
             ),
+            record=record,
         )
+        if not self.dry_run:
+            self._deliver_incident(incident, record, now=now, force=True)
 
     def _retry_due(
         self,
@@ -1271,9 +1315,21 @@ class RiskWakeupWatchdog:
             == record.get("incident_signature")
         ):
             return
+        # Warnings are intentionally Telegram-only. The Feishu message is
+        # reserved for critical events because it is also required by the
+        # urgent-phone API.
+        if incident.severity != "critical":
+            return
         self._send_feishu_message(incident, record, now=now, force=force)
         self._send_feishu_phone(incident, record, now=now, force=force)
-        self._send_bark(incident, record, now=now, force=force)
+        # Bark is a last-resort path, not a third routine copy of the alert.
+        # It is sent only when neither Telegram nor the Feishu phone path
+        # delivered the critical incident.
+        if (
+            record.get("telegram_status") != "sent"
+            and record.get("feishu_phone_status") != "sent"
+        ):
+            self._send_bark(incident, record, now=now, force=force)
 
     def _recover_incident(
         self,
@@ -1289,24 +1345,11 @@ class RiskWakeupWatchdog:
         message = "\n".join(
             [
                 "[Var/Lighter] 风险监控已恢复",
-                f"事件：{key}",
+                f"事件：{incident_key_cn(key)}",
                 f"恢复时间：{iso_time(now)}",
             ]
         )
         self._notify_telegram(message)
-        if self.dry_run:
-            return
-        if record.get("bark_status") == "sent":
-            self.bark.send(
-                title="Var/Lighter 风险已恢复",
-                message=message,
-                critical=False,
-            )
-        if record.get("feishu_message_status") == "sent":
-            self.feishu.send_message(
-                title="Var/Lighter 风险已恢复",
-                message=message,
-            )
 
     def run_once(
         self,
@@ -1408,22 +1451,23 @@ class RiskWakeupWatchdog:
                 if incident.severity == "critical":
                     record["critical_since_at"] = iso_time(now)
                 record["incident_signature"] = signature
-                self._deliver_incident(
-                    incident,
-                    record,
-                    now=now,
-                    force=True,
-                )
                 self._notify_telegram(
                     "\n".join(
                         [
-                            "[Var/Lighter] 紧急风险原因已变化",
+                            "[Var/Lighter] 风险原因已变化",
                             incident.message,
                         ]
                     ),
                     acknowledgement_token=str(
                         record.get("acknowledgement_token") or ""
                     ),
+                    record=record,
+                )
+                self._deliver_incident(
+                    incident,
+                    record,
+                    now=now,
+                    force=True,
                 )
             elif not record.get("acknowledgement_token"):
                 record["acknowledgement_token"] = (
@@ -1439,6 +1483,7 @@ class RiskWakeupWatchdog:
                     acknowledgement_token=str(
                         record["acknowledgement_token"]
                     ),
+                    record=record,
                 )
             if (
                 incident.severity == "critical"
