@@ -26,6 +26,18 @@ from tools.lib.runtime_files import (  # noqa: E402
 
 
 ALLOWED_ASSETS = {"BNB", "BTC", "ETH", "HYPE", "SOL", "XRP"}
+RECOVERABLE_OPEN_STATE_MANUAL_REASONS = frozenset(
+    {
+        "variational_extension_disconnected",
+        "variational_html_response",
+        "startup_reconcile_open_state_but_variational_flat",
+        "startup_reconcile_exchange_position_check_failed",
+        "runtime_stopped_with_unresolved_entry_submission",
+        # A failed reduce-only hedge may leave the saved paired lots intact.
+        # Startup must still reconcile both venue quantities and directions.
+        "basis_exit_lighter_final_fill_not_confirmed",
+    }
+)
 CALIBRATION_DIRECTIONS = {
     "alternate",
     "long_var_short_lighter",
@@ -219,16 +231,9 @@ def validate_state(
 
     if resume_open_position:
         manual_reason = str(state.get("manual_review_reason") or "")
-        recoverable_manual_reasons = {
-            "variational_extension_disconnected",
-            "variational_html_response",
-            "startup_reconcile_open_state_but_variational_flat",
-            "startup_reconcile_exchange_position_check_failed",
-            "runtime_stopped_with_unresolved_entry_submission",
-        }
         state_is_resumable = status in {"open", "pending"} or (
             status == "manual_review_required"
-            and manual_reason in recoverable_manual_reasons
+            and manual_reason in RECOVERABLE_OPEN_STATE_MANUAL_REASONS
         )
         if not state_is_resumable:
             return (

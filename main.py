@@ -217,6 +217,20 @@ LIVE_INVENTORY_WATCHDOG_OWNED_NOTIFICATION_EVENTS = frozenset(
     {
         "live_inventory_account_risk_alert",
         "live_inventory_account_risk_recovered",
+        # Manual-review incidents are reconstructed by the watchdog so the
+        # operator receives one deduplicated alert with the full state.
+        "live_inventory_manual_review_required",
+    }
+)
+LIVE_INVENTORY_OPEN_STATE_RESUME_MANUAL_REASONS = frozenset(
+    {
+        "variational_extension_disconnected",
+        "variational_html_response",
+        "startup_reconcile_open_state_but_variational_flat",
+        "startup_reconcile_exchange_position_check_failed",
+        "runtime_stopped_with_unresolved_entry_submission",
+        # Only the strict startup reconciliation can clear this exit failure.
+        "basis_exit_lighter_final_fill_not_confirmed",
     }
 )
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS = 5
@@ -12843,13 +12857,7 @@ class VariationalToLighterRuntime:
                     recoverable_open_manual_review = (
                         state_status == "manual_review_required"
                         and manual_reason
-                        in {
-                            "variational_extension_disconnected",
-                            "variational_html_response",
-                            "startup_reconcile_open_state_but_variational_flat",
-                            "startup_reconcile_exchange_position_check_failed",
-                            "runtime_stopped_with_unresolved_entry_submission",
-                        }
+                        in LIVE_INVENTORY_OPEN_STATE_RESUME_MANUAL_REASONS
                         and bool(open_lots)
                     )
                     recoverable_pending_intent = (

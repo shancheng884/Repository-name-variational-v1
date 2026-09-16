@@ -371,6 +371,21 @@ fills and the PnL report, and stops. It never resets an open state. Do not use
 manual sequential closes unless startup reconciliation has refused and the
 venues require manual recovery.
 
+If a reduce-only exit stopped at
+`basis_exit_lighter_final_fill_not_confirmed`, manually re-align the two venue
+positions to the saved open lots, then use the normal open-state takeover:
+
+```bash
+python tools/live.py --asset ETH --v4-live --v4-real-gradient \
+  --v4-continuous --v4-test-skip-recent-health \
+  --resume-open-position
+```
+
+This reason is accepted only as an admission to strict startup reconciliation;
+the process still refuses to trade unless both live quantities and directions
+match every saved lot. It never clears the manual-review state merely because
+the operator supplied the flag.
+
 For routine deployment, request a maintenance drain instead of waiting for a
 multi-cycle batch to finish:
 

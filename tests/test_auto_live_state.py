@@ -127,6 +127,41 @@ def test_live_inventory_open_state_resume_allows_startup(tmp_path, monkeypatch) 
     assert "live_inventory_open_state_resume_accepted" in diagnostics.passed
 
 
+def test_live_inventory_exit_fill_review_resume_requires_strict_reconcile(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LIGHTER_ACCOUNT_INDEX", "1")
+    monkeypatch.setenv("LIGHTER_API_KEY_INDEX", "1")
+    monkeypatch.setenv("LIGHTER_PRIVATE_KEY", "secret")
+    runtime = _runtime(tmp_path)
+    runtime.auto_live_entry = False
+    runtime.live_inventory = True
+    runtime.live_inventory_dry_decisions = False
+    runtime.live_inventory_i_accept_open_state_resume = True
+    runtime.write_live_inventory_state(
+        {
+            "status": "manual_review_required",
+            "manual_review_reason": "basis_exit_lighter_final_fill_not_confirmed",
+            "asset": "ETH",
+            "next_lot_id": 15,
+            "open_lots": [
+                {
+                    "lot_id": 1,
+                    "direction": "long_var_short_lighter",
+                    "qty": "0.00830",
+                }
+            ],
+            "pending_actions": [],
+        }
+    )
+
+    diagnostics = runtime.run_startup_diagnostics()
+
+    assert diagnostics.blocking_errors == []
+    assert "live_inventory_open_state_resume_accepted" in diagnostics.passed
+
+
 def test_live_inventory_interrupted_entry_resume_reaches_strict_reconcile(
     tmp_path,
     monkeypatch,

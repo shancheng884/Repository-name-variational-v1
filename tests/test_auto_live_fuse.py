@@ -4607,6 +4607,34 @@ def test_account_risk_notifications_are_owned_by_watchdog(tmp_path) -> None:
     assert rows[-1]["event"] == "live_inventory_account_risk_alert"
 
 
+def test_manual_review_notifications_are_owned_by_watchdog(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    telegram_events = []
+    runtime.telegram_notifier = SimpleNamespace(
+        enqueue=lambda event_type, payload: telegram_events.append(
+            (event_type, payload)
+        )
+    )
+
+    asyncio.run(
+        runtime.append_live_inventory_log(
+            "live_inventory_manual_review_required",
+            {
+                "asset": "ETH",
+                "reason": "basis_exit_lighter_final_fill_not_confirmed",
+                "open_lots_total": 14,
+            },
+        )
+    )
+
+    assert telegram_events == []
+    rows = [
+        json.loads(line)
+        for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows[-1]["event"] == "live_inventory_manual_review_required"
+
+
 def _eth_inventory_snapshot() -> CrossSpreadSnapshot:
     snapshot = _inventory_entry_snapshot()
     snapshot.asset = "ETH"
