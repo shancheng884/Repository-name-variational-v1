@@ -261,6 +261,11 @@ LIVE_INVENTORY_BASIS_V4_REARM_CONFIRM_SAMPLES = 3
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_COOLDOWN_SECONDS = 1800
 LIVE_INVENTORY_BASIS_V4_THRESHOLD_CACHE_SECONDS = 30
 LIVE_INVENTORY_VARIATIONAL_MAX_FUTURE_SKEW_SECONDS = 5.0
+# An automatic rollback is safe to rearm only after both venue APIs confirm
+# the post-rollback position. The bounded retry covers exchange settlement
+# lag without turning a transient mismatch into a permanent manual stop.
+LIVE_INVENTORY_AUTO_CLOSE_POSITION_VERIFY_TIMEOUT_SECONDS = 10.0
+LIVE_INVENTORY_AUTO_CLOSE_POSITION_VERIFY_INTERVAL_SECONDS = 0.5
 # The 15d/30d windows are diagnostic context only. Refreshing them daily keeps
 # their full-history sort out of the order-decision path.
 LIVE_INVENTORY_BASIS_V4_SHADOW_CACHE_SECONDS = 86400
@@ -10705,6 +10710,79 @@ class VariationalToLighterRuntime:
         )
         return result
 
+    async def verify_live_inventory_auto_close_positions(
+        self,
+        *,
+        asset: str,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """Confirm rollback exposure against the remaining local lots."""
+        configured_timeout = getattr(
+            self,
+            "live_inventory_snapshot_timeout_seconds",
+            LIVE_INVENTORY_AUTO_CLOSE_POSITION_VERIFY_TIMEOUT_SECONDS,
+        )
+        try:
+            timeout_seconds = float(configured_timeout)
+        except (TypeError, ValueError):
+            timeout_seconds = LIVE_INVENTORY_AUTO_CLOSE_POSITION_VERIFY_TIMEOUT_SECONDS
+        if timeout_seconds <= 0:
+            timeout_seconds = LIVE_INVENTORY_AUTO_CLOSE_POSITION_VERIFY_TIMEOUT_SECONDS
+        timeout_seconds = min(timeout_seconds, 30.0)
+        deadline = time.monotonic() + timeout_seconds
+        attempts = 0
+        last_reason = "auto_close_position_reconcile_failed"
+        last_context: dict[str, Any] = {}
+
+        while True:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0 and attempts:
+                break
+            attempts += 1
+            try:
+                check_timeout = max(0.1, min(5.0, remaining_seconds))
+                ok, reason, context = await asyncio.wait_for(
+                    self.verify_live_inventory_reference_recovery_positions(
+                        asset=asset,
+                    ),
+                    timeout=check_timeout,
+                )
+            except asyncio.TimeoutError:
+                ok = False
+                reason = "auto_close_position_reconcile_timeout"
+                context = {"error": "position_check_timeout"}
+            except Exception as exc:
+                ok = False
+                reason = "auto_close_position_reconcile_failed"
+                context = {"error": f"{type(exc).__name__}:{exc}"}
+
+            last_reason = reason
+            last_context = dict(context or {})
+            if ok:
+                return True, reason, {
+                    **last_context,
+                    "attempts": attempts,
+                    "timeout_seconds": timeout_seconds,
+                }
+            # Authentication failures cannot be fixed by polling and must
+            # retain the manual-review stop path.
+            if reason == "authentication_required":
+                break
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                break
+            await asyncio.sleep(
+                min(
+                    LIVE_INVENTORY_AUTO_CLOSE_POSITION_VERIFY_INTERVAL_SECONDS,
+                    remaining_seconds,
+                )
+            )
+
+        return False, last_reason, {
+            **last_context,
+            "attempts": attempts,
+            "timeout_seconds": timeout_seconds,
+        }
+
     async def auto_close_live_inventory_manual_review_position_once(self) -> None:
         state = self.load_live_inventory_state()
         reason = str(state.get("manual_review_reason") or "")
@@ -10903,6 +10981,39 @@ class VariationalToLighterRuntime:
                 close_lighter=True,
                 force=True,
             )
+            positions_verified, position_check_reason, position_check_context = (
+                await self.verify_live_inventory_auto_close_positions(asset=asset)
+            )
+            auto_close_context["position_reconcile"] = {
+                "ok": positions_verified,
+                "reason": position_check_reason,
+                "context": position_check_context,
+            }
+            if positions_verified:
+                # The entry is rejected, but no exposure remains. Keep the
+                # current episode/counters and continue without an alert.
+                await self.persist_live_inventory_memory(
+                    reason="basis_entry_actual_slippage_rejected_auto_closed"
+                )
+                await self.append_live_inventory_log(
+                    "live_inventory_entry_rejected_auto_closed",
+                    {
+                        "asset": asset,
+                        "lot_id": lot_id,
+                        "basis_trace_id": context.get("basis_trace_id"),
+                        "direction": direction,
+                        "qty": decimal_to_str(qty),
+                        "entry_lighter_slippage_bps": decimal_to_str(
+                            entry_lighter_slippage_bps
+                        ),
+                        "max_lighter_slippage_bps": decimal_to_str(
+                            self.live_inventory_max_lighter_slippage_bps
+                        ),
+                        "auto_close_unhedged": auto_close_context,
+                        "action": "continue_live_inventory_after_verified_flat_or_open_state",
+                    },
+                )
+                return
             await self.require_live_inventory_manual_review(
                 asset=asset,
                 reason="basis_entry_lighter_actual_slippage_exceeds_limit",
@@ -10917,6 +11028,8 @@ class VariationalToLighterRuntime:
                     "max_lighter_slippage_bps": decimal_to_str(self.live_inventory_max_lighter_slippage_bps),
                     "lighter_payload": lighter_payload,
                     "auto_close_unhedged": auto_close_context,
+                    "position_reconcile_reason": position_check_reason,
+                    "position_reconcile_context": position_check_context,
                     "action": "manual_confirm_auto_close_or_flatten_remaining_legs",
                 },
             )
