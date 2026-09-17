@@ -3981,6 +3981,7 @@ def _live_inventory_runtime(tmp_path) -> VariationalToLighterRuntime:
         "bids": {Decimal("59990"): Decimal("1")},
         "asks": {Decimal("60010"): Decimal("1")},
     }
+    runtime.lighter_market_index = 1
     runtime.lighter_best_bid = Decimal("59990")
     runtime.lighter_best_ask = Decimal("60010")
     runtime.last_lighter_order_book_update_at = "2999-06-02T08:50:11+00:00"
@@ -8508,6 +8509,189 @@ def test_v4_exit_pair_preserves_one_leg_exception_outcome(tmp_path) -> None:
         assert result[2] is not None
         assert result[7]["lighter_submit_started"] is True
         assert result[7]["var_submit_exception"] == "var timeout unknown"
+
+    asyncio.run(run())
+
+
+def test_lighter_exit_retries_canceled_remainder_without_alert_spam(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        initial = OrderLifecycle(
+            trade_key="initial-exit",
+            trade_id="initial-exit",
+            side="buy",
+            qty=Decimal("0.01000"),
+            asset="ETH",
+            mode="live",
+            last_variational_status="submitted",
+            lighter_client_order_id=100,
+            lighter_order_status="canceled-too-much-slippage",
+            lighter_filled_base_amount=Decimal("0.00400"),
+            lighter_filled_quote_amount=Decimal("8.0000"),
+            lighter_reduce_only=True,
+            dry_run_plan_price=Decimal("2000.00"),
+        )
+        initial.processing_stage = "live_submit_failed"
+        refresh_calls = []
+        place_calls = []
+        logged_events = []
+        notifications = []
+
+        class FakeNotifier:
+            def enqueue(self, event_type, payload):
+                notifications.append((event_type, payload))
+
+        async def fake_append_order_log(event_type, payload):
+            logged_events.append((event_type, payload))
+
+        async def fake_refresh():
+            refresh_calls.append(True)
+            return {
+                "ok": True,
+                "request_sent": True,
+                "snapshot_received": True,
+                "update_at": "2999-06-02T08:50:12+00:00",
+            }
+
+        async def fake_place(**kwargs):
+            place_calls.append(kwargs)
+            attempt = len(place_calls)
+            record = OrderLifecycle(
+                trade_key=f"retry-exit-{attempt}",
+                trade_id=f"retry-exit-{attempt}",
+                side="buy",
+                qty=kwargs["qty"],
+                asset="ETH",
+                mode="live",
+                last_variational_status="submitted",
+                lighter_client_order_id=100 + attempt,
+                lighter_reduce_only=True,
+            )
+            record.processing_stage = "live_submit_sent"
+            return record, record.to_payload()
+
+        async def fake_wait(record):
+            attempt = int(record.trade_key.rsplit("-", 1)[-1])
+            if attempt == 1:
+                record.lighter_order_status = "canceled-too-much-slippage"
+                record.lighter_filled_base_amount = Decimal("0")
+                record.lighter_filled_quote_amount = Decimal("0")
+                record.processing_stage = "live_submit_failed"
+                return False
+            record.lighter_order_status = "filled"
+            record.lighter_filled_base_amount = Decimal("0.00600")
+            record.lighter_filled_quote_amount = Decimal("12.0600")
+            record.lighter_fill_price = Decimal("2010.00")
+            record.lighter_fill_ts_iso = "2026-09-17T00:00:02+00:00"
+            record.processing_stage = "lighter_filled"
+            return True
+
+        runtime.append_order_log = fake_append_order_log
+        runtime.refresh_lighter_order_book_for_exit_retry = fake_refresh
+        runtime.place_lighter_order_from_plan = fake_place
+        runtime.wait_for_lighter_final_fill = fake_wait
+        runtime.telegram_notifier = FakeNotifier()
+
+        result = await runtime.retry_lighter_exit_after_cancel(
+            asset="ETH",
+            direction="short_var_long_lighter",
+            lot_id=7,
+            exit_side="BUY",
+            qty=Decimal("0.01000"),
+            var_exit_price=Decimal("1999.00"),
+            lighter_record=initial,
+        )
+
+        assert result["ok"] is True
+        assert len(refresh_calls) == 2
+        assert [call["qty"] for call in place_calls] == [
+            Decimal("0.00600"),
+            Decimal("0.00600"),
+        ]
+        assert all(call["reduce_only"] is True for call in place_calls)
+        assert all(
+            call["retry_price_boundary"] == Decimal("2000.00")
+            for call in place_calls
+        )
+        assert [call["retry_index"] for call in place_calls] == [1, 2]
+
+        record = result["record"]
+        assert record.lighter_filled_base_amount == Decimal("0.01000")
+        assert record.lighter_filled_quote_amount == Decimal("20.0600")
+        assert record.lighter_fill_price == Decimal("2006")
+        assert record.lighter_exit_retry_price_boundary == Decimal("2000.00")
+        assert [
+            item["attempt"] for item in record.lighter_exit_retry_history
+        ] == [0, 1, 2]
+        assert all(
+            item["price_boundary"] == "2000.00"
+            for item in record.lighter_exit_retry_history
+        )
+        assert [
+            payload["result"] for _, payload in logged_events
+        ] == ["retryable_cancel", "filled_after_retry"]
+        assert notifications == []
+
+        assert runtime.lighter_exit_cancel_is_retryable(
+            "canceled-too-much-slippage"
+        ) is True
+        assert runtime.lighter_exit_cancel_is_retryable("expired") is False
+
+    asyncio.run(run())
+
+
+def test_lighter_exit_retry_refresh_requests_new_snapshot(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.last_lighter_order_book_update_at = "2999-06-02T08:50:11+00:00"
+        sent = []
+
+        class FakeWebSocket:
+            closed = False
+
+            async def send(self, message):
+                sent.append(json.loads(message))
+                runtime.last_lighter_order_book_update_at = (
+                    "2999-06-02T08:50:12+00:00"
+                )
+
+        runtime._lighter_market_data_ws = FakeWebSocket()
+        result = await runtime.refresh_lighter_order_book_for_exit_retry()
+
+        assert result["ok"] is True
+        assert result["snapshot_received"] is True
+        assert sent == [{
+            "type": "subscribe",
+            "channel": "order_book/1",
+        }]
+
+    asyncio.run(run())
+
+
+def test_lighter_exit_retry_plan_keeps_original_price_boundary(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_lighter_exit_submit_slippage_bps = Decimal("30")
+        record = OrderLifecycle(
+            trade_key="retry-boundary",
+            trade_id="retry-boundary",
+            side="sell",
+            qty=Decimal("0.00100"),
+            asset="ETH",
+            mode="live",
+            last_variational_status="submitted",
+            var_fill_price=Decimal("60000"),
+            auto_live_role="live_inventory_exit",
+            lighter_reduce_only=True,
+            lighter_exit_retry_price_boundary=Decimal("60020"),
+        )
+
+        plan = await runtime.build_hedge_plan(record)
+
+        assert plan is not None
+        assert plan[0] == "BUY"
+        assert plan[1] == Decimal("60020")
 
     asyncio.run(run())
 

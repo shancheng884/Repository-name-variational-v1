@@ -179,6 +179,9 @@ LIVE_INVENTORY_REFERENCE_FEED_RECOVERY_EXECUTION_QUIET_SECONDS = 30.0
 LIVE_INVENTORY_VARIATIONAL_STREAM_HEALTH_INTERVAL_SECONDS = 15.0
 LIVE_INVENTORY_VARIATIONAL_STREAM_HEALTH_TIMEOUT_SECONDS = 3.0
 LIVE_INVENTORY_PAIR_SUBMIT_TIMEOUT_SECONDS = 8.0
+# A canceled reduce-only IOC can be retried safely only for its unfilled
+# remainder. Keep this bounded so a changing market cannot create a retry loop.
+LIVE_INVENTORY_LIGHTER_EXIT_MAX_RETRIES = 2
 LIVE_INVENTORY_VARIATIONAL_MAINTENANCE_RATE_FALLBACK = Decimal("0.10")
 LIVE_INVENTORY_LIGHTER_MAINTENANCE_RATE_FALLBACK = Decimal("0.012")
 # Only /quotes/indicative calls consume this budget. The last five RFQs are
@@ -1739,6 +1742,9 @@ class OrderLifecycle:
     dry_run_plan_side: str | None = None
     dry_run_plan_price: Decimal | None = None
     dry_run_plan_base_amount: int | None = None
+    lighter_exit_retry_price_boundary: Decimal | None = None
+    lighter_exit_retry_index: int = 0
+    lighter_exit_retry_history: list[dict[str, Any]] = field(default_factory=list)
     live_notional_usd: Decimal | None = None
     live_edge_bps: Decimal | None = None
     live_fill_latency_ms: Decimal | None = None
@@ -1799,6 +1805,11 @@ class OrderLifecycle:
             "dry_run_plan_side": self.dry_run_plan_side,
             "dry_run_plan_price": decimal_to_str(self.dry_run_plan_price),
             "dry_run_plan_base_amount": self.dry_run_plan_base_amount,
+            "lighter_exit_retry_price_boundary": decimal_to_str(
+                self.lighter_exit_retry_price_boundary
+            ),
+            "lighter_exit_retry_index": self.lighter_exit_retry_index,
+            "lighter_exit_retry_history": list(self.lighter_exit_retry_history),
             "live_notional_usd": decimal_to_str(self.live_notional_usd),
             "live_edge_bps": decimal_to_str(self.live_edge_bps),
             "live_fill_latency_ms": decimal_to_str(self.live_fill_latency_ms),
@@ -2769,6 +2780,7 @@ class VariationalToLighterRuntime:
         self._lighter_signer_lock = asyncio.Lock()
         self._lighter_submit_ws: Any | None = None
         self._lighter_submit_ws_lock = asyncio.Lock()
+        self._lighter_market_data_ws: Any | None = None
         self._var_command_ws: Any | None = None
         self._var_command_ws_lock = asyncio.Lock()
         self._var_read_command_ws: Any | None = None
@@ -13305,6 +13317,337 @@ class VariationalToLighterRuntime:
         )
 
     @staticmethod
+    def lighter_exit_cancel_is_retryable(status: Any) -> bool:
+        normalized = str(status or "").strip().lower()
+        return normalized in {"canceled", "cancelled"} or normalized.startswith(
+            ("canceled-", "cancelled-", "canceled_", "cancelled_")
+        )
+
+    async def retry_lighter_exit_after_cancel(
+        self,
+        *,
+        asset: str,
+        direction: str,
+        lot_id: int | None,
+        exit_side: str,
+        qty: Decimal,
+        var_exit_price: Decimal,
+        lighter_record: OrderLifecycle,
+    ) -> dict[str, Any]:
+        """Retry only an explicitly canceled Lighter reduce-only exit."""
+        status = str(
+            getattr(lighter_record, "lighter_order_status", None) or ""
+        ).strip().lower()
+        boundary = to_decimal(getattr(lighter_record, "dry_run_plan_price", None))
+        context: dict[str, Any] = {
+            "asset": asset,
+            "lot_id": lot_id,
+            "direction": direction,
+            "exit_side": exit_side,
+            "lighter_side": (
+                "BUY" if exit_side.strip().upper() == "SELL" else "SELL"
+            ),
+            "requested_qty": decimal_to_str(qty),
+            "max_retries": LIVE_INVENTORY_LIGHTER_EXIT_MAX_RETRIES,
+            "initial_client_order_id": getattr(
+                lighter_record, "lighter_client_order_id", None
+            ),
+            "initial_status": status or None,
+            "initial_price_boundary": decimal_to_str(boundary),
+            "attempts": [],
+        }
+        initial_payload = lighter_record.to_payload()
+
+        def failed(
+            reason: str,
+            record: OrderLifecycle | None,
+            payload: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            context["result"] = "failed"
+            context["failure_reason"] = reason
+            return {
+                "ok": False,
+                "reason": reason,
+                "record": record,
+                "payload": payload or (
+                    record.to_payload() if record is not None else None
+                ),
+                "context": context,
+            }
+
+        async def log_attempt(attempt: dict[str, Any], result: str) -> None:
+            attempt["result"] = result
+            context["attempts"].append(dict(attempt))
+            await self.append_live_inventory_internal_log(
+                "live_inventory_exit_lighter_retry",
+                {
+                    **attempt,
+                    "asset": asset,
+                    "lot_id": lot_id,
+                    "direction": direction,
+                },
+            )
+
+        if not self.lighter_exit_cancel_is_retryable(status):
+            context["result"] = "not_retryable"
+            context["failure_reason"] = "lighter_exit_status_not_retryable"
+            return {
+                "ok": False,
+                "reason": "lighter_exit_status_not_retryable",
+                "record": lighter_record,
+                "payload": initial_payload,
+                "context": context,
+            }
+        if boundary is None or boundary <= 0:
+            return failed(
+                "lighter_exit_retry_price_boundary_missing",
+                lighter_record,
+                initial_payload,
+            )
+
+        tolerance = self.live_inventory_position_qty_tolerance(qty)
+        total_qty = to_decimal(
+            getattr(lighter_record, "lighter_filled_base_amount", None)
+        ) or Decimal("0")
+        total_quote = to_decimal(
+            getattr(lighter_record, "lighter_filled_quote_amount", None)
+        )
+        fill_price = to_decimal(getattr(lighter_record, "lighter_fill_price", None))
+        if total_qty < 0 or total_qty > qty + tolerance:
+            return failed(
+                "lighter_exit_initial_fill_exceeds_qty",
+                lighter_record,
+                initial_payload,
+            )
+        if total_qty > 0 and (total_quote is None or total_quote <= 0):
+            if fill_price is None or fill_price <= 0:
+                return failed(
+                    "lighter_exit_retry_partial_fill_quote_missing",
+                    lighter_record,
+                    initial_payload,
+                )
+            total_quote = total_qty * fill_price
+
+        context["attempts"].append(
+            {
+                "attempt": 0,
+                "client_order_id": getattr(
+                    lighter_record, "lighter_client_order_id", None
+                ),
+                "status": status or None,
+                "requested_qty": decimal_to_str(
+                    to_decimal(getattr(lighter_record, "qty", None)) or qty
+                ),
+                "filled_qty": decimal_to_str(total_qty),
+                "filled_quote": decimal_to_str(total_quote),
+                "fill_price": decimal_to_str(fill_price),
+                "price_boundary": decimal_to_str(boundary),
+            }
+        )
+        current_record: OrderLifecycle = lighter_record
+        current_payload: dict[str, Any] | None = initial_payload
+
+        for retry_index in range(1, LIVE_INVENTORY_LIGHTER_EXIT_MAX_RETRIES + 1):
+            remaining_qty = qty - total_qty
+            if remaining_qty <= tolerance:
+                return failed(
+                    "lighter_exit_retry_no_remaining_qty",
+                    current_record,
+                    current_payload,
+                )
+
+            try:
+                refresh = await self.refresh_lighter_order_book_for_exit_retry()
+            except Exception as exc:
+                refresh = {
+                    "ok": False,
+                    "reason": "lighter_market_data_snapshot_request_failed",
+                    "error": f"{type(exc).__name__}:{exc}",
+                }
+            attempt: dict[str, Any] = {
+                "attempt": retry_index,
+                "remaining_qty": decimal_to_str(remaining_qty),
+                "price_boundary": decimal_to_str(boundary),
+                "book_refresh": refresh,
+            }
+            if not refresh.get("ok"):
+                await log_attempt(attempt, "book_refresh_failed")
+                return failed(
+                    "lighter_exit_retry_book_refresh_failed",
+                    current_record,
+                    current_payload,
+                )
+
+            lighter_side = (
+                "BUY" if exit_side.strip().upper() == "SELL" else "SELL"
+            )
+            try:
+                attempt["book_depth"] = await self.estimate_lighter_fill_details(
+                    lighter_side,
+                    remaining_qty,
+                )
+            except Exception as exc:
+                attempt["book_depth_error"] = f"{type(exc).__name__}:{exc}"
+
+            try:
+                retry_record, retry_payload = await self.place_lighter_order_from_plan(
+                    asset=asset,
+                    side=exit_side,
+                    qty=remaining_qty,
+                    var_fill_price=var_exit_price,
+                    cycle_id=lot_id,
+                    role="live_inventory_exit",
+                    reduce_only=True,
+                    retry_price_boundary=boundary,
+                    retry_index=retry_index,
+                )
+            except Exception as exc:
+                attempt["error"] = f"{type(exc).__name__}:{exc}"
+                await log_attempt(attempt, "submit_exception")
+                return failed(
+                    "lighter_exit_retry_submit_exception",
+                    current_record,
+                    current_payload,
+                )
+
+            current_record = retry_record or current_record
+            current_payload = retry_payload or (
+                retry_record.to_payload() if retry_record is not None else None
+            )
+            if retry_record is None or not self.auto_live_eager_hedge_started(
+                retry_record
+            ):
+                await log_attempt(attempt, "submit_failed")
+                return failed(
+                    "lighter_exit_retry_submit_failed",
+                    current_record,
+                    current_payload,
+                )
+
+            try:
+                final_fill = await self.wait_for_lighter_final_fill(retry_record)
+            except Exception as exc:
+                attempt["error"] = f"{type(exc).__name__}:{exc}"
+                await log_attempt(attempt, "wait_exception")
+                return failed(
+                    "lighter_exit_retry_wait_exception",
+                    current_record,
+                    current_payload,
+                )
+
+            status = str(
+                getattr(retry_record, "lighter_order_status", None) or ""
+            ).strip().lower()
+            retry_qty = to_decimal(
+                getattr(retry_record, "lighter_filled_base_amount", None)
+            ) or Decimal("0")
+            retry_quote = to_decimal(
+                getattr(retry_record, "lighter_filled_quote_amount", None)
+            )
+            retry_price = to_decimal(
+                getattr(retry_record, "lighter_fill_price", None)
+            )
+            if final_fill and retry_qty <= 0:
+                retry_qty = remaining_qty
+            if retry_qty < 0 or retry_qty > remaining_qty + tolerance:
+                attempt.update(
+                    {
+                        "status": status or None,
+                        "filled_qty": decimal_to_str(retry_qty),
+                    }
+                )
+                await log_attempt(attempt, "fill_qty_invalid")
+                return failed(
+                    "lighter_exit_retry_fill_qty_invalid",
+                    current_record,
+                    current_payload,
+                )
+            if retry_qty > 0 and (retry_quote is None or retry_quote <= 0):
+                if retry_price is None or retry_price <= 0:
+                    attempt.update(
+                        {
+                            "status": status or None,
+                            "filled_qty": decimal_to_str(retry_qty),
+                        }
+                    )
+                    await log_attempt(attempt, "partial_fill_quote_missing")
+                    return failed(
+                        "lighter_exit_retry_partial_fill_quote_missing",
+                        current_record,
+                        current_payload,
+                    )
+                retry_quote = retry_qty * retry_price
+
+            retry_quote = retry_quote or Decimal("0")
+            total_qty += retry_qty
+            total_quote = (total_quote or Decimal("0")) + retry_quote
+            attempt.update(
+                {
+                    "status": status or None,
+                    "filled_qty": decimal_to_str(retry_qty),
+                    "filled_quote": decimal_to_str(retry_quote),
+                    "fill_price": decimal_to_str(retry_price),
+                    "total_filled_qty": decimal_to_str(total_qty),
+                }
+            )
+
+            if final_fill:
+                if total_qty + tolerance < qty:
+                    await log_attempt(attempt, "final_fill_shortfall")
+                    return failed(
+                        "lighter_exit_retry_final_fill_shortfall",
+                        current_record,
+                        current_payload,
+                    )
+                await log_attempt(attempt, "filled_after_retry")
+                async with self._record_lock:
+                    retry_record.lighter_filled_base_amount = total_qty
+                    retry_record.lighter_filled_quote_amount = total_quote
+                    retry_record.lighter_fill_price = total_quote / total_qty
+                    retry_record.lighter_exit_retry_price_boundary = boundary
+                    retry_record.lighter_exit_retry_index = retry_index
+                    retry_record.lighter_exit_retry_history = [
+                        dict(item) for item in context["attempts"]
+                    ]
+                    retry_record.hedge_error = None
+                    self.set_record_stage(
+                        retry_record,
+                        STAGE_LIGHTER_FILLED,
+                        clear_failure=True,
+                    )
+                    current_payload = retry_record.to_payload()
+                context.update(
+                    {
+                        "result": "filled_after_retry",
+                        "successful_retry_index": retry_index,
+                        "total_filled_qty": decimal_to_str(total_qty),
+                        "total_filled_quote": decimal_to_str(total_quote),
+                    }
+                )
+                return {
+                    "ok": True,
+                    "reason": None,
+                    "record": retry_record,
+                    "payload": current_payload,
+                    "context": context,
+                }
+
+            if not self.lighter_exit_cancel_is_retryable(status):
+                await log_attempt(attempt, "non_retryable_terminal")
+                return failed(
+                    "lighter_exit_retry_status_not_retryable",
+                    current_record,
+                    current_payload,
+                )
+            await log_attempt(attempt, "retryable_cancel")
+
+        return failed(
+            "lighter_exit_retry_exhausted",
+            current_record,
+            current_payload,
+        )
+
+    @staticmethod
     def _auto_live_direction_to_var_side(direction: str) -> str:
         if direction == "long_var_short_lighter":
             return "BUY"
@@ -13949,6 +14292,8 @@ class VariationalToLighterRuntime:
         cycle_id: int | None = None,
         role: str | None = None,
         reduce_only: bool = False,
+        retry_price_boundary: Decimal | None = None,
+        retry_index: int = 0,
     ) -> tuple[OrderLifecycle | None, dict[str, Any] | None]:
         limiter = self.live_inventory_order_limiter("lighter")
         await limiter.acquire(urgent=reduce_only)
@@ -13972,6 +14317,8 @@ class VariationalToLighterRuntime:
             lighter_submit_transport=self.lighter_submit_transport,
             lighter_order_mode=self.lighter_order_mode,
             lighter_reduce_only=reduce_only,
+            lighter_exit_retry_price_boundary=retry_price_boundary,
+            lighter_exit_retry_index=int(retry_index),
         )
         async with self._record_lock:
             self.set_record_stage(record, STAGE_RECORD_CREATED, clear_failure=True)
@@ -14575,6 +14922,7 @@ class VariationalToLighterRuntime:
 
     async def handle_lighter_ws(self) -> None:
         while not self.stop_flag:
+            ws = None
             try:
                 await self.reset_lighter_order_book()
                 url = self.build_lighter_ws_url()
@@ -14583,6 +14931,7 @@ class VariationalToLighterRuntime:
                     ping_interval=LIGHTER_WS_PING_INTERVAL_SECONDS,
                     ping_timeout=LIGHTER_WS_PING_TIMEOUT_SECONDS,
                 ) as ws:
+                    self._lighter_market_data_ws = ws
                     await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
                     if self.requires_lighter_trading_credentials():
@@ -14683,6 +15032,69 @@ class VariationalToLighterRuntime:
                     self.build_lighter_ws_url(),
                 )
                 await asyncio.sleep(1)
+            finally:
+                if getattr(self, "_lighter_market_data_ws", None) is ws:
+                    self._lighter_market_data_ws = None
+
+    async def refresh_lighter_order_book_for_exit_retry(
+        self,
+        *,
+        timeout_seconds: float = 1.0,
+    ) -> dict[str, Any]:
+        """Request a fresh market-data snapshot before retrying a canceled IOC."""
+        previous_update_at = getattr(self, "last_lighter_order_book_update_at", None)
+        websocket = getattr(self, "_lighter_market_data_ws", None)
+        if websocket is None or bool(getattr(websocket, "closed", False)):
+            return {
+                "ok": False,
+                "request_sent": False,
+                "snapshot_received": False,
+                "reason": "lighter_market_data_ws_unavailable",
+                "previous_update_at": previous_update_at,
+            }
+
+        try:
+            await self.request_fresh_snapshot(websocket)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "request_sent": False,
+                "snapshot_received": False,
+                "reason": "lighter_market_data_snapshot_request_failed",
+                "error": f"{type(exc).__name__}:{exc}",
+                "previous_update_at": previous_update_at,
+            }
+
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+        while time.monotonic() <= deadline:
+            current_update_at = getattr(self, "last_lighter_order_book_update_at", None)
+            if current_update_at and current_update_at != previous_update_at:
+                best_bid, best_ask = await self.get_lighter_best_bid_ask()
+                return {
+                    "ok": True,
+                    "request_sent": True,
+                    "snapshot_received": True,
+                    "reason": None,
+                    "previous_update_at": previous_update_at,
+                    "update_at": current_update_at,
+                    "book_age_seconds": self._lighter_order_book_age_seconds(),
+                    "best_bid": decimal_to_str(best_bid),
+                    "best_ask": decimal_to_str(best_ask),
+                }
+            await asyncio.sleep(0.01)
+
+        best_bid, best_ask = await self.get_lighter_best_bid_ask()
+        return {
+            "ok": False,
+            "request_sent": True,
+            "snapshot_received": False,
+            "reason": "lighter_market_data_snapshot_timeout",
+            "previous_update_at": previous_update_at,
+            "update_at": getattr(self, "last_lighter_order_book_update_at", None),
+            "book_age_seconds": self._lighter_order_book_age_seconds(),
+            "best_bid": decimal_to_str(best_bid),
+            "best_ask": decimal_to_str(best_ask),
+        }
 
     async def get_lighter_best_bid_ask(self) -> tuple[Decimal | None, Decimal | None]:
         async with self.lighter_order_book_lock:
@@ -15195,6 +15607,26 @@ class VariationalToLighterRuntime:
                 lot_id=payload.get("lot_id"),
             )
 
+    async def append_live_inventory_internal_log(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Write diagnostics without sending a user-facing notification."""
+        enriched_payload = {
+            "record_kind": "live_inventory",
+            "mode": self.mode,
+            "execution_mode": "dry_decision" if self.live_inventory_dry_decisions else "live",
+            "run_id": getattr(self, "live_inventory_run_id", "unknown"),
+            "schema_version": getattr(self, "live_inventory_schema_version", "1"),
+            "strategy_version": getattr(self, "live_inventory_strategy_version", "legacy"),
+            "strategy_variant": getattr(self, "live_inventory_strategy_variant", "legacy"),
+            "config_hash": getattr(self, "live_inventory_config_hash", None),
+            "cycle_id": payload.get("cycle_id", payload.get("lot_id")),
+            **payload,
+        }
+        await self.append_order_log(event_type, enriched_payload)
+
     def should_log_live_inventory_basis_state(self, payload: dict[str, Any]) -> bool:
         if not getattr(self, "live_inventory_basis_v4_mode", False):
             return True
@@ -15593,6 +16025,9 @@ class VariationalToLighterRuntime:
             "live_inventory_exit_blocked_log_throttle_seconds",
         ]
         config = {key: str(getattr(self, key, None)) for key in keys}
+        config[
+            "live_inventory_lighter_exit_max_retries"
+        ] = str(LIVE_INVENTORY_LIGHTER_EXIT_MAX_RETRIES)
         await self.append_live_inventory_log("live_inventory_run_config", {"config": config})
         if getattr(self, "live_inventory_basis_v4_mode", False):
             await self.append_live_inventory_log(
@@ -15809,6 +16244,18 @@ class VariationalToLighterRuntime:
             limit_price = best_ask * (Decimal("1") + slippage)
         else:
             limit_price = best_bid * (Decimal("1") - slippage)
+
+        retry_price_boundary = to_decimal(
+            getattr(record, "lighter_exit_retry_price_boundary", None)
+        )
+        if retry_price_boundary is not None and retry_price_boundary > 0:
+            # A refreshed book may improve the retry, but never widen the
+            # original absolute price boundary that protected the first IOC.
+            limit_price = (
+                min(limit_price, retry_price_boundary)
+                if side == "BUY"
+                else max(limit_price, retry_price_boundary)
+            )
 
         notional = record.qty * limit_price
         edge_bps = basis_points_diff(limit_price, record.var_fill_price)
@@ -22623,20 +23070,53 @@ class VariationalToLighterRuntime:
                 )
                 return
             if not await self.wait_for_lighter_final_fill(lighter_record):
-                await self.require_live_inventory_manual_review(
+                retry_result = await self.retry_lighter_exit_after_cancel(
                     asset=asset,
-                    reason="basis_exit_lighter_final_fill_not_confirmed",
-                    context={
-                        "action": "manual_confirm_or_flatten_after_var_exit",
-                        "lot_id": lot.get("lot_id"),
-                        "direction": direction,
-                        "qty": decimal_to_str(qty),
-                        "lighter_payload": lighter_payload,
+                    direction=direction,
+                    lot_id=int(lot.get("lot_id") or 0),
+                    exit_side=exit_side,
+                    qty=qty,
+                    var_exit_price=var_exit_price,
+                    lighter_record=lighter_record,
+                )
+                retry_context = retry_result.get("context") or {}
+                retry_record = retry_result.get("record")
+                if retry_result.get("ok"):
+                    lighter_record = retry_record
+                    lighter_payload = retry_result.get("payload")
+                    exit_pair_context = {
+                        **exit_pair_context,
+                        "lighter_exit_retry": retry_context,
+                    }
+                else:
+                    if retry_record is not None:
+                        lighter_record = retry_record
+                        lighter_payload = retry_result.get("payload") or retry_record.to_payload()
+                    pending_exit_match.context = {
+                        **(pending_exit_match.context or {}),
+                        "submitted_at": utc_now(),
+                        "lighter_exit_retry": retry_context,
                         "lighter_record": lighter_record.to_payload(),
                         "exit_pair_context": exit_pair_context,
-                    },
-                )
-                return
+                    }
+                    await self.persist_live_inventory_memory(
+                        reason="basis_exit_lighter_retry_failed"
+                    )
+                    await self.require_live_inventory_manual_review(
+                        asset=asset,
+                        reason="basis_exit_lighter_final_fill_not_confirmed",
+                        context={
+                            "action": "manual_confirm_or_flatten_after_var_exit",
+                            "lot_id": lot.get("lot_id"),
+                            "direction": direction,
+                            "qty": decimal_to_str(qty),
+                            "lighter_payload": lighter_payload,
+                            "lighter_record": lighter_record.to_payload(),
+                            "lighter_exit_retry": retry_context,
+                            "exit_pair_context": exit_pair_context,
+                        },
+                    )
+                    return
         if v4_mode and not partial_detier_selected:
             await self.close_all_live_inventory_basis_v4_shadow_tranches(
                 asset=asset,
