@@ -3174,6 +3174,7 @@ def test_runtime_disk_guard_stops_flat_live_below_three_gb(
 ) -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.mode = "live"
         runtime.output_dir = tmp_path
         runtime.live_inventory_last_disk_check_monotonic = 0.0
         runtime.live_inventory_last_disk_warning_monotonic = 0.0
@@ -3195,6 +3196,7 @@ def test_runtime_disk_guard_stops_flat_live_below_three_gb(
         await runtime.maybe_enforce_live_disk_guard(asset="ETH")
 
         assert runtime.stop_flag is True
+        assert runtime.live_inventory_disk_entry_blocked is True
         assert runtime.shutdown_reason == "disk_free_below_stop_threshold"
         fuse = next(
             payload
@@ -3202,6 +3204,45 @@ def test_runtime_disk_guard_stops_flat_live_below_three_gb(
             if event == "live_inventory_runtime_fuse_triggered"
         )
         assert fuse["action"] == "auto_stop_flat"
+
+    asyncio.run(run())
+
+
+def test_runtime_disk_guard_keeps_open_position_managed_but_blocks_entries(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.mode = "live"
+        runtime.output_dir = tmp_path
+        runtime.live_inventory_last_disk_check_monotonic = 0.0
+        runtime.live_inventory_last_disk_warning_monotonic = 0.0
+        runtime.live_inventory_open_lots = [{"lot_id": 1}]
+        runtime.stop_flag = False
+        runtime.shutdown_reason = None
+        runtime.logger = logging.getLogger("test_runtime_disk_guard_open")
+        events: list[tuple[str, dict]] = []
+
+        async def capture(event: str, payload: dict) -> None:
+            events.append((event, payload))
+
+        runtime.append_live_inventory_log = capture
+        monkeypatch.setattr(
+            "main.shutil.disk_usage",
+            lambda _path: SimpleNamespace(free=2 * 1024**3),
+        )
+
+        await runtime.maybe_enforce_live_disk_guard(asset="ETH")
+
+        assert runtime.live_inventory_disk_entry_blocked is True
+        assert runtime.stop_flag is False
+        warning = next(
+            payload
+            for event, payload in events
+            if event == "live_inventory_disk_free_warning"
+        )
+        assert warning["action"] == "block_new_entries_manage_existing_positions"
 
     asyncio.run(run())
 

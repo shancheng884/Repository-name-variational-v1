@@ -5,6 +5,7 @@ import argparse
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -94,13 +95,21 @@ def compact(path: Path) -> tuple[Path, int, int]:
             destination.flush()
             os.fsync(destination.fileno())
 
+        source_digest = hashlib.sha256()
         with path.open("rb") as source, gzip.open(
             archive_tmp,
             "wb",
             compresslevel=6,
         ) as destination:
             while chunk := source.read(1024 * 1024):
+                source_digest.update(chunk)
                 destination.write(chunk)
+        archive_digest = hashlib.sha256()
+        with gzip.open(archive_tmp, "rb") as archived:
+            while chunk := archived.read(1024 * 1024):
+                archive_digest.update(chunk)
+        if archive_digest.digest() != source_digest.digest():
+            raise OSError("full order-metrics archive verification failed")
 
         os.chmod(compact_tmp, source_mode)
         os.replace(archive_tmp, archive)

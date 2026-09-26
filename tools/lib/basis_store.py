@@ -6,7 +6,7 @@ import json
 import os
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -58,13 +58,24 @@ class DayStats:
 
 
 class BasisSampleStore:
-    """Append-only, per-asset daily storage with lossless gzip rotation."""
+    """Append-only daily samples with lossless compression and bounded age."""
 
-    def __init__(self, root: Path, *, config_hash: str, commit: str) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        config_hash: str,
+        commit: str,
+        retention_days: int = 45,
+    ) -> None:
+        if retention_days < 30:
+            raise ValueError("basis sample retention must be at least 30 days")
         self.root = root
         self.config_hash = config_hash
         self.commit = commit
+        self.retention_days = retention_days
         self.stats: dict[tuple[str, str], DayStats] = {}
+        self._last_prune_day: str | None = None
         self.root.mkdir(parents=True, exist_ok=True)
 
     def append(self, row: dict[str, Any]) -> Path:
@@ -122,7 +133,30 @@ class BasisSampleStore:
             if path.stem >= today:
                 continue
             compressed.append(compress_jsonl(path))
+        if self._last_prune_day != today:
+            self.prune_expired_days(current_day=today)
+            self._last_prune_day = today
         return compressed
+
+    def prune_expired_days(self, *, current_day: str | None = None) -> list[Path]:
+        """Remove only closed sample files older than the configured history."""
+        today = date.fromisoformat(current_day or _utc_day())
+        cutoff = today - timedelta(days=self.retention_days)
+        removed: list[Path] = []
+        for path in self.root.glob("*/*"):
+            if not path.is_file() or path.name.endswith(".tmp"):
+                continue
+            try:
+                sample_day = date.fromisoformat(path.name[:10])
+            except ValueError:
+                continue
+            if sample_day >= cutoff:
+                continue
+            if path.name[10:] not in (".jsonl", ".jsonl.gz", ".manifest.json"):
+                continue
+            path.unlink()
+            removed.append(path)
+        return removed
 
 
 def basis_sample_paths(root: Path, asset_filter: str | None = None) -> list[Path]:

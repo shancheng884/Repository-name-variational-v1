@@ -169,23 +169,30 @@ end. The legacy weekend flag is not needed in new commands.
 generic rotation command on `order_metrics.jsonl`: the strategy reads retained
 execution events from that file for calibration.
 
-When `order_metrics.jsonl` exceeds 512 MB, stop the strategy and collector and
-confirm both exchanges are flat. Preview the safe compaction first:
+Run the unified log maintenance preview regularly:
 
 ```bash
-python tools/compact_order_metrics.py
+python tools/log_maintenance.py
 ```
 
-Then execute it:
+Execution requires all trading and collector writers to be stopped and the
+local live inventory state to be flat with no pending actions. It compresses
+`order_metrics.jsonl` once it reaches 512 MiB, archives oversized raw capture
+logs, compresses closed mainnet/RH basis days, and removes sample days older
+than 45 days. Raw capture archives expire after 14 days; market and paper log
+archives expire after 45 days. The exact full order-metrics archives remain
+protected. Use:
 
 ```bash
-python tools/compact_order_metrics.py --execute
+python tools/log_maintenance.py --execute
 ```
 
-The command creates a gzip archive containing the exact original file. The new
-current file keeps every trading, fill, PnL, calibration, fuse, and manual-review
-event, while bounding only repetitive diagnostics. Keep the newest full archive
-until the compacted file and analyzer have been verified.
+The live strategy also records repeated basis-state snapshots less often and
+blocks new entries/add-ons below 3 GiB free disk while continuing to manage
+existing positions. Closed-day sample retention preserves at least 30 days.
+The 4 GiB log-directory budget is a monitoring target; if protected full order
+archives push usage over it, keep them and add disk or move verified archives
+off-host rather than deleting execution history.
 
 Other stopped-process logs can be previewed and archived separately:
 

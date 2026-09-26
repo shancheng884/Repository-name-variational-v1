@@ -2835,6 +2835,8 @@ class VariationalToLighterRuntime:
         self.auto_live_manual_review_reason: str | None = None
         self._last_auto_live_guard_log: tuple[str, int, int] | None = None
         self._last_live_inventory_entry_blocked_log: dict[tuple[str, str], float] = {}
+        self.live_inventory_disk_entry_blocked = False
+        self.live_inventory_last_disk_entry_block_log_monotonic = 0.0
         self._last_live_inventory_exit_blocked_log: dict[tuple[Any, str], float] = {}
         self._last_auto_live_precheck_failure_log: dict[tuple[str, int, str, str, str], float] = {}
         self.paper_last_closed_monotonic: float | None = None
@@ -10444,6 +10446,9 @@ class VariationalToLighterRuntime:
             return
         self.live_inventory_last_disk_check_monotonic = now
         free_gb = shutil.disk_usage(self.output_dir).free / (1024**3)
+        self.live_inventory_disk_entry_blocked = (
+            self.is_live_mode() and free_gb < LIVE_DISK_STOP_FREE_GB
+        )
         if free_gb >= LIVE_DISK_WARN_FREE_GB:
             return
         if free_gb >= LIVE_DISK_STOP_FREE_GB:
@@ -10473,12 +10478,28 @@ class VariationalToLighterRuntime:
             return
 
         if self.live_inventory_open_lots:
-            self.logger.error(
-                "live_inventory_disk_guard_deferred_until_flat asset=%s free_gb=%.3f open_lots=%s",
-                asset,
-                free_gb,
-                len(self.live_inventory_open_lots),
+            warning_last = float(
+                getattr(self, "live_inventory_last_disk_warning_monotonic", 0.0)
+                or 0.0
             )
+            if now - warning_last >= 3600.0 or warning_last == 0.0:
+                self.live_inventory_last_disk_warning_monotonic = now
+                self.logger.error(
+                    "live_inventory_disk_guard_manage_existing_only asset=%s free_gb=%.3f open_lots=%s",
+                    asset,
+                    free_gb,
+                    len(self.live_inventory_open_lots),
+                )
+                await self.append_live_inventory_log(
+                    "live_inventory_disk_free_warning",
+                    {
+                        "asset": asset,
+                        "disk_free_gb": f"{free_gb:.3f}",
+                        "disk_stop_free_gb": LIVE_DISK_STOP_FREE_GB,
+                        "open_lots_total": len(self.live_inventory_open_lots),
+                        "action": "block_new_entries_manage_existing_positions",
+                    },
+                )
             return
         self.shutdown_reason = "disk_free_below_stop_threshold"
         await self.append_live_inventory_log(
@@ -15649,10 +15670,12 @@ class VariationalToLighterRuntime:
         if crossing != previous_crossing:
             self.live_inventory_last_basis_state_log_monotonic = now
             return True
+        # Full-rate basis samples are stored separately. Keep operational
+        # snapshots less frequent so the execution ledger stays compact.
         interval = (
-            5.0
+            30.0
             if crossing or getattr(self, "live_inventory_open_lots", [])
-            else 30.0
+            else 120.0
         )
         last = float(getattr(self, "live_inventory_last_basis_state_log_monotonic", 0.0) or 0.0)
         if now - last < interval:
@@ -19518,6 +19541,33 @@ class VariationalToLighterRuntime:
                     )
                     return
                 open_notional_usd = self.live_inventory_open_notional_usd()
+                if getattr(self, "live_inventory_disk_entry_blocked", False):
+                    self.live_inventory_basis_entry_confirm_counts.clear()
+                    last_log = float(
+                        getattr(
+                            self,
+                            "live_inventory_last_disk_entry_block_log_monotonic",
+                            0.0,
+                        )
+                        or 0.0
+                    )
+                    if time.monotonic() - last_log >= 3600.0 or last_log == 0.0:
+                        self.live_inventory_last_disk_entry_block_log_monotonic = (
+                            time.monotonic()
+                        )
+                        await self.block_live_inventory_entry(
+                            asset=asset,
+                            reason="disk_free_below_stop_threshold",
+                            context={
+                                "disk_free_gb": round(
+                                    shutil.disk_usage(self.output_dir).free
+                                    / (1024**3),
+                                    3,
+                                ),
+                                "action": "block_new_entries_manage_existing_positions",
+                            },
+                        )
+                    return
                 proposed_total_notional_usd = open_notional_usd + self.live_inventory_lot_notional_usd
                 if (
                     not self.live_inventory_basis_v4_real_gradient
@@ -23441,6 +23491,27 @@ class VariationalToLighterRuntime:
         index = self.live_inventory_sample_index
         event_prefix = "live_inventory_dry" if self.live_inventory_dry_decisions else "live_inventory"
         if not self.live_inventory_open_lots:
+            if getattr(self, "live_inventory_disk_entry_blocked", False):
+                last_log = float(
+                    getattr(
+                        self,
+                        "live_inventory_last_disk_entry_block_log_monotonic",
+                        0.0,
+                    )
+                    or 0.0
+                )
+                if time.monotonic() - last_log >= 3600.0 or last_log == 0.0:
+                    self.live_inventory_last_disk_entry_block_log_monotonic = (
+                        time.monotonic()
+                    )
+                    await self.block_live_inventory_entry(
+                        asset=snapshot.asset.upper(),
+                        reason="disk_free_below_stop_threshold",
+                        context={
+                            "action": "block_new_entries_manage_existing_positions",
+                        },
+                    )
+                return
             if (
                 self.live_inventory_max_cycles > 0
                 and self.live_inventory_completed_cycles

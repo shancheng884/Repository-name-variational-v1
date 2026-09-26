@@ -33,6 +33,40 @@ def test_basis_store_rotates_closed_days_without_losing_rows(tmp_path) -> None:
     assert manifest["rows_this_process"] == 1
 
 
+def test_basis_store_prunes_files_older_than_retention(tmp_path) -> None:
+    store = BasisSampleStore(
+        tmp_path,
+        config_hash="config",
+        commit="commit",
+        retention_days=45,
+    )
+    asset_dir = tmp_path / "ETH"
+    asset_dir.mkdir()
+    expired = [
+        asset_dir / "2026-05-01.jsonl.gz",
+        asset_dir / "2026-05-01.manifest.json",
+    ]
+    recent = asset_dir / "2026-06-01.jsonl.gz"
+    for path in (*expired, recent):
+        path.write_text("test", encoding="utf-8")
+
+    removed = store.prune_expired_days(current_day="2026-07-16")
+
+    assert set(removed) == set(expired)
+    assert not any(path.exists() for path in expired)
+    assert recent.exists()
+
+
+def test_basis_store_requires_at_least_30_day_retention(tmp_path) -> None:
+    with pytest.raises(ValueError, match="at least 30 days"):
+        BasisSampleStore(
+            tmp_path,
+            config_hash="config",
+            commit="commit",
+            retention_days=29,
+        )
+
+
 def test_basis_store_can_read_only_valid_baseline_rows(tmp_path) -> None:
     store = BasisSampleStore(tmp_path, config_hash="config", commit="commit")
     for sample_kind, sample_quality in (
