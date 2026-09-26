@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from main import VariationalToLighterRuntime
 
@@ -19,6 +20,18 @@ def _reset_runtime(state_path: Path, *, var_qty: str = "0", lighter_qty: str = "
     runtime.live_inventory_state_file = state_path
     runtime.live_allowed_assets = {"ETH"}
     runtime.live_inventory_flat_reset_confirmation = "FLAT:ETH"
+    runtime.ticker = None
+    runtime.lighter_market_index = 0
+    runtime.base_amount_multiplier = 0
+    runtime.price_multiplier = 0
+    runtime.lighter_min_base_amount = None
+    runtime.lighter_min_quote_amount = None
+
+    def get_market_config():
+        assert runtime.ticker == "ETH"
+        return 9, 1000, 100, None, None
+
+    runtime.get_lighter_market_config = get_market_config
 
     async def fetch_variational_positions():
         return {
@@ -44,6 +57,7 @@ def _reset_runtime(state_path: Path, *, var_qty: str = "0", lighter_qty: str = "
         return {"code": 200, "accounts": [{"positions": positions}]}
 
     async def fetch_lighter_active_orders():
+        assert runtime.lighter_market_index == 9
         return []
 
     async def append_log(*_args, **_kwargs):
@@ -56,6 +70,40 @@ def _reset_runtime(state_path: Path, *, var_qty: str = "0", lighter_qty: str = "
     runtime.append_live_inventory_log = append_log
     runtime.sync_live_inventory_memory_from_state = lambda: None
     return runtime
+
+
+def test_lighter_active_order_request_includes_resolved_market_id(monkeypatch) -> None:
+    captured = {}
+
+    class FakeOrderApi:
+        def __init__(self, api_client):
+            assert api_client == "api-client"
+
+        async def account_active_orders(self, **kwargs):
+            captured.update(kwargs)
+            return {"code": 200, "orders": []}
+
+    class FakeClient:
+        api_client = "api-client"
+
+        def create_auth_token_with_expiry(self, *, api_key_index):
+            assert api_key_index == 3
+            return "read-token", None
+
+    monkeypatch.setattr("lighter.OrderApi", FakeOrderApi)
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.account_index = 12
+    runtime.api_key_index = 3
+    runtime.lighter_market_index = 9
+    runtime.initialize_lighter_client = lambda: FakeClient()
+
+    async def run() -> None:
+        assert await runtime.fetch_lighter_active_orders() == []
+
+    asyncio.run(run())
+    assert captured["account_index"] == 12
+    assert captured["market_id"] == 9
+    assert captured["authorization"] == "read-token"
 
 
 def test_state_only_reset_requires_verified_flat_and_creates_backup(tmp_path) -> None:

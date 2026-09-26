@@ -5005,11 +5005,15 @@ class VariationalToLighterRuntime:
         )
         if error is not None or not auth_token:
             raise RuntimeError(f"Failed to create Lighter read token: {error or 'empty token'}")
+        market_id = int(self.lighter_market_index)
+        if market_id < 0:
+            raise RuntimeError(f"Invalid Lighter market_id for active-order query: {market_id}")
         from lighter import OrderApi
 
         result = await OrderApi(client.api_client).account_active_orders(
             authorization=auth_token,
             account_index=self.account_index,
+            market_id=market_id,
             _request_timeout=10.0,
         )
         if hasattr(result, "to_dict"):
@@ -5190,6 +5194,15 @@ class VariationalToLighterRuntime:
             )
         if len(self.live_allowed_assets) != 1 or asset not in self.live_allowed_assets:
             raise RuntimeError("Flat-reset mode requires exactly the confirmed asset")
+
+        self.ticker = resolve_lighter_ticker(asset)
+        (
+            self.lighter_market_index,
+            self.base_amount_multiplier,
+            self.price_multiplier,
+            self.lighter_min_base_amount,
+            self.lighter_min_quote_amount,
+        ) = await asyncio.to_thread(self.get_lighter_market_config)
 
         state_file = self.live_inventory_state_file
         if state_file is None:
