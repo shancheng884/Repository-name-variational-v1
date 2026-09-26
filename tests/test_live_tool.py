@@ -848,6 +848,62 @@ def test_live_tool_explicit_reset_allows_confirmed_flat_cleanup_of_old_state(
     assert "local_state_backup_required=true" in message
 
 
+def test_live_tool_state_only_reset_uses_no_strategy_or_submit_flags(
+    monkeypatch,
+) -> None:
+    command = build_main_command(
+        "ETH",
+        LiveConfig(v4_live_mode=True),
+        reset_state_only_after_manual_flat=True,
+        flat_reset_confirmation="FLAT:ETH",
+    )
+    monkeypatch.setattr("sys.argv", command[1:])
+
+    args = parse_args()
+
+    assert args.live_inventory_reset_state_only_after_manual_flat is True
+    assert args.live_inventory_flat_reset_confirmation == "FLAT:ETH"
+    assert "--live-inventory-i-confirm-flat-start" in command
+    assert "--live-inventory-reset-state-after-manual-flat" not in command
+    assert "--lighter-prewarm-submit-ws" not in command
+    assert "--live-inventory-i-accept-basis-real-diagnostic" not in command
+    assert "--live-inventory-basis-v4-real-gradient" not in command
+
+
+def test_live_tool_state_only_reset_accepts_stale_known_state_but_not_unknown(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    state_path = tmp_path / "live_inventory_state.json"
+    monkeypatch.setattr(live, "LIVE_STATE", state_path)
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "open",
+                "asset": "ETH",
+                "open_lots": [{"lot_id": 1, "qty": "0.01"}],
+                "pending_actions": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    allowed, message = validate_state(
+        LiveConfig(v4_live_mode=True),
+        reset_state_only_after_manual_flat=True,
+    )
+    state_path.write_text(json.dumps({"status": "corrupt"}), encoding="utf-8")
+    refused, refusal = validate_state(
+        LiveConfig(v4_live_mode=True),
+        reset_state_only_after_manual_flat=True,
+    )
+
+    assert allowed is True
+    assert "exchange_position_and_order_verification_required=true" in message
+    assert refused is False
+    assert "reset_only_refuses_state" in refusal
+
+
 def test_live_tool_corrects_flat_status_when_open_lots_exist(
     tmp_path,
     monkeypatch,

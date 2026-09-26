@@ -24,6 +24,22 @@ To inspect the full `main.py` command without starting live:
 python tools/live.py --asset SOL --dry-run --verbose
 ```
 
+## Reset Local State Without Starting Live
+
+After manually flattening an asset, use this one-shot command when the local
+journal still shows old lots:
+
+```bash
+python tools/live.py --asset ETH --reset-local-state-only
+```
+
+The command asks for `FLAT:ETH`, then independently checks two consecutive
+snapshots from Variational and Lighter. It refuses to reset if either venue has
+a non-zero position, an active order, an API error, or an unrecognized local
+state. On success it backs up `log/live_inventory_state.json`, marks it flat,
+and exits before starting any trading loop. Run log maintenance only after this
+command exits and all other log writers are stopped.
+
 ## Analyze Live Data
 
 ```bash
@@ -355,7 +371,9 @@ python tools/live.py --asset ETH --v4-live --v4-real-gradient \
 venues were manually checked flat. When an old local journal still contains
 lots or pending actions, startup backs it up, resets it to flat, and then runs
 the strict two-venue reconciliation before enabling entries. If either venue
-is not flat or cannot be queried, startup remains fail-closed.
+is not flat or cannot be queried, startup remains fail-closed. This option
+continues into the selected live strategy; for state cleanup without starting
+trading, use `--reset-local-state-only` instead.
 
 Continuous mode records a checkpoint every time the whole portfolio returns to
 flat, then rearms and starts another episode. `max_cycles=0` is accepted only

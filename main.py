@@ -2096,6 +2096,12 @@ class VariationalToLighterRuntime:
             args.live_inventory_maintenance_drain_after_start
         )
         self.live_inventory_reset_state_after_manual_flat = bool(args.live_inventory_reset_state_after_manual_flat)
+        self.live_inventory_reset_state_only_after_manual_flat = bool(
+            args.live_inventory_reset_state_only_after_manual_flat
+        )
+        self.live_inventory_flat_reset_confirmation = str(
+            args.live_inventory_flat_reset_confirmation or ""
+        ).strip().upper()
         self.live_inventory_auto_close_manual_review_position = bool(args.live_inventory_auto_close_manual_review_position)
         self.live_inventory_force_close_open_state = bool(
             args.live_inventory_force_close_open_state
@@ -4989,6 +4995,323 @@ class VariationalToLighterRuntime:
                 f"Lighter account request failed: code={result.get('code')} message={result.get('message')}"
             )
         return result
+
+    async def fetch_lighter_active_orders(self) -> list[dict[str, Any]]:
+        if self.account_index is None or self.api_key_index is None:
+            raise RuntimeError("Lighter trading credentials are not loaded")
+        client = self.initialize_lighter_client()
+        auth_token, error = client.create_auth_token_with_expiry(
+            api_key_index=self.api_key_index
+        )
+        if error is not None or not auth_token:
+            raise RuntimeError(f"Failed to create Lighter read token: {error or 'empty token'}")
+        from lighter import OrderApi
+
+        result = await OrderApi(client.api_client).account_active_orders(
+            authorization=auth_token,
+            account_index=self.account_index,
+            _request_timeout=10.0,
+        )
+        if hasattr(result, "to_dict"):
+            result = result.to_dict()
+        elif hasattr(result, "model_dump"):
+            result = result.model_dump(mode="json")
+        if not isinstance(result, dict):
+            raise RuntimeError("Lighter active-orders response is not an object")
+        if result.get("code") not in {None, 0, 200}:
+            raise RuntimeError(
+                "Lighter active-orders request failed: "
+                f"code={result.get('code')} message={result.get('message')}"
+            )
+        orders = result.get("orders")
+        if not isinstance(orders, list) or any(
+            not isinstance(order, dict) for order in orders
+        ):
+            raise RuntimeError("Lighter active-orders response has no orders list")
+        return orders
+
+    @staticmethod
+    def extract_all_variational_position_qtys(
+        positions_result: dict[str, Any] | None, *, asset: str
+    ) -> list[Decimal] | None:
+        if not isinstance(positions_result, dict):
+            return None
+        payload = (
+            positions_result.get("result")
+            if isinstance(positions_result.get("result"), dict)
+            else positions_result
+        )
+        positions = payload.get("positions") if isinstance(payload, dict) else None
+        if isinstance(positions, dict):
+            iterable = list(positions.values())
+        elif isinstance(positions, list):
+            iterable = positions
+        else:
+            return None
+
+        asset = asset.upper()
+        quantities: list[Decimal] = []
+        for position in iterable:
+            if not isinstance(position, dict):
+                return None
+            instrument = position.get("instrument")
+            position_info = position.get("position_info")
+            nested_instrument = (
+                position_info.get("instrument")
+                if isinstance(position_info, dict)
+                else None
+            )
+            candidates = [
+                position.get("asset"),
+                position.get("market"),
+                position.get("symbol"),
+                position.get("underlying"),
+            ]
+            for item in (instrument, nested_instrument):
+                if isinstance(item, dict):
+                    candidates.extend(
+                        [item.get("underlying"), item.get("symbol"), item.get("asset")]
+                    )
+            if isinstance(position_info, dict):
+                candidates.extend(
+                    [
+                        position_info.get("asset"),
+                        position_info.get("market"),
+                        position_info.get("symbol"),
+                        position_info.get("underlying"),
+                    ]
+                )
+            if asset not in {str(item).upper() for item in candidates if item is not None}:
+                continue
+
+            qty = None
+            for row in (position, position_info):
+                if not isinstance(row, dict):
+                    continue
+                for key in (
+                    "qty",
+                    "quantity",
+                    "size",
+                    "position",
+                    "position_size",
+                    "base_amount",
+                    "amount",
+                ):
+                    qty = to_decimal(row.get(key))
+                    if qty is not None:
+                        break
+                if qty is not None:
+                    break
+            if qty is None:
+                return None
+            quantities.append(qty)
+        return quantities
+
+    @staticmethod
+    def extract_all_lighter_position_qtys(
+        account_result: dict[str, Any] | None, *, asset: str
+    ) -> list[Decimal] | None:
+        if not isinstance(account_result, dict):
+            return None
+        accounts = account_result.get("accounts")
+        if not isinstance(accounts, list) or not accounts or any(
+            not isinstance(account, dict) for account in accounts
+        ):
+            return None
+        asset = asset.upper()
+        quantities: list[Decimal] = []
+        for account in accounts:
+            positions = account.get("positions")
+            if not isinstance(positions, list):
+                return None
+            for position in positions:
+                if not isinstance(position, dict):
+                    return None
+                symbol = str(position.get("symbol") or "").upper()
+                if symbol != asset and not symbol.startswith(f"{asset}-"):
+                    continue
+                qty = to_decimal(position.get("position"))
+                if qty is None:
+                    return None
+                sign = to_decimal(position.get("sign"))
+                if sign is not None and sign != 0:
+                    qty = abs(qty) * (Decimal("1") if sign > 0 else Decimal("-1"))
+                quantities.append(qty)
+        return quantities
+
+    async def fetch_all_variational_pending_orders(
+        self, *, asset: str
+    ) -> list[dict[str, Any]]:
+        limit = 100
+        all_orders: list[dict[str, Any]] = []
+        for page in range(50):
+            result = await self.fetch_variational_orders(
+                asset=asset,
+                status="pending",
+                limit=limit,
+                offset=page * limit,
+            )
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                raise RuntimeError(
+                    f"Variational pending-orders request failed: {result}"
+                )
+            payload: Any = result
+            for _ in range(8):
+                if isinstance(payload, list):
+                    break
+                if not isinstance(payload, dict):
+                    payload = None
+                    break
+                if isinstance(payload.get("orders"), (dict, list)):
+                    payload = payload["orders"]
+                elif isinstance(payload.get("result"), (dict, list)):
+                    payload = payload["result"]
+                else:
+                    payload = None
+                    break
+            if not isinstance(payload, list) or any(
+                not isinstance(order, dict) for order in payload
+            ):
+                raise RuntimeError("Variational pending-orders response has an invalid shape")
+            all_orders.extend(payload)
+            if len(payload) < limit:
+                return all_orders
+        raise RuntimeError("Variational pending-orders pagination exceeded safety limit")
+
+    async def reset_live_inventory_state_only_after_verified_flat(
+        self, *, asset: str
+    ) -> None:
+        asset = asset.strip().upper()
+        expected_confirmation = f"FLAT:{asset}"
+        if self.live_inventory_flat_reset_confirmation != expected_confirmation:
+            raise RuntimeError(
+                "Flat-reset confirmation mismatch; expected "
+                f"{expected_confirmation}"
+            )
+        if len(self.live_allowed_assets) != 1 or asset not in self.live_allowed_assets:
+            raise RuntimeError("Flat-reset mode requires exactly the confirmed asset")
+
+        state_file = self.live_inventory_state_file
+        if state_file is None:
+            raise RuntimeError("Live inventory state path is unavailable")
+        try:
+            original_bytes = state_file.read_bytes() if state_file.exists() else None
+            previous = (
+                json.loads(original_bytes.decode("utf-8"))
+                if original_bytes is not None
+                else {"status": "flat", "open_lots": [], "pending_actions": []}
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Cannot safely read local live state: {exc}") from exc
+        if not isinstance(previous, dict):
+            raise RuntimeError("Local live state is not an object")
+
+        previous_status = str(previous.get("status") or "unknown").strip()
+        if previous_status not in {"flat", "open", "pending", "manual_review_required"}:
+            raise RuntimeError(f"Refusing to reset unrecognized local state: {previous_status}")
+        local_asset = str(previous.get("asset") or "").strip().upper()
+        if local_asset and local_asset != asset:
+            raise RuntimeError(
+                f"Local state asset mismatch: state={local_asset} requested={asset}"
+            )
+        lots = previous.get("open_lots") or []
+        if not isinstance(lots, list):
+            raise RuntimeError("Local open_lots is not a list")
+        pending_actions = previous.get("pending_actions") or []
+        if not isinstance(pending_actions, list) or any(
+            not isinstance(action, dict) for action in pending_actions
+        ):
+            raise RuntimeError("Local pending_actions is not a valid list")
+        for lot in lots:
+            if not isinstance(lot, dict):
+                raise RuntimeError("Local open_lots contains an invalid row")
+            lot_asset = str(lot.get("asset") or asset).strip().upper()
+            if lot_asset != asset:
+                raise RuntimeError(
+                    f"Local lot asset mismatch: lot={lot_asset} requested={asset}"
+                )
+
+        snapshots: list[dict[str, Any]] = []
+        tolerance = Decimal("0.00000001")
+        for sample_index in range(2):
+            variational = await self.fetch_variational_positions()
+            if not isinstance(variational, dict) or variational.get("ok") is not True:
+                raise RuntimeError(f"Variational positions could not be verified: {variational}")
+            variational_qtys = self.extract_all_variational_position_qtys(
+                variational, asset=asset
+            )
+            if variational_qtys is None:
+                raise RuntimeError("Variational position quantity is unavailable")
+
+            lighter = await self.fetch_lighter_account()
+            lighter_qtys = self.extract_all_lighter_position_qtys(
+                lighter, asset=asset
+            )
+            if lighter_qtys is None:
+                raise RuntimeError("Lighter position quantity is unavailable")
+
+            variational_orders = await self.fetch_all_variational_pending_orders(
+                asset=asset
+            )
+            lighter_orders = await self.fetch_lighter_active_orders()
+            snapshot = {
+                "variational_position_qtys": [
+                    decimal_to_str(qty) for qty in variational_qtys
+                ],
+                "lighter_position_qtys": [
+                    decimal_to_str(qty) for qty in lighter_qtys
+                ],
+                "variational_active_orders": len(variational_orders),
+                "lighter_active_orders": len(lighter_orders),
+            }
+            snapshots.append(snapshot)
+            if any(abs(qty) > tolerance for qty in variational_qtys) or any(
+                abs(qty) > tolerance for qty in lighter_qtys
+            ):
+                raise RuntimeError(f"Exchange position is not flat: {snapshot}")
+            if variational_orders or lighter_orders:
+                raise RuntimeError(f"Open orders remain on an exchange: {snapshot}")
+            if sample_index == 0:
+                await asyncio.sleep(1.0)
+
+        current_bytes = state_file.read_bytes() if state_file.exists() else None
+        if current_bytes != original_bytes:
+            raise RuntimeError("Local state changed during exchange verification; refusing reset")
+
+        backup_path = self.backup_live_inventory_state_for_manual_flat_reset()
+        reset_at = utc_now()
+        reset_state = {
+            "status": "flat",
+            "asset": asset,
+            "next_lot_id": 1,
+            "open_lots": [],
+            "pending_actions": [],
+            "realized_pnl_usd": "0",
+            "completed_cycles": 0,
+            "reason": "manual_flat_state_reset_exchange_verified",
+            "reset_source_run_id": previous.get("run_id"),
+            "exchange_flat_verified_at": reset_at,
+            "exchange_flat_verification": {
+                "snapshot_count": len(snapshots),
+                "snapshots": snapshots,
+            },
+        }
+        self.write_live_inventory_state(reset_state)
+        self.sync_live_inventory_memory_from_state()
+        await self.append_live_inventory_log(
+            "live_inventory_manual_flat_state_reset_only",
+            {
+                "asset": asset,
+                "verified_snapshots": snapshots,
+                "backup": str(backup_path) if backup_path else "not_needed",
+                "strategy_started": False,
+            },
+        )
+        print(
+            "FLAT_STATE_RESET=YES "
+            f"asset={asset} snapshots={len(snapshots)} "
+            f"backup={backup_path if backup_path else 'not_needed'} strategy_started=NO"
+        )
 
     def apply_live_inventory_account_recovery_gate(
         self,
@@ -12815,9 +13138,31 @@ class VariationalToLighterRuntime:
                     passed.append("live_inventory_dry_decisions_only_no_orders")
                     if getattr(self, "live_inventory_collect_only", False):
                         passed.append("live_inventory_basis_collect_only_state_logging_no_orders")
+                elif getattr(
+                    self, "live_inventory_reset_state_only_after_manual_flat", False
+                ):
+                    passed.append("live_inventory_flat_state_reset_only_no_orders_no_strategy_loop")
                 else:
                     passed.append("live_inventory_real_submit_one_lot_enabled")
-                if getattr(self, "live_inventory_auto_close_manual_review_position", False):
+                if getattr(
+                    self, "live_inventory_reset_state_only_after_manual_flat", False
+                ):
+                    state = self.load_live_inventory_state()
+                    state_status = clean_state_value(state.get("status")) or "unknown"
+                    state_asset = clean_state_value(state.get("asset"))
+                    if state_status not in {"flat", "open", "pending", "manual_review_required"}:
+                        blocking_errors.append(
+                            "live_inventory_reset_only_refuses_unrecognized_state: "
+                            + self.live_inventory_state_summary(state)
+                        )
+                    elif state_asset and state_asset.upper() not in self.live_allowed_assets:
+                        blocking_errors.append(
+                            "live_inventory_reset_only_asset_mismatch: "
+                            + self.live_inventory_state_summary(state)
+                        )
+                    else:
+                        passed.append("live_inventory_state_reset_deferred_until_exchange_flat_verified")
+                elif getattr(self, "live_inventory_auto_close_manual_review_position", False):
                     state = self.load_live_inventory_state()
                     state_status = clean_state_value(state.get("status")) or "unknown"
                     manual_reason = clean_state_value(state.get("manual_review_reason")) or "unknown"
@@ -25567,7 +25912,8 @@ class VariationalToLighterRuntime:
         await self.append_live_inventory_run_config()
         await self.runtime.start()
         v4_history_task: asyncio.Task[dict[str, Any]] | None = None
-        if self.live_inventory_basis_v4_mode:
+        reset_state_only = self.live_inventory_reset_state_only_after_manual_flat
+        if self.live_inventory_basis_v4_mode and not reset_state_only:
             # Load the rolling anchor while exchange clients initialize. Recent
             # continuity is checked separately and cannot replace the 7d anchor.
             v4_history_task = asyncio.create_task(
@@ -25595,10 +25941,15 @@ class VariationalToLighterRuntime:
                 "Variational heartbeat did not arrive within %ss; continuing in stale state until browser events appear",
                 READY_TIMEOUT_SECONDS,
             )
+        initial_asset = ""
+        if reset_state_only:
+            if len(self.live_allowed_assets) != 1:
+                raise RuntimeError("Flat-state reset requires exactly one allowed asset")
+            initial_asset = next(iter(self.live_allowed_assets)).upper()
         if self.requires_lighter_trading_credentials():
             self.load_lighter_trading_credentials()
             self.initialize_lighter_client()
-        if self.requires_lighter_market_data():
+        if self.requires_lighter_market_data() and not reset_state_only:
             initial_asset = await self.wait_for_ticker_resolution()
             if self.live_allowed_assets and initial_asset.upper() not in self.live_allowed_assets:
                 raise RuntimeError(
@@ -25631,6 +25982,11 @@ class VariationalToLighterRuntime:
             except Exception:
                 self.logger.exception("variational_api_command_client_preflight_failed asset=%s", initial_asset)
                 raise
+        if reset_state_only:
+            await self.reset_live_inventory_state_only_after_verified_flat(
+                asset=initial_asset
+            )
+            return
         if self.live_inventory_basis_v4_mode:
             if v4_history_task is None:
                 raise RuntimeError("V4 history task was not initialized")
@@ -26200,6 +26556,19 @@ def parse_args() -> argparse.Namespace:
         help="After manually confirming Var and Lighter are flat, reset log/live_inventory_state.json to flat during startup.",
     )
     parser.add_argument(
+        "--live-inventory-reset-state-only-after-manual-flat",
+        action="store_true",
+        help=(
+            "Verify both venues have zero positions and active orders, back up and reset "
+            "the local inventory state, then exit without starting the strategy."
+        ),
+    )
+    parser.add_argument(
+        "--live-inventory-flat-reset-confirmation",
+        default="",
+        help="Exact operator confirmation required by reset-state-only mode: FLAT:<ASSET>.",
+    )
+    parser.add_argument(
         "--live-inventory-auto-close-manual-review-position",
         action="store_true",
         help="One-shot recovery: only for live_inventory manual_review caused by entry Lighter actual slippage exceeding the limit; submit reduce-only closes for both legs and exit.",
@@ -26705,6 +27074,7 @@ def parse_args() -> argparse.Namespace:
             and not args.live_inventory_i_accept_open_state_resume
             and not args.live_inventory_auto_close_manual_review_position
             and not args.live_inventory_force_close_open_state
+            and not args.live_inventory_reset_state_only_after_manual_flat
         ):
             parser.error(
                 "--live-inventory requires --live-inventory-i-confirm-flat-start after manually confirming flat, "
@@ -26728,6 +27098,24 @@ def parse_args() -> argparse.Namespace:
                 "--live-inventory-auto-close-manual-review-position, or "
                 "--live-inventory-force-close-open-state"
             )
+        if args.live_inventory_reset_state_only_after_manual_flat:
+            if not args.live_inventory_i_confirm_flat_start:
+                parser.error(
+                    "--live-inventory-reset-state-only-after-manual-flat requires "
+                    "--live-inventory-i-confirm-flat-start"
+                )
+            if (
+                args.live_inventory_reset_state_after_manual_flat
+                or args.live_inventory_i_accept_open_state_resume
+                or args.live_inventory_auto_close_manual_review_position
+                or args.live_inventory_force_close_open_state
+                or args.live_inventory_maintenance_drain_after_start
+                or args.live_inventory_collect_only
+                or args.live_inventory_dry_decisions
+            ):
+                parser.error(
+                    "reset-state-only mode cannot be combined with other inventory modes"
+                )
         if (
             args.live_inventory_maintenance_drain_after_start
             and not args.live_inventory_i_accept_open_state_resume
@@ -26737,6 +27125,17 @@ def parse_args() -> argparse.Namespace:
                 "--live-inventory-i-accept-open-state-resume"
             )
         allowed_assets = {asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()}
+        if args.live_inventory_reset_state_only_after_manual_flat:
+            if len(allowed_assets) != 1:
+                parser.error(
+                    "reset-state-only mode requires exactly one --live-allowed-assets value"
+                )
+            expected_confirmation = f"FLAT:{next(iter(allowed_assets))}"
+            if str(args.live_inventory_flat_reset_confirmation or "").strip().upper() != expected_confirmation:
+                parser.error(
+                    "reset-state-only mode requires "
+                    f"--live-inventory-flat-reset-confirmation {expected_confirmation}"
+                )
         if args.live_inventory_collect_only and (
             not args.live_inventory_dry_decisions
             or args.live_inventory_signal_mode != LIVE_INVENTORY_SIGNAL_BASIS
@@ -26752,7 +27151,10 @@ def parse_args() -> argparse.Namespace:
                     "--live-inventory-signal-mode basis requires --live-allowed-assets values from "
                     f"{sorted(LIVE_INVENTORY_BASIS_ALLOWED_ASSETS)}"
                 )
-            if not args.live_inventory_dry_decisions:
+            if args.live_inventory_reset_state_only_after_manual_flat:
+                if len(allowed_assets) != 1:
+                    parser.error("reset-state-only mode requires exactly one basis asset")
+            elif not args.live_inventory_dry_decisions:
                 if len(allowed_assets) != 1:
                     parser.error(
                         "--live-inventory-signal-mode basis real-submit requires exactly one --live-allowed-assets value"
@@ -26813,7 +27215,11 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory V1 requires --lighter-submit-transport ws")
         if args.lighter_order_mode != LIGHTER_ORDER_MODE_MARKET_IOC:
             parser.error("--live-inventory V1 requires --lighter-order-mode market-ioc")
-        if not args.lighter_prewarm_submit_ws and not args.live_inventory_collect_only:
+        if (
+            not args.lighter_prewarm_submit_ws
+            and not args.live_inventory_collect_only
+            and not args.live_inventory_reset_state_only_after_manual_flat
+        ):
             parser.error("--live-inventory V1 requires --lighter-prewarm-submit-ws")
         if args.live_inventory_lot_notional_usd <= 0 or args.live_inventory_lot_notional_usd > live_inventory_max_lot_notional_usd:
             parser.error(f"--live-inventory-lot-notional-usd must be > 0 and <= {live_inventory_max_lot_notional_usd} in V1")
@@ -27255,6 +27661,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--live-inventory-basis-sigma-floor-bps must be >= 0")
     elif args.live_inventory_reset_state_after_manual_flat:
         parser.error("--live-inventory-reset-state-after-manual-flat requires --live-inventory")
+    elif args.live_inventory_reset_state_only_after_manual_flat:
+        parser.error("--live-inventory-reset-state-only-after-manual-flat requires --live-inventory")
     elif args.live_inventory_dry_decisions:
         parser.error("--live-inventory-dry-decisions requires --live-inventory")
     elif args.live_inventory_collect_only:

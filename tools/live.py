@@ -189,6 +189,7 @@ def validate_state(
     config: LiveConfig,
     *,
     reset_state_after_manual_flat: bool = False,
+    reset_state_only_after_manual_flat: bool = False,
     collect_only: bool = False,
     close_open_position: bool = False,
     resume_open_position: bool = False,
@@ -197,6 +198,8 @@ def validate_state(
     if not state:
         if close_open_position:
             return False, "close_requires_existing_open_state"
+        if reset_state_only_after_manual_flat:
+            return True, "state=missing reset_only=true exchange_verification_required=true"
         return True, "state=missing allowed=start_after_manual_exchange_flat_confirmation"
 
     status = str(state.get("status") or "unknown")
@@ -211,6 +214,16 @@ def validate_state(
         completed_cycles = int(state.get("completed_cycles") or 0)
     except (TypeError, ValueError):
         completed_cycles = 0
+
+    if reset_state_only_after_manual_flat:
+        if status not in {"flat", "open", "pending", "manual_review_required"}:
+            return False, f"reset_only_refuses_state status={status} asset={asset}"
+        return (
+            True,
+            f"state={status} asset={asset} open_lots={len(open_lots)} "
+            f"pending_actions={len(pending_actions)} "
+            "reset_only=true exchange_position_and_order_verification_required=true",
+        )
 
     if close_open_position:
         if status != "open":
@@ -479,6 +492,8 @@ def build_main_command(
     close_open_position: bool = False,
     resume_open_position: bool = False,
     maintenance_drain_after_start: bool = False,
+    reset_state_only_after_manual_flat: bool = False,
+    flat_reset_confirmation: str | None = None,
 ) -> list[str]:
     reversion_mode = config.reversion_mode
     calibration_mode = config.calibration_mode
@@ -620,8 +635,17 @@ def build_main_command(
         command.append("--live-inventory-maintenance-drain-after-start")
     if collect_only:
         command.extend(["--live-inventory-dry-decisions", "--live-inventory-collect-only"])
-    else:
+    elif not reset_state_only_after_manual_flat:
         command.extend(["--lighter-prewarm-submit-ws", "--live-inventory-i-accept-basis-real-diagnostic"])
+    if reset_state_only_after_manual_flat:
+        command.extend(
+            [
+                "--live-inventory-reset-state-only-after-manual-flat",
+                "--live-inventory-flat-reset-confirmation",
+                flat_reset_confirmation or f"FLAT:{asset.upper()}",
+            ]
+        )
+        return command
     if config.dynamic_entry_threshold and not v4_live_mode:
         command.append("--live-inventory-basis-dynamic-entry-threshold")
     if not reversion_mode and not calibration_mode and not v4_live_mode:
@@ -876,7 +900,18 @@ def main() -> int:
     parser.add_argument(
         "--reset-state-after-manual-flat",
         action="store_true",
-        help="After manually confirming both venues are flat, reset the completed-cycle state during startup.",
+        help=(
+            "After manual flat confirmation, reset state and continue into the "
+            "selected live strategy; use --reset-local-state-only to exit without trading."
+        ),
+    )
+    parser.add_argument(
+        "--reset-local-state-only",
+        action="store_true",
+        help=(
+            "Verify both exchanges show zero positions and active orders, back up and "
+            "reset local inventory state, then exit without starting the strategy."
+        ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print checks without starting live.")
     parser.add_argument("--verbose", action="store_true", help="Print the full main.py command.")
@@ -943,6 +978,23 @@ def main() -> int:
         parser.error("use only one of --reversion, --calibration, --v4-live, or --collect-only")
     if args.collect_only and args.reset_state_after_manual_flat:
         parser.error("--collect-only does not allow --reset-state-after-manual-flat")
+    if args.reset_local_state_only and (
+        assets
+        or args.reversion
+        or args.calibration
+        or args.v4_live
+        or args.v4_shadow_gradient
+        or args.v4_real_gradient
+        or args.v4_reverse_test
+        or args.v4_bidirectional
+        or args.v4_continuous
+        or args.collect_only
+        or args.reset_state_after_manual_flat
+        or args.close_open_position
+        or args.resume_open_position
+        or args.drain_after_flat
+    ):
+        parser.error("--reset-local-state-only is a standalone one-shot mode")
     if args.close_open_position and not args.v4_live:
         parser.error("--close-open-position requires --v4-live")
     if args.close_open_position and (
@@ -1073,6 +1125,7 @@ def main() -> int:
     state_ok, state_message = validate_state(
         config,
         reset_state_after_manual_flat=args.reset_state_after_manual_flat,
+        reset_state_only_after_manual_flat=args.reset_local_state_only,
         collect_only=args.collect_only,
         close_open_position=args.close_open_position,
         resume_open_position=args.resume_open_position,
@@ -1111,6 +1164,8 @@ def main() -> int:
             maintenance_drain_after_start=(
                 args.drain_after_flat and args.resume_open_position
             ),
+            reset_state_only_after_manual_flat=args.reset_local_state_only,
+            flat_reset_confirmation=f"FLAT:{asset}" if asset else None,
         )
     )
     effective_max_cycles = (
@@ -1121,7 +1176,9 @@ def main() -> int:
         else config.max_cycles
     )
     strategy_mode = (
-        "basis_v3_collect_only"
+        "manual_flat_state_reset_only"
+        if args.reset_local_state_only
+        else "basis_v3_collect_only"
         if args.collect_only
         else "execution_calibration"
         if config.calibration_mode
@@ -1159,6 +1216,17 @@ def main() -> int:
 
     if args.collect_only:
         print("Starting collect-only basis logging. Real and dry inventory entries are disabled.")
+    elif args.reset_local_state_only:
+        if not args.dry_run:
+            expected_confirmation = f"FLAT:{asset}"
+            confirmation = input(
+                f"确认 {asset} 在 Variational 与 Lighter 的仓位和未成交订单均为 0，输入 {expected_confirmation}: "
+            ).strip().upper()
+            if confirmation != expected_confirmation:
+                print("REFUSE_RESET reason=operator_confirmation_mismatch")
+                return 2
+            command[command.index("--live-inventory-flat-reset-confirmation") + 1] = confirmation
+        print("Only exchange verification and local-state reset will run; no trading loop will start.")
     else:
         print("Starting live. You are responsible for confirming both exchanges are flat before running this command.")
     return subprocess.call(command, cwd=ROOT)
