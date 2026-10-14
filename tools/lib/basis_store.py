@@ -184,6 +184,9 @@ def read_basis_samples(
     sample_kind_filter: str | None = None,
     sample_quality_filter: str | None = None,
     quote_size_mode_filter: str | None = None,
+    since_utc: datetime | None = None,
+    until_utc: datetime | None = None,
+    row_fields: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     paths_by_asset: dict[str, list[Path]] = {}
@@ -202,6 +205,17 @@ def read_basis_samples(
                             continue
                         if not isinstance(row, dict):
                             continue
+                        if since_utc is not None or until_utc is not None:
+                            try:
+                                at = datetime.fromisoformat(str(row.get("logged_at", "")).replace("Z", "+00:00"))
+                                if at.tzinfo is None:
+                                    continue
+                            except ValueError:
+                                continue
+                            if since_utc is not None and at < since_utc:
+                                continue
+                            if until_utc is not None and at > until_utc:
+                                continue
                         if (
                             sample_kind_filter is not None
                             and str(row.get("sample_kind") or "")
@@ -220,7 +234,10 @@ def read_basis_samples(
                             != quote_size_mode_filter
                         ):
                             continue
-                        asset_rows.append(row)
+                        asset_rows.append(
+                            {key: value for key, value in row.items() if key in row_fields}
+                            if row_fields is not None else row
+                        )
             except OSError:
                 continue
         rows.extend(asset_rows)

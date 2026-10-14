@@ -122,9 +122,10 @@ class MarketBook:
 
 
 class MultiLighterBooks:
-    def __init__(self, assets: tuple[str, ...], logger: logging.Logger) -> None:
+    def __init__(self, assets: tuple[str, ...], logger: logging.Logger, *, websocket_url: str | None = None) -> None:
         self.assets = assets
         self.logger = logger
+        self.websocket_url = websocket_url or LIGHTER_WS_URL
         self.books: dict[int, MarketBook] = {}
         self.by_asset: dict[str, MarketBook] = {}
         self.lock = asyncio.Lock()
@@ -174,7 +175,8 @@ class MultiLighterBooks:
     async def run(self) -> None:
         backoff = 1.0
         use_server_pings = os.getenv("LIGHTER_WS_SERVER_PINGS", "").strip().lower() in {"1", "true", "yes", "on"}
-        websocket_url = f"{LIGHTER_WS_URL}?server_pings=true" if use_server_pings else LIGHTER_WS_URL
+        separator = "&" if "?" in self.websocket_url else "?"
+        websocket_url = f"{self.websocket_url}{separator}server_pings=true" if use_server_pings else self.websocket_url
         while not self.stop:
             try:
                 async with websockets.connect(websocket_url, ping_interval=30, ping_timeout=30, max_size=None) as websocket:

@@ -1,0 +1,18 @@
+[Unit]
+Description=Var/Lighter mainnet ETH read-only anchor collection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
+ExecStart=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/mainnet_anchor_collect.py --source-root /home/ubuntu/var-rh-eth/log/basis_samples
+Restart=always
+RestartSec=15
+KillSignal=SIGINT
+TimeoutStopSec=30
+MemoryMax=900M
+
+[Install]
+WantedBy=multi-user.target

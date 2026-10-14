@@ -8917,6 +8917,9 @@ class VariationalToLighterRuntime:
             rows,
             key=lambda item: str(item.get("logged_at") or ""),
         ):
+            if row.get("venue") not in (None, "mainnet_lighter"):
+                reject("wrong_lighter_venue")
+                continue
             quality_version = int(to_decimal(row.get("sample_quality_version")) or 0)
             if (
                 quality_version >= LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION
@@ -9065,12 +9068,10 @@ class VariationalToLighterRuntime:
                         self.live_inventory_basis_v4_migration_fallback_by_direction[
                             direction
                         ] = fallback
-        raw_source_rows = read_basis_samples(
-            self.output_dir / "basis_samples",
-            limit=100000,
-            asset_filter=asset,
-            sample_kind_filter="baseline",
-            sample_quality_filter="valid",
+        from tools.lib.mainnet_anchor import load_mainnet_anchor_rows
+        raw_source_rows = load_mainnet_anchor_rows(
+            self.output_dir, asset=asset,
+            now=datetime.fromtimestamp(now, tz=timezone.utc),
         )
         source_rows, sample_quality_counts = (
             self.filter_live_inventory_basis_v4_history_rows(raw_source_rows)
