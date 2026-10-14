@@ -20,6 +20,13 @@ without counting duplicate reference frames or manufacturing missing history.
 
 After synchronizing this version, run from the original mainnet checkout:
 
+To restart RH trading and install the concurrent follower service together, use
+`bash deploy/start_rh_and_mainnet_collection.sh`. It verifies local state, asks for
+actual venue-position confirmation, resets a flat halted state through the
+existing exchange-verification command, and preserves open positions by resuming
+them. RH trading uses its existing configuration and exit logic; this collection
+update does not fix RH's observed execution-price shortfall.
+
 ```bash
 cd /home/ubuntu/Repository-name-variational-v1
 sudo cp deploy/systemd/var-mainnet-anchor.service /etc/systemd/system/
