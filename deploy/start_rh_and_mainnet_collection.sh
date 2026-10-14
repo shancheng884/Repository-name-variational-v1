@@ -3,7 +3,8 @@ set -euo pipefail
 
 MAINNET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RH_DIR="/home/ubuntu/var-rh-eth"
-echo "RH live exit logic is unchanged; its previously observed execution-price shortfall is not fixed by this deployment."
+echo "RH live now checks exchange book timestamps, bounds normal profit exits, and pauses on abnormal RH fills."
+echo "The IOC boundary uses the quoted Var exit price; confirm both venue fills after any uncertain submission."
 test -x "$RH_DIR/.venv/bin/python"
 test -f "$RH_DIR/.env"
 test -d "$RH_DIR/.git"
