@@ -23,6 +23,7 @@ if [ ! -x "$COLLECTOR_PY" ]; then
   COLLECTOR_PY="$RH_DIR/.venv/bin/python"
 fi
 "$COLLECTOR_PY" -c "import sys; sys.path.insert(0, '$MAINNET_DIR'); import tools.lib.mainnet_anchor_follow"
+"$COLLECTOR_PY" "$MAINNET_DIR/tools/mainnet_anchor_collect.py" --help >/dev/null
 "$RH_DIR/.venv/bin/python" -m py_compile "$RH_DIR/main.py"
 
 mapfile -t PIDS < <(pgrep -f '^/home/ubuntu/var-rh-eth/.venv/bin/python main.py ' || true)
