@@ -1345,8 +1345,9 @@ def extract_variational_account_metrics(payload: Any) -> dict[str, Decimal | str
         equity = balance
         formula = "balance"
     else:
-        equity = balance + upnl
-        formula = "balance_plus_upnl"
+        # Variational's published balance already reflects unrealized PnL.
+        equity = balance
+        formula = "balance_includes_upnl"
     margin_usage = payload.get("margin_usage")
     if not isinstance(margin_usage, dict):
         margin_usage = {}
@@ -22475,7 +22476,16 @@ class VariationalToLighterRuntime:
             )
             raw_should_exit = raw_should_exit or should_profit_take
             should_exit = raw_should_exit and var_quote_age_ok and lighter_book_age_ok
-            should_stop = pnl_bps is not None and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
+            loss_review_required = (
+                v4_mode
+                and pnl_bps is not None
+                and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
+            )
+            should_stop = (
+                not v4_mode
+                and pnl_bps is not None
+                and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
+            )
             account_risk_exit_reason = getattr(
                 self, "live_inventory_account_risk_exit_reason", None
             )
@@ -22548,8 +22558,8 @@ class VariationalToLighterRuntime:
                                 "quote_source": quote.get("quote_source"),
                             },
                         )
-                # V4 has no time-driven exit or target relaxation. Account risk,
-                # executable profit, and the independent loss fuse are the only exits.
+                # V4 exits on account risk and confirmed executable profit; the
+                # configured loss threshold only requests a manual review.
                 should_timeout = False
                 should_timeout_exit = False
                 if (
@@ -22578,6 +22588,23 @@ class VariationalToLighterRuntime:
                             "lighter_book_age_ok": lighter_book_age_ok,
                         },
                     )
+            if loss_review_required and not candidate_lot.get(
+                "v4_loss_review_alerted"
+            ):
+                candidate_lot["v4_loss_review_alerted"] = True
+                await self.append_live_inventory_log(
+                    "live_inventory_v4_loss_review_alert",
+                    {
+                        **state_payload,
+                        "lot_id": candidate_lot.get("lot_id"),
+                        "direction": direction,
+                        "pnl_bps": decimal_to_str(pnl_bps),
+                        "threshold_bps": decimal_to_str(
+                            self.live_inventory_max_unrealized_loss_bps
+                        ),
+                        "action": "manual_review_no_automatic_stop",
+                    },
+                )
             if should_timeout and not should_timeout_exit:
                 last_warned = int(candidate_lot.get("max_hold_warned_samples") or 0)
                 if holding_samples > last_warned and self.should_log_live_inventory_exit_blocked(

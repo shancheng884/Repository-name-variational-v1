@@ -26,6 +26,7 @@ TELEGRAM_EVENT_TYPES = {
     "live_inventory_v4_entry_blocked",
     "live_inventory_exit_blocked",
     "live_inventory_manual_review_required",
+    "live_inventory_v4_loss_review_alert",
     "live_inventory_runtime_fuse_triggered",
     "live_inventory_basis_quote_failed",
     "live_inventory_v4_strong_single_auto_disabled",
@@ -382,6 +383,17 @@ def format_telegram_trade_message(
                 "[Var/Lighter] 需要人工核对",
                 f"资产：{asset}｜原因：{_reason_cn(_value(payload, 'reason'))}",
                 f"本地未平仓层数：{_value(payload, 'open_lots_total')}",
+                f"运行编号：{run_id}",
+            ]
+        )
+    if event_type == "live_inventory_v4_loss_review_alert":
+        return "\n".join(
+            [
+                "[Var/Lighter] 浮亏达到人工复核线",
+                f"资产：{asset}｜方向：{_direction_cn(direction)}",
+                f"当前可执行浮亏：{_value(payload, 'pnl_bps')} bps",
+                f"复核线：-{_value(payload, 'threshold_bps')} bps",
+                "动作：不自动止损；请人工复核，策略继续按正常规则管理仓位",
                 f"运行编号：{run_id}",
             ]
         )

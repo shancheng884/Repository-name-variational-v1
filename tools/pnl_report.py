@@ -5,6 +5,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,7 @@ from tools.lib.pnl_baseline import (  # noqa: E402
 ORDER_METRICS = ROOT / "log" / "order_metrics.jsonl"
 LIVE_INVENTORY_STATE = ROOT / "log" / "live_inventory_state.json"
 PNL_BASELINE = ROOT / "log" / PNL_BASELINE_FILE_NAME
+DAILY_PNL_SEND_STATE = ROOT / "log" / "pnl_daily_telegram_state.json"
 RELEVANT_EVENTS = {
     "live_inventory_run_config",
     "live_inventory_actual_pnl",
@@ -133,22 +135,7 @@ def reset_pnl_reporting_baseline(
     baseline_path: Path = PNL_BASELINE,
     started_at: str | None = None,
 ) -> dict[str, Any]:
-    if not state_path.exists():
-        raise RuntimeError("live_inventory_state_missing")
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"live_inventory_state_invalid:{exc}") from exc
-    if not isinstance(state, dict):
-        raise RuntimeError("live_inventory_state_not_object")
-    open_lots = state.get("open_lots")
-    pending_actions = state.get("pending_actions")
-    if (
-        str(state.get("status") or "").strip() != "flat"
-        or (isinstance(open_lots, list) and open_lots)
-        or (isinstance(pending_actions, list) and pending_actions)
-    ):
-        raise RuntimeError("local_live_inventory_state_not_flat")
+    state = require_flat_inventory_state(asset=asset, state_path=state_path)
     baseline = new_pnl_baseline(
         asset=asset,
         realized_pnl_usd=state.get("realized_pnl_usd") or "0",
@@ -160,6 +147,33 @@ def reset_pnl_reporting_baseline(
     if loaded is None:
         raise RuntimeError("pnl_baseline_write_failed")
     return loaded
+
+
+def require_flat_inventory_state(
+    *, asset: str, state_path: Path = LIVE_INVENTORY_STATE
+) -> dict[str, Any]:
+    if not state_path.exists():
+        raise RuntimeError("live_inventory_state_missing")
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"live_inventory_state_invalid:{exc}") from exc
+    if not isinstance(state, dict):
+        raise RuntimeError("live_inventory_state_not_object")
+    state_asset = str(state.get("asset") or "").strip().upper()
+    if state_asset and state_asset != asset.upper():
+        raise RuntimeError("live_inventory_state_asset_mismatch")
+    open_lots = state.get("open_lots")
+    pending_actions = state.get("pending_actions")
+    if (
+        str(state.get("status") or "").strip() != "flat"
+        or not isinstance(open_lots, list)
+        or open_lots
+        or not isinstance(pending_actions, list)
+        or pending_actions
+    ):
+        raise RuntimeError("local_live_inventory_state_not_flat")
+    return state
 
 
 def row_key(row: dict[str, Any]) -> tuple[str, str, str]:
@@ -849,13 +863,66 @@ def main() -> int:
     if args.since and args.period:
         raise SystemExit("--since and --period cannot be used together")
     if args.reset_baseline:
+        reset_at = datetime.now(timezone.utc)
+        backup_stamp = reset_at.strftime("%Y%m%dT%H%M%S%fZ")
+        baseline_existed = PNL_BASELINE.exists()
         try:
-            baseline = reset_pnl_reporting_baseline(asset=args.asset)
-        except RuntimeError as exc:
+            require_flat_inventory_state(asset=args.asset)
+            backups: list[Path] = []
+            for path in (PNL_BASELINE, DAILY_PNL_SEND_STATE):
+                if path.exists():
+                    backup = path.with_name(
+                        f"{path.name}.before_reset.{backup_stamp}.bak"
+                    )
+                    shutil.copy2(path, backup)
+                    backups.append(backup)
+        except (RuntimeError, OSError) as exc:
+            raise SystemExit(f"reset_baseline=FAILED {exc}") from exc
+        try:
+            baseline = reset_pnl_reporting_baseline(
+                asset=args.asset,
+                started_at=reset_at.isoformat(),
+            )
+            DAILY_PNL_SEND_STATE.parent.mkdir(parents=True, exist_ok=True)
+            temporary = DAILY_PNL_SEND_STATE.with_suffix(
+                DAILY_PNL_SEND_STATE.suffix + ".tmp"
+            )
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "updated_at": reset_at.isoformat(),
+                        "sent_keys": [],
+                    },
+                    ensure_ascii=True,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(DAILY_PNL_SEND_STATE)
+        except (RuntimeError, OSError) as exc:
+            baseline_backup = next(
+                (path for path in backups if path.name.startswith(PNL_BASELINE.name + ".before_reset.")),
+                None,
+            )
+            try:
+                if baseline_backup is not None:
+                    shutil.copy2(baseline_backup, PNL_BASELINE)
+                elif not baseline_existed and PNL_BASELINE.exists():
+                    PNL_BASELINE.unlink()
+            except OSError as rollback_exc:
+                raise SystemExit(
+                    f"reset_baseline=PARTIAL {exc}; baseline_rollback_failed={rollback_exc}"
+                ) from exc
             raise SystemExit(f"reset_baseline=FAILED {exc}") from exc
         print("reset_baseline=PASS")
         print(f"asset={baseline.get('asset')}")
         print(f"started_at={baseline.get('started_at')}")
+        print("daily_totals=ZERO telegram_send_dedup=RESET")
+        for backup in backups:
+            print(f"backup={backup.name}")
         print("next_startup_account_snapshot_required=true")
         return 0
     tracking_baseline = load_pnl_baseline(PNL_BASELINE)
