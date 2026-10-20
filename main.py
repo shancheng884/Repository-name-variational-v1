@@ -255,7 +255,8 @@ LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_MAD_BPS = Decimal("2.0")
 LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_INTERVAL_SECONDS = 300.0
 # A scheduled exact RFQ is useful only when the passive estimate is close
 # enough to the translated threshold to have a realistic chance of passing.
-LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_BAND_BPS = Decimal("0.75")
+LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_BAND_BPS = Decimal("1.50")
+LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_COOLDOWN_REOPEN_EDGE_BPS = Decimal("2.00")
 LIVE_INVENTORY_ENTRY_RFQ_BIAS_STATE_FILE_NAME = "live_inventory_entry_rfq_bias.json"
 LIVE_INVENTORY_BASIS_V4_WEEKEND_TRANSITION_SECONDS = 6 * 3600
 LIVE_INVENTORY_EQUITY_REBALANCE_TARGET_IMBALANCE_PCT = Decimal("6.5")
@@ -1021,6 +1022,65 @@ def v4_exact_rfq_entry_threshold(
     if passive_threshold_bps is None:
         return None
     return passive_threshold_bps + (directional_bias_bps or Decimal("0"))
+
+
+def v4_single_tail_exit_target_bps(
+    *,
+    open_lot_count: int,
+    holding_seconds: float,
+    execution_reserve_bps: Decimal,
+    normal_net_target_bps: Decimal,
+) -> tuple[Decimal, bool]:
+    """After six hours, let a sole confirmed lot exit at cost recovery."""
+    tail_release = (
+        open_lot_count == 1
+        and holding_seconds >= LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS
+    )
+    net_target = (
+        min(normal_net_target_bps, Decimal("0"))
+        if tail_release
+        else normal_net_target_bps
+    )
+    return execution_reserve_bps + net_target, tail_release
+
+
+def v4_entry_rfq_cooldown_reopened(
+    *,
+    current_edge_bps: Decimal | None,
+    last_rfq_edge_bps: Decimal | None,
+) -> bool:
+    """Recheck a cooled-down direction only after a material edge recovery."""
+    return bool(
+        current_edge_bps is not None
+        and last_rfq_edge_bps is not None
+        and current_edge_bps - last_rfq_edge_bps
+        >= LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_COOLDOWN_REOPEN_EDGE_BPS
+    )
+
+
+def v4_opposite_direction_rearm_allowed(
+    *,
+    rearm_required: bool,
+    rearm_direction: str | None,
+    candidate_direction: str,
+    candidate_edge_bps: Decimal | None,
+    candidate_threshold_bps: Decimal | None,
+    is_flat: bool,
+    has_pending_actions: bool,
+    manual_review_required: bool,
+) -> bool:
+    """Allow a qualified direction switch only from a verified local flat state."""
+    return bool(
+        rearm_required
+        and is_flat
+        and not has_pending_actions
+        and not manual_review_required
+        and rearm_direction is not None
+        and candidate_direction != rearm_direction
+        and candidate_edge_bps is not None
+        and candidate_threshold_bps is not None
+        and candidate_edge_bps >= candidate_threshold_bps
+    )
 
 
 def v4_exact_rfq_gradient_thresholds(
@@ -2529,6 +2589,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_entry_rfq_cooldown_until_monotonic: dict[
             str, float
         ] = {}
+        self.live_inventory_basis_entry_rfq_last_edge_bps_by_direction: dict[
+            str, Decimal
+        ] = {}
         self.live_inventory_basis_entry_rfq_last_skip_log_monotonic = 0.0
         self.live_inventory_v4_episode_id: str | None = None
         self.live_inventory_v4_next_tranche_index = 1
@@ -3548,6 +3611,7 @@ class VariationalToLighterRuntime:
         if (
             direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
             and getattr(self, "live_inventory_basis_v4_bidirectional", False)
+            and not context["ready"]
         ):
             reserve_bps = max(
                 reserve_bps,
@@ -3788,6 +3852,34 @@ class VariationalToLighterRuntime:
         ]
         if not qualified:
             return self.live_inventory_basis_v4_entry_direction()
+        if getattr(self, "live_inventory_v4_rearm_required", False):
+            rearm_direction = getattr(
+                self,
+                "live_inventory_v4_rearm_direction",
+                None,
+            )
+            open_lots = getattr(self, "live_inventory_open_lots", [])
+            pending_actions = self.pending_live_inventory_actions_payload()
+            manual_review_required = bool(
+                getattr(self, "auto_live_manual_review_required", False)
+                or getattr(self, "shutdown_reason", None)
+            )
+            opposite_qualified = [
+                direction
+                for direction in qualified
+                if v4_opposite_direction_rearm_allowed(
+                    rearm_required=True,
+                    rearm_direction=rearm_direction,
+                    candidate_direction=direction,
+                    candidate_edge_bps=signal_edges.get(direction),
+                    candidate_threshold_bps=thresholds.get(direction),
+                    is_flat=not open_lots,
+                    has_pending_actions=bool(pending_actions),
+                    manual_review_required=manual_review_required,
+                )
+            ]
+            if opposite_qualified:
+                qualified = opposite_qualified
         return max(
             qualified,
             key=lambda direction: (
@@ -9908,50 +10000,53 @@ class VariationalToLighterRuntime:
             self.live_inventory_v4_rearm_reason = None
             self.live_inventory_v4_rearm_threshold_bps = None
             self.live_inventory_v4_rearm_direction = None
-            self.live_inventory_v4_episode_id = None
-            self.live_inventory_v4_next_tranche_index = 1
-            self.live_inventory_v4_gradient_tier_states = {
-                tier: {"armed": True, "reset_seen": False}
-                for tier in range(
-                    1,
-                    LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
-                )
-            }
-            for direction_states in getattr(
-                self,
-                "live_inventory_v4_gradient_tier_states_by_direction",
-                {},
-            ).values():
-                direction_states.clear()
-                direction_states.update(
-                    {
-                        tier: {"armed": True, "reset_seen": False}
-                        for tier in range(
-                            1,
-                            LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
-                        )
-                    }
-                )
-            tier_window = getattr(
-                self,
-                "live_inventory_v4_gradient_entry_tier_window",
-                None,
-            )
-            if isinstance(tier_window, deque):
-                tier_window.clear()
-            for direction_window in getattr(
-                self,
-                "live_inventory_v4_gradient_entry_tier_windows_by_direction",
-                {},
-            ).values():
-                direction_window.clear()
-            self.reset_live_inventory_basis_v4_shadow_gradient()
+            self.reset_live_inventory_basis_v4_episode_after_rearm()
         return rearmed, {
             **self.live_inventory_v4_episode_payload(),
             "v4_rearm_reset_threshold_bps": decimal_to_str(reset_threshold),
             "v4_rearm_signal_below_reset": below_reset,
             "v4_rearm_direction": direction,
         }
+
+    def reset_live_inventory_basis_v4_episode_after_rearm(self) -> None:
+        self.live_inventory_v4_episode_id = None
+        self.live_inventory_v4_next_tranche_index = 1
+        self.live_inventory_v4_gradient_tier_states = {
+            tier: {"armed": True, "reset_seen": False}
+            for tier in range(
+                1,
+                LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
+            )
+        }
+        for direction_states in getattr(
+            self,
+            "live_inventory_v4_gradient_tier_states_by_direction",
+            {},
+        ).values():
+            direction_states.clear()
+            direction_states.update(
+                {
+                    tier: {"armed": True, "reset_seen": False}
+                    for tier in range(
+                        1,
+                        LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS + 1,
+                    )
+                }
+            )
+        tier_window = getattr(
+            self,
+            "live_inventory_v4_gradient_entry_tier_window",
+            None,
+        )
+        if isinstance(tier_window, deque):
+            tier_window.clear()
+        for direction_window in getattr(
+            self,
+            "live_inventory_v4_gradient_entry_tier_windows_by_direction",
+            {},
+        ).values():
+            direction_window.clear()
+        self.reset_live_inventory_basis_v4_shadow_gradient()
 
     def live_inventory_basis_v4_active_gradient_tier(
         self,
@@ -19391,18 +19486,91 @@ class VariationalToLighterRuntime:
                             )
                         continue
                     if self.live_inventory_v4_rearm_required:
-                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
-                        if index == 1 or index % 30 == 0:
+                        rearm_direction = self.live_inventory_v4_rearm_direction
+                        pending_rearm_actions = (
+                            self.pending_live_inventory_actions_payload()
+                        )
+                        manual_review_required = bool(
+                            getattr(
+                                self,
+                                "auto_live_manual_review_required",
+                                False,
+                            )
+                            or getattr(self, "shutdown_reason", None)
+                        )
+                        opposite_rearm_allowed = (
+                            v4_opposite_direction_rearm_allowed(
+                                rearm_required=True,
+                                rearm_direction=rearm_direction,
+                                candidate_direction=direction,
+                                candidate_edge_bps=v4_signal_edges.get(
+                                    direction
+                                ),
+                                candidate_threshold_bps=(
+                                    v4_entry_thresholds.get(direction)
+                                ),
+                                is_flat=not self.live_inventory_open_lots,
+                                has_pending_actions=bool(
+                                    pending_rearm_actions
+                                ),
+                                manual_review_required=(
+                                    manual_review_required
+                                ),
+                            )
+                        )
+                        if opposite_rearm_allowed:
+                            self.live_inventory_v4_rearm_required = False
+                            self.live_inventory_v4_rearm_confirmation_count = 0
+                            self.live_inventory_v4_rearm_reason = None
+                            self.live_inventory_v4_rearm_threshold_bps = None
+                            self.live_inventory_v4_rearm_direction = None
+                            self.reset_live_inventory_basis_v4_episode_after_rearm()
+                            v4_rearm_context = {
+                                **v4_rearm_context,
+                                **self.live_inventory_v4_episode_payload(),
+                                "v4_opposite_direction_rearm": True,
+                                "v4_rearm_previous_direction": rearm_direction,
+                                "v4_rearm_candidate_direction": direction,
+                                "v4_rearm_candidate_edge_bps": decimal_to_str(
+                                    v4_signal_edges.get(direction)
+                                ),
+                                "v4_rearm_candidate_threshold_bps": decimal_to_str(
+                                    v4_entry_thresholds.get(direction)
+                                ),
+                            }
                             await self.append_live_inventory_log(
-                                "live_inventory_v4_entry_blocked",
+                                "live_inventory_v4_opposite_direction_rearmed",
                                 {
                                     **state_payload,
-                                    "reason": "v4_waiting_for_episode_rearm",
-                                    "direction": direction,
+                                    "asset": asset,
+                                    "sample_index": index,
                                     **v4_rearm_context,
                                 },
                             )
-                        continue
+                            await self.persist_live_inventory_memory(
+                                reason="v4_opposite_direction_rearmed"
+                            )
+                        else:
+                            self.live_inventory_basis_entry_confirm_counts[
+                                direction
+                            ] = 0
+                            if index == 1 or index % 30 == 0:
+                                await self.append_live_inventory_log(
+                                    "live_inventory_v4_entry_blocked",
+                                    {
+                                        **state_payload,
+                                        "reason": "v4_waiting_for_episode_rearm",
+                                        "direction": direction,
+                                        **v4_rearm_context,
+                                        "v4_opposite_direction_rearm_allowed": False,
+                                        "v4_rearm_is_flat": not self.live_inventory_open_lots,
+                                        "v4_rearm_pending_actions": len(
+                                            pending_rearm_actions
+                                        ),
+                                        "v4_rearm_manual_review_required": manual_review_required,
+                                    },
+                                )
+                            continue
                     direction_signal = edge_bps - v4_entry_threshold_bps
                     if self.live_inventory_basis_v4_real_gradient:
                         raw_real_gradient_tier = v4_real_gradient_eligible_tier(
@@ -19991,6 +20159,47 @@ class VariationalToLighterRuntime:
                         0.0,
                     )
                     now_monotonic = time.monotonic()
+                    last_rfq_edges = getattr(
+                        self,
+                        "live_inventory_basis_entry_rfq_last_edge_bps_by_direction",
+                        None,
+                    )
+                    if not isinstance(last_rfq_edges, dict):
+                        last_rfq_edges = {}
+                        self.live_inventory_basis_entry_rfq_last_edge_bps_by_direction = (
+                            last_rfq_edges
+                        )
+                    if cooldown_until > now_monotonic:
+                        last_rfq_edge_bps = last_rfq_edges.get(direction)
+                        current_edge_bps = to_decimal(
+                            v4_signal_edges.get(direction)
+                        )
+                        if v4_entry_rfq_cooldown_reopened(
+                            current_edge_bps=current_edge_bps,
+                            last_rfq_edge_bps=last_rfq_edge_bps,
+                        ):
+                            self.live_inventory_basis_entry_rfq_cooldown_until_monotonic.pop(
+                                direction,
+                                None,
+                            )
+                            cooldown_until = 0.0
+                            await self.append_live_inventory_log(
+                                "live_inventory_entry_rfq_cooldown_reopened",
+                                {
+                                    **state_payload,
+                                    "direction": direction,
+                                    "reason": "passive_edge_recovered",
+                                    "last_rfq_edge_bps": decimal_to_str(
+                                        last_rfq_edge_bps
+                                    ),
+                                    "current_edge_bps": decimal_to_str(
+                                        current_edge_bps
+                                    ),
+                                    "required_improvement_bps": decimal_to_str(
+                                        LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_COOLDOWN_REOPEN_EDGE_BPS
+                                    ),
+                                },
+                            )
                     if cooldown_until > now_monotonic:
                         if (
                             now_monotonic
@@ -20012,6 +20221,9 @@ class VariationalToLighterRuntime:
                         self.live_inventory_basis_v4_entry_rfq_exploration_due(
                             direction
                         )
+                    last_rfq_edges[direction] = to_decimal(
+                        v4_signal_edges.get(direction)
+                    ) or Decimal("0")
                     refreshed_quote, refreshed_quote_ms = await self.fetch_live_inventory_basis_quote(
                         asset=asset,
                         qty=signal_quote_qty,
@@ -22498,10 +22710,17 @@ class VariationalToLighterRuntime:
             should_account_risk_exit = bool(forced_exit_reason)
             should_timeout = holding_samples >= self.live_inventory_max_hold_samples
             should_timeout_exit = should_timeout and self.live_inventory_basis_max_hold_action == "exit"
+            v4_tail_release_active = False
             if v4_mode and candidate_lot.get("entry_kind") == "basis_v4_eth_short_p97_5":
-                effective_min_exit_pnl_bps = (
-                    v4_exit_shortfall_reserve_bps
-                    + LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS
+                effective_min_exit_pnl_bps, v4_tail_release_active = (
+                    v4_single_tail_exit_target_bps(
+                        open_lot_count=len(self.live_inventory_open_lots),
+                        holding_seconds=float(holding_seconds or 0.0),
+                        execution_reserve_bps=v4_exit_shortfall_reserve_bps,
+                        normal_net_target_bps=(
+                            LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS
+                        ),
+                    )
                 )
                 if portfolio_exit_selected:
                     locked_portfolio_target = to_decimal(
@@ -22580,6 +22799,10 @@ class VariationalToLighterRuntime:
                             "reason": "v4_executable_pnl_below_threshold",
                             "holding_samples": holding_samples,
                             "holding_seconds": holding_seconds,
+                            "v4_tail_release_active": v4_tail_release_active,
+                            "v4_tail_release_after_seconds": (
+                                LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS
+                            ),
                             "pnl_bps": decimal_to_str(pnl_bps),
                             "effective_min_exit_pnl_bps": decimal_to_str(
                                 effective_min_exit_pnl_bps

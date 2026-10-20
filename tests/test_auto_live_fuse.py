@@ -42,7 +42,10 @@ from main import (
     v4_real_gradient_thresholds,
     v4_exact_rfq_entry_threshold,
     v4_exact_rfq_gradient_thresholds,
+    v4_entry_rfq_cooldown_reopened,
+    v4_opposite_direction_rearm_allowed,
     v4_partial_detier_selection,
+    v4_single_tail_exit_target_bps,
     v4_weekend_regime_context,
 )
 
@@ -2254,6 +2257,40 @@ def test_v4_exit_target_uses_mature_floor_for_low_shortfall() -> None:
     )
 
 
+def test_bidirectional_long_exit_uses_observed_reserve_after_calibration_ready() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_dynamic_exit_buffer = True
+    runtime.live_inventory_basis_v4_bidirectional = True
+    runtime.live_inventory_exit_shortfall_bps_samples_by_direction = {
+        "long_var_short_lighter": deque([Decimal("0")] * 10, maxlen=20),
+        "short_var_long_lighter": deque(maxlen=20),
+    }
+
+    payload = runtime.live_inventory_basis_v4_exit_calibration_payload(
+        direction="long_var_short_lighter"
+    )
+
+    assert payload["v4_exit_shortfall_calibration_ready"] is True
+    assert payload["v4_exit_shortfall_reserve_bps"] == "1.50"
+
+
+def test_bidirectional_long_exit_keeps_prior_before_calibration_ready() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_dynamic_exit_buffer = True
+    runtime.live_inventory_basis_v4_bidirectional = True
+    runtime.live_inventory_exit_shortfall_bps_samples_by_direction = {
+        "long_var_short_lighter": deque([Decimal("0")] * 2, maxlen=20),
+        "short_var_long_lighter": deque(maxlen=20),
+    }
+
+    payload = runtime.live_inventory_basis_v4_exit_calibration_payload(
+        direction="long_var_short_lighter"
+    )
+
+    assert payload["v4_exit_shortfall_calibration_ready"] is False
+    assert payload["v4_exit_shortfall_reserve_bps"] == "3.50"
+
+
 def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
     tmp_path,
 ) -> None:
@@ -2522,7 +2559,75 @@ def test_v4_bidirectional_selects_best_flat_direction_and_locks_open_episode() -
     ) == "short_var_long_lighter"
 
 
-def test_v4_bidirectional_uses_conservative_long_execution_reserves() -> None:
+def test_v4_rearm_selects_only_a_fully_qualified_opposite_direction() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_reverse_test = False
+    runtime.live_inventory_basis_v4_bidirectional = True
+    runtime.live_inventory_open_lots = []
+    runtime.live_inventory_v4_rearm_required = True
+    runtime.live_inventory_v4_rearm_direction = "long_var_short_lighter"
+
+    edges = {
+        "long_var_short_lighter": Decimal("10"),
+        "short_var_long_lighter": Decimal("-6"),
+    }
+    thresholds = {
+        "long_var_short_lighter": Decimal("5"),
+        "short_var_long_lighter": Decimal("-7"),
+    }
+
+    assert runtime.live_inventory_basis_v4_select_entry_direction(
+        signal_edges=edges,
+        thresholds=thresholds,
+    ) == "short_var_long_lighter"
+
+    assert not v4_opposite_direction_rearm_allowed(
+        rearm_required=True,
+        rearm_direction="long_var_short_lighter",
+        candidate_direction="short_var_long_lighter",
+        candidate_edge_bps=Decimal("-7.1"),
+        candidate_threshold_bps=Decimal("-7"),
+        is_flat=True,
+        has_pending_actions=False,
+        manual_review_required=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("is_flat", "has_pending_actions", "manual_review_required"),
+    [(False, False, False), (True, True, False), (True, False, True)],
+)
+def test_v4_opposite_rearm_refuses_unsafe_local_state(
+    is_flat: bool,
+    has_pending_actions: bool,
+    manual_review_required: bool,
+) -> None:
+    assert not v4_opposite_direction_rearm_allowed(
+        rearm_required=True,
+        rearm_direction="long_var_short_lighter",
+        candidate_direction="short_var_long_lighter",
+        candidate_edge_bps=Decimal("-6"),
+        candidate_threshold_bps=Decimal("-7"),
+        is_flat=is_flat,
+        has_pending_actions=has_pending_actions,
+        manual_review_required=manual_review_required,
+    )
+
+
+def test_v4_opposite_rearm_allows_flat_confirmed_edge_only() -> None:
+    assert v4_opposite_direction_rearm_allowed(
+        rearm_required=True,
+        rearm_direction="long_var_short_lighter",
+        candidate_direction="short_var_long_lighter",
+        candidate_edge_bps=Decimal("-6"),
+        candidate_threshold_bps=Decimal("-7"),
+        is_flat=True,
+        has_pending_actions=False,
+        manual_review_required=False,
+    )
+
+
+def test_v4_bidirectional_uses_observed_long_exit_reserve_when_ready() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_basis_v4_reverse_test = False
     runtime.live_inventory_basis_v4_bidirectional = True
@@ -2552,7 +2657,7 @@ def test_v4_bidirectional_uses_conservative_long_execution_reserves() -> None:
     ) == Decimal("0.25")
     assert runtime.live_inventory_basis_v4_exit_calibration_payload(
         direction="long_var_short_lighter"
-    )["v4_exit_shortfall_reserve_bps"] == "3.50"
+    )["v4_exit_shortfall_reserve_bps"] == "0.50"
 
 
 def test_v4_bidirectional_gradient_confirmation_state_is_isolated() -> None:
@@ -4997,8 +5102,13 @@ def test_v4_entry_rfq_exploration_requires_near_threshold_edge() -> None:
         exact_entry_threshold_bps=Decimal("2.00"),
         bias_ready=True,
     )
-    assert not runtime.live_inventory_basis_v4_entry_rfq_exploration_allowed(
+    assert runtime.live_inventory_basis_v4_entry_rfq_exploration_allowed(
         predicted_exact_edge_bps=Decimal("1.00"),
+        exact_entry_threshold_bps=Decimal("2.00"),
+        bias_ready=True,
+    )
+    assert not runtime.live_inventory_basis_v4_entry_rfq_exploration_allowed(
+        predicted_exact_edge_bps=Decimal("0.49"),
         exact_entry_threshold_bps=Decimal("2.00"),
         bias_ready=True,
     )
@@ -5006,6 +5116,51 @@ def test_v4_entry_rfq_exploration_requires_near_threshold_edge() -> None:
         predicted_exact_edge_bps=Decimal("2.00"),
         exact_entry_threshold_bps=Decimal("2.00"),
         bias_ready=True,
+    )
+
+
+def test_v4_single_tail_exit_releases_only_after_six_hours_at_cost_recovery() -> None:
+    from main import LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS
+
+    reserve = Decimal("1.50")
+    normal_target = Decimal("1.00")
+
+    before, before_active = v4_single_tail_exit_target_bps(
+        open_lot_count=1,
+        holding_seconds=LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS - 1,
+        execution_reserve_bps=reserve,
+        normal_net_target_bps=normal_target,
+    )
+    after, after_active = v4_single_tail_exit_target_bps(
+        open_lot_count=1,
+        holding_seconds=LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS,
+        execution_reserve_bps=reserve,
+        normal_net_target_bps=normal_target,
+    )
+    basket, basket_active = v4_single_tail_exit_target_bps(
+        open_lot_count=2,
+        holding_seconds=LIVE_INVENTORY_BASIS_V4_MAX_HOLD_SECONDS * 2,
+        execution_reserve_bps=reserve,
+        normal_net_target_bps=normal_target,
+    )
+
+    assert (before, before_active) == (Decimal("2.50"), False)
+    assert (after, after_active) == (reserve, True)
+    assert (basket, basket_active) == (Decimal("2.50"), False)
+
+
+def test_entry_rfq_cooldown_reopens_only_after_material_edge_recovery() -> None:
+    assert not v4_entry_rfq_cooldown_reopened(
+        current_edge_bps=Decimal("11.99"),
+        last_rfq_edge_bps=Decimal("10"),
+    )
+    assert v4_entry_rfq_cooldown_reopened(
+        current_edge_bps=Decimal("12"),
+        last_rfq_edge_bps=Decimal("10"),
+    )
+    assert not v4_entry_rfq_cooldown_reopened(
+        current_edge_bps=None,
+        last_rfq_edge_bps=Decimal("10"),
     )
 
 
