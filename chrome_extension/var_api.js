@@ -133,7 +133,7 @@ export function buildVariationalApiScript(action, params) {
       underlying: o.market || "BTC",
       instrument_type: instrumentType,
       settlement_asset: o.settlementAsset || "USDC",
-      funding_interval_s: o.fundingIntervalS || 3600
+      funding_interval_s: o.fundingIntervalS ?? 3600
     };
 
     if (action === "POSITIONS") {

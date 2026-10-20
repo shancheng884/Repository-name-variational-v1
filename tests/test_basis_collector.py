@@ -128,6 +128,12 @@ def test_lighter_depth_fill_uses_executable_levels() -> None:
     assert Decimal("99") < fill < Decimal("100")
 
 
+def test_lighter_base_quantity_fill_uses_same_contract_quantity() -> None:
+    levels = {Decimal("100"): Decimal("0.1"), Decimal("101"): Decimal("1")}
+    fill = MultiLighterBooks._fill_base(levels, side="BUY", base_qty=Decimal("0.2"))
+    assert fill == Decimal("100.5")
+
+
 def test_burst_rows_do_not_enter_baseline_history(tmp_path) -> None:
     args = parse_args(["--assets", "SOL,BTC", "--output-dir", str(tmp_path)])
     collector = MultiAssetCollector(args)

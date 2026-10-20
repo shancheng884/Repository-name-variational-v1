@@ -128,6 +128,7 @@ class MultiLighterBooks:
         self.websocket_url = websocket_url or LIGHTER_WS_URL
         self.books: dict[int, MarketBook] = {}
         self.by_asset: dict[str, MarketBook] = {}
+        self.market_metadata: dict[str, dict[str, Any]] = {}
         self.lock = asyncio.Lock()
         self.stop = False
 
@@ -143,6 +144,7 @@ class MultiLighterBooks:
             book = MarketBook(asset=asset, market_id=int(item["market_id"]))
             self.books[book.market_id] = book
             self.by_asset[asset] = book
+            self.market_metadata[asset] = dict(item)
 
     @staticmethod
     def _market_id(message: dict[str, Any]) -> int | None:
@@ -262,7 +264,32 @@ class MultiLighterBooks:
             return None
         return total_quote / total_base
 
-    async def snapshot(self, asset: str, quote_notional: Decimal) -> dict[str, Any] | None:
+    @staticmethod
+    def _fill_base(levels: dict[Decimal, Decimal], *, side: str, base_qty: Decimal) -> Decimal | None:
+        ordered = sorted(levels.items(), reverse=side == "SELL")
+        remaining_base = base_qty
+        total_base = Decimal("0")
+        total_quote = Decimal("0")
+        for price, size in ordered:
+            if price <= 0:
+                continue
+            take_base = min(size, remaining_base)
+            total_base += take_base
+            total_quote += take_base * price
+            remaining_base -= take_base
+            if remaining_base <= Decimal("0.000000000001"):
+                break
+        if remaining_base > Decimal("0.000000000001") or total_base <= 0:
+            return None
+        return total_quote / total_base
+
+    async def snapshot(
+        self,
+        asset: str,
+        quote_notional: Decimal,
+        *,
+        base_qty: Decimal | None = None,
+    ) -> dict[str, Any] | None:
         async with self.lock:
             book = self.by_asset[asset]
             if not book.ready or not book.bids or not book.asks:
@@ -273,8 +300,16 @@ class MultiLighterBooks:
             return {
                 "bid": bid,
                 "ask": ask,
-                "sell_price": self._fill(book.bids, side="SELL", quote_notional=quote_notional),
-                "buy_price": self._fill(book.asks, side="BUY", quote_notional=quote_notional),
+                "sell_price": (
+                    self._fill_base(book.bids, side="SELL", base_qty=base_qty)
+                    if base_qty is not None
+                    else self._fill(book.bids, side="SELL", quote_notional=quote_notional)
+                ),
+                "buy_price": (
+                    self._fill_base(book.asks, side="BUY", base_qty=base_qty)
+                    if base_qty is not None
+                    else self._fill(book.asks, side="BUY", quote_notional=quote_notional)
+                ),
                 "nonce": book.nonce,
                 "server_timestamp_ms": book.server_timestamp_ms,
                 "book_age_seconds": None if book.received_monotonic is None else now_mono - book.received_monotonic,
@@ -307,17 +342,29 @@ class VariationalQuoteClient:
                 await self.websocket.close()
             self.websocket = None
 
-    async def quote(self, asset: str, amount: Decimal) -> tuple[dict[str, Any], float]:
+    async def quote(
+        self,
+        asset: str,
+        amount: Decimal,
+        *,
+        market: str | None = None,
+        instrument_type: str | None = None,
+        funding_interval_s: int | None = None,
+    ) -> tuple[dict[str, Any], float]:
         if self.websocket is None:
             self.websocket = await websockets.connect(self.url, ping_interval=20, ping_timeout=20)
         request_id = uuid.uuid4().hex
         payload = {
             "type": "VAR_API_QUOTE",
             "requestId": request_id,
-            "market": asset,
+            "market": market or asset,
             "amount": decimal_text(amount),
             "confirm": False,
         }
+        if instrument_type is not None:
+            payload["instrumentType"] = instrument_type
+        if funding_interval_s is not None:
+            payload["fundingIntervalS"] = funding_interval_s
         started = time.monotonic()
         try:
             await self.websocket.send(json.dumps(payload, ensure_ascii=True))

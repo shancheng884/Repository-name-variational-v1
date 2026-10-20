@@ -52,3 +52,4 @@ def test_extension_supports_explicit_variational_instrument_types() -> None:
     assert '["perpetual_future", "swap"]' in api_script
     assert 'instrument_type: instrumentType' in api_script
     assert 'instrumentType: instrument.instrument_type' in api_script
+    assert 'o.fundingIntervalS ?? 3600' in api_script
