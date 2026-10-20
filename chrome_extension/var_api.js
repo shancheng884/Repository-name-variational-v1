@@ -135,6 +135,9 @@ export function buildVariationalApiScript(action, params) {
       settlement_asset: o.settlementAsset || "USDC",
       funding_interval_s: o.fundingIntervalS ?? 3600
     };
+    if (o.kind != null && String(o.kind)) {
+      instrument.kind = String(o.kind);
+    }
 
     if (action === "POSITIONS") {
       const response = await request("GET", "/api/positions", undefined);

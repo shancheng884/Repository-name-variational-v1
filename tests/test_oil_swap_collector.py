@@ -82,12 +82,14 @@ def test_swap_quote_command_preserves_zero_interval_and_is_non_ordering() -> Non
         socket = FakeSocket()
         client.websocket = socket
         await client.quote(
-            "WTI", Decimal("0.2"), market="USOIL", instrument_type="swap", funding_interval_s=0
+            "WTI", Decimal("0.2"), market="USOILP", instrument_type="swap",
+            kind="commodity", funding_interval_s=0
         )
         assert socket.sent["type"] == "VAR_API_QUOTE"
         assert socket.sent["confirm"] is False
-        assert socket.sent["market"] == "USOIL"
+        assert socket.sent["market"] == "USOILP"
         assert socket.sent["instrumentType"] == "swap"
+        assert socket.sent["kind"] == "commodity"
         assert socket.sent["fundingIntervalS"] == 0
 
     asyncio.run(run())
@@ -129,7 +131,8 @@ def test_oil_sample_quotes_same_qty_as_lighter_depth_and_uses_swap(tmp_path) -> 
             assert asset == "WTI"
             assert qty == Decimal("0.200")
             assert kwargs == {
-                "market": "USOIL", "instrument_type": "swap", "funding_interval_s": 0,
+                "market": "USOILP", "instrument_type": "swap",
+                "kind": "commodity", "funding_interval_s": 0,
             }
             return {
                 "ok": True,
@@ -145,12 +148,37 @@ def test_oil_sample_quotes_same_qty_as_lighter_depth_and_uses_swap(tmp_path) -> 
 
         assert row["sample_quality"] == "valid"
         assert row["asset"] == "WTI"
-        assert row["variational_underlying"] == "USOIL"
+        assert row["variational_underlying"] == "USOILP"
         assert row["variational_instrument_type"] == "swap"
+        assert row["variational_instrument_kind"] == "commodity"
         assert row["variational_funding_interval_s"] == 0
         assert Decimal(row["lighter_qty"]) == Decimal(row["variational_qty"]) == Decimal("0.200")
         assert row["lighter_market_id"] == 145
         assert row["orders_attempted"] is False
         assert seen_qty == [None, Decimal("0.200"), Decimal("0.200")]
+
+    asyncio.run(run())
+
+
+def test_variational_quote_command_omits_optional_kind_for_perpetuals() -> None:
+    async def run() -> None:
+        class FakeSocket:
+            sent = None
+
+            async def send(self, raw):
+                self.sent = json.loads(raw)
+
+            async def recv(self):
+                return json.dumps({"requestId": self.sent["requestId"], "ok": True})
+
+            async def close(self):
+                return None
+
+        client = VariationalQuoteClient("ws://unused", timeout=1, logger=logging.getLogger("test"))
+        socket = FakeSocket()
+        client.websocket = socket
+        await client.quote("ETH", Decimal("0.01"), market="ETH")
+        assert socket.sent["market"] == "ETH"
+        assert "kind" not in socket.sent
 
     asyncio.run(run())

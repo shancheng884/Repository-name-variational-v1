@@ -1,7 +1,8 @@
 # Read-Only USOIL / WTI Collection
 
 `tools/oil_swap_collector.py` collects indicative Variational USOIL swap quotes
-and Lighter mainnet WTI order-book depth. It is a separate read-only process:
+(`USOILP`, instrument kind `commodity`) and Lighter mainnet WTI order-book depth.
+It is a separate read-only process:
 it does not start another forwarder, submit orders, or modify the ETH inventory
 journal. Samples are written under `log/oil_swap/basis_samples/WTI`, separate
 from ETH anchor history.

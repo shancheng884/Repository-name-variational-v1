@@ -38,8 +38,9 @@ from tools.lib.basis_store import BasisSampleStore  # noqa: E402
 
 
 ASSET = "WTI"
-VAR_MARKET = "USOIL"
+VAR_MARKET = "USOILP"
 INSTRUMENT_TYPE = "swap"
+INSTRUMENT_KIND = "commodity"
 FUNDING_INTERVAL_S = 0
 
 
@@ -156,7 +157,9 @@ class OilSwapCollector:
             "venue_pair": "variational_usoil_swap_lighter_mainnet_wti",
             "execution_mode": "collect_only",
             "orders_attempted": False,
+            "variational_underlying": VAR_MARKET,
             "instrument_type": INSTRUMENT_TYPE,
+            "instrument_kind": INSTRUMENT_KIND,
             "funding_interval_s": FUNDING_INTERVAL_S,
             "lighter_market": {
                 key: metadata.get(key)
@@ -206,6 +209,7 @@ class OilSwapCollector:
             var_qty,
             market=VAR_MARKET,
             instrument_type=INSTRUMENT_TYPE,
+            kind=INSTRUMENT_KIND,
             funding_interval_s=FUNDING_INTERVAL_S,
         )
         if not message.get("ok"):
@@ -288,6 +292,7 @@ class OilSwapCollector:
             "asset": ASSET,
             "variational_underlying": VAR_MARKET,
             "variational_instrument_type": INSTRUMENT_TYPE,
+            "variational_instrument_kind": INSTRUMENT_KIND,
             "variational_funding_interval_s": FUNDING_INTERVAL_S,
             "variational_qty": decimal_text(var_qty.normalize()),
             "lighter_symbol": metadata.get("symbol"),

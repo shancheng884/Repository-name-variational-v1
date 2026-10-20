@@ -349,6 +349,7 @@ class VariationalQuoteClient:
         *,
         market: str | None = None,
         instrument_type: str | None = None,
+        kind: str | None = None,
         funding_interval_s: int | None = None,
     ) -> tuple[dict[str, Any], float]:
         if self.websocket is None:
@@ -363,6 +364,8 @@ class VariationalQuoteClient:
         }
         if instrument_type is not None:
             payload["instrumentType"] = instrument_type
+        if kind is not None:
+            payload["kind"] = kind
         if funding_interval_s is not None:
             payload["fundingIntervalS"] = funding_interval_s
         started = time.monotonic()
