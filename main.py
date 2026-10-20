@@ -11153,16 +11153,11 @@ class VariationalToLighterRuntime:
                 quote = await fallback(preferred_asset)
                 return dict(quote) if isinstance(quote, dict) else None
             return None
+        asset = str(preferred_asset or self.variational_ticker or "").strip().upper()
+        if not asset:
+            return None
         async with runtime.monitor._lock:
-            quote = None
-            if preferred_asset:
-                quote = runtime.monitor.reference_quotes.get(preferred_asset)
-            if quote is None and self.variational_ticker:
-                quote = runtime.monitor.reference_quotes.get(self.variational_ticker)
-            if quote is None and runtime.monitor.current_quote_asset:
-                quote = runtime.monitor.reference_quotes.get(
-                    runtime.monitor.current_quote_asset
-                )
+            quote = runtime.monitor.reference_quotes.get(asset)
             return dict(quote) if isinstance(quote, dict) else None
 
     async def try_auto_close_unhedged_live_inventory_leg(
@@ -13495,8 +13490,11 @@ class VariationalToLighterRuntime:
         self.account_index = required_int_env("LIGHTER_ACCOUNT_INDEX")
         self.api_key_index = required_int_env("LIGHTER_API_KEY_INDEX")
 
-    def get_lighter_market_config(self) -> tuple[int, int, int, Decimal | None, Decimal | None]:
-        if not self.ticker:
+    def get_lighter_market_config(
+        self, ticker: str | None = None
+    ) -> tuple[int, int, int, Decimal | None, Decimal | None]:
+        market_ticker = str(ticker or self.ticker or "").strip().upper()
+        if not market_ticker:
             raise RuntimeError("Ticker is not resolved yet")
         response = requests.get(
             f"{self.lighter_base_url}/api/v1/orderBooks",
@@ -13507,7 +13505,7 @@ class VariationalToLighterRuntime:
         data = response.json()
 
         for market in data.get("order_books", []):
-            if market.get("symbol") == self.ticker:
+            if market.get("symbol") == market_ticker:
                 price_decimals = int(market["supported_price_decimals"])
                 size_decimals = int(market["supported_size_decimals"])
                 return (
@@ -13518,10 +13516,35 @@ class VariationalToLighterRuntime:
                     to_decimal(market.get("min_quote_amount")),
                 )
 
-        raise RuntimeError(f"Ticker {self.ticker} not found in Lighter order books")
+        raise RuntimeError(f"Ticker {market_ticker} not found in Lighter order books")
+
+    def fixed_runtime_asset(self) -> str | None:
+        allowed_assets = {
+            str(asset).strip().upper()
+            for asset in (getattr(self, "live_allowed_assets", set()) or set())
+            if str(asset).strip()
+        }
+        return next(iter(allowed_assets)) if len(allowed_assets) == 1 else None
 
     async def detect_current_variational_asset(self) -> str | None:
         async with self.runtime.monitor._lock:
+            fixed_asset = self.fixed_runtime_asset()
+            if fixed_asset:
+                quote = self.runtime.monitor.quotes.get(fixed_asset)
+                if (
+                    isinstance(quote, dict)
+                    and to_decimal(quote.get("bid")) is not None
+                    and to_decimal(quote.get("ask")) is not None
+                ):
+                    return fixed_asset
+                reference_quote = self.runtime.monitor.reference_quotes.get(fixed_asset)
+                if (
+                    isinstance(reference_quote, dict)
+                    and to_decimal(reference_quote.get("reference_price")) is not None
+                ):
+                    return fixed_asset
+                return None
+
             if self.runtime.monitor.current_quote_asset:
                 asset = str(self.runtime.monitor.current_quote_asset).strip().upper()
                 quote = self.runtime.monitor.quotes.get(asset)
@@ -13578,10 +13601,24 @@ class VariationalToLighterRuntime:
         if not asset or asset == "UNKNOWN":
             return
 
+        fixed_asset = self.fixed_runtime_asset()
+        if fixed_asset and asset != fixed_asset:
+            self.logger.warning(
+                "ignored_asset_switch reason=%s requested_asset=%s fixed_asset=%s",
+                reason,
+                asset,
+                fixed_asset,
+            )
+            return
+
         async with self._asset_switch_lock:
             next_ticker = resolve_lighter_ticker(asset)
             if self.variational_ticker == asset and self.ticker == next_ticker:
                 return
+
+            market_config = None
+            if self.requires_lighter_market_data():
+                market_config = self.get_lighter_market_config(next_ticker)
 
             self.variational_ticker = asset
             self.ticker = next_ticker
@@ -13601,13 +13638,15 @@ class VariationalToLighterRuntime:
                 )
                 return
 
+            if market_config is None:
+                raise RuntimeError("Lighter market config was not resolved")
             (
                 self.lighter_market_index,
                 self.base_amount_multiplier,
                 self.price_multiplier,
                 self.lighter_min_base_amount,
                 self.lighter_min_quote_amount,
-            ) = self.get_lighter_market_config()
+            ) = market_config
             await self.reset_lighter_order_book()
             await self._reset_state_for_asset_switch()
 
@@ -15830,24 +15869,29 @@ class VariationalToLighterRuntime:
         }
 
     async def get_variational_quote(self, preferred_asset: str | None) -> dict[str, Any] | None:
+        requested_asset = str(
+            preferred_asset or self.variational_ticker or ""
+        ).strip().upper()
         async with self.runtime.monitor._lock:
-            quote = None
-            if preferred_asset:
-                quote = self.runtime.monitor.quotes.get(preferred_asset)
-            if quote is None and self.variational_ticker:
-                quote = self.runtime.monitor.quotes.get(self.variational_ticker)
-            if quote is None and self.runtime.monitor.current_quote_asset:
-                quote = self.runtime.monitor.quotes.get(self.runtime.monitor.current_quote_asset)
+            if requested_asset:
+                quote = self.runtime.monitor.quotes.get(requested_asset)
+            else:
+                current_asset = self.runtime.monitor.current_quote_asset
+                quote = (
+                    self.runtime.monitor.quotes.get(current_asset)
+                    if current_asset
+                    else None
+                )
 
             # Preserve the legacy dashboard/paper fallback, but keep the
             # reference stream isolated from the executable quote cache. V4
             # live inventory uses get_variational_reference_quote directly.
             if quote is None:
-                if preferred_asset:
-                    quote = self.runtime.monitor.reference_quotes.get(preferred_asset)
-                if quote is None and self.variational_ticker:
-                    quote = self.runtime.monitor.reference_quotes.get(self.variational_ticker)
-                if quote is None and self.runtime.monitor.current_quote_asset:
+                if requested_asset:
+                    quote = self.runtime.monitor.reference_quotes.get(
+                        requested_asset
+                    )
+                elif self.runtime.monitor.current_quote_asset:
                     quote = self.runtime.monitor.reference_quotes.get(
                         self.runtime.monitor.current_quote_asset
                     )
