@@ -712,7 +712,8 @@ def test_account_snapshot_logs_normalized_equity_without_raw_account(
         row = json.loads(runtime.orders_file.read_text(encoding="utf-8"))
         assert row["snapshot_status"] == "complete"
         assert row["variational_snapshot_fresh"] is True
-        assert row["variational_equity_usd"] == "14.8"
+        # Snapshot strings preserve the precision supplied by the venue API.
+        assert row["variational_equity_usd"] == "14.80"
         assert row["lighter_equity_usd"] == "20.25"
         assert row["combined_equity_usd"] == "35.05"
         assert "must-not-be-logged" not in json.dumps(row)

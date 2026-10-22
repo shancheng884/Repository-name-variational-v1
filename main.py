@@ -30,6 +30,11 @@ from rich.panel import Panel
 from rich.table import Table
 
 from tools.lib.auto_rebalance import build_rebalance_plan
+from tools.lib.execution_quality import (
+    advance_shortfall_reserve,
+    lighter_book_clock,
+    shortfall_tail,
+)
 from tools.lib.pnl_baseline import (
     PNL_BASELINE_FILE_NAME,
     PNL_REPORTING_TIMEZONE,
@@ -122,7 +127,7 @@ LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES = 10
 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_FULL_SAMPLES = 20
 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS = Decimal("3.50")
 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_EARLY_READY_FLOOR_BPS = Decimal("1.50")
-LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_CAP_BPS = Decimal("3.00")
+LIVE_INVENTORY_PROFIT_EXIT_MAX_BOOK_AGE_SECONDS = 0.25
 LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
     {
         "basis-v4-live-v2",
@@ -2705,6 +2710,7 @@ class VariationalToLighterRuntime:
             DIRECTION_LONG_VAR_SHORT_LIGHTER: deque(maxlen=20),
             DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(maxlen=20),
         }
+        self.live_inventory_exit_shortfall_reserve_floor_by_direction: dict[str, Decimal] = {}
         self.live_inventory_exit_fill_latency_ms_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_basis_var_spread_bps_samples: deque[Decimal] = deque(maxlen=200)
         self.live_inventory_basis_lighter_spread_bps_samples: deque[Decimal] = deque(maxlen=200)
@@ -2892,6 +2898,8 @@ class VariationalToLighterRuntime:
 
         self.last_variational_trade_event_at: str | None = None
         self.last_lighter_order_book_update_at: str | None = None
+        self.last_lighter_order_book_received_monotonic: float | None = None
+        self.last_lighter_order_book_clock: dict[str, Any] = {}
         self.last_live_submit_monotonic_by_asset: dict[str, float] = {}
         self.live_inventory_var_reject_cooldown_until: dict[tuple[str, str], float] = {}
         self.live_inventory_var_reject_cooldown_seconds = 600.0
@@ -3452,6 +3460,8 @@ class VariationalToLighterRuntime:
         strong_single_samples: deque[Decimal] = deque(
             maxlen=strong_single_target.maxlen
         )
+        reserve_floors: dict[str, Decimal] = {}
+        seen: set[tuple[Any, ...]] = set()
         try:
             with orders_file.open("r", encoding="utf-8") as handle:
                 for line in handle:
@@ -3474,8 +3484,13 @@ class VariationalToLighterRuntime:
                         continue
                     estimated_bps = to_decimal(row.get("estimated_pnl_bps"))
                     actual_bps = to_decimal(row.get("actual_pnl_bps"))
-                    if estimated_bps is None or actual_bps is None:
+                    if estimated_bps is None or actual_bps is None or not estimated_bps.is_finite() or not actual_bps.is_finite():
                         continue
+                    identity = (row.get("run_id"), row.get("lot_id"))
+                    if identity[0] is not None and identity[1] is not None:
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
                     # Zero-shortfall fills are real observations and must count
                     # toward calibration maturity instead of biasing the sample.
                     shortfall_bps = max(
@@ -3483,6 +3498,10 @@ class VariationalToLighterRuntime:
                         Decimal("0"),
                     )
                     samples_by_direction[direction].append(shortfall_bps)
+                    _, _, tail = shortfall_tail(samples_by_direction[direction])
+                    reserve_floors[direction] = advance_shortfall_reserve(
+                        reserve_floors.get(direction, Decimal("0")), tail
+                    )
                     if (
                         direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
                         and row.get("exit_confirmation_mode") == "strong_single"
@@ -3504,6 +3523,7 @@ class VariationalToLighterRuntime:
             self.live_inventory_exit_shortfall_bps_samples_by_direction = targets
         for direction, samples in samples_by_direction.items():
             targets[direction].extend(samples)
+        self.live_inventory_exit_shortfall_reserve_floor_by_direction = reserve_floors
         self.live_inventory_exit_estimate_shortfall_bps_samples.extend(
             samples_by_direction[DIRECTION_SHORT_VAR_LONG_LIGHTER]
         )
@@ -3537,7 +3557,7 @@ class VariationalToLighterRuntime:
         )
         samples = list(source)
         sample_count = len(samples)
-        raw_p80_bps = self.percentile_decimal(samples, 80) or Decimal("0")
+        raw_p80_bps, raw_p95_bps, observed_tail_bps = shortfall_tail(samples)
         enabled = bool(
             getattr(self, "live_inventory_basis_dynamic_exit_buffer", False)
         )
@@ -3549,38 +3569,40 @@ class VariationalToLighterRuntime:
             enabled
             and sample_count >= LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_FULL_SAMPLES
         )
-        capped_raw_p80_bps = min(
-            raw_p80_bps,
-            LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_CAP_BPS,
-        )
         if not enabled:
             applied_dynamic_bps = Decimal("0")
             calibration_weight = Decimal("0")
             stage_floor_bps = LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS
         elif not ready:
-            applied_dynamic_bps = LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS
+            applied_dynamic_bps = max(
+                LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS,
+                observed_tail_bps,
+            )
             calibration_weight = Decimal("0")
             stage_floor_bps = LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS
         elif fully_mature:
-            applied_dynamic_bps = capped_raw_p80_bps
+            applied_dynamic_bps = observed_tail_bps
             calibration_weight = Decimal("1")
             stage_floor_bps = LIVE_INVENTORY_BASIS_V4_SHORTFALL_RESERVE_BPS
         else:
-            # Once ten fills exist, use observed execution shortfall directly.
-            # A bounded floor protects the still-young sample without carrying
-            # the conservative 3.5 bps cold-start prior all the way to sample 20.
             calibration_weight = Decimal("1")
             stage_floor_bps = (
                 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_EARLY_READY_FLOOR_BPS
             )
             applied_dynamic_bps = max(
-                capped_raw_p80_bps,
+                observed_tail_bps,
                 stage_floor_bps,
             )
         reserve_bps = max(
             stage_floor_bps,
             applied_dynamic_bps,
         )
+        reserve_direction = direction or DIRECTION_SHORT_VAR_LONG_LIGHTER
+        envelope_bps = getattr(
+            self, "live_inventory_exit_shortfall_reserve_floor_by_direction", {}
+        ).get(reserve_direction, Decimal("0"))
+        if enabled:
+            reserve_bps = max(reserve_bps, envelope_bps)
         return {
             "sample_count": sample_count,
             "min_samples": LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES,
@@ -3588,10 +3610,13 @@ class VariationalToLighterRuntime:
             "ready": ready,
             "fully_mature": fully_mature,
             "raw_p80_bps": raw_p80_bps,
+            "raw_p95_bps": raw_p95_bps,
+            "recent_observation_bps": samples[-1] if samples else Decimal("0"),
+            "reserve_envelope_bps": envelope_bps,
             "prior_bps": LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS,
             "calibration_weight": calibration_weight,
             "stage_floor_bps": stage_floor_bps,
-            "cap_bps": LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_CAP_BPS,
+            "cap_bps": None,
             "applied_dynamic_bps": applied_dynamic_bps,
             "reserve_bps": reserve_bps,
         }
@@ -3627,6 +3652,10 @@ class VariationalToLighterRuntime:
             "v4_exit_shortfall_raw_p80_bps": decimal_to_str(
                 context["raw_p80_bps"]
             ),
+            "v4_exit_shortfall_raw_p95_bps": decimal_to_str(context.get("raw_p95_bps")),
+            "v4_exit_shortfall_reserve_envelope_bps": decimal_to_str(
+                context.get("reserve_envelope_bps")
+            ),
             "v4_exit_shortfall_prior_bps": decimal_to_str(
                 context["prior_bps"]
             ),
@@ -3650,6 +3679,32 @@ class VariationalToLighterRuntime:
         if getattr(self, "live_inventory_basis_v4_reverse_test", False):
             return max(reserve, LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS)
         return reserve
+
+    def observe_live_inventory_exit_shortfall(self, direction: str, shortfall_bps: Decimal) -> None:
+        if not shortfall_bps.is_finite():
+            return
+        observed = max(shortfall_bps, Decimal("0"))
+        by_direction = getattr(self, "live_inventory_exit_shortfall_bps_samples_by_direction", None)
+        if by_direction is None:
+            by_direction = self.live_inventory_exit_shortfall_bps_samples_by_direction = {
+                value: deque(maxlen=20)
+                for value in (DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER)
+            }
+        if direction not in by_direction:
+            return
+        by_direction[direction].append(observed)
+        if not hasattr(self, "live_inventory_exit_estimate_shortfall_bps_samples"):
+            self.live_inventory_exit_estimate_shortfall_bps_samples = deque(maxlen=20)
+        if not getattr(self, "live_inventory_basis_v4_bidirectional", False) or direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
+            self.live_inventory_exit_estimate_shortfall_bps_samples.append(observed)
+        floors = getattr(self, "live_inventory_exit_shortfall_reserve_floor_by_direction", None)
+        if floors is None:
+            floors = self.live_inventory_exit_shortfall_reserve_floor_by_direction = {}
+        _, _, tail = shortfall_tail(by_direction[direction])
+        floors[direction] = advance_shortfall_reserve(floors.get(direction, Decimal("0")), tail)
+        # Entry thresholds cache execution costs as well as historical edges.
+        self.live_inventory_basis_v4_threshold_cache = None
+        self.live_inventory_basis_v4_threshold_cache_by_direction = {}
 
     def live_inventory_basis_v4_effective_exit_target_bps(self) -> Decimal:
         return (
@@ -3769,7 +3824,7 @@ class VariationalToLighterRuntime:
                     pnl_bps = to_decimal(row.get("actual_pnl_bps"))
                     if direction in by_direction and pnl_bps is not None:
                         by_direction[direction].append(pnl_bps)
-                    latency_ms = to_decimal(row.get("exit_var_fill_to_lighter_fill_ms"))
+                    latency_ms = to_decimal(row.get("exit_lighter_wire_to_fill_report_ms"))
                     if latency_ms is not None and latency_ms >= 0:
                         latency_samples.append(latency_ms)
         except OSError as exc:
@@ -4617,6 +4672,12 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_strong_single_disabled_at = (
             state.get("v4_strong_single_disabled_at") or None
         )
+        reserve_floors = getattr(self, "live_inventory_exit_shortfall_reserve_floor_by_direction", {})
+        for direction, value in (state.get("v4_exit_shortfall_reserve_floor_by_direction") or {}).items():
+            saved = to_decimal(value)
+            if direction in {DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER} and saved is not None and saved.is_finite() and saved >= 0:
+                reserve_floors[direction] = max(saved, reserve_floors.get(direction, Decimal("0")))
+        self.live_inventory_exit_shortfall_reserve_floor_by_direction = reserve_floors
         self.live_inventory_v4_portfolio_exit_lot_ids = {
             self.live_inventory_normalized_lot_id(value)
             for value in list(state.get("v4_portfolio_exit_lot_ids") or [])
@@ -4866,6 +4927,12 @@ class VariationalToLighterRuntime:
                 "live_inventory_v4_strong_single_disabled_at",
                 None,
             ),
+            "v4_exit_shortfall_reserve_floor_by_direction": {
+                direction: decimal_to_str(value)
+                for direction, value in getattr(
+                    self, "live_inventory_exit_shortfall_reserve_floor_by_direction", {}
+                ).items()
+            },
             "v4_strong_single_shortfall_sample_count": strong_single_context[
                 "sample_count"
             ],
@@ -9799,6 +9866,12 @@ class VariationalToLighterRuntime:
                 direction=direction
             )
         )
+        exit_cost_context = self.live_inventory_basis_v4_exit_calibration_context(direction=direction)
+        exit_cost_increment_bps = max(
+            exit_cost_context["reserve_bps"] - LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS,
+            Decimal("0"),
+        )
+        entry_execution_reserve_bps += exit_cost_increment_bps
         threshold = raw_threshold + entry_execution_reserve_bps
         market_noise_bps = self.percentile_decimal(
             [
@@ -9876,6 +9949,7 @@ class VariationalToLighterRuntime:
             "v4_entry_execution_reserve_bps": decimal_to_str(
                 entry_execution_reserve_bps
             ),
+            "v4_entry_exit_cost_increment_bps": decimal_to_str(exit_cost_increment_bps),
             **self.live_inventory_basis_v4_entry_calibration_payload(
                 direction=direction
             ),
@@ -11783,30 +11857,21 @@ class VariationalToLighterRuntime:
             pending.get("portfolio_component_lot_count") or 1
         )
         confirmed_at = utc_now()
-        var_fill_to_lighter_fill_ms = decimal_to_str(elapsed_iso_ms(
-            payload.get("variational_filled_at"),
-            payload.get("lighter_filled_at"),
-        ))
+        # Lighter's timestamp here is local notification receipt, not the
+        # exchange matching time. Synthetic Var records are not fills.
+        var_fill_to_lighter_fill_ms = (
+            decimal_to_str(elapsed_iso_ms(
+                payload.get("variational_filled_at"),
+                payload.get("lighter_filled_at"),
+            ))
+            if payload.get("synthetic_eager_fill") is False
+            else None
+        )
         direction = str(pending.get("direction") or "")
-        if estimated_pnl_bps is not None and actual_pnl_bps is not None:
-            if not hasattr(self, "live_inventory_exit_estimate_shortfall_bps_samples"):
-                self.live_inventory_exit_estimate_shortfall_bps_samples = deque(maxlen=20)
+        if estimated_pnl_bps is not None and actual_pnl_bps is not None and var_roundtrip_qty_match and lighter_roundtrip_qty_match:
             shortfall_bps = estimated_pnl_bps - actual_pnl_bps
             observed_shortfall_bps = max(shortfall_bps, Decimal("0"))
-            direction_samples = getattr(
-                self,
-                "live_inventory_exit_shortfall_bps_samples_by_direction",
-                {},
-            )
-            if direction in direction_samples:
-                direction_samples[direction].append(observed_shortfall_bps)
-            if (
-                not getattr(self, "live_inventory_basis_v4_bidirectional", False)
-                or direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
-            ):
-                self.live_inventory_exit_estimate_shortfall_bps_samples.append(
-                    observed_shortfall_bps
-                )
+            self.observe_live_inventory_exit_shortfall(direction, observed_shortfall_bps)
             if (
                 direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
                 and pending.get("exit_confirmation_mode") == "strong_single"
@@ -11823,7 +11888,7 @@ class VariationalToLighterRuntime:
                 )
         if actual_pnl_bps is not None and direction in getattr(self, "live_inventory_actual_pnl_bps_by_direction", {}):
             self.live_inventory_actual_pnl_bps_by_direction[direction].append(actual_pnl_bps)
-        latency_ms = to_decimal(var_fill_to_lighter_fill_ms)
+        latency_ms = to_decimal(payload.get("live_wire_sent_to_fill_ms"))
         if latency_ms is not None and latency_ms >= 0:
             self.live_inventory_exit_fill_latency_ms_samples.append(latency_ms)
         self.live_inventory_realized_pnl_usd += actual_pnl - estimated_pnl
@@ -11892,6 +11957,10 @@ class VariationalToLighterRuntime:
                 else None
             ),
             "exit_var_fill_to_lighter_fill_ms": var_fill_to_lighter_fill_ms,
+            "exit_latency_basis": "local_wire_send_to_fill_notification",
+            "exit_lighter_wire_to_fill_report_ms": payload.get("live_wire_sent_to_fill_ms"),
+            "exit_lighter_wire_to_ack_ms": payload.get("live_wire_sent_to_submit_ack_ms"),
+            "exit_var_time_is_synthetic": payload.get("synthetic_eager_fill") is not False,
             "actual_var_leg_pnl_usd": decimal_to_str(var_leg_pnl),
             "actual_lighter_leg_pnl_usd": decimal_to_str(lighter_leg_pnl),
             "actual_pnl_usd": decimal_to_str(actual_pnl),
@@ -13694,6 +13763,14 @@ class VariationalToLighterRuntime:
             self.lighter_order_book_sequence_gap = False
             self.lighter_best_bid = None
             self.lighter_best_ask = None
+            self.last_lighter_order_book_update_at = None
+            self.last_lighter_order_book_received_monotonic = None
+            self.last_lighter_order_book_clock = {}
+
+    def record_lighter_order_book_clock(self, message: dict[str, Any]) -> None:
+        self.last_lighter_order_book_update_at = utc_now()
+        self.last_lighter_order_book_received_monotonic = time.monotonic()
+        self.last_lighter_order_book_clock = lighter_book_clock(message, received_epoch=time.time())
 
     def update_lighter_order_book(self, side: str, levels: list[Any]) -> None:
         for level in levels:
@@ -13836,6 +13913,16 @@ class VariationalToLighterRuntime:
         normalized = str(status or "").strip().lower()
         return normalized in {"canceled", "cancelled"} or normalized.startswith(
             ("canceled-", "cancelled-", "canceled_", "cancelled_")
+        )
+
+    def lighter_exit_submission_known(self, record: OrderLifecycle | None) -> bool:
+        if self.auto_live_eager_hedge_started(record):
+            return True
+        return bool(
+            record is not None
+            and getattr(record, "lighter_reduce_only", False)
+            and getattr(record, "lighter_client_order_id", None) is not None
+            and self.lighter_exit_cancel_is_retryable(getattr(record, "lighter_order_status", None))
         )
 
     async def retry_lighter_exit_after_cancel(
@@ -14029,9 +14116,7 @@ class VariationalToLighterRuntime:
             current_payload = retry_payload or (
                 retry_record.to_payload() if retry_record is not None else None
             )
-            if retry_record is None or not self.auto_live_eager_hedge_started(
-                retry_record
-            ):
+            if not self.lighter_exit_submission_known(retry_record):
                 await log_attempt(attempt, "submit_failed")
                 return failed(
                     "lighter_exit_retry_submit_failed",
@@ -15067,6 +15152,73 @@ class VariationalToLighterRuntime:
         result = await awaitable
         return result, elapsed_ms_str(started)
 
+    async def live_inventory_profit_exit_preflight(
+        self, *, asset: str, direction: str, qty: Decimal,
+        var_exit_price: Decimal, reuse_quote_id: str | None, context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run after intent persistence, before either reduce-only leg starts."""
+        if direction not in {DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER} or qty <= 0 or context["entry_var_price"] <= 0:
+            return {"ok": False, "reason": "profit_exit_invalid_cost_or_quantity"}
+        for venue in ("variational", "lighter"):
+            budget = self.live_inventory_order_limiter(venue).snapshot()
+            if budget.get("backoff_seconds", 0) > 0 or budget.get("used", 0) >= budget.get("hard_limit", float("inf")):
+                return {"ok": False, "reason": "profit_exit_order_budget_unavailable", "venue": venue}
+        quote_ok, quote_reason, _ = self.live_inventory_basis_quote_reuse_validation(
+            asset=asset, quote_id=reuse_quote_id,
+            quote_qty=to_decimal(context.get("quote_request_qty")), submitted_qty=qty,
+            quote_size_mode=context.get("quote_size_mode"),
+            quote_timestamp=context.get("quote_timestamp"), quote_asset=context.get("quote_asset"),
+        )
+        if not quote_ok:
+            return {"ok": False, "reason": "profit_exit_quote_invalid_before_submit", "quote_reason": quote_reason}
+        depth = await self.live_inventory_lighter_depth_context(
+            lighter_side="BUY" if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER else "SELL", qty=qty,
+        )
+        limit = getattr(self, "live_inventory_max_lighter_book_age_seconds", 2.0)
+        profit_book_limit = min(limit, LIVE_INVENTORY_PROFIT_EXIT_MAX_BOOK_AGE_SECONDS) if limit > 0 else None
+        age = depth.get("book_age_seconds")
+        if limit > 0 and (
+            not depth.get("book_exchange_timestamp_valid") or age is None or age > profit_book_limit
+        ):
+            return {
+                "ok": False, "reason": "profit_exit_lighter_book_stale_before_submit",
+                "exit_lighter_depth": depth, "max_profit_book_age_seconds": profit_book_limit,
+            }
+        price = to_decimal(depth.get("estimated_fill_price"))
+        if price is None:
+            return {"ok": False, "reason": "profit_exit_lighter_depth_insufficient", "exit_lighter_depth": depth}
+        _, _, pnl = self.live_inventory_pair_pnl(
+            direction=direction, qty=qty,
+            entry_var_price=context["entry_var_price"], entry_lighter_price=context["entry_lighter_price"],
+            exit_var_price=var_exit_price, exit_lighter_price=price,
+        )
+        pnl_bps = pnl / (qty * context["entry_var_price"]) * Decimal("10000")
+        reserve = self.live_inventory_basis_v4_exit_calibration_context(direction=direction)["reserve_bps"]
+        net_target = max(context["effective_min_exit_pnl_bps"] - context["exit_reserve_bps"], Decimal("0"))
+        target = max(context["effective_min_exit_pnl_bps"], reserve + net_target)
+        completion_bps = getattr(
+            self, "live_inventory_lighter_exit_submit_slippage_bps", self.live_inventory_max_lighter_slippage_bps
+        )
+        top = to_decimal(depth.get("reference_price")) or price
+        completion_boundary = top * (
+            Decimal("1") + completion_bps / Decimal("10000")
+            if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+            else Decimal("1") - completion_bps / Decimal("10000")
+        )
+        return {
+            "ok": pnl_bps >= target,
+            "reason": None if pnl_bps >= target else "profit_exit_pnl_below_threshold_before_submit",
+            "executable_lighter_exit_price": decimal_to_str(price),
+            "executable_pnl_usd": decimal_to_str(pnl), "executable_pnl_bps": decimal_to_str(pnl_bps),
+            "effective_min_exit_pnl_bps": decimal_to_str(target),
+            "exit_lighter_depth": depth,
+            "max_profit_book_age_seconds": profit_book_limit,
+            "exit_execution_reserve_bps": decimal_to_str(reserve),
+            "completion_slippage_budget_bps": decimal_to_str(completion_bps),
+            "completion_price_boundary": decimal_to_str(completion_boundary),
+            "price_boundary_policy": "bounded_hedge_completion_not_guaranteed_pair_pnl",
+        }
+
     async def submit_live_inventory_exit_pair(
         self,
         *,
@@ -15079,6 +15231,7 @@ class VariationalToLighterRuntime:
         var_exit_price: Decimal,
         exit_lighter_depth: dict[str, Any] | None,
         reuse_quote_id: str | None = None,
+        profit_exit_context: dict[str, Any] | None = None,
     ) -> tuple[
         dict[str, Any] | None,
         str | None,
@@ -15089,6 +15242,17 @@ class VariationalToLighterRuntime:
         Exception | None,
         dict[str, Any],
     ]:
+        preflight = None
+        if profit_exit_context is not None:
+            preflight = await self.live_inventory_profit_exit_preflight(
+                asset=asset, direction=direction, qty=qty, var_exit_price=var_exit_price,
+                reuse_quote_id=reuse_quote_id, context=profit_exit_context,
+            )
+            if not preflight["ok"]:
+                return None, None, None, None, None, None, None, {
+                    "preflight_blocked": True, "profit_preflight": preflight,
+                }
+            exit_lighter_depth = preflight["exit_lighter_depth"]
         pair_started_at = utc_now()
         pair_started_monotonic = time.monotonic()
         ledger_context = {
@@ -15105,6 +15269,7 @@ class VariationalToLighterRuntime:
             "pair_submit_started_at": pair_started_at,
             "estimated_var_exit_price": decimal_to_str(var_exit_price),
             "exit_lighter_depth": exit_lighter_depth,
+            "profit_preflight": preflight,
         }
         var_task = asyncio.create_task(
             self._timed_submit(
@@ -15129,6 +15294,9 @@ class VariationalToLighterRuntime:
                     cycle_id=int(lot.get("lot_id") or 0),
                     role="live_inventory_exit",
                     reduce_only=True,
+                    retry_price_boundary=(
+                        to_decimal(preflight["completion_price_boundary"]) if preflight is not None else None
+                    ),
                 )
             )
         )
@@ -15204,7 +15372,7 @@ class VariationalToLighterRuntime:
             "var_submit_ms": var_submit_ms,
             "lighter_submit_ms": lighter_submit_ms,
             "var_submit_ok": bool(var_result and var_result.get("ok")),
-            "lighter_submit_started": self.auto_live_eager_hedge_started(lighter_record),
+            "lighter_submit_started": self.lighter_exit_submission_known(lighter_record),
             "var_submit_exception": str(var_exception) if var_exception is not None else None,
             "lighter_submit_exception": str(lighter_exception) if lighter_exception is not None else None,
             "var_result": var_result,
@@ -15490,7 +15658,7 @@ class VariationalToLighterRuntime:
                                 self.update_lighter_order_book("asks", order_book.get("asks", []))
                                 self.lighter_snapshot_loaded = True
                                 self.lighter_order_book_ready = True
-                                self.last_lighter_order_book_update_at = utc_now()
+                                self.record_lighter_order_book_clock(data)
                                 self.lighter_best_bid = (
                                     max(self.lighter_order_book["bids"].keys())
                                     if self.lighter_order_book["bids"]
@@ -15514,7 +15682,7 @@ class VariationalToLighterRuntime:
                                     self.update_lighter_order_book("bids", order_book.get("bids", []))
                                     self.update_lighter_order_book("asks", order_book.get("asks", []))
                                     self.lighter_order_book_offset = new_offset
-                                    self.last_lighter_order_book_update_at = utc_now()
+                                    self.record_lighter_order_book_clock(data)
                                     self.lighter_best_bid = (
                                         max(self.lighter_order_book["bids"].keys())
                                         if self.lighter_order_book["bids"]
@@ -15616,14 +15784,42 @@ class VariationalToLighterRuntime:
             return self.lighter_best_bid, self.lighter_best_ask
 
     def _lighter_order_book_age_seconds(self) -> float | None:
-        return self._age_seconds_from_iso(self.last_lighter_order_book_update_at)
+        return self.lighter_order_book_freshness_context()["book_age_seconds"]
+
+    def lighter_order_book_freshness_context(self) -> dict[str, Any]:
+        received = getattr(self, "last_lighter_order_book_received_monotonic", None)
+        local_age = (
+            time.monotonic() - received if received is not None
+            else self._age_seconds_from_iso(getattr(self, "last_lighter_order_book_update_at", None))
+        )
+        clock = getattr(self, "last_lighter_order_book_clock", {})
+        exchange_ages = [
+            time.time() - clock[key]
+            for key in ("exchange_frame_epoch", "exchange_state_epoch")
+            if clock.get(key) is not None
+        ]
+        ages = ([local_age] if local_age is not None else []) + exchange_ages
+        error = clock.get("error")
+        if any(age < -0.1 for age in ages):
+            error = "lighter_book_clock_moved_backwards"
+        return {
+            "book_age_seconds": max(0.0, max(ages)) if ages else None,
+            "book_local_age_seconds": local_age,
+            "book_exchange_age_seconds": max(0.0, max(exchange_ages)) if exchange_ages else None,
+            "book_exchange_frame_at": clock.get("exchange_frame_at"),
+            "book_exchange_state_at": clock.get("exchange_state_at"),
+            "book_timestamp_error": error,
+            "book_exchange_timestamp_valid": bool(clock.get("exchange_frame_epoch") is not None and error is None),
+            "book_offset": getattr(self, "lighter_order_book_offset", None),
+        }
 
     def live_inventory_lighter_book_age_ok(self) -> tuple[bool, float | None]:
-        age = self._lighter_order_book_age_seconds()
+        context = self.lighter_order_book_freshness_context()
+        age = context["book_age_seconds"]
         limit = self.live_inventory_max_lighter_book_age_seconds
         if limit <= 0:
             return True, age
-        return age is not None and age <= limit, age
+        return bool(context["book_exchange_timestamp_valid"] and age is not None and age <= limit), age
 
     def live_inventory_var_quote_freshness(
         self,
@@ -15818,6 +16014,7 @@ class VariationalToLighterRuntime:
             return empty
         book_side = "asks" if side.upper() == "BUY" else "bids"
         async with self.lighter_order_book_lock:
+            empty.update(self.lighter_order_book_freshness_context())
             levels = self.lighter_order_book.get(book_side, {})
             if not levels:
                 return empty
@@ -17033,7 +17230,9 @@ class VariationalToLighterRuntime:
         is_ask = side == "SELL"
         asset_key = record.asset.upper()
 
-        price_i = int(limit_price * self.price_multiplier)
+        price_i = int((limit_price * self.price_multiplier).to_integral_value(
+            rounding=ROUND_UP if is_ask and record.lighter_exit_retry_price_boundary is not None else ROUND_DOWN
+        ))
         async with self._record_lock:
             record.live_plan_ready_at_iso = plan_ready_iso
             record.live_plan_ready_monotonic = plan_ready_monotonic
@@ -17113,7 +17312,10 @@ class VariationalToLighterRuntime:
                 record.lighter_tx_hash = tx_hash
                 if wire_sent_monotonic is not None:
                     record.live_submit_wire_sent_monotonic = wire_sent_monotonic
-                    record.live_submit_wire_sent_at_iso = utc_now()
+                    record.live_submit_wire_sent_at_iso = datetime.fromtimestamp(
+                        time.time() - (time.monotonic() - wire_sent_monotonic),
+                        tz=timezone.utc,
+                    ).isoformat()
                 record.live_submit_sent_at_iso = submit_sent_iso
                 record.live_submit_sent_monotonic = submit_sent_monotonic
                 record.hedge_error = None
@@ -23283,7 +23485,7 @@ class VariationalToLighterRuntime:
                             },
                         )
                         return
-                    if should_exit and not portfolio_exit_selected and (
+                    if should_exit and not should_stop and not should_timeout_exit and not should_account_risk_exit and (
                         refreshed_pnl_bps is None
                         or refreshed_pnl_bps < effective_min_exit_pnl_bps
                     ):
@@ -23416,7 +23618,6 @@ class VariationalToLighterRuntime:
                     )
                 if (
                     should_exit
-                    and not portfolio_exit_selected
                     and not should_stop
                     and not should_timeout_exit
                     and not should_account_risk_exit
@@ -23479,11 +23680,6 @@ class VariationalToLighterRuntime:
                         )
                         return
                     exit_confirmation_mode = "two_of_three"
-            if portfolio_exit_selected:
-                self.remember_live_inventory_final_pnl_lot(
-                    asset=asset,
-                    lot=lot,
-                )
             var_amount = variational_api_amount_to_str(qty, asset=asset)
             if refresh_context is not None and not exit_quote_id:
                 self.live_inventory_basis_v4_reset_exit_confirmation(lot)
@@ -23544,6 +23740,12 @@ class VariationalToLighterRuntime:
                         )
                         return
                     exit_quote_id = None
+            previous_group_pnl = None
+            group_pnl_key = self.live_inventory_final_pnl_key(asset, lot.get("lot_id"))
+            if portfolio_exit_selected:
+                previous_group_pnl = self.pending_live_inventory_final_pnl.get(group_pnl_key)
+                previous_group_pnl = dict(previous_group_pnl) if previous_group_pnl is not None else None
+                self.remember_live_inventory_final_pnl_lot(asset=asset, lot=lot)
             pending_exit_match = PendingLiveInventoryVarFillMatch(
                 asset=asset,
                 side=exit_side.lower(),
@@ -23580,7 +23782,53 @@ class VariationalToLighterRuntime:
                     var_exit_price=var_exit_price,
                     exit_lighter_depth=exit_lighter_depth,
                     reuse_quote_id=exit_quote_id,
+                    profit_exit_context=(
+                        {
+                            **(refresh_context or {}),
+                            "entry_var_price": entry_var_price,
+                            "entry_lighter_price": entry_lighter_price,
+                            "effective_min_exit_pnl_bps": effective_min_exit_pnl_bps,
+                            "exit_reserve_bps": v4_exit_shortfall_reserve_bps,
+                        }
+                        if should_exit and not should_stop and not should_timeout_exit and not should_account_risk_exit
+                        else None
+                    ),
                 )
+                preflight = exit_pair_context.get("profit_preflight") or {}
+                if exit_pair_context.get("preflight_blocked"):
+                    self.remove_pending_live_inventory_var_fill_match(
+                        asset=asset, lot_id=lot.get("lot_id"), role="live_inventory_exit"
+                    )
+                    self.live_inventory_basis_v4_reset_exit_confirmation(lot)
+                    if portfolio_exit_selected:
+                        if previous_group_pnl is None:
+                            self.pending_live_inventory_final_pnl.pop(group_pnl_key, None)
+                        else:
+                            self.pending_live_inventory_final_pnl[group_pnl_key] = previous_group_pnl
+                        self.live_inventory_v4_portfolio_exit_lot_ids = set()
+                        self.live_inventory_v4_portfolio_exit_context = {}
+                        for attribute in (
+                            "live_inventory_v4_portfolio_exit_confirmations",
+                            "live_inventory_v4_partial_detier_confirmations",
+                            "live_inventory_v4_gradient_tier_exit_confirmations",
+                        ):
+                            confirmations = getattr(self, attribute, None)
+                            if confirmations is not None:
+                                confirmations.clear()
+                    await self.persist_live_inventory_memory(reason="profit_exit_preflight_blocked_no_orders_sent")
+                    await self.append_live_inventory_log("live_inventory_exit_blocked", {
+                        **state_payload, "lot_id": lot.get("lot_id"), "direction": direction,
+                        **preflight, "orders_sent": False,
+                    })
+                    return
+                if preflight.get("ok"):
+                    lighter_exit_price = to_decimal(preflight["executable_lighter_exit_price"])
+                    exit_lighter_depth = preflight["exit_lighter_depth"]
+                    pnl = to_decimal(preflight["executable_pnl_usd"])
+                    pnl_bps = to_decimal(preflight["executable_pnl_bps"])
+                    effective_min_exit_pnl_bps = to_decimal(preflight["effective_min_exit_pnl_bps"])
+                    v4_exit_shortfall_reserve_bps = to_decimal(preflight["exit_execution_reserve_bps"])
+                    v4_exit_calibration_payload = self.live_inventory_basis_v4_exit_calibration_payload(direction=direction)
             else:
                 try:
                     var_result, var_submit_ms = await self._timed_submit(
@@ -23758,7 +24006,7 @@ class VariationalToLighterRuntime:
                     },
                 )
                 return
-            if lighter_record is None or not self.auto_live_eager_hedge_started(lighter_record):
+            if not self.lighter_exit_submission_known(lighter_record):
                 await self.require_live_inventory_manual_review(
                     asset=asset,
                     reason="basis_exit_lighter_submit_failed",

@@ -621,6 +621,10 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "exit_shortfall_raw_p80_bps": exit_calibration.get(
             "v4_exit_shortfall_raw_p80_bps"
         ),
+        "exit_shortfall_raw_p95_bps": exit_calibration.get("v4_exit_shortfall_raw_p95_bps"),
+        "exit_shortfall_reserve_envelope_bps": exit_calibration.get(
+            "v4_exit_shortfall_reserve_envelope_bps"
+        ),
         "exit_shortfall_cap_bps": exit_calibration.get(
             "v4_exit_shortfall_cap_bps"
         ),
@@ -976,6 +980,8 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
             f"ready={funnel['exit_shortfall_calibration_ready']} "
             f"fully_mature={funnel['exit_shortfall_fully_mature']} "
             f"raw_p80_bps={funnel['exit_shortfall_raw_p80_bps']} "
+            f"raw_p95_bps={funnel['exit_shortfall_raw_p95_bps']} "
+            f"reserve_envelope_bps={funnel['exit_shortfall_reserve_envelope_bps']} "
             f"prior_bps={funnel['exit_shortfall_prior_bps']} "
             f"weight={funnel['exit_shortfall_calibration_weight']} "
             f"stage_floor_bps={funnel['exit_shortfall_stage_floor_bps']} "

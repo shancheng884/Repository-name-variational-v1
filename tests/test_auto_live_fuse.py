@@ -1095,7 +1095,8 @@ def test_account_risk_refreshes_stale_variational_snapshot_via_api() -> None:
 
         assert context["risk_action"] == "normal"
         assert context["variational_account_snapshot_fresh"] is True
-        assert context["variational_equity_usd"] == "102"
+        # Variational balance already includes its reported unrealized PnL.
+        assert context["variational_equity_usd"] == "101"
         assert context["variational_portfolio_refresh_attempted"] is True
         assert context["variational_portfolio_refresh_ok"] is True
         assert context["variational_portfolio_refresh_reason"] == "api_fallback"
@@ -2136,7 +2137,7 @@ def test_v4_entry_threshold_cache_refreshes_on_baseline_cadence() -> None:
     assert refreshed_threshold is not None
 
 
-def test_v4_exit_target_uses_conservative_prior_until_calibration_is_ready() -> None:
+def test_v4_exit_target_uses_observed_tail_even_before_calibration_is_ready() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_basis_dynamic_exit_buffer = True
     runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
@@ -2146,10 +2147,10 @@ def test_v4_exit_target_uses_conservative_prior_until_calibration_is_ready() -> 
     lot: dict[str, object] = {}
 
     assert runtime.live_inventory_basis_v4_exit_shortfall_reserve_bps() == Decimal(
-        "3.50"
+        "6.65"
     )
     assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
-        "4.50"
+        "7.65"
     )
     context = runtime.live_inventory_basis_v4_exit_calibration_context()
     assert context["sample_count"] == 2
@@ -2189,12 +2190,12 @@ def test_v4_exit_target_uses_observed_shortfall_after_ten_samples() -> None:
     assert context["raw_p80_bps"] == Decimal("6.65")
     assert context["calibration_weight"] == Decimal("1")
     assert context["stage_floor_bps"] == Decimal("1.50")
-    assert context["applied_dynamic_bps"] == Decimal("3.00")
+    assert context["applied_dynamic_bps"] == Decimal("6.65")
     assert runtime.live_inventory_basis_v4_exit_shortfall_reserve_bps() == Decimal(
-        "3.00"
+        "6.65"
     )
     assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
-        "4.00"
+        "7.65"
     )
 
 
@@ -2217,7 +2218,7 @@ def test_v4_exit_target_uses_early_ready_floor_for_low_shortfall() -> None:
     )
 
 
-def test_v4_exit_target_caps_observed_shortfall_after_twenty_samples() -> None:
+def test_v4_exit_target_does_not_clip_observed_shortfall_after_twenty_samples() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_basis_dynamic_exit_buffer = True
     runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(
@@ -2233,9 +2234,9 @@ def test_v4_exit_target_caps_observed_shortfall_after_twenty_samples() -> None:
     assert context["raw_p80_bps"] == Decimal("6.65")
     assert context["calibration_weight"] == Decimal("1")
     assert context["stage_floor_bps"] == Decimal("0.50")
-    assert context["applied_dynamic_bps"] == Decimal("3.00")
+    assert context["applied_dynamic_bps"] == Decimal("6.65")
     assert runtime.live_inventory_basis_v4_effective_exit_target_bps() == Decimal(
-        "4.00"
+        "7.65"
     )
 
 
@@ -3863,7 +3864,8 @@ def test_reduce_only_lighter_order_bypasses_live_cooldown() -> None:
     asyncio.run(run())
 
 
-def test_reduce_only_lighter_order_bypasses_entry_sizing_and_edge_limits() -> None:
+@pytest.mark.parametrize("absolute_boundary", [None, Decimal("2424.64418")])
+def test_reduce_only_lighter_order_bypasses_entry_sizing_and_edge_limits(absolute_boundary) -> None:
     async def run() -> None:
         runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
         runtime.mode = "live"
@@ -3925,11 +3927,15 @@ def test_reduce_only_lighter_order_bypasses_entry_sizing_and_edge_limits() -> No
             var_fill_price=Decimal("2431.72"),
             role="live_inventory_exit",
             reduce_only=True,
+            retry_price_boundary=absolute_boundary,
         )
 
         assert record is not None
         assert captured_kwargs["reduce_only"] is True
         assert captured_kwargs["base_amount"] == 572
+        if absolute_boundary is not None:
+            assert captured_kwargs["price"] == 242465
+            assert Decimal(captured_kwargs["price"]) / runtime.price_multiplier >= absolute_boundary
         assert payload["live_notional_usd"] == "138.6896470960"
         assert payload["failure_reason"] is None
         assert payload["processing_stage"] == "live_submit_sent"
@@ -6091,8 +6097,9 @@ def test_live_inventory_basis_exit_submits_var_before_lighter(tmp_path) -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("move_before_submit", [False, True])
 def test_v4_exit_reuses_latest_exact_main_loop_quote_after_two_of_three(
-    tmp_path,
+    tmp_path, move_before_submit,
 ) -> None:
     class ExitSubmitted(RuntimeError):
         pass
@@ -6226,6 +6233,9 @@ def test_v4_exit_reuses_latest_exact_main_loop_quote_after_two_of_three(
 
         async def fake_submit_live_inventory_exit_pair(**kwargs):
             submitted.append(kwargs)
+            if move_before_submit:
+                _set_test_lighter_book(runtime, bid="99.90", ask="99.91")
+                return await VariationalToLighterRuntime.submit_live_inventory_exit_pair(runtime, **kwargs)
             raise ExitSubmitted
 
         async def refuse_fast_refresh(**_kwargs):
@@ -6273,8 +6283,16 @@ def test_v4_exit_reuses_latest_exact_main_loop_quote_after_two_of_three(
             "v4_exit_confirmation_window"
         ] == [True, False]
 
-        with pytest.raises(ExitSubmitted):
+        if move_before_submit:
             await runtime.maybe_run_live_inventory_basis(snapshot)
+            assert len(runtime.live_inventory_open_lots) == 1
+            assert runtime.pending_live_inventory_actions_payload() == []
+            rows = [json.loads(line) for line in runtime.orders_file.read_text(encoding="utf-8").splitlines()]
+            assert rows[-1]["reason"] == "profit_exit_pnl_below_threshold_before_submit"
+            assert rows[-1]["orders_sent"] is False
+        else:
+            with pytest.raises(ExitSubmitted):
+                await runtime.maybe_run_live_inventory_basis(snapshot)
 
         assert len(submitted) == 1
         assert submitted[0]["reuse_quote_id"] == "main-loop-3"
@@ -8158,7 +8176,8 @@ def test_live_inventory_exit_waits_for_min_hold_samples(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path) -> None:
+@pytest.mark.parametrize("synthetic", [True, False])
+def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path, synthetic) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
         runtime.live_allowed_assets = {"ETH"}
@@ -8182,6 +8201,11 @@ def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path) -> 
             {
                 "trade_key": "exit-1",
                 "lighter_filled_price": "60605.8",
+                "variational_filled_at": "2026-10-22T00:00:00+00:00",
+                "lighter_filled_at": "2026-10-22T00:00:10+00:00",
+                "synthetic_eager_fill": synthetic,
+                "live_wire_sent_to_fill_ms": "350.0",
+                "live_wire_sent_to_submit_ack_ms": "20.0",
             }
         )
 
@@ -8191,6 +8215,9 @@ def test_live_inventory_actual_pnl_logged_after_lighter_final_fill(tmp_path) -> 
         assert rows[-1]["actual_pnl_status"] == "lighter_final_fill_confirmed"
         assert rows[-1]["exit_lighter_final_fill_price"] == "60605.8"
         assert rows[-1]["actual_pnl_usd"] == "0.02509222"
+        assert rows[-1]["exit_lighter_wire_to_fill_report_ms"] == "350.0"
+        assert list(runtime.live_inventory_exit_fill_latency_ms_samples) == [Decimal("350.0")]
+        assert (rows[-1]["exit_var_fill_to_lighter_fill_ms"] is None) == synthetic
         state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
         assert state["asset"] == "ETH"
         assert state["realized_pnl_usd"] == "0.02509222000000000000000000000"
@@ -8709,7 +8736,8 @@ def test_v4_exit_pair_preserves_one_leg_exception_outcome(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_lighter_exit_retries_canceled_remainder_without_alert_spam(tmp_path) -> None:
+@pytest.mark.parametrize("cancel_before_ack", [False, True])
+def test_lighter_exit_retries_canceled_remainder_without_alert_spam(tmp_path, cancel_before_ack) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
         initial = OrderLifecycle(
@@ -8764,6 +8792,9 @@ def test_lighter_exit_retries_canceled_remainder_without_alert_spam(tmp_path) ->
                 lighter_reduce_only=True,
             )
             record.processing_stage = "live_submit_sent"
+            if cancel_before_ack and attempt == 1:
+                record.processing_stage = "live_submit_failed"
+                record.lighter_order_status = "canceled-too-much-slippage"
             return record, record.to_payload()
 
         async def fake_wait(record):
