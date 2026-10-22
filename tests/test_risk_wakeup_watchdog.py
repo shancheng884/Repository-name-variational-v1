@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from main import VariationalToLighterRuntime
+from tools import risk_wakeup_backup as backup_module
 from tools import risk_wakeup_watchdog as watchdog_module
 from tools.lib.risk_wakeup_remote import RemoteHeartbeatPublisher
 from tools.risk_wakeup_watchdog import (
@@ -131,6 +132,7 @@ def reject_production_watchdog_dependencies(monkeypatch):
         raise AssertionError("test attempted to load production heartbeat credentials")
 
     monkeypatch.setattr(watchdog_module, "read_alert_control", isolated_control)
+    monkeypatch.setattr(backup_module, "read_alert_control", isolated_control)
     monkeypatch.setattr(RemoteHeartbeatPublisher, "from_env", reject_remote_configuration)
 
 
@@ -495,6 +497,7 @@ def test_remote_heartbeat_stale_key_does_not_change_with_age(tmp_path) -> None:
         config=remote_config,
         heartbeat_path=tmp_path / "missing-heartbeat.json",
         state_path=tmp_path / "remote-state.json",
+        alert_control_path=tmp_path / "backup-alert-control.json",
         bark=FakeBark(),
         feishu=FakeFeishu(),
         telegram=FakeTelegram(),
