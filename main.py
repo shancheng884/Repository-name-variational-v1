@@ -260,7 +260,8 @@ LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MIN_SAMPLES = 10
 LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_CLAMP_BPS = Decimal("3.0")
 LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_AGE_SECONDS = 24 * 3600
 LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_BIAS_MAX_MAD_BPS = Decimal("2.0")
-LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_INTERVAL_SECONDS = 300.0
+# At most one near-threshold probe per direction per minute; execution gates stay unchanged.
+LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_INTERVAL_SECONDS = 60.0
 # A scheduled exact RFQ is useful only when the passive estimate is close
 # enough to the translated threshold to have a realistic chance of passing.
 LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_BAND_BPS = Decimal("1.50")
@@ -1151,6 +1152,180 @@ def v4_real_gradient_entry_activation(
     if latest_tier >= LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_STRONG_SINGLE_MIN_TIER:
         return 1, "strong_single_probe"
     return 0, "pending_two_of_three"
+
+
+def v4_entry_rfq_shock_cooldown_bypass_allowed(
+    *,
+    cooldown_active: bool,
+    shock_recheck_pending_confirmation: bool,
+    confirmation_sample_is_new: bool,
+    confirmation_mode: str,
+    sample_move_ok: bool,
+    active_tier: int,
+) -> bool:
+    """Let a fresh ordinary confirmation recheck once after a rejected shock probe."""
+    return bool(
+        cooldown_active
+        and shock_recheck_pending_confirmation
+        and confirmation_sample_is_new
+        and confirmation_mode == "two_of_three"
+        and sample_move_ok
+        and active_tier > 0
+    )
+
+
+def v4_entry_rfq_probe_candidate_kind(
+    *,
+    enabled: bool,
+    refresh_enabled: bool,
+    account_flat: bool,
+    predicted_exact_edge_bps: Decimal | None,
+    exact_entry_threshold_bps: Decimal | None,
+    bias_ready: bool,
+    exploration_due: bool,
+) -> str | None:
+    """Classify executable and bounded first-lot RFQ probes."""
+    if (
+        not enabled
+        or not refresh_enabled
+        or predicted_exact_edge_bps is None
+        or exact_entry_threshold_bps is None
+    ):
+        return None
+    if predicted_exact_edge_bps >= exact_entry_threshold_bps:
+        return "predicted_exact_threshold"
+    if (
+        account_flat
+        and bias_ready
+        and exploration_due
+        and predicted_exact_edge_bps
+        >= exact_entry_threshold_bps
+        - LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_BAND_BPS
+    ):
+        return "near_threshold_exploration"
+    return None
+
+
+def v4_entry_rfq_evaluation_edge_fields(
+    *,
+    passive_edge_bps: Decimal | None,
+    exact_edge_bps: Decimal | None,
+    raw_exact_edge_bps: Decimal | None,
+) -> dict[str, str | None]:
+    """Keep passive and refreshed RFQ edge values distinct in telemetry."""
+    return {
+        "passive_edge_bps": decimal_to_str(passive_edge_bps),
+        "exact_edge_bps": decimal_to_str(exact_edge_bps),
+        "raw_exact_edge_bps": decimal_to_str(raw_exact_edge_bps),
+    }
+
+
+def v4_single_lot_rfq_gradient_state(
+    *,
+    active_tier: int,
+    confirmation_mode: str,
+    probe_enabled: bool,
+    candidate_kind: str | None,
+) -> tuple[int, str]:
+    """Report the first-lot exact RFQ probe as the effective tier state."""
+    if not probe_enabled or active_tier > 0:
+        return active_tier, confirmation_mode
+    if candidate_kind == "near_threshold_exploration":
+        return 1, "near_threshold_exact_rfq_probe"
+    return 1, "exact_rfq_single_lot"
+
+
+def v4_single_lot_rfq_probe_allowed(
+    *,
+    v4_enabled: bool,
+    real_gradient_enabled: bool,
+    account_flat: bool,
+    refresh_enabled: bool,
+    passive_edge_bps: Decimal,
+    passive_threshold_bps: Decimal | None,
+    candidate_kind: str | None,
+) -> bool:
+    return bool(
+        v4_enabled
+        and real_gradient_enabled
+        and account_flat
+        and refresh_enabled
+        and passive_threshold_bps is not None
+        and (
+            passive_edge_bps >= passive_threshold_bps
+            or candidate_kind is not None
+        )
+    )
+
+
+def v4_entry_rfq_exact_edge_passes(
+    *, exact_edge_bps: Decimal, required_edge_bps: Decimal
+) -> bool:
+    return exact_edge_bps >= required_edge_bps
+
+
+def v4_entry_rfq_exact_quality_passes(
+    *, quality_score_bps: Decimal, minimum_quality_bps: Decimal
+) -> bool:
+    return quality_score_bps >= minimum_quality_bps
+
+
+def v4_live_entry_threshold_breakdown(
+    *,
+    context: dict[str, Any],
+    rfq_bias_context: dict[str, Any],
+    signal_edge_bps: Decimal,
+    predicted_exact_edge_bps: Decimal,
+    exact_threshold_bps: Decimal | None,
+    confirmation_mode: str,
+    raw_gradient_tier: int,
+    active_gradient_tier: int,
+) -> dict[str, Any]:
+    """Build a same-snapshot, JSON-safe explanation of one direction's gate."""
+    passive_threshold = to_decimal(context.get("v4_entry_threshold_bps"))
+    applied_bias = to_decimal(
+        rfq_bias_context.get("v4_entry_rfq_bias_applied_bps")
+    ) or Decimal("0")
+
+    def margin(value: Decimal, threshold: Decimal | None) -> str | None:
+        return decimal_to_str(value - threshold) if threshold is not None else None
+
+    return {
+        "anchor_7d_p97_5_bps": context.get("v4_7d_entry_threshold_bps"),
+        "fast_1d_p95_ready": context.get("v4_fast_ready"),
+        "fast_1d_p95_bps": context.get("v4_fast_threshold_bps"),
+        "fast_threshold_applied": context.get("v4_fast_threshold_applied"),
+        "mid_15d_p97_5_ready": context.get("v4_mid_ready"),
+        "mid_15d_p97_5_bps": context.get("v4_mid_threshold_bps"),
+        "long_30d_p97_5_ready": context.get("v4_long_ready"),
+        "long_30d_p97_5_bps": context.get("v4_long_threshold_bps"),
+        "weekend_transition_active": context.get(
+            "v4_weekend_transition_active"
+        ),
+        "raw_threshold_driver": context.get("v4_raw_threshold_driver"),
+        "raw_history_threshold_bps": context.get(
+            "v4_raw_entry_threshold_bps"
+        ),
+        "entry_execution_reserve_bps": context.get(
+            "v4_entry_execution_reserve_bps"
+        ),
+        "entry_exit_cost_increment_bps": context.get(
+            "v4_entry_exit_cost_increment_bps"
+        ),
+        "passive_threshold_bps": decimal_to_str(passive_threshold),
+        "rfq_bias_applied_bps": decimal_to_str(applied_bias),
+        "exact_threshold_bps": decimal_to_str(exact_threshold_bps),
+        "signal_edge_bps": decimal_to_str(signal_edge_bps),
+        "passive_margin_bps": margin(signal_edge_bps, passive_threshold),
+        "predicted_exact_edge_bps": decimal_to_str(predicted_exact_edge_bps),
+        "exact_margin_bps": margin(predicted_exact_edge_bps, exact_threshold_bps),
+        "gradient_tier_thresholds_bps": context.get(
+            "v4_real_gradient_tier_thresholds_bps"
+        ),
+        "raw_gradient_tier": raw_gradient_tier,
+        "active_gradient_tier": active_gradient_tier,
+        "confirmation_mode": confirmation_mode,
+    }
 
 
 def v4_real_gradient_sample_move_decision(
@@ -2615,6 +2790,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_last_entry_submit_monotonic = 0.0
         self.live_inventory_basis_entry_rfq_cooldown_until_monotonic: dict[
             str, float
+        ] = {}
+        self.live_inventory_basis_entry_shock_recheck_pending_confirmation: dict[
+            str, bool
         ] = {}
         self.live_inventory_basis_entry_rfq_last_edge_bps_by_direction: dict[
             str, Decimal
@@ -10008,19 +10186,22 @@ class VariationalToLighterRuntime:
         if anchor_threshold is None:
             return finish(None, context)
         fast_threshold = to_decimal(fast_context.get("threshold_bps"))
-        raw_threshold = (
-            max(anchor_threshold, fast_threshold)
-            if fast_context["ready"] and fast_threshold is not None
-            else anchor_threshold
-        )
         weekend_context = v4_weekend_regime_context(now)
+        raw_threshold_candidates = [(anchor_threshold, "anchor_7d_p97_5")]
+        if fast_context["ready"] and fast_threshold is not None:
+            raw_threshold_candidates.append((fast_threshold, "fast_1d_p95"))
         if weekend_context["v4_weekend_transition_active"]:
-            transition_candidates = [raw_threshold]
-            for window_context in (mid_context, long_context):
+            for name, window_context in (
+                ("mid_15d_p97_5", mid_context),
+                ("long_30d_p97_5", long_context),
+            ):
                 window_threshold = to_decimal(window_context.get("threshold_bps"))
                 if window_context.get("ready") and window_threshold is not None:
-                    transition_candidates.append(window_threshold)
-            raw_threshold = max(transition_candidates)
+                    raw_threshold_candidates.append((window_threshold, name))
+        raw_threshold, raw_threshold_driver = max(
+            raw_threshold_candidates,
+            key=lambda item: item[0],
+        )
         entry_execution_reserve_bps = (
             self.live_inventory_basis_v4_entry_execution_reserve_bps(
                 direction=direction
@@ -10096,6 +10277,7 @@ class VariationalToLighterRuntime:
         return finish(threshold, {
             **context,
             **weekend_context,
+            "v4_raw_threshold_driver": raw_threshold_driver,
             "v4_entry_percentile": decimal_to_str(
                 LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE
             ),
@@ -10289,6 +10471,7 @@ class VariationalToLighterRuntime:
         edge_bps: Decimal,
         thresholds_bps: list[Decimal],
         direction: str | None = None,
+        advance_confirmation: bool = True,
     ) -> int:
         bidirectional = bool(
             direction is not None
@@ -10319,10 +10502,16 @@ class VariationalToLighterRuntime:
                 ] = window
             else:
                 self.live_inventory_v4_gradient_entry_tier_window = window
-        window.append(max(0, int(raw_tier)))
+        if advance_confirmation:
+            window.append(max(0, int(raw_tier)))
+        latest_confirmation_tier = (
+            max(0, int(raw_tier))
+            if advance_confirmation
+            else (max(0, int(window[-1])) if window else 0)
+        )
         activation_tier, _confirmation_mode = v4_real_gradient_entry_activation(
             window,
-            latest_tier=raw_tier,
+            latest_tier=latest_confirmation_tier,
         )
         states = (
             getattr(
@@ -10347,14 +10536,18 @@ class VariationalToLighterRuntime:
                 tier,
                 {"armed": True, "reset_seen": False},
             )
-            if not state.get("armed", True):
+            if advance_confirmation and not state.get("armed", True):
                 if edge_bps < threshold:
                     state["reset_seen"] = True
                 if state.get("reset_seen") and activation_tier >= tier:
                     state["armed"] = True
                     state["reset_seen"] = False
                     state["rearmed_at"] = utc_now()
-            if state.get("armed", True) and activation_tier >= tier:
+            if (
+                state.get("armed", True)
+                and activation_tier >= tier
+                and raw_tier >= tier
+            ):
                 active_tier = tier
         return active_tier
 
@@ -11356,6 +11549,7 @@ class VariationalToLighterRuntime:
             "quote_latency_kind": "exact_rfq_roundtrip",
             "rfq_category": rfq_category,
             "rfq_consumed": True,
+            "command_rate_limit_wait_ms": result.get("rate_limit_wait_ms"),
         }
         bid = to_decimal(payload.get("bid"))
         ask = to_decimal(payload.get("ask"))
@@ -18580,6 +18774,15 @@ class VariationalToLighterRuntime:
             dict,
         ):
             self.live_inventory_basis_entry_rfq_cooldown_until_monotonic = {}
+        if not isinstance(
+            getattr(
+                self,
+                "live_inventory_basis_entry_shock_recheck_pending_confirmation",
+                None,
+            ),
+            dict,
+        ):
+            self.live_inventory_basis_entry_shock_recheck_pending_confirmation = {}
         if not hasattr(self, "live_inventory_basis_entry_rfq_last_skip_log_monotonic"):
             self.live_inventory_basis_entry_rfq_last_skip_log_monotonic = 0.0
         calibration_mode = bool(getattr(self, "live_inventory_execution_calibration", False))
@@ -19355,6 +19558,34 @@ class VariationalToLighterRuntime:
                     for direction, edge in v4_predicted_entry_edges.items()
                 },
             }
+        v4_entry_rfq_candidate_kinds: dict[str, str | None] = {}
+        if v4_mode:
+            for direction in v4_entry_directions:
+                bias_context = v4_entry_rfq_bias_contexts.get(direction, {})
+                v4_entry_rfq_candidate_kinds[direction] = (
+                    v4_entry_rfq_probe_candidate_kind(
+                        enabled=True,
+                        refresh_enabled=(
+                            self.live_inventory_basis_refresh_entry_quote_before_submit
+                        ),
+                        account_flat=not self.live_inventory_open_lots,
+                        predicted_exact_edge_bps=v4_predicted_entry_edges.get(
+                            direction
+                        ),
+                        exact_entry_threshold_bps=v4_exact_entry_thresholds.get(
+                            direction
+                        ),
+                        bias_ready=(
+                            bias_context.get("v4_entry_rfq_bias_ready") is True
+                        ),
+                        exploration_due=(
+                            self.live_inventory_basis_v4_entry_rfq_exploration_due(
+                                direction,
+                                consume=False,
+                            )
+                        ),
+                    )
+                )
         real_gradient_thresholds_by_direction: dict[str, list[Decimal]] = {}
         raw_real_gradient_tiers: dict[str, int] = {}
         real_gradient_tiers: dict[str, int] = {}
@@ -19396,6 +19627,7 @@ class VariationalToLighterRuntime:
                         if bidirectional_gradient
                         else None
                     ),
+                    advance_confirmation=not duplicate_passive_reference,
                 )
                 if self.live_inventory_basis_v4_real_gradient
                 else 0
@@ -19411,10 +19643,15 @@ class VariationalToLighterRuntime:
                     self, "live_inventory_v4_gradient_entry_tier_window", ()
                 )
             )
+            confirmation_latest_tier = (
+                raw_tier
+                if not duplicate_passive_reference
+                else (int(direction_window[-1]) if direction_window else 0)
+            )
             _, real_gradient_confirmation_modes[direction] = (
                 v4_real_gradient_entry_activation(
                     direction_window or (),
-                    latest_tier=raw_tier,
+                    latest_tier=confirmation_latest_tier,
                 )
                 if self.live_inventory_basis_v4_real_gradient
                 else (0, "disabled")
@@ -19440,20 +19677,67 @@ class VariationalToLighterRuntime:
             v4_entry_direction,
             "disabled",
         )
-        v4_single_lot_exact_rfq_probe = bool(
-            v4_mode
-            and self.live_inventory_basis_v4_real_gradient
-            and not self.live_inventory_open_lots
-            and self.live_inventory_basis_refresh_entry_quote_before_submit
-            and v4_entry_threshold_bps is not None
-            and v4_signal_edge_bps >= v4_entry_threshold_bps
+        v4_single_lot_exact_rfq_probe = v4_single_lot_rfq_probe_allowed(
+            v4_enabled=v4_mode,
+            real_gradient_enabled=self.live_inventory_basis_v4_real_gradient,
+            account_flat=not self.live_inventory_open_lots,
+            refresh_enabled=(
+                self.live_inventory_basis_refresh_entry_quote_before_submit
+            ),
+            passive_edge_bps=v4_signal_edge_bps,
+            passive_threshold_bps=v4_entry_threshold_bps,
+            candidate_kind=v4_entry_rfq_candidate_kinds.get(
+                v4_entry_direction
+            ),
         )
-        if v4_single_lot_exact_rfq_probe and real_gradient_tier <= 0:
-            # A flat account needs one exact RFQ to validate the first lot.
-            # Do not require the passive stream to already pass the later-lot
-            # 2-of-3 gradient activation window.
-            real_gradient_tier = 1
-            real_gradient_confirmation_mode = "exact_rfq_single_lot"
+        real_gradient_tier_before_probe = real_gradient_tier
+        real_gradient_tier, real_gradient_confirmation_mode = (
+            v4_single_lot_rfq_gradient_state(
+                active_tier=real_gradient_tier,
+                confirmation_mode=real_gradient_confirmation_mode,
+                probe_enabled=v4_single_lot_exact_rfq_probe,
+                candidate_kind=v4_entry_rfq_candidate_kinds.get(
+                    v4_entry_direction
+                ),
+            )
+        )
+        if (
+            v4_single_lot_exact_rfq_probe
+            and real_gradient_tier_before_probe <= 0
+        ):
+            # This is a quote probe only; exact edge and capacity checks still
+            # decide whether the first lot can be submitted.
+            real_gradient_tiers[v4_entry_direction] = real_gradient_tier
+            real_gradient_confirmation_modes[v4_entry_direction] = (
+                real_gradient_confirmation_mode
+            )
+        v4_direction_threshold_breakdown: dict[str, dict[str, Any]] = {}
+        if v4_mode:
+            for direction in v4_entry_directions:
+                v4_direction_threshold_breakdown[direction] = (
+                    v4_live_entry_threshold_breakdown(
+                        context=v4_entry_contexts.get(direction, {}),
+                        rfq_bias_context=v4_entry_rfq_bias_contexts.get(
+                            direction, {}
+                        ),
+                        signal_edge_bps=v4_signal_edges[direction],
+                        predicted_exact_edge_bps=v4_predicted_entry_edges.get(
+                            direction, v4_signal_edges[direction]
+                        ),
+                        exact_threshold_bps=v4_exact_entry_thresholds.get(
+                            direction
+                        ),
+                        confirmation_mode=real_gradient_confirmation_modes.get(
+                            direction, "disabled"
+                        ),
+                        raw_gradient_tier=raw_real_gradient_tiers.get(
+                            direction, 0
+                        ),
+                        active_gradient_tier=real_gradient_tiers.get(
+                            direction, 0
+                        ),
+                    )
+                )
         variational_rate = self.live_inventory_order_limiter(
             "variational"
         ).snapshot()
@@ -19600,6 +19884,9 @@ class VariationalToLighterRuntime:
             "v4_real_gradient_active_tier": real_gradient_tier,
             "v4_real_gradient_confirmation_mode": real_gradient_confirmation_mode,
             "v4_direction_confirmation_modes": real_gradient_confirmation_modes,
+            "v4_direction_threshold_breakdown": (
+                v4_direction_threshold_breakdown
+            ),
             "realized_pnl_usd": decimal_to_str(self.live_inventory_realized_pnl_usd),
             "completed_cycles": self.live_inventory_completed_cycles,
             "basis_collect_only": collect_only,
@@ -20291,6 +20578,9 @@ class VariationalToLighterRuntime:
                     if v4_mode
                     else {}
                 )
+                entry_rfq_candidate_kind = (
+                    v4_entry_rfq_candidate_kinds.get(direction)
+                )
                 predicted_exact_edge_bps = edge_bps
                 exact_entry_threshold_bps = min_entry_edge_bps
                 if v4_mode:
@@ -20303,33 +20593,13 @@ class VariationalToLighterRuntime:
                     )
                     if exact_entry_threshold_bps is None:
                         exact_entry_threshold_bps = min_entry_edge_bps
-                predicted_entry_candidate = bool(
-                    v4_mode
-                    and self.live_inventory_basis_refresh_entry_quote_before_submit
-                    and predicted_exact_edge_bps >= exact_entry_threshold_bps
+                predicted_entry_candidate = (
+                    entry_rfq_candidate_kind == "predicted_exact_threshold"
                 )
-                entry_rfq_exploration_candidate = bool(
-                    v4_mode
-                    and self.live_inventory_basis_refresh_entry_quote_before_submit
-                    and entry_rfq_bias_context.get("v4_entry_rfq_bias_ready") is True
-                    and self.live_inventory_basis_v4_entry_rfq_exploration_allowed(
-                        predicted_exact_edge_bps=predicted_exact_edge_bps,
-                        exact_entry_threshold_bps=exact_entry_threshold_bps,
-                        bias_ready=(
-                            entry_rfq_bias_context.get(
-                                "v4_entry_rfq_bias_ready"
-                            )
-                            is True
-                        ),
-                    )
-                    and self.live_inventory_basis_v4_entry_rfq_exploration_due(
-                        direction,
-                        consume=False,
-                    )
+                entry_rfq_exploration_candidate = (
+                    entry_rfq_candidate_kind == "near_threshold_exploration"
                 )
-                entry_rfq_probe_candidate = (
-                    predicted_entry_candidate or entry_rfq_exploration_candidate
-                )
+                entry_rfq_probe_candidate = entry_rfq_candidate_kind is not None
                 if predicted_entry_candidate:
                     entry_quality_score_bps = max(
                         entry_quality_score_bps,
@@ -20378,6 +20648,10 @@ class VariationalToLighterRuntime:
                     entry_quality_score_bps
                     < self.live_inventory_basis_min_entry_quality_score_bps
                     and not predicted_entry_candidate
+                    and not (
+                        entry_rfq_exploration_candidate
+                        and not self.live_inventory_basis_watch_candidate
+                    )
                 ):
                     promoted, watch_context = self.live_inventory_update_watch_candidate(
                         direction=direction,
@@ -20409,7 +20683,12 @@ class VariationalToLighterRuntime:
                         continue
                     entry_quality_context = {**entry_quality_context, **watch_context}
 
-                if entry_quality_score_bps < self.live_inventory_basis_min_entry_quality_score_bps and not self.live_inventory_basis_watch_candidate:
+                if (
+                    entry_quality_score_bps
+                    < self.live_inventory_basis_min_entry_quality_score_bps
+                    and not self.live_inventory_basis_watch_candidate
+                    and not entry_rfq_exploration_candidate
+                ):
                     self.live_inventory_basis_entry_confirm_counts[direction] = 0
                     await self.append_live_inventory_log(
                         "live_inventory_entry_blocked",
@@ -20547,11 +20826,22 @@ class VariationalToLighterRuntime:
                         },
                     )
                     return
-                confirm_count = self.live_inventory_basis_entry_confirm_counts.get(direction, 0) + 1
-                self.live_inventory_basis_entry_confirm_counts[direction] = confirm_count
-                for other_direction in (DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER):
-                    if other_direction != direction:
-                        self.live_inventory_basis_entry_confirm_counts[other_direction] = 0
+                confirm_count = self.live_inventory_basis_entry_confirm_counts.get(
+                    direction, 0
+                )
+                if not duplicate_passive_reference:
+                    confirm_count += 1
+                    self.live_inventory_basis_entry_confirm_counts[
+                        direction
+                    ] = confirm_count
+                    for other_direction in (
+                        DIRECTION_LONG_VAR_SHORT_LIGHTER,
+                        DIRECTION_SHORT_VAR_LONG_LIGHTER,
+                    ):
+                        if other_direction != direction:
+                            self.live_inventory_basis_entry_confirm_counts[
+                                other_direction
+                            ] = 0
                 if confirm_count < self.live_inventory_basis_entry_confirm_samples:
                     await self.append_live_inventory_log(
                         "live_inventory_entry_blocked",
@@ -20579,6 +20869,51 @@ class VariationalToLighterRuntime:
                         last_rfq_edges = {}
                         self.live_inventory_basis_entry_rfq_last_edge_bps_by_direction = (
                             last_rfq_edges
+                        )
+                    shock_confirmation_pending = (
+                        self.live_inventory_basis_entry_shock_recheck_pending_confirmation.get(
+                            direction, False
+                        )
+                    )
+                    shock_confirmation_bypass = (
+                        v4_entry_rfq_shock_cooldown_bypass_allowed(
+                            cooldown_active=cooldown_until > now_monotonic,
+                            shock_recheck_pending_confirmation=(
+                                shock_confirmation_pending
+                            ),
+                            confirmation_sample_is_new=(
+                                not duplicate_passive_reference
+                            ),
+                            confirmation_mode=real_gradient_confirmation_mode,
+                            sample_move_ok=basis_sample_move_ok,
+                            active_tier=real_gradient_tier,
+                        )
+                    )
+                    if shock_confirmation_bypass:
+                        remaining = max(0.0, cooldown_until - now_monotonic)
+                        self.live_inventory_basis_entry_shock_recheck_pending_confirmation.pop(
+                            direction, None
+                        )
+                        self.live_inventory_basis_entry_rfq_cooldown_until_monotonic.pop(
+                            direction, None
+                        )
+                        cooldown_until = 0.0
+                        await self.append_live_inventory_internal_log(
+                            "live_inventory_entry_rfq_shock_cooldown_bypassed",
+                            {
+                                **state_payload,
+                                "direction": direction,
+                                "reason": "fresh_two_of_three_confirmation_after_rejected_shock_probe",
+                                "cooldown_remaining_seconds": f"{remaining:.3f}",
+                                "entry_gradient_confirmation_mode": (
+                                    real_gradient_confirmation_mode
+                                ),
+                                "active_gradient_tier": real_gradient_tier,
+                            },
+                        )
+                    elif cooldown_until <= now_monotonic:
+                        self.live_inventory_basis_entry_shock_recheck_pending_confirmation.pop(
+                            direction, None
                         )
                     if cooldown_until > now_monotonic:
                         last_rfq_edge_bps = last_rfq_edges.get(direction)
@@ -20632,6 +20967,43 @@ class VariationalToLighterRuntime:
                         self.live_inventory_basis_v4_entry_rfq_exploration_due(
                             direction
                         )
+                    entry_rfq_trace_context = {
+                        "asset": asset,
+                        "sample_index": index,
+                        "signal_quote_id": signal_quote_id,
+                        "direction": direction,
+                        "candidate_kind": entry_rfq_candidate_kind,
+                        "passive_edge_bps": decimal_to_str(edge_bps),
+                        "predicted_exact_edge_bps": decimal_to_str(
+                            predicted_exact_edge_bps
+                        ),
+                        "passive_threshold_bps": decimal_to_str(
+                            v4_entry_thresholds.get(direction)
+                        ),
+                        "exact_threshold_bps": decimal_to_str(
+                            exact_entry_threshold_bps
+                        ),
+                        "confirmation_mode": real_gradient_confirmation_mode,
+                        "active_gradient_tier": real_gradient_tier,
+                        "basis_sample_move_ok": basis_sample_move_ok,
+                        "passive_var_quote_age_seconds": (
+                            None
+                            if var_quote_age_seconds is None
+                            else f"{var_quote_age_seconds:.6f}"
+                        ),
+                        "lighter_book_age_seconds": (
+                            None
+                            if lighter_book_age_seconds is None
+                            else f"{lighter_book_age_seconds:.6f}"
+                        ),
+                    }
+                    entry_rfq_started_monotonic = time.monotonic()
+                    await self.append_live_inventory_internal_log(
+                        "live_inventory_v4_entry_rfq_candidate",
+                        {
+                            **entry_rfq_trace_context,
+                        },
+                    )
                     last_rfq_edges[direction] = to_decimal(
                         v4_signal_edges.get(direction)
                     ) or Decimal("0")
@@ -20640,6 +21012,33 @@ class VariationalToLighterRuntime:
                         qty=signal_quote_qty,
                         priority="trade",
                         rfq_category="entry_rfq",
+                    )
+                    await self.append_live_inventory_internal_log(
+                        "live_inventory_v4_entry_rfq_response",
+                        {
+                            **entry_rfq_trace_context,
+                            "quote_available": bool(refreshed_quote),
+                            "quote_roundtrip_ms": decimal_to_str(
+                                refreshed_quote_ms
+                            ),
+                            "candidate_to_response_ms": decimal_to_str(
+                                Decimal(str(
+                                    (time.monotonic() - entry_rfq_started_monotonic)
+                                    * 1000
+                                ))
+                            ),
+                            "command_rate_limit_wait_ms": (
+                                refreshed_quote.get("command_rate_limit_wait_ms")
+                                if isinstance(refreshed_quote, dict)
+                                else None
+                            ),
+                            "quote_timestamp": (
+                                refreshed_quote.get("quoteTimestamp")
+                                or refreshed_quote.get("quote_timestamp")
+                                if isinstance(refreshed_quote, dict)
+                                else None
+                            ),
+                        },
                     )
                     refreshed_var_bid = to_decimal(refreshed_quote.get("bid")) if refreshed_quote else None
                     refreshed_var_ask = to_decimal(refreshed_quote.get("ask")) if refreshed_quote else None
@@ -20812,6 +21211,56 @@ class VariationalToLighterRuntime:
                         edge_bps = refreshed_normalized_edge_bps
                     if self.live_inventory_basis_use_normalized_edge_for_entry and refreshed_normalized_roundtrip_bps is not None:
                         roundtrip_bps = refreshed_normalized_roundtrip_bps
+                    if v4_mode:
+                        exact_entry_threshold_bps = v4_exact_entry_thresholds.get(
+                            direction
+                        )
+                        await self.append_live_inventory_internal_log(
+                            "live_inventory_v4_entry_rfq_evaluated",
+                            {
+                                **entry_rfq_trace_context,
+                                "quote_roundtrip_ms": decimal_to_str(
+                                    refreshed_quote_ms
+                                ),
+                                "candidate_to_evaluation_ms": decimal_to_str(
+                                    Decimal(str(
+                                        (time.monotonic() - entry_rfq_started_monotonic)
+                                        * 1000
+                                    ))
+                                ),
+                                **v4_entry_rfq_evaluation_edge_fields(
+                                    passive_edge_bps=to_decimal(
+                                        entry_rfq_trace_context.get(
+                                            "passive_edge_bps"
+                                        )
+                                    ),
+                                    exact_edge_bps=edge_bps,
+                                    raw_exact_edge_bps=raw_refreshed_edge_bps,
+                                ),
+                                "predicted_exact_edge_bps": decimal_to_str(
+                                    predicted_exact_edge_bps
+                                ),
+                                "exact_threshold_bps": decimal_to_str(
+                                    exact_entry_threshold_bps
+                                ),
+                                "exact_margin_bps": decimal_to_str(
+                                    edge_bps
+                                    - exact_entry_threshold_bps
+                                )
+                                if exact_entry_threshold_bps is not None
+                                else None,
+                                "roundtrip_pnl_bps": decimal_to_str(
+                                    raw_refreshed_roundtrip_bps
+                                ),
+                                "entry_lighter_depth_sufficient": entry_depth.get(
+                                    "book_depth_sufficient"
+                                ),
+                                "entry_lighter_depth_slippage_bps": (
+                                    (entry_depth.get("slippage_bps"))
+                                ),
+                                "quote_timestamp": entry_quote_timestamp,
+                            },
+                        )
                     refreshed_stablecoin_filter_ok, refreshed_stablecoin_edge_context = self.live_inventory_stablecoin_edge_context(
                         raw_edge_bps=raw_refreshed_edge_bps,
                         normalized_edge_bps=refreshed_normalized_edge_bps,
@@ -20908,6 +21357,20 @@ class VariationalToLighterRuntime:
                                 and refreshed_raw_gradient_tier
                                 < required_refreshed_raw_gradient_tier
                             ):
+                                pending_shock_confirmations = getattr(
+                                    self,
+                                    "live_inventory_basis_entry_shock_recheck_pending_confirmation",
+                                    None,
+                                )
+                                if not isinstance(
+                                    pending_shock_confirmations, dict
+                                ):
+                                    pending_shock_confirmations = {}
+                                    self.live_inventory_basis_entry_shock_recheck_pending_confirmation = (
+                                        pending_shock_confirmations
+                                    )
+                                if strong_single_sample_move_recheck:
+                                    pending_shock_confirmations[direction] = True
                                 self.live_inventory_basis_entry_rfq_cooldown_until_monotonic[
                                     direction
                                 ] = (
@@ -20958,7 +21421,13 @@ class VariationalToLighterRuntime:
                             basis_sample_move_bps=basis_sample_move_bps,
                             roundtrip_bps=roundtrip_bps,
                         )
-                    if not calibration_mode and edge_bps < min_entry_edge_bps:
+                    if (
+                        not calibration_mode
+                        and not v4_entry_rfq_exact_edge_passes(
+                            exact_edge_bps=edge_bps,
+                            required_edge_bps=min_entry_edge_bps,
+                        )
+                    ):
                         self.live_inventory_basis_entry_rfq_cooldown_until_monotonic[
                             direction
                         ] = (
@@ -20990,7 +21459,12 @@ class VariationalToLighterRuntime:
                         return
                     if (
                         not calibration_mode
-                        and entry_quality_score_bps < self.live_inventory_basis_min_entry_quality_score_bps
+                        and not v4_entry_rfq_exact_quality_passes(
+                            quality_score_bps=entry_quality_score_bps,
+                            minimum_quality_bps=(
+                                self.live_inventory_basis_min_entry_quality_score_bps
+                            ),
+                        )
                     ):
                         self.live_inventory_basis_entry_rfq_cooldown_until_monotonic[
                             direction

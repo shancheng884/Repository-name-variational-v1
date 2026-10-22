@@ -593,6 +593,72 @@ def test_v4_live_funnel_checkpoint_resolves_final_fill_wait_status() -> None:
     assert funnel["status"] == "WAITING_FOR_EPISODE_REARM"
 
 
+def test_v4_live_funnel_reports_same_snapshot_thresholds_and_rfq_capture(
+    capsys,
+) -> None:
+    common = {
+        "run_id": "live-v4-threshold-breakdown",
+        "strategy_version": "basis-v4-live-test-v1",
+        "asset": "ETH",
+    }
+    old_breakdown = {"long_var_short_lighter": {"passive_threshold_bps": "9"}}
+    current_breakdown = {
+        "long_var_short_lighter": {
+            "anchor_7d_p97_5_bps": "14.0",
+            "raw_threshold_driver": "fast_1d_p95",
+            "entry_execution_reserve_bps": "1.5",
+            "passive_threshold_bps": "16.0",
+            "exact_threshold_bps": "15.5",
+        }
+    }
+    rows = [
+        {
+            **common,
+            "event": "live_inventory_basis_state",
+            "logged_at": "2026-10-22T10:00:00+00:00",
+            "v4_direction_threshold_breakdown": old_breakdown,
+        },
+        {
+            **common,
+            "event": "live_inventory_basis_state",
+            "logged_at": "2026-10-22T10:01:00+00:00",
+            "v4_bidirectional": True,
+            "v4_direction_threshold_breakdown": current_breakdown,
+        },
+        {
+            **common,
+            "event": "live_inventory_v4_entry_rfq_candidate",
+        },
+        {
+            **common,
+            "event": "live_inventory_v4_entry_rfq_response",
+            "quote_available": True,
+            "quote_roundtrip_ms": "130.0",
+        },
+        {
+            **common,
+            "event": "live_inventory_v4_entry_rfq_evaluated",
+            "quote_roundtrip_ms": "124.5",
+            "exact_margin_bps": "-0.25",
+        },
+    ]
+
+    funnel = build_v4_live_funnel(rows)
+
+    assert funnel is not None
+    assert funnel["direction_threshold_breakdown"] == current_breakdown
+    assert funnel["entry_rfq_candidate_count"] == 1
+    assert funnel["entry_rfq_response_count"] == 1
+    assert funnel["entry_rfq_latest_response_ms"] == "130.0"
+    assert funnel["entry_rfq_evaluated_count"] == 1
+    assert funnel["entry_rfq_latest_roundtrip_ms"] == "124.5"
+    assert funnel["entry_rfq_latest_exact_margin_bps"] == "-0.25"
+    print_v4_live_funnel(rows)
+    output = capsys.readouterr().out
+    assert '"raw_threshold_driver":"fast_1d_p95"' in output
+    assert "entry_rfq_candidates=1 entry_rfq_responses=1" in output
+
+
 def test_basis_v4_formal_profile_accepts_only_versioned_calibrated_eth_short_config() -> None:
     common = {
         "evaluation_interval_seconds": 1,

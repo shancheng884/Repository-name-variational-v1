@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_left, bisect_right
+import json
 import subprocess
 import sys
 from collections import Counter, deque
@@ -121,6 +122,27 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     preflight_blocked = sum(row.get("shadow_status") == "blocked" for row in shadows)
     dynamic_floor_blocks = reasons["edge_bps_below_dynamic_live_inventory_entry"]
     latest_state = state_rows[-1] if state_rows else {}
+    entry_rfq_candidates = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_v4_entry_rfq_candidate"
+    ]
+    entry_rfq_responses = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_v4_entry_rfq_response"
+    ]
+    latest_entry_rfq_response = (
+        entry_rfq_responses[-1] if entry_rfq_responses else {}
+    )
+    entry_rfq_evaluations = [
+        row
+        for row in v4_rows
+        if row.get("event") == "live_inventory_v4_entry_rfq_evaluated"
+    ]
+    latest_entry_rfq_evaluation = (
+        entry_rfq_evaluations[-1] if entry_rfq_evaluations else {}
+    )
     exit_submit_rows = [
         row
         for row in v4_rows
@@ -657,6 +679,21 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "direction_thresholds_bps": latest_state.get(
             "v4_direction_thresholds_bps"
         ),
+        "direction_threshold_breakdown": latest_state.get(
+            "v4_direction_threshold_breakdown"
+        ),
+        "entry_rfq_candidate_count": len(entry_rfq_candidates),
+        "entry_rfq_response_count": len(entry_rfq_responses),
+        "entry_rfq_latest_response_ms": latest_entry_rfq_response.get(
+            "quote_roundtrip_ms"
+        ),
+        "entry_rfq_evaluated_count": len(entry_rfq_evaluations),
+        "entry_rfq_latest_roundtrip_ms": latest_entry_rfq_evaluation.get(
+            "quote_roundtrip_ms"
+        ),
+        "entry_rfq_latest_exact_margin_bps": latest_entry_rfq_evaluation.get(
+            "exact_margin_bps"
+        ),
         "latest_edge_bps": latest_state.get("v4_signal_edge_bps")
         if latest_state.get("v4_signal_edge_bps") is not None
         else latest_state.get("short_edge_bps"),
@@ -820,6 +857,25 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
             f"direction_edges_bps={funnel['direction_edges_bps']} "
             f"direction_thresholds_bps={funnel['direction_thresholds_bps']}"
         )
+        if funnel["direction_threshold_breakdown"] is not None:
+            print(
+                "direction_threshold_breakdown="
+                + json.dumps(
+                    funnel["direction_threshold_breakdown"],
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+    print(
+        f"entry_rfq_candidates={funnel['entry_rfq_candidate_count']} "
+        f"entry_rfq_responses={funnel['entry_rfq_response_count']} "
+        f"entry_rfq_latest_response_ms={funnel['entry_rfq_latest_response_ms']} "
+        f"entry_rfq_evaluated={funnel['entry_rfq_evaluated_count']} "
+        f"entry_rfq_latest_roundtrip_ms={funnel['entry_rfq_latest_roundtrip_ms']} "
+        f"entry_rfq_latest_exact_margin_bps="
+        f"{funnel['entry_rfq_latest_exact_margin_bps']}"
+    )
     print(
         f"multi_window_7d_p97_5={funnel['seven_day_threshold_bps']} "
         f"fast_1d_p95={funnel['fast_threshold_bps']} "

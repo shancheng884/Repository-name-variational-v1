@@ -43,9 +43,17 @@ from main import (
     v4_exact_rfq_entry_threshold,
     v4_exact_rfq_gradient_thresholds,
     v4_entry_rfq_cooldown_reopened,
+    v4_entry_rfq_evaluation_edge_fields,
+    v4_entry_rfq_exact_edge_passes,
+    v4_entry_rfq_exact_quality_passes,
+    v4_entry_rfq_probe_candidate_kind,
+    v4_entry_rfq_shock_cooldown_bypass_allowed,
+    v4_live_entry_threshold_breakdown,
     v4_opposite_direction_rearm_allowed,
     v4_partial_detier_selection,
     v4_single_tail_exit_target_bps,
+    v4_single_lot_rfq_gradient_state,
+    v4_single_lot_rfq_probe_allowed,
     v4_weekend_regime_context,
 )
 
@@ -343,6 +351,231 @@ def test_v4_real_gradient_high_tier_single_sample_is_one_layer_probe() -> None:
         0,
         "pending_two_of_three",
     )
+
+
+def test_rejected_shock_probe_allows_only_fresh_two_of_three_rfq_retry() -> None:
+    shock_tier, shock_mode = v4_real_gradient_entry_activation(
+        [3], latest_tier=3
+    )
+    assert (shock_tier, shock_mode) == (1, "strong_single_probe")
+    assert not v4_entry_rfq_shock_cooldown_bypass_allowed(
+        cooldown_active=True,
+        shock_recheck_pending_confirmation=True,
+        confirmation_sample_is_new=False,
+        confirmation_mode=shock_mode,
+        sample_move_ok=True,
+        active_tier=shock_tier,
+    )
+
+    confirmed_tier, confirmed_mode = v4_real_gradient_entry_activation(
+        [3, 0, 2], latest_tier=2
+    )
+    assert (confirmed_tier, confirmed_mode) == (2, "two_of_three")
+    assert v4_entry_rfq_shock_cooldown_bypass_allowed(
+        cooldown_active=True,
+        shock_recheck_pending_confirmation=True,
+        confirmation_sample_is_new=True,
+        confirmation_mode=confirmed_mode,
+        sample_move_ok=True,
+        active_tier=confirmed_tier,
+    )
+    assert not v4_entry_rfq_shock_cooldown_bypass_allowed(
+        cooldown_active=True,
+        shock_recheck_pending_confirmation=True,
+        confirmation_sample_is_new=True,
+        confirmation_mode=confirmed_mode,
+        sample_move_ok=False,
+        active_tier=confirmed_tier,
+    )
+    assert not v4_entry_rfq_shock_cooldown_bypass_allowed(
+        cooldown_active=True,
+        shock_recheck_pending_confirmation=False,
+        confirmation_sample_is_new=True,
+        confirmation_mode=confirmed_mode,
+        sample_move_ok=True,
+        active_tier=confirmed_tier,
+    )
+
+
+def test_v4_duplicate_passive_reference_does_not_advance_gradient_confirmation() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_bidirectional = False
+    runtime.live_inventory_v4_gradient_entry_tier_window = deque(
+        [3, 3, 0], maxlen=3
+    )
+
+    duplicate_tier = runtime.live_inventory_basis_v4_active_gradient_tier(
+        raw_tier=3,
+        edge_bps=Decimal("3"),
+        thresholds_bps=[Decimal("1"), Decimal("2"), Decimal("3")],
+        advance_confirmation=False,
+    )
+    duplicate_mode = v4_real_gradient_entry_activation(
+        runtime.live_inventory_v4_gradient_entry_tier_window,
+        latest_tier=runtime.live_inventory_v4_gradient_entry_tier_window[-1],
+    )[1]
+
+    assert list(runtime.live_inventory_v4_gradient_entry_tier_window) == [3, 3, 0]
+    assert duplicate_tier == 0
+    assert duplicate_mode == "pending_two_of_three"
+
+    fresh_tier = runtime.live_inventory_basis_v4_active_gradient_tier(
+        raw_tier=3,
+        edge_bps=Decimal("3"),
+        thresholds_bps=[Decimal("1"), Decimal("2"), Decimal("3")],
+        advance_confirmation=True,
+    )
+    assert list(runtime.live_inventory_v4_gradient_entry_tier_window) == [3, 0, 3]
+    assert fresh_tier == 3
+
+
+def test_v4_near_threshold_probe_requires_flat_ready_bounded_due_candidate() -> None:
+    candidate = dict(
+        enabled=True,
+        refresh_enabled=True,
+        account_flat=True,
+        predicted_exact_edge_bps=Decimal("15.0"),
+        exact_entry_threshold_bps=Decimal("16.0"),
+        bias_ready=True,
+        exploration_due=True,
+    )
+    assert (
+        v4_entry_rfq_probe_candidate_kind(**candidate)
+        == "near_threshold_exploration"
+    )
+    assert v4_entry_rfq_probe_candidate_kind(
+        **{**candidate, "account_flat": False}
+    ) is None
+    assert v4_entry_rfq_probe_candidate_kind(
+        **{**candidate, "bias_ready": False}
+    ) is None
+    assert v4_entry_rfq_probe_candidate_kind(
+        **{**candidate, "exploration_due": False}
+    ) is None
+    assert v4_entry_rfq_probe_candidate_kind(
+        **{**candidate, "predicted_exact_edge_bps": Decimal("14.49")}
+    ) is None
+    assert v4_entry_rfq_probe_candidate_kind(
+        **{**candidate, "predicted_exact_edge_bps": Decimal("16.0"), "account_flat": False}
+    ) == "predicted_exact_threshold"
+
+    assert v4_single_lot_rfq_gradient_state(
+        active_tier=0,
+        confirmation_mode="pending_two_of_three",
+        probe_enabled=True,
+        candidate_kind="near_threshold_exploration",
+    ) == (1, "near_threshold_exact_rfq_probe")
+    assert v4_single_lot_rfq_gradient_state(
+        active_tier=0,
+        confirmation_mode="pending_two_of_three",
+        probe_enabled=False,
+        candidate_kind="near_threshold_exploration",
+    ) == (0, "pending_two_of_three")
+    assert v4_single_lot_rfq_probe_allowed(
+        v4_enabled=True,
+        real_gradient_enabled=True,
+        account_flat=True,
+        refresh_enabled=True,
+        passive_edge_bps=Decimal("15.0"),
+        passive_threshold_bps=Decimal("16.0"),
+        candidate_kind="near_threshold_exploration",
+    )
+    assert not v4_single_lot_rfq_probe_allowed(
+        v4_enabled=True,
+        real_gradient_enabled=True,
+        account_flat=False,
+        refresh_enabled=True,
+        passive_edge_bps=Decimal("15.0"),
+        passive_threshold_bps=Decimal("16.0"),
+        candidate_kind="near_threshold_exploration",
+    )
+
+    assert not v4_entry_rfq_exact_edge_passes(
+        exact_edge_bps=Decimal("16.0"),
+        required_edge_bps=Decimal("16.000000001"),
+    )
+    assert v4_entry_rfq_exact_edge_passes(
+        exact_edge_bps=Decimal("16.000000002"),
+        required_edge_bps=Decimal("16.000000001"),
+    )
+    assert not v4_entry_rfq_exact_quality_passes(
+        quality_score_bps=Decimal("0.4"),
+        minimum_quality_bps=Decimal("0.5"),
+    )
+    assert v4_entry_rfq_exact_quality_passes(
+        quality_score_bps=Decimal("0.5"),
+        minimum_quality_bps=Decimal("0.5"),
+    )
+
+
+def test_v4_entry_rfq_audit_keeps_passive_and_exact_edges_distinct() -> None:
+    fields = v4_entry_rfq_evaluation_edge_fields(
+        passive_edge_bps=Decimal("15.2"),
+        exact_edge_bps=Decimal("16.1"),
+        raw_exact_edge_bps=Decimal("16.0"),
+    )
+
+    assert fields == {
+        "passive_edge_bps": "15.2",
+        "exact_edge_bps": "16.1",
+        "raw_exact_edge_bps": "16.0",
+    }
+
+
+def test_v4_threshold_breakdown_preserves_each_gate_component() -> None:
+    breakdown = v4_live_entry_threshold_breakdown(
+        context={
+            "v4_7d_entry_threshold_bps": "14.0",
+            "v4_fast_ready": True,
+            "v4_fast_threshold_bps": "14.5",
+            "v4_fast_threshold_applied": True,
+            "v4_mid_ready": False,
+            "v4_mid_threshold_bps": None,
+            "v4_long_ready": True,
+            "v4_long_threshold_bps": "15.0",
+            "v4_weekend_transition_active": True,
+            "v4_raw_threshold_driver": "long_30d_p97_5",
+            "v4_raw_entry_threshold_bps": "15.0",
+            "v4_entry_execution_reserve_bps": "1.5",
+            "v4_entry_exit_cost_increment_bps": "0",
+            "v4_entry_threshold_bps": "16.5",
+            "v4_real_gradient_tier_thresholds_bps": ["16.5", "17.0"],
+        },
+        rfq_bias_context={"v4_entry_rfq_bias_applied_bps": "-0.5"},
+        signal_edge_bps=Decimal("16.0"),
+        predicted_exact_edge_bps=Decimal("15.5"),
+        exact_threshold_bps=Decimal("16.0"),
+        confirmation_mode="two_of_three",
+        raw_gradient_tier=1,
+        active_gradient_tier=1,
+    )
+
+    assert breakdown["raw_threshold_driver"] == "long_30d_p97_5"
+    assert breakdown["raw_history_threshold_bps"] == "15.0"
+    assert breakdown["entry_execution_reserve_bps"] == "1.5"
+    assert breakdown["entry_exit_cost_increment_bps"] == "0"
+    assert breakdown["passive_threshold_bps"] == "16.5"
+    assert breakdown["exact_threshold_bps"] == "16.0"
+    assert breakdown["exact_margin_bps"] == "-0.5"
+
+    effective_tier, effective_mode = v4_single_lot_rfq_gradient_state(
+        active_tier=0,
+        confirmation_mode="pending_two_of_three",
+        probe_enabled=True,
+        candidate_kind="near_threshold_exploration",
+    )
+    effective_breakdown = v4_live_entry_threshold_breakdown(
+        context={"v4_entry_threshold_bps": "16.5"},
+        rfq_bias_context={},
+        signal_edge_bps=Decimal("16.0"),
+        predicted_exact_edge_bps=Decimal("15.5"),
+        exact_threshold_bps=Decimal("16.0"),
+        confirmation_mode=effective_mode,
+        raw_gradient_tier=1,
+        active_gradient_tier=effective_tier,
+    )
+    assert effective_breakdown["active_gradient_tier"] == 1
+    assert effective_breakdown["confirmation_mode"] == "near_threshold_exact_rfq_probe"
 
 
 def test_v4_real_gradient_sample_move_only_rechecks_high_tier_single_probe() -> None:
@@ -2028,6 +2261,7 @@ def test_v4_entry_threshold_adds_recent_entry_capture_loss_reserve() -> None:
     assert context["v4_entry_capture_raw_p80_bps"] == "3.19"
     assert context["v4_entry_capture_calibration_weight"] == "0"
     assert context["v4_entry_execution_reserve_bps"] == "1.50"
+    assert context["v4_raw_threshold_driver"] == "anchor_7d_p97_5"
     assert threshold == Decimal("98.50")
     assert context["v4_entry_threshold_bps"] == "98.50"
 
@@ -2096,6 +2330,7 @@ def test_v4_fast_1d_threshold_can_raise_rolling_7d_entry_gate() -> None:
 
     assert context["v4_fast_ready"] is True
     assert context["v4_fast_threshold_applied"] is True
+    assert context["v4_raw_threshold_driver"] == "fast_1d_p95"
     assert Decimal(context["v4_fast_threshold_bps"]) > Decimal(
         context["v4_7d_entry_threshold_bps"]
     )
@@ -5117,7 +5352,8 @@ def test_v4_entry_rfq_exploration_is_rate_limited() -> None:
 
     assert runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, now)
     assert not runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, now + 1.0)
-    assert runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, now + 300.0)
+    assert not runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, now + 59.0)
+    assert runtime.live_inventory_basis_v4_entry_rfq_exploration_due(direction, now + 60.0)
 
 
 def test_v4_entry_rfq_exploration_requires_near_threshold_edge() -> None:
