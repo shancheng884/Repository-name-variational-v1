@@ -122,28 +122,45 @@ export function buildVariationalApiScript(action, params) {
       ...(extra || {})
     });
     if (action === "MARKET_METADATA") {
-      const response = await request("GET", "/api/metadata/supported_assets", undefined);
+      const marketSymbol = String(o.market || "");
+      const response = await request(
+        "GET",
+        "/api/metadata/supported_assets?cex_asset=" + encodeURIComponent(marketSymbol),
+        undefined
+      );
       if (!response.ok || !response.json) {
         return fail("metadata/supported_assets", response);
       }
-      const listings = Object.values(response.json)
-        .filter(Array.isArray)
-        .flat()
-        .filter((item) => item && item.symbol === o.market);
-      if (listings.length !== 1) {
+      const listings = Array.isArray(response.json)
+        ? response.json
+        : Object.values(response.json)
+          .filter(Array.isArray)
+          .flat();
+      const matches = listings.filter((item) => {
+        if (!item || typeof item !== "object") {
+          return false;
+        }
+        const asset = typeof item.asset === "string" ? item.asset : null;
+        const symbol = typeof item.symbol === "string" ? item.symbol : null;
+        const identities = [asset, symbol].filter(Boolean);
+        return identities.length > 0 && identities.every((value) => value === marketSymbol);
+      });
+      if (matches.length !== 1) {
         return {
           ok: false,
           step: "metadata/supported_assets",
-          error: listings.length ? "Market metadata is ambiguous." : "Market metadata not found.",
+          error: matches.length ? "Market metadata is ambiguous." : "Market metadata not found.",
           httpStatus: response.status
         };
       }
-      const listing = listings[0];
+      const listing = matches[0];
       return {
         ok: true,
         market: {
-          symbol: listing.symbol,
-          trading_sessions: listing.trading_sessions
+          symbol: listing.symbol || listing.asset,
+          trading_sessions: listing.trading_sessions,
+          trading_schedule: listing.trading_schedule,
+          market_status: listing.market_status
         },
         httpStatus: response.status
       };

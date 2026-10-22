@@ -38,7 +38,9 @@ def test_extension_can_fetch_portfolio_through_authenticated_page() -> None:
     assert 'action === "PORTFOLIO"' in api_script
     assert 'request("GET", "/api/portfolio"' in api_script
     assert 'action === "MARKET_METADATA"' in api_script
-    assert 'request("GET", "/api/metadata/supported_assets"' in api_script
+    assert '"/api/metadata/supported_assets?cex_asset="' in api_script
+    assert 'item.asset' in api_script
+    assert 'item.symbol' in api_script
     assert 'listing.trading_sessions' in api_script
     assert "AbortController" in api_script
     assert "requestTimeoutMs" in api_script
