@@ -14,7 +14,7 @@ from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from math import isfinite
 from pathlib import Path
 from typing import Any, Callable, Iterator, Protocol
@@ -26,9 +26,14 @@ from tools.lib.hedge_instruments import (
     integer_value,
     lighter_position_qty,
     paired_exposure_matches,
+    paired_realized_pnl,
     variational_position_qty,
 )
-from tools.lib.market_sessions import OilSession, SessionWindow
+from tools.lib.market_sessions import (
+    OilSession,
+    SessionWindow,
+    session_observation_for_sample,
+)
 
 
 SCHEMA_VERSION = 2
@@ -55,7 +60,9 @@ class WTIExecutionGateway(Protocol):
 
     def submit_order(self, request: dict[str, Any]) -> dict[str, Any]: ...
 
-    def lookup_order(self, client_order_id: str) -> dict[str, Any]: ...
+    def lookup_order(
+        self, client_order_id: str, request: dict[str, Any] | None = None
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +70,11 @@ class MarketContext:
     instrument: HedgeInstrument
     market_id: int
     multiplier: Decimal
+    session_id: str
+    session_observed_at: datetime
+    session_closing_at: datetime
     lighter_qty_step: Decimal
+    lighter_price_decimals: int
     var_bid: Decimal
     var_ask: Decimal
     lighter_bid: Decimal
@@ -111,6 +122,7 @@ def validate_market_sample(
     expected_lighter_market_id: int,
     expected_lighter_multiplier: Decimal,
     expected_lighter_size_decimals: int,
+    expected_lighter_price_decimals: int | None = None,
     now: datetime | None = None,
     max_sample_age_seconds: float = 20,
     max_quote_age_seconds: float = 2,
@@ -132,6 +144,9 @@ def validate_market_sample(
         raise WTIExecutionError("market_sample_not_valid_wti")
     if sample.get("market_availability") != "both_feeds_live":
         raise WTIExecutionError("market_feeds_not_both_live")
+    session = session_observation_for_sample(sample)
+    if session is None:
+        raise WTIExecutionError("exchange_session_observation_unverified")
     if (
         sample.get("variational_underlying") != WTI_HEDGE.var.symbol
         or sample.get("variational_instrument_type") != WTI_HEDGE.var.instrument_type
@@ -165,6 +180,7 @@ def validate_market_sample(
         raise WTIExecutionError("lighter_market_not_confirmed_active")
     market_id = integer_value(sample.get("lighter_market_id"))
     decimals = integer_value(sample.get("lighter_supported_size_decimals"))
+    price_decimals = integer_value(sample.get("lighter_supported_price_decimals"))
     if (
         market_id is None
         or market_id < 0
@@ -172,6 +188,12 @@ def validate_market_sample(
         or decimals < 0
         or market_id != expected_lighter_market_id
         or decimals != expected_lighter_size_decimals
+        or price_decimals is None
+        or price_decimals < 0
+        or (
+            expected_lighter_price_decimals is not None
+            and price_decimals != expected_lighter_price_decimals
+        )
     ):
         raise WTIExecutionError("lighter_market_identity_or_precision_invalid")
     multiplier = _positive_decimal(sample.get("lighter_multiplier"), "lighter_multiplier")
@@ -199,7 +221,11 @@ def validate_market_sample(
         instrument=instrument,
         market_id=market_id,
         multiplier=multiplier,
+        session_id=session.session_id,
+        session_observed_at=session.observed_at,
+        session_closing_at=session.closing_at,
         lighter_qty_step=qty_step,
+        lighter_price_decimals=price_decimals,
         var_bid=var_bid,
         var_ask=var_ask,
         lighter_bid=lighter_bid,
@@ -311,11 +337,18 @@ def _normalized_order_result(
     """Normalize only explicit terminal fills; ambiguous replies remain unknown."""
     if (
         not isinstance(payload, dict)
-        or payload.get("ok") is not True
-        or payload.get("final") is not True
         or str(payload.get("client_order_id") or "") != expected_client_order_id
     ):
         return {"classification": "unknown"}
+    if payload.get("ok") is not True or payload.get("final") is not True:
+        return {
+            "classification": "unknown",
+            "client_order_id": expected_client_order_id,
+            "native_order_id": payload.get("native_order_id"),
+            "native_client_order_id": payload.get("native_client_order_id"),
+            "status": str(payload.get("status") or "unknown").lower(),
+            "terminal_confirmed": False,
+        }
     order_id = payload.get("order_id")
     status = str(payload.get("status") or "").lower()
     filled_qty = decimal_value(payload.get("filled_qty"))
@@ -326,12 +359,19 @@ def _normalized_order_result(
     evidence = {
         "client_order_id": expected_client_order_id,
         "order_id": str(order_id) if order_id else None,
+        "native_order_id": str(payload.get("native_order_id") or order_id) if (payload.get("native_order_id") or order_id) else None,
+        "native_client_order_id": payload.get("native_client_order_id"),
         "status": status,
         "filled_qty": str(filled_qty),
         "trade_ids": [str(value) for value in trade_ids] if isinstance(trade_ids, list) else [],
         "trade_ids_confirmed": isinstance(trade_ids, list),
         "fee_usd": str(fee) if fee is not None else None,
         "fee_confirmed": fee is not None,
+        "average_price": (
+            str(decimal_value(payload.get("average_price")))
+            if decimal_value(payload.get("average_price")) is not None
+            else None
+        ),
         "terminal_confirmed": True,
         "no_order_confirmed": payload.get("no_order_confirmed") is True,
     }
@@ -393,6 +433,34 @@ def _session_allows(
     return (
         session.state in {OilSession.OPEN, OilSession.ENTRY_CUTOFF}
         and session.allow_position_management
+    )
+
+
+def _session_matches_sample(
+    sample: dict[str, Any], session: SessionWindow | None
+) -> str | None:
+    observation = session_observation_for_sample(sample)
+    if observation is None or session is None or session.exchange_open is not True:
+        return None
+    try:
+        if (
+            abs((_sample_time(session.observed_at) - observation.observed_at).total_seconds()) > 30
+            or abs((_sample_time(session.closing_at) - observation.closing_at).total_seconds()) > 1
+        ):
+            return None
+    except WTIExecutionError:
+        return None
+    return observation.session_id
+
+
+def _fresh_session_window(
+    session: SessionWindow, context: MarketContext
+) -> SessionWindow:
+    return replace(
+        session,
+        observed_at=context.session_observed_at.isoformat(),
+        closing_at=context.session_closing_at.isoformat(),
+        exchange_open=True,
     )
 
 
@@ -512,6 +580,7 @@ class WTIPairExecutor:
         expected_lighter_market_id: int,
         expected_lighter_multiplier: Decimal,
         expected_lighter_size_decimals: int,
+        expected_lighter_price_decimals: int | None = None,
         max_notional_usd: Decimal = Decimal("25"),
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -538,6 +607,13 @@ class WTIPairExecutor:
         self.expected_lighter_market_id = trusted_market_id
         self.expected_lighter_multiplier = trusted_multiplier
         self.expected_lighter_size_decimals = trusted_size_decimals
+        self.expected_lighter_price_decimals = (
+            None
+            if expected_lighter_price_decimals is None
+            else integer_value(expected_lighter_price_decimals)
+        )
+        if self.expected_lighter_price_decimals is not None and self.expected_lighter_price_decimals < 0:
+            raise ValueError("trusted Lighter price precision must be non-negative")
         self.max_notional_usd = max_notional_usd
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -553,6 +629,7 @@ class WTIPairExecutor:
             expected_lighter_market_id=self.expected_lighter_market_id,
             expected_lighter_multiplier=self.expected_lighter_multiplier,
             expected_lighter_size_decimals=self.expected_lighter_size_decimals,
+            expected_lighter_price_decimals=self.expected_lighter_price_decimals,
             now=now or self._now(),
         )
 
@@ -582,6 +659,11 @@ class WTIPairExecutor:
             raise WTIExecutionError("fresh_readonly_market_sample_unavailable") from exc
         if context.market_id != initial.market_id or context.multiplier != initial.multiplier:
             raise WTIExecutionError("wti_market_metadata_changed_during_pair_execution")
+        if (
+            context.session_id != initial.session_id
+            or abs((context.session_closing_at - initial.session_closing_at).total_seconds()) > 1
+        ):
+            raise WTIExecutionError("wti_session_changed_during_pair_execution")
         if context.quoted_var_qty < var_qty or context.quoted_lighter_qty < lighter_qty:
             raise WTIExecutionError("readonly_sample_depth_below_order_quantity")
         limit = self.max_slippage_bps / Decimal("10000")
@@ -629,6 +711,7 @@ class WTIPairExecutor:
             "time_in_force": "IOC",
             "order_type": "marketable_limit",
             "max_slippage_bps": str(self.max_slippage_bps),
+            "limit_price": None,
         }
         if venue == "variational":
             reference = context.var_ask if side == "buy" else context.var_bid
@@ -638,7 +721,12 @@ class WTIPairExecutor:
             raise WTIExecutionError("unsupported_venue")
         move = self.max_slippage_bps / Decimal("10000")
         boundary = reference * (Decimal("1") + move if side == "buy" else Decimal("1") - move)
+        if venue == "lighter":
+            tick = Decimal(1).scaleb(-context.lighter_price_decimals)
+            rounding = ROUND_CEILING if side == "buy" else ROUND_FLOOR
+            boundary = (boundary / tick).to_integral_value(rounding=rounding) * tick
         request["limit_price"] = str(boundary)
+        request["reference_price"] = str(reference)
         if venue == "variational":
             request.update({
                 "symbol": WTI_HEDGE.var.symbol,
@@ -667,6 +755,7 @@ class WTIPairExecutor:
             context=context, venue=venue, side=side, qty=qty,
             reduce_only=reduce_only, action_id=pending["action_id"],
         )
+        request["intent_at"] = pending.get("intent_at")
         leg = {
             "request": request,
             "intent_at": self._now().isoformat(),
@@ -676,7 +765,8 @@ class WTIPairExecutor:
         pending["legs"][venue] = leg
         self.store.save(state)
         now = self._now()
-        if not _session_allows(session, opening=opening, now=now):
+        fresh_session = _fresh_session_window(session, context)
+        if not _session_allows(fresh_session, opening=opening, now=now):
             normalized = {
                 "classification": "no_fill",
                 "source": "local_pre_submit_guard",
@@ -699,6 +789,7 @@ class WTIPairExecutor:
             self.store.save(state)
             return normalized
         leg["submitted_at"] = now.isoformat()
+        request["submitted_at"] = leg["submitted_at"]
         leg["submission_started"] = True
         self.store.save(state)
         try:
@@ -708,6 +799,13 @@ class WTIPairExecutor:
         normalized = _normalized_order_result(
             result, qty, expected_client_order_id=request["client_order_id"]
         )
+        for source_key, target_key in (
+            ("native_order_id", "native_order_id"),
+            ("native_client_order_id", "native_client_order_id"),
+        ):
+            value = normalized.get(source_key)
+            if value not in (None, ""):
+                request[target_key] = value
         leg["result"] = normalized
         leg["response_received_at"] = self._now().isoformat()
         self.store.save(state)
@@ -784,6 +882,68 @@ class WTIPairExecutor:
         state.setdefault("execution_history", []).append(record)
         return record
 
+    @staticmethod
+    def _closed_pnl_evidence(
+        position: dict[str, Any],
+        *,
+        var_exit: dict[str, Any],
+        lighter_exit: dict[str, Any],
+    ) -> dict[str, Any]:
+        var_entry = decimal_value(position.get("var_entry_price"))
+        lighter_entry = decimal_value(position.get("lighter_entry_price"))
+        var_qty = decimal_value(position.get("var_qty"))
+        lighter_qty = decimal_value(position.get("lighter_qty"))
+        multiplier = decimal_value(position.get("multiplier"))
+        var_exit_price = decimal_value(var_exit.get("average_price"))
+        lighter_exit_price = decimal_value(lighter_exit.get("average_price"))
+        output: dict[str, Any] = {
+            "var_exit_price": var_exit.get("average_price"),
+            "lighter_exit_price": lighter_exit.get("average_price"),
+            "var_exit_fee_usd": var_exit.get("fee_usd"),
+            "lighter_exit_fee_usd": lighter_exit.get("fee_usd"),
+            "funding_cashflow_usd": None,
+            "funding_cashflow_confirmed": False,
+            "actual_net_pnl_usd": None,
+        }
+        if None not in (
+            var_entry, lighter_entry, var_qty, lighter_qty, multiplier,
+            var_exit_price, lighter_exit_price,
+        ):
+            instrument = replace(
+                WTI_HEDGE,
+                lighter=replace(WTI_HEDGE.lighter, exposure_multiplier=multiplier),
+            )
+            gross = paired_realized_pnl(
+                direction=str(position.get("direction")),
+                var_entry=var_entry,
+                var_exit=var_exit_price,
+                var_qty=var_qty,
+                lighter_entry=lighter_entry,
+                lighter_exit=lighter_exit_price,
+                lighter_qty=lighter_qty,
+                instrument=instrument,
+            )
+            output["actual_gross_pnl_usd"] = str(gross)
+            output["actual_gross_pnl_status"] = "confirmed_from_final_fills"
+        else:
+            output["actual_gross_pnl_usd"] = None
+            output["actual_gross_pnl_status"] = "fill_price_or_quantity_unverified"
+        fee_values = [
+            decimal_value(position.get("var_entry_fee_usd")),
+            decimal_value(position.get("lighter_entry_fee_usd")),
+            decimal_value(var_exit.get("fee_usd")),
+            decimal_value(lighter_exit.get("fee_usd")),
+        ]
+        output["actual_fees_usd"] = (
+            str(sum(fee_values, Decimal("0"))) if all(value is not None for value in fee_values) else None
+        )
+        output["actual_net_pnl_status"] = (
+            "funding_unverified"
+            if output["actual_gross_pnl_usd"] is not None and output["actual_fees_usd"] is not None
+            else "fees_unverified"
+        )
+        return output
+
     def _resolve_pending_orders(self, state: dict[str, Any], pending: dict[str, Any]) -> bool:
         changed = False
         legs = pending.get("legs", {})
@@ -808,7 +968,18 @@ class WTIPairExecutor:
             if not client_order_id:
                 return False
             try:
-                lookup = self.gateway.lookup_order(str(client_order_id))
+                lookup_request = deepcopy(leg.get("request") or {})
+                prior_result = leg.get("result") or {}
+                for key in ("native_order_id", "native_client_order_id"):
+                    if key not in lookup_request and prior_result.get(key) not in (None, ""):
+                        lookup_request[key] = prior_result[key]
+                try:
+                    lookup = self.gateway.lookup_order(
+                        str(client_order_id), request=lookup_request
+                    )
+                except TypeError:
+                    # Keep compatibility with test and third-party adapters implementing v1.
+                    lookup = self.gateway.lookup_order(str(client_order_id))
             except Exception:
                 return False
             requested_qty = decimal_value((leg.get("request") or {}).get("qty"))
@@ -863,6 +1034,9 @@ class WTIPairExecutor:
         if notional_usd <= 0 or notional_usd > self.max_notional_usd:
             raise WTIExecutionError("notional_outside_executor_limit")
         context = self._validate_sample(sample, now=operation_now)
+        session_id = _session_matches_sample(sample, session)
+        if session_id is None:
+            raise WTIExecutionError("exchange_session_observation_unverified")
         var_qty, lighter_qty = _size_for_notional(notional_usd, context)
         reference = (context.lighter_bid + context.lighter_ask) / Decimal("2")
         planned_notional = lighter_qty * context.multiplier * reference
@@ -900,6 +1074,7 @@ class WTIPairExecutor:
                     "lighter_qty": str(lighter_qty),
                     "multiplier": str(context.multiplier),
                     "market_id": context.market_id,
+                    "session_id": session_id,
                     "previous_position": None,
                     "intent_at": self._now().isoformat(),
                     "legs": {},
@@ -931,6 +1106,16 @@ class WTIPairExecutor:
                 qty=lighter_qty, reduce_only=False, session=session, opening=True,
             )
             if lighter_result["classification"] != "filled":
+                if lighter_result["classification"] == "no_fill":
+                    compensated = self._compensate_var_only_open(
+                        state,
+                        context=refreshed,
+                        session=session,
+                        side="sell" if var_side == "buy" else "buy",
+                        qty=var_qty,
+                    )
+                    if compensated:
+                        return state
                 return self._manual_review(state, f"lighter_open_{lighter_result['classification']}")
 
             try:
@@ -952,8 +1137,11 @@ class WTIPairExecutor:
                 "expected_lighter_qty": str(expected[1]),
                 "var_entry_price": var_result["average_price"],
                 "lighter_entry_price": lighter_result["average_price"],
+                "var_entry_fee_usd": var_result.get("fee_usd"),
+                "lighter_entry_fee_usd": lighter_result.get("fee_usd"),
                 "market_id": context.market_id,
                 "multiplier": str(context.multiplier),
+                "session_id": session_id,
                 "opened_at": _utc_now(),
                 "entry_execution_id": execution["action_id"],
             }
@@ -961,6 +1149,99 @@ class WTIPairExecutor:
             state["manual_review_reason"] = None
             self.store.save(state)
             return state
+
+    def _compensate_var_only_open(
+        self,
+        state: dict[str, Any],
+        *,
+        context: MarketContext,
+        session: SessionWindow,
+        side: str,
+        qty: Decimal,
+    ) -> bool:
+        """Flatten a proven first-leg-only entry; never compensate an unknown fill."""
+        pending = state.get("pending_action")
+        if not isinstance(pending, dict):
+            return False
+        var_leg = (pending.get("legs") or {}).get("variational") or {}
+        var_fill = var_leg.get("result") or {}
+        lighter_result = ((pending.get("legs") or {}).get("lighter") or {}).get("result") or {}
+        if (
+            var_fill.get("classification") != "filled"
+            or var_fill.get("terminal_confirmed") is not True
+            or lighter_result.get("classification") != "no_fill"
+            or lighter_result.get("terminal_confirmed") is not True
+            or not _session_allows(
+                _fresh_session_window(session, context), opening=False, now=self._now()
+            )
+        ):
+            return False
+        try:
+            before = self._read(context)
+        except WTIExecutionError:
+            return False
+        expected_var = Decimal(str(pending.get("expected_var_qty")))
+        if (
+            before.active_order_count != 0
+            or abs(before.variational_qty - expected_var) > Decimal("0.00000001")
+            or abs(before.lighter_qty) > context.lighter_position_tolerance
+        ):
+            return False
+
+        action_id = str(pending.get("action_id") or "")
+        compensation_request = self._order_request(
+            context=context,
+            venue="variational",
+            side=side,
+            qty=qty,
+            reduce_only=True,
+            action_id=f"{action_id}-compensation",
+        )
+        compensation_request["intent_at"] = self._now().isoformat()
+        pending["compensation"] = {
+            "request": compensation_request,
+            "intent_at": compensation_request["intent_at"],
+            "submission_started": False,
+            "result": None,
+        }
+        self.store.save(state)
+        if not self._context_is_fresh(context, self._now()):
+            return False
+        compensation = pending["compensation"]
+        compensation["submitted_at"] = self._now().isoformat()
+        compensation["submission_started"] = True
+        self.store.save(state)
+        try:
+            response = self.gateway.submit_order(compensation_request)
+        except Exception as exc:
+            response = {"exception": type(exc).__name__}
+        result = _normalized_order_result(
+            response,
+            qty,
+            expected_client_order_id=compensation_request["client_order_id"],
+        )
+        for key in ("native_order_id", "native_client_order_id"):
+            if result.get(key) not in (None, ""):
+                compensation_request[key] = result[key]
+        compensation["result"] = result
+        compensation["response_received_at"] = self._now().isoformat()
+        self.store.save(state)
+        if result.get("classification") != "filled":
+            return False
+        try:
+            after = self._read(context, minimum_observed_at=self._now())
+        except WTIExecutionError:
+            return False
+        if not _matches(after, (Decimal("0"), Decimal("0")), context):
+            return False
+        self._archive_execution(state, pending, "compensated")
+        state["status"] = "flat"
+        state["open_position"] = None
+        state["pending_action"] = None
+        state["manual_review_reason"] = None
+        state["last_action_resolution"] = "one_leg_open_confirmed_and_reduce_only_compensated"
+        self.store.save(state)
+        return True
 
     def close(
         self,
@@ -975,6 +1256,9 @@ class WTIPairExecutor:
         if session is None:
             raise WTIExecutionError("exchange_session_does_not_allow_position_management")
         context = self._validate_sample(sample, now=operation_now)
+        session_id = _session_matches_sample(sample, session)
+        if session_id is None:
+            raise WTIExecutionError("exchange_session_observation_unverified")
         with self.store.exclusive():
             state = self.store.load()
             position = state.get("open_position")
@@ -1014,6 +1298,7 @@ class WTIPairExecutor:
                 "lighter_qty": str(position["lighter_qty"]),
                 "multiplier": str(context.multiplier),
                 "market_id": context.market_id,
+                "session_id": session_id,
                 "previous_position": position,
                 "intent_at": self._now().isoformat(),
                 "legs": {},
@@ -1066,8 +1351,9 @@ class WTIPairExecutor:
             state["manual_review_reason"] = None
             state["last_closed_position"] = {
                 **position,
-                "var_exit_price": var_result["average_price"],
-                "lighter_exit_price": lighter_result["average_price"],
+                **self._closed_pnl_evidence(
+                    position, var_exit=var_result, lighter_exit=lighter_result
+                ),
                 "closed_at": _utc_now(),
                 "exit_execution_id": execution["action_id"],
             }
@@ -1155,6 +1441,7 @@ class WTIPairExecutor:
                         "lighter_entry_price": lighter_fill,
                         "market_id": pending["market_id"],
                         "multiplier": pending["multiplier"],
+                        "session_id": pending.get("session_id"),
                         "opened_at": _utc_now(),
                         "recovered_from_pending": True,
                         "entry_execution_id": execution["action_id"],
@@ -1166,8 +1453,11 @@ class WTIPairExecutor:
                     legs = pending.get("legs") or {}
                     state["last_closed_position"] = {
                         **(pending.get("previous_position") or {}),
-                        "var_exit_price": (legs.get("variational") or {}).get("result", {}).get("average_price"),
-                        "lighter_exit_price": (legs.get("lighter") or {}).get("result", {}).get("average_price"),
+                        **self._closed_pnl_evidence(
+                            pending.get("previous_position") or {},
+                            var_exit=(legs.get("variational") or {}).get("result") or {},
+                            lighter_exit=(legs.get("lighter") or {}).get("result") or {},
+                        ),
                         "closed_at": _utc_now(),
                         "recovered_from_pending": True,
                         "exit_execution_id": execution["action_id"],

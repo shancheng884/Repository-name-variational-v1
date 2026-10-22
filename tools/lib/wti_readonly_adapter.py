@@ -175,6 +175,7 @@ def validate_lighter_market_metadata(
     market = matches[0]
     market_id = integer_value(market.get("market_id"))
     size_decimals = integer_value(market.get("supported_size_decimals"))
+    price_decimals = integer_value(market.get("supported_price_decimals"))
     multiplier = decimal_value(market.get("multiplier"))
     min_base = decimal_value(market.get("min_base_amount"))
     min_quote = decimal_value(market.get("min_quote_amount"))
@@ -183,6 +184,8 @@ def validate_lighter_market_metadata(
         or market_id < 0
         or size_decimals is None
         or size_decimals < 0
+        or price_decimals is None
+        or price_decimals < 0
         or multiplier is None
         or multiplier <= 0
         or min_base is None
@@ -203,6 +206,7 @@ def validate_lighter_market_metadata(
         "status": "active",
         "multiplier": multiplier,
         "supported_size_decimals": size_decimals,
+        "supported_price_decimals": price_decimals,
         "min_base_amount": min_base,
         "min_quote_amount": min_quote,
     }
@@ -300,6 +304,19 @@ class WTIReadOnlyAccountAdapter:
             self.variational,
             timeout_ms=self.request_timeout_ms,
         )
+        portfolio_id = uuid.uuid4().hex
+        portfolio_message = await self.variational.request({
+            "type": "VAR_API_PORTFOLIO",
+            "requestId": portfolio_id,
+            "requestTimeoutMs": self.request_timeout_ms,
+        })
+        if not isinstance(portfolio_message, dict) or str(portfolio_message.get("requestId")) != portfolio_id:
+            raise WTIReadOnlyError("variational_portfolio_request_id_mismatch")
+        raw_portfolio = _require_var_response(
+            portfolio_message,
+            expected_type="VAR_API_PORTFOLIO_RESULT",
+            key="portfolio",
+        )
         lighter_positions_raw, lighter_orders_raw = await self.lighter.read_account_and_active_orders(
             self.market["market_id"]
         )
@@ -332,6 +349,7 @@ class WTIReadOnlyAccountAdapter:
                 for key, value in self.market.items()
             },
             "variational_positions": var_positions,
+            "variational_portfolio": {"result": raw_portfolio},
             "lighter_positions": lighter_positions,
             "active_orders": {"ok": True, "orders": active_orders},
             "normalized": {

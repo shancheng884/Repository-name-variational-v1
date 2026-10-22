@@ -137,6 +137,8 @@ class OilSwapCollector:
         self.last_session_status_observed_at: str | None = None
         self.last_session_id: str | None = None
         self.last_session_closing_at: str | None = None
+        self.latest_sample: dict[str, Any] | None = None
+        self.sample_lock = asyncio.Lock()
         self.last_health_write = 0.0
         self.last_maintenance = 0.0
 
@@ -221,6 +223,10 @@ class OilSwapCollector:
         os.replace(temporary, path)
 
     async def _collect_once(self) -> dict[str, Any] | None:
+        async with self.sample_lock:
+            return await self._collect_once_unlocked()
+
+    async def _collect_once_unlocked(self) -> dict[str, Any] | None:
         metadata = self.books.market_metadata[ASSET]
         top = await self.books.snapshot(ASSET, Decimal(str(self.args.notional_usd)))
         if top is None:
@@ -358,6 +364,7 @@ class OilSwapCollector:
             "lighter_min_base_amount": metadata.get("min_base_amount"),
             "lighter_min_quote_amount": metadata.get("min_quote_amount"),
             "lighter_supported_size_decimals": metadata.get("supported_size_decimals"),
+            "lighter_supported_price_decimals": metadata.get("supported_price_decimals"),
             "lighter_taker_fee": metadata.get("taker_fee"),
             "lighter_taker_fee_enabled": metadata.get("is_taker_fee_enabled"),
             "lighter_market_cost_metadata": {
@@ -407,6 +414,23 @@ class OilSwapCollector:
             "fee_model_note": "indicative market metadata only; actual fills, tier fees, funding and roll cashflows are required for net PnL",
         }
         return row
+
+    def _record_sample(self, row: dict[str, Any]) -> None:
+        self.store.append(row)
+        self.latest_sample = dict(row)
+        self.samples += 1
+        self.sample_quality_counts[str(row.get("sample_quality") or "unknown")] += 1
+        self.last_sample_at = row["logged_at"]
+        self.errors.clear()
+
+    async def collect_fresh_sample(self) -> dict[str, Any]:
+        """Serialize execution refreshes with the normal collector poll loop."""
+        row = await self._collect_once()
+        if not isinstance(row, dict):
+            raise RuntimeError("wti_fresh_sample_unavailable")
+        self._record_sample(row)
+        self._write_health(force=True)
+        return dict(row)
 
     @staticmethod
     def _cost_metadata(quote: dict[str, Any]) -> dict[str, Any]:
@@ -481,11 +505,7 @@ class OilSwapCollector:
                     await self._refresh_session_metadata()
                 try:
                     row = await self._collect_once()
-                    self.store.append(row)
-                    self.samples += 1
-                    self.sample_quality_counts[str(row.get("sample_quality") or "unknown")] += 1
-                    self.last_sample_at = row["logged_at"]
-                    self.errors.clear()
+                    self._record_sample(row)
                     self.logger.info(
                         "oil_sample asset=WTI quality=%s qty=%s basis_bps=%s quote_age_s=%s book_age_s=%s",
                         row["sample_quality"], row["lighter_qty"], row["basis_bps"],

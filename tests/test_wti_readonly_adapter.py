@@ -25,6 +25,7 @@ def _market(**overrides):
         "is_frozen": False,
         "multiplier": "1",
         "supported_size_decimals": 2,
+        "supported_price_decimals": 2,
         "min_base_amount": "0.01",
         "min_quote_amount": "1",
     }
@@ -62,6 +63,13 @@ class FakeVariational:
                         }]
                     },
                 },
+            }
+        if payload["type"] == "VAR_API_PORTFOLIO":
+            return {
+                "type": "VAR_API_PORTFOLIO_RESULT",
+                "requestId": payload["requestId"],
+                "ok": True,
+                "result": {"ok": True, "httpStatus": 200, "portfolio": {"balance": "100"}},
             }
         page = payload["offset"] // payload["limit"]
         return {
@@ -246,6 +254,7 @@ def test_account_adapter_returns_fresh_sanitized_snapshot_and_has_no_order_api()
     }
     assert snapshot["active_orders"]["orders"][0]["venue"] == "lighter"
     assert snapshot["observed_at"] == now.isoformat()
+    assert snapshot["variational_portfolio"]["result"]["balance"] == "100"
     assert lighter.market_ids == [145]
     assert not hasattr(adapter, "submit_order")
     assert not any(call["type"] == "VAR_API_ORDER" for call in var.calls)

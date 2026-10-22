@@ -56,6 +56,8 @@ WATCHDOG_HEALTH_PATH = ROOT / "log" / "risk_wakeup_watchdog_health.json"
 WATCHDOG_CONTROL_PATH = ROOT / "log" / "risk_wakeup_watchdog_control.json"
 ALERT_CONTROL_PATH = ROOT / "log" / "risk_wakeup_alert_control.json"
 WATCHDOG_LOCK_PATH = ROOT / "log" / "risk_wakeup_watchdog.lock"
+WTI_STATE_PATH = ROOT / "log" / "wti_live_state.json"
+WTI_RISK_HEALTH_PATH = ROOT / "log" / "wti_live_risk_health.json"
 
 
 CRITICAL_MANUAL_REVIEW_MARKERS = (
@@ -175,6 +177,19 @@ def process_is_strategy(pid: int | None) -> bool:
     except OSError:
         return False
     return "main.py" in command and "python" in command.lower()
+
+
+def process_is_wti_strategy(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    command_path = Path("/proc") / str(pid) / "cmdline"
+    try:
+        command = command_path.read_bytes().replace(b"\x00", b" ").decode(
+            "utf-8", errors="replace"
+        )
+    except OSError:
+        return False
+    return "tools/wti_live.py" in command and "python" in command.lower()
 
 
 @contextlib.contextmanager
@@ -795,12 +810,15 @@ class RiskWakeupWatchdog:
         watchdog_health_path: Path = WATCHDOG_HEALTH_PATH,
         watchdog_control_path: Path = WATCHDOG_CONTROL_PATH,
         alert_control_path: Path = ALERT_CONTROL_PATH,
+        wti_state_path: Path = WTI_STATE_PATH,
+        wti_risk_health_path: Path = WTI_RISK_HEALTH_PATH,
         bark: BarkNotifier | None = None,
         feishu: FeishuUrgentNotifier | None = None,
         telegram: TelegramNotifier | None = None,
         remote_publisher: RemoteHeartbeatPublisher | None = None,
         clock: Callable[[], datetime] = utc_now,
         strategy_check: Callable[[int | None], bool] = process_is_strategy,
+        wti_strategy_check: Callable[[int | None], bool] = process_is_wti_strategy,
         dry_run: bool = False,
     ) -> None:
         self.config = config
@@ -810,6 +828,8 @@ class RiskWakeupWatchdog:
         self.watchdog_health_path = watchdog_health_path
         self.watchdog_control_path = watchdog_control_path
         self.alert_control_path = alert_control_path
+        self.wti_state_path = wti_state_path
+        self.wti_risk_health_path = wti_risk_health_path
         self.bark = bark or BarkNotifier.from_config()
         self.feishu = feishu or FeishuUrgentNotifier.from_config()
         self.telegram = telegram or TelegramNotifier.from_env(
@@ -820,6 +840,7 @@ class RiskWakeupWatchdog:
         )
         self.clock = clock
         self.strategy_check = strategy_check
+        self.wti_strategy_check = wti_strategy_check
         self.dry_run = dry_run
         self.metrics = JsonlFollower(metrics_path)
         self.memory = read_json(watchdog_state_path)
@@ -1391,6 +1412,73 @@ class RiskWakeupWatchdog:
                     or deadline <= now
                 )
             ]
+            wti_state_raw = read_json(self.wti_state_path)
+            wti_health = read_json(self.wti_risk_health_path)
+            if wti_state_raw or wti_health:
+                raw_pid = wti_health.get("pid")
+                try:
+                    wti_pid = int(raw_pid) if raw_pid not in (None, "") else None
+                except (TypeError, ValueError):
+                    wti_pid = None
+                wti_running = self.wti_strategy_check(wti_pid)
+                open_position = wti_state_raw.get("open_position")
+                pending_action = wti_state_raw.get("pending_action")
+                wti_pending: list[dict[str, Any]] = []
+                if isinstance(pending_action, dict):
+                    pending_view = {**pending_action, "role": "wti_pair_execution"}
+                    submitted_times = [
+                        str(leg.get("submitted_at"))
+                        for leg in (pending_action.get("legs") or {}).values()
+                        if isinstance(leg, dict) and leg.get("submitted_at")
+                    ]
+                    compensation = pending_action.get("compensation")
+                    if isinstance(compensation, dict) and compensation.get("submitted_at"):
+                        submitted_times.append(str(compensation["submitted_at"]))
+                    if submitted_times:
+                        pending_view["submitted_at"] = min(submitted_times)
+                    wti_pending.append(pending_view)
+                wti_state = {
+                    "asset": "WTI",
+                    "status": wti_state_raw.get("status") or "unknown",
+                    "open_lots": [open_position] if isinstance(open_position, dict) else [],
+                    "pending_actions": wti_pending,
+                    "manual_review_reason": (
+                        wti_state_raw.get("manual_review_reason")
+                        or wti_health.get("manual_review_reason")
+                    ),
+                    "last_blocked_reason": wti_health.get("risk_reason"),
+                    "updated_at": wti_state_raw.get("updated_at"),
+                }
+                wti_events = evaluate_incidents(
+                    state=wti_state,
+                    risk_health=wti_health,
+                    events=[],
+                    strategy_running=wti_running,
+                    config=self.config,
+                    now=now,
+                )
+                has_wti_exposure = bool(wti_state["open_lots"] or wti_state["pending_actions"])
+                if has_wti_exposure and wti_health.get("market_sample_fresh") is not True:
+                    wti_events.append(Incident(
+                        key="wti_market_data_unavailable_with_exposure",
+                        severity="critical",
+                        title="WTI 持仓期间行情或交易时段数据失效",
+                        message="WTI：存在未平仓位或待确认动作，但最新双边行情/时段证据不可用；自动开平仓已被阻止，请检查两边账户。",
+                        alert_params=("WTI", "WTI持仓期间行情或时段数据失效"),
+                    ))
+                incidents.extend(
+                    Incident(
+                        key=f"wti:{item.key}",
+                        severity=item.severity,
+                        title=item.title,
+                        message=item.message,
+                        alert_params=("WTI", *(item.alert_params[1:] or ("WTI 风险监控",))),
+                        fingerprint=item.fingerprint,
+                        rearm_seconds=item.rearm_seconds,
+                        notify_recovery=item.notify_recovery,
+                    )
+                    for item in wti_events
+                )
         active = self.memory["active_incidents"]
         if not any(item.severity == "critical" for item in incidents):
             promoted: list[Incident] = []

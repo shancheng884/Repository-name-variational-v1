@@ -33,6 +33,7 @@ def _sample(*, now: datetime | None = None, **overrides):
         "lighter_min_base_amount": "0.01",
         "lighter_min_quote_amount": "1",
         "lighter_supported_size_decimals": 2,
+        "lighter_supported_price_decimals": 2,
         "var_quote_age_seconds": "0.1",
         "lighter_book_age_seconds": "0.1",
         "var_bid": "70",
@@ -43,6 +44,15 @@ def _sample(*, now: datetime | None = None, **overrides):
         "lighter_sell_price": "70.02",
         "variational_qty": "0.29",
         "lighter_qty": "0.29",
+        "market_status": "open",
+        "session_status": "open",
+        "session_status_source": "variational_market_status_websocket",
+        "session_status_observed_at": now.isoformat(),
+        "session_status_feed_connected": True,
+        "session_status_feed_heartbeat_at": now.isoformat(),
+        "session_schedule_source": "variational_supported_assets_api",
+        "session_id": "wti-session-1",
+        "session_closing_at": (now + timedelta(hours=4)).isoformat(),
     }
     row.update(overrides)
     return row
@@ -64,6 +74,21 @@ def _session(
         exchange_closing_at=now + closes_in if open_ else None,
         entry_cutoff_minutes=entry_cutoff_minutes,
         status_max_age_seconds=status_max_age_seconds,
+    )
+
+
+def _session_for_sample(sample):
+    return classify_usoil_session(
+        datetime.fromisoformat(sample["logged_at"].replace("Z", "+00:00")),
+        exchange_open=sample.get("market_status") == "open",
+        exchange_status_observed_at=datetime.fromisoformat(
+            sample["session_status_observed_at"].replace("Z", "+00:00")
+        ),
+        exchange_closing_at=datetime.fromisoformat(
+            sample["session_closing_at"].replace("Z", "+00:00")
+        ),
+        entry_cutoff_minutes=30,
+        status_max_age_seconds=30,
     )
 
 
@@ -116,7 +141,8 @@ class SimulatedWTIGateway:
     def submit_order(self, request):
         self.requests.append(dict(request))
         venue = request["venue"]
-        result = deepcopy(self.results.get(venue))
+        result_key = f"{venue}_compensation" if request.get("reduce_only") else venue
+        result = deepcopy(self.results.get(result_key, self.results.get(venue)))
         qty = Decimal(request["qty"])
         if result is None:
             result = {
@@ -144,7 +170,7 @@ class SimulatedWTIGateway:
                 self.lighter_qty += signed
         return result
 
-    def lookup_order(self, client_order_id):
+    def lookup_order(self, client_order_id, request=None):
         return deepcopy(self.order_responses.get(client_order_id, {"ok": False, "error": "not_found"}))
 
 
@@ -167,11 +193,12 @@ def _executor(tmp_path, gateway=None, *, clock=None, sample=None):
 
 def _open(executor, *, sample=None, session=None):
     now = datetime.now(timezone.utc)
+    sample = sample or _sample(now=now)
     return executor.open(
-        sample=sample or _sample(now=now),
+        sample=sample,
         direction=DIRECTION,
         notional_usd=Decimal("20"),
-        session=session or _session(now=now),
+        session=session or _session_for_sample(sample),
         now=now,
     )
 
@@ -200,6 +227,10 @@ def test_full_open_close_uses_exact_contracts_reduce_only_and_confirmed_position
     assert closed["status"] == "flat"
     assert closed["open_position"] is None
     assert closed["last_closed_position"]["var_exit_price"] == "70.05"
+    assert closed["last_closed_position"]["actual_gross_pnl_status"] == "confirmed_from_final_fills"
+    assert closed["last_closed_position"]["actual_net_pnl_usd"] is None
+    assert closed["last_closed_position"]["actual_net_pnl_status"] == "funding_unverified"
+    assert closed["last_closed_position"]["funding_cashflow_confirmed"] is False
     assert closed["last_closed_position"]["entry_execution_id"]
     assert closed["last_closed_position"]["exit_execution_id"]
     assert len(gateway.requests) == 4
@@ -211,6 +242,20 @@ def test_full_open_close_uses_exact_contracts_reduce_only_and_confirmed_position
     assert var_evidence["trade_ids"] == ["trade-1"]
     assert var_evidence["fee_usd"] == "0.01"
     assert var_evidence["fee_confirmed"] is True
+
+
+def test_unverified_session_snapshot_blocks_before_any_order(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    now = datetime.now(timezone.utc)
+    with pytest.raises(WTIExecutionError, match="exchange_session_observation_unverified"):
+        executor.open(
+            sample=_sample(now=now, session_status_feed_connected=False),
+            direction=DIRECTION,
+            notional_usd=Decimal("20"),
+            session=_session(now=now),
+            now=now,
+        )
+    assert gateway.requests == []
 
 
 def test_short_direction_uses_opposite_signed_positions_and_sides(tmp_path):
@@ -353,10 +398,16 @@ def test_session_is_rechecked_after_slow_flat_account_read(tmp_path):
     gateway.read_account = slow_read
     executor, _ = _executor(
         tmp_path, gateway, clock=lambda: clock_value[0],
-        sample=_sample(now=start, var_quote_age_seconds="0", lighter_book_age_seconds="0"),
+        sample=_sample(
+            now=start, var_quote_age_seconds="0", lighter_book_age_seconds="0",
+            session_closing_at=(start + timedelta(milliseconds=500)).isoformat(),
+        ),
     )
     result = executor.open(
-        sample=_sample(now=start, var_quote_age_seconds="0", lighter_book_age_seconds="0"),
+        sample=_sample(
+            now=start, var_quote_age_seconds="0", lighter_book_age_seconds="0",
+            session_closing_at=(start + timedelta(milliseconds=500)).isoformat(),
+        ),
         direction=DIRECTION,
         notional_usd=Decimal("20"),
         session=_session(
@@ -372,22 +423,22 @@ def test_session_is_rechecked_after_slow_flat_account_read(tmp_path):
 
 
 def test_open_window_is_rechecked_against_entry_cutoff_time(tmp_path):
-    start = datetime.now(timezone.utc)
-    current = start + timedelta(minutes=11)
+    current = datetime.now(timezone.utc)
+    close_at = current + timedelta(minutes=29)
+    current_sample = _sample(
+        now=current,
+        session_closing_at=close_at.isoformat(),
+    )
     executor, gateway = _executor(
         tmp_path,
         clock=lambda: current,
-        sample=_sample(now=current),
+        sample=current_sample,
     )
-    window = _session(
-        now=start,
-        closes_in=timedelta(minutes=40),
-        status_max_age_seconds=3600,
-    )
-    assert window.state.value == "open"
+    window = _session_for_sample(current_sample)
+    assert window.state.value == "entry_cutoff"
     with pytest.raises(WTIExecutionError, match="exchange_session_does_not_allow_entry"):
         executor.open(
-            sample=_sample(now=current), direction=DIRECTION,
+            sample=current_sample, direction=DIRECTION,
             notional_usd=Decimal("20"), session=window, now=current,
         )
     assert gateway.requests == []
@@ -445,6 +496,34 @@ def test_second_leg_requires_fresh_market_within_drift_guard(tmp_path):
     assert gateway.lighter_qty == 0
 
 
+def test_session_change_after_first_fill_never_submits_second_leg(tmp_path):
+    gateway = SimulatedWTIGateway()
+    now = datetime.now(timezone.utc)
+    initial = _sample(now=now)
+    executor, _ = _executor(tmp_path, gateway, sample=initial)
+    refreshes = 0
+
+    def changing_session():
+        nonlocal refreshes
+        refreshes += 1
+        if refreshes == 1:
+            return initial
+        next_open = datetime.now(timezone.utc)
+        return _sample(
+            now=next_open,
+            session_id="wti-session-2",
+            session_closing_at=(next_open + timedelta(hours=8)).isoformat(),
+        )
+
+    executor.market_reader = changing_session
+    state = _open(executor, sample=initial)
+    assert state["status"] == "manual_review_required"
+    assert state["manual_review_reason"] == "wti_session_changed_during_pair_execution"
+    assert [request["venue"] for request in gateway.requests] == ["variational"]
+    assert gateway.var_qty == Decimal("0.29")
+    assert gateway.lighter_qty == 0
+
+
 def test_unknown_submit_reply_is_not_replayed_after_restart(tmp_path):
     unknown = {"ok": False, "error": "timeout"}
     gateway = SimulatedWTIGateway(results={"variational": unknown})
@@ -475,7 +554,7 @@ def test_order_intent_is_durable_before_gateway_submit(tmp_path):
                         (gateway.requests[1]["client_order_id"], True)]
 
 
-def test_second_leg_rejection_keeps_unhedged_state_manual_review(tmp_path):
+def test_confirmed_second_leg_no_fill_is_compensated_once(tmp_path):
     rejected = {
         "ok": True, "final": True, "order_id": "lighter-rejected",
         "status": "rejected", "filled_qty": "0",
@@ -483,12 +562,37 @@ def test_second_leg_rejection_keeps_unhedged_state_manual_review(tmp_path):
     gateway = SimulatedWTIGateway(results={"lighter": rejected})
     executor, _ = _executor(tmp_path, gateway)
     state = _open(executor)
+    assert state["status"] == "flat"
+    assert state["open_position"] is None
+    assert state["execution_history"][-1]["outcome"] == "compensated"
+    assert gateway.var_qty == 0
+    assert gateway.lighter_qty == 0
+    assert len(gateway.requests) == 3
+    assert gateway.requests[-1]["venue"] == "variational"
+    assert gateway.requests[-1]["reduce_only"] is True
+
+
+def test_unknown_var_compensation_keeps_manual_review_without_retry(tmp_path):
+    rejected = {
+        "ok": True, "final": True, "order_id": "lighter-rejected",
+        "status": "rejected", "filled_qty": "0",
+    }
+    unknown = {"ok": False, "error": "timeout"}
+    gateway = SimulatedWTIGateway(
+        results={"lighter": rejected, "variational_compensation": unknown}
+    )
+    executor, _ = _executor(tmp_path, gateway)
+    state = _open(executor)
     assert state["status"] == "manual_review_required"
     assert state["manual_review_reason"] == "lighter_open_no_fill"
     assert gateway.var_qty == Decimal("0.29")
     assert gateway.lighter_qty == 0
-    assert len(gateway.requests) == 2
-    assert executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))["status"] == "manual_review_required"
+    assert len(gateway.requests) == 3
+    assert gateway.requests[-1]["reduce_only"] is True
+    restarted, _ = _executor(tmp_path, gateway)
+    with pytest.raises(WTIExecutionError, match="existing_wti_state_blocks_entry"):
+        _open(restarted)
+    assert len(gateway.requests) == 3
 
 
 def test_restart_reconciles_confirmed_open_without_resubmitting(tmp_path):
@@ -502,6 +606,7 @@ def test_restart_reconciles_confirmed_open_without_resubmitting(tmp_path):
     recovered = restarted.reconcile(sample=_sample(), now=datetime.now(timezone.utc))
     assert recovered["status"] == "open"
     assert recovered["open_position"]["recovered_from_pending"] is True
+    assert recovered["open_position"]["session_id"] == "wti-session-1"
     assert len(gateway.requests) == 2
 
 
@@ -537,6 +642,7 @@ def test_unknown_second_leg_can_recover_only_after_terminal_order_lookup(tmp_pat
     assert lighter_evidence["trade_ids"] == ["lighter-trade-recovered"]
     assert lighter_evidence["fee_usd"] == "0.02"
     assert len(gateway.requests) == 2
+    assert all(not request.get("reduce_only") for request in gateway.requests)
 
 
 def test_order_lookup_must_match_the_persisted_client_order_id(tmp_path):

@@ -737,12 +737,62 @@ def build_watchdog(
         watchdog_state_path=tmp_path / "watchdog.json",
         watchdog_health_path=tmp_path / "health.json",
         watchdog_control_path=tmp_path / "control.json",
+        wti_state_path=tmp_path / "wti-state.json",
+        wti_risk_health_path=tmp_path / "wti-risk.json",
         bark=bark or FakeBark(),
         feishu=feishu or FakeFeishu(),
         telegram=FakeTelegram(),
         clock=lambda: current[0],
         strategy_check=lambda _pid: True,
+        wti_strategy_check=lambda _pid: True,
     )
+
+
+def test_watchdog_raises_wti_data_loss_incident_without_changing_eth_state(tmp_path) -> None:
+    current = [datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)]
+    watchdog = build_watchdog(tmp_path, current=current)
+    write_json(tmp_path / "wti-state.json", {
+        "asset": "WTI", "status": "open",
+        "open_position": {"direction": "long_var_short_lighter", "var_qty": "0.1"},
+        "pending_action": None, "updated_at": current[0].isoformat(),
+    })
+    write_json(tmp_path / "wti-risk.json", {
+        "asset": "WTI", "pid": 999, "updated_at": current[0].isoformat(),
+        "risk_action": "block_entry", "risk_reason": "wti_market_sample_or_session_unavailable",
+        "open_lots_total": 1, "pending_actions_total": 0,
+        "market_sample_fresh": False,
+    })
+    incidents = watchdog.run_once()
+    wti = [item for item in incidents if item.key.startswith("wti:")]
+    assert any(
+        item.key == "wti:wti_market_data_unavailable_with_exposure"
+        and item.severity == "critical"
+        for item in wti
+    )
+
+
+def test_watchdog_scopes_wti_manual_review_without_using_eth_metrics(tmp_path) -> None:
+    current = [datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)]
+    watchdog = build_watchdog(tmp_path, current=current)
+    write_json(tmp_path / "wti-state.json", {
+        "asset": "WTI", "status": "manual_review_required",
+        "manual_review_reason": "pending_order_terminal_status_unconfirmed",
+        "open_position": None,
+        "pending_action": {"intent_at": current[0].isoformat(), "legs": {}},
+        "updated_at": current[0].isoformat(),
+    })
+    write_json(tmp_path / "wti-risk.json", {
+        "asset": "WTI", "pid": 999, "updated_at": current[0].isoformat(),
+        "risk_action": "normal", "risk_reason": "account_risk_normal",
+        "market_sample_fresh": True,
+    })
+    incidents = watchdog.run_once()
+    assert any(
+        item.key.startswith("wti:")
+        and item.severity == "critical"
+        for item in incidents
+    )
+    assert all(item.alert_params[0] == "WTI" for item in incidents if item.key.startswith("wti:"))
 
 
 def test_critical_incident_uses_feishu_phone_without_routine_bark(tmp_path) -> None:

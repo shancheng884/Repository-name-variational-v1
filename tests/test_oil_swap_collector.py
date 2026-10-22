@@ -165,6 +165,7 @@ def test_oil_sample_quotes_same_qty_as_lighter_depth_and_uses_swap(tmp_path) -> 
         assert row["variational_funding_interval_s"] == 0
         assert Decimal(row["lighter_qty"]) == Decimal(row["variational_qty"]) == Decimal("0.200")
         assert row["lighter_market_id"] == 145
+        assert row["lighter_supported_price_decimals"] == 3
         assert row["session_status"] == "open"
         assert row["market_status"] == "open"
         assert row["session_status_source"] == "variational_market_status_websocket"

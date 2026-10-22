@@ -5,43 +5,35 @@
 The WTI collector remains read-only. It records indicative Variational USOILP swap
 quotes and Lighter WTI order-book snapshots; it does not submit orders or infer
 realized fees, funding, or roll cashflows. Session status is extracted only from
-explicit status fields in the Variational quote response, with a receive-time
-observation stamp, session identity, and timezone-aware future close. Missing,
-stale, contradictory, or incomplete evidence remains unknown. Its rotating log
-is capped at 10 MiB with five backups.
+explicit exchange status and schedule evidence. Missing, stale, contradictory,
+or incomplete evidence remains unknown. Its rotating log is capped at 10 MiB
+with five backups.
 
-`tools/lib/wti_execution.py` adds an isolated execution coordinator for adapter
-development and simulated-response tests. It is not imported by `main.py` or
-`tools/live.py`, has no exchange API implementation, and cannot place real orders
-by itself. The coordinator requires an injected gateway, a fresh read-only
-sample reader, and a separately verified `SessionWindow`. Its order requests
-carry exact USOILP swap / Lighter WTI identities, IOC time-in-force, a marketable
-limit boundary, and a hard notional cap. Each leg requires a final full-fill
-response; any partial, unknown, or mismatched result is persisted as
-`manual_review_required`, blocks retries, and must be resolved by read-only
-position and open-order reconciliation. The executor pins the verified Lighter
-market ID, exposure multiplier, and size precision at construction; a collector
-sample cannot choose the execution contract. The adapter contract must provide
-WTI-filtered open orders, exact identity-aware position responses, and an
-`observed_at` timestamp for the account snapshot. A snapshot older than five
-seconds or taken before the last order attempt cannot confirm a fill or flat
-state. Unknown submissions are resolved only through a terminal lookup by the
-persisted `client_order_id`; lookup responses must repeat that exact ID.
+`tools/lib/wti_execution.py` is a fail-closed pair coordinator. The standalone
+`tools/wti_live.py` wires it to the production Variational forwarder and Lighter
+SDK in an isolated WTI process; it is not imported by the ETH runner and does
+not start, stop, or modify ETH. The coordinator pins the validated Lighter
+market ID, exposure multiplier, and precision. Each submitted leg has a durable
+client ID and requires explicit terminal fill evidence plus a fresh reconciled
+account snapshot. Partial, unknown, or mismatched results stop in
+`manual_review_required`; there is no blind retry. A single reduce-only
+Variational compensation is permitted only after an exact first-leg fill and
+confirmed terminal no-fill on Lighter.
 
-The exchange session observation and closing time are carried in
-`SessionWindow`. Entry cutoff and closing expiry are recalculated immediately
-before each submission, so a previously open window cannot authorize an order
-after its status expires or entry cutoff passes. Each order intent is flushed
-to disk before submission. Confirmed open and close actions retain order IDs,
-trade IDs, raw normalized quantities, and fee evidence in `execution_history`;
-unreported fees remain unknown instead of being recorded as zero. The
-coordinator does not infer funding or realized PnL.
+Positions record the verified exchange session ID. A different or missing
+entry-session identity triggers a close decision when the venue is verifiably
+open for position management. Samples and session windows must agree before
+execution. Live entry authorization is revoked after an in-process sample gap
+over 120 seconds or an execution-cycle failure; an open position is drained on
+the next valid manageable sample. Authorization does not recover in that
+process. Exchange position reads, active-order reads, final fill lookup, and
+state reconciliation are required before a position can be treated as flat or
+open.
 
-The ETH V4 live runner is explicitly ETH-only. Do not add WTI to its allowlist or
-reuse the ETH calibration profile for WTI. Automatic pair switching is not
-enabled by this change because the current live runner does not yet reconcile
-the USOILP swap identity, swap-specific open-order identity, market session, and
-contract exposure as one WTI execution path.
+The ETH V4 live runner remains ETH-only. Do not add WTI to its allowlist or reuse
+the ETH calibration profile for WTI. ETH must be locally flat and explicitly
+confirmed before WTI live mode starts; the live runner also reconciles both
+venues before enabling entries.
 
 ## Read-Only Account Probe
 
@@ -86,6 +78,37 @@ execution work.
   market identities (the Lighter market ID must match the validated sample
   profile), matched paired exposure, reconciled positions, actual fees
   and funding cashflows, and positive aggregate net PnL.
+
+## Standalone WTI Runtime
+
+`python tools/wti_live.py --mode observe` starts WTI collection and its separate
+health file without enabling order submission. It owns the configured forwarder
+ports (8766-8768 by default) and cannot share those listeners with another
+process. Resolve a port conflict explicitly; do not kill an unknown process.
+
+Live mode requires explicit entry, exit, and cost thresholds selected from an
+accepted WTI replay, the current Lighter market ID, confirmation that local ETH
+state is flat, and explicit pilot/order acknowledgements. It refuses new entries
+unless the existing three-session readiness gate passes. The gate remains three
+qualified sessions, 1,200 valid samples and six hours of coverage per session,
+at most 120 seconds between samples, and at most 120 seconds of latest-sample
+age. These requirements are unchanged.
+
+The bounded pilot defaults to $20 notional and has a hard $25 maximum, an 8 bps
+maximum execution boundary, a six-hour maximum hold, and a minimum 30-minute
+pre-close entry cutoff. Account risk retains the existing 40/50/60/75 percent
+margin thresholds and 0.82/0.74 cross-venue equity balance thresholds. These
+are code guards, not evidence that the strategy is profitable.
+
+The gateway treats a Variational `cleared` order as filled only with explicit
+executed quantity and fill price and matches its RFQ identity. Lighter orders use
+the pinned market precision and client order index. Unknown outcomes remain
+pending for lookup; they are not resubmitted. Gross PnL is computed from
+confirmed fills, but net PnL remains unverified unless both-venue fees and
+funding are separately confirmed. The runtime writes
+`log/wti_live_state.json` and `log/wti_live_risk_health.json`; the watchdog
+monitors them independently from ETH. Code tests do not substitute for replay
+against qualified real WTI data or venue-side verification.
 
 ## Readiness Audit
 
@@ -152,9 +175,7 @@ does not establish fills, fees, funding, roll cashflows, or live latency. Its re
 The rotation state machine in `tools/lib/pair_rotation.py` is a decision
 primitive only; it does not stop or start trading processes. Unknown positions
 while no active pair is recorded force reconciliation and block new entries.
-Production automation still requires production venue adapters, verified live
-session-status and account/order response schemas, exchange price-precision
-handling, funding/fee reconciliation, close-window draining, and end-to-end tests.
-The simulator tests validate only coordinator behavior with synthetic gateway
-responses and read-only collector-shaped samples; they do not qualify WTI for
-live trading or automatic ETH/WTI rotation.
+The standalone production adapters and bounded runtime are implemented, but
+automatic ETH/WTI process rotation is not. Their regression tests use synthetic
+venue responses. They do not qualify WTI for live trading, replace empirical
+replay, verify live credentials, or establish realized fees/funding.
