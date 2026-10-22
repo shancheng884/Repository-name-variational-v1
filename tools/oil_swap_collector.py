@@ -16,6 +16,7 @@ import shutil
 import sys
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
@@ -35,6 +36,10 @@ from tools.basis_collector import (  # noqa: E402
     utc_now,
 )
 from tools.lib.basis_store import BasisSampleStore  # noqa: E402
+from tools.lib.market_sessions import (  # noqa: E402
+    VariationalMarketStatusFeed,
+    extract_exchange_session_observation,
+)
 
 
 ASSET = "WTI"
@@ -116,12 +121,22 @@ class OilSwapCollector:
             timeout=args.quote_timeout_seconds,
             logger=self.logger,
         )
+        self.market_status_feed = VariationalMarketStatusFeed()
+        self.trading_sessions: list[dict[str, Any]] = []
+        self.session_schedule_updated_at: str | None = None
+        self.session_schedule_error: str | None = None
+        self.last_session_refresh = 0.0
         self.stop = False
         self.errors: dict[str, int] = {}
         self.samples = 0
+        self.sample_quality_counts: Counter[str] = Counter()
         self.last_sample_at: str | None = None
         self.last_quote_state = "not_checked"
         self.last_book_state = "not_checked"
+        self.last_session_status = "unknown"
+        self.last_session_status_observed_at: str | None = None
+        self.last_session_id: str | None = None
+        self.last_session_closing_at: str | None = None
         self.last_health_write = 0.0
         self.last_maintenance = 0.0
 
@@ -172,7 +187,28 @@ class OilSwapCollector:
             },
             "var_quote_state": self.last_quote_state,
             "lighter_book_state": self.last_book_state,
+            "session_status": self.last_session_status,
+            "session_status_observed_at": self.last_session_status_observed_at,
+            "session_id": self.last_session_id,
+            "session_closing_at": self.last_session_closing_at,
+            "market_status": self.market_status_feed.status or "unknown",
+            "market_status_feed_connected": self.market_status_feed.connected,
+            "market_status_feed_last_frame_at": (
+                None if self.market_status_feed.last_frame_at is None
+                else self.market_status_feed.last_frame_at.isoformat()
+            ),
+            "market_status_feed_heartbeat_at": (
+                None if self.market_status_feed.heartbeat_at is None
+                else self.market_status_feed.heartbeat_at.isoformat()
+            ),
+            "market_status_feed_error": self.market_status_feed.error,
+            "session_schedule_source": (
+                "variational_supported_assets_api" if self.trading_sessions else None
+            ),
+            "session_schedule_updated_at": self.session_schedule_updated_at,
+            "session_schedule_error": self.session_schedule_error,
             "samples_this_run": self.samples,
+            "sample_quality_counts": dict(self.sample_quality_counts),
             "last_sample_at": self.last_sample_at,
             "errors": self.errors,
             "disk_free_gb": round(usage.free / (1024**3), 3),
@@ -227,6 +263,18 @@ class OilSwapCollector:
             self.last_book_state = "unavailable"
             raise RuntimeError("lighter_book_unavailable_after_quote")
         now = datetime.now(timezone.utc)
+        session_observation = extract_exchange_session_observation(
+            self.market_status_feed.status,
+            self.trading_sessions,
+            observed_at=now,
+            status_observed_at=self.market_status_feed.status_observed_at,
+            feed_connected=self.market_status_feed.connected,
+            feed_heartbeat_at=self.market_status_feed.heartbeat_at,
+        )
+        self.last_session_status = str(session_observation["session_status"])
+        self.last_session_status_observed_at = session_observation["session_status_observed_at"]
+        self.last_session_id = session_observation["session_id"]
+        self.last_session_closing_at = session_observation["session_closing_at"]
         quote_text = quote.get("quoteTimestamp") or quote.get("timestamp")
         quote_dt = parse_timestamp(quote_text)
         quote_age = None if quote_dt is None else (now - quote_dt).total_seconds()
@@ -253,6 +301,13 @@ class OilSwapCollector:
         )
         reasons: list[str] = []
         invalid = False
+        if (
+            session_observation["session_status"] != "open"
+            or not session_observation["session_id"]
+            or not session_observation["session_closing_at"]
+        ):
+            invalid = True
+            reasons.append("variational_market_session_unverified")
         if self.last_quote_state != "fresh":
             invalid = True
             reasons.append("variational_quote_age_invalid")
@@ -279,7 +334,7 @@ class OilSwapCollector:
         sample_quality = "invalid" if invalid else "degraded" if degraded else "valid"
         row = {
             "event": "live_inventory_basis_state",
-            "logged_at": utc_now(),
+            "logged_at": now.isoformat(),
             "sample_id": uuid.uuid4().hex,
             "sample_kind": "baseline",
             "sample_quality": sample_quality,
@@ -305,10 +360,15 @@ class OilSwapCollector:
             "lighter_supported_size_decimals": metadata.get("supported_size_decimals"),
             "lighter_taker_fee": metadata.get("taker_fee"),
             "lighter_taker_fee_enabled": metadata.get("is_taker_fee_enabled"),
+            "lighter_market_cost_metadata": {
+                key: value for key, value in metadata.items()
+                if any(token in str(key).lower() for token in ("fee", "fund", "roll", "oracle", "session"))
+            },
             "requested_notional_usd": decimal_text(Decimal(str(self.args.notional_usd))),
             "estimated_notional_usd": decimal_text(lighter_qty * multiplier * mid_lighter),
             "lighter_qty": decimal_text(lighter_qty),
             "quote_id": quote.get("quoteId") or quote.get("quote_id"),
+            "variational_quote_cost_metadata": self._cost_metadata(quote),
             "quote_timestamp": quote_text,
             "quote_ms": f"{quote_ms:.3f}",
             "var_quote_age_seconds": None if quote_age is None else f"{quote_age:.6f}",
@@ -342,9 +402,22 @@ class OilSwapCollector:
             ),
             "basis_collect_only": True,
             "orders_attempted": False,
-            "fee_model_note": "recorded venue metadata; no profitability claim",
+            "variational_session_schedule_updated_at": self.session_schedule_updated_at,
+            **session_observation,
+            "fee_model_note": "indicative market metadata only; actual fills, tier fees, funding and roll cashflows are required for net PnL",
         }
         return row
+
+    @staticmethod
+    def _cost_metadata(quote: dict[str, Any]) -> dict[str, Any]:
+        raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else quote
+        allowed = ("fee", "fund", "roll", "settle", "commission", "financing")
+        return {
+            str(key): value
+            for key, value in raw.items()
+            if any(token in str(key).lower() for token in allowed)
+            and isinstance(value, (str, int, float, bool, type(None)))
+        }
 
     def _record_error(self, exc: Exception) -> None:
         reason = " ".join(str(exc).split())[:160] or type(exc).__name__
@@ -353,13 +426,41 @@ class OilSwapCollector:
             self.last_quote_state = "unavailable"
         self.logger.warning("oil_sample_unavailable reason=%s", reason)
 
+    async def _refresh_session_metadata(self) -> None:
+        self.last_session_refresh = time.monotonic()
+        try:
+            message, _elapsed_ms = await self.quote_client.market_metadata(VAR_MARKET)
+            result = message.get("result") if isinstance(message, dict) else None
+            market = result.get("market") if isinstance(result, dict) else None
+            sessions = market.get("trading_sessions") if isinstance(market, dict) else None
+            if (
+                not message.get("ok")
+                or not isinstance(market, dict)
+                or market.get("symbol") != VAR_MARKET
+                or not isinstance(sessions, list)
+                or not sessions
+            ):
+                raise RuntimeError(
+                    str(message.get("error") or "variational_trading_sessions_missing")
+                )
+            self.trading_sessions = sessions
+            self.session_schedule_updated_at = datetime.now(timezone.utc).isoformat()
+            self.session_schedule_error = None
+        except Exception as exc:
+            self.trading_sessions = []
+            self.session_schedule_updated_at = None
+            self.session_schedule_error = " ".join(str(exc).split())[:160] or type(exc).__name__
+            self.logger.warning("variational_session_schedule_unavailable reason=%s", self.session_schedule_error)
+
     async def run(self) -> None:
         if shutil.disk_usage(self.output_dir).free / (1024**3) < self.args.disk_stop_free_gb:
             raise RuntimeError("disk_free_below_stop_threshold")
         self.store.rotate_closed_days()
         self._write_health(force=True)
         book_task: asyncio.Task[None] | None = None
+        status_task: asyncio.Task[None] | None = None
         try:
+            status_task = asyncio.create_task(self.market_status_feed.run())
             await self.books.load_markets()
             metadata = self.books.market_metadata[ASSET]
             validate_market_metadata(metadata)
@@ -367,16 +468,22 @@ class OilSwapCollector:
                 raise RuntimeError("Lighter market mapping did not resolve to WTI")
             book_task = asyncio.create_task(self.books.run())
             await self.books.wait_ready()
+            if not await self.market_status_feed.wait_for_status(timeout=10):
+                self.logger.warning("variational_market_status_snapshot_not_received")
+            await self._refresh_session_metadata()
             self.logger.info(
                 "oil_swap_collector_started run_id=%s market_id=%s size_decimals=%s output=%s",
                 self.run_id, metadata.get("market_id"), metadata.get("supported_size_decimals"), self.sample_root,
             )
             while not self.stop:
                 started = time.monotonic()
+                if time.monotonic() - self.last_session_refresh >= 60:
+                    await self._refresh_session_metadata()
                 try:
                     row = await self._collect_once()
                     self.store.append(row)
                     self.samples += 1
+                    self.sample_quality_counts[str(row.get("sample_quality") or "unknown")] += 1
                     self.last_sample_at = row["logged_at"]
                     self.errors.clear()
                     self.logger.info(
@@ -400,7 +507,11 @@ class OilSwapCollector:
                     self._write_health(force=True)
         finally:
             self.stop = True
+            self.market_status_feed.stop = True
             self.books.stop = True
+            if status_task is not None:
+                status_task.cancel()
+                await asyncio.gather(status_task, return_exceptions=True)
             if book_task is not None:
                 book_task.cancel()
                 await asyncio.gather(book_task, return_exceptions=True)

@@ -620,6 +620,10 @@ async function handleCommandSocketMessage(data) {
     await handleVariationalApiCommand(payload, "QUOTE", "VAR_API_QUOTE_RESULT");
     return;
   }
+  if (type === "VAR_API_MARKET_METADATA") {
+    await handleVariationalApiCommand(payload, "MARKET_METADATA", "VAR_API_MARKET_METADATA_RESULT");
+    return;
+  }
   if (type === "VAR_API_ORDER") {
     await handleVariationalApiCommand(payload, "ORDER", "VAR_API_ORDER_RESULT");
     return;

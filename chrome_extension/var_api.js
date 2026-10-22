@@ -121,6 +121,33 @@ export function buildVariationalApiScript(action, params) {
       rateLimitResetMs: response.rateLimitResetMs,
       ...(extra || {})
     });
+    if (action === "MARKET_METADATA") {
+      const response = await request("GET", "/api/metadata/supported_assets", undefined);
+      if (!response.ok || !response.json) {
+        return fail("metadata/supported_assets", response);
+      }
+      const listings = Object.values(response.json)
+        .filter(Array.isArray)
+        .flat()
+        .filter((item) => item && item.symbol === o.market);
+      if (listings.length !== 1) {
+        return {
+          ok: false,
+          step: "metadata/supported_assets",
+          error: listings.length ? "Market metadata is ambiguous." : "Market metadata not found.",
+          httpStatus: response.status
+        };
+      }
+      const listing = listings[0];
+      return {
+        ok: true,
+        market: {
+          symbol: listing.symbol,
+          trading_sessions: listing.trading_sessions
+        },
+        httpStatus: response.status
+      };
+    }
     const instrumentType = String(o.instrumentType || o.instrument_type || "perpetual_future");
     if (!["perpetual_future", "swap"].includes(instrumentType)) {
       return {

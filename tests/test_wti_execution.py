@@ -1,0 +1,755 @@
+from __future__ import annotations
+
+import json
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+import pytest
+
+from tools.lib.market_sessions import classify_usoil_session
+from tools.lib.wti_execution import WTIPairExecutor, WTIExecutionError
+
+
+DIRECTION = "long_var_short_lighter"
+
+
+def _sample(*, now: datetime | None = None, **overrides):
+    now = now or datetime.now(timezone.utc)
+    row = {
+        "asset": "WTI",
+        "sample_quality": "valid",
+        "market_availability": "both_feeds_live",
+        "logged_at": now.isoformat(),
+        "variational_underlying": "USOILP",
+        "variational_instrument_type": "swap",
+        "variational_instrument_kind": "commodity",
+        "variational_funding_interval_s": 0,
+        "lighter_symbol": "WTI",
+        "lighter_market_type": "perp",
+        "lighter_market_id": 145,
+        "lighter_market_status": "active",
+        "lighter_multiplier": "1",
+        "lighter_min_base_amount": "0.01",
+        "lighter_min_quote_amount": "1",
+        "lighter_supported_size_decimals": 2,
+        "var_quote_age_seconds": "0.1",
+        "lighter_book_age_seconds": "0.1",
+        "var_bid": "70",
+        "var_ask": "70.1",
+        "lighter_bid": "70.02",
+        "lighter_ask": "70.08",
+        "lighter_buy_price": "70.08",
+        "lighter_sell_price": "70.02",
+        "variational_qty": "0.29",
+        "lighter_qty": "0.29",
+    }
+    row.update(overrides)
+    return row
+
+
+def _session(
+    *,
+    open_: bool = True,
+    now: datetime | None = None,
+    closes_in: timedelta = timedelta(hours=4),
+    entry_cutoff_minutes: int = 30,
+    status_max_age_seconds: float = 30,
+):
+    now = now or datetime.now(timezone.utc)
+    return classify_usoil_session(
+        now,
+        exchange_open=open_,
+        exchange_status_observed_at=now,
+        exchange_closing_at=now + closes_in if open_ else None,
+        entry_cutoff_minutes=entry_cutoff_minutes,
+        status_max_age_seconds=status_max_age_seconds,
+    )
+
+
+class SimulatedWTIGateway:
+    """Test-only exchange simulator. No network or credentials are used."""
+
+    def __init__(self, *, results=None, lookup_results=None, fail_read_calls=(), active_orders=None, clock=None):
+        self.var_qty = Decimal("0")
+        self.lighter_qty = Decimal("0")
+        self.results = results or {}
+        self.lookup_results = lookup_results or {}
+        self.fail_read_calls = set(fail_read_calls)
+        self.active_orders = active_orders if active_orders is not None else []
+        self.read_calls = 0
+        self.requests = []
+        self.order_responses = {}
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def read_account(self):
+        self.read_calls += 1
+        if self.read_calls in self.fail_read_calls:
+            raise TimeoutError("simulated account timeout")
+        return {
+            "observed_at": self.clock().isoformat(),
+            "variational_positions": {
+                "ok": True,
+                "positions": [{
+                    "instrument": {
+                        "underlying": "USOILP",
+                        "instrument_type": "swap",
+                        "settlement_asset": "USDC",
+                        "kind": "commodity",
+                        "funding_interval_s": 0,
+                    },
+                    "qty": str(self.var_qty),
+                }],
+            },
+            "lighter_positions": {
+                "code": 200,
+                "accounts": [{"positions": [{
+                    "market_id": 145,
+                    "symbol": "WTI",
+                    "position": str(abs(self.lighter_qty)),
+                    "sign": 1 if self.lighter_qty >= 0 else -1,
+                }]}],
+            },
+            "active_orders": {"ok": True, "orders": list(self.active_orders)},
+        }
+
+    def submit_order(self, request):
+        self.requests.append(dict(request))
+        venue = request["venue"]
+        result = deepcopy(self.results.get(venue))
+        qty = Decimal(request["qty"])
+        if result is None:
+            result = {
+                "ok": True,
+                "final": True,
+                "order_id": f"order-{len(self.requests)}",
+                "status": "filled",
+                "filled_qty": str(qty),
+                "average_price": "70.05",
+                "trade_ids": [f"trade-{len(self.requests)}"],
+                "fee_usd": "0.01",
+            }
+        result.setdefault("client_order_id", request["client_order_id"])
+        lookup_result = deepcopy(self.lookup_results.get(venue, result))
+        if isinstance(lookup_result, dict):
+            lookup_result.setdefault("client_order_id", request["client_order_id"])
+        self.order_responses[request["client_order_id"]] = lookup_result
+        executed_status = result.get("execute_status", result.get("status"))
+        if result.get("mutate_position", True) and executed_status in {"filled", "partially_filled"}:
+            fill = Decimal(str(result.get("execute_filled_qty", result.get("filled_qty", qty))))
+            signed = fill if request["side"] == "buy" else -fill
+            if venue == "variational":
+                self.var_qty += signed
+            else:
+                self.lighter_qty += signed
+        return result
+
+    def lookup_order(self, client_order_id):
+        return deepcopy(self.order_responses.get(client_order_id, {"ok": False, "error": "not_found"}))
+
+
+def _executor(tmp_path, gateway=None, *, clock=None, sample=None):
+    sample = sample or _sample()
+    gateway = gateway or SimulatedWTIGateway(clock=clock)
+    if clock is not None:
+        gateway.clock = clock
+    return WTIPairExecutor(
+        state_path=tmp_path / "wti-live-state.json",
+        gateway=gateway,
+        max_slippage_bps=Decimal("8"),
+        market_reader=lambda: sample,
+        expected_lighter_market_id=145,
+        expected_lighter_multiplier=Decimal("1"),
+        expected_lighter_size_decimals=2,
+        clock=clock,
+    ), gateway
+
+
+def _open(executor, *, sample=None, session=None):
+    now = datetime.now(timezone.utc)
+    return executor.open(
+        sample=sample or _sample(now=now),
+        direction=DIRECTION,
+        notional_usd=Decimal("20"),
+        session=session or _session(now=now),
+        now=now,
+    )
+
+
+def test_full_open_close_uses_exact_contracts_reduce_only_and_confirmed_positions(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    opened = _open(executor)
+    assert opened["status"] == "open"
+    assert opened["open_position"]["expected_var_qty"] == "0.29"
+    assert opened["open_position"]["expected_lighter_qty"] == "-0.29"
+    assert len(gateway.requests) == 2
+    var, lighter = gateway.requests
+    assert (var["venue"], var["symbol"], var["instrument_type"], var["kind"]) == (
+        "variational", "USOILP", "swap", "commodity"
+    )
+    assert (lighter["venue"], lighter["symbol"], lighter["market_id"]) == (
+        "lighter", "WTI", 145
+    )
+    assert var["time_in_force"] == lighter["time_in_force"] == "IOC"
+    assert Decimal(var["limit_price"]) > Decimal("70.1")
+    assert Decimal(lighter["limit_price"]) < Decimal("70.02")
+    assert not var["reduce_only"] and not lighter["reduce_only"]
+
+    now = datetime.now(timezone.utc)
+    closed = executor.close(sample=_sample(now=now), session=_session(now=now), now=now)
+    assert closed["status"] == "flat"
+    assert closed["open_position"] is None
+    assert closed["last_closed_position"]["var_exit_price"] == "70.05"
+    assert closed["last_closed_position"]["entry_execution_id"]
+    assert closed["last_closed_position"]["exit_execution_id"]
+    assert len(gateway.requests) == 4
+    assert all(request["reduce_only"] for request in gateway.requests[-2:])
+    assert gateway.var_qty == gateway.lighter_qty == 0
+    assert len(closed["execution_history"]) == 2
+    var_evidence = closed["execution_history"][0]["legs"]["variational"]["result"]
+    assert var_evidence["order_id"] == "order-1"
+    assert var_evidence["trade_ids"] == ["trade-1"]
+    assert var_evidence["fee_usd"] == "0.01"
+    assert var_evidence["fee_confirmed"] is True
+
+
+def test_short_direction_uses_opposite_signed_positions_and_sides(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    now = datetime.now(timezone.utc)
+    opened = executor.open(
+        sample=_sample(now=now),
+        direction="short_var_long_lighter",
+        notional_usd=Decimal("20"),
+        session=_session(now=now),
+        now=now,
+    )
+    assert opened["status"] == "open"
+    assert opened["open_position"]["expected_var_qty"] == "-0.29"
+    assert opened["open_position"]["expected_lighter_qty"] == "0.29"
+    assert [request["side"] for request in gateway.requests] == ["sell", "buy"]
+    closed = executor.close(sample=_sample(), session=_session(), now=datetime.now(timezone.utc))
+    assert closed["status"] == "flat"
+    assert [request["side"] for request in gateway.requests] == ["sell", "buy", "buy", "sell"]
+
+
+@pytest.mark.parametrize(
+    ("sample_overrides", "expected_reason"),
+    [
+        ({"market_availability": "partial_or_unavailable"}, "market_feeds_not_both_live"),
+        ({"sample_quality": "degraded"}, "market_sample_not_valid_wti"),
+        ({"lighter_market_id": None}, "lighter_market_identity_or_precision_invalid"),
+        ({"lighter_market_type": "spot"}, "lighter_wti_market_type_mismatch"),
+        ({"variational_instrument_kind": "perp"}, "wti_instrument_identity_mismatch"),
+        ({"var_quote_age_seconds": "4"}, "variational_quote_stale_or_invalid"),
+        ({"lighter_market_status": "closed"}, "lighter_market_not_confirmed_active"),
+    ],
+)
+def test_untrusted_readonly_market_data_never_submits(sample_overrides, expected_reason, tmp_path):
+    executor, gateway = _executor(tmp_path)
+    with pytest.raises(WTIExecutionError, match=expected_reason):
+        _open(executor, sample=_sample(**sample_overrides))
+    assert gateway.requests == []
+
+
+def test_insufficient_readonly_depth_blocks_order_before_any_submit(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    with pytest.raises(WTIExecutionError, match="readonly_sample_depth_below_order_quantity"):
+        _open(executor, sample=_sample(variational_qty="0.1", lighter_qty="0.1"))
+    assert gateway.requests == []
+
+
+def test_notional_cap_blocks_order_before_any_submit(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    with pytest.raises(WTIExecutionError, match="notional_outside_executor_limit"):
+        executor.open(
+            sample=_sample(), direction=DIRECTION,
+            notional_usd=Decimal("26"), session=_session(),
+            now=datetime.now(timezone.utc),
+        )
+    assert gateway.requests == []
+
+
+def test_stale_sample_and_unverified_session_never_submit(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    now = datetime.now(timezone.utc)
+    stale = _sample(now=now - timedelta(seconds=21))
+    with pytest.raises(WTIExecutionError, match="market_sample_stale_or_future"):
+        _open(executor, sample=stale)
+    with pytest.raises(WTIExecutionError, match="exchange_session_does_not_allow_entry"):
+        executor.open(
+            sample=_sample(), direction=DIRECTION, notional_usd=Decimal("20"),
+            session=None, now=now,
+        )
+    with pytest.raises(WTIExecutionError, match="exchange_session_does_not_allow_entry"):
+        _open(executor, session=_session(open_=False, now=now))
+    assert gateway.requests == []
+
+
+def test_quote_age_includes_elapsed_time_after_sample_capture(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    old = _sample(now=datetime.now(timezone.utc) - timedelta(seconds=19))
+    with pytest.raises(WTIExecutionError, match="variational_quote_stale_or_invalid"):
+        _open(executor, sample=old)
+    assert gateway.requests == []
+
+
+def test_quote_age_is_not_counted_twice_between_validation_and_submit(tmp_path):
+    now = datetime.now(timezone.utc)
+    sample = _sample(
+        now=now - timedelta(seconds=1.5),
+        var_quote_age_seconds="0.1",
+        lighter_book_age_seconds="0.1",
+    )
+    executor, gateway = _executor(tmp_path, sample=sample)
+    assert _open(executor, sample=sample)["status"] == "open"
+    assert len(gateway.requests) == 2
+
+
+def test_sample_cannot_choose_an_untrusted_lighter_market_id(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    bad = _sample(lighter_market_id=0)
+    with pytest.raises(WTIExecutionError, match="lighter_market_identity_or_precision_invalid"):
+        _open(executor, sample=bad)
+    assert gateway.requests == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"lighter_multiplier": "2"}, "lighter_market_multiplier_mismatch"),
+        ({"lighter_supported_size_decimals": 3}, "lighter_market_identity_or_precision_invalid"),
+    ],
+)
+def test_sample_cannot_override_trusted_lighter_contract_metadata(tmp_path, overrides, reason):
+    executor, gateway = _executor(tmp_path)
+    with pytest.raises(WTIExecutionError, match=reason):
+        _open(executor, sample=_sample(**overrides))
+    assert gateway.requests == []
+
+
+def test_session_window_is_rejected_after_its_exchange_close(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    created = datetime.now(timezone.utc) - timedelta(hours=5)
+    expired = _session(now=created, closes_in=timedelta(hours=4))
+    with pytest.raises(WTIExecutionError, match="exchange_session_does_not_allow_entry"):
+        executor.open(
+            sample=_sample(), direction=DIRECTION, notional_usd=Decimal("20"),
+            session=expired, now=datetime.now(timezone.utc),
+        )
+    assert gateway.requests == []
+
+
+def test_session_is_rechecked_after_slow_flat_account_read(tmp_path):
+    start = datetime.now(timezone.utc)
+    clock_value = [start]
+    gateway = SimulatedWTIGateway(clock=lambda: clock_value[0])
+    original_read = gateway.read_account
+
+    def slow_read():
+        result = original_read()
+        clock_value[0] = start + timedelta(seconds=1)
+        return result
+
+    gateway.read_account = slow_read
+    executor, _ = _executor(
+        tmp_path, gateway, clock=lambda: clock_value[0],
+        sample=_sample(now=start, var_quote_age_seconds="0", lighter_book_age_seconds="0"),
+    )
+    result = executor.open(
+        sample=_sample(now=start, var_quote_age_seconds="0", lighter_book_age_seconds="0"),
+        direction=DIRECTION,
+        notional_usd=Decimal("20"),
+        session=_session(
+            now=start,
+            closes_in=timedelta(milliseconds=500),
+            entry_cutoff_minutes=0,
+        ),
+        now=start,
+    )
+    assert result["status"] == "manual_review_required"
+    assert result["pending_action"]["legs"]["variational"]["result"]["reason"] == "exchange_session_expired_before_submit"
+    assert gateway.requests == []
+
+
+def test_open_window_is_rechecked_against_entry_cutoff_time(tmp_path):
+    start = datetime.now(timezone.utc)
+    current = start + timedelta(minutes=11)
+    executor, gateway = _executor(
+        tmp_path,
+        clock=lambda: current,
+        sample=_sample(now=current),
+    )
+    window = _session(
+        now=start,
+        closes_in=timedelta(minutes=40),
+        status_max_age_seconds=3600,
+    )
+    assert window.state.value == "open"
+    with pytest.raises(WTIExecutionError, match="exchange_session_does_not_allow_entry"):
+        executor.open(
+            sample=_sample(now=current), direction=DIRECTION,
+            notional_usd=Decimal("20"), session=window, now=current,
+        )
+    assert gateway.requests == []
+
+
+def test_existing_exchange_position_or_active_order_blocks_entry(tmp_path):
+    gateway = SimulatedWTIGateway(active_orders=[{"market_id": 145, "id": "existing"}])
+    executor, _ = _executor(tmp_path, gateway)
+    with pytest.raises(WTIExecutionError, match="not_flat_or_has_active_orders"):
+        _open(executor)
+    assert not gateway.requests
+
+    gateway = SimulatedWTIGateway()
+    gateway.var_qty = Decimal("0.1")
+    executor, _ = _executor(tmp_path / "other", gateway)
+    with pytest.raises(WTIExecutionError, match="not_flat_or_has_active_orders"):
+        _open(executor)
+    assert not gateway.requests
+
+
+def test_partial_first_leg_is_persisted_and_never_retried_or_hedged_blindly(tmp_path):
+    partial = {
+        "ok": True, "final": True, "order_id": "var-partial",
+        "status": "partially_filled", "filled_qty": "0.1",
+    }
+    gateway = SimulatedWTIGateway(results={"variational": partial})
+    executor, _ = _executor(tmp_path, gateway)
+    state = _open(executor)
+    assert state["status"] == "manual_review_required"
+    assert state["pending_action"]["legs"]["variational"]["result"]["classification"] == "partial_or_inconsistent"
+    assert gateway.var_qty == Decimal("0.1")
+    assert len(gateway.requests) == 1
+    with pytest.raises(WTIExecutionError, match="existing_wti_state_blocks_entry"):
+        _open(executor)
+    assert len(gateway.requests) == 1
+    recovered = executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))
+    assert recovered["status"] == "manual_review_required"
+
+
+def test_second_leg_requires_fresh_market_within_drift_guard(tmp_path):
+    gateway = SimulatedWTIGateway()
+    executor, _ = _executor(tmp_path, gateway)
+    reads = 0
+
+    def changing_market():
+        nonlocal reads
+        reads += 1
+        return _sample(lighter_ask="70.2") if reads > 1 else _sample()
+
+    executor.market_reader = changing_market
+    state = _open(executor)
+    assert state["status"] == "manual_review_required"
+    assert state["manual_review_reason"] == "readonly_market_moved_beyond_slippage_guard"
+    assert len(gateway.requests) == 1
+    assert gateway.lighter_qty == 0
+
+
+def test_unknown_submit_reply_is_not_replayed_after_restart(tmp_path):
+    unknown = {"ok": False, "error": "timeout"}
+    gateway = SimulatedWTIGateway(results={"variational": unknown})
+    executor, _ = _executor(tmp_path, gateway)
+    state = _open(executor)
+    assert state["status"] == "manual_review_required"
+    assert state["pending_action"]["legs"]["variational"]["result"]["classification"] == "unknown"
+    restarted, _ = _executor(tmp_path, gateway)
+    with pytest.raises(WTIExecutionError, match="existing_wti_state_blocks_entry"):
+        _open(restarted)
+    assert len(gateway.requests) == 1
+
+
+def test_order_intent_is_durable_before_gateway_submit(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    original_submit = gateway.submit_order
+    observed = []
+
+    def inspect_then_submit(request):
+        saved = json.loads((tmp_path / "wti-live-state.json").read_text(encoding="utf-8"))
+        leg = saved["pending_action"]["legs"][request["venue"]]
+        observed.append((leg["request"]["client_order_id"], leg["submission_started"]))
+        return original_submit(request)
+
+    gateway.submit_order = inspect_then_submit
+    assert _open(executor)["status"] == "open"
+    assert observed == [(gateway.requests[0]["client_order_id"], True),
+                        (gateway.requests[1]["client_order_id"], True)]
+
+
+def test_second_leg_rejection_keeps_unhedged_state_manual_review(tmp_path):
+    rejected = {
+        "ok": True, "final": True, "order_id": "lighter-rejected",
+        "status": "rejected", "filled_qty": "0",
+    }
+    gateway = SimulatedWTIGateway(results={"lighter": rejected})
+    executor, _ = _executor(tmp_path, gateway)
+    state = _open(executor)
+    assert state["status"] == "manual_review_required"
+    assert state["manual_review_reason"] == "lighter_open_no_fill"
+    assert gateway.var_qty == Decimal("0.29")
+    assert gateway.lighter_qty == 0
+    assert len(gateway.requests) == 2
+    assert executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))["status"] == "manual_review_required"
+
+
+def test_restart_reconciles_confirmed_open_without_resubmitting(tmp_path):
+    gateway = SimulatedWTIGateway(fail_read_calls={2})
+    executor, _ = _executor(tmp_path, gateway)
+    pending = _open(executor)
+    assert pending["status"] == "manual_review_required"
+    assert pending["manual_review_reason"] == "post_open_account_snapshot_unavailable"
+    assert len(gateway.requests) == 2
+    restarted, _ = _executor(tmp_path, gateway)
+    recovered = restarted.reconcile(sample=_sample(), now=datetime.now(timezone.utc))
+    assert recovered["status"] == "open"
+    assert recovered["open_position"]["recovered_from_pending"] is True
+    assert len(gateway.requests) == 2
+
+
+def test_unknown_second_leg_can_recover_only_after_terminal_order_lookup(tmp_path):
+    unknown = {
+        "ok": False,
+        "error": "submit_timeout",
+        "execute_status": "filled",
+        "execute_filled_qty": "0.29",
+    }
+    confirmed = {
+        "ok": True,
+        "final": True,
+        "order_id": "lighter-recovered",
+        "status": "filled",
+        "filled_qty": "0.29",
+        "average_price": "70.04",
+        "trade_ids": ["lighter-trade-recovered"],
+        "fee_usd": "0.02",
+    }
+    gateway = SimulatedWTIGateway(
+        results={"lighter": unknown}, lookup_results={"lighter": confirmed}
+    )
+    executor, _ = _executor(tmp_path, gateway)
+    pending = _open(executor)
+    assert pending["status"] == "manual_review_required"
+    assert gateway.lighter_qty == Decimal("-0.29")
+    recovered = executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))
+    assert recovered["status"] == "open"
+    assert recovered["open_position"]["lighter_entry_price"] == "70.04"
+    lighter_evidence = recovered["execution_history"][-1]["legs"]["lighter"]["result"]
+    assert lighter_evidence["order_id"] == "lighter-recovered"
+    assert lighter_evidence["trade_ids"] == ["lighter-trade-recovered"]
+    assert lighter_evidence["fee_usd"] == "0.02"
+    assert len(gateway.requests) == 2
+
+
+def test_order_lookup_must_match_the_persisted_client_order_id(tmp_path):
+    unknown = {
+        "ok": False,
+        "error": "submit_timeout",
+        "execute_status": "filled",
+        "execute_filled_qty": "0.29",
+    }
+    mismatched = {
+        "ok": True,
+        "final": True,
+        "client_order_id": "some-other-order",
+        "order_id": "order-foreign",
+        "status": "filled",
+        "filled_qty": "0.29",
+        "average_price": "70.05",
+    }
+    gateway = SimulatedWTIGateway(
+        results={"variational": unknown}, lookup_results={"variational": mismatched}
+    )
+    executor, _ = _executor(tmp_path, gateway)
+    assert _open(executor)["status"] == "manual_review_required"
+    recovered = executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))
+    assert recovered["status"] == "manual_review_required"
+    assert recovered["manual_review_reason"] == "pending_order_terminal_status_unconfirmed"
+    assert len(gateway.requests) == 1
+
+
+def test_missing_fee_is_preserved_as_unknown_not_zero(tmp_path):
+    no_fee = {
+        "ok": True,
+        "final": True,
+        "order_id": "var-no-fee",
+        "status": "filled",
+        "filled_qty": "0.29",
+        "average_price": "70.05",
+        "trade_ids": ["var-no-fee-trade"],
+    }
+    gateway = SimulatedWTIGateway(results={"variational": no_fee})
+    executor, _ = _executor(tmp_path, gateway)
+    opened = _open(executor)
+    evidence = opened["execution_history"][0]["legs"]["variational"]["result"]
+    assert evidence["fee_usd"] is None
+    assert evidence["fee_confirmed"] is False
+
+
+def test_stale_pre_entry_flat_snapshot_cannot_confirm_post_close_flat(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    stale_flat = gateway.read_account()
+    assert _open(executor)["status"] == "open"
+    original_read = gateway.read_account
+    read_count = 0
+
+    def stale_after_close():
+        nonlocal read_count
+        read_count += 1
+        if read_count == 1:
+            return original_read()
+        return stale_flat
+
+    gateway.read_account = stale_after_close
+    close_state = executor.close(
+        sample=_sample(), session=_session(), now=datetime.now(timezone.utc)
+    )
+    assert close_state["status"] == "manual_review_required"
+    assert gateway.var_qty == gateway.lighter_qty == 0
+    recovered = executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))
+    assert recovered["status"] == "manual_review_required"
+    assert recovered["pending_action"] is not None
+    assert recovered["manual_review_reason"] == "post_order_account_snapshot_unavailable"
+    assert len(gateway.requests) == 4
+
+
+def test_confirmed_zero_fill_can_recover_flat_but_unknown_cannot(tmp_path):
+    no_fill = {
+        "ok": True, "final": True, "order_id": "var-reject",
+        "status": "rejected", "filled_qty": "0",
+    }
+    gateway = SimulatedWTIGateway(results={"variational": no_fill})
+    executor, _ = _executor(tmp_path, gateway)
+    assert _open(executor)["status"] == "manual_review_required"
+    assert executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))["status"] == "flat"
+    assert len(gateway.requests) == 1
+
+    gateway = SimulatedWTIGateway(results={"variational": {"ok": False}})
+    executor, _ = _executor(tmp_path / "unknown", gateway)
+    assert _open(executor)["status"] == "manual_review_required"
+    assert executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))["status"] == "manual_review_required"
+
+
+def test_terminal_lookup_can_confirm_no_order_and_restore_flat(tmp_path):
+    gateway = SimulatedWTIGateway(
+        results={"variational": {"ok": False, "error": "submit_timeout"}},
+        lookup_results={
+            "variational": {
+                "ok": True,
+                "final": True,
+                "status": "not_found",
+                "filled_qty": "0",
+                "no_order_confirmed": True,
+            }
+        },
+    )
+    executor, _ = _executor(tmp_path, gateway)
+    assert _open(executor)["status"] == "manual_review_required"
+    recovered = executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))
+    assert recovered["status"] == "flat"
+    assert recovered["pending_action"] is None
+    assert recovered["execution_history"][-1]["outcome"] == "no_fill"
+    assert len(gateway.requests) == 1
+
+
+def test_close_partial_fill_blocks_rotation_and_restart_does_not_resubmit(tmp_path):
+    gateway = SimulatedWTIGateway()
+    executor, _ = _executor(tmp_path, gateway)
+    assert _open(executor)["status"] == "open"
+    partial = {
+        "ok": True, "final": True, "order_id": "var-close-partial",
+        "status": "partially_filled", "filled_qty": "0.1",
+    }
+    gateway.results = {"variational": partial}
+    state = executor.close(sample=_sample(), session=_session(), now=datetime.now(timezone.utc))
+    assert state["status"] == "manual_review_required"
+    assert state["pending_action"]["kind"] == "close"
+    assert gateway.var_qty == Decimal("0.19")
+    assert gateway.lighter_qty == Decimal("-0.29")
+    assert len(gateway.requests) == 3
+    recovered = executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))
+    assert recovered["status"] == "manual_review_required"
+    assert len(gateway.requests) == 3
+    with pytest.raises(WTIExecutionError, match="exchange_session_does_not_allow_position_management"):
+        executor.close(sample=_sample(), session=_session(open_=False), now=datetime.now(timezone.utc))
+    assert len(gateway.requests) == 3
+
+
+def test_close_no_fill_reconciles_back_to_open_only_when_both_positions_match(tmp_path):
+    gateway = SimulatedWTIGateway()
+    executor, _ = _executor(tmp_path, gateway)
+    assert _open(executor)["status"] == "open"
+    no_fill = {
+        "ok": True, "final": True, "order_id": "var-close-reject",
+        "status": "canceled", "filled_qty": "0",
+    }
+    gateway.results = {"variational": no_fill}
+    close_state = executor.close(
+        sample=_sample(), session=_session(), now=datetime.now(timezone.utc)
+    )
+    assert close_state["status"] == "manual_review_required"
+    recovered = executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))
+    assert recovered["status"] == "open"
+    assert recovered["last_action_resolution"] == "close_confirmed_no_fill"
+    assert len(gateway.requests) == 3
+
+
+def test_close_depth_below_position_is_rejected_before_submission(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    assert _open(executor)["status"] == "open"
+    with pytest.raises(WTIExecutionError, match="readonly_sample_depth_below_close_quantity"):
+        executor.close(
+            sample=_sample(variational_qty="0.1", lighter_qty="0.1"),
+            session=_session(),
+            now=datetime.now(timezone.utc),
+        )
+    assert len(gateway.requests) == 2
+
+
+def test_corrupt_state_is_not_overwritten(tmp_path):
+    state_path = tmp_path / "wti-live-state.json"
+    state_path.write_text("{broken", encoding="utf-8")
+    executor, gateway = _executor(tmp_path)
+    with pytest.raises(Exception, match="unreadable"):
+        _open(executor)
+    assert state_path.read_text(encoding="utf-8") == "{broken"
+    assert gateway.requests == []
+
+
+def test_open_state_reconciliation_requires_market_identity_and_no_open_orders(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    assert _open(executor)["status"] == "open"
+    with pytest.raises(WTIExecutionError, match="lighter_market_identity_or_precision_invalid"):
+        executor.reconcile(sample=_sample(lighter_market_id=146), now=datetime.now(timezone.utc))
+    assert len(gateway.requests) == 2
+    assert executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))["status"] == "open"
+
+
+def test_lighter_position_mismatch_after_order_responses_requires_manual_review(tmp_path):
+    gateway = SimulatedWTIGateway()
+    executor, _ = _executor(tmp_path, gateway)
+    # Simulate a venue reporting a different final quantity than the order ack.
+    original_read = gateway.read_account
+    reads = 0
+
+    def read_with_mismatch():
+        nonlocal reads
+        reads += 1
+        result = original_read()
+        if reads == 2:
+            result["lighter_positions"]["accounts"][0]["positions"][0]["position"] = "0.2"
+        return result
+
+    gateway.read_account = read_with_mismatch
+    state = _open(executor)
+    assert state["status"] == "manual_review_required"
+    assert state["manual_review_reason"] == "post_open_exchange_position_mismatch"
+    assert state["pending_action"] is not None
+
+
+def test_terminal_fill_response_must_include_quantity_order_id_and_final_flag(tmp_path):
+    malformed = {"ok": True, "status": "filled", "filled_qty": "0.29", "average_price": "70"}
+    gateway = SimulatedWTIGateway(results={"variational": malformed})
+    executor, _ = _executor(tmp_path, gateway)
+    state = _open(executor)
+    assert state["status"] == "manual_review_required"
+    assert state["pending_action"]["legs"]["variational"]["result"]["classification"] == "unknown"
+    assert len(gateway.requests) == 1

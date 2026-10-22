@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -134,14 +134,25 @@ def test_oil_sample_quotes_same_qty_as_lighter_depth_and_uses_swap(tmp_path) -> 
                 "market": "USOILP", "instrument_type": "swap",
                 "kind": "commodity", "funding_interval_s": 0,
             }
+            observed = datetime.now(timezone.utc)
             return {
                 "ok": True,
                 "result": {
                     "bid": "100.00", "ask": "100.02", "quoteId": "q1",
-                    "quoteTimestamp": datetime.now(timezone.utc).isoformat(),
+                    "quoteTimestamp": observed.isoformat(),
                 },
             }, 30.0
 
+        status_at = datetime.now(timezone.utc)
+        collector.market_status_feed.connected = True
+        collector.market_status_feed.status = "open"
+        collector.market_status_feed.status_observed_at = status_at
+        collector.market_status_feed.heartbeat_at = status_at
+        collector.trading_sessions = [{
+            "open": (status_at - timedelta(minutes=1)).isoformat(),
+            "close": (status_at + timedelta(hours=6)).isoformat(),
+        }]
+        collector.session_schedule_updated_at = status_at.isoformat()
         collector.books.snapshot = fake_snapshot
         collector.quote_client.quote = fake_quote
         row = await collector._collect_once()
@@ -154,8 +165,58 @@ def test_oil_sample_quotes_same_qty_as_lighter_depth_and_uses_swap(tmp_path) -> 
         assert row["variational_funding_interval_s"] == 0
         assert Decimal(row["lighter_qty"]) == Decimal(row["variational_qty"]) == Decimal("0.200")
         assert row["lighter_market_id"] == 145
+        assert row["session_status"] == "open"
+        assert row["market_status"] == "open"
+        assert row["session_status_source"] == "variational_market_status_websocket"
+        assert row["session_schedule_source"] == "variational_supported_assets_api"
+        assert row["session_id"].endswith(
+            (status_at + timedelta(hours=6)).isoformat()
+        )
+        assert row["session_closing_at"] is not None
         assert row["orders_attempted"] is False
         assert seen_qty == [None, Decimal("0.200"), Decimal("0.200")]
+
+    asyncio.run(run())
+
+
+def test_market_metadata_command_is_read_only_and_returns_actual_schedule_fields() -> None:
+    async def run() -> None:
+        class FakeSocket:
+            sent = None
+
+            async def send(self, raw):
+                self.sent = json.loads(raw)
+
+            async def recv(self):
+                return json.dumps({
+                    "type": "VAR_API_MARKET_METADATA_RESULT",
+                    "requestId": self.sent["requestId"],
+                    "ok": True,
+                    "result": {
+                        "market": {
+                            "symbol": "USOILP",
+                            "trading_sessions": [{
+                                "open": "2026-10-22T04:00:00Z",
+                                "close": "2026-10-22T21:00:00Z",
+                            }],
+                        }
+                    },
+                })
+
+            async def close(self):
+                return None
+
+        client = VariationalQuoteClient("ws://unused", timeout=1, logger=logging.getLogger("test"))
+        socket = FakeSocket()
+        client.websocket = socket
+        response, _ = await client.market_metadata("USOILP")
+        assert socket.sent == {
+            "type": "VAR_API_MARKET_METADATA",
+            "requestId": socket.sent["requestId"],
+            "market": "USOILP",
+        }
+        assert response["ok"] is True
+        assert response["result"]["market"]["trading_sessions"][0]["close"].endswith("Z")
 
     asyncio.run(run())
 

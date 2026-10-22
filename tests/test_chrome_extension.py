@@ -20,6 +20,7 @@ def test_extension_has_persistent_keepalive_and_recovery() -> None:
     assert "restoreForwarding" in background
     assert "Page.setWebLifecycleState" in background
     assert 'type === "VAR_API_PORTFOLIO"' in background
+    assert 'type === "VAR_API_MARKET_METADATA"' in background
     assert 'type === "VAR_API_READY"' in background
     assert 'type === "VAR_API_RELOAD_PAGE"' in background
     assert 'type: "VAR_API_RELOAD_PAGE_RESULT"' in background
@@ -36,6 +37,9 @@ def test_extension_can_fetch_portfolio_through_authenticated_page() -> None:
 
     assert 'action === "PORTFOLIO"' in api_script
     assert 'request("GET", "/api/portfolio"' in api_script
+    assert 'action === "MARKET_METADATA"' in api_script
+    assert 'request("GET", "/api/metadata/supported_assets"' in api_script
+    assert 'listing.trading_sessions' in api_script
     assert "AbortController" in api_script
     assert "requestTimeoutMs" in api_script
     assert "request_timeout" in api_script

@@ -380,6 +380,28 @@ class VariationalQuoteClient:
             await self.close()
             raise
 
+    async def market_metadata(self, market: str) -> tuple[dict[str, Any], float]:
+        """Read the exact app metadata used for its trading_sessions schedule."""
+        if self.websocket is None:
+            self.websocket = await websockets.connect(self.url, ping_interval=20, ping_timeout=20)
+        request_id = uuid.uuid4().hex
+        payload = {
+            "type": "VAR_API_MARKET_METADATA",
+            "requestId": request_id,
+            "market": market,
+        }
+        started = time.monotonic()
+        try:
+            await self.websocket.send(json.dumps(payload, ensure_ascii=True))
+            while True:
+                raw = await asyncio.wait_for(self.websocket.recv(), timeout=self.timeout)
+                message = json.loads(raw)
+                if isinstance(message, dict) and message.get("requestId") == request_id:
+                    return message, (time.monotonic() - started) * 1000.0
+        except Exception:
+            await self.close()
+            raise
+
 
 class MultiAssetCollector:
     def __init__(self, args: argparse.Namespace) -> None:
