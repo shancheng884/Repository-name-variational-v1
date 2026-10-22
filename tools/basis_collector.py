@@ -342,6 +342,32 @@ class VariationalQuoteClient:
                 await self.websocket.close()
             self.websocket = None
 
+    async def _wait_for_response(self, request_id: str) -> dict[str, Any]:
+        deadline = time.monotonic() + self.timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("variational_forwarder_response_timeout")
+            raw = await asyncio.wait_for(self.websocket.recv(), timeout=remaining)
+            message = json.loads(raw)
+            if isinstance(message, dict) and str(message.get("requestId")) == request_id:
+                return message
+            if (
+                isinstance(message, dict)
+                and str(message.get("type", "")).upper() == "ERROR"
+                and message.get("ok") is False
+            ):
+                raise RuntimeError(
+                    str(message.get("error") or "variational_forwarder_error")
+                )
+
+    def _api_timeout_fields(self) -> dict[str, int]:
+        timeout_ms = max(1, int(self.timeout * 800))
+        return {
+            "requestTimeoutMs": timeout_ms,
+            "operationTimeoutMs": timeout_ms,
+        }
+
     async def quote(
         self,
         asset: str,
@@ -361,6 +387,7 @@ class VariationalQuoteClient:
             "market": market or asset,
             "amount": decimal_text(amount),
             "confirm": False,
+            **self._api_timeout_fields(),
         }
         if instrument_type is not None:
             payload["instrumentType"] = instrument_type
@@ -371,11 +398,8 @@ class VariationalQuoteClient:
         started = time.monotonic()
         try:
             await self.websocket.send(json.dumps(payload, ensure_ascii=True))
-            while True:
-                raw = await asyncio.wait_for(self.websocket.recv(), timeout=self.timeout)
-                message = json.loads(raw)
-                if message.get("requestId") == request_id:
-                    return message, (time.monotonic() - started) * 1000.0
+            message = await self._wait_for_response(request_id)
+            return message, (time.monotonic() - started) * 1000.0
         except Exception:
             await self.close()
             raise
@@ -389,15 +413,13 @@ class VariationalQuoteClient:
             "type": "VAR_API_MARKET_METADATA",
             "requestId": request_id,
             "market": market,
+            **self._api_timeout_fields(),
         }
         started = time.monotonic()
         try:
             await self.websocket.send(json.dumps(payload, ensure_ascii=True))
-            while True:
-                raw = await asyncio.wait_for(self.websocket.recv(), timeout=self.timeout)
-                message = json.loads(raw)
-                if isinstance(message, dict) and message.get("requestId") == request_id:
-                    return message, (time.monotonic() - started) * 1000.0
+            message = await self._wait_for_response(request_id)
+            return message, (time.monotonic() - started) * 1000.0
         except Exception:
             await self.close()
             raise

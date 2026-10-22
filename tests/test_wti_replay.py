@@ -96,6 +96,42 @@ def test_replay_is_no_lookahead_and_exits_on_net_target():
     assert report.unresolved_position is False
 
 
+def test_replay_waits_for_exit_quotes_covering_the_open_position_size():
+    rows = [
+        _row(0),
+        _row(
+            1,
+            variational_qty="0.01",
+            lighter_qty="0.01",
+            var_bid="70.4",
+            var_ask="70.5",
+            long_edge_bps="0",
+            short_edge_bps="0",
+        ),
+        _row(
+            2,
+            var_bid="70.4",
+            var_ask="70.5",
+            lighter_bid="70.2",
+            lighter_ask="70.3",
+            lighter_buy_price="70.3",
+            lighter_sell_price="70.2",
+            long_edge_bps="0",
+            short_edge_bps="0",
+        ),
+    ]
+
+    report = replay_wti(rows, config=_config())
+
+    assert report.completed_trades == 1
+    assert report.trades[0].exit_at == rows[2]["logged_at"]
+    assert report.exit_reasons == {
+        "exit_quote_depth_below_position_size": 1,
+        "target_reached": 1,
+    }
+    assert report.unresolved_position is False
+
+
 def test_replay_does_not_claim_fill_when_position_remains_open_at_end():
     report = replay_wti([_row(0)], config=_config())
     assert report.completed_trades == 0

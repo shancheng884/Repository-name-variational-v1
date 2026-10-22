@@ -1038,6 +1038,7 @@ class CommandBroker:
             "VAR_API_PORTFOLIO",
             "VAR_API_ORDERS",
             "VAR_API_QUOTE",
+            "VAR_API_MARKET_METADATA",
             "VAR_API_ORDER",
             "VAR_API_RELOAD_PAGE",
         }:
@@ -1059,6 +1060,7 @@ class CommandBroker:
             "VAR_API_PORTFOLIO_RESULT",
             "VAR_API_ORDERS_RESULT",
             "VAR_API_QUOTE_RESULT",
+            "VAR_API_MARKET_METADATA_RESULT",
             "VAR_API_ORDER_RESULT",
             "VAR_API_RELOAD_PAGE_RESULT",
         }:

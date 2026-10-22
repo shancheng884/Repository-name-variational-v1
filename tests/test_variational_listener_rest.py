@@ -217,3 +217,44 @@ def test_stream_health_command_round_trips_with_its_result_type() -> None:
         assert requester.sent[-1]["type"] == "VAR_API_STREAM_HEALTH_RESULT"
 
     asyncio.run(run())
+
+
+def test_market_metadata_command_round_trips_with_its_result_type() -> None:
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send(self, raw: str) -> None:
+            self.sent.append(json.loads(raw))
+
+    async def run() -> None:
+        broker = CommandBroker(quiet=True)
+        extension = FakeSocket()
+        requester = FakeSocket()
+        broker._extension = extension
+
+        request = {
+            "type": "VAR_API_MARKET_METADATA",
+            "requestId": "metadata-1",
+            "market": "USOILP",
+            "requestTimeoutMs": 800,
+            "operationTimeoutMs": 800,
+        }
+        await broker.handle_raw_message(requester, json.dumps(request))
+
+        assert extension.sent[-1]["type"] == "VAR_API_MARKET_METADATA"
+        assert extension.sent[-1]["requestId"] == "metadata-1"
+        assert extension.sent[-1]["market"] == "USOILP"
+
+        result = {
+            "type": "VAR_API_MARKET_METADATA_RESULT",
+            "requestId": "metadata-1",
+            "ok": True,
+            "result": {"market": {"symbol": "USOILP", "trading_sessions": []}},
+        }
+        await broker.handle_raw_message(extension, json.dumps(result))
+
+        assert requester.sent[-1] == result
+        assert "metadata-1" not in broker._pending_requests
+
+    asyncio.run(run())

@@ -304,6 +304,12 @@ def replay_wti(
         if current is not None:
             if at <= current["at"]:
                 continue
+            if (
+                _decimal(row.get("variational_qty")) < current["var_qty"]
+                or _decimal(row.get("lighter_qty")) < current["lighter_qty"]
+            ):
+                exit_reasons["exit_quote_depth_below_position_size"] += 1
+                continue
             gross, cost, net, net_bps = _trade_pnl(
                 current, row, roundtrip_cost_bps=config.roundtrip_cost_bps
             )

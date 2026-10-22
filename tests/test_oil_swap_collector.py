@@ -214,9 +214,56 @@ def test_market_metadata_command_is_read_only_and_returns_actual_schedule_fields
             "type": "VAR_API_MARKET_METADATA",
             "requestId": socket.sent["requestId"],
             "market": "USOILP",
+            "requestTimeoutMs": 800,
+            "operationTimeoutMs": 800,
         }
         assert response["ok"] is True
         assert response["result"]["market"]["trading_sessions"][0]["close"].endswith("Z")
+
+    asyncio.run(run())
+
+
+def test_market_metadata_forwarder_error_is_reported_without_waiting_for_timeout() -> None:
+    async def run() -> None:
+        class FakeSocket:
+            async def send(self, _raw):
+                return None
+
+            async def recv(self):
+                return json.dumps({
+                    "type": "ERROR",
+                    "ok": False,
+                    "error": "Unsupported message type: VAR_API_MARKET_METADATA",
+                })
+
+            async def close(self):
+                return None
+
+        client = VariationalQuoteClient("ws://unused", timeout=1, logger=logging.getLogger("test"))
+        client.websocket = FakeSocket()
+        with pytest.raises(RuntimeError, match="Unsupported message type"):
+            await client.market_metadata("USOILP")
+
+    asyncio.run(run())
+
+
+def test_quote_wait_uses_one_deadline_when_unrelated_messages_arrive() -> None:
+    async def run() -> None:
+        class FakeSocket:
+            async def send(self, _raw):
+                return None
+
+            async def recv(self):
+                await asyncio.sleep(0.01)
+                return json.dumps({"type": "PONG"})
+
+            async def close(self):
+                return None
+
+        client = VariationalQuoteClient("ws://unused", timeout=0.04, logger=logging.getLogger("test"))
+        client.websocket = FakeSocket()
+        with pytest.raises(asyncio.TimeoutError):
+            await client.market_metadata("USOILP")
 
     asyncio.run(run())
 
@@ -241,5 +288,7 @@ def test_variational_quote_command_omits_optional_kind_for_perpetuals() -> None:
         await client.quote("ETH", Decimal("0.01"), market="ETH")
         assert socket.sent["market"] == "ETH"
         assert "kind" not in socket.sent
+        assert socket.sent["requestTimeoutMs"] == 800
+        assert socket.sent["operationTimeoutMs"] == 800
 
     asyncio.run(run())
