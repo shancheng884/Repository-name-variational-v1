@@ -612,6 +612,9 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "exit_shortfall_full_samples": exit_calibration.get(
             "v4_exit_shortfall_full_samples"
         ),
+        "exit_shortfall_profile_id": exit_calibration.get(
+            "v4_exit_shortfall_profile_id"
+        ),
         "exit_shortfall_calibration_ready": exit_calibration.get(
             "v4_exit_shortfall_calibration_ready"
         ),
@@ -977,6 +980,7 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
             f"{funnel['exit_shortfall_sample_count']} "
             f"min_samples={funnel['exit_shortfall_min_samples']} "
             f"full_samples={funnel['exit_shortfall_full_samples']} "
+            f"profile={funnel['exit_shortfall_profile_id']} "
             f"ready={funnel['exit_shortfall_calibration_ready']} "
             f"fully_mature={funnel['exit_shortfall_fully_mature']} "
             f"raw_p80_bps={funnel['exit_shortfall_raw_p80_bps']} "

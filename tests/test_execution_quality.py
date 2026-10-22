@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from main import VariationalToLighterRuntime
+from main import LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE, VariationalToLighterRuntime
 from tools.lib.execution_quality import exchange_epoch_seconds, lighter_book_clock
 
 
@@ -247,11 +247,61 @@ def test_reserve_envelope_survives_state_reload():
         },
     }
     runtime.sync_live_inventory_memory_from_state()
-    assert runtime.live_inventory_basis_v4_exit_calibration_context(direction="short_var_long_lighter")["reserve_bps"] == Decimal("5.75")
+    assert runtime.live_inventory_basis_v4_exit_calibration_context(direction="short_var_long_lighter")["reserve_bps"] == Decimal("3.50")
+    assert runtime.live_inventory_exit_shortfall_legacy_reserve_floor_by_direction[
+        "short_var_long_lighter"
+    ] == Decimal("5.75")
     assert "long_var_short_lighter" not in runtime.live_inventory_exit_shortfall_reserve_floor_by_direction
     runtime.live_inventory_basis_v4_mode = True
     payload = runtime.live_inventory_v4_episode_payload()
     assert payload["v4_exit_shortfall_reserve_floor_by_direction"] == {"short_var_long_lighter": "5.75"}
+    assert payload["v4_exit_shortfall_legacy_reserve_floor_by_direction"] == {
+        "short_var_long_lighter": "5.75"
+    }
+
+
+def test_profiled_reserve_survives_restart_without_importing_legacy_floor():
+    runtime = runtime_with_book()
+    runtime.live_inventory_basis_v4_mode = True
+    runtime.live_inventory_exit_shortfall_reserve_floor_by_direction = {
+        "long_var_short_lighter": Decimal("6.65")
+    }
+    runtime.live_inventory_exit_shortfall_reserve_floors_by_profile = {
+        LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE: {
+            "long_var_short_lighter": Decimal("6.65")
+        }
+    }
+    runtime.load_live_inventory_state = lambda: {
+        "open_lots": [],
+        "v4_exit_shortfall_calibration_profile": LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE,
+        "v4_exit_shortfall_reserve_floors_by_profile": {
+            LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE: {
+                "long_var_short_lighter": "6.65"
+            }
+        },
+        "v4_exit_shortfall_legacy_reserve_floor_by_direction": {
+            "long_var_short_lighter": "25.339"
+        },
+        "v4_exit_shortfall_reserve_floor_by_direction": {
+            "long_var_short_lighter": "25.339"
+        },
+    }
+
+    runtime.sync_live_inventory_memory_from_state()
+
+    assert runtime.live_inventory_basis_v4_exit_calibration_context(
+        direction="long_var_short_lighter"
+    )["reserve_bps"] == Decimal("6.65")
+    assert runtime.live_inventory_exit_shortfall_legacy_reserve_floor_by_direction[
+        "long_var_short_lighter"
+    ] == Decimal("25.339")
+    payload = runtime.live_inventory_v4_episode_payload()
+    assert payload["v4_exit_shortfall_reserve_floors_by_profile"][
+        LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE
+    ]["long_var_short_lighter"] == "6.65"
+    assert payload["v4_exit_shortfall_reserve_floor_by_direction"][
+        "long_var_short_lighter"
+    ] == "25.339"
 
 
 def test_observed_exit_cost_increases_new_entry_threshold_without_waiting_for_cache():

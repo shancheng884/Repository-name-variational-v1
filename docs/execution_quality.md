@@ -22,6 +22,19 @@ Exit costs above the existing 3.5 bps cold-start prior also increase the entry
 execution reserve, and new observations invalidate the cached entry thresholds.
 This is a conservative execution-cost policy, not a fitted profitability claim.
 
+Exit shortfall observations are keyed by the explicit
+`mainnet_lighter_full_depth_preflight_v1` execution profile. Only confirmed
+ETH exits carrying that profile and a supported V4 strategy version calibrate
+the current profile. The profile identifies the full-quantity depth preflight
+execution path; bump it if executable-price estimation or exit submission
+semantics change. Older untagged rows remain in the metrics log and continue to
+be included in the read-only audit, but are not treated as measurements of this
+execution path. On state migration, their saved reserve is retained under the
+legacy field and in the compatibility high-water field. The current profile
+loads only its own saved reserve and confirmed tagged fills. Its cold-start
+prior remains 3.5 bps, and the existing full-depth preflight, freshness,
+slippage, margin, and reconciliation checks are unchanged.
+
 The profit gate and hedge-completion price budget serve different purposes.
 The existing reduce-only completion allowance is anchored to the preflight
 Lighter price, and retries cannot widen its absolute boundary. Sell boundaries

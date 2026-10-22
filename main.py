@@ -128,6 +128,8 @@ LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_FULL_SAMPLES = 20
 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS = Decimal("3.50")
 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_EARLY_READY_FLOOR_BPS = Decimal("1.50")
 LIVE_INVENTORY_PROFIT_EXIT_MAX_BOOK_AGE_SECONDS = 0.25
+# Bump this identifier when executable-price estimation or exit submission semantics change.
+LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE = "mainnet_lighter_full_depth_preflight_v1"
 LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
     {
         "basis-v4-live-v2",
@@ -158,6 +160,7 @@ LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
         "basis-v4-live-test-v14",
         "basis-v4-live-v15-bidirectional",
         "basis-v4-live-v16-bidirectional",
+        "basis-v4-live-v17-bidirectional",
     }
 )
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
@@ -426,6 +429,22 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return format(value, "f")
+
+
+def valid_exit_shortfall_reserve_floors(value: Any) -> dict[str, Decimal]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Decimal] = {}
+    for direction, raw in value.items():
+        parsed = to_decimal(raw)
+        if (
+            direction in {DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER}
+            and parsed is not None
+            and parsed.is_finite()
+            and parsed >= 0
+        ):
+            result[direction] = parsed
+    return result
 
 
 def margin_usage_percent(
@@ -2482,13 +2501,16 @@ class VariationalToLighterRuntime:
         self.live_inventory_maintenance_control_payload: dict[str, Any] = {}
         self.live_inventory_maintenance_last_flat_check_monotonic = 0.0
         self.live_inventory_maintenance_last_block_log_monotonic = 0.0
-        self.live_inventory_schema_version = "2"
+        self.live_inventory_schema_version = "3"
+        self.live_inventory_execution_profile = (
+            LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE
+        )
         self.live_inventory_strategy_version = (
             "basis-v3-collector-v1"
             if self.live_inventory_collect_only
             else "execution-calibration-v1"
             if self.live_inventory_execution_calibration
-            else "basis-v4-live-v16-bidirectional"
+            else "basis-v4-live-v17-bidirectional"
             if (
                 self.live_inventory_basis_v4_mode
                 and self.live_inventory_basis_v4_bidirectional
@@ -2711,6 +2733,12 @@ class VariationalToLighterRuntime:
             DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(maxlen=20),
         }
         self.live_inventory_exit_shortfall_reserve_floor_by_direction: dict[str, Decimal] = {}
+        self.live_inventory_exit_shortfall_reserve_floors_by_profile: dict[
+            str, dict[str, Decimal]
+        ] = {LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE: {}}
+        self.live_inventory_exit_shortfall_legacy_reserve_floor_by_direction: dict[
+            str, Decimal
+        ] = {}
         self.live_inventory_exit_fill_latency_ms_samples: deque[Decimal] = deque(maxlen=20)
         self.live_inventory_basis_var_spread_bps_samples: deque[Decimal] = deque(maxlen=200)
         self.live_inventory_basis_lighter_spread_bps_samples: deque[Decimal] = deque(maxlen=200)
@@ -3461,6 +3489,11 @@ class VariationalToLighterRuntime:
             maxlen=strong_single_target.maxlen
         )
         reserve_floors: dict[str, Decimal] = {}
+        execution_profile = getattr(
+            self,
+            "live_inventory_execution_profile",
+            LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE,
+        )
         seen: set[tuple[Any, ...]] = set()
         try:
             with orders_file.open("r", encoding="utf-8") as handle:
@@ -3474,6 +3507,8 @@ class VariationalToLighterRuntime:
                     if str(row.get("strategy_version") or "") not in (
                         LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS
                     ):
+                        continue
+                    if row.get("execution_profile") != execution_profile:
                         continue
                     if str(row.get("asset") or "").upper() != "ETH":
                         continue
@@ -3524,6 +3559,25 @@ class VariationalToLighterRuntime:
         for direction, samples in samples_by_direction.items():
             targets[direction].extend(samples)
         self.live_inventory_exit_shortfall_reserve_floor_by_direction = reserve_floors
+        profile_floors = getattr(
+            self,
+            "live_inventory_exit_shortfall_reserve_floors_by_profile",
+            {},
+        )
+        if not isinstance(profile_floors, dict):
+            profile_floors = {}
+        existing_profile_floors = valid_exit_shortfall_reserve_floors(
+            profile_floors.get(execution_profile)
+        )
+        for direction, value in reserve_floors.items():
+            existing_profile_floors[direction] = max(
+                value, existing_profile_floors.get(direction, Decimal("0"))
+            )
+        profile_floors[execution_profile] = existing_profile_floors
+        self.live_inventory_exit_shortfall_reserve_floors_by_profile = profile_floors
+        self.live_inventory_exit_shortfall_reserve_floor_by_direction = (
+            existing_profile_floors
+        )
         self.live_inventory_exit_estimate_shortfall_bps_samples.extend(
             samples_by_direction[DIRECTION_SHORT_VAR_LONG_LIGHTER]
         )
@@ -3604,6 +3658,11 @@ class VariationalToLighterRuntime:
         if enabled:
             reserve_bps = max(reserve_bps, envelope_bps)
         return {
+            "profile_id": getattr(
+                self,
+                "live_inventory_execution_profile",
+                LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE,
+            ),
             "sample_count": sample_count,
             "min_samples": LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_MIN_SAMPLES,
             "full_samples": LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_FULL_SAMPLES,
@@ -3643,6 +3702,7 @@ class VariationalToLighterRuntime:
                 LIVE_INVENTORY_BASIS_V4_EXIT_SHORTFALL_PRIOR_BPS,
             )
         return {
+            "v4_exit_shortfall_profile_id": context.get("profile_id"),
             "v4_exit_shortfall_direction": direction,
             "v4_exit_shortfall_sample_count": context["sample_count"],
             "v4_exit_shortfall_min_samples": context["min_samples"],
@@ -3702,6 +3762,19 @@ class VariationalToLighterRuntime:
             floors = self.live_inventory_exit_shortfall_reserve_floor_by_direction = {}
         _, _, tail = shortfall_tail(by_direction[direction])
         floors[direction] = advance_shortfall_reserve(floors.get(direction, Decimal("0")), tail)
+        profile = getattr(
+            self,
+            "live_inventory_execution_profile",
+            LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE,
+        )
+        profiles = getattr(
+            self,
+            "live_inventory_exit_shortfall_reserve_floors_by_profile",
+            None,
+        )
+        if not isinstance(profiles, dict):
+            profiles = self.live_inventory_exit_shortfall_reserve_floors_by_profile = {}
+        profiles[profile] = dict(floors)
         # Entry thresholds cache execution costs as well as historical edges.
         self.live_inventory_basis_v4_threshold_cache = None
         self.live_inventory_basis_v4_threshold_cache_by_direction = {}
@@ -4672,12 +4745,58 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_strong_single_disabled_at = (
             state.get("v4_strong_single_disabled_at") or None
         )
-        reserve_floors = getattr(self, "live_inventory_exit_shortfall_reserve_floor_by_direction", {})
-        for direction, value in (state.get("v4_exit_shortfall_reserve_floor_by_direction") or {}).items():
-            saved = to_decimal(value)
-            if direction in {DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER} and saved is not None and saved.is_finite() and saved >= 0:
-                reserve_floors[direction] = max(saved, reserve_floors.get(direction, Decimal("0")))
-        self.live_inventory_exit_shortfall_reserve_floor_by_direction = reserve_floors
+        current_profile = getattr(
+            self,
+            "live_inventory_execution_profile",
+            LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE,
+        )
+        stored_profiles = state.get("v4_exit_shortfall_reserve_floors_by_profile")
+        profile_floors = getattr(
+            self,
+            "live_inventory_exit_shortfall_reserve_floors_by_profile",
+            {},
+        )
+        if not isinstance(profile_floors, dict):
+            profile_floors = {}
+        if isinstance(stored_profiles, dict):
+            for profile, values in stored_profiles.items():
+                saved_floors = valid_exit_shortfall_reserve_floors(values)
+                existing = profile_floors.get(str(profile), {})
+                if not isinstance(existing, dict):
+                    existing = {}
+                for direction, saved in saved_floors.items():
+                    existing[direction] = max(saved, existing.get(direction, Decimal("0")))
+                profile_floors[str(profile)] = existing
+
+        legacy_floors = valid_exit_shortfall_reserve_floors(
+            state.get("v4_exit_shortfall_legacy_reserve_floor_by_direction")
+        )
+        if not isinstance(
+            state.get("v4_exit_shortfall_legacy_reserve_floor_by_direction"), dict
+        ):
+            # The pre-profile key is preserved as legacy calibration. It must
+            # not silently become evidence for the new execution path.
+            old_floors = valid_exit_shortfall_reserve_floors(
+                state.get("v4_exit_shortfall_reserve_floor_by_direction")
+            )
+            for direction, saved in old_floors.items():
+                legacy_floors[direction] = max(
+                    saved, legacy_floors.get(direction, Decimal("0"))
+                )
+        self.live_inventory_exit_shortfall_legacy_reserve_floor_by_direction = (
+            legacy_floors
+        )
+        current_floors = profile_floors.setdefault(current_profile, {})
+        if not isinstance(current_floors, dict):
+            current_floors = profile_floors[current_profile] = {}
+        for direction, saved in valid_exit_shortfall_reserve_floors(
+            getattr(self, "live_inventory_exit_shortfall_reserve_floor_by_direction", {})
+        ).items():
+            current_floors[direction] = max(
+                saved, current_floors.get(direction, Decimal("0"))
+            )
+        self.live_inventory_exit_shortfall_reserve_floor_by_profile = profile_floors
+        self.live_inventory_exit_shortfall_reserve_floor_by_direction = current_floors
         self.live_inventory_v4_portfolio_exit_lot_ids = {
             self.live_inventory_normalized_lot_id(value)
             for value in list(state.get("v4_portfolio_exit_lot_ids") or [])
@@ -4855,8 +4974,51 @@ class VariationalToLighterRuntime:
             episode_state = "disarmed"
         else:
             episode_state = "armed"
+        current_profile = getattr(
+            self,
+            "live_inventory_execution_profile",
+            LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE,
+        )
+        profiles = getattr(
+            self,
+            "live_inventory_exit_shortfall_reserve_floors_by_profile",
+            {},
+        )
+        if not isinstance(profiles, dict):
+            profiles = {}
+        current_floors = valid_exit_shortfall_reserve_floors(
+            getattr(self, "live_inventory_exit_shortfall_reserve_floor_by_direction", {})
+        )
+        profiles[current_profile] = current_floors
+        legacy_floors = valid_exit_shortfall_reserve_floors(
+            getattr(
+                self,
+                "live_inventory_exit_shortfall_legacy_reserve_floor_by_direction",
+                {},
+            )
+        )
+        compatibility_floors = dict(legacy_floors)
+        for values in profiles.values():
+            for direction, value in valid_exit_shortfall_reserve_floors(values).items():
+                compatibility_floors[direction] = max(
+                    value, compatibility_floors.get(direction, Decimal("0"))
+                )
         return {
             "v4_episode_state": episode_state,
+            "v4_exit_shortfall_calibration_profile": current_profile,
+            "v4_exit_shortfall_reserve_floors_by_profile": {
+                profile: {
+                    direction: decimal_to_str(value)
+                    for direction, value in valid_exit_shortfall_reserve_floors(
+                        values
+                    ).items()
+                }
+                for profile, values in profiles.items()
+            },
+            "v4_exit_shortfall_legacy_reserve_floor_by_direction": {
+                direction: decimal_to_str(value)
+                for direction, value in legacy_floors.items()
+            },
             "v4_episode_id": getattr(self, "live_inventory_v4_episode_id", None),
             "v4_next_tranche_index": int(
                 getattr(self, "live_inventory_v4_next_tranche_index", 1)
@@ -4929,9 +5091,7 @@ class VariationalToLighterRuntime:
             ),
             "v4_exit_shortfall_reserve_floor_by_direction": {
                 direction: decimal_to_str(value)
-                for direction, value in getattr(
-                    self, "live_inventory_exit_shortfall_reserve_floor_by_direction", {}
-                ).items()
+                for direction, value in compatibility_floors.items()
             },
             "v4_strong_single_shortfall_sample_count": strong_single_context[
                 "sample_count"
@@ -16291,6 +16451,11 @@ class VariationalToLighterRuntime:
             "config_hash": getattr(self, "live_inventory_config_hash", None),
             "cycle_id": payload.get("cycle_id", payload.get("lot_id")),
             **payload,
+            "execution_profile": getattr(
+                self,
+                "live_inventory_execution_profile",
+                LIVE_INVENTORY_BASIS_V4_EXECUTION_PROFILE,
+            ),
         }
         await self.append_order_log(event_type, enriched_payload)
         notifier = getattr(self, "telegram_notifier", None)

@@ -2329,7 +2329,19 @@ def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
         },
         {
             "event": "live_inventory_actual_pnl",
-            "strategy_version": "basis-v4-live-test-v2",
+            "strategy_version": "basis-v4-live-v16-bidirectional",
+            "asset": "ETH",
+            "direction": "long_var_short_lighter",
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "estimated_pnl_bps": "30",
+            "actual_pnl_bps": "1.7649",
+            "run_id": "legacy-large-shortfall",
+            "lot_id": 15,
+        },
+        {
+            "event": "live_inventory_actual_pnl",
+            "strategy_version": "basis-v4-live-v17-bidirectional",
+            "execution_profile": "mainnet_lighter_full_depth_preflight_v1",
             "asset": "ETH",
             "direction": "short_var_long_lighter",
             "actual_pnl_status": "lighter_final_fill_confirmed",
@@ -2338,7 +2350,8 @@ def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
         },
         {
             "event": "live_inventory_actual_pnl",
-            "strategy_version": "basis-v4-live-v3",
+            "strategy_version": "basis-v4-live-v17-bidirectional",
+            "execution_profile": "mainnet_lighter_full_depth_preflight_v1",
             "asset": "ETH",
             "direction": "short_var_long_lighter",
             "actual_pnl_status": "lighter_final_fill_confirmed",
@@ -2383,6 +2396,12 @@ def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
     assert list(runtime.live_inventory_strong_single_shortfall_bps_samples) == [
         Decimal("2.00")
     ]
+    assert runtime.live_inventory_exit_shortfall_reserve_floor_by_direction[
+        "short_var_long_lighter"
+    ] == Decimal("2.00")
+    assert "long_var_short_lighter" not in (
+        runtime.live_inventory_exit_shortfall_reserve_floor_by_direction
+    )
 
 
 def test_v4_entry_threshold_accepts_36h_effective_7d_anchor() -> None:
@@ -4704,6 +4723,7 @@ def test_live_inventory_log_includes_run_id_and_config(tmp_path) -> None:
     assert rows[0]["config"]["live_inventory_max_total_notional_usd"] == "10"
     assert rows[1]["event"] == "live_inventory_test_event"
     assert rows[1]["run_id"] == "test-run-id"
+    assert rows[1]["execution_profile"] == "mainnet_lighter_full_depth_preflight_v1"
     assert telegram_events[-1][0] == "live_inventory_test_event"
     assert telegram_events[-1][1]["run_id"] == "test-run-id"
 
