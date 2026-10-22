@@ -10,6 +10,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -140,6 +141,10 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             args.lighter_base_url,
             expected_market_id=args.expected_market_id,
         )
+        report["lighter_market"] = {
+            key: str(value) if isinstance(value, Decimal) else value
+            for key, value in market.items()
+        }
         from lighter.signer_client import SignerClient
 
         client = SignerClient(

@@ -295,7 +295,10 @@ class WTIReadOnlyAccountAdapter:
             expected_type="VAR_API_POSITIONS_RESULT",
             key="positions",
         )
-        var_positions = {"ok": True, "result": raw_positions}
+        var_positions = {
+            "ok": True,
+            "result": {"positions": raw_positions} if isinstance(raw_positions, list) else raw_positions,
+        }
         var_qty = variational_position_qty(var_positions, WTI_HEDGE)
         if var_qty is None:
             raise WTIReadOnlyError("variational_wti_position_unverifiable")

@@ -105,6 +105,143 @@ class FakeLighter:
         )
 
 
+class FakeVariationalPositions(FakeVariational):
+    def __init__(self, positions, *, response_ok=True, http_status=200):
+        super().__init__()
+        self.positions = positions
+        self.response_ok = response_ok
+        self.http_status = http_status
+
+    async def request(self, payload):
+        response = await super().request(payload)
+        if payload["type"] == "VAR_API_POSITIONS":
+            response["ok"] = self.response_ok
+            response["result"].update({
+                "ok": self.response_ok,
+                "httpStatus": self.http_status,
+                "positions": self.positions,
+            })
+        return response
+
+
+@pytest.mark.parametrize("positions", [[], {"positions": []}])
+def test_confirmed_empty_var_positions_are_zero_for_both_response_formats(positions):
+    adapter = WTIReadOnlyAccountAdapter(
+        variational=FakeVariationalPositions(positions),
+        lighter=FakeLighter(qty="0"),
+        market=_market(),
+    )
+
+    snapshot = asyncio_call(adapter.read_account())
+
+    assert snapshot["normalized"] == {
+        "variational_qty": "0", "lighter_qty": "0", "active_order_count": 0,
+    }
+
+
+def test_bare_var_position_list_preserves_exact_wti_identity_and_signed_quantity():
+    position = {
+        "instrument": {
+            "underlying": "USOILP", "instrument_type": "swap",
+            "settlement_asset": "USDC", "kind": "commodity", "funding_interval_s": 0,
+        },
+        "qty": "-0.25",
+    }
+    adapter = WTIReadOnlyAccountAdapter(
+        variational=FakeVariationalPositions([position]),
+        lighter=FakeLighter(qty="0.25"),
+        market=_market(),
+    )
+
+    snapshot = asyncio_call(adapter.read_account())
+
+    assert snapshot["normalized"]["variational_qty"] == "-0.25"
+    assert snapshot["normalized"]["lighter_qty"] == "0.25"
+
+
+@pytest.mark.parametrize("positions", [None, "", [None], [{"qty": "0"}]])
+def test_malformed_var_positions_never_become_zero(positions):
+    var = FakeVariationalPositions(positions)
+    adapter = WTIReadOnlyAccountAdapter(
+        variational=var, lighter=FakeLighter(qty="0"), market=_market(),
+    )
+
+    with pytest.raises(WTIReadOnlyError, match="position_unverifiable"):
+        asyncio_call(adapter.read_account())
+    assert [call["type"] for call in var.calls] == ["VAR_API_POSITIONS"]
+
+
+@pytest.mark.parametrize("response_ok,http_status", [(False, 200), (True, 401)])
+def test_failed_var_response_with_empty_list_is_not_a_flat_account(response_ok, http_status):
+    adapter = WTIReadOnlyAccountAdapter(
+        variational=FakeVariationalPositions(
+            [], response_ok=response_ok, http_status=http_status,
+        ),
+        lighter=FakeLighter(qty="0"),
+        market=_market(),
+    )
+
+    with pytest.raises(WTIReadOnlyError, match="variational_read"):
+        asyncio_call(adapter.read_account())
+
+
+def test_probe_keeps_verified_market_metadata_when_account_read_fails(monkeypatch):
+    import json
+    import sys
+    from types import SimpleNamespace
+    from tools import wti_account_probe as probe
+
+    closed = []
+
+    class FakeSigner:
+        def __init__(self, **kwargs):
+            self.api_client = self
+
+        def check_client(self):
+            return None
+
+        async def close(self):
+            closed.append(True)
+
+    class FakeForwarder:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    class FailedAdapter:
+        def __init__(self, **kwargs):
+            pass
+
+        async def read_account(self):
+            raise WTIReadOnlyError("variational_wti_position_unverifiable")
+
+    monkeypatch.setattr(probe, "_load_env", lambda: (12, 3, "test-private-key"))
+    monkeypatch.setattr(
+        probe, "fetch_lighter_market_metadata",
+        lambda *args, **kwargs: validate_lighter_market_metadata({"order_books": [_market()]}),
+    )
+    monkeypatch.setitem(sys.modules, "lighter.signer_client", SimpleNamespace(SignerClient=FakeSigner))
+    monkeypatch.setattr(probe, "VariationalForwarderClient", FakeForwarder)
+    monkeypatch.setattr(probe, "WTIReadOnlyAccountAdapter", FailedAdapter)
+
+    report = asyncio_call(probe.run_probe(probe.parse_args([])))
+
+    assert report["status"] == "unverified"
+    assert report["error"] == "variational_wti_position_unverifiable"
+    assert report["lighter_market"]["market_id"] == 145
+    assert report["lighter_market"]["multiplier"] == "1"
+    assert "snapshot" not in report
+    assert report["orders_attempted"] is False
+    assert report["execution_enabled"] is False
+    assert "test-private-key" not in json.dumps(report)
+    assert closed == [True]
+
+
 def test_market_metadata_requires_unique_active_wti_and_can_pin_id():
     metadata = validate_lighter_market_metadata(
         {"order_books": [_market(), {"symbol": "ETH", "market_id": 0}]},

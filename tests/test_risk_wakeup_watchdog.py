@@ -7,7 +7,11 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from main import VariationalToLighterRuntime
+from tools import risk_wakeup_watchdog as watchdog_module
+from tools.lib.risk_wakeup_remote import RemoteHeartbeatPublisher
 from tools.risk_wakeup_watchdog import (
     Incident,
     RiskWakeupWatchdog,
@@ -113,6 +117,36 @@ class FakeTelegram:
 
 def write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def reject_production_watchdog_dependencies(monkeypatch):
+    read_control = watchdog_module.read_alert_control
+
+    def isolated_control(path):
+        assert path != watchdog_module.ALERT_CONTROL_PATH, "test attempted to read production alert control"
+        return read_control(path)
+
+    def reject_remote_configuration(*args, **kwargs):
+        raise AssertionError("test attempted to load production heartbeat credentials")
+
+    monkeypatch.setattr(watchdog_module, "read_alert_control", isolated_control)
+    monkeypatch.setattr(RemoteHeartbeatPublisher, "from_env", reject_remote_configuration)
+
+
+def isolated_watchdog_paths(tmp_path):
+    return {
+        "state_path": tmp_path / "state.json",
+        "risk_health_path": tmp_path / "risk.json",
+        "metrics_path": tmp_path / "metrics.jsonl",
+        "watchdog_state_path": tmp_path / "watchdog.json",
+        "watchdog_health_path": tmp_path / "health.json",
+        "watchdog_control_path": tmp_path / "control.json",
+        "alert_control_path": tmp_path / "alert-control.json",
+        "wti_state_path": tmp_path / "wti-state.json",
+        "wti_risk_health_path": tmp_path / "wti-risk.json",
+        "remote_publisher": RemoteHeartbeatPublisher(endpoint="", token=""),
+    }
 
 
 def test_open_position_and_stopped_strategy_is_critical() -> None:
@@ -731,14 +765,7 @@ def build_watchdog(
             if watchdog_config is not None
             else config(channel_retry_seconds=10)
         ),
-        state_path=tmp_path / "state.json",
-        risk_health_path=tmp_path / "risk.json",
-        metrics_path=tmp_path / "metrics.jsonl",
-        watchdog_state_path=tmp_path / "watchdog.json",
-        watchdog_health_path=tmp_path / "health.json",
-        watchdog_control_path=tmp_path / "control.json",
-        wti_state_path=tmp_path / "wti-state.json",
-        wti_risk_health_path=tmp_path / "wti-risk.json",
+        **isolated_watchdog_paths(tmp_path),
         bark=bark or FakeBark(),
         feishu=feishu or FakeFeishu(),
         telegram=FakeTelegram(),
@@ -746,6 +773,30 @@ def build_watchdog(
         strategy_check=lambda _pid: True,
         wti_strategy_check=lambda _pid: True,
     )
+
+
+def test_fixture_notifications_ignore_production_silence(monkeypatch, tmp_path):
+    current = [datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc)]
+    read_control = watchdog_module.read_alert_control
+    expected_path = tmp_path / "alert-control.json"
+    observed_paths = []
+
+    def control_with_external_silence(path):
+        observed_paths.append(path)
+        if path != expected_path:
+            return {"notifications_enabled": False, "reason": "operator_silence"}
+        return read_control(path)
+
+    monkeypatch.setattr(watchdog_module, "read_alert_control", control_with_external_silence)
+    watchdog = build_watchdog(tmp_path, current=current)
+
+    watchdog.run_once(synthetic=Incident(
+        "test", "critical", "title", "message", ("ETH", "test"),
+    ))
+
+    assert len(watchdog.feishu.messages) == 1
+    assert observed_paths and set(observed_paths) == {expected_path}
+    assert watchdog.remote_publisher.enabled is False
 
 
 def test_watchdog_raises_wti_data_loss_incident_without_changing_eth_state(tmp_path) -> None:
@@ -889,12 +940,7 @@ def test_critical_incident_falls_back_to_bark_only_when_primary_paths_fail(
     telegram.failures_remaining = 1
     watchdog = RiskWakeupWatchdog(
         config=config(),
-        state_path=tmp_path / "state.json",
-        risk_health_path=tmp_path / "risk.json",
-        metrics_path=tmp_path / "metrics.jsonl",
-        watchdog_state_path=tmp_path / "watchdog.json",
-        watchdog_health_path=tmp_path / "health.json",
-        watchdog_control_path=tmp_path / "control.json",
+        **isolated_watchdog_paths(tmp_path),
         bark=bark,
         feishu=feishu,
         telegram=telegram,
@@ -977,12 +1023,7 @@ def test_telegram_acknowledgement_stops_failed_channel_retries(tmp_path) -> None
     telegram = FakeTelegram()
     watchdog = RiskWakeupWatchdog(
         config=config(channel_retry_seconds=10),
-        state_path=tmp_path / "state.json",
-        risk_health_path=tmp_path / "risk.json",
-        metrics_path=tmp_path / "metrics.jsonl",
-        watchdog_state_path=tmp_path / "watchdog.json",
-        watchdog_health_path=tmp_path / "health.json",
-        watchdog_control_path=tmp_path / "control.json",
+        **isolated_watchdog_paths(tmp_path),
         bark=bark,
         feishu=feishu,
         telegram=telegram,
@@ -1033,13 +1074,7 @@ def test_telegram_global_silence_persists_and_stops_delivery(tmp_path) -> None:
     telegram = FakeTelegram()
     watchdog = RiskWakeupWatchdog(
         config=config(channel_retry_seconds=10),
-        state_path=tmp_path / "state.json",
-        risk_health_path=tmp_path / "risk.json",
-        metrics_path=tmp_path / "metrics.jsonl",
-        watchdog_state_path=tmp_path / "watchdog.json",
-        watchdog_health_path=tmp_path / "health.json",
-        watchdog_control_path=tmp_path / "control.json",
-        alert_control_path=tmp_path / "alert-control.json",
+        **isolated_watchdog_paths(tmp_path),
         bark=bark,
         feishu=feishu,
         telegram=telegram,
@@ -1085,12 +1120,7 @@ def test_severity_escalation_realerts_after_acknowledgement(tmp_path) -> None:
     telegram = FakeTelegram()
     watchdog = RiskWakeupWatchdog(
         config=config(channel_retry_seconds=10),
-        state_path=tmp_path / "state.json",
-        risk_health_path=tmp_path / "risk.json",
-        metrics_path=tmp_path / "metrics.jsonl",
-        watchdog_state_path=tmp_path / "watchdog.json",
-        watchdog_health_path=tmp_path / "health.json",
-        watchdog_control_path=tmp_path / "control.json",
+        **isolated_watchdog_paths(tmp_path),
         bark=bark,
         feishu=feishu,
         telegram=telegram,
