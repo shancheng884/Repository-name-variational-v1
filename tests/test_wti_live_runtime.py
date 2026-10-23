@@ -829,6 +829,230 @@ def test_single_round_pilot_finishes_only_after_confirmed_flat_state():
     assert runtime.entry_gate_block_reason == "single_round_pilot_completed"
 
 
+@pytest.mark.parametrize("pilot_status", ["completed", "exhausted"])
+def test_management_keeps_collector_and_forwarder_after_pilot_finishes(pilot_status):
+    runtime = _runtime_for_entry_gate(allow_unqualified=False)
+    runtime.args.manage_existing_wti_position = True
+    runtime.manage_existing_only = True
+    runtime.stop = False
+    runtime.collector = SimpleNamespace(request_stop=lambda: pytest.fail("collector must keep running"))
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "single_round_pilot": {"status": pilot_status, "completed_roundtrips": 1},
+    }
+    assert runtime._finish_single_round_pilot_if_done(state)
+    assert runtime.stop is False
+    assert runtime.entry_authorized is False
+
+
+def test_resumed_bounded_pilot_still_stops_after_one_round():
+    runtime = _runtime_for_entry_gate(allow_unqualified=True)
+    runtime.args.manage_existing_wti_position = False
+    runtime.manage_existing_only = True
+    runtime.stop = False
+    runtime.collector = SimpleNamespace(request_stop=lambda: None)
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "single_round_pilot": {"status": "completed", "completed_roundtrips": 1},
+    }
+    assert runtime._finish_single_round_pilot_if_done(state)
+    assert runtime.stop is True
+
+
+@pytest.mark.parametrize("exposure", [False, True])
+def test_management_initialization_is_entry_disabled_even_after_already_flattened(
+    monkeypatch, tmp_path, exposure,
+):
+    import lighter.signer_client
+    from tools import wti_account_probe
+    from tools.lib import wti_readonly_adapter
+
+    class Signer:
+        def __init__(self, **_kwargs):
+            pass
+
+        def check_client(self):
+            return None
+
+    class Forwarder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+    collector = SimpleNamespace(latest_sample=None)
+    runtime = _runtime_with_real_executor(tmp_path, collector, _FlatLoopGateway())
+    runtime.args.manage_existing_wti_position = True
+    runtime.args.confirm_bounded_live_pilot = False
+    runtime.args.allow_unqualified_data_pilot = False
+    state = runtime.pilot_store.load()
+    if exposure:
+        state.update(status="manual_review_required", pending_action={"kind": "close"})
+    runtime.pilot_store.save(state)
+    before = runtime.args.state_path.read_bytes()
+
+    async def readiness():
+        runtime.readiness = {"ready": False, "market_data_ready": False}
+
+    market = {
+        "market_id": 145, "symbol": "WTI", "market_type": "perp", "status": "active",
+        "multiplier": Decimal("1"), "supported_size_decimals": 3,
+        "supported_price_decimals": 3, "min_base_amount": "0.001", "min_quote_amount": "1",
+    }
+    runtime._load_startup_readiness = readiness
+    monkeypatch.setenv("LIGHTER_ACCOUNT_INDEX", "1")
+    monkeypatch.setenv("LIGHTER_API_KEY_INDEX", "2")
+    monkeypatch.setenv("API_KEY_PRIVATE_KEY", "test-only-not-used")
+    monkeypatch.setattr(lighter.signer_client, "SignerClient", Signer)
+    monkeypatch.setattr(wti_account_probe, "fetch_lighter_market_metadata", lambda *_args, **_kwargs: market)
+    monkeypatch.setattr(wti_readonly_adapter, "VariationalForwarderClient", Forwarder)
+    asyncio.run(runtime._initialize_execution())
+    assert runtime.manage_existing_only is True
+    assert runtime.args.state_path.read_bytes() == before
+    assert runtime.entry_authorized is False
+
+
+def test_full_run_recovers_real_0198_close_once_then_continues_collecting(monkeypatch, tmp_path):
+    class Gateway(_FlatLoopGateway):
+        def __init__(self):
+            super().__init__()
+            self.var_qty = Decimal("0")
+            self.lighter_qty = Decimal("0")
+            self.requests = []
+            self.lose_var_close_reply = False
+
+        def read_account(self):
+            snapshot = super().read_account()
+            snapshot["variational_positions"]["positions"] = [{
+                "instrument": {"underlying": "USOILP", "instrument_type": "swap",
+                               "kind": "commodity", "settlement_asset": "USDC", "funding_interval_s": 0},
+                "qty": str(self.var_qty),
+            }]
+            snapshot["lighter_positions"]["accounts"][0]["positions"] = [{
+                "market_id": 145, "symbol": "WTI", "position": str(abs(self.lighter_qty)),
+                "sign": 1 if self.lighter_qty >= 0 else -1,
+            }]
+            return snapshot
+
+        def submit_order(self, request):
+            self.requests.append(dict(request))
+            qty = Decimal(request["qty"])
+            signed = qty if request["side"] == "buy" else -qty
+            if request["venue"] == "variational":
+                self.var_qty += signed
+                if self.lose_var_close_reply and request["reduce_only"]:
+                    return {"ok": False, "final": False, "status": "unknown"}
+            else:
+                self.lighter_qty += signed
+            return {
+                "ok": True, "final": True, "status": "filled", "filled_qty": str(qty),
+                "order_id": f"order-{len(self.requests)}", "client_order_id": request["client_order_id"],
+                "average_price": request["reference_price"],
+            }
+
+        def lookup_order(self, *_args, **_kwargs):
+            return {"ok": False, "final": False, "status": "unknown"}
+
+    class Collector:
+        latest_sample = None
+        stopped = False
+        frames = 0
+
+        def __init__(self):
+            self.closing = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat()
+
+        def sample(self, *, var_qty=None, lighter_qty=None):
+            self.frames += 1
+            row = _live_sample(datetime.now(timezone.utc), sample_id=f"recovery-{self.frames}")
+            row.update({
+                "var_bid": "100.420", "var_ask": "100.426",
+                "lighter_bid": "100.800", "lighter_ask": "100.810",
+                "lighter_buy_price": "100.810", "lighter_sell_price": "100.800",
+                "long_edge_bps": "38", "short_edge_bps": "-39",
+                "variational_qty": str(var_qty or "0.195"),
+                "lighter_qty": str(lighter_qty or "0.195"),
+                "lighter_supported_size_decimals": 3, "lighter_supported_price_decimals": 3,
+                "session_closing_at": self.closing,
+            })
+            return row
+
+        async def collect_fresh_sample(self, **kwargs):
+            self.latest_sample = self.sample(**kwargs)
+            return dict(self.latest_sample)
+
+        async def run(self):
+            while not self.stopped:
+                await self.collect_fresh_sample()
+                if processed:
+                    self.kept_collecting_after_flat = True
+                    runtime.request_stop()
+                await asyncio.sleep(0.02)
+
+        def request_stop(self):
+            self.stopped = True
+
+    processed = []
+    gateway, collector = Gateway(), Collector()
+    runtime = _runtime_with_real_executor(tmp_path, collector, gateway)
+    runtime.args.manage_existing_wti_position = True
+    runtime.args.confirm_bounded_live_pilot = False
+    runtime.args.allow_unqualified_data_pilot = False
+    runtime.args.forwarder_ws_port = runtime.args.forwarder_rest_port = runtime.args.forwarder_command_port = 0
+    runtime.manage_existing_only = True
+    runtime.executor = wti_live.WTIPairExecutor(
+        state_path=runtime.args.state_path, gateway=gateway, max_slippage_bps=Decimal("8"),
+        market_reader=lambda: collector.sample(),
+        market_reader_for_qty=lambda v, l: collector.sample(var_qty=v, lighter_qty=l),
+        expected_lighter_market_id=145, expected_lighter_multiplier=Decimal("1"),
+        expected_lighter_size_decimals=3, expected_lighter_price_decimals=3,
+        max_notional_usd=Decimal("20"),
+    )
+    pilot = runtime.single_round_pilot
+    reservation = runtime.pilot_store.reserve_single_round_pilot_entry(pilot["pilot_id"])
+    sample = collector.sample(var_qty=Decimal("0.198"), lighter_qty=Decimal("0.198"))
+    opened = runtime.executor.open(
+        sample=sample, direction="long_var_short_lighter", notional_usd=Decimal("19.9"),
+        session=wti_live._session_window(sample, datetime.now(timezone.utc), 1800),
+        pilot_id=pilot["pilot_id"], pilot_reservation_id=reservation,
+    )
+    assert opened["open_position"]["var_qty"] == "0.198"
+    gateway.lose_var_close_reply = True
+    interrupted = runtime.executor.close(
+        sample=sample, session=wti_live._session_window(sample, datetime.now(timezone.utc), 1800),
+    )
+    assert interrupted["status"] == "manual_review_required"
+    assert gateway.var_qty == 0 and gateway.lighter_qty == Decimal("-0.198")
+    real_process_sample = runtime._process_sample
+
+    async def initialize():
+        assert len(runtime.servers) == 3
+        assert all(server.sockets for server in runtime.servers)
+
+    async def process(row):
+        result = await real_process_sample(row)
+        assert runtime.stop is False
+        processed.append(result["status"])
+        return result
+
+    runtime._initialize_execution = initialize
+    runtime._process_sample = process
+    monkeypatch.setattr(wti_live, "validate_startup_preconditions", lambda _args: None)
+    asyncio.run(asyncio.wait_for(runtime.run(), timeout=8))
+    recovered = runtime.pilot_store.load()
+    assert processed == ["flat"]
+    assert collector.kept_collecting_after_flat
+    assert recovered["status"] == "flat" and recovered["pending_action"] is None
+    assert recovered["single_round_pilot"]["completed_roundtrips"] == 1
+    assert gateway.var_qty == gateway.lighter_qty == 0
+    assert len(gateway.requests) == 4
+    assert gateway.requests[-1]["venue"] == "lighter"
+    assert gateway.requests[-1]["side"] == "buy"
+    assert gateway.requests[-1]["qty"] == "0.198"
+    assert gateway.requests[-1]["reduce_only"] is True
+    assert runtime.entry_authorized is False
+
+
 def test_unqualified_pilot_does_not_bypass_live_account_risk_block(monkeypatch):
     now = datetime.now(timezone.utc)
     row = _live_sample(now)

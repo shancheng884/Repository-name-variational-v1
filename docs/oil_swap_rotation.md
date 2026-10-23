@@ -187,6 +187,31 @@ future heartbeats, and unverified session sources still block execution.
 
 ## Readiness Audit
 
+For Linux management takeover, use
+`python tools/wti_takeover.py --execute --confirm-eth-flat --i-understand-live-orders`.
+Without `--execute` the command only reports local state and process identities.
+The helper recognizes both relative and absolute Python command paths, excludes
+tmux wrapper processes, accepts zero or one existing WTI runtime, and refuses
+multiple runtimes or a running ETH strategy. It sends only SIGTERM and refuses
+to force-kill a runtime that has not exited. A nonblocking lock serializes
+takeovers, and occupied forwarder ports block a new start.
+
+The WTI runtime owns its forwarder and collector. Stopping it also closes
+8766-8768, so an account probe cannot verify the account in the interval between
+stop and restart. The helper starts the management runtime first; that runtime
+then reconnects the extension, performs fresh account/order reconciliation, and
+applies the existing execution guards. It does not delete state or submit orders
+itself. Success requires a new PID/run heartbeat, reconciled flat or open state,
+no pending action, entry authorization disabled, and fresh collector samples
+from the same process. A timeout prints the current blocking diagnostics and
+leaves the new runtime running; it does not repeatedly restart or resubmit.
+
+Explicit existing-position management also accepts an already-flat local state
+so that recovery is safe to repeat after a completed close. It never initializes
+a new entry pilot. After a completed/exhausted pilot is flat, management mode
+keeps the collector and forwarder alive with entries disabled. The separate
+bounded-entry pilot retains its existing stop-after-one-round behavior.
+
 Run `python tools/oil_swap_readiness.py` against the WTI collector data. For a
 production-promotion audit, provide both `--lighter-market-id` and
 `--lighter-exposure-multiplier` using the current Lighter market metadata, never

@@ -331,7 +331,11 @@ class WTILiveRuntime:
                 or existing.get("pending_action") is not None
                 or existing.get("status") in {"pending", "manual_review_required", "open"}
             )
-            if local_exposure:
+            if self.args.manage_existing_wti_position:
+                # Management remains entry-disabled even if a previous run
+                # already flattened the account before this restart.
+                self.manage_existing_only = True
+            elif local_exposure:
                 pilot_owns_exposure = single_round_pilot_owns_exposure(existing)
                 if not self.readiness["ready"] and not (
                     self.args.manage_existing_wti_position or pilot_owns_exposure
@@ -486,7 +490,8 @@ class WTILiveRuntime:
             self.single_round_pilot = dict(pilot)
             self.entry_authorized = False
             self.entry_gate_block_reason = f"single_round_pilot_{pilot['status']}"
-            self.request_stop()
+            if not getattr(getattr(self, "args", None), "manage_existing_wti_position", False):
+                self.request_stop()
             return True
         return False
 

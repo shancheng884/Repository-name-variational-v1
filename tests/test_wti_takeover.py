@@ -1,0 +1,211 @@
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+import socket
+from types import SimpleNamespace
+
+import pytest
+
+from tools import wti_takeover as takeover
+
+
+def _state_files(root):
+    (root / ".env").touch()
+    (root / "log").mkdir(exist_ok=True)
+    (root / "log/live_inventory_state.json").write_text(json.dumps({
+        "asset": "ETH", "status": "flat", "open_lots": [], "pending_actions": [],
+    }))
+    (root / "log/wti_live_state.json").write_text(json.dumps({
+        "status": "manual_review_required", "pending_action": {"kind": "close"},
+    }))
+
+
+def test_process_identity_accepts_relative_and_absolute_python_but_not_tmux(monkeypatch, tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    commands = {
+        11: [".venv/bin/python", "tools/wti_live.py", "--mode", "live"],
+        12: [str(root / ".venv/bin/python"), str(root / "tools/wti_live.py")],
+        13: ["tmux", "new-session", "exec .venv/bin/python tools/wti_live.py"],
+        14: ["python", "tools/wti_live.py.backup"],
+        15: ["python", str(tmp_path / "other/tools/wti_live.py")],
+        16: ["python3.14", "-u", "-B", "tools/wti_live.py"],
+        17: ["python", "other_script.py", "tools/wti_live.py"],
+    }
+    for pid, argv in commands.items():
+        entry = proc / str(pid)
+        entry.mkdir()
+        (entry / "cmdline").write_bytes(b"\0".join(str(arg).encode() for arg in argv) + b"\0")
+    original_resolve = Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        return root if path.name == "cwd" else original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert takeover.runtime_processes(root, proc) == [11, 12, 16]
+
+
+@pytest.mark.parametrize("pids", [[], [1005477]])
+def test_takeover_accepts_stopped_or_relative_path_runtime_and_starts_before_account_checks(
+    monkeypatch, tmp_path, pids,
+):
+    _state_files(tmp_path)
+    (tmp_path / ".venv/bin").mkdir(parents=True)
+    (tmp_path / ".venv/bin/python").touch()
+    events = []
+    monkeypatch.setattr(takeover, "script_processes", lambda *_args: [])
+    reads = iter([pids, []])
+    monkeypatch.setattr(takeover, "runtime_processes", lambda *_args: next(reads))
+    monkeypatch.setattr(takeover.os, "kill", lambda pid, sig: events.append(("stop", pid)))
+    monkeypatch.setattr(takeover, "require_free_ports", lambda: events.append("ports_free"))
+
+    def run(command, **_kwargs):
+        events.append(command[:2])
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(takeover.subprocess, "run", run)
+
+    def status(*_args, **_kwargs):
+        assert ["tmux", "new-session"] in events
+        events.append("fresh_runtime_account_reconciled")
+        return {"recovered": True, "state": "flat", "pending": False}
+
+    monkeypatch.setattr(takeover, "recovery_status", status)
+    report = takeover.execute_takeover(tmp_path)
+    assert report["recovered"] is True
+    assert events.index("ports_free") < events.index(["tmux", "new-session"])
+    assert events[-1] == "fresh_runtime_account_reconciled"
+    assert (("stop", 1005477) in events) is bool(pids)
+    command = takeover.management_command(tmp_path)
+    assert "--manage-existing-wti-position" in command
+    assert "--confirm-bounded-live-pilot" not in command
+    assert "--allow-unqualified-data-pilot" not in command
+
+
+def test_duplicate_runtime_never_killed_or_restarted(monkeypatch, tmp_path):
+    monkeypatch.setattr(takeover, "runtime_processes", lambda *_args: [10, 11])
+    monkeypatch.setattr(takeover.os, "kill", lambda *_args: pytest.fail("must not kill"))
+    with pytest.raises(RuntimeError, match="multiple_wti_runtimes"):
+        takeover.stop_old_runtime(tmp_path)
+
+
+def test_shutdown_timeout_does_not_force_kill(monkeypatch, tmp_path):
+    monkeypatch.setattr(takeover, "runtime_processes", lambda *_args: [42])
+    signals = []
+    monkeypatch.setattr(takeover.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    with pytest.raises(RuntimeError, match="no_force_kill"):
+        takeover.stop_old_runtime(tmp_path, timeout=0)
+    assert signals == [(42, takeover.signal.SIGTERM)]
+
+
+def test_eth_runtime_blocks_takeover_before_stopping_wti(monkeypatch, tmp_path):
+    _state_files(tmp_path)
+    monkeypatch.setattr(takeover, "script_processes", lambda *_args: [41])
+    monkeypatch.setattr(takeover, "stop_old_runtime", lambda *_args: pytest.fail("must not stop WTI"))
+    with pytest.raises(RuntimeError, match="eth_runtime_still_running"):
+        takeover.execute_takeover(tmp_path)
+
+
+def test_busy_port_prevents_new_runtime(monkeypatch, tmp_path):
+    _state_files(tmp_path)
+    (tmp_path / ".venv/bin").mkdir(parents=True)
+    (tmp_path / ".venv/bin/python").touch()
+    monkeypatch.setattr(takeover, "script_processes", lambda *_args: [])
+    monkeypatch.setattr(takeover, "stop_old_runtime", lambda *_args: None)
+    commands = []
+    monkeypatch.setattr(takeover.subprocess, "run", lambda command, **_kwargs: commands.append(command))
+
+    def occupied():
+        raise RuntimeError("forwarder_port_unavailable:8768")
+
+    monkeypatch.setattr(takeover, "require_free_ports", occupied)
+    with pytest.raises(RuntimeError, match="port_unavailable"):
+        takeover.execute_takeover(tmp_path)
+    assert all("new-session" not in command for command in commands)
+
+
+def test_port_check_rejects_actual_listener_without_connecting(monkeypatch):
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        monkeypatch.setattr(takeover, "PORTS", (listener.getsockname()[1],))
+        with pytest.raises(RuntimeError, match="forwarder_port_unavailable"):
+            takeover.require_free_ports()
+
+
+def test_missing_env_does_not_stop_existing_runtime(monkeypatch, tmp_path):
+    _state_files(tmp_path)
+    (tmp_path / ".env").unlink()
+    (tmp_path / ".venv/bin").mkdir(parents=True)
+    (tmp_path / ".venv/bin/python").touch()
+    monkeypatch.setattr(takeover, "script_processes", lambda *_args: [])
+    monkeypatch.setattr(takeover.subprocess, "run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(takeover, "stop_old_runtime", lambda *_args: pytest.fail("must not stop"))
+    with pytest.raises(RuntimeError, match="workspace_env_missing"):
+        takeover.execute_takeover(tmp_path)
+
+
+@pytest.mark.parametrize("case", ["stale", "old_run", "old_pid", "pending", "entry_enabled", "wrong_mode"])
+def test_takeover_never_accepts_old_or_incomplete_health(monkeypatch, tmp_path, case):
+    _state_files(tmp_path)
+    health = {
+        "pid": 42, "run_id": "new-run", "updated_at": datetime.now(timezone.utc).isoformat(),
+        "status": "running", "startup_reconciled": True, "manage_existing_only": True,
+        "wti_entry_authorized": False,
+    }
+    if case != "pending":
+        (tmp_path / "log/wti_live_state.json").write_text(json.dumps({"status": "flat"}))
+    if case == "stale":
+        health["updated_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    elif case == "old_run":
+        health["run_id"] = "previous"
+    elif case == "old_pid":
+        health["pid"] = 41
+    elif case == "entry_enabled":
+        health["wti_entry_authorized"] = True
+    elif case == "wrong_mode":
+        health["manage_existing_only"] = False
+    (tmp_path / "log/wti_live_risk_health.json").write_text(json.dumps(health))
+    monkeypatch.setattr(takeover, "runtime_processes", lambda *_args: [42])
+    assert takeover.recovery_status(tmp_path, previous_run="previous")["recovered"] is False
+
+
+def test_wait_timeout_leaves_new_runtime_alive_and_reports_pending(monkeypatch, tmp_path):
+    _state_files(tmp_path)
+    (tmp_path / ".venv/bin").mkdir(parents=True)
+    (tmp_path / ".venv/bin/python").touch()
+    monkeypatch.setattr(takeover, "script_processes", lambda *_args: [])
+    monkeypatch.setattr(takeover, "stop_old_runtime", lambda *_args: None)
+    monkeypatch.setattr(takeover, "require_free_ports", lambda: None)
+    commands = []
+    monkeypatch.setattr(takeover.subprocess, "run", lambda command, **_kwargs: commands.append(command))
+    monkeypatch.setattr(takeover, "recovery_status", lambda *_args, **_kwargs: {
+        "recovered": False, "pending": True, "reason": "pending_order_terminal_status_unconfirmed",
+    })
+    report = takeover.execute_takeover(tmp_path, wait_seconds=0)
+    assert report["pending"] is True
+    assert report["reason"] == "pending_order_terminal_status_unconfirmed"
+    assert [command[1] for command in commands] == ["-V", "new-session"]
+
+
+@pytest.mark.parametrize("collector_pid", [41, 42])
+def test_success_requires_current_runtime_collection(monkeypatch, tmp_path, collector_pid):
+    _state_files(tmp_path)
+    (tmp_path / "log/wti_live_state.json").write_text(json.dumps({"status": "flat"}))
+    (tmp_path / "log/wti_live_risk_health.json").write_text(json.dumps({
+        "pid": 42, "run_id": "new", "updated_at": datetime.now(timezone.utc).isoformat(),
+        "status": "running", "startup_reconciled": True, "manage_existing_only": True,
+        "wti_entry_authorized": False,
+    }))
+    collector_root = tmp_path / "log/oil_swap/basis_samples"
+    collector_root.mkdir(parents=True)
+    (collector_root / "health.json").write_text(json.dumps({
+        "pid": collector_pid, "status": "running", "samples_this_run": 2,
+        "last_sample_at": datetime.now(timezone.utc).isoformat(),
+    }))
+    monkeypatch.setattr(takeover, "runtime_processes", lambda *_args: [42])
+    report = takeover.recovery_status(tmp_path, previous_run="previous")
+    assert report["recovered"] is (collector_pid == 42)
+    assert report["collecting"] is (collector_pid == 42)
