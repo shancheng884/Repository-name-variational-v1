@@ -297,6 +297,81 @@ def test_single_round_pilot_is_persisted_through_confirmed_open_close_and_restar
         )
 
 
+def test_explicit_new_pilot_archives_completed_budget_and_restart_never_renews_it(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    store = executor.store
+    config = {"entry_threshold_bps": "30", "exit_target_bps": "1"}
+    first = store.initialize_single_round_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, readiness={},
+    )
+    reservation = store.reserve_single_round_pilot_entry(first["pilot_id"])
+    _open(executor, pilot_id=first["pilot_id"], pilot_reservation_id=reservation)
+    executor.close(sample=_sample(), session=_session_for_sample(_sample()))
+    before = store.load()
+    assert before["single_round_pilot"]["status"] == "completed"
+    second = store.initialize_single_round_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, readiness={},
+        new_pilot_after=first["pilot_id"],
+    )
+    state = store.load()
+    assert second["pilot_id"] != first["pilot_id"]
+    assert second["previous_pilot_id"] == first["pilot_id"]
+    assert second["status"] == "available" and second["entry_attempts"] == 0
+    assert state["single_round_pilot_history"] == [before["single_round_pilot"]]
+    assert state["execution_history"] == before["execution_history"]
+    assert state["last_closed_position"] == before["last_closed_position"]
+    again = store.initialize_single_round_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, readiness={},
+        new_pilot_after=first["pilot_id"],
+    )
+    assert again == second
+    assert len(store.load()["single_round_pilot_history"]) == 1
+    reservation = store.reserve_single_round_pilot_entry(second["pilot_id"])
+    _open(executor, pilot_id=second["pilot_id"], pilot_reservation_id=reservation)
+    resumed = store.initialize_single_round_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, readiness={},
+        new_pilot_after=first["pilot_id"],
+    )
+    assert resumed["pilot_id"] == second["pilot_id"] and resumed["entry_attempts"] == 1
+    executor.close(sample=_sample(), session=_session_for_sample(_sample()))
+    after = store.path.read_bytes()
+    with pytest.raises(WTIExecutionError, match="already_completed"):
+        store.initialize_single_round_pilot(
+            market_id=145, multiplier=Decimal("1"), config=config, readiness={},
+            new_pilot_after=first["pilot_id"],
+        )
+    assert store.path.read_bytes() == after
+    assert len(gateway.requests) == 8
+
+
+@pytest.mark.parametrize("blocker", ["available", "open", "pending", "wrong_id", "market_changed"])
+def test_explicit_new_pilot_requires_exact_terminal_flat_predecessor(tmp_path, blocker):
+    executor, gateway = _executor(tmp_path)
+    store = executor.store
+    first = store.initialize_single_round_pilot(
+        market_id=145, multiplier=Decimal("1"), config={}, readiness={},
+    )
+    state = store.load()
+    state["single_round_pilot"]["status"] = "completed"
+    state["single_round_pilot"]["completed_roundtrips"] = 1
+    if blocker == "available":
+        state["single_round_pilot"]["status"] = "available"
+    elif blocker == "open":
+        state.update(status="open", open_position={"var_qty": "0.29"})
+    elif blocker == "pending":
+        state.update(status="pending", pending_action={"kind": "open"})
+    store.save(state)
+    before = store.path.read_bytes()
+    with pytest.raises(WTIExecutionError):
+        store.initialize_single_round_pilot(
+            market_id=146 if blocker == "market_changed" else 145, multiplier=Decimal("1"),
+            config={}, readiness={},
+            new_pilot_after="different-id" if blocker == "wrong_id" else first["pilot_id"],
+        )
+    assert store.path.read_bytes() == before
+    assert gateway.requests == []
+
+
 def test_single_round_pilot_entry_attempt_limit_persists(tmp_path):
     executor, _ = _executor(tmp_path)
     store = WTIExecutionStore(executor.store.path)

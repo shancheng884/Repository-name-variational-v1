@@ -859,9 +859,23 @@ def test_resumed_bounded_pilot_still_stops_after_one_round():
     assert runtime.stop is True
 
 
-@pytest.mark.parametrize("exposure", [False, True])
-def test_management_initialization_is_entry_disabled_even_after_already_flattened(
-    monkeypatch, tmp_path, exposure,
+def test_explicit_live_test_keeps_collecting_without_renewing_entry_budget():
+    runtime = _runtime_for_entry_gate(allow_unqualified=True)
+    runtime.args.keep_collecting_after_pilot = True
+    runtime.stop = False
+    runtime.collector = SimpleNamespace(request_stop=lambda: pytest.fail("collector must keep running"))
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "single_round_pilot": {"status": "completed", "completed_roundtrips": 1},
+    }
+    assert runtime._finish_single_round_pilot_if_done(state)
+    assert runtime.stop is False and runtime.entry_authorized is False
+    assert not runtime._sync_entry_authorization(state, _live_sample(datetime.now(timezone.utc)), now=datetime.now(timezone.utc))
+
+
+@pytest.mark.parametrize("scenario", ["manage_flat", "manage_exposure", "new_test", "resume_test", "wrong_test"])
+def test_initialization_handles_management_and_explicit_new_test_without_renewing_budget(
+    monkeypatch, tmp_path, scenario,
 ):
     import lighter.signer_client
     from tools import wti_account_probe
@@ -887,8 +901,24 @@ def test_management_initialization_is_entry_disabled_even_after_already_flattene
     runtime.args.confirm_bounded_live_pilot = False
     runtime.args.allow_unqualified_data_pilot = False
     state = runtime.pilot_store.load()
-    if exposure:
+    if scenario == "manage_exposure":
         state.update(status="manual_review_required", pending_action={"kind": "close"})
+    if scenario in {"new_test", "resume_test", "wrong_test"}:
+        runtime.args.manage_existing_wti_position = False
+        runtime.args.confirm_bounded_live_pilot = True
+        runtime.args.allow_unqualified_data_pilot = True
+        runtime.args.new_pilot_after = state["single_round_pilot"]["pilot_id"]
+        state["single_round_pilot"].update(status="completed", completed_roundtrips=1)
+    if scenario in {"resume_test", "wrong_test"}:
+        runtime.args.new_pilot_after = "exact-previous-test"
+        state["single_round_pilot"].update(
+            status="in_position", completed_roundtrips=0, previous_pilot_id="exact-previous-test",
+        )
+        state.update(status="open", open_position={
+            "single_round_pilot_id": state["single_round_pilot"]["pilot_id"],
+        })
+    if scenario == "wrong_test":
+        runtime.args.new_pilot_after = "wrong-previous-test"
     runtime.pilot_store.save(state)
     before = runtime.args.state_path.read_bytes()
 
@@ -907,9 +937,20 @@ def test_management_initialization_is_entry_disabled_even_after_already_flattene
     monkeypatch.setattr(lighter.signer_client, "SignerClient", Signer)
     monkeypatch.setattr(wti_account_probe, "fetch_lighter_market_metadata", lambda *_args, **_kwargs: market)
     monkeypatch.setattr(wti_readonly_adapter, "VariationalForwarderClient", Forwarder)
+    if scenario == "wrong_test":
+        with pytest.raises(RuntimeError, match="requires_flat_wti_state"):
+            asyncio.run(runtime._initialize_execution())
+        assert runtime.args.state_path.read_bytes() == before
+        return
     asyncio.run(runtime._initialize_execution())
-    assert runtime.manage_existing_only is True
-    assert runtime.args.state_path.read_bytes() == before
+    assert runtime.manage_existing_only is (scenario != "new_test")
+    if scenario == "new_test":
+        after = runtime.pilot_store.load()
+        assert after["single_round_pilot"]["previous_pilot_id"] == runtime.args.new_pilot_after
+        assert after["single_round_pilot"]["status"] == "available"
+        assert len(after["single_round_pilot_history"]) == 1
+    else:
+        assert runtime.args.state_path.read_bytes() == before
     assert runtime.entry_authorized is False
 
 

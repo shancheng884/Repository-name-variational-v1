@@ -331,6 +331,14 @@ class WTILiveRuntime:
                 or existing.get("pending_action") is not None
                 or existing.get("status") in {"pending", "manual_review_required", "open"}
             )
+            predecessor = getattr(self.args, "new_pilot_after", None)
+            current_pilot = existing.get("single_round_pilot") or {}
+            if predecessor and local_exposure and not (
+                current_pilot.get("previous_pilot_id") == predecessor
+                and current_pilot.get("pilot_id") != predecessor
+                and single_round_pilot_owns_exposure(existing)
+            ):
+                raise RuntimeError("new_single_round_pilot_requires_flat_wti_state")
             if self.args.manage_existing_wti_position:
                 # Management remains entry-disabled even if a previous run
                 # already flattened the account before this restart.
@@ -361,6 +369,7 @@ class WTILiveRuntime:
                     config=self._pilot_config(),
                     readiness=self.readiness,
                     max_entry_attempts=MAX_SINGLE_ROUND_PILOT_ENTRY_ATTEMPTS,
+                    new_pilot_after=getattr(self.args, "new_pilot_after", None),
                 )
             if not self.args.i_understand_live_orders:
                 raise RuntimeError("explicit_live_order_acknowledgement_required")
@@ -490,7 +499,9 @@ class WTILiveRuntime:
             self.single_round_pilot = dict(pilot)
             self.entry_authorized = False
             self.entry_gate_block_reason = f"single_round_pilot_{pilot['status']}"
-            if not getattr(getattr(self, "args", None), "manage_existing_wti_position", False):
+            args = getattr(self, "args", None)
+            if not (getattr(args, "manage_existing_wti_position", False)
+                    or getattr(args, "keep_collecting_after_pilot", False)):
                 self.request_stop()
             return True
         return False
@@ -968,6 +979,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--confirm-eth-flat", action="store_true")
     parser.add_argument("--i-understand-live-orders", action="store_true")
     parser.add_argument("--confirm-bounded-live-pilot", action="store_true")
+    parser.add_argument("--new-pilot-after", help="authorize one new round after this exact terminal pilot ID")
+    parser.add_argument("--keep-collecting-after-pilot", action="store_true")
     parser.add_argument(
         "--allow-unqualified-data-pilot",
         action="store_true",
@@ -996,6 +1009,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lighter-base-url", default=DEFAULT_LIGHTER_URL)
     parser.add_argument("--expected-lighter-market-id", type=int)
     args = parser.parse_args(argv)
+    if args.new_pilot_after and (args.mode != "live" or not args.confirm_bounded_live_pilot):
+        parser.error("new-pilot-after requires explicit bounded live pilot mode")
     if len({args.forwarder_ws_port, args.forwarder_rest_port, args.forwarder_command_port}) != 3:
         parser.error("forwarder ports must be distinct")
     if any(not 1 <= port <= 65535 for port in (

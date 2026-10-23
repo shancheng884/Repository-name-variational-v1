@@ -209,3 +209,63 @@ def test_success_requires_current_runtime_collection(monkeypatch, tmp_path, coll
     report = takeover.recovery_status(tmp_path, previous_run="previous")
     assert report["recovered"] is (collector_pid == 42)
     assert report["collecting"] is (collector_pid == 42)
+
+
+def test_new_live_test_launches_exact_completed_predecessor(monkeypatch, tmp_path):
+    _state_files(tmp_path)
+    (tmp_path / "log/wti_live_state.json").write_text(json.dumps({
+        "status": "flat", "single_round_pilot": {"pilot_id": "completed-id", "status": "completed"},
+    }))
+    (tmp_path / ".venv/bin").mkdir(parents=True)
+    (tmp_path / ".venv/bin/python").touch()
+    monkeypatch.setattr(takeover, "script_processes", lambda *_args: [])
+    monkeypatch.setattr(takeover, "stop_old_runtime", lambda *_args: None)
+    monkeypatch.setattr(takeover, "require_free_ports", lambda: None)
+    commands = []
+    monkeypatch.setattr(takeover.subprocess, "run", lambda command, **_kwargs: commands.append(command))
+
+    def status(*_args, **kwargs):
+        assert kwargs["new_pilot_after"] == "completed-id"
+        return {"recovered": True}
+
+    monkeypatch.setattr(takeover, "recovery_status", status)
+    assert takeover.execute_takeover(tmp_path, start_pilot=True)["recovered"]
+    launched = commands[-1][-1]
+    assert "--new-pilot-after completed-id" in launched
+    assert "--confirm-bounded-live-pilot" in launched
+    assert "--keep-collecting-after-pilot" in launched
+    assert "--manage-existing-wti-position" not in launched
+
+
+def test_new_test_does_not_restart_existing_pending_round(monkeypatch, tmp_path):
+    _state_files(tmp_path)
+    monkeypatch.setattr(takeover, "stop_old_runtime", lambda *_args: pytest.fail("must not stop"))
+    with pytest.raises(RuntimeError, match="terminal_previous_pilot_and_flat"):
+        takeover.execute_takeover(tmp_path, start_pilot=True)
+
+
+@pytest.mark.parametrize("authorized", [False, True])
+@pytest.mark.parametrize("risk_action", ["normal", "block_entry"])
+def test_new_live_test_acceptance_requires_actual_new_entry_authorization(monkeypatch, tmp_path, authorized, risk_action):
+    _state_files(tmp_path)
+    (tmp_path / "log/wti_live_state.json").write_text(json.dumps({
+        "status": "flat", "single_round_pilot": {
+            "pilot_id": "new-pilot", "previous_pilot_id": "old-pilot", "status": "available",
+        },
+    }))
+    (tmp_path / "log/wti_live_risk_health.json").write_text(json.dumps({
+        "pid": 42, "run_id": "new-run", "updated_at": datetime.now(timezone.utc).isoformat(),
+        "status": "running", "startup_reconciled": True,
+        "manage_existing_only": False, "wti_entry_authorized": authorized,
+        "risk_action": risk_action, "risk_data_complete": True,
+    }))
+    collector_root = tmp_path / "log/oil_swap/basis_samples"
+    collector_root.mkdir(parents=True)
+    (collector_root / "health.json").write_text(json.dumps({
+        "pid": 42, "status": "running", "samples_this_run": 3,
+        "last_sample_at": datetime.now(timezone.utc).isoformat(),
+    }))
+    monkeypatch.setattr(takeover, "runtime_processes", lambda *_args: [42])
+    report = takeover.recovery_status(tmp_path, previous_run="old-run", new_pilot_after="old-pilot")
+    assert report["recovered"] is (authorized and risk_action == "normal")
+    assert report["purpose"] == "single_round_live_test"

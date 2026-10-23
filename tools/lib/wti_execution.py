@@ -582,6 +582,7 @@ class WTIExecutionStore:
         config: dict[str, Any],
         readiness: dict[str, Any],
         max_entry_attempts: int = 3,
+        new_pilot_after: str | None = None,
     ) -> dict[str, Any]:
         """Create or resume one durable pilot; never reset its completed budget."""
         if not isinstance(max_entry_attempts, int) or max_entry_attempts < 1:
@@ -589,6 +590,30 @@ class WTIExecutionStore:
         with self.exclusive():
             state = self.load()
             pilot = state.get("single_round_pilot")
+            if new_pilot_after is not None:
+                if not isinstance(pilot, dict):
+                    raise WTIExecutionError("previous_single_round_pilot_missing")
+                if pilot.get("pilot_id") == new_pilot_after:
+                    if (
+                        state.get("status") != "flat" or state.get("open_position") is not None
+                        or state.get("pending_action") is not None
+                        or pilot.get("status") not in {"completed", "exhausted"}
+                        or pilot.get("schema_version") != 1
+                        or (pilot.get("status") == "completed" and pilot.get("completed_roundtrips") != 1)
+                        or (pilot.get("status") == "exhausted" and (
+                            pilot.get("completed_roundtrips") != 0
+                            or not isinstance(pilot.get("max_entry_attempts"), int)
+                            or pilot.get("max_entry_attempts", 0) < 1
+                            or pilot.get("entry_attempts") != pilot.get("max_entry_attempts")
+                        ))
+                        or pilot.get("market_id") != market_id
+                        or decimal_value(pilot.get("multiplier")) != multiplier
+                    ):
+                        raise WTIExecutionError("new_single_round_pilot_requires_terminal_flat_previous")
+                    state.setdefault("single_round_pilot_history", []).append(deepcopy(pilot))
+                    pilot = None
+                elif pilot.get("previous_pilot_id") != new_pilot_after:
+                    raise WTIExecutionError("previous_single_round_pilot_identity_mismatch")
             if pilot is None:
                 if (
                     state.get("status") != "flat"
@@ -610,6 +635,7 @@ class WTIExecutionStore:
                     "reservation_id": None,
                     "entry_action_id": None,
                     "started_at": _utc_now(),
+                    **({"previous_pilot_id": new_pilot_after} if new_pilot_after is not None else {}),
                 }
                 state["single_round_pilot"] = pilot
                 self.save(state)

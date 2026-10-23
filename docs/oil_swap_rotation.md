@@ -212,6 +212,19 @@ a new entry pilot. After a completed/exhausted pilot is flat, management mode
 keeps the collector and forwarder alive with entries disabled. The separate
 bounded-entry pilot retains its existing stop-after-one-round behavior.
 
+After a reconciled completed/exhausted test, explicitly authorize one more round
+with `python tools/wti_takeover.py --execute --start-pilot --confirm-eth-flat --i-understand-live-orders`.
+This preserves the previous pilot in `single_round_pilot_history` and all prior
+execution records. The new runtime receives `--new-pilot-after` with that exact
+previous pilot ID; restarting with the same ID resumes the same new budget and
+cannot renew it after completion. A pending, open, or nonterminal prior round
+blocks this operation. The new test uses the same 20 USD cap, 30 bps entry,
+1 bps exit target, 10 bps assumed roundtrip cost and 8 bps slippage cap. Historical
+data qualification is explicitly bypassed for this single test only; fresh
+account, orders, executable quantity/depth, session and risk checks still apply.
+`--keep-collecting-after-pilot` keeps collection alive after its entry budget
+finishes, with further entries disabled.
+
 Run `python tools/oil_swap_readiness.py` against the WTI collector data. For a
 production-promotion audit, provide both `--lighter-market-id` and
 `--lighter-exposure-multiplier` using the current Lighter market metadata, never
