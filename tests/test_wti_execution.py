@@ -408,6 +408,27 @@ def test_notional_cap_blocks_order_before_any_submit(tmp_path):
     assert gateway.requests == []
 
 
+def test_target_equal_to_cap_rounds_quantity_down_without_exceeding_cap(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    executor.max_notional_usd = Decimal("20")
+    opened = _open(executor)
+    assert opened["status"] == "open"
+    assert opened["open_position"]["var_qty"] == "0.28"
+    assert all(Decimal(r["qty"]) == Decimal("0.28") for r in gateway.requests)
+    assert Decimal("0.28") * Decimal("70.05") <= executor.max_notional_usd
+
+
+@pytest.mark.parametrize(
+    "minimums", [{"lighter_min_base_amount": "0.29"}, {"lighter_min_quote_amount": "20"}]
+)
+def test_cap_cannot_be_rounded_below_market_minimums(tmp_path, minimums):
+    executor, gateway = _executor(tmp_path)
+    executor.max_notional_usd = Decimal("20")
+    with pytest.raises(WTIExecutionError, match="rounded_order_exceeds_executor_notional_limit"):
+        _open(executor, sample=_sample(**minimums))
+    assert gateway.requests == []
+
+
 def test_stale_sample_and_unverified_session_never_submit(tmp_path):
     executor, gateway = _executor(tmp_path)
     now = datetime.now(timezone.utc)

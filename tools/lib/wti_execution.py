@@ -1231,7 +1231,21 @@ class WTIPairExecutor:
         reference = (context.lighter_bid + context.lighter_ask) / Decimal("2")
         planned_notional = lighter_qty * context.multiplier * reference
         if planned_notional > self.max_notional_usd:
-            raise WTIExecutionError("rounded_order_exceeds_executor_notional_limit")
+            # A target equal to the cap cannot be rounded up past that cap.
+            capped_steps = (
+                self.max_notional_usd / (reference * context.multiplier)
+                / context.lighter_qty_step
+            ).to_integral_value(rounding=ROUND_FLOOR)
+            lighter_qty = capped_steps * context.lighter_qty_step
+            var_qty = lighter_qty * context.multiplier
+            planned_notional = lighter_qty * context.multiplier * reference
+            if (
+                lighter_qty <= 0
+                or lighter_qty < context.lighter_min_base
+                or planned_notional < context.lighter_min_quote
+                or planned_notional > self.max_notional_usd
+            ):
+                raise WTIExecutionError("rounded_order_exceeds_executor_notional_limit")
         if context.quoted_var_qty < var_qty or context.quoted_lighter_qty < lighter_qty:
             raise WTIExecutionError("readonly_sample_depth_below_order_quantity")
         if not context.instrument or not paired_exposure_matches(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -192,6 +193,29 @@ def _live_sample(now: datetime, *, sample_id="sample-1"):
         "market_availability": "both_feeds_live",
         "lighter_continuity_ok": True,
         "logged_at": now.isoformat(),
+        "variational_underlying": "USOILP",
+        "variational_instrument_type": "swap",
+        "variational_instrument_kind": "commodity",
+        "variational_funding_interval_s": 0,
+        "lighter_symbol": "WTI",
+        "lighter_market_type": "perp",
+        "lighter_market_status": "active",
+        "lighter_market_id": 145,
+        "lighter_multiplier": "1",
+        "lighter_supported_size_decimals": 2,
+        "lighter_supported_price_decimals": 2,
+        "lighter_min_base_amount": "0.01",
+        "lighter_min_quote_amount": "1",
+        "variational_qty": "0.29",
+        "lighter_qty": "0.29",
+        "var_bid": "70",
+        "var_ask": "70.1",
+        "lighter_bid": "70.02",
+        "lighter_ask": "70.08",
+        "lighter_buy_price": "70.08",
+        "lighter_sell_price": "70.02",
+        "long_edge_bps": "0",
+        "short_edge_bps": "0",
         "var_quote_age_seconds": "0.2",
         "lighter_book_age_seconds": "0.2",
         "market_status": "open",
@@ -436,6 +460,285 @@ def test_run_defers_startup_reconcile_age_race_and_recovers_in_live_loop(
     assert runtime.startup_reconciled is True
     assert runtime.entry_authorization_permanently_revoked is False
     assert runtime.last_runtime_error is None
+
+
+class _FlatLoopGateway:
+    def __init__(self, *, delay=0):
+        self.delay = delay
+        self.read_calls = 0
+        self.after_read = None
+        self.latest_risk = {"risk_action": "normal", "risk_reason": "account_risk_normal"}
+
+    def read_account(self):
+        time.sleep(self.delay)
+        self.read_calls += 1
+        if self.after_read:
+            self.after_read(self.read_calls)
+        return {
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "variational_positions": {"ok": True, "positions": []},
+            "lighter_positions": {"code": 200, "accounts": [{"positions": []}]},
+            "active_orders": {"ok": True, "orders": []},
+        }
+
+    def set_current_notional(self, _value):
+        pass
+
+    def set_proposed_notional(self, _value):
+        pass
+
+    def submit_order(self, _request):
+        raise AssertionError("below-threshold samples must never submit")
+
+    def lookup_order(self, *_args, **_kwargs):
+        raise AssertionError("flat state has no orders to recover")
+
+
+def _runtime_with_real_executor(tmp_path, collector, gateway):
+    runtime = _runtime_for_entry_gate(allow_unqualified=True)
+    runtime.args = wti_live.parse_args([
+        "--mode", "live", "--confirm-eth-flat", "--i-understand-live-orders",
+        "--confirm-bounded-live-pilot", "--allow-unqualified-data-pilot",
+        "--expected-lighter-market-id", "145", "--entry-threshold-bps", "30",
+        "--exit-target-bps", "1", "--roundtrip-cost-bps", "10",
+        "--state-path", str(tmp_path / "wti-state.json"),
+        "--health-path", str(tmp_path / "wti-health.json"),
+        "--sample-root", str(tmp_path / "samples"),
+    ])
+    runtime.config = wti_live.build_replay_config(runtime.args)
+    runtime.logger = logging.getLogger("test_wti_real_loop")
+    runtime.collector = collector
+    runtime.collector_task = None
+    runtime.servers = []
+    runtime.account_client = None
+    runtime.signer_client = None
+    runtime.gateway = gateway
+    runtime.market_metadata = {"market_id": 145, "multiplier": Decimal("1")}
+    runtime.run_id = "test-real-loop"
+    runtime.stop = False
+    runtime.startup_reconciled = False
+    runtime.last_processed_sample_id = None
+    runtime.last_processed_sample_at = None
+    runtime.last_sample_gap_seconds = None
+    runtime.pending_gap_exit = False
+    runtime.last_risk = {}
+    runtime.last_action = {"action": "none"}
+    runtime.last_health_write_monotonic = 0
+    runtime.last_runtime_error = None
+    runtime.pilot_store = wti_live.WTIExecutionStore(runtime.args.state_path)
+    runtime.single_round_pilot = runtime.pilot_store.initialize_single_round_pilot(
+        market_id=145, multiplier=Decimal("1"),
+        config=runtime._pilot_config(), readiness=runtime.readiness,
+    )
+    runtime.executor = wti_live.WTIPairExecutor(
+        state_path=runtime.args.state_path, gateway=gateway,
+        max_slippage_bps=Decimal("8"),
+        market_reader=lambda: collector.latest_sample,
+        expected_lighter_market_id=145, expected_lighter_multiplier=Decimal("1"),
+        expected_lighter_size_decimals=2, expected_lighter_price_decimals=2,
+        max_notional_usd=Decimal("20"),
+    )
+    return runtime
+
+
+def test_run_keeps_collector_alive_during_slow_history_scan_and_reconciles_fresh_sample(
+    monkeypatch, tmp_path
+):
+    class StreamingCollector:
+        latest_sample = None
+        frames = 0
+        stopped = False
+
+        async def run(self):
+            while not self.stopped:
+                self.frames += 1
+                self.latest_sample = _live_sample(
+                    datetime.now(timezone.utc), sample_id=f"stream-{self.frames}"
+                )
+                await asyncio.sleep(0.05)
+
+        def request_stop(self):
+            self.stopped = True
+
+    collector = StreamingCollector()
+    gateway = _FlatLoopGateway()
+    runtime = _runtime_with_real_executor(tmp_path, collector, gateway)
+    scans = []
+
+    def slow_history(*_args, **_kwargs):
+        before = collector.frames
+        time.sleep(2.1)
+        scans.append(collector.frames - before)
+        return []
+
+    async def no_op():
+        pass
+
+    async def initialize():
+        loop = asyncio.get_running_loop()
+        gateway.after_read = lambda n: loop.call_soon_threadsafe(runtime.request_stop) if n == 2 else None
+        await runtime._load_startup_readiness()
+
+    runtime._start_forwarder = no_op
+    runtime._initialize_execution = initialize
+    monkeypatch.setattr(wti_live, "read_basis_samples", slow_history)
+    monkeypatch.setattr(wti_live, "validate_startup_preconditions", lambda _args: None)
+
+    async def run_bounded():
+        await asyncio.wait_for(runtime.run(), timeout=8)
+
+    asyncio.run(run_bounded())
+
+    assert len(scans) == 1
+    assert scans[0] >= 10
+    assert gateway.read_calls == 2
+    assert runtime.startup_reconciled is True
+    assert runtime.entry_authorized is True
+    assert runtime.last_action["reason"] == "entry_edge_below_threshold"
+    assert runtime.last_runtime_error is None
+    assert runtime.pilot_store.load()["single_round_pilot"]["entry_attempts"] == 0
+
+
+@pytest.mark.parametrize("quality", ["valid", "degraded"])
+def test_real_reconcile_refreshes_quote_after_slow_account_read(tmp_path, quality):
+    class RefreshingCollector:
+        latest_sample = _live_sample(datetime.now(timezone.utc))
+        refreshes = 0
+
+        async def collect_fresh_sample(self):
+            self.refreshes += 1
+            self.latest_sample = {
+                **_live_sample(datetime.now(timezone.utc), sample_id="after-account"),
+                "sample_quality": quality,
+            }
+            return self.latest_sample
+
+    collector = RefreshingCollector()
+    gateway = _FlatLoopGateway(delay=2.1)
+    runtime = _runtime_with_real_executor(tmp_path, collector, gateway)
+    row = dict(collector.latest_sample)
+    assert runtime._record_new_sample(row) is True
+
+    state = asyncio.run(runtime._process_sample(row))
+
+    assert state["status"] == "flat"
+    assert collector.refreshes == 1
+    assert runtime.last_reconcile_elapsed_ms >= 2000
+    assert runtime.entry_authorization_permanently_revoked is False
+    assert runtime.pilot_store.load()["single_round_pilot"]["entry_attempts"] == 0
+    if quality == "valid":
+        assert runtime.entry_authorized is True
+        assert runtime.last_action["reason"] == "entry_edge_below_threshold"
+    else:
+        assert runtime.entry_authorized is False
+        assert runtime.last_action["reason"] == "wti_current_sample_or_session_not_fresh"
+
+
+def test_real_strategy_executor_roundtrip_after_slow_account_read_stops_one_pilot(tmp_path):
+    class FillingGateway(_FlatLoopGateway):
+        def __init__(self):
+            super().__init__(delay=2.1)
+            self.var_qty = Decimal("0")
+            self.lighter_qty = Decimal("0")
+            self.requests = []
+            self.after_read = lambda _n: setattr(self, "delay", 0)
+
+        def read_account(self):
+            snapshot = super().read_account()
+            snapshot["variational_positions"]["positions"] = [{
+                "instrument": {
+                    "underlying": "USOILP", "instrument_type": "swap",
+                    "kind": "commodity", "settlement_asset": "USDC", "funding_interval_s": 0,
+                },
+                "qty": str(self.var_qty),
+            }]
+            snapshot["lighter_positions"]["accounts"][0]["positions"] = [{
+                "market_id": 145, "symbol": "WTI", "position": str(abs(self.lighter_qty)),
+                "sign": 1 if self.lighter_qty >= 0 else -1,
+            }]
+            return snapshot
+
+        def submit_order(self, request):
+            self.requests.append(dict(request))
+            qty = Decimal(request["qty"])
+            signed = qty if request["side"] == "buy" else -qty
+            if request["venue"] == "variational":
+                self.var_qty += signed
+            else:
+                self.lighter_qty += signed
+            return {
+                "ok": True, "final": True, "status": "filled",
+                "client_order_id": request["client_order_id"],
+                "order_id": f"order-{len(self.requests)}", "filled_qty": str(qty),
+                "average_price": request["reference_price"], "fee_usd": "0",
+                "trade_ids": [f"trade-{len(self.requests)}"],
+            }
+
+    class PairCollector:
+        phase = "entry"
+        refreshes = 0
+        stopped = False
+
+        def __init__(self):
+            self.closing_at = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat()
+            self.latest_sample = self.sample()
+
+        def sample(self):
+            self.refreshes += 1
+            row = _live_sample(datetime.now(timezone.utc), sample_id=f"pair-{self.refreshes}")
+            row["session_closing_at"] = self.closing_at
+            if self.phase == "entry":
+                row.update({
+                    "lighter_bid": "70.5", "lighter_ask": "70.6",
+                    "lighter_sell_price": "70.5", "lighter_buy_price": "70.6",
+                    "long_edge_bps": "50",
+                })
+            else:
+                row.update({
+                    "var_bid": "70.45", "var_ask": "70.55",
+                    "lighter_bid": "70", "lighter_ask": "70.1",
+                    "lighter_sell_price": "70", "lighter_buy_price": "70.1",
+                })
+            return row
+
+        async def collect_fresh_sample(self):
+            self.latest_sample = self.sample()
+            return dict(self.latest_sample)
+
+        def request_stop(self):
+            self.stopped = True
+
+    collector = PairCollector()
+    gateway = FillingGateway()
+    runtime = _runtime_with_real_executor(tmp_path, collector, gateway)
+
+    async def roundtrip():
+        loop = asyncio.get_running_loop()
+        runtime.executor.market_reader = lambda: asyncio.run_coroutine_threadsafe(
+            collector.collect_fresh_sample(), loop
+        ).result(timeout=3)
+        first = dict(collector.latest_sample)
+        assert runtime._record_new_sample(first) is True
+        opened = await runtime._process_sample(first)
+        assert opened["status"] == "open"
+        assert opened["open_position"]["var_qty"] == "0.28"
+        assert runtime.stop is False
+        collector.phase = "exit"
+        exit_row = await collector.collect_fresh_sample()
+        assert runtime._record_new_sample(exit_row) is True
+        return await runtime._process_sample(exit_row)
+
+    closed = asyncio.run(roundtrip())
+
+    assert closed["status"] == "flat"
+    assert closed["pending_action"] is None
+    assert closed["single_round_pilot"]["completed_roundtrips"] == 1
+    assert closed["single_round_pilot"]["entry_attempts"] == 1
+    assert runtime.stop is True and collector.stopped is True
+    assert gateway.var_qty == gateway.lighter_qty == 0
+    assert len(gateway.requests) == 4
+    assert all(Decimal(r["qty"]) == Decimal("0.28") for r in gateway.requests)
+    assert [r["reduce_only"] for r in gateway.requests] == [False, False, True, True]
 
 
 def test_single_round_pilot_finishes_only_after_confirmed_flat_state():

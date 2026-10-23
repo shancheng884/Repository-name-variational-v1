@@ -261,6 +261,8 @@ class WTILiveRuntime:
         self.pilot_store: WTIExecutionStore | None = None
         self.single_round_pilot: dict[str, Any] | None = None
         self.entry_authorization_permanently_revoked = False
+        self.last_readiness_elapsed_ms: float | None = None
+        self.last_reconcile_elapsed_ms: float | None = None
 
     def request_stop(self, *_args: Any) -> None:
         self.stop = True
@@ -310,17 +312,10 @@ class WTILiveRuntime:
             account_index=account_index,
             api_private_keys={api_key_index: private_key},
         )
-        if self.signer_client.check_client() is not None:
+        if await asyncio.to_thread(self.signer_client.check_client) is not None:
             raise RuntimeError("lighter_signer_client_preflight_failed")
-        var_rows = read_basis_samples(
-            self.args.sample_root, limit=200000, asset_filter="WTI"
-        )
         if self.args.mode == "live":
-            self.readiness = readiness_for_new_entries(
-                var_rows,
-                market_id=market["market_id"],
-                multiplier=market["multiplier"],
-            )
+            await self._load_startup_readiness()
             store = WTIExecutionStore(self.args.state_path)
             existing = store.load()
             local_exposure = (
@@ -503,6 +498,15 @@ class WTILiveRuntime:
                 "reasons": [f"wti_readiness_recheck_failed:{type(exc).__name__}"],
             }
 
+    async def _load_startup_readiness(self) -> None:
+        started = time.monotonic()
+        await asyncio.to_thread(self._refresh_readiness)
+        self.last_readiness_elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+        self.logger.info(
+            "wti_startup_readiness_loaded elapsed_ms=%s",
+            self.last_readiness_elapsed_ms,
+        )
+
     @staticmethod
     def _position_notional(state: dict[str, Any], row: dict[str, Any] | None) -> Decimal:
         position = state.get("open_position") or {}
@@ -641,6 +645,9 @@ class WTILiveRuntime:
             ),
             "single_round_pilot": state.get("single_round_pilot"),
             "wti_entry_authorized": self.entry_authorized,
+            "startup_reconciled": self.startup_reconciled,
+            "readiness_elapsed_ms": getattr(self, "last_readiness_elapsed_ms", None),
+            "reconcile_elapsed_ms": getattr(self, "last_reconcile_elapsed_ms", None),
             "entry_gate_block_reason": self.entry_gate_block_reason,
             "last_sample_gap_seconds": self.last_sample_gap_seconds,
             "manage_existing_only": self.manage_existing_only,
@@ -668,19 +675,46 @@ class WTILiveRuntime:
 
     async def _read_reconcile(self, row: dict[str, Any]) -> dict[str, Any]:
         assert self.executor is not None
-        return await asyncio.to_thread(
-            lambda: self.executor.reconcile(sample=row, now=datetime.now(timezone.utc))
-        )
+        started = time.monotonic()
+        try:
+            return await asyncio.to_thread(
+                lambda: self.executor.reconcile(sample=row, now=datetime.now(timezone.utc))
+            )
+        finally:
+            self.last_reconcile_elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+
+    async def _decision_sample(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        if self._sample_health_fresh(row, datetime.now(timezone.utc)):
+            return row
+        latest = self.collector.latest_sample
+        if self._sample_health_fresh(latest, datetime.now(timezone.utc)):
+            candidate = dict(latest)
+        else:
+            candidate = await self.collector.collect_fresh_sample()
+        if self._record_new_sample(candidate) is False:
+            return None
+        if not self._sample_health_fresh(candidate, datetime.now(timezone.utc)):
+            return None
+        return candidate
 
     async def _process_sample(self, row: dict[str, Any]) -> dict[str, Any]:
         assert self.executor is not None and self.gateway is not None and self.config is not None
-        now = datetime.now(timezone.utc)
         state = await self._read_reconcile(row)
         self.last_risk = dict(self.gateway.latest_risk)
         if state.get("status") != "flat" and state.get("status") != "open":
             self.last_action = {"action": "reconcile", "reason": state.get("manual_review_reason") or state.get("status")}
             return state
         position = state.get("open_position")
+        decision_sample = await self._decision_sample(row)
+        if decision_sample is None:
+            self.entry_authorized = False
+            self.last_action = {
+                "action": "blocked_close" if position else "blocked_entry",
+                "reason": "wti_current_sample_or_session_not_fresh",
+            }
+            return state
+        row = decision_sample
+        now = datetime.now(timezone.utc)
         if position is None:
             self._sync_entry_authorization(state, row, now=now)
         else:
@@ -703,7 +737,9 @@ class WTILiveRuntime:
                 }
                 return state
             state = await asyncio.to_thread(
-                lambda: self.executor.close(sample=row, session=window, now=now)
+                lambda: self.executor.close(
+                    sample=row, session=window, now=datetime.now(timezone.utc)
+                )
             )
             if state.get("status") == "flat":
                 self.pending_gap_exit = False
@@ -732,7 +768,7 @@ class WTILiveRuntime:
                         session=window,
                         pilot_id=self.single_round_pilot["pilot_id"],
                         pilot_reservation_id=reservation_id,
-                        now=now,
+                        now=datetime.now(timezone.utc),
                     )
                 )
             except Exception:
@@ -772,7 +808,6 @@ class WTILiveRuntime:
                 sample = await self._wait_for_first_sample()
                 state = read_json(self.args.state_path)
                 if self._record_new_sample(dict(sample)) is True:
-                    self._refresh_readiness()
                     try:
                         state = await self._read_reconcile(dict(sample))
                     except WTIExecutionError as exc:
@@ -815,7 +850,6 @@ class WTILiveRuntime:
                     if new_valid_sample is True:
                         try:
                             if not self.startup_reconciled:
-                                self._refresh_readiness()
                                 state = await self._read_reconcile(dict(row))
                                 self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
                                 self.startup_reconciled = state.get("status") in {"flat", "open"}
@@ -830,7 +864,9 @@ class WTILiveRuntime:
                                 state = await self._process_sample(dict(row))
                             self._finish_single_round_pilot_if_done(state)
                             self.last_runtime_error = None
-                            self._write_health(state=state, row=row)
+                            self._write_health(
+                                state=state, row=self.collector.latest_sample or row
+                            )
                         except Exception as exc:
                             if _retryable_sample_validation_error(exc):
                                 self.entry_authorized = False
