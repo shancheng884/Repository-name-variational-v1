@@ -726,8 +726,9 @@ def test_real_strategy_executor_roundtrip_after_slow_account_read_stops_one_pilo
         def __init__(self):
             self.closing_at = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat()
             self.latest_sample = self.sample()
+            self.requested_sizes = []
 
-        def sample(self):
+        def sample(self, *, var_qty=None, lighter_qty=None):
             self.refreshes += 1
             row = _live_sample(datetime.now(timezone.utc), sample_id=f"pair-{self.refreshes}")
             row["session_closing_at"] = self.closing_at
@@ -742,11 +743,18 @@ def test_real_strategy_executor_roundtrip_after_slow_account_read_stops_one_pilo
                     "var_bid": "70.45", "var_ask": "70.55",
                     "lighter_bid": "70", "lighter_ask": "70.1",
                     "lighter_sell_price": "70", "lighter_buy_price": "70.1",
+                    "variational_qty": "0.27", "lighter_qty": "0.27",
                 })
+            if var_qty is not None:
+                row["variational_qty"] = str(var_qty)
+            if lighter_qty is not None:
+                row["lighter_qty"] = str(lighter_qty)
             return row
 
-        async def collect_fresh_sample(self):
-            self.latest_sample = self.sample()
+        async def collect_fresh_sample(self, *, var_qty=None, lighter_qty=None):
+            if var_qty is not None or lighter_qty is not None:
+                self.requested_sizes.append((var_qty, lighter_qty))
+            self.latest_sample = self.sample(var_qty=var_qty, lighter_qty=lighter_qty)
             return dict(self.latest_sample)
 
         def request_stop(self):
@@ -761,14 +769,19 @@ def test_real_strategy_executor_roundtrip_after_slow_account_read_stops_one_pilo
         runtime.executor.market_reader = lambda: asyncio.run_coroutine_threadsafe(
             collector.collect_fresh_sample(), loop
         ).result(timeout=3)
+        runtime.executor.market_reader_for_qty = lambda var_qty, lighter_qty: asyncio.run_coroutine_threadsafe(
+            collector.collect_fresh_sample(var_qty=var_qty, lighter_qty=lighter_qty), loop
+        ).result(timeout=3)
         first = dict(collector.latest_sample)
         assert runtime._record_new_sample(first) is True
         opened = await runtime._process_sample(first)
         assert opened["status"] == "open"
         assert opened["open_position"]["var_qty"] == "0.28"
         assert runtime.stop is False
+        collector.requested_sizes.clear()
         collector.phase = "exit"
         exit_row = await collector.collect_fresh_sample()
+        assert exit_row["variational_qty"] == exit_row["lighter_qty"] == "0.27"
         assert runtime._record_new_sample(exit_row) is True
         return await runtime._process_sample(exit_row)
 
@@ -783,6 +796,11 @@ def test_real_strategy_executor_roundtrip_after_slow_account_read_stops_one_pilo
     assert len(gateway.requests) == 4
     assert all(Decimal(r["qty"]) == Decimal("0.28") for r in gateway.requests)
     assert [r["reduce_only"] for r in gateway.requests] == [False, False, True, True]
+    assert collector.requested_sizes == [
+        (Decimal("0.28"), Decimal("0.28")),
+        (Decimal("0.28"), Decimal("0.28")),
+        (Decimal("0.28"), Decimal("0.28")),
+    ]
 
 
 def test_single_round_pilot_finishes_only_after_confirmed_flat_state():

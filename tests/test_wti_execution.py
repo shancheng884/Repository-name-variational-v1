@@ -1407,13 +1407,19 @@ def test_close_no_fill_reconciles_back_to_open_only_when_both_positions_match(tm
 def test_close_depth_below_position_is_rejected_before_submission(tmp_path):
     executor, gateway = _executor(tmp_path)
     assert _open(executor)["status"] == "open"
+    insufficient = _sample(variational_qty="0.1", lighter_qty="0.1")
+    executor.market_reader = lambda: insufficient
+    executor.market_reader_for_qty = lambda _var_qty, _lighter_qty: insufficient
     with pytest.raises(WTIExecutionError, match="readonly_sample_depth_below_close_quantity"):
         executor.close(
-            sample=_sample(variational_qty="0.1", lighter_qty="0.1"),
+            sample=insufficient,
             session=_session(),
             now=datetime.now(timezone.utc),
         )
     assert len(gateway.requests) == 2
+    state = executor.store.load()
+    assert state["status"] == "open"
+    assert state["pending_action"] is None
 
 
 def test_corrupt_state_is_not_overwritten(tmp_path):

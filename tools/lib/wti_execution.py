@@ -1540,11 +1540,24 @@ class WTIPairExecutor:
                 or decimal_value(position.get("multiplier")) != context.multiplier
             ):
                 raise WTIExecutionError("wti_market_metadata_changed_since_entry")
+            close_var_qty = Decimal(str(position["var_qty"]))
+            close_lighter_qty = Decimal(str(position["lighter_qty"]))
             if (
-                context.quoted_var_qty < Decimal(str(position["var_qty"]))
-                or context.quoted_lighter_qty < Decimal(str(position["lighter_qty"]))
+                context.quoted_var_qty < close_var_qty
+                or context.quoted_lighter_qty < close_lighter_qty
             ):
-                raise WTIExecutionError("readonly_sample_depth_below_close_quantity")
+                try:
+                    context = self._fresh_context(
+                        context,
+                        var_qty=close_var_qty,
+                        lighter_qty=close_lighter_qty,
+                    )
+                except WTIExecutionError as exc:
+                    if str(exc) == "readonly_sample_depth_below_order_quantity":
+                        raise WTIExecutionError(
+                            "readonly_sample_depth_below_close_quantity"
+                        ) from exc
+                    raise
             before = self._read(context)
             expected_open = (
                 Decimal(str(position["expected_var_qty"])),
