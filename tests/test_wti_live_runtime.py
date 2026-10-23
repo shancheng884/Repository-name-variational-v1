@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -210,6 +211,9 @@ def test_runtime_requires_current_dual_feed_and_verified_session_in_health():
     row = _live_sample(now)
     assert wti_live.WTILiveRuntime._sample_health_fresh(row, now)
     assert not wti_live.WTILiveRuntime._sample_health_fresh(
+        row, now + timedelta(seconds=2)
+    )
+    assert not wti_live.WTILiveRuntime._sample_health_fresh(
         {**row, "market_availability": "partial_or_unavailable"}, now
     )
     assert not wti_live.WTILiveRuntime._sample_health_fresh(
@@ -218,6 +222,30 @@ def test_runtime_requires_current_dual_feed_and_verified_session_in_health():
     assert not wti_live.WTILiveRuntime._sample_health_fresh(
         {**row, "lighter_continuity_ok": False}, now
     )
+
+
+def test_runtime_skips_sample_that_ages_past_executor_quote_limit():
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.last_processed_sample_id = None
+    runtime.last_processed_sample_at = None
+    runtime.last_sample_gap_seconds = None
+    runtime.pending_gap_exit = False
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.last_action = {}
+
+    now = datetime.now(timezone.utc)
+    aged = _live_sample(now - timedelta(seconds=0.5), sample_id="aged-quote")
+    aged["var_quote_age_seconds"] = "1.8"
+    assert runtime._record_new_sample(aged) is False
+    assert runtime.last_action["reason"] == "wti_current_sample_or_session_not_fresh"
+    assert runtime.entry_authorized is False
+    assert runtime.entry_authorization_permanently_revoked is False
+
+    assert runtime._record_new_sample(
+        _live_sample(now, sample_id="fresh-quote")
+    ) is True
 
 
 def test_runtime_revokes_entry_after_sample_gap_without_reprocessing_same_id():
@@ -317,6 +345,97 @@ def test_degraded_startup_sample_blocks_entry_then_recovers_on_valid_sample():
         },
     }
     assert runtime._sync_entry_authorization(state, valid, now=now)
+
+
+def test_run_defers_startup_reconcile_age_race_and_recovers_in_live_loop(
+    monkeypatch, tmp_path: Path
+):
+    now = datetime.now(timezone.utc)
+    first = _live_sample(now, sample_id="startup-sample")
+    following = _live_sample(now, sample_id="loop-sample")
+
+    class FakeCollector:
+        def __init__(self):
+            self.latest_sample = first
+            self.stopped = False
+
+        async def run(self):
+            await asyncio.sleep(0.1)
+            self.latest_sample = following
+            await asyncio.sleep(1.5)
+
+        def request_stop(self):
+            self.stopped = True
+
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.args = SimpleNamespace(
+        mode="live",
+        state_path=tmp_path / "wti-state.json",
+        health_path=tmp_path / "wti-health.json",
+        allow_unqualified_data_pilot=True,
+    )
+    runtime.args.state_path.write_text(json.dumps({
+        "status": "flat", "open_position": None, "pending_action": None,
+        "single_round_pilot": {"pilot_id": "pilot-1", "status": "available"},
+    }))
+    runtime.logger = logging.getLogger("test_wti_live_startup_race")
+    runtime.collector = FakeCollector()
+    runtime.collector_task = None
+    runtime.servers = []
+    runtime.account_client = None
+    runtime.signer_client = None
+    runtime.gateway = SimpleNamespace(latest_risk={})
+    runtime.readiness = {"ready": False, "market_data_ready": False}
+    runtime.run_id = "test-run"
+    runtime.stop = False
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.manage_existing_only = False
+    runtime.startup_reconciled = False
+    runtime.last_processed_sample_id = None
+    runtime.last_processed_sample_at = None
+    runtime.last_sample_gap_seconds = None
+    runtime.pending_gap_exit = False
+    runtime.last_risk = {}
+    runtime.last_action = {"action": "none"}
+    runtime.last_health_write_monotonic = 0.0
+    runtime.last_runtime_error = None
+    runtime.single_round_pilot = {"pilot_id": "pilot-1"}
+    reconciled_samples = []
+
+    async def no_op():
+        return None
+
+    async def first_sample():
+        return first
+
+    async def reconcile(row):
+        reconciled_samples.append(row["sample_id"])
+        if len(reconciled_samples) == 1:
+            raise wti_live.WTIExecutionError("variational_quote_stale_or_invalid")
+        return {
+            "status": "flat", "open_position": None, "pending_action": None,
+            "single_round_pilot": {
+                "pilot_id": "pilot-1", "status": "completed",
+                "completed_roundtrips": 1,
+            },
+        }
+
+    runtime._start_forwarder = no_op
+    runtime._initialize_execution = no_op
+    runtime._wait_for_first_sample = first_sample
+    runtime._refresh_readiness = lambda: None
+    runtime._read_reconcile = reconcile
+    runtime._sync_entry_authorization = lambda *_args, **_kwargs: False
+    monkeypatch.setattr(wti_live, "validate_startup_preconditions", lambda _args: None)
+
+    asyncio.run(runtime.run())
+
+    assert reconciled_samples == ["startup-sample", "loop-sample"]
+    assert runtime.startup_reconciled is True
+    assert runtime.entry_authorization_permanently_revoked is False
+    assert runtime.last_runtime_error is None
 
 
 def test_single_round_pilot_finishes_only_after_confirmed_flat_state():

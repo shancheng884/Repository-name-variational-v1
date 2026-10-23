@@ -39,7 +39,11 @@ from tools.lib.market_sessions import (  # noqa: E402
 )
 from tools.lib.oil_swap_readiness import assess_oil_readiness  # noqa: E402
 from tools.lib.runtime_files import read_json, write_json_atomic  # noqa: E402
-from tools.lib.wti_execution import WTIPairExecutor, WTIExecutionStore  # noqa: E402
+from tools.lib.wti_execution import (  # noqa: E402
+    WTIPairExecutor,
+    WTIExecutionError,
+    WTIExecutionStore,
+)
 from tools.lib.wti_live_gateway import WTIProductionGateway  # noqa: E402
 from tools.lib.wti_live_strategy import decide_wti_action  # noqa: E402
 from tools.lib.wti_replay import ReplayConfig  # noqa: E402
@@ -58,6 +62,16 @@ MIN_ENTRY_CUTOFF_SECONDS = 1800
 MAX_HOLD_SECONDS = 21600
 MAX_SLIPPAGE_BPS = Decimal("8")
 MAX_SINGLE_ROUND_PILOT_ENTRY_ATTEMPTS = 3
+RETRYABLE_SAMPLE_VALIDATION_ERRORS = frozenset({
+    "market_sample_stale_or_future",
+    "variational_quote_stale_or_invalid",
+    "lighter_book_stale_or_invalid",
+    "exchange_session_observation_unverified",
+})
+
+
+def _retryable_sample_validation_error(exc: BaseException) -> bool:
+    return isinstance(exc, WTIExecutionError) and str(exc) in RETRYABLE_SAMPLE_VALIDATION_ERRORS
 
 
 def _decimal(value: Any, name: str, *, minimum: Decimal, maximum: Decimal | None = None) -> Decimal:
@@ -502,6 +516,8 @@ class WTILiveRuntime:
     def _sample_health_fresh(row: dict[str, Any] | None, now: datetime) -> bool:
         if not isinstance(row, dict):
             return False
+        if now.tzinfo is None or now.utcoffset() is None:
+            return False
         try:
             at = datetime.fromisoformat(str(row.get("logged_at")).replace("Z", "+00:00"))
         except (TypeError, ValueError):
@@ -514,14 +530,19 @@ class WTILiveRuntime:
             book_age = Decimal(str(row.get("lighter_book_age_seconds")))
         except Exception:
             return False
+        elapsed = Decimal(str(max(0.0, age)))
+        current_quote_age = quote_age + elapsed
+        current_book_age = book_age + elapsed
         return (
             -5 <= age <= 20
             and row.get("sample_quality") == "valid"
             and row.get("market_availability") == "both_feeds_live"
             and row.get("lighter_continuity_ok") is True
             and session_observation_for_sample(row) is not None
-            and quote_age.is_finite() and Decimal("-1") <= quote_age <= Decimal("2")
-            and book_age.is_finite() and Decimal("0") <= book_age <= Decimal("2")
+            and quote_age.is_finite() and Decimal("-1") <= quote_age
+            and current_quote_age <= Decimal("2")
+            and book_age.is_finite() and Decimal("0") <= book_age
+            and current_book_age <= Decimal("2")
         )
 
     def _revoke_entry_authorization(self, reason: str) -> None:
@@ -539,6 +560,13 @@ class WTILiveRuntime:
             self.entry_authorized = False
             if not self.entry_authorization_permanently_revoked:
                 self.entry_gate_block_reason = "wti_sample_or_session_unverified"
+            return False
+        if not self._sample_health_fresh(row, datetime.now(timezone.utc)):
+            reason = "wti_current_sample_or_session_not_fresh"
+            self.last_action = {"action": "blocked", "reason": reason}
+            self.entry_authorized = False
+            if not self.entry_authorization_permanently_revoked:
+                self.entry_gate_block_reason = reason
             return False
         try:
             sample_at = datetime.fromisoformat(
@@ -742,29 +770,36 @@ class WTILiveRuntime:
             if self.args.mode == "live":
                 await self._initialize_execution()
                 sample = await self._wait_for_first_sample()
-                if (
-                    sample.get("sample_quality") == "valid"
-                    and session_observation_for_sample(sample) is not None
-                ):
+                state = read_json(self.args.state_path)
+                if self._record_new_sample(dict(sample)) is True:
                     self._refresh_readiness()
-                    state = await self._read_reconcile(sample)
-                    self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
-                    self.startup_reconciled = state.get("status") in {"flat", "open"}
-                    self._sync_entry_authorization(
-                        state, sample, now=datetime.now(timezone.utc)
-                    )
-                    self.last_processed_sample_id = str(sample.get("sample_id") or "") or None
-                    with contextlib.suppress(TypeError, ValueError):
-                        parsed_at = datetime.fromisoformat(
-                            str(sample.get("logged_at")).replace("Z", "+00:00")
+                    try:
+                        state = await self._read_reconcile(dict(sample))
+                    except WTIExecutionError as exc:
+                        if not _retryable_sample_validation_error(exc):
+                            raise
+                        self.entry_authorized = False
+                        if not self.entry_authorization_permanently_revoked:
+                            self.entry_gate_block_reason = "wti_current_sample_or_session_not_fresh"
+                        self.last_runtime_error = str(exc)
+                        self.last_action = {"action": "deferred", "reason": str(exc)}
+                        self.logger.warning("wti_startup_reconcile_deferred reason=%s", exc)
+                        self._write_health(state=state, row=sample, error=str(exc))
+                    else:
+                        self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
+                        self.startup_reconciled = state.get("status") in {"flat", "open"}
+                        self._sync_entry_authorization(
+                            state, sample, now=datetime.now(timezone.utc)
                         )
-                        if parsed_at.tzinfo is not None:
-                            self.last_processed_sample_at = parsed_at.astimezone(timezone.utc)
-                    self.last_action = {"action": "startup_reconcile", "status": state.get("status")}
-                    self._write_health(state=state, row=sample)
-                    self._finish_single_round_pilot_if_done(state)
+                        self.last_action = {"action": "startup_reconcile", "status": state.get("status")}
+                        self._write_health(state=state, row=sample)
+                        self._finish_single_round_pilot_if_done(state)
                 else:
-                    self._write_health(state=None, row=sample, error="initial_wti_sample_or_session_not_valid")
+                    self._write_health(
+                        state=state,
+                        row=sample,
+                        error=self.last_action.get("reason") or "initial_wti_sample_or_session_not_valid",
+                    )
                 self.logger.info(
                     "wti_live_started run_id=%s entries_authorized=%s manage_existing_only=%s readiness=%s",
                     self.run_id, self.entry_authorized, self.manage_existing_only, self.readiness,
@@ -797,11 +832,26 @@ class WTILiveRuntime:
                             self.last_runtime_error = None
                             self._write_health(state=state, row=row)
                         except Exception as exc:
-                            self.logger.exception("wti_strategy_cycle_failed error=%s", type(exc).__name__)
-                            self._revoke_entry_authorization("wti_strategy_cycle_requires_review")
-                            self.last_runtime_error = type(exc).__name__
-                            self.last_action = {"action": "blocked", "reason": type(exc).__name__}
-                            self._write_health(state=state, row=row, error=type(exc).__name__)
+                            if _retryable_sample_validation_error(exc):
+                                self.entry_authorized = False
+                                if not self.entry_authorization_permanently_revoked:
+                                    self.entry_gate_block_reason = "wti_current_sample_or_session_not_fresh"
+                                self.last_runtime_error = str(exc)
+                                self.last_action = {"action": "deferred", "reason": str(exc)}
+                                self.logger.warning(
+                                    "wti_strategy_cycle_deferred sample_id=%s reason=%s",
+                                    row.get("sample_id"), exc,
+                                )
+                                self._write_health(state=state, row=row, error=str(exc))
+                            else:
+                                self.logger.exception(
+                                    "wti_strategy_cycle_failed error=%s reason=%s",
+                                    type(exc).__name__, exc,
+                                )
+                                self._revoke_entry_authorization("wti_strategy_cycle_requires_review")
+                                self.last_runtime_error = type(exc).__name__
+                                self.last_action = {"action": "blocked", "reason": type(exc).__name__}
+                                self._write_health(state=state, row=row, error=type(exc).__name__)
                     elif new_valid_sample is False:
                         self._write_health(state=state, row=row)
                     elif time.monotonic() - self.last_health_write_monotonic >= 5:
