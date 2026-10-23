@@ -57,6 +57,7 @@ MAX_WTI_ENTRY_GAP_SECONDS = 120
 MIN_ENTRY_CUTOFF_SECONDS = 1800
 MAX_HOLD_SECONDS = 21600
 MAX_SLIPPAGE_BPS = Decimal("8")
+MAX_SINGLE_ROUND_PILOT_ENTRY_ATTEMPTS = 3
 
 
 def _decimal(value: Any, name: str, *, minimum: Decimal, maximum: Decimal | None = None) -> Decimal:
@@ -148,6 +149,8 @@ def readiness_for_new_entries(
     )
     return {
         "ready": report.ready_for_bounded_live_review,
+        "market_data_ready": report.market_data_ready,
+        "data_fresh": report.data_fresh,
         "production_ready": report.ready_for_production_rotation,
         "reasons": list(report.reasons),
         "session_count": report.session_count,
@@ -226,6 +229,9 @@ class WTILiveRuntime:
         self.last_action: dict[str, Any] = {"action": "none", "reason": "starting"}
         self.last_health_write_monotonic = 0.0
         self.last_runtime_error: str | None = None
+        self.pilot_store: WTIExecutionStore | None = None
+        self.single_round_pilot: dict[str, Any] | None = None
+        self.entry_authorization_permanently_revoked = False
 
     def request_stop(self, *_args: Any) -> None:
         self.stop = True
@@ -286,22 +292,50 @@ class WTILiveRuntime:
                 market_id=market["market_id"],
                 multiplier=market["multiplier"],
             )
-            existing = WTIExecutionStore(self.args.state_path).load()
+            store = WTIExecutionStore(self.args.state_path)
+            existing = store.load()
             local_exposure = (
                 existing.get("open_position") is not None
                 or existing.get("pending_action") is not None
                 or existing.get("status") in {"pending", "manual_review_required", "open"}
             )
-            if not self.readiness["ready"] and not local_exposure:
-                raise RuntimeError(
-                    "wti_new_entries_blocked_by_data_readiness:" + ",".join(self.readiness["reasons"])
+            if local_exposure:
+                pilot = existing.get("single_round_pilot") or {}
+                pending = existing.get("pending_action") or {}
+                pilot_owns_exposure = (
+                    pilot.get("pilot_id")
+                    and pilot.get("status") in {"entry_reserved", "in_position"}
+                    and (
+                        (existing.get("open_position") or {}).get("single_round_pilot_id")
+                        == pilot.get("pilot_id")
+                        or pending.get("single_round_pilot_id") == pilot.get("pilot_id")
+                    )
                 )
-            if not self.readiness["ready"]:
-                if not self.args.manage_existing_wti_position:
+                if not self.readiness["ready"] and not (
+                    self.args.manage_existing_wti_position or pilot_owns_exposure
+                ):
+                    raise RuntimeError("existing_wti_exposure_requires_explicit_management_mode")
+                if not self.args.manage_existing_wti_position and not pilot_owns_exposure:
                     raise RuntimeError("existing_wti_exposure_requires_explicit_management_mode")
                 self.manage_existing_only = True
-            if self.readiness["ready"] and not self.args.confirm_bounded_live_pilot:
-                raise RuntimeError("explicit_bounded_live_pilot_confirmation_required")
+            else:
+                if not self.args.confirm_bounded_live_pilot:
+                    raise RuntimeError("explicit_bounded_live_pilot_confirmation_required")
+                if (
+                    not self.readiness.get("market_data_ready", self.readiness["ready"])
+                    and not getattr(self.args, "allow_unqualified_data_pilot", False)
+                ):
+                    raise RuntimeError(
+                        "wti_new_entries_blocked_by_data_readiness:" + ",".join(self.readiness["reasons"])
+                    )
+                self.pilot_store = store
+                self.single_round_pilot = store.initialize_single_round_pilot(
+                    market_id=int(market["market_id"]),
+                    multiplier=Decimal(str(market["multiplier"])),
+                    config=self._pilot_config(),
+                    readiness=self.readiness,
+                    max_entry_attempts=MAX_SINGLE_ROUND_PILOT_ENTRY_ATTEMPTS,
+                )
             if not self.args.i_understand_live_orders:
                 raise RuntimeError("explicit_live_order_acknowledgement_required")
 
@@ -354,6 +388,70 @@ class WTILiveRuntime:
             max_notional_usd=self.args._validated_notional,
         )
         return market, {"account_index": account_index, "api_key_index": api_key_index}
+
+    def _pilot_config(self) -> dict[str, Any]:
+        assert self.config is not None
+        return {
+            "entry_threshold_bps": str(self.config.entry_threshold_bps),
+            "exit_target_bps": str(self.config.exit_target_bps),
+            "roundtrip_cost_bps": str(self.config.roundtrip_cost_bps),
+            "max_hold_seconds": self.config.max_hold_seconds,
+            "entry_cutoff_seconds": self.config.entry_cutoff_seconds,
+            "max_notional_usd": str(self.args._validated_notional),
+            "max_slippage_bps": str(self.args._validated_slippage),
+        }
+
+    def _sync_entry_authorization(
+        self, state: dict[str, Any], row: dict[str, Any], *, now: datetime
+    ) -> bool:
+        if (
+            self.args.mode != "live"
+            or self.entry_authorization_permanently_revoked
+            or self.manage_existing_only
+            or state.get("status") != "flat"
+            or state.get("open_position") is not None
+            or state.get("pending_action") is not None
+        ):
+            self.entry_authorized = False
+            return False
+        pilot = state.get("single_round_pilot") or {}
+        if (
+            not isinstance(pilot, dict)
+            or not self.single_round_pilot
+            or pilot.get("pilot_id") != self.single_round_pilot.get("pilot_id")
+            or pilot.get("status") != "available"
+            or pilot.get("completed_roundtrips") != 0
+            or pilot.get("entry_attempts", 0) >= pilot.get("max_entry_attempts", 0)
+        ):
+            self.entry_authorized = False
+            self.entry_gate_block_reason = "single_round_pilot_entry_budget_unavailable"
+            return False
+        fresh = self._sample_health_fresh(row, now)
+        qualified = bool(self.readiness.get("market_data_ready")) and fresh
+        unqualified_pilot = bool(
+            getattr(self.args, "allow_unqualified_data_pilot", False)
+        )
+        self.entry_authorized = fresh and (qualified or unqualified_pilot)
+        self.entry_gate_block_reason = None if self.entry_authorized else (
+            "wti_current_sample_or_session_not_fresh"
+            if not fresh else "wti_data_readiness_not_met"
+        )
+        return self.entry_authorized
+
+    def _finish_single_round_pilot_if_done(self, state: dict[str, Any]) -> bool:
+        pilot = state.get("single_round_pilot") or {}
+        if (
+            pilot.get("status") in {"completed", "exhausted"}
+            and state.get("status") == "flat"
+            and state.get("open_position") is None
+            and state.get("pending_action") is None
+        ):
+            self.single_round_pilot = dict(pilot)
+            self.entry_authorized = False
+            self.entry_gate_block_reason = f"single_round_pilot_{pilot['status']}"
+            self.request_stop()
+            return True
+        return False
 
     async def _wait_for_first_sample(self) -> dict[str, Any]:
         deadline = time.monotonic() + self.args.initial_sample_timeout_seconds
@@ -424,6 +522,7 @@ class WTILiveRuntime:
     def _revoke_entry_authorization(self, reason: str) -> None:
         self.entry_authorized = False
         self.entry_gate_block_reason = reason
+        self.entry_authorization_permanently_revoked = True
 
     def _record_new_sample(self, row: dict[str, Any]) -> bool | None:
         sample_id = str(row.get("sample_id") or "")
@@ -432,6 +531,7 @@ class WTILiveRuntime:
         self.last_processed_sample_id = sample_id
         if row.get("sample_quality") != "valid" or session_observation_for_sample(row) is None:
             self.last_action = {"action": "blocked", "reason": "wti_sample_or_session_unverified"}
+            self._revoke_entry_authorization("wti_sample_or_session_unverified")
             return False
         try:
             sample_at = datetime.fromisoformat(
@@ -494,7 +594,17 @@ class WTILiveRuntime:
             "pid": os.getpid(),
             "updated_at": now.isoformat(),
             "status": "running" if not self.stop else "stopped",
-            "execution_mode": "live_bounded" if self.args.mode == "live" else "observe_only",
+            "execution_mode": (
+                "live_single_round_pilot"
+                if self.args.mode == "live" and self.single_round_pilot
+                else "live_bounded" if self.args.mode == "live" else "observe_only"
+            ),
+            "historical_readiness_gate_bypassed": bool(
+                self.args.mode == "live"
+                and getattr(self.args, "allow_unqualified_data_pilot", False)
+                and not self.readiness.get("market_data_ready")
+            ),
+            "single_round_pilot": state.get("single_round_pilot"),
             "wti_entry_authorized": self.entry_authorized,
             "entry_gate_block_reason": self.entry_gate_block_reason,
             "last_sample_gap_seconds": self.last_sample_gap_seconds,
@@ -536,6 +646,10 @@ class WTILiveRuntime:
             self.last_action = {"action": "reconcile", "reason": state.get("manual_review_reason") or state.get("status")}
             return state
         position = state.get("open_position")
+        if position is None:
+            self._sync_entry_authorization(state, row, now=now)
+        else:
+            self.entry_authorized = False
         self.gateway.set_current_notional(self._position_notional(state, row))
         risk_action = str(self.last_risk.get("risk_action") or "block_entry")
         window = _session_window(row, now, self.config.entry_cutoff_seconds)
@@ -559,6 +673,7 @@ class WTILiveRuntime:
             if state.get("status") == "flat":
                 self.pending_gap_exit = False
             self.last_action = {"action": "close", "reason": decision["reason"], "status": state.get("status")}
+            self._finish_single_round_pilot_if_done(state)
             return state
         if (
             decision["action"] == "open"
@@ -567,6 +682,11 @@ class WTILiveRuntime:
             and risk_action in {"normal", "warning"}
             and window.allow_new_entries
         ):
+            assert self.pilot_store is not None and self.single_round_pilot is not None
+            reservation_id = await asyncio.to_thread(
+                self.pilot_store.reserve_single_round_pilot_entry,
+                self.single_round_pilot["pilot_id"],
+            )
             self.gateway.set_proposed_notional(self.args._validated_notional)
             try:
                 state = await asyncio.to_thread(
@@ -575,12 +695,25 @@ class WTILiveRuntime:
                         direction=decision["direction"],
                         notional_usd=self.args._validated_notional,
                         session=window,
+                        pilot_id=self.single_round_pilot["pilot_id"],
+                        pilot_reservation_id=reservation_id,
                         now=now,
                     )
                 )
+            except Exception:
+                state = await asyncio.to_thread(
+                    self.pilot_store.release_unsubmitted_single_round_pilot_entry,
+                    self.single_round_pilot["pilot_id"], reservation_id,
+                )
+                self._finish_single_round_pilot_if_done(state)
+                raise
             finally:
                 self.gateway.set_proposed_notional(None)
             self.last_risk = dict(self.gateway.latest_risk)
+            if state.get("status") == "open":
+                self.entry_authorized = False
+                self.entry_gate_block_reason = "single_round_pilot_position_open"
+            self._finish_single_round_pilot_if_done(state)
             self.last_action = {
                 "action": "open", "direction": decision["direction"],
                 "edge_bps": decision["edge_bps"], "status": state.get("status"),
@@ -609,12 +742,10 @@ class WTILiveRuntime:
                     self._refresh_readiness()
                     state = await self._read_reconcile(sample)
                     self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
-                    self.entry_authorized = bool(
-                        self.readiness.get("ready")
-                        and not self.manage_existing_only
-                        and state.get("status") in {"flat", "open"}
-                    )
                     self.startup_reconciled = state.get("status") in {"flat", "open"}
+                    self._sync_entry_authorization(
+                        state, sample, now=datetime.now(timezone.utc)
+                    )
                     self.last_processed_sample_id = str(sample.get("sample_id") or "") or None
                     with contextlib.suppress(TypeError, ValueError):
                         parsed_at = datetime.fromisoformat(
@@ -624,6 +755,7 @@ class WTILiveRuntime:
                             self.last_processed_sample_at = parsed_at.astimezone(timezone.utc)
                     self.last_action = {"action": "startup_reconcile", "status": state.get("status")}
                     self._write_health(state=state, row=sample)
+                    self._finish_single_round_pilot_if_done(state)
                 else:
                     self._write_health(state=None, row=sample, error="initial_wti_sample_or_session_not_valid")
                 self.logger.info(
@@ -645,10 +777,8 @@ class WTILiveRuntime:
                                 state = await self._read_reconcile(dict(row))
                                 self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
                                 self.startup_reconciled = state.get("status") in {"flat", "open"}
-                                self.entry_authorized = bool(
-                                    self.readiness.get("ready")
-                                    and not self.manage_existing_only
-                                    and self.startup_reconciled
+                                self._sync_entry_authorization(
+                                    state, dict(row), now=datetime.now(timezone.utc)
                                 )
                                 self.last_action = {
                                     "action": "startup_reconcile",
@@ -656,6 +786,7 @@ class WTILiveRuntime:
                                 }
                             else:
                                 state = await self._process_sample(dict(row))
+                            self._finish_single_round_pilot_if_done(state)
                             self.last_runtime_error = None
                             self._write_health(state=state, row=row)
                         except Exception as exc:
@@ -701,6 +832,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirm-eth-flat", action="store_true")
     parser.add_argument("--i-understand-live-orders", action="store_true")
     parser.add_argument("--confirm-bounded-live-pilot", action="store_true")
+    parser.add_argument(
+        "--allow-unqualified-data-pilot",
+        action="store_true",
+        help="allow one durable live round with unqualified history; current market/account guards still apply",
+    )
     parser.add_argument("--manage-existing-wti-position", action="store_true")
     parser.add_argument("--entry-threshold-bps", type=Decimal)
     parser.add_argument("--exit-target-bps", type=Decimal)
@@ -741,7 +877,9 @@ def build_parser() -> argparse.ArgumentParser:
             build_replay_config(args)
         except ValueError as exc:
             parser.error(str(exc))
-        if args.manage_existing_wti_position and args.confirm_bounded_live_pilot:
+        if args.manage_existing_wti_position and (
+            args.confirm_bounded_live_pilot or args.allow_unqualified_data_pilot
+        ):
             parser.error("choose either bounded entry pilot or existing-position management")
     return args
 

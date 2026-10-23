@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -81,6 +82,8 @@ def test_readiness_for_entries_keeps_three_session_sample_and_gap_rules(monkeypa
         captured.update(kwargs)
         return SimpleNamespace(
             ready_for_bounded_live_review=False,
+            market_data_ready=False,
+            data_fresh=True,
             ready_for_production_rotation=False,
             reasons=("not_enough_sessions",),
             session_count=1,
@@ -94,6 +97,8 @@ def test_readiness_for_entries_keeps_three_session_sample_and_gap_rules(monkeypa
         now=datetime(2026, 10, 23, tzinfo=timezone.utc),
     )
     assert report["ready"] is False
+    assert report["market_data_ready"] is False
+    assert report["data_fresh"] is True
     assert captured["minimum_sessions"] == 3
     assert captured["minimum_valid_samples_per_session"] == 1200
     assert captured["minimum_coverage_seconds"] == 21600
@@ -206,3 +211,114 @@ def test_runtime_keeps_entry_gate_when_sample_gap_is_within_existing_limit():
     ) is True
     assert runtime.entry_authorized is True
     assert runtime.entry_gate_block_reason is None
+
+
+def _runtime_for_entry_gate(*, allow_unqualified: bool):
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.args = SimpleNamespace(mode="live", allow_unqualified_data_pilot=allow_unqualified)
+    runtime.readiness = {"ready": False, "market_data_ready": False}
+    runtime.single_round_pilot = {"pilot_id": "pilot-1"}
+    runtime.manage_existing_only = False
+    runtime.entry_authorized = False
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    return runtime
+
+
+def test_unqualified_data_pilot_bypasses_history_only_with_fresh_verified_sample():
+    now = datetime.now(timezone.utc)
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "single_round_pilot": {
+            "pilot_id": "pilot-1", "status": "available",
+            "completed_roundtrips": 0, "entry_attempts": 0,
+            "max_entry_attempts": 3,
+        },
+    }
+    row = _live_sample(now)
+
+    ordinary = _runtime_for_entry_gate(allow_unqualified=False)
+    assert not ordinary._sync_entry_authorization(state, row, now=now)
+    assert ordinary.entry_gate_block_reason == "wti_data_readiness_not_met"
+
+    pilot = _runtime_for_entry_gate(allow_unqualified=True)
+    assert pilot._sync_entry_authorization(state, row, now=now)
+
+    stale = _runtime_for_entry_gate(allow_unqualified=True)
+    assert not stale._sync_entry_authorization(
+        state, {**row, "var_quote_age_seconds": "3"}, now=now
+    )
+    assert stale.entry_gate_block_reason == "wti_current_sample_or_session_not_fresh"
+
+
+def test_single_round_pilot_finishes_only_after_confirmed_flat_state():
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.stop = False
+    runtime.collector = SimpleNamespace(request_stop=lambda: setattr(runtime, "stop", True))
+    runtime.single_round_pilot = None
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+
+    open_state = {
+        "status": "open", "open_position": {"var_qty": "0.2"},
+        "pending_action": None,
+        "single_round_pilot": {"status": "completed", "completed_roundtrips": 1},
+    }
+    assert not runtime._finish_single_round_pilot_if_done(open_state)
+    assert runtime.stop is False
+
+    flat_state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "single_round_pilot": {"status": "completed", "completed_roundtrips": 1},
+    }
+    assert runtime._finish_single_round_pilot_if_done(flat_state)
+    assert runtime.stop is True
+    assert runtime.entry_authorized is False
+    assert runtime.entry_gate_block_reason == "single_round_pilot_completed"
+
+
+def test_unqualified_pilot_does_not_bypass_live_account_risk_block(monkeypatch):
+    now = datetime.now(timezone.utc)
+    row = _live_sample(now)
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "single_round_pilot": {
+            "pilot_id": "pilot-1", "status": "available",
+            "completed_roundtrips": 0, "entry_attempts": 0,
+            "max_entry_attempts": 3,
+        },
+    }
+
+    class NoEntryStore:
+        def reserve_single_round_pilot_entry(self, _pilot_id):
+            raise AssertionError("risk block must run before pilot reservation")
+
+    class RiskBlockedGateway:
+        latest_risk = {"risk_action": "block_entry", "risk_reason": "margin_block"}
+
+        def set_current_notional(self, _notional):
+            pass
+
+    runtime = _runtime_for_entry_gate(allow_unqualified=True)
+    runtime.config = SimpleNamespace(entry_cutoff_seconds=1800)
+    runtime.executor = object()
+    runtime.gateway = RiskBlockedGateway()
+    runtime.pilot_store = NoEntryStore()
+    runtime.single_round_pilot = {"pilot_id": "pilot-1"}
+    runtime.last_risk = {}
+    runtime.pending_gap_exit = False
+    runtime.last_action = {}
+
+    async def read_state(_row):
+        return state
+
+    runtime._read_reconcile = read_state
+    monkeypatch.setattr(
+        wti_live, "decide_wti_action",
+        lambda *_args, **_kwargs: {"action": "open", "direction": "long_var_short_lighter", "edge_bps": "8"},
+    )
+
+    result = asyncio.run(runtime._process_sample(row))
+    assert result is state
+    assert runtime.last_action["risk_action"] == "block_entry"
+    assert runtime.entry_authorized is True  # Data gate is clear; account risk still blocks submission.

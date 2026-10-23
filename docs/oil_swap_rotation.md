@@ -86,13 +86,25 @@ health file without enabling order submission. It owns the configured forwarder
 ports (8766-8768 by default) and cannot share those listeners with another
 process. Resolve a port conflict explicitly; do not kill an unknown process.
 
-Live mode requires explicit entry, exit, and cost thresholds selected from an
-accepted WTI replay, the current Lighter market ID, confirmation that local ETH
-state is flat, and explicit pilot/order acknowledgements. It refuses new entries
-unless the existing three-session readiness gate passes. The gate remains three
-qualified sessions, 1,200 valid samples and six hours of coverage per session,
-at most 120 seconds between samples, and at most 120 seconds of latest-sample
-age. These requirements are unchanged.
+Live mode requires explicit entry, exit, and cost thresholds, the current
+Lighter market ID, confirmation that local ETH state is flat, and explicit
+pilot/order acknowledgements. By default it still requires the existing
+three-session readiness gate: three qualified sessions, 1,200 valid samples
+and six hours of coverage per session, at most 120 seconds between samples,
+and at most 120 seconds of latest-sample age.
+
+For a deliberately unqualified-history trial, add
+`--allow-unqualified-data-pilot` together with
+`--confirm-bounded-live-pilot`. This bypasses only the historical session-count
+gate. Every entry still requires a fresh valid two-venue sample, verified open
+session, continuity within 120 seconds, exact instrument metadata, reconciled
+flat positions and passing live account-risk checks. The runner persists one
+pilot in `log/wti_live_state.json`, allows at most three entry attempts, and
+stops entry authorization permanently after one paired open/close confirmed
+flat. If a position or order is uncertain, it keeps reconciling and managing
+exposure; it does not treat the pilot as complete. Restarting with changed pilot
+thresholds or after completion is rejected. The readiness report remains
+unqualified and this mode is not production-rotation approval.
 
 The bounded pilot defaults to $20 notional and has a hard $25 maximum, an 8 bps
 maximum execution boundary, a six-hour maximum hold, and a minimum 30-minute

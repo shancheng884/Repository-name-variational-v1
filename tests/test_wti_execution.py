@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 
 from tools.lib.market_sessions import classify_usoil_session
-from tools.lib.wti_execution import WTIPairExecutor, WTIExecutionError
+from tools.lib.wti_execution import WTIPairExecutor, WTIExecutionError, WTIExecutionStore
 
 
 DIRECTION = "long_var_short_lighter"
@@ -191,7 +191,7 @@ def _executor(tmp_path, gateway=None, *, clock=None, sample=None):
     ), gateway
 
 
-def _open(executor, *, sample=None, session=None):
+def _open(executor, *, sample=None, session=None, pilot_id=None, pilot_reservation_id=None):
     now = datetime.now(timezone.utc)
     sample = sample or _sample(now=now)
     return executor.open(
@@ -199,6 +199,8 @@ def _open(executor, *, sample=None, session=None):
         direction=DIRECTION,
         notional_usd=Decimal("20"),
         session=session or _session_for_sample(sample),
+        pilot_id=pilot_id,
+        pilot_reservation_id=pilot_reservation_id,
         now=now,
     )
 
@@ -242,6 +244,98 @@ def test_full_open_close_uses_exact_contracts_reduce_only_and_confirmed_position
     assert var_evidence["trade_ids"] == ["trade-1"]
     assert var_evidence["fee_usd"] == "0.01"
     assert var_evidence["fee_confirmed"] is True
+
+
+def test_single_round_pilot_is_persisted_through_confirmed_open_close_and_restart(tmp_path):
+    executor, _ = _executor(tmp_path)
+    store = WTIExecutionStore(executor.store.path)
+    config = {
+        "entry_threshold_bps": "4", "exit_target_bps": "2",
+        "roundtrip_cost_bps": "3", "max_notional_usd": "20",
+    }
+    pilot = store.initialize_single_round_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config,
+        readiness={"ready": False, "session_count": 0},
+    )
+    reservation_id = store.reserve_single_round_pilot_entry(pilot["pilot_id"])
+
+    opened = _open(
+        executor, pilot_id=pilot["pilot_id"],
+        pilot_reservation_id=reservation_id,
+    )
+    assert opened["single_round_pilot"]["status"] == "in_position"
+    assert opened["single_round_pilot"]["entry_action_id"] == opened["open_position"]["entry_execution_id"]
+    assert opened["open_position"]["single_round_pilot_id"] == pilot["pilot_id"]
+
+    resumed = store.initialize_single_round_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config,
+        readiness={"ready": True, "session_count": 3},
+    )
+    assert resumed["pilot_id"] == pilot["pilot_id"]
+    assert resumed["status"] == "in_position"
+    assert resumed["entry_attempts"] == 1
+
+    now = datetime.now(timezone.utc)
+    closed = executor.close(sample=_sample(now=now), session=_session(now=now), now=now)
+    assert closed["status"] == "flat"
+    assert closed["single_round_pilot"]["status"] == "completed"
+    assert closed["single_round_pilot"]["completed_roundtrips"] == 1
+    assert closed["single_round_pilot"]["exit_action_id"] == closed["last_closed_position"]["exit_execution_id"]
+    with pytest.raises(WTIExecutionError, match="single_round_pilot_entry_budget_unavailable"):
+        store.reserve_single_round_pilot_entry(pilot["pilot_id"])
+    with pytest.raises(WTIExecutionError, match="single_round_pilot_already_completed"):
+        store.initialize_single_round_pilot(
+            market_id=145, multiplier=Decimal("1"), config=config,
+            readiness={"ready": True},
+        )
+
+
+def test_single_round_pilot_entry_attempt_limit_persists(tmp_path):
+    executor, _ = _executor(tmp_path)
+    store = WTIExecutionStore(executor.store.path)
+    config = {"entry_threshold_bps": "4", "exit_target_bps": "2"}
+    pilot = store.initialize_single_round_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config,
+        readiness={"ready": False}, max_entry_attempts=1,
+    )
+    reservation = store.reserve_single_round_pilot_entry(pilot["pilot_id"])
+    released = store.release_unsubmitted_single_round_pilot_entry(
+        pilot["pilot_id"], reservation
+    )
+    assert released["single_round_pilot"]["status"] == "exhausted"
+    assert released["single_round_pilot"]["entry_attempts"] == 1
+    with pytest.raises(WTIExecutionError, match="single_round_pilot_entry_attempts_exhausted"):
+        store.initialize_single_round_pilot(
+            market_id=145, multiplier=Decimal("1"), config=config,
+            readiness={"ready": True}, max_entry_attempts=1,
+        )
+
+
+def test_reconciled_close_completes_pilot_only_after_both_venues_are_flat(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    store = WTIExecutionStore(executor.store.path)
+    config = {"entry_threshold_bps": "4", "exit_target_bps": "2"}
+    pilot = store.initialize_single_round_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config,
+        readiness={"ready": False},
+    )
+    reservation = store.reserve_single_round_pilot_entry(pilot["pilot_id"])
+    assert _open(
+        executor, pilot_id=pilot["pilot_id"], pilot_reservation_id=reservation
+    )["status"] == "open"
+
+    gateway.fail_read_calls.add(gateway.read_calls + 2)
+    pending = executor.close(
+        sample=_sample(), session=_session(), now=datetime.now(timezone.utc)
+    )
+    assert pending["status"] == "manual_review_required"
+    assert pending["single_round_pilot"]["status"] == "in_position"
+    assert gateway.var_qty == gateway.lighter_qty == 0
+
+    recovered = executor.reconcile(sample=_sample(), now=datetime.now(timezone.utc))
+    assert recovered["status"] == "flat"
+    assert recovered["single_round_pilot"]["status"] == "completed"
+    assert recovered["single_round_pilot"]["completed_roundtrips"] == 1
 
 
 def test_unverified_session_snapshot_blocks_before_any_order(tmp_path):

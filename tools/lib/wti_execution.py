@@ -562,6 +562,147 @@ class WTIExecutionStore:
             except FileNotFoundError:
                 pass
 
+    def initialize_single_round_pilot(
+        self,
+        *,
+        market_id: int,
+        multiplier: Decimal,
+        config: dict[str, Any],
+        readiness: dict[str, Any],
+        max_entry_attempts: int = 3,
+    ) -> dict[str, Any]:
+        """Create or resume one durable pilot; never reset its completed budget."""
+        if not isinstance(max_entry_attempts, int) or max_entry_attempts < 1:
+            raise ValueError("single_round_pilot_max_entry_attempts_invalid")
+        with self.exclusive():
+            state = self.load()
+            pilot = state.get("single_round_pilot")
+            if pilot is None:
+                if (
+                    state.get("status") != "flat"
+                    or state.get("open_position") is not None
+                    or state.get("pending_action") is not None
+                ):
+                    raise WTIExecutionError("single_round_pilot_requires_flat_wti_state")
+                pilot = {
+                    "schema_version": 1,
+                    "pilot_id": uuid.uuid4().hex,
+                    "status": "available",
+                    "market_id": market_id,
+                    "multiplier": str(multiplier),
+                    "config": deepcopy(config),
+                    "readiness_at_start": deepcopy(readiness),
+                    "entry_attempts": 0,
+                    "max_entry_attempts": max_entry_attempts,
+                    "completed_roundtrips": 0,
+                    "reservation_id": None,
+                    "entry_action_id": None,
+                    "started_at": _utc_now(),
+                }
+                state["single_round_pilot"] = pilot
+                self.save(state)
+            else:
+                if (
+                    not isinstance(pilot, dict)
+                    or pilot.get("schema_version") != 1
+                    or not pilot.get("pilot_id")
+                    or pilot.get("market_id") != market_id
+                    or decimal_value(pilot.get("multiplier")) != multiplier
+                    or pilot.get("config") != config
+                    or not isinstance(pilot.get("entry_attempts"), int)
+                    or not isinstance(pilot.get("completed_roundtrips"), int)
+                    or not isinstance(pilot.get("max_entry_attempts"), int)
+                    or pilot.get("max_entry_attempts", 0) < 1
+                    or pilot.get("entry_attempts", 0) < 0
+                    or pilot.get("entry_attempts", 0) > pilot.get("max_entry_attempts", 0)
+                    or pilot.get("completed_roundtrips", 0) not in {0, 1}
+                ):
+                    raise CorruptExecutionState("single-round pilot state is invalid or config changed")
+                if pilot["completed_roundtrips"] >= 1 or pilot.get("status") == "completed":
+                    raise WTIExecutionError("single_round_pilot_already_completed")
+                if pilot.get("status") == "exhausted":
+                    raise WTIExecutionError("single_round_pilot_entry_attempts_exhausted")
+                if pilot.get("status") == "entry_reserved":
+                    if (
+                        state.get("status") == "flat"
+                        and state.get("open_position") is None
+                        and state.get("pending_action") is None
+                    ):
+                        # Executor persists a pending intent before any venue submit.
+                        pilot["status"] = (
+                            "exhausted"
+                            if pilot["entry_attempts"] >= pilot["max_entry_attempts"]
+                            else "available"
+                        )
+                        pilot["reservation_id"] = None
+                        pilot["entry_action_id"] = None
+                        self.save(state)
+                    else:
+                        raise WTIExecutionError("single_round_pilot_entry_requires_reconciliation")
+                elif pilot.get("status") == "in_position":
+                    position = state.get("open_position")
+                    if (
+                        state.get("status") != "open"
+                        or not isinstance(position, dict)
+                        or position.get("single_round_pilot_id") != pilot.get("pilot_id")
+                        or position.get("entry_execution_id") != pilot.get("entry_action_id")
+                    ):
+                        raise WTIExecutionError("single_round_pilot_position_requires_reconciliation")
+                elif pilot.get("status") != "available":
+                    raise CorruptExecutionState("single-round pilot status is invalid")
+            return deepcopy(pilot)
+
+    def reserve_single_round_pilot_entry(self, pilot_id: str) -> str:
+        with self.exclusive():
+            state = self.load()
+            pilot = state.get("single_round_pilot")
+            if (
+                not isinstance(pilot, dict)
+                or pilot.get("pilot_id") != pilot_id
+                or pilot.get("status") != "available"
+                or pilot.get("completed_roundtrips") != 0
+                or pilot.get("entry_attempts", 0) >= pilot.get("max_entry_attempts", 0)
+                or state.get("status") != "flat"
+                or state.get("open_position") is not None
+                or state.get("pending_action") is not None
+            ):
+                raise WTIExecutionError("single_round_pilot_entry_budget_unavailable")
+            reservation_id = uuid.uuid4().hex
+            pilot["status"] = "entry_reserved"
+            pilot["entry_attempts"] += 1
+            pilot["reservation_id"] = reservation_id
+            pilot["reserved_at"] = _utc_now()
+            self.save(state)
+            return reservation_id
+
+    def release_unsubmitted_single_round_pilot_entry(
+        self, pilot_id: str, reservation_id: str
+    ) -> dict[str, Any]:
+        """Release only when executor state proves no order intent was persisted."""
+        with self.exclusive():
+            state = self.load()
+            pilot = state.get("single_round_pilot")
+            if (
+                not isinstance(pilot, dict)
+                or pilot.get("pilot_id") != pilot_id
+                or pilot.get("reservation_id") != reservation_id
+                or pilot.get("status") != "entry_reserved"
+                or state.get("status") != "flat"
+                or state.get("open_position") is not None
+                or state.get("pending_action") is not None
+            ):
+                return state
+            pilot["status"] = (
+                "exhausted"
+                if pilot["entry_attempts"] >= pilot["max_entry_attempts"]
+                else "available"
+            )
+            pilot["reservation_id"] = None
+            pilot["entry_action_id"] = None
+            pilot["last_no_submit_at"] = _utc_now()
+            self.save(state)
+            return state
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -880,7 +1021,52 @@ class WTIPairExecutor:
     ) -> dict[str, Any]:
         record = self._execution_record(pending, outcome, recovered=recovered)
         state.setdefault("execution_history", []).append(record)
+        if pending.get("kind") == "open" and pending.get("single_round_pilot_id"):
+            pilot = state.get("single_round_pilot")
+            if (
+                not isinstance(pilot, dict)
+                or pilot.get("pilot_id") != pending.get("single_round_pilot_id")
+                or pilot.get("reservation_id") != pending.get("pilot_reservation_id")
+            ):
+                raise CorruptExecutionState("single-round pilot reservation does not match entry")
+            if outcome == "filled":
+                pilot["status"] = "in_position"
+                pilot["entry_action_id"] = pending["action_id"]
+                pilot["position_opened_at"] = record["completed_at"]
+            elif outcome in {"no_fill", "compensated"}:
+                pilot["status"] = (
+                    "exhausted"
+                    if pilot.get("entry_attempts", 0) >= pilot.get("max_entry_attempts", 0)
+                    else "available"
+                )
+                pilot["reservation_id"] = None
+                pilot["entry_action_id"] = None
+                pilot["last_no_fill_at"] = record["completed_at"]
         return record
+
+    @staticmethod
+    def _complete_single_round_pilot(
+        state: dict[str, Any],
+        position: dict[str, Any],
+        execution: dict[str, Any],
+    ) -> None:
+        pilot_id = position.get("single_round_pilot_id")
+        if not pilot_id:
+            return
+        pilot = state.get("single_round_pilot")
+        if (
+            not isinstance(pilot, dict)
+            or pilot.get("pilot_id") != pilot_id
+            or pilot.get("status") != "in_position"
+            or pilot.get("entry_action_id") != position.get("entry_execution_id")
+            or pilot.get("completed_roundtrips") != 0
+        ):
+            raise CorruptExecutionState("single-round pilot close does not match its confirmed entry")
+        pilot["status"] = "completed"
+        pilot["completed_roundtrips"] = 1
+        pilot["reservation_id"] = None
+        pilot["exit_action_id"] = execution["action_id"]
+        pilot["completed_at"] = execution["completed_at"]
 
     @staticmethod
     def _closed_pnl_evidence(
@@ -1022,6 +1208,8 @@ class WTIPairExecutor:
         direction: str,
         notional_usd: Decimal,
         session: SessionWindow | None,
+        pilot_id: str | None = None,
+        pilot_reservation_id: str | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         operation_now = now or self._now()
@@ -1037,6 +1225,8 @@ class WTIPairExecutor:
         session_id = _session_matches_sample(sample, session)
         if session_id is None:
             raise WTIExecutionError("exchange_session_observation_unverified")
+        if bool(pilot_id) != bool(pilot_reservation_id):
+            raise WTIExecutionError("single_round_pilot_reservation_incomplete")
         var_qty, lighter_qty = _size_for_notional(notional_usd, context)
         reference = (context.lighter_bid + context.lighter_ask) / Decimal("2")
         planned_notional = lighter_qty * context.multiplier * reference
@@ -1058,6 +1248,16 @@ class WTIPairExecutor:
             state = self.store.load()
             if state["status"] != "flat" or state.get("pending_action") or state.get("open_position"):
                 raise WTIExecutionError("existing_wti_state_blocks_entry")
+            if pilot_id:
+                pilot = state.get("single_round_pilot")
+                if (
+                    not isinstance(pilot, dict)
+                    or pilot.get("pilot_id") != pilot_id
+                    or pilot.get("status") != "entry_reserved"
+                    or pilot.get("reservation_id") != pilot_reservation_id
+                    or pilot.get("completed_roundtrips") != 0
+                ):
+                    raise WTIExecutionError("single_round_pilot_reservation_invalid")
             baseline = self._read(context)
             if not _matches(baseline, (Decimal("0"), Decimal("0")), context):
                 raise WTIExecutionError("wti_account_not_flat_or_has_active_orders")
@@ -1075,6 +1275,8 @@ class WTIPairExecutor:
                     "multiplier": str(context.multiplier),
                     "market_id": context.market_id,
                     "session_id": session_id,
+                    "single_round_pilot_id": pilot_id,
+                    "pilot_reservation_id": pilot_reservation_id,
                     "previous_position": None,
                     "intent_at": self._now().isoformat(),
                     "legs": {},
@@ -1144,6 +1346,7 @@ class WTIPairExecutor:
                 "session_id": session_id,
                 "opened_at": _utc_now(),
                 "entry_execution_id": execution["action_id"],
+                **({"single_round_pilot_id": pilot_id} if pilot_id else {}),
             }
             state["pending_action"] = None
             state["manual_review_reason"] = None
@@ -1357,6 +1560,7 @@ class WTIPairExecutor:
                 "closed_at": _utc_now(),
                 "exit_execution_id": execution["action_id"],
             }
+            self._complete_single_round_pilot(state, position, execution)
             self.store.save(state)
             return state
 
@@ -1445,6 +1649,9 @@ class WTIPairExecutor:
                         "opened_at": _utc_now(),
                         "recovered_from_pending": True,
                         "entry_execution_id": execution["action_id"],
+                        **({
+                            "single_round_pilot_id": pending.get("single_round_pilot_id")
+                        } if pending.get("single_round_pilot_id") else {}),
                     }
                     state["status"] = "open"
                 elif pending.get("kind") == "close":
@@ -1462,6 +1669,11 @@ class WTIPairExecutor:
                         "recovered_from_pending": True,
                         "exit_execution_id": execution["action_id"],
                     }
+                    self._complete_single_round_pilot(
+                        state,
+                        pending.get("previous_position") or {},
+                        execution,
+                    )
                 else:
                     return self._manual_review(state, "pending_action_kind_invalid")
                 state["pending_action"] = None
