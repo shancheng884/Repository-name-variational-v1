@@ -27,6 +27,7 @@ VARIATIONAL_RESULT_TYPES = {
     "VAR_API_ORDERS": "VAR_API_ORDERS_RESULT",
 }
 TERMINAL_VAR_NO_FILL = {"canceled", "cancelled", "rejected", "expired"}
+TERMINAL_VAR_FILLED = {"cleared", "filled", "executed", "complete", "completed"}
 TERMINAL_LIGHTER_NO_FILL = {
     "canceled", "canceled-post-only", "canceled-reduce-only",
     "canceled-position-not-allowed", "canceled-margin-not-allowed",
@@ -333,7 +334,7 @@ class WTIProductionGateway:
             message = await self.variational.request({
                 "type": "VAR_API_ORDERS",
                 "requestId": request_id,
-                "status": "pending,canceled,cancelled,cleared,rejected,expired",
+                "status": "pending,canceled,cancelled,cleared,filled,executed,completed,rejected,expired",
                 "createdAtGte": created_at_gte,
                 "limit": 100,
                 "offset": offset,
@@ -346,46 +347,46 @@ class WTIProductionGateway:
                 return {"ok": False, "final": False, "client_order_id": client_order_id}
             for row in rows:
                 identity = self._var_identity(row)
-                if identity is None:
+                if identity == "ambiguous":
                     return {"ok": False, "final": False, "client_order_id": client_order_id}
-                if identity != WTI_HEDGE.var.symbol:
+                if identity not in {WTI_HEDGE.var.symbol, "WTI"}:
                     continue
                 if self._var_order_matches(row, request):
                     matching.append(row)
             if len(rows) < 100:
                 break
-        explicit_rfq = str(
-            request.get("native_client_order_id")
-            or request.get("rfq_id")
-            or request.get("native_order_id")
-            or ""
-        )
+        explicit_rfq = str(request.get("native_client_order_id") or request.get("rfq_id") or "")
+        explicit_order_id = str(request.get("native_order_id") or "")
         if explicit_rfq:
-            matching = [row for row in matching if str(row.get("rfq_id") or "") == explicit_rfq]
+            matching = [row for row in matching if str(self._var_order_value(row, "rfq_id") or "") == explicit_rfq]
+        if explicit_order_id:
+            matching = [
+                row for row in matching
+                if str(self._var_order_value(row, "order_id") or "") == explicit_order_id
+            ]
         if len(matching) != 1:
             return {"ok": False, "final": False, "client_order_id": client_order_id}
         row = matching[0]
-        status = str(row.get("status") or "").strip().lower()
-        filled_raw = next((row[key] for key in (
+        status = str(self._var_order_value(row, "status") or "").strip().lower().replace("-", "_")
+        filled_raw = next((self._var_order_value(row, key) for key in (
             "filled_qty", "executed_qty", "filled_amount", "executed_amount"
-        ) if row.get(key) is not None), None)
-        fill_price_raw = next((row[key] for key in (
-            "average_fill_price", "average_price", "avg_fill_price", "fill_price"
-        ) if row.get(key) is not None), None)
+        ) if self._var_order_value(row, key) is not None), None)
+        fill_price_raw = next((self._var_order_value(row, key) for key in (
+            "average_fill_price", "average_price", "avg_fill_price", "avg_price", "fill_price"
+        ) if self._var_order_value(row, key) is not None), None)
         qty = _decimal(filled_raw)
         price = _decimal(fill_price_raw)
-        order_id = row.get("order_id") or row.get("rfq_id")
-        if status == "cleared" and qty is not None and qty > 0 and price is not None and price > 0 and order_id:
+        order_id = self._var_order_value(row, "order_id") or self._var_order_value(row, "rfq_id")
+        if status in TERMINAL_VAR_FILLED and qty is not None and qty > 0 and price is not None and price > 0 and order_id:
             result = {
                 "ok": True, "final": True, "client_order_id": client_order_id,
-                "order_id": str(order_id), "native_order_id": str(row.get("order_id") or ""),
-                "native_client_order_id": str(row.get("rfq_id") or ""),
+                "order_id": str(order_id), "native_order_id": str(self._var_order_value(row, "order_id") or ""),
+                "native_client_order_id": str(self._var_order_value(row, "rfq_id") or ""),
                 "status": "filled", "filled_qty": str(qty), "average_price": str(price),
                 "trade_ids": [], "fee_usd": self._explicit_fee_usd(row),
             }
             return result
-        filled_qty = _decimal(filled_raw)
-        if status in TERMINAL_VAR_NO_FILL and filled_qty == 0:
+        if status in TERMINAL_VAR_NO_FILL and qty == 0:
             return {
                 "ok": True, "final": True, "client_order_id": client_order_id,
                 "order_id": str(order_id or ""), "status": "canceled",
@@ -416,25 +417,63 @@ class WTIProductionGateway:
 
     @staticmethod
     def _var_identity(row: dict[str, Any]) -> str | None:
-        instrument = row.get("instrument")
-        values = [row.get(key) for key in ("underlying", "symbol", "asset", "market")]
-        if isinstance(instrument, dict):
-            values.extend(instrument.get(key) for key in ("underlying", "symbol", "asset"))
-        else:
-            values.append(instrument)
+        keys = ("underlying", "symbol", "asset", "market")
+        values = [row.get(key) for key in keys]
+        containers = [row.get("order_info"), row.get("instrument")]
+        for container in containers:
+            if isinstance(container, dict):
+                values.extend(container.get(key) for key in keys)
+            elif isinstance(container, str):
+                token = container.strip().upper()
+                if token in {"USOILP", "WTI", "ETH", "BTC", "SOL"}:
+                    values.append(token)
+                else:
+                    parts = token.replace("_", "-").replace("/", "-").split("-")
+                    if len(parts) >= 2 and parts[0] in {"P", "S", "SWAP", "PERP"}:
+                        values.append(parts[1])
+        order_info = row.get("order_info")
+        if isinstance(order_info, dict) and isinstance(order_info.get("instrument"), dict):
+            values.extend(order_info["instrument"].get(key) for key in keys)
         found = {str(value).strip().upper() for value in values if value not in (None, "")}
         found = {value for value in found if value in {"USOILP", "WTI", "ETH", "BTC", "SOL"}}
+        if found == {"USOILP", "WTI"}:
+            return WTI_HEDGE.var.symbol
         if len(found) == 1:
-            return next(iter(found))
+            identity = next(iter(found))
+            return WTI_HEDGE.var.symbol if identity == "WTI" else identity
+        return "ambiguous" if len(found) > 1 else None
+
+    @staticmethod
+    def _var_order_value(row: dict[str, Any], key: str) -> Any:
+        value = row.get(key)
+        if value is not None:
+            return value
+        order_info = row.get("order_info")
+        if isinstance(order_info, dict):
+            value = order_info.get(key)
+            if value is not None:
+                return value
+            nested_order = order_info.get("order")
+            if isinstance(nested_order, dict):
+                return nested_order.get(key)
+        instrument = row.get("instrument")
+        if isinstance(instrument, dict):
+            return instrument.get(key)
         return None
 
     @staticmethod
     def _var_order_matches(row: dict[str, Any], request: dict[str, Any]) -> bool:
-        side = str(row.get("side") or "").lower()
-        qty = _decimal(row.get("qty"))
+        side = str(WTIProductionGateway._var_order_value(row, "side") or "").lower()
+        qty_raw = next((WTIProductionGateway._var_order_value(row, key) for key in (
+            "qty", "quantity", "base_amount", "amount", "requested_qty"
+        ) if WTIProductionGateway._var_order_value(row, key) is not None), None)
+        qty = _decimal(qty_raw)
         wanted_qty = _decimal(request.get("qty"))
         wanted_side = str(request.get("side") or "").lower()
-        created = _timestamp(row.get("created_at") or row.get("createdAt"))
+        created = _timestamp(
+            WTIProductionGateway._var_order_value(row, "created_at")
+            or WTIProductionGateway._var_order_value(row, "createdAt")
+        )
         submitted = _timestamp(request.get("submitted_at") or request.get("intent_at"))
         return (
             side in {wanted_side, wanted_side.upper()}

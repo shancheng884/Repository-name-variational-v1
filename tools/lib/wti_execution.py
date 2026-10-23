@@ -1578,8 +1578,144 @@ class WTIPairExecutor:
             self.store.save(state)
             return state
 
-    def reconcile(self, *, sample: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
-        """Recover a restart only from exact, fresh, both-venue evidence; never resubmit."""
+    def _resume_pending_open_missing_lighter(
+        self,
+        state: dict[str, Any],
+        pending: dict[str, Any],
+        *,
+        context: MarketContext,
+        actual: AccountSnapshot,
+        sample: dict[str, Any],
+        session: SessionWindow | None,
+    ) -> dict[str, Any] | None:
+        """Continue only a proven Var-first open whose Lighter leg was never sent."""
+        if pending.get("kind") != "open" or actual.active_order_count != 0:
+            return None
+        legs = pending.get("legs") or {}
+        var_leg = legs.get("variational") or {}
+        var_fill = var_leg.get("result") or {}
+        var_qty = decimal_value(pending.get("var_qty"))
+        lighter_qty = decimal_value(pending.get("lighter_qty"))
+        expected_var = decimal_value(pending.get("expected_var_qty"))
+        expected_lighter = decimal_value(pending.get("expected_lighter_qty"))
+        direction = pending.get("direction")
+        if (
+            direction not in VALID_DIRECTIONS
+            or None in (var_qty, lighter_qty, expected_var, expected_lighter)
+            or var_qty <= 0 or lighter_qty <= 0
+            or (expected_var, expected_lighter)
+            != _signed_target(direction, var_qty, lighter_qty)
+            or var_leg.get("submission_started") is not True
+            or var_fill.get("classification") != "filled"
+            or var_fill.get("terminal_confirmed") is not True
+            or decimal_value(var_fill.get("filled_qty")) != var_qty
+            or not _matches(actual, (expected_var, Decimal("0")), context)
+        ):
+            return None
+
+        lighter_leg = legs.get("lighter")
+        if isinstance(lighter_leg, dict):
+            if lighter_leg.get("submission_started") is True:
+                lighter_result = lighter_leg.get("result") or {}
+                if (
+                    lighter_result.get("classification") != "no_fill"
+                    or lighter_result.get("terminal_confirmed") is not True
+                ):
+                    return None
+                return self._manual_review(state, "pending_open_lighter_no_fill_requires_operator")
+            if lighter_leg.get("submission_started") is not False:
+                return None
+            prior = lighter_leg.get("result") or {}
+            if prior and (
+                prior.get("classification") != "no_fill"
+                or prior.get("source") != "local_pre_submit_guard"
+                or prior.get("terminal_confirmed") is not True
+            ):
+                return None
+
+        pilot_id = pending.get("single_round_pilot_id")
+        if pilot_id:
+            pilot = state.get("single_round_pilot")
+            if (
+                not isinstance(pilot, dict)
+                or pilot.get("pilot_id") != pilot_id
+                or pilot.get("status") != "entry_reserved"
+                or pilot.get("reservation_id") != pending.get("pilot_reservation_id")
+            ):
+                return self._manual_review(state, "single_round_pilot_reservation_invalid")
+
+        if (
+            _session_matches_sample(sample, session) != pending.get("session_id")
+            or not _session_allows(session, opening=True, now=self._now())
+        ):
+            return self._manual_review(state, "pending_open_var_only_requires_position_management")
+        try:
+            fresh = self._fresh_context(context, var_qty=var_qty, lighter_qty=lighter_qty)
+        except WTIExecutionError:
+            return self._manual_review(state, "pending_open_missing_lighter_fresh_sample_unavailable")
+
+        lighter_side = "sell" if direction == "long_var_short_lighter" else "buy"
+        lighter_result = self._submit_leg(
+            state,
+            context=fresh,
+            venue="lighter",
+            side=lighter_side,
+            qty=lighter_qty,
+            reduce_only=False,
+            session=session,
+            opening=True,
+        )
+        if lighter_result.get("classification") != "filled":
+            if lighter_result.get("classification") == "no_fill":
+                return self._manual_review(state, "pending_open_lighter_no_fill_requires_operator")
+            return self._manual_review(
+                state, f"pending_open_lighter_{lighter_result.get('classification', 'unknown')}"
+            )
+
+        try:
+            after = self._read(context, minimum_observed_at=self._latest_order_time(pending))
+        except WTIExecutionError:
+            return self._manual_review(state, "post_open_account_snapshot_unavailable")
+        expected = (expected_var, expected_lighter)
+        if after.active_order_count != 0 or not _matches(after, expected, context):
+            return self._manual_review(state, "post_open_exchange_position_mismatch")
+
+        execution = self._archive_execution(state, pending, "filled", recovered=True)
+        var_fill = (pending.get("legs") or {}).get("variational", {}).get("result") or {}
+        lighter_fill = (pending.get("legs") or {}).get("lighter", {}).get("result") or {}
+        state["open_position"] = {
+            "direction": direction,
+            "var_qty": str(var_qty),
+            "lighter_qty": str(lighter_qty),
+            "expected_var_qty": str(expected_var),
+            "expected_lighter_qty": str(expected_lighter),
+            "var_entry_price": var_fill.get("average_price"),
+            "lighter_entry_price": lighter_fill.get("average_price"),
+            "var_entry_fee_usd": var_fill.get("fee_usd"),
+            "lighter_entry_fee_usd": lighter_fill.get("fee_usd"),
+            "market_id": pending["market_id"],
+            "multiplier": pending["multiplier"],
+            "session_id": pending.get("session_id"),
+            "opened_at": _utc_now(),
+            "recovered_from_pending": True,
+            "entry_execution_id": execution["action_id"],
+            **({"single_round_pilot_id": pilot_id} if pilot_id else {}),
+        }
+        state["status"] = "open"
+        state["pending_action"] = None
+        state["manual_review_reason"] = None
+        state["last_action_resolution"] = "pending_open_missing_lighter_leg_completed"
+        self.store.save(state)
+        return state
+
+    def reconcile(
+        self,
+        *,
+        sample: dict[str, Any],
+        now: datetime | None = None,
+        session: SessionWindow | None = None,
+    ) -> dict[str, Any]:
+        """Recover only from exact venue evidence; pending client IDs are never resubmitted."""
         context = self._validate_sample(sample, now=now or self._now())
         with self.store.exclusive():
             state = self.store.load()
@@ -1616,6 +1752,17 @@ class WTIPairExecutor:
                 actual = self._read(context)
             if actual.active_order_count != 0:
                 return self._manual_review(state, "active_wti_orders_require_reconciliation")
+            if isinstance(pending, dict):
+                resumed = self._resume_pending_open_missing_lighter(
+                    state,
+                    pending,
+                    context=context,
+                    actual=actual,
+                    sample=sample,
+                    session=session,
+                )
+                if resumed is not None:
+                    return resumed
             zero = (Decimal("0"), Decimal("0"))
             if state["status"] == "flat":
                 if _matches(actual, zero, context):

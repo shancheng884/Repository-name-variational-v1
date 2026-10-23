@@ -54,6 +54,16 @@ were parsed within the configured read window; the operator must still compare
 the two signed quantities and verify the live session before any future
 execution work.
 
+If the process stops after a confirmed Variational first-leg fill but before a
+Lighter submission was persisted, restart reconciliation may submit only that
+missing Lighter hedge leg. It requires the exact terminal Var fill, an account
+snapshot showing precisely the Var-only exposure and no active orders, the same
+verified exchange session, and a fresh sample. The durable pending action is
+written before submission; a leg already marked submitted is only looked up and
+is never sent again. If those checks fail, the position remains in manual
+review. A terminal no-fill on the missing leg also stops in manual review; it
+does not automatically retry that order.
+
 ## Fail-Closed Rotation Rules
 
 - WTI entry is considered only when the exchange explicitly reports the market

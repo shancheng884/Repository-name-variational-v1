@@ -676,9 +676,11 @@ class WTILiveRuntime:
     async def _read_reconcile(self, row: dict[str, Any]) -> dict[str, Any]:
         assert self.executor is not None
         started = time.monotonic()
+        now = datetime.now(timezone.utc)
+        session = _session_window(row, now, self.args.entry_cutoff_seconds)
         try:
             return await asyncio.to_thread(
-                lambda: self.executor.reconcile(sample=row, now=datetime.now(timezone.utc))
+                lambda: self.executor.reconcile(sample=row, now=now, session=session)
             )
         finally:
             self.last_reconcile_elapsed_ms = round((time.monotonic() - started) * 1000, 3)

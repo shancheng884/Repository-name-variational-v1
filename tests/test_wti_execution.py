@@ -174,7 +174,7 @@ class SimulatedWTIGateway:
         return deepcopy(self.order_responses.get(client_order_id, {"ok": False, "error": "not_found"}))
 
 
-def _executor(tmp_path, gateway=None, *, clock=None, sample=None):
+def _executor(tmp_path, gateway=None, *, clock=None, sample=None, market_reader=None):
     sample = sample or _sample()
     gateway = gateway or SimulatedWTIGateway(clock=clock)
     if clock is not None:
@@ -183,7 +183,7 @@ def _executor(tmp_path, gateway=None, *, clock=None, sample=None):
         state_path=tmp_path / "wti-live-state.json",
         gateway=gateway,
         max_slippage_bps=Decimal("8"),
-        market_reader=lambda: sample,
+        market_reader=market_reader or (lambda: sample),
         expected_lighter_market_id=145,
         expected_lighter_multiplier=Decimal("1"),
         expected_lighter_size_decimals=2,
@@ -723,6 +723,122 @@ def test_restart_reconciles_confirmed_open_without_resubmitting(tmp_path):
     assert recovered["open_position"]["recovered_from_pending"] is True
     assert recovered["open_position"]["session_id"] == "wti-session-1"
     assert len(gateway.requests) == 2
+
+
+def test_restart_continues_only_missing_lighter_leg_after_confirmed_var_fill(tmp_path):
+    sample = _sample()
+    gateway = SimulatedWTIGateway()
+    reads = 0
+
+    def fail_after_first_leg():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise RuntimeError("simulated restart boundary after Var fill")
+        return sample
+
+    executor, _ = _executor(tmp_path, gateway, sample=sample, market_reader=fail_after_first_leg)
+    interrupted = _open(executor, sample=sample)
+    assert interrupted["status"] == "manual_review_required"
+    assert interrupted["pending_action"]["legs"].keys() == {"variational"}
+    assert gateway.var_qty == Decimal("0.29")
+    assert gateway.lighter_qty == 0
+    assert [request["venue"] for request in gateway.requests] == ["variational"]
+
+    restarted, _ = _executor(tmp_path, gateway, sample=sample)
+    recovered = restarted.reconcile(
+        sample=sample,
+        session=_session_for_sample(sample),
+        now=datetime.now(timezone.utc),
+    )
+
+    assert recovered["status"] == "open"
+    assert recovered["open_position"]["recovered_from_pending"] is True
+    assert recovered["open_position"]["expected_var_qty"] == "0.29"
+    assert recovered["open_position"]["expected_lighter_qty"] == "-0.29"
+    assert recovered["last_action_resolution"] == "pending_open_missing_lighter_leg_completed"
+    assert [request["venue"] for request in gateway.requests] == ["variational", "lighter"]
+
+    again = restarted.reconcile(
+        sample=sample,
+        session=_session_for_sample(sample),
+        now=datetime.now(timezone.utc),
+    )
+    assert again["status"] == "open"
+    assert [request["venue"] for request in gateway.requests] == ["variational", "lighter"]
+
+
+def test_restart_does_not_submit_missing_hedge_without_original_live_session(tmp_path):
+    sample = _sample()
+    gateway = SimulatedWTIGateway()
+    reads = 0
+
+    def fail_after_first_leg():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise RuntimeError("simulated restart boundary after Var fill")
+        return sample
+
+    executor, _ = _executor(tmp_path, gateway, sample=sample, market_reader=fail_after_first_leg)
+    assert _open(executor, sample=sample)["status"] == "manual_review_required"
+    restarted, _ = _executor(tmp_path, gateway, sample=sample)
+
+    recovered = restarted.reconcile(
+        sample=sample,
+        session=None,
+        now=datetime.now(timezone.utc),
+    )
+
+    assert recovered["status"] == "manual_review_required"
+    assert recovered["manual_review_reason"] == "pending_open_var_only_requires_position_management"
+    assert gateway.var_qty == Decimal("0.29")
+    assert gateway.lighter_qty == 0
+    assert [request["venue"] for request in gateway.requests] == ["variational"]
+
+
+def test_restart_does_not_retry_lighter_after_confirmed_no_fill(tmp_path):
+    sample = _sample()
+    gateway = SimulatedWTIGateway()
+    reads = 0
+
+    def fail_after_first_leg():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise RuntimeError("simulated restart boundary after Var fill")
+        return sample
+
+    executor, _ = _executor(tmp_path, gateway, sample=sample, market_reader=fail_after_first_leg)
+    assert _open(executor, sample=sample)["status"] == "manual_review_required"
+    gateway.results = {
+        "lighter": {
+            "ok": True,
+            "final": True,
+            "order_id": "lighter-rejected",
+            "status": "rejected",
+            "filled_qty": "0",
+            "average_price": "0",
+        }
+    }
+    restarted, _ = _executor(tmp_path, gateway, sample=sample)
+
+    first_reconcile = restarted.reconcile(
+        sample=sample,
+        session=_session_for_sample(sample),
+        now=datetime.now(timezone.utc),
+    )
+    second_reconcile = restarted.reconcile(
+        sample=sample,
+        session=_session_for_sample(sample),
+        now=datetime.now(timezone.utc),
+    )
+
+    assert first_reconcile["status"] == second_reconcile["status"] == "manual_review_required"
+    assert second_reconcile["manual_review_reason"] == "pending_open_lighter_no_fill_requires_operator"
+    assert gateway.var_qty == Decimal("0.29")
+    assert gateway.lighter_qty == 0
+    assert [request["venue"] for request in gateway.requests] == ["variational", "lighter"]
 
 
 def test_unknown_second_leg_can_recover_only_after_terminal_order_lookup(tmp_path):

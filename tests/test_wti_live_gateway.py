@@ -153,6 +153,54 @@ def test_variational_lookup_accepts_exact_native_match_and_explicit_fills():
     gateway.loop.close()
 
 
+def test_variational_lookup_matches_nested_order_info_and_separate_native_ids():
+    submitted = datetime.now(timezone.utc).isoformat()
+    order = {
+        "symbol": "WTI",
+        "order_info": {
+            "instrument": {"underlying": "USOILP", "instrument_type": "swap"},
+            "side": "BUY",
+            "amount": "0.198",
+            "created_at": submitted,
+            "rfq_id": "rfq-live-123",
+            "order_id": "order-live-456",
+            "status": "filled",
+            "filled_amount": "0.198",
+            "average_fill_price": "71.25",
+        }
+    }
+    var = FakeVariational(orders=[{"unrelated": "row"}, order])
+    gateway = _gateway(var)
+    request = {
+        "venue": "variational",
+        "side": "buy",
+        "qty": "0.198",
+        "submitted_at": submitted,
+        "native_client_order_id": "rfq-live-123",
+        "native_order_id": "order-live-456",
+    }
+
+    result = asyncio.run(gateway._lookup_variational("action-variational", request))
+
+    assert result["final"] is True
+    assert result["status"] == "filled"
+    assert result["filled_qty"] == "0.198"
+    assert result["average_price"] == "71.25"
+    assert result["native_order_id"] == "order-live-456"
+    assert result["native_client_order_id"] == "rfq-live-123"
+    assert "filled" in var.requests[0]["status"]
+    gateway.loop.close()
+
+    native_order_only = _gateway(FakeVariational(orders=[order]))
+    result = asyncio.run(native_order_only._lookup_variational(
+        "action-variational",
+        {**request, "native_client_order_id": None, "native_order_id": "order-live-456"},
+    ))
+    assert result["final"] is True
+    assert result["native_order_id"] == "order-live-456"
+    native_order_only.loop.close()
+
+
 def test_lighter_order_payload_is_ioc_market_with_exact_precision(monkeypatch):
     monkeypatch.setitem(sys.modules, "lighter", SimpleNamespace(OrderApi=object))
 
