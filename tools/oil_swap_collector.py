@@ -222,28 +222,70 @@ class OilSwapCollector:
         temporary.write_text(json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, path)
 
-    async def _collect_once(self) -> dict[str, Any] | None:
+    async def _collect_once(
+        self,
+        *,
+        var_qty: Decimal | None = None,
+        lighter_qty: Decimal | None = None,
+    ) -> dict[str, Any] | None:
         async with self.sample_lock:
-            return await self._collect_once_unlocked()
+            return await self._collect_once_unlocked(var_qty=var_qty, lighter_qty=lighter_qty)
 
-    async def _collect_once_unlocked(self) -> dict[str, Any] | None:
+    async def _collect_once_unlocked(
+        self,
+        *,
+        var_qty: Decimal | None = None,
+        lighter_qty: Decimal | None = None,
+    ) -> dict[str, Any] | None:
         metadata = self.books.market_metadata[ASSET]
-        top = await self.books.snapshot(ASSET, Decimal(str(self.args.notional_usd)))
-        if top is None:
-            self.last_book_state = "unavailable"
-            raise RuntimeError("lighter_book_unavailable")
-        midpoint = (top["bid"] + top["ask"]) / Decimal("2")
-        lighter_qty = quantity_for_notional(
-            notional_usd=Decimal(str(self.args.notional_usd)),
-            reference_price=midpoint,
-            market=metadata,
-        )
         multiplier = Decimal(str(metadata.get("multiplier") or "1"))
-        var_qty = lighter_qty * multiplier
-        before = await self.books.snapshot(ASSET, Decimal(str(self.args.notional_usd)), base_qty=lighter_qty)
+        requested_pair = var_qty is not None or lighter_qty is not None
+        if requested_pair and (var_qty is None or lighter_qty is None):
+            raise RuntimeError("requested_pair_quantity_incomplete")
+
+        if requested_pair:
+            var_qty = Decimal(str(var_qty))
+            lighter_qty = Decimal(str(lighter_qty))
+            if (
+                not var_qty.is_finite() or not lighter_qty.is_finite()
+                or var_qty <= 0 or lighter_qty <= 0
+            ):
+                raise RuntimeError("requested_pair_quantity_invalid")
+            decimals = int(metadata["supported_size_decimals"])
+            qty_step = Decimal(1).scaleb(-decimals)
+            if lighter_qty % qty_step != 0:
+                raise RuntimeError("requested_lighter_quantity_precision_mismatch")
+            if var_qty != lighter_qty * multiplier:
+                raise RuntimeError("requested_pair_quantity_multiplier_mismatch")
+            min_base = Decimal(str(metadata.get("min_base_amount") or "0"))
+            if lighter_qty < min_base:
+                raise RuntimeError("requested_lighter_quantity_below_market_minimum")
+            before = await self.books.snapshot(
+                ASSET, Decimal(str(self.args.notional_usd)), base_qty=lighter_qty
+            )
+        else:
+            top = await self.books.snapshot(ASSET, Decimal(str(self.args.notional_usd)))
+            if top is None:
+                self.last_book_state = "unavailable"
+                raise RuntimeError("lighter_book_unavailable")
+            midpoint = (top["bid"] + top["ask"]) / Decimal("2")
+            lighter_qty = quantity_for_notional(
+                notional_usd=Decimal(str(self.args.notional_usd)),
+                reference_price=midpoint,
+                market=metadata,
+            )
+            var_qty = lighter_qty * multiplier
+            before = await self.books.snapshot(
+                ASSET, Decimal(str(self.args.notional_usd)), base_qty=lighter_qty
+            )
         if before is None:
             self.last_book_state = "unavailable"
             raise RuntimeError("lighter_book_unavailable_before_quote")
+        if requested_pair:
+            min_quote = Decimal(str(metadata.get("min_quote_amount") or "0"))
+            reference_price = (before["bid"] + before["ask"]) / Decimal("2")
+            if lighter_qty * multiplier * reference_price < min_quote:
+                raise RuntimeError("requested_pair_notional_below_market_minimum")
         self.last_book_state = "fresh" if before.get("book_age_seconds", 999) <= self.args.max_book_age_seconds else "stale"
         self.last_quote_state = "pending"
         message, quote_ms = await self.quote_client.quote(
@@ -423,9 +465,14 @@ class OilSwapCollector:
         self.last_sample_at = row["logged_at"]
         self.errors.clear()
 
-    async def collect_fresh_sample(self) -> dict[str, Any]:
+    async def collect_fresh_sample(
+        self,
+        *,
+        var_qty: Decimal | None = None,
+        lighter_qty: Decimal | None = None,
+    ) -> dict[str, Any]:
         """Serialize execution refreshes with the normal collector poll loop."""
-        row = await self._collect_once()
+        row = await self._collect_once(var_qty=var_qty, lighter_qty=lighter_qty)
         if not isinstance(row, dict):
             raise RuntimeError("wti_fresh_sample_unavailable")
         self._record_sample(row)

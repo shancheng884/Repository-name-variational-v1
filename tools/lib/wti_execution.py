@@ -718,6 +718,7 @@ class WTIPairExecutor:
         gateway: WTIExecutionGateway,
         max_slippage_bps: Decimal,
         market_reader: Callable[[], dict[str, Any]],
+        market_reader_for_qty: Callable[[Decimal, Decimal], dict[str, Any]] | None = None,
         expected_lighter_market_id: int,
         expected_lighter_multiplier: Decimal,
         expected_lighter_size_decimals: int,
@@ -745,6 +746,7 @@ class WTIPairExecutor:
         self.gateway = gateway
         self.max_slippage_bps = max_slippage_bps
         self.market_reader = market_reader
+        self.market_reader_for_qty = market_reader_for_qty
         self.expected_lighter_market_id = trusted_market_id
         self.expected_lighter_multiplier = trusted_multiplier
         self.expected_lighter_size_decimals = trusted_size_decimals
@@ -795,9 +797,23 @@ class WTIPairExecutor:
         lighter_qty: Decimal,
     ) -> MarketContext:
         try:
-            context = self._validate_sample(self.market_reader(), now=self._now())
+            sample = (
+                self.market_reader_for_qty(var_qty, lighter_qty)
+                if self.market_reader_for_qty is not None
+                else self.market_reader()
+            )
+        except WTIExecutionError:
+            raise
         except Exception as exc:
-            raise WTIExecutionError("fresh_readonly_market_sample_unavailable") from exc
+            detail = str(exc).strip()
+            if not detail or len(detail) > 120 or not all(
+                char.isalnum() or char in "_.:-" for char in detail
+            ):
+                detail = type(exc).__name__
+            raise WTIExecutionError(
+                f"fresh_readonly_market_sample_unavailable:{detail}"
+            ) from exc
+        context = self._validate_sample(sample, now=self._now())
         if context.market_id != initial.market_id or context.multiplier != initial.multiplier:
             raise WTIExecutionError("wti_market_metadata_changed_during_pair_execution")
         if (
@@ -1651,8 +1667,10 @@ class WTIPairExecutor:
             return self._manual_review(state, "pending_open_var_only_requires_position_management")
         try:
             fresh = self._fresh_context(context, var_qty=var_qty, lighter_qty=lighter_qty)
-        except WTIExecutionError:
-            return self._manual_review(state, "pending_open_missing_lighter_fresh_sample_unavailable")
+        except WTIExecutionError as exc:
+            return self._manual_review(
+                state, f"pending_open_missing_lighter_{exc}"
+            )
 
         lighter_side = "sell" if direction == "long_var_short_lighter" else "buy"
         lighter_result = self._submit_leg(

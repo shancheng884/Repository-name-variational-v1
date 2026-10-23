@@ -390,11 +390,26 @@ class WTILiveRuntime:
                 raise RuntimeError("wti_fresh_sample_invalid")
             return sample
 
+        def fresh_market_reader_for_qty(
+            var_qty: Decimal, lighter_qty: Decimal
+        ) -> dict[str, Any]:
+            future = asyncio.run_coroutine_threadsafe(
+                self.collector.collect_fresh_sample(
+                    var_qty=var_qty, lighter_qty=lighter_qty
+                ),
+                loop,
+            )
+            sample = future.result(timeout=self.args.command_timeout_seconds + 3)
+            if not isinstance(sample, dict):
+                raise RuntimeError("wti_fresh_sample_invalid")
+            return sample
+
         self.executor = WTIPairExecutor(
             state_path=self.args.state_path,
             gateway=self.gateway,
             max_slippage_bps=self.args._validated_slippage,
             market_reader=fresh_market_reader,
+            market_reader_for_qty=fresh_market_reader_for_qty,
             expected_lighter_market_id=market["market_id"],
             expected_lighter_multiplier=market["multiplier"],
             expected_lighter_size_decimals=market["supported_size_decimals"],

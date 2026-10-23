@@ -180,6 +180,78 @@ def test_oil_sample_quotes_same_qty_as_lighter_depth_and_uses_swap(tmp_path) -> 
     asyncio.run(run())
 
 
+def test_execution_refresh_preserves_requested_pair_quantity(tmp_path) -> None:
+    async def run() -> None:
+        args = parse_args(["--reuse-forwarder", "--output-dir", str(tmp_path)])
+        collector = OilSwapCollector(args)
+        collector.books.market_metadata["WTI"] = market()
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        snapshots = [
+            {
+                "bid": Decimal("101.99"), "ask": Decimal("102.01"),
+                "sell_price": Decimal("101.99"), "buy_price": Decimal("102.01"),
+                "nonce": n, "server_timestamp_ms": now_ms, "book_age_seconds": 0.1,
+                "continuity_ok": True, "cold": False, "sequence_gaps": 0,
+            }
+            for n in (20, 21)
+        ]
+        requested_depth = []
+        quoted_qty = []
+
+        async def fake_snapshot(_asset, _notional, *, base_qty=None):
+            requested_depth.append(base_qty)
+            return snapshots.pop(0)
+
+        async def fake_quote(_asset, qty, **_kwargs):
+            quoted_qty.append(qty)
+            observed = datetime.now(timezone.utc)
+            return {
+                "ok": True,
+                "result": {
+                    "bid": "102.00", "ask": "102.02",
+                    "quoteTimestamp": observed.isoformat(),
+                },
+            }, 25.0
+
+        observed = datetime.now(timezone.utc)
+        collector.market_status_feed.connected = True
+        collector.market_status_feed.status = "open"
+        collector.market_status_feed.status_observed_at = observed
+        collector.market_status_feed.heartbeat_at = observed
+        collector.trading_sessions = [{
+            "open": (observed - timedelta(minutes=1)).isoformat(),
+            "close": (observed + timedelta(hours=6)).isoformat(),
+        }]
+        collector.session_schedule_updated_at = observed.isoformat()
+        collector.books.snapshot = fake_snapshot
+        collector.quote_client.quote = fake_quote
+
+        row = await collector.collect_fresh_sample(
+            var_qty=Decimal("0.198"), lighter_qty=Decimal("0.198")
+        )
+
+        assert row["sample_quality"] == "valid"
+        assert Decimal(row["variational_qty"]) == Decimal("0.198")
+        assert Decimal(row["lighter_qty"]) == Decimal("0.198")
+        assert requested_depth == [Decimal("0.198"), Decimal("0.198")]
+        assert quoted_qty == [Decimal("0.198")]
+
+    asyncio.run(run())
+
+
+def test_execution_refresh_rejects_inconsistent_requested_pair_quantity(tmp_path) -> None:
+    async def run() -> None:
+        args = parse_args(["--reuse-forwarder", "--output-dir", str(tmp_path)])
+        collector = OilSwapCollector(args)
+        collector.books.market_metadata["WTI"] = market()
+        with pytest.raises(RuntimeError, match="requested_pair_quantity_multiplier_mismatch"):
+            await collector.collect_fresh_sample(
+                var_qty=Decimal("0.198"), lighter_qty=Decimal("0.196")
+            )
+
+    asyncio.run(run())
+
+
 def test_market_metadata_command_is_read_only_and_returns_actual_schedule_fields() -> None:
     async def run() -> None:
         class FakeSocket:

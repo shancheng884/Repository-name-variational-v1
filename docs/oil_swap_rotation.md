@@ -138,6 +138,15 @@ funding are separately confirmed. The runtime writes
 monitors them independently from ETH. Code tests do not substitute for replay
 against qualified real WTI data or venue-side verification.
 
+When recovery must complete a confirmed Var-first open, its fresh market sample
+requests the exact Var and Lighter quantities persisted in the pending action.
+The collector measures executable Lighter depth and requests the Var quote at
+those quantities; it does not resize the hedge from the collector's notional
+sampling target. Existing freshness, session, market identity, depth, and
+slippage checks still apply. A failed refresh records its specific validation
+or collector error code in `manual_review_reason`, and no hedge order is sent
+until the full original quantity passes those checks.
+
 ## Readiness Audit
 
 Run `python tools/oil_swap_readiness.py` against the WTI collector data. For a

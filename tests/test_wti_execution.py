@@ -176,7 +176,10 @@ class SimulatedWTIGateway:
         return deepcopy(self.order_responses.get(client_order_id, {"ok": False, "error": "not_found"}))
 
 
-def _executor(tmp_path, gateway=None, *, clock=None, sample=None, market_reader=None):
+def _executor(
+    tmp_path, gateway=None, *, clock=None, sample=None, market_reader=None,
+    market_reader_for_qty=None,
+):
     sample = sample or _sample()
     gateway = gateway or SimulatedWTIGateway(clock=clock)
     if clock is not None:
@@ -186,6 +189,7 @@ def _executor(tmp_path, gateway=None, *, clock=None, sample=None, market_reader=
         gateway=gateway,
         max_slippage_bps=Decimal("8"),
         market_reader=market_reader or (lambda: sample),
+        market_reader_for_qty=market_reader_for_qty,
         expected_lighter_market_id=145,
         expected_lighter_multiplier=Decimal("1"),
         expected_lighter_size_decimals=2,
@@ -768,6 +772,92 @@ def test_restart_continues_only_missing_lighter_leg_after_confirmed_var_fill(tmp
     )
     assert again["status"] == "open"
     assert [request["venue"] for request in gateway.requests] == ["variational", "lighter"]
+
+
+def test_pending_open_refresh_uses_original_pair_quantities_and_submits_hedge_once(tmp_path):
+    sample = _sample()
+    gateway = SimulatedWTIGateway()
+    reads = 0
+
+    def fail_after_var_fill():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise RuntimeError("simulated restart boundary after Var fill")
+        return sample
+
+    executor, _ = _executor(
+        tmp_path, gateway, sample=sample, market_reader=fail_after_var_fill
+    )
+    interrupted = _open(executor, sample=sample)
+    assert interrupted["status"] == "manual_review_required"
+    assert gateway.var_qty == Decimal("0.29")
+    assert gateway.lighter_qty == 0
+
+    requested = []
+
+    def exact_market_reader(var_qty, lighter_qty):
+        requested.append((var_qty, lighter_qty))
+        return _sample(
+            variational_qty=str(var_qty), lighter_qty=str(lighter_qty)
+        )
+
+    restarted, _ = _executor(
+        tmp_path, gateway, sample=sample,
+        market_reader_for_qty=exact_market_reader,
+    )
+    recovered = restarted.reconcile(
+        sample=sample, session=_session_for_sample(sample), now=datetime.now(timezone.utc),
+    )
+    again = restarted.reconcile(
+        sample=sample, session=_session_for_sample(sample), now=datetime.now(timezone.utc),
+    )
+
+    assert requested == [(Decimal("0.29"), Decimal("0.29"))]
+    assert recovered["status"] == again["status"] == "open"
+    assert gateway.var_qty == Decimal("0.29")
+    assert gateway.lighter_qty == Decimal("-0.29")
+    assert [request["venue"] for request in gateway.requests] == ["variational", "lighter"]
+
+
+def test_pending_open_records_specific_refresh_depth_failure_without_resubmitting(tmp_path):
+    sample = _sample()
+    gateway = SimulatedWTIGateway()
+    reads = 0
+
+    def fail_after_var_fill():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise RuntimeError("simulated restart boundary after Var fill")
+        return sample
+
+    executor, _ = _executor(
+        tmp_path, gateway, sample=sample, market_reader=fail_after_var_fill
+    )
+    assert _open(executor, sample=sample)["status"] == "manual_review_required"
+
+    restarted, _ = _executor(
+        tmp_path, gateway, sample=sample,
+        market_reader_for_qty=lambda _var_qty, _lighter_qty: _sample(
+            variational_qty="0.196", lighter_qty="0.196"
+        ),
+    )
+    recovered = restarted.reconcile(
+        sample=sample, session=_session_for_sample(sample), now=datetime.now(timezone.utc),
+    )
+    again = restarted.reconcile(
+        sample=sample, session=_session_for_sample(sample), now=datetime.now(timezone.utc),
+    )
+
+    expected_reason = (
+        "pending_open_missing_lighter_readonly_sample_depth_below_order_quantity"
+    )
+    assert recovered["manual_review_reason"] == expected_reason
+    assert again["manual_review_reason"] == expected_reason
+    assert gateway.var_qty == Decimal("0.29")
+    assert gateway.lighter_qty == 0
+    assert [request["venue"] for request in gateway.requests] == ["variational"]
 
 
 def test_restart_uses_production_booked_order_lookup_and_hedges_only_once(tmp_path):
