@@ -33,6 +33,23 @@ def test_observe_mode_does_not_require_live_eth_confirmation(tmp_path: Path):
     wti_live.validate_startup_preconditions(args, eth_state_path=tmp_path / "missing.json")
 
 
+def test_pilot_restart_recognizes_pending_close_as_owned_exposure():
+    pilot_id = "pilot-123"
+    state = {
+        "status": "manual_review_required",
+        "open_position": None,
+        "pending_action": {
+            "kind": "close",
+            "previous_position": {"single_round_pilot_id": pilot_id},
+        },
+        "single_round_pilot": {"pilot_id": pilot_id, "status": "in_position"},
+    }
+    assert wti_live.single_round_pilot_owns_exposure(state)
+
+    state["pending_action"]["previous_position"].pop("single_round_pilot_id")
+    assert not wti_live.single_round_pilot_owns_exposure(state)
+
+
 def test_live_config_pins_existing_data_gap_cutoff_hold_and_notional_caps():
     args = SimpleNamespace(
         entry_threshold_bps=Decimal("4"),

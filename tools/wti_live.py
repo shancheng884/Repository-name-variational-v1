@@ -84,6 +84,21 @@ def validate_eth_flat_confirmation(path: Path, *, confirmed: bool) -> dict[str, 
     return state
 
 
+def single_round_pilot_owns_exposure(state: dict[str, Any]) -> bool:
+    pilot = state.get("single_round_pilot") or {}
+    pending = state.get("pending_action") or {}
+    pilot_id = pilot.get("pilot_id")
+    if not pilot_id or pilot.get("status") not in {"entry_reserved", "in_position"}:
+        return False
+    position = state.get("open_position") or {}
+    previous_position = pending.get("previous_position") or {}
+    return any(
+        item.get("single_round_pilot_id") == pilot_id
+        for item in (position, pending, previous_position)
+        if isinstance(item, dict)
+    )
+
+
 def validate_startup_preconditions(
     args: argparse.Namespace,
     *,
@@ -300,17 +315,7 @@ class WTILiveRuntime:
                 or existing.get("status") in {"pending", "manual_review_required", "open"}
             )
             if local_exposure:
-                pilot = existing.get("single_round_pilot") or {}
-                pending = existing.get("pending_action") or {}
-                pilot_owns_exposure = (
-                    pilot.get("pilot_id")
-                    and pilot.get("status") in {"entry_reserved", "in_position"}
-                    and (
-                        (existing.get("open_position") or {}).get("single_round_pilot_id")
-                        == pilot.get("pilot_id")
-                        or pending.get("single_round_pilot_id") == pilot.get("pilot_id")
-                    )
-                )
+                pilot_owns_exposure = single_round_pilot_owns_exposure(existing)
                 if not self.readiness["ready"] and not (
                     self.args.manage_existing_wti_position or pilot_owns_exposure
                 ):
