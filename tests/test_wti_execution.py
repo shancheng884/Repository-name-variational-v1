@@ -1385,6 +1385,222 @@ def test_close_partial_fill_blocks_rotation_and_restart_does_not_resubmit(tmp_pa
     assert len(gateway.requests) == 3
 
 
+def test_restart_recovers_var_unknown_close_by_submitting_only_missing_lighter_leg(tmp_path):
+    gateway = SimulatedWTIGateway()
+    executor, _ = _executor(tmp_path, gateway)
+    assert _open(executor)["status"] == "open"
+    gateway.results = {
+        "variational": {
+            "ok": False,
+            "final": False,
+            "status": "unknown",
+            "execute_status": "filled",
+            "execute_filled_qty": "0.29",
+        }
+    }
+    gateway.lookup_results = {
+        "variational": {"ok": False, "final": False, "status": "unknown"}
+    }
+    now = datetime.now(timezone.utc)
+    interrupted = executor.close(
+        sample=_sample(now=now), session=_session(now=now), now=now
+    )
+    assert interrupted["status"] == "manual_review_required"
+    assert set(interrupted["pending_action"]["legs"]) == {"variational"}
+    assert gateway.var_qty == 0
+    assert gateway.lighter_qty == Decimal("-0.29")
+    assert [request["venue"] for request in gateway.requests] == [
+        "variational", "lighter", "variational"
+    ]
+
+    restarted, _ = _executor(tmp_path, gateway)
+    sample = _sample()
+    recovered = restarted.reconcile(
+        sample=sample,
+        session=_session_for_sample(sample),
+        now=datetime.now(timezone.utc),
+    )
+    assert recovered["status"] == "flat"
+    assert recovered["pending_action"] is None
+    assert recovered["last_action_resolution"] == (
+        "pending_close_missing_lighter_leg_completed_from_verified_account_snapshot"
+    )
+    assert recovered["last_closed_position"]["actual_gross_pnl_status"] == (
+        "fill_price_or_quantity_unverified"
+    )
+    assert recovered["execution_history"][-1]["outcome"] == "positions_flat_confirmed"
+    assert recovered["execution_history"][-1]["legs"]["variational"]["result"]["classification"] == "unknown"
+    assert [request["venue"] for request in gateway.requests] == [
+        "variational", "lighter", "variational", "lighter"
+    ]
+    assert gateway.requests[-1]["side"] == "buy"
+    assert gateway.requests[-1]["qty"] == "0.29"
+    assert gateway.requests[-1]["reduce_only"] is True
+
+    again = restarted.reconcile(
+        sample=sample,
+        session=_session_for_sample(sample),
+        now=datetime.now(timezone.utc),
+    )
+    assert again["status"] == "flat"
+    assert len(gateway.requests) == 4
+
+
+def test_close_recovery_replaces_only_a_proven_unsent_lighter_leg(tmp_path):
+    gateway = SimulatedWTIGateway()
+    executor, _ = _executor(tmp_path, gateway)
+    assert _open(executor)["status"] == "open"
+    gateway.results = {
+        "variational": {
+            "ok": False,
+            "final": False,
+            "status": "unknown",
+            "execute_status": "filled",
+            "execute_filled_qty": "0.29",
+        }
+    }
+    gateway.lookup_results = {
+        "variational": {"ok": False, "final": False, "status": "unknown"}
+    }
+    now = datetime.now(timezone.utc)
+    sample = _sample(now=now)
+    interrupted = executor.close(
+        sample=sample, session=_session(now=now), now=now
+    )
+    assert interrupted["status"] == "manual_review_required"
+    state = executor.store.load()
+    pending = state["pending_action"]
+    context = executor._validate_sample(sample)
+    request = executor._order_request(
+        context=context,
+        venue="lighter",
+        side="buy",
+        qty=Decimal("0.29"),
+        reduce_only=True,
+        action_id=pending["action_id"],
+    )
+    request["intent_at"] = pending["intent_at"]
+    pending["legs"]["lighter"] = {
+        "request": request,
+        "intent_at": pending["intent_at"],
+        "submission_started": False,
+        "result": {
+            "classification": "no_fill",
+            "source": "local_pre_submit_guard",
+            "filled_qty": "0",
+            "terminal_confirmed": True,
+        },
+    }
+    executor.store.save(state)
+
+    restarted, _ = _executor(tmp_path, gateway)
+    recovered = restarted.reconcile(
+        sample=sample,
+        session=_session_for_sample(sample),
+        now=datetime.now(timezone.utc),
+    )
+    assert recovered["status"] == "flat"
+    assert len(gateway.requests) == 4
+    assert gateway.requests[-1]["venue"] == "lighter"
+    assert gateway.requests[-1]["client_order_id"] == (
+        f"{pending['action_id']}-replacement-1-lighter"
+    )
+    assert recovered["execution_history"][-1]["superseded_legs"][0]["leg"]["submission_started"] is False
+
+
+@pytest.mark.parametrize("blocker", ["var_not_flat", "lighter_changed", "active_order"])
+def test_var_unknown_close_recovery_requires_exact_residual_and_no_active_orders(
+    tmp_path, blocker,
+):
+    gateway = SimulatedWTIGateway()
+    executor, _ = _executor(tmp_path, gateway)
+    assert _open(executor)["status"] == "open"
+    gateway.results = {
+        "variational": {
+            "ok": False,
+            "final": False,
+            "status": "unknown",
+            "execute_status": "filled",
+            "execute_filled_qty": "0.29",
+        }
+    }
+    gateway.lookup_results = {
+        "variational": {"ok": False, "final": False, "status": "unknown"}
+    }
+    now = datetime.now(timezone.utc)
+    executor.close(sample=_sample(now=now), session=_session(now=now), now=now)
+    if blocker == "var_not_flat":
+        gateway.var_qty = Decimal("0.01")
+    elif blocker == "lighter_changed":
+        gateway.lighter_qty = Decimal("-0.28")
+    else:
+        gateway.active_orders = [{"market_id": 145, "order_id": "still-active"}]
+
+    restarted, _ = _executor(tmp_path, gateway)
+    sample = _sample()
+    recovered = restarted.reconcile(
+        sample=sample,
+        session=_session_for_sample(sample),
+        now=datetime.now(timezone.utc),
+    )
+    assert recovered["status"] == "manual_review_required"
+    assert len(gateway.requests) == 3
+    assert [request["venue"] for request in gateway.requests[-1:]] == ["variational"]
+
+
+def test_var_unknown_close_does_not_retry_submitted_lighter_leg(tmp_path):
+    gateway = SimulatedWTIGateway()
+    executor, _ = _executor(tmp_path, gateway)
+    assert _open(executor)["status"] == "open"
+    gateway.results = {
+        "variational": {
+            "ok": False,
+            "final": False,
+            "status": "unknown",
+            "execute_status": "filled",
+            "execute_filled_qty": "0.29",
+        },
+        "lighter": {"ok": False, "final": False, "status": "unknown"},
+    }
+    gateway.lookup_results = {
+        "variational": {"ok": False, "final": False, "status": "unknown"},
+        "lighter": {"ok": False, "final": False, "status": "unknown"},
+    }
+    now = datetime.now(timezone.utc)
+    interrupted = executor.close(
+        sample=_sample(now=now), session=_session(now=now), now=now
+    )
+    assert interrupted["status"] == "manual_review_required"
+    assert set(interrupted["pending_action"]["legs"]) == {"variational"}
+    assert gateway.var_qty == 0
+    assert gateway.lighter_qty == Decimal("-0.29")
+    pending_state = executor.store.load()
+    context = executor._validate_sample(_sample())
+    lighter_result = executor._submit_leg(
+        pending_state,
+        context=context,
+        venue="lighter",
+        side="buy",
+        qty=Decimal("0.29"),
+        reduce_only=True,
+        session=_session_for_sample(_sample()),
+        opening=False,
+    )
+    assert lighter_result["classification"] == "unknown"
+    executor._manual_review(pending_state, "test_lighter_ack_lost")
+
+    restarted, _ = _executor(tmp_path, gateway)
+    sample = _sample()
+    recovered = restarted.reconcile(
+        sample=sample,
+        session=_session_for_sample(sample),
+        now=datetime.now(timezone.utc),
+    )
+    assert recovered["status"] == "manual_review_required"
+    assert len(gateway.requests) == 4
+    assert sum(request["venue"] == "lighter" for request in gateway.requests) == 2
+
+
 def test_close_no_fill_reconciles_back_to_open_only_when_both_positions_match(tmp_path):
     gateway = SimulatedWTIGateway()
     executor, _ = _executor(tmp_path, gateway)

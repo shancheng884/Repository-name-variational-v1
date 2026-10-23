@@ -64,6 +64,15 @@ is never sent again. If those checks fail, the position remains in manual
 review. A terminal no-fill on the missing leg also stops in manual review; it
 does not automatically retry that order.
 
+For a Var-first close, an unknown Var receipt is never resubmitted. Recovery may
+submit only the missing Lighter reduce-only close when a fresh post-submit
+account snapshot proves Var is flat, the original Lighter quantity is unchanged,
+and there are no active WTI orders; the exchange session, exact-size depth, and
+slippage checks still apply. If Lighter was already marked submitted, it is only
+looked up and is never sent again. If both venues are already flat with no active
+orders, state may be reconciled flat from that account evidence, while PnL stays
+unverified wherever final fill evidence is missing.
+
 ## Fail-Closed Rotation Rules
 
 - WTI entry is considered only when the exchange explicitly reports the market

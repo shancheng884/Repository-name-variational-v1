@@ -1805,6 +1805,221 @@ class WTIPairExecutor:
         self.store.save(state)
         return state
 
+    def _finalize_reconciled_close(
+        self,
+        state: dict[str, Any],
+        pending: dict[str, Any],
+    ) -> dict[str, Any]:
+        position = pending.get("previous_position") or {}
+        legs = pending.get("legs") or {}
+        var_result = (legs.get("variational") or {}).get("result") or {}
+        lighter_result = (legs.get("lighter") or {}).get("result") or {}
+        var_exit = var_result if var_result.get("classification") == "filled" else {}
+        lighter_exit = lighter_result if lighter_result.get("classification") == "filled" else {}
+        execution = self._archive_execution(
+            state, pending, "positions_flat_confirmed", recovered=True
+        )
+        state["status"] = "flat"
+        state["open_position"] = None
+        state["pending_action"] = None
+        state["manual_review_reason"] = None
+        state["last_action_resolution"] = "close_confirmed_flat_by_account_snapshot"
+        state["last_closed_position"] = {
+            **position,
+            **self._closed_pnl_evidence(
+                position, var_exit=var_exit, lighter_exit=lighter_exit
+            ),
+            "closed_at": _utc_now(),
+            "recovered_from_pending": True,
+            "exit_execution_id": execution["action_id"],
+        }
+        self._complete_single_round_pilot(state, position, execution)
+        self.store.save(state)
+        return state
+
+    def _resume_pending_close_missing_lighter(
+        self,
+        state: dict[str, Any],
+        pending: dict[str, Any],
+        *,
+        context: MarketContext,
+        actual: AccountSnapshot,
+        sample: dict[str, Any],
+        session: SessionWindow | None,
+    ) -> dict[str, Any] | None:
+        """Recover a Var-first close without ever retrying an uncertain submitted leg."""
+        if pending.get("kind") != "close" or actual.active_order_count != 0:
+            return None
+        previous = pending.get("previous_position")
+        legs = pending.get("legs")
+        if not isinstance(previous, dict) or not isinstance(legs, dict):
+            return None
+        var_leg = legs.get("variational")
+        if not isinstance(var_leg, dict) or var_leg.get("submission_started") is not True:
+            return None
+
+        var_request = var_leg.get("request") or {}
+        var_result = var_leg.get("result") or {}
+        direction = str(pending.get("direction") or "")
+        var_qty = decimal_value(previous.get("var_qty"))
+        lighter_qty = decimal_value(previous.get("lighter_qty"))
+        expected_var = decimal_value(previous.get("expected_var_qty"))
+        expected_lighter = decimal_value(previous.get("expected_lighter_qty"))
+        lighter_side = "buy" if expected_lighter is not None and expected_lighter < 0 else "sell"
+        if (
+            direction not in VALID_DIRECTIONS
+            or None in (var_qty, lighter_qty, expected_var, expected_lighter)
+            or var_qty <= 0 or lighter_qty <= 0
+            or (expected_var, expected_lighter)
+            != _signed_target(direction, var_qty, lighter_qty)
+            or decimal_value(pending.get("var_qty")) != var_qty
+            or decimal_value(pending.get("lighter_qty")) != lighter_qty
+            or decimal_value(pending.get("expected_var_qty")) != 0
+            or decimal_value(pending.get("expected_lighter_qty")) != 0
+            or var_request.get("venue") != "variational"
+            or var_request.get("client_order_id") != f"{pending.get('action_id')}-variational"
+            or var_request.get("side") != ("sell" if direction == "long_var_short_lighter" else "buy")
+            or decimal_value(var_request.get("qty")) != var_qty
+            or var_request.get("reduce_only") is not True
+            or var_request.get("symbol") != WTI_HEDGE.var.symbol
+            or var_request.get("instrument_type") != WTI_HEDGE.var.instrument_type
+            or integer_value(pending.get("market_id")) != context.market_id
+            or decimal_value(pending.get("multiplier")) != context.multiplier
+        ):
+            return None
+
+        var_classification = var_result.get("classification")
+        if var_classification == "filled":
+            if (
+                var_result.get("terminal_confirmed") is not True
+                or decimal_value(var_result.get("filled_qty")) != var_qty
+            ):
+                return None
+        elif var_classification != "unknown" or var_result.get("terminal_confirmed") is True:
+            return None
+
+        lighter_leg = legs.get("lighter")
+        superseded = pending.get("superseded_legs") or []
+        if not isinstance(superseded, list) or any(
+            not isinstance(item, dict) for item in superseded
+        ):
+            return None
+        lighter_replacements = sum(
+            1 for item in superseded if item.get("venue") == "lighter"
+        )
+        lighter_action_id = str(pending.get("action_id") or "")
+        if lighter_replacements:
+            lighter_action_id = f"{lighter_action_id}-replacement-{lighter_replacements}"
+        if lighter_leg is not None:
+            if not isinstance(lighter_leg, dict):
+                return None
+            lighter_request = lighter_leg.get("request") or {}
+            if (
+                lighter_request.get("venue") != "lighter"
+                or lighter_request.get("client_order_id") != f"{lighter_action_id}-lighter"
+                or lighter_request.get("side") != lighter_side
+                or decimal_value(lighter_request.get("qty")) != lighter_qty
+                or lighter_request.get("reduce_only") is not True
+                or integer_value(lighter_request.get("market_id")) != context.market_id
+            ):
+                return None
+
+        snapshot_evidence = {
+            "observed_at": actual.observed_at.isoformat(),
+            "variational_qty": str(actual.variational_qty),
+            "lighter_qty": str(actual.lighter_qty),
+            "active_order_count": actual.active_order_count,
+        }
+        if _matches(actual, (Decimal("0"), Decimal("0")), context):
+            pending["recovery_account_snapshot"] = snapshot_evidence
+            return self._finalize_reconciled_close(state, pending)
+
+        if (
+            abs(actual.variational_qty) > Decimal("0.00000001")
+            or abs(actual.lighter_qty - expected_lighter) > context.lighter_position_tolerance
+            or _session_matches_sample(sample, session) != pending.get("session_id")
+            or not _session_allows(session, opening=False, now=self._now())
+        ):
+            return None
+
+        if lighter_leg is not None:
+            if lighter_leg.get("submission_started") is not False:
+                return None
+            old_result = lighter_leg.get("result") or {}
+            if old_result and (
+                old_result.get("classification") != "no_fill"
+                or old_result.get("source") != "local_pre_submit_guard"
+                or old_result.get("terminal_confirmed") is not True
+            ):
+                return None
+
+        pending["recovery_account_snapshot"] = {
+            **snapshot_evidence,
+            "action": "submit_only_missing_lighter_reduce_only_close",
+        }
+        self.store.save(state)
+        try:
+            fresh = self._fresh_context(
+                context, var_qty=var_qty, lighter_qty=lighter_qty
+            )
+        except WTIExecutionError as exc:
+            return self._manual_review(
+                state, f"pending_close_missing_lighter_{exc}"
+            )
+
+        if lighter_leg is not None:
+            superseded = pending.setdefault("superseded_legs", [])
+            client_id = (lighter_leg.get("request") or {}).get("client_order_id")
+            archived = any(
+                item.get("venue") == "lighter"
+                and ((item.get("leg") or {}).get("request") or {}).get("client_order_id") == client_id
+                for item in superseded if isinstance(item, dict)
+            )
+            if not archived:
+                superseded.append({
+                    "venue": "lighter",
+                    "reason": "prior_close_lighter_leg_not_submitted",
+                    "archived_at": self._now().isoformat(),
+                    "leg": deepcopy(lighter_leg),
+                })
+
+        lighter_result = self._submit_leg(
+            state,
+            context=fresh,
+            venue="lighter",
+            side=lighter_side,
+            qty=lighter_qty,
+            reduce_only=True,
+            session=session,
+            opening=False,
+        )
+        if lighter_result.get("classification") != "filled":
+            return self._manual_review(
+                state,
+                f"pending_close_lighter_{lighter_result.get('classification', 'unknown')}",
+            )
+        try:
+            after = self._read(
+                context,
+                minimum_observed_at=self._latest_order_time(pending),
+            )
+        except WTIExecutionError:
+            return self._manual_review(state, "post_close_account_snapshot_unavailable")
+        if not _matches(after, (Decimal("0"), Decimal("0")), context):
+            return self._manual_review(state, "post_close_exchange_position_mismatch")
+        pending["recovery_account_snapshot_after"] = {
+            "observed_at": after.observed_at.isoformat(),
+            "variational_qty": str(after.variational_qty),
+            "lighter_qty": str(after.lighter_qty),
+            "active_order_count": after.active_order_count,
+        }
+        result = self._finalize_reconciled_close(state, pending)
+        result["last_action_resolution"] = (
+            "pending_close_missing_lighter_leg_completed_from_verified_account_snapshot"
+        )
+        self.store.save(result)
+        return result
+
     def reconcile(
         self,
         *,
@@ -1835,9 +2050,9 @@ class WTIPairExecutor:
                 return self._manual_review(state, "flat_state_contains_open_position")
             if state["status"] == "open" and not isinstance(state.get("open_position"), dict):
                 return self._manual_review(state, "open_state_position_missing")
+            orders_resolved = True
             if isinstance(pending, dict):
-                if not self._resolve_pending_orders(state, pending):
-                    return self._manual_review(state, "pending_order_terminal_status_unconfirmed")
+                orders_resolved = self._resolve_pending_orders(state, pending)
                 try:
                     actual = self._read(
                         context,
@@ -1850,6 +2065,18 @@ class WTIPairExecutor:
             if actual.active_order_count != 0:
                 return self._manual_review(state, "active_wti_orders_require_reconciliation")
             if isinstance(pending, dict):
+                resumed_close = self._resume_pending_close_missing_lighter(
+                    state,
+                    pending,
+                    context=context,
+                    actual=actual,
+                    sample=sample,
+                    session=session,
+                )
+                if resumed_close is not None:
+                    return resumed_close
+                if not orders_resolved:
+                    return self._manual_review(state, "pending_order_terminal_status_unconfirmed")
                 resumed = self._resume_pending_open_missing_lighter(
                     state,
                     pending,
