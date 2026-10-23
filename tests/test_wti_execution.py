@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ import pytest
 
 from tools.lib.market_sessions import classify_usoil_session
 from tools.lib.wti_execution import WTIPairExecutor, WTIExecutionError, WTIExecutionStore
+from tools.lib.wti_live_gateway import WTIProductionGateway
 
 
 DIRECTION = "long_var_short_lighter"
@@ -766,6 +768,79 @@ def test_restart_continues_only_missing_lighter_leg_after_confirmed_var_fill(tmp
     )
     assert again["status"] == "open"
     assert [request["venue"] for request in gateway.requests] == ["variational", "lighter"]
+
+
+def test_restart_uses_production_booked_order_lookup_and_hedges_only_once(tmp_path):
+    sample = _sample()
+    gateway = SimulatedWTIGateway(results={"variational": {
+        "ok": False, "status": "unknown", "execute_status": "filled",
+    }})
+    executor, _ = _executor(tmp_path, gateway, sample=sample)
+    interrupted = _open(executor, sample=sample)
+    assert interrupted["manual_review_reason"] == "variational_open_unknown"
+    assert gateway.var_qty == Decimal("0.29")
+    assert gateway.lighter_qty == 0
+    original_request = gateway.requests[0]
+
+    class OrdersAPI:
+        calls = 0
+
+        async def request(self, payload):
+            assert payload["type"] == "VAR_API_ORDERS"
+            self.calls += 1
+            row = {
+                "instrument": {"underlying": "USOILP"},
+                "side": original_request["side"],
+                "qty": original_request["qty"],
+                "price": "100.426",
+                "status": "cleared",
+                "clearing_status": "success_trades_booked_into_pool",
+                "order_id": "booked-var-order",
+                "rfq_id": "booked-var-rfq",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "execution_timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            return {
+                "type": "VAR_API_ORDERS_RESULT", "requestId": payload["requestId"],
+                "ok": True, "result": {"ok": True, "httpStatus": 200, "orders": [row]},
+            }
+
+    api = OrdersAPI()
+    production = WTIProductionGateway(
+        loop=asyncio.new_event_loop(), variational=api, account_reader=object(),
+        lighter_client=None, account_index=10, api_key_index=1, market={"market_id": 145},
+    )
+    original_lookup = gateway.lookup_order
+
+    def lookup(client_order_id, request=None):
+        if request["venue"] == "variational":
+            return asyncio.run(production._lookup_variational(client_order_id, request))
+        return original_lookup(client_order_id, request=request)
+
+    gateway.lookup_order = lookup
+    restarted, _ = _executor(tmp_path, gateway, sample=sample)
+    try:
+        recovered = restarted.reconcile(
+            sample=sample, session=_session_for_sample(sample), now=datetime.now(timezone.utc),
+        )
+        again = restarted.reconcile(
+            sample=sample, session=_session_for_sample(sample), now=datetime.now(timezone.utc),
+        )
+    finally:
+        production.loop.close()
+
+    assert recovered["status"] == again["status"] == "open"
+    assert recovered["pending_action"] is None
+    assert recovered["open_position"]["var_entry_price"] == "100.426"
+    assert recovered["open_position"]["recovered_from_pending"] is True
+    assert gateway.var_qty == Decimal("0.29")
+    assert gateway.lighter_qty == Decimal("-0.29")
+    assert [r["venue"] for r in gateway.requests] == ["variational", "lighter"]
+    assert api.calls == 1
+    var_evidence = recovered["execution_history"][-1]["legs"]["variational"]["result"]
+    assert var_evidence["native_order_id"] == "booked-var-order"
+    assert var_evidence["native_client_order_id"] == "booked-var-rfq"
+    assert var_evidence["fee_confirmed"] is False
 
 
 def test_restart_does_not_submit_missing_hedge_without_original_live_session(tmp_path):

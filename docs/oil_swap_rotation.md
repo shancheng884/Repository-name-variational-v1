@@ -122,8 +122,14 @@ pre-close entry cutoff. Account risk retains the existing 40/50/60/75 percent
 margin thresholds and 0.82/0.74 cross-venue equity balance thresholds. These
 are code guards, not evidence that the strategy is profitable.
 
-The gateway treats a Variational `cleared` order as filled only with explicit
-executed quantity and fill price and matches its RFQ identity. Lighter orders use
+The gateway treats a Variational `cleared` order as filled with explicit
+executed quantity and fill price. The observed orders-v2 format also supplies
+`qty` and `price` as executed values when `clearing_status` is
+`success_trades_booked_into_pool`; this requires a native order ID and a valid
+execution timestamp at or after submission. Bare requested quantity and price,
+failed clearing, and incomplete explicit fill fields do not establish a fill.
+Lookup retains unique instrument, side, quantity, time, and available native-ID
+matching. Lighter orders use
 the pinned market precision and client order index. Unknown outcomes remain
 pending for lookup; they are not resubmitted. Gross PnL is computed from
 confirmed fills, but net PnL remains unverified unless both-venue fees and

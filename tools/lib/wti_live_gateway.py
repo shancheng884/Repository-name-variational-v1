@@ -377,6 +377,23 @@ class WTIProductionGateway:
         fill_price_raw = next((self._var_order_value(row, key) for key in (
             "average_fill_price", "average_price", "avg_fill_price", "avg_price", "fill_price"
         ) if self._var_order_value(row, key) is not None), None)
+        clearing_status = self._var_order_value(row, "clearing_status")
+        if status == "cleared" and clearing_status not in (None, "success_trades_booked_into_pool"):
+            return {"ok": False, "final": False, "client_order_id": client_order_id}
+        if filled_raw is None and fill_price_raw is None:
+            execution_at = _timestamp(self._var_order_value(row, "execution_timestamp"))
+            # In orders-v2, successfully booked cleared records carry fills as
+            # qty/price. A pending order's qty/price are not execution evidence.
+            if (
+                status == "cleared"
+                and clearing_status == "success_trades_booked_into_pool"
+                and submitted is not None
+                and execution_at is not None
+                and submitted <= execution_at <= datetime.now(timezone.utc)
+                and self._var_order_value(row, "order_id")
+            ):
+                filled_raw = self._var_order_value(row, "qty")
+                fill_price_raw = self._var_order_value(row, "price")
         qty = _decimal(filled_raw)
         price = _decimal(fill_price_raw)
         order_id = self._var_order_value(row, "order_id") or self._var_order_value(row, "rfq_id")

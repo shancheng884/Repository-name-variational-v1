@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -124,6 +124,135 @@ def test_variational_cleared_record_requires_explicit_fill_fields():
     assert result["final"] is False
     assert result["ok"] is False
     gateway.loop.close()
+
+
+def _booked_wti_order():
+    # Captured orders-v2 schema; IDs and timestamps are replaced for the test.
+    now = datetime.now(timezone.utc)
+    return {
+        "instrument": {"underlying": "USOILP"},
+        "status": "cleared",
+        "clearing_status": "success_trades_booked_into_pool",
+        "side": "buy",
+        "qty": "0.198",
+        "price": "100.426",
+        "order_id": "wti-booked-order",
+        "rfq_id": "rfq-123",
+        "created_at": now.isoformat(),
+        "execution_timestamp": (now - timedelta(milliseconds=100)).isoformat(),
+    }
+
+
+def _booked_wti_request():
+    return {
+        "venue": "variational", "side": "buy", "qty": "0.198",
+        "submitted_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        "rfq_id": "rfq-123",
+    }
+
+
+@pytest.mark.parametrize("known_native_ids", [False, True])
+def test_variational_lookup_decodes_observed_booked_cleared_qty_and_price(known_native_ids):
+    gateway = _gateway(FakeVariational(orders=[_booked_wti_order()]))
+    request = _booked_wti_request()
+    if known_native_ids:
+        request["native_order_id"] = "wti-booked-order"
+    else:
+        request.pop("rfq_id")
+    try:
+        result = asyncio.run(gateway._lookup_variational("action-variational", request))
+    finally:
+        gateway.loop.close()
+    assert result["final"] is True
+    assert result["status"] == "filled"
+    assert result["filled_qty"] == "0.198"
+    assert result["average_price"] == "100.426"
+    assert result["native_order_id"] == "wti-booked-order"
+    assert result["native_client_order_id"] == "rfq-123"
+    assert result["fee_usd"] is None
+
+
+@pytest.mark.parametrize("override", [
+    {"status": "pending"},
+    {"status": "filled"},
+    {"clearing_status": None},
+    {"clearing_status": "rejected_failed_taker_funding"},
+    {"execution_timestamp": None},
+    {"execution_timestamp": "2020-01-01T00:00:00Z"},
+    {"execution_timestamp": "2999-01-01T00:00:00Z"},
+    {"order_id": None},
+    {"price": None},
+    {"price": "NaN"},
+    {"price": "0"},
+    {"qty": "0.197"},
+    {"side": "sell"},
+    {"created_at": "2020-01-01T00:00:00Z"},
+    {"instrument": {"underlying": "ETH"}},
+    {"rfq_id": "some-other-rfq"},
+    {"filled_qty": "0"},
+    {"average_fill_price": "0"},
+])
+def test_variational_canonical_fill_requires_complete_success_evidence(override):
+    order = {**_booked_wti_order(), **override}
+    gateway = _gateway(FakeVariational(orders=[order]))
+    try:
+        result = asyncio.run(gateway._lookup_variational("action-variational", _booked_wti_request()))
+    finally:
+        gateway.loop.close()
+    assert result["final"] is False
+
+
+def test_variational_booked_order_without_known_native_id_still_requires_unique_match():
+    order = _booked_wti_order()
+    gateway = _gateway(FakeVariational(orders=[order, {**order, "order_id": "other-order"}]))
+    request = _booked_wti_request()
+    request.pop("rfq_id")
+    try:
+        result = asyncio.run(gateway._lookup_variational("action-variational", request))
+    finally:
+        gateway.loop.close()
+    assert result["final"] is False
+
+
+def test_variational_booked_order_does_not_override_contradictory_clearing_status():
+    order = {
+        **_booked_wti_order(),
+        "clearing_status": "rejected_failed_taker_funding",
+        "filled_qty": "0.198",
+        "average_fill_price": "100.426",
+    }
+    gateway = _gateway(FakeVariational(orders=[order]))
+    try:
+        result = asyncio.run(gateway._lookup_variational("action-variational", _booked_wti_request()))
+    finally:
+        gateway.loop.close()
+    assert result["final"] is False
+
+
+@pytest.mark.parametrize("reduce_only", [False, True])
+def test_variational_submit_confirms_booked_record_without_resubmitting(reduce_only):
+    var = FakeVariational(orders=[_booked_wti_order()])
+    gateway = _gateway(var)
+
+    async def healthy_account():
+        return {"risk": {
+            "risk_action": "normal", "risk_data_complete": True,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        }}
+
+    gateway._read_account = healthy_account
+    request = {
+        **_booked_wti_request(), "client_order_id": "action-variational",
+        "reduce_only": reduce_only, "max_slippage_bps": "8",
+    }
+    try:
+        result = asyncio.run(gateway._submit_order(request))
+    finally:
+        gateway.loop.close()
+    assert result["final"] is True
+    assert result["filled_qty"] == "0.198"
+    assert result["average_price"] == "100.426"
+    assert [r["type"] for r in var.requests] == ["VAR_API_ORDER", "VAR_API_ORDERS"]
 
 
 def test_variational_order_lookup_requires_unique_exact_native_rfq_match():
