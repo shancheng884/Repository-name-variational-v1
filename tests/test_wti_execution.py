@@ -11,6 +11,7 @@ import pytest
 from tools.lib.market_sessions import classify_usoil_session
 from tools.lib.wti_execution import WTIPairExecutor, WTIExecutionError, WTIExecutionStore
 from tools.lib.wti_live_gateway import WTIProductionGateway
+from tools.lib.lighter_order_identity import LEGACY_INDEX_REJECTION, MAX_LIGHTER_CLIENT_ORDER_INDEX
 
 
 DIRECTION = "long_var_short_lighter"
@@ -772,6 +773,215 @@ def test_restart_continues_only_missing_lighter_leg_after_confirmed_var_fill(tmp
     )
     assert again["status"] == "open"
     assert [request["venue"] for request in gateway.requests] == ["variational", "lighter"]
+
+
+def _legacy_invalid_lighter_pending(tmp_path):
+    sample = _sample(lighter_continuity_ok=True)
+    simulation = SimulatedWTIGateway(results={"lighter": {"ok": False, "final": False}})
+    executor, _ = _executor(tmp_path, simulation, sample=sample)
+    state = _open(executor, sample=sample)
+    assert state["status"] == "manual_review_required"
+    state["pending_action"]["action_id"] = "legacy-live-action"
+    leg = state["pending_action"]["legs"]["lighter"]
+    leg["request"]["client_order_id"] = "legacy-live-action-lighter"
+    for key in ("native_client_order_id", "lighter_client_index_scheme", "transaction_hash"):
+        leg["request"].pop(key, None)
+    leg["result"] = {"classification": "unknown", "terminal_confirmed": False}
+    leg.pop("submission_result", None)
+    executor.store.save(state)
+    return executor, simulation, sample
+
+
+@pytest.mark.parametrize("response_mode", ["accepted", "lost_ack", "absent", "risk_block", "unchanged_open_status"])
+def test_startup_recovery_uses_production_submission_and_lookup_without_duplicate_send(
+    tmp_path, monkeypatch, response_mode,
+):
+    import lighter
+    from lighter.transactions import CreateOrder
+    from tools import wti_live
+    from types import SimpleNamespace
+
+    executor, simulation, sample = _legacy_invalid_lighter_pending(tmp_path)
+    if response_mode == "unchanged_open_status":
+        sample["session_status_observed_at"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    orders, sent = [], []
+
+    class API:
+        def __init__(self, client):
+            pass
+
+        async def account_inactive_orders(self, **kwargs):
+            return {"code": 200, "orders": deepcopy(orders)}
+
+        async def account_active_orders(self, **kwargs):
+            return {"code": 200, "orders": []}
+
+        async def trades(self, **kwargs):
+            return {"code": 200, "trades": []}
+
+    class Signer:
+        api_client = object()
+        ORDER_TYPE_MARKET = 1
+        ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0
+        DEFAULT_IOC_EXPIRY = 0
+
+        def create_auth_token_with_expiry(self, **kwargs):
+            return "test-token", None
+
+        async def create_order(self, **kwargs):
+            sent.append(kwargs)
+            saved = executor.store.load()["pending_action"]
+            req = saved["legs"]["lighter"]["request"]
+            assert saved["legs"]["lighter"]["submission_started"] is True
+            assert req["lighter_client_index_scheme"] == "sha256_48_v1"
+            assert int(req["native_client_order_id"]) == kwargs["client_order_index"]
+            assert 1 <= kwargs["client_order_index"] <= MAX_LIGHTER_CLIENT_ORDER_INDEX
+            assert "replacement-1" in req["client_order_id"]
+            archived = saved["superseded_legs"][0]
+            assert archived["reason"] == LEGACY_INDEX_REJECTION
+            assert archived["leg"]["request"]["client_order_id"] == "legacy-live-action-lighter"
+            if response_mode != "absent":
+                simulation.lighter_qty = Decimal("-0.29")
+                orders.append({
+                    "market_index": 145, "client_order_index": kwargs["client_order_index"],
+                    "order_index": 123456, "is_ask": True, "status": "filled",
+                    "filled_base_amount": "0.29", "filled_quote_amount": "20.30",
+                })
+            if response_mode == "lost_ack":
+                raise TimeoutError("simulated disconnect after send")
+            return CreateOrder.from_json("{}"), {"code": 200, "tx_hash": "tx-accepted"}, None
+
+    monkeypatch.setattr(lighter, "OrderApi", API)
+
+    async def exercise():
+        production = WTIProductionGateway(
+            loop=asyncio.get_running_loop(), variational=object(), account_reader=object(),
+            lighter_client=Signer(), account_index=10, api_key_index=1,
+            market={"market_id": 145, "supported_size_decimals": 2, "supported_price_decimals": 2},
+            max_order_wait_seconds=0.01,
+        )
+
+        async def read_account():
+            observed = simulation.read_account()
+            risk = {
+                "risk_action": "block_entry" if response_mode == "risk_block" else "normal",
+                "risk_reason": "test_account_risk", "risk_data_complete": True,
+                "observed_at": observed["observed_at"],
+            }
+            production.latest_risk = risk
+            return {**observed, "risk": risk}
+
+        production._read_account = read_account
+        executor.gateway = production
+        runtime = object.__new__(wti_live.WTILiveRuntime)
+        runtime.args = SimpleNamespace(
+            entry_cutoff_seconds=1800, entry_threshold_bps=Decimal("30"),
+            exit_target_bps=Decimal("1"), roundtrip_cost_bps=Decimal("10"),
+            max_notional_usd=Decimal("25"), max_slippage_bps=Decimal("8"), max_hold_seconds=21600,
+        )
+        runtime.config = wti_live.build_replay_config(runtime.args)
+        runtime.executor = executor
+        runtime.gateway = production
+        runtime.manage_existing_only = True
+        runtime.pending_gap_exit = False
+        first = await runtime._read_reconcile(sample)
+        if response_mode in {"accepted", "unchanged_open_status"}:
+            assert first["status"] == "open"
+            evidence = first["execution_history"][-1]["legs"]["lighter"]["submission_result"]
+            assert evidence["transaction_hash"] == "tx-accepted"
+        else:
+            assert first["status"] == "manual_review_required"
+        second = await runtime._read_reconcile(sample)
+        third = await runtime._read_reconcile(sample)
+        if response_mode in {"accepted", "lost_ack", "unchanged_open_status"}:
+            assert second["status"] == third["status"] == "open"
+            assert not third["pending_action"]
+            assert len(third["execution_history"][-1]["superseded_legs"]) == 1
+            assert third["open_position"]["opened_at"] == third["execution_history"][-1]["intent_at"]
+            for _ in range(2):
+                continuing = await runtime._process_sample(sample)
+                assert continuing["status"] == "open"
+                assert runtime.last_action["action"] == "hold"
+            assert len(sent) == 1
+        elif response_mode == "absent":
+            assert third["manual_review_reason"] == "pending_order_terminal_status_unconfirmed"
+            result = third["pending_action"]["legs"]["lighter"]["result"]
+            assert result["lookup_reason"] == "lighter_order_absent_from_active_and_inactive"
+            assert third["pending_action"]["legs"]["lighter"]["submission_result"]["transaction_hash"] == "tx-accepted"
+            assert len(sent) == 1
+        else:
+            assert third["manual_review_reason"] == "pending_open_lighter_no_fill_requires_operator", third
+            assert not sent
+        assert simulation.var_qty == Decimal("0.29")
+        assert len(simulation.requests) == 2  # Only setup attempts; Var never resubmitted.
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("blocker", ["closed", "stale", "active_orders", "position_mismatch", "depth"])
+def test_legacy_rejection_recovery_keeps_session_freshness_depth_and_position_gates(tmp_path, blocker):
+    executor, gateway, sample = _legacy_invalid_lighter_pending(tmp_path)
+    proof = WTIProductionGateway(
+        loop=asyncio.new_event_loop(), variational=object(), account_reader=object(),
+        lighter_client=object(), account_index=10, api_key_index=1, market={"market_id": 145},
+    )
+
+    def lookup(cid, request=None):
+        return asyncio.run(proof._lookup_lighter(cid, request or {}))
+
+    gateway.lookup_order = lookup
+    session = _session_for_sample(sample)
+    if blocker == "closed":
+        session = _session(open_=False)
+    elif blocker == "stale":
+        sample["var_quote_age_seconds"] = "3"
+    elif blocker == "active_orders":
+        gateway.active_orders.append({"order_id": "still-active"})
+    elif blocker == "position_mismatch":
+        gateway.var_qty = Decimal("0.30")
+    else:
+        executor.market_reader = lambda: {**sample, "variational_qty": "0.28", "lighter_qty": "0.28"}
+    try:
+        try:
+            recovered = executor.reconcile(sample=sample, session=session, now=datetime.now(timezone.utc))
+        except WTIExecutionError:
+            recovered = executor.store.load()
+        assert recovered["status"] == "manual_review_required"
+        assert recovered["pending_action"].get("superseded_legs") is None
+        assert len(gateway.requests) == 2
+    finally:
+        proof.loop.close()
+
+
+def test_recovery_does_not_restart_maximum_hold_clock(tmp_path):
+    from tools.lib.wti_live_strategy import decide_wti_action
+    from tools.lib.wti_replay import ReplayConfig
+
+    executor, simulation, sample = _legacy_invalid_lighter_pending(tmp_path)
+    state = executor.store.load()
+    intended = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
+    state["pending_action"]["intent_at"] = intended
+    leg = state["pending_action"]["legs"]["lighter"]
+    # Exercise the ordinary never-submitted branch; both recovery branches share
+    # the preserved intent clock, independently of whether a legacy index failed.
+    leg["submission_started"] = False
+    leg["result"] = None
+    simulation.results.clear()
+    executor.store.save(state)
+    recovered = executor.reconcile(
+        sample=sample, session=_session_for_sample(sample), now=datetime.now(timezone.utc),
+    )
+    assert recovered["status"] == "open"
+    assert recovered["open_position"]["opened_at"] == intended
+    decision = decide_wti_action(
+        sample, recovered["open_position"],
+        config=ReplayConfig(entry_threshold_bps=Decimal("30"), exit_target_bps=Decimal("1"),
+                            roundtrip_cost_bps=Decimal("10"), max_hold_seconds=21600,
+                            max_sample_gap_seconds=120),
+        now=datetime.now(timezone.utc),
+    )
+    assert decision["action"] == "close"
+    assert decision["reason"] == "max_hold"
 
 
 def test_pending_open_refresh_uses_original_pair_quantities_and_submits_hedge_once(tmp_path):

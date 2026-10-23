@@ -248,6 +248,24 @@ def test_runtime_requires_current_dual_feed_and_verified_session_in_health():
     )
 
 
+def test_execution_session_uses_validated_heartbeat_without_requiring_state_change():
+    now = datetime.now(timezone.utc)
+    row = _live_sample(now)
+    row["session_status_observed_at"] = (now - timedelta(hours=2)).isoformat()
+    window = wti_live._session_window(row, now, 1800)
+    assert window.allow_new_entries is True
+    assert window.observed_at == row["session_status_feed_heartbeat_at"]
+    for changed in (
+        {"session_status_feed_connected": False},
+        {"session_status_feed_heartbeat_at": (now - timedelta(seconds=31)).isoformat()},
+        {"session_status_feed_heartbeat_at": (now + timedelta(seconds=6)).isoformat()},
+        {"session_status_source": "unverified"},
+    ):
+        blocked = wti_live._session_window({**row, **changed}, now, 1800)
+        assert blocked.allow_new_entries is False
+        assert blocked.allow_position_management is False
+
+
 def test_runtime_skips_sample_that_ages_past_executor_quote_limit():
     runtime = object.__new__(wti_live.WTILiveRuntime)
     runtime.last_processed_sample_id = None
@@ -318,6 +336,32 @@ def _runtime_for_entry_gate(*, allow_unqualified: bool):
     runtime.entry_gate_block_reason = None
     runtime.entry_authorization_permanently_revoked = False
     return runtime
+
+
+def test_health_exposes_pending_lookup_reason_and_retains_original_submission_receipt(tmp_path):
+    runtime = _runtime_for_entry_gate(allow_unqualified=False)
+    runtime.args.health_path = tmp_path / "health.json"
+    runtime.run_id = "test-pending-diagnostics"
+    runtime.stop = False
+    runtime.startup_reconciled = False
+    runtime.last_sample_gap_seconds = None
+    runtime.last_risk = {}
+    runtime.last_action = {"action": "reconcile"}
+    submission = {"transaction_hash": "tx-accepted", "submission_acknowledged": True}
+    state = {
+        "status": "manual_review_required", "manual_review_reason": "pending_order_terminal_status_unconfirmed",
+        "pending_action": {"legs": {"lighter": {
+            "submission_started": True, "submission_result": submission,
+            "result": {"classification": "unknown", "lookup_stage": "active_orders",
+                       "lookup_reason": "lighter_order_absent_from_active_and_inactive"},
+        }}},
+    }
+    runtime._write_health(state=state, row=_live_sample(datetime.now(timezone.utc)))
+    health = json.loads(runtime.args.health_path.read_text())
+    diagnostic = health["pending_order_diagnostics"]["lighter"]
+    assert diagnostic["lookup_reason"] == "lighter_order_absent_from_active_and_inactive"
+    assert diagnostic["submission_result"] == submission
+    assert health["startup_reconciled"] is False
 
 
 def test_unqualified_data_pilot_bypasses_history_only_with_fresh_verified_sample():

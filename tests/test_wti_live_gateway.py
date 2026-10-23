@@ -14,6 +14,11 @@ from tools.lib.wti_live_gateway import (
     lighter_client_order_index,
 )
 from tools.lib.wti_readonly_adapter import WTIReadOnlyError
+from tools.lib.lighter_order_identity import (
+    LEGACY_INDEX_REJECTION,
+    legacy_lighter_client_order_index,
+    lighter_order_identity,
+)
 
 
 class FakeVariational:
@@ -424,4 +429,120 @@ def test_entry_risk_block_prevents_any_order_submission(monkeypatch):
     }))
     assert result["status"] == "rejected"
     assert not var.requests
+    gateway.loop.close()
+
+
+def test_real_sdk_create_order_object_does_not_erase_accepted_send_receipt():
+    from lighter.transactions import CreateOrder
+
+    class Signer:
+        ORDER_TYPE_MARKET = 1
+        ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0
+        DEFAULT_IOC_EXPIRY = 0
+
+        async def create_order(self, **kwargs):
+            assert 1 <= kwargs["client_order_index"] < 1 << 48
+            return CreateOrder.from_json("{}"), {"code": 200, "tx_hash": "tx-accepted"}, None
+
+    gateway = _gateway(FakeVariational(), lighter=Signer())
+    result = asyncio.run(gateway._submit_lighter({
+        "client_order_id": "sdk-object-lighter", "side": "sell", "qty": "0.29",
+        "limit_price": "70.00", "reduce_only": False,
+    }))
+    assert result["ok"] is True
+    assert result["submission_acknowledged"] is True
+    assert result["transaction_hash"] == "tx-accepted"
+    gateway.loop.close()
+
+
+def test_lighter_legacy_invalid_index_is_proven_local_rejection_without_api_calls():
+    gateway = _gateway(FakeVariational(), lighter=object())
+    cid = "legacy-live-action-lighter"
+    result = asyncio.run(gateway._lookup_lighter(cid, {
+        "client_order_id": cid, "venue": "lighter", "side": "sell", "qty": "0.198",
+    }))
+    assert result["ok"] is result["final"] is True
+    assert result["no_order_confirmed"] is True
+    assert result["filled_qty"] == "0"
+    assert result["error_code"] == LEGACY_INDEX_REJECTION
+    assert result["native_client_order_id"] == str(legacy_lighter_client_order_index(cid))
+    gateway.loop.close()
+
+
+def test_sdk_submission_error_remains_unknown_with_safe_diagnostics():
+    class Signer:
+        ORDER_TYPE_MARKET = 1
+        ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0
+        DEFAULT_IOC_EXPIRY = 0
+
+        async def create_order(self, **kwargs):
+            return None, None, "unexpected response with confidential detail"
+
+    gateway = _gateway(FakeVariational(), lighter=Signer())
+    result = asyncio.run(gateway._submit_lighter({
+        "client_order_id": "sdk-error-lighter", "side": "sell", "qty": "0.29",
+        "limit_price": "70.00", "reduce_only": False,
+    }))
+    assert result["final"] is False
+    assert result["error_code"] == "lighter_sdk_submission_failed"
+    assert result["submission_stage"] == "sdk_create_order"
+    assert "confidential" not in str(result)
+    gateway.loop.close()
+
+
+@pytest.mark.parametrize("mode", ["absent", "active", "timeout", "filled_fee_timeout", "filled_missing_id"])
+def test_lighter_lookup_preserves_saved_identity_and_reports_specific_evidence(monkeypatch, mode):
+    cid = "legacy-live-action-lighter"
+    identity = lighter_order_identity(cid)
+    index = int(identity["native_client_order_id"])
+
+    class API:
+        def __init__(self, client):
+            pass
+
+        async def account_inactive_orders(self, **kwargs):
+            if mode == "timeout":
+                raise TimeoutError("do not persist arbitrary exception payload")
+            rows = [] if mode not in {"filled_fee_timeout", "filled_missing_id"} else [{
+                "market_index": 145, "client_order_index": index, "is_ask": True,
+                "status": "filled", "filled_base_amount": "0.29",
+                "filled_quote_amount": "20.30", "order_index": 123456,
+            }]
+            if mode == "filled_missing_id":
+                rows[0].pop("order_index")
+            return {"code": 200, "orders": rows}
+
+        async def account_active_orders(self, **kwargs):
+            return {"code": 200, "orders": [{"client_order_index": index}] if mode == "active" else []}
+
+        async def trades(self, **kwargs):
+            raise TimeoutError("fee query unavailable")
+
+    monkeypatch.setitem(sys.modules, "lighter", SimpleNamespace(OrderApi=API))
+    signer = SimpleNamespace(
+        api_client=object(), create_auth_token_with_expiry=lambda **kwargs: ("test-token", None),
+    )
+    gateway = _gateway(FakeVariational(), lighter=signer)
+    result = asyncio.run(gateway._lookup_lighter(cid, {
+        "client_order_id": cid, "venue": "lighter", "side": "sell", "qty": "0.29", **identity,
+    }))
+    assert result["native_client_order_id"] == str(index)
+    if mode == "filled_fee_timeout":
+        assert result["ok"] is result["final"] is True
+        assert result["status"] == "filled"
+        assert result["filled_qty"] == "0.29"
+        assert result["trade_ids"] is result["fee_usd"] is None
+        assert result["lookup_reason"] == "lighter_trade_evidence_unavailable"
+    else:
+        assert result["final"] is False
+        assert result.get("no_order_confirmed") is not True
+        assert result["lookup_reason"] == {
+            "absent": "lighter_order_absent_from_active_and_inactive",
+            "active": "lighter_order_still_active",
+            "timeout": "lighter_lookup_request_failed",
+            "filled_missing_id": "lighter_native_order_id_missing",
+        }[mode]
+        if mode == "timeout":
+            assert result["lookup_stage"] == "inactive_orders"
+            assert result["error_type"] == "TimeoutError"
     gateway.loop.close()

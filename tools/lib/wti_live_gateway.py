@@ -15,6 +15,13 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from tools.lib.hedge_instruments import WTI_HEDGE, integer_value
+from tools.lib.lighter_order_identity import (
+    LEGACY_INDEX_REJECTION,
+    legacy_lighter_index_was_unsendable,
+    lighter_client_order_index as lighter_client_order_index,
+    lighter_order_identity,
+    request_lighter_client_order_index,
+)
 from tools.lib.wti_readonly_adapter import (
     WTIReadOnlyAccountAdapter,
     WTIReadOnlyError,
@@ -46,11 +53,6 @@ def _decimal(value: Any) -> Decimal | None:
     except (InvalidOperation, TypeError, ValueError):
         return None
     return parsed if parsed.is_finite() else None
-
-
-def lighter_client_order_index(client_order_id: str) -> int:
-    digest = hashlib.sha256(client_order_id.encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1) or 1
 
 
 def _model_dict(value: Any) -> dict[str, Any] | None:
@@ -212,12 +214,17 @@ class WTIProductionGateway:
                 or age is None or age < -5 or age > 15
             ):
                 return {
-                    "ok": False,
+                    "ok": True,
                     "final": True,
                     "client_order_id": request.get("client_order_id"),
                     "status": "rejected",
                     "filled_qty": "0",
                     "risk_reason": risk.get("risk_reason") or "wti_entry_risk_gate_blocked",
+                    "error_code": "wti_entry_risk_gate_blocked",
+                    "source": "local_account_risk_preflight",
+                    "submission_stage": "account_risk_preflight",
+                    "no_order_confirmed": True,
+                    "native_client_order_id": request.get("native_client_order_id"),
                 }
         if request["venue"] == "variational":
             request_id = str(request["client_order_id"])
@@ -263,12 +270,22 @@ class WTIProductionGateway:
             if rfq_id not in (None, ""):
                 request["rfq_id"] = str(rfq_id)
         else:
-            await self._submit_lighter(request)
+            receipt = await self._submit_lighter(request)
+            if receipt.get("ok") is not True:
+                return receipt
+            request.update({key: receipt[key] for key in (
+                "native_client_order_id", "transaction_hash", "submission_stage",
+                "submission_acknowledged",
+            ) if key in receipt})
         deadline = time.monotonic() + self.max_order_wait_seconds
+        status: dict[str, Any] = {}
         while time.monotonic() < deadline:
             status = await self._lookup_order(request["client_order_id"], request)
             if status.get("final") is True:
                 status.setdefault("native_client_order_id", request.get("rfq_id"))
+                for key in ("transaction_hash", "submission_stage", "submission_acknowledged"):
+                    if key in request:
+                        status.setdefault(key, request[key])
                 return status
             await asyncio.sleep(0.2)
         return {
@@ -276,12 +293,14 @@ class WTIProductionGateway:
             "final": False,
             "client_order_id": request["client_order_id"],
             "status": "unknown",
-            "native_client_order_id": request.get("rfq_id"),
+            "native_client_order_id": request.get("native_client_order_id") or request.get("rfq_id"),
+            **{key: request[key] for key in (
+                "transaction_hash", "submission_stage", "submission_acknowledged",
+            ) if key in request},
+            **{key: status[key] for key in ("lookup_stage", "lookup_reason", "error_type") if key in status},
         }
 
-    async def _submit_lighter(self, request: dict[str, Any]) -> None:
-        from lighter import OrderApi
-
+    async def _submit_lighter(self, request: dict[str, Any]) -> dict[str, Any]:
         size_decimals = int(self.market["supported_size_decimals"])
         price_decimals = int(self.market["supported_price_decimals"])
         base_units = Decimal(str(request["qty"])) * (Decimal(10) ** size_decimals)
@@ -294,8 +313,16 @@ class WTIProductionGateway:
         ):
             raise WTIReadOnlyError("lighter_order_precision_invalid")
         base_amount = int(base_units)
-        client_index = lighter_client_order_index(str(request["client_order_id"]))
-        create_order, response, error = await self.lighter_client.create_order(
+        client_order_id = str(request["client_order_id"])
+        client_index = request_lighter_client_order_index(client_order_id, request, submitting=True)
+        if request.get("native_client_order_id") in (None, ""):
+            request.update(lighter_order_identity(client_order_id))
+        receipt = {
+            "ok": False, "final": False, "status": "unknown",
+            "client_order_id": client_order_id, "native_client_order_id": str(client_index),
+            "submission_stage": "sdk_create_order",
+        }
+        _create_order, response, error = await self.lighter_client.create_order(
             market_index=int(self.market["market_id"]),
             client_order_index=client_index,
             base_amount=base_amount,
@@ -308,13 +335,17 @@ class WTIProductionGateway:
             api_key_index=self.api_key_index,
         )
         if error is not None:
-            raise WTIReadOnlyError("lighter_order_submission_rejected")
+            return {**receipt, "error_code": "lighter_sdk_submission_failed", "error_type": type(error).__name__}
         response_dict = _model_dict(response)
         if response_dict is None or integer_value(response_dict.get("code")) not in {0, 200}:
-            raise WTIReadOnlyError("lighter_order_submission_unconfirmed")
-        order_dict = _model_dict(create_order)
-        if order_dict is None:
-            raise WTIReadOnlyError("lighter_order_intent_response_invalid")
+            return {**receipt, "submission_stage": "send_tx_response", "error_code": "lighter_order_submission_unconfirmed"}
+        # SDK CreateOrder exposes to_json(), not to_dict()/model_dump(). An accepted
+        # send_tx receipt must survive independently of that signed payload object.
+        return {
+            **receipt, "ok": True, "submission_acknowledged": True,
+            "submission_stage": "send_tx_accepted",
+            "transaction_hash": response_dict.get("tx_hash"),
+        }
 
     async def _lookup_order(
         self, client_order_id: str, request: dict[str, Any]
@@ -515,14 +546,28 @@ class WTIProductionGateway:
     ) -> dict[str, Any]:
         from lighter import OrderApi
 
-        token, error = self.lighter_client.create_auth_token_with_expiry(
-            api_key_index=self.api_key_index
-        )
-        if error is not None or not token:
-            return {"ok": False, "final": False, "client_order_id": client_order_id}
-        client_index = lighter_client_order_index(client_order_id)
-        api = OrderApi(self.lighter_client.api_client)
+        unknown = {"ok": False, "final": False, "status": "unknown", "client_order_id": client_order_id}
         try:
+            client_index = request_lighter_client_order_index(client_order_id, request)
+        except ValueError as exc:
+            return {**unknown, "lookup_stage": "identity", "lookup_reason": str(exc)}
+        unknown["native_client_order_id"] = str(client_index)
+        if legacy_lighter_index_was_unsendable(client_order_id, request):
+            return {
+                **unknown, "ok": True, "final": True, "status": "rejected",
+                "filled_qty": "0", "trade_ids": [], "fee_usd": "0",
+                "source": "local_signer_validation", "error_code": LEGACY_INDEX_REJECTION,
+                "no_order_confirmed": True, "lookup_stage": "identity",
+            }
+        stage = "auth"
+        try:
+            token, error = self.lighter_client.create_auth_token_with_expiry(
+                api_key_index=self.api_key_index
+            )
+            if error is not None or not token:
+                return {**unknown, "lookup_stage": stage, "lookup_reason": "lighter_auth_token_unavailable"}
+            api = OrderApi(self.lighter_client.api_client)
+            stage = "inactive_orders"
             inactive = await api.account_inactive_orders(
                 account_index=self.account_index,
                 limit=100,
@@ -532,11 +577,12 @@ class WTIProductionGateway:
             )
             inactive_rows = _rows(inactive, "orders")
             if inactive_rows is None:
-                return {"ok": False, "final": False, "client_order_id": client_order_id}
+                return {**unknown, "lookup_stage": stage, "lookup_reason": "lighter_inactive_orders_response_invalid"}
             matches = [row for row in inactive_rows if integer_value(row.get("client_order_index")) == client_index]
             if len(matches) > 1:
-                return {"ok": False, "final": False, "client_order_id": client_order_id}
+                return {**unknown, "lookup_stage": stage, "lookup_reason": "lighter_order_identity_ambiguous"}
             if not matches:
+                stage = "active_orders"
                 active = await api.account_active_orders(
                     account_index=self.account_index,
                     market_id=int(self.market["market_id"]),
@@ -544,34 +590,48 @@ class WTIProductionGateway:
                     _request_timeout=5.0,
                 )
                 active_rows = _rows(active, "orders")
-                if active_rows is None or any(
+                if active_rows is None:
+                    return {**unknown, "lookup_stage": stage, "lookup_reason": "lighter_active_orders_response_invalid"}
+                if any(
                     integer_value(row.get("client_order_index")) == client_index
                     for row in active_rows
                 ):
-                    return {"ok": False, "final": False, "client_order_id": client_order_id}
-                return {"ok": False, "final": False, "client_order_id": client_order_id}
+                    return {**unknown, "lookup_stage": stage, "lookup_reason": "lighter_order_still_active"}
+                return {**unknown, "lookup_stage": stage, "lookup_reason": "lighter_order_absent_from_active_and_inactive"}
             order = matches[0]
+            stage = "order_record"
             if (
                 integer_value(order.get("market_index")) != int(self.market["market_id"])
                 or integer_value(order.get("client_order_index")) != client_index
-                or bool(order.get("is_ask")) != (request.get("side") == "sell")
+                or not isinstance(order.get("is_ask"), bool)
+                or request.get("side") not in {"buy", "sell"}
+                or order["is_ask"] != (request["side"] == "sell")
             ):
-                return {"ok": False, "final": False, "client_order_id": client_order_id}
+                return {**unknown, "lookup_stage": stage, "lookup_reason": "lighter_order_identity_mismatch"}
+            order_index = integer_value(order.get("order_index"))
+            if order_index is None or order_index <= 0:
+                return {**unknown, "lookup_stage": stage, "lookup_reason": "lighter_native_order_id_missing"}
             status = str(order.get("status") or "").lower()
             filled = _decimal(order.get("filled_base_amount"))
             quote = _decimal(order.get("filled_quote_amount"))
             wanted = _decimal(request.get("qty"))
             if filled is None or quote is None or wanted is None or filled < 0:
-                return {"ok": False, "final": False, "client_order_id": client_order_id}
+                return {**unknown, "lookup_stage": stage, "lookup_reason": "lighter_order_amounts_unverifiable"}
             if status == "filled" and filled == wanted and filled > 0 and quote > 0:
-                trades = await api.trades(
-                    sort_by="timestamp", limit=100, auth=token,
-                    market_id=int(self.market["market_id"]),
-                    account_index=self.account_index,
-                    order_index=integer_value(order.get("order_index")),
-                    sort_dir="asc", _request_timeout=5.0,
-                )
-                trade_rows = _rows(trades, "trades")
+                # An unavailable fee query cannot erase a proven terminal order fill.
+                trade_error = None
+                try:
+                    trades = await api.trades(
+                        sort_by="timestamp", limit=100, auth=token,
+                        market_id=int(self.market["market_id"]),
+                        account_index=self.account_index,
+                        order_index=order_index,
+                        sort_dir="asc", _request_timeout=5.0,
+                    )
+                    trade_rows = _rows(trades, "trades")
+                except Exception as exc:
+                    trade_rows = None
+                    trade_error = type(exc).__name__
                 trade_ids: list[str] = []
                 fee_total = Decimal("0")
                 fee_confirmed = bool(trade_rows)
@@ -587,23 +647,29 @@ class WTIProductionGateway:
                         else:
                             fee_total += explicit_fee
                 return {
-                    "ok": True, "final": True, "client_order_id": client_order_id,
+                    **unknown, "ok": True, "final": True,
                     "order_id": str(order.get("order_index")),
                     "native_order_id": str(order.get("order_id") or order.get("order_index")),
                     "native_client_order_id": str(client_index), "status": "filled",
                     "filled_qty": str(filled), "average_price": str(quote / filled),
-                    "trade_ids": trade_ids, "fee_usd": str(fee_total) if fee_confirmed else None,
+                    "trade_ids": trade_ids if trade_rows else None,
+                    "fee_usd": str(fee_total) if fee_confirmed else None,
+                    **({"lookup_stage": "trades", "lookup_reason": "lighter_trade_evidence_unavailable",
+                        "error_type": trade_error} if not trade_rows else {}),
                 }
             if status in TERMINAL_LIGHTER_NO_FILL and filled == 0:
                 return {
-                    "ok": True, "final": True, "client_order_id": client_order_id,
+                    **unknown, "ok": True, "final": True,
                     "order_id": str(order.get("order_index")), "status": "canceled",
                     "filled_qty": "0", "trade_ids": [], "fee_usd": "0",
                 }
             return {
-                "ok": True, "final": True, "client_order_id": client_order_id,
+                **unknown, "ok": True, "final": True,
                 "order_id": str(order.get("order_index")), "status": status,
                 "filled_qty": str(filled), "trade_ids": [],
             }
-        except Exception:
-            return {"ok": False, "final": False, "client_order_id": client_order_id}
+        except Exception as exc:
+            return {
+                **unknown, "lookup_stage": stage,
+                "lookup_reason": "lighter_lookup_request_failed", "error_type": type(exc).__name__,
+            }

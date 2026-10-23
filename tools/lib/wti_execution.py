@@ -34,6 +34,11 @@ from tools.lib.market_sessions import (
     SessionWindow,
     session_observation_for_sample,
 )
+from tools.lib.lighter_order_identity import (
+    LEGACY_INDEX_REJECTION,
+    legacy_lighter_index_was_unsendable,
+    lighter_order_identity,
+)
 
 
 SCHEMA_VERSION = 2
@@ -222,7 +227,7 @@ def validate_market_sample(
         market_id=market_id,
         multiplier=multiplier,
         session_id=session.session_id,
-        session_observed_at=session.observed_at,
+        session_observed_at=_sample_time(sample["session_status_feed_heartbeat_at"]),
         session_closing_at=session.closing_at,
         lighter_qty_step=qty_step,
         lighter_price_decimals=price_decimals,
@@ -340,8 +345,13 @@ def _normalized_order_result(
         or str(payload.get("client_order_id") or "") != expected_client_order_id
     ):
         return {"classification": "unknown"}
+    diagnostics = {key: payload[key] for key in (
+        "source", "error_code", "error_type", "submission_stage", "submission_acknowledged",
+        "transaction_hash", "lookup_stage", "lookup_reason", "risk_reason",
+    ) if key in payload and isinstance(payload[key], (str, bool, int, type(None)))}
     if payload.get("ok") is not True or payload.get("final") is not True:
         return {
+            **diagnostics,
             "classification": "unknown",
             "client_order_id": expected_client_order_id,
             "native_order_id": payload.get("native_order_id"),
@@ -357,6 +367,7 @@ def _normalized_order_result(
     fee = decimal_value(payload.get("fee_usd"))
     trade_ids = payload.get("trade_ids")
     evidence = {
+        **diagnostics,
         "client_order_id": expected_client_order_id,
         "order_id": str(order_id) if order_id else None,
         "native_order_id": str(payload.get("native_order_id") or order_id) if (payload.get("native_order_id") or order_id) else None,
@@ -443,8 +454,9 @@ def _session_matches_sample(
     if observation is None or session is None or session.exchange_open is not True:
         return None
     try:
+        heartbeat_at = _sample_time(sample["session_status_feed_heartbeat_at"])
         if (
-            abs((_sample_time(session.observed_at) - observation.observed_at).total_seconds()) > 30
+            abs((_sample_time(session.observed_at) - heartbeat_at).total_seconds()) > 30
             or abs((_sample_time(session.closing_at) - observation.closing_at).total_seconds()) > 1
         ):
             return None
@@ -898,6 +910,7 @@ class WTIPairExecutor:
                 "instrument_type": WTI_HEDGE.lighter.instrument_type,
                 "market_id": context.market_id,
                 "settlement_asset": WTI_HEDGE.lighter.settlement_asset,
+                **lighter_order_identity(request["client_order_id"]),
             })
         return request
 
@@ -908,9 +921,16 @@ class WTIPairExecutor:
         opening: bool,
     ) -> dict[str, Any]:
         pending = state["pending_action"]
+        previous = pending.get("superseded_legs", [])
+        if not isinstance(previous, list) or any(not isinstance(item, dict) for item in previous):
+            raise WTIExecutionError("pending_leg_replacement_history_invalid")
+        replacements = sum(1 for item in previous if item.get("venue") == venue)
+        action_id = pending["action_id"]
+        if replacements:
+            action_id = f"{action_id}-replacement-{replacements}"
         request = self._order_request(
             context=context, venue=venue, side=side, qty=qty,
-            reduce_only=reduce_only, action_id=pending["action_id"],
+            reduce_only=reduce_only, action_id=action_id,
         )
         request["intent_at"] = pending.get("intent_at")
         leg = {
@@ -952,7 +972,13 @@ class WTIPairExecutor:
         try:
             result = self.gateway.submit_order(request)
         except Exception as exc:
-            result = {"exception": type(exc).__name__}
+            code = str(exc)
+            result = {
+                "ok": False, "final": False, "client_order_id": request["client_order_id"],
+                "error_type": type(exc).__name__, "submission_stage": "gateway_call",
+                "error_code": code if code.startswith("lighter_") and code.replace("_", "").isalnum()
+                else "order_submission_exception",
+            }
         normalized = _normalized_order_result(
             result, qty, expected_client_order_id=request["client_order_id"]
         )
@@ -964,6 +990,9 @@ class WTIPairExecutor:
             if value not in (None, ""):
                 request[target_key] = value
         leg["result"] = normalized
+        leg["submission_result"] = deepcopy(normalized)
+        if normalized.get("transaction_hash"):
+            request["transaction_hash"] = normalized["transaction_hash"]
         leg["response_received_at"] = self._now().isoformat()
         self.store.save(state)
         return normalized
@@ -1024,6 +1053,7 @@ class WTIPairExecutor:
             "market_id": pending["market_id"],
             "multiplier": pending["multiplier"],
             "legs": deepcopy(pending.get("legs") or {}),
+            "superseded_legs": deepcopy(pending.get("superseded_legs") or []),
             "recovered": recovered,
         }
 
@@ -1172,9 +1202,13 @@ class WTIPairExecutor:
             try:
                 lookup_request = deepcopy(leg.get("request") or {})
                 prior_result = leg.get("result") or {}
-                for key in ("native_order_id", "native_client_order_id"):
+                for key in ("native_order_id", "native_client_order_id", "transaction_hash"):
                     if key not in lookup_request and prior_result.get(key) not in (None, ""):
                         lookup_request[key] = prior_result[key]
+                submission = leg.get("submission_result") or {}
+                for key in ("native_order_id", "native_client_order_id", "transaction_hash"):
+                    if key not in lookup_request and submission.get(key) not in (None, ""):
+                        lookup_request[key] = submission[key]
                 try:
                     lookup = self.gateway.lookup_order(
                         str(client_order_id), request=lookup_request
@@ -1182,8 +1216,12 @@ class WTIPairExecutor:
                 except TypeError:
                     # Keep compatibility with test and third-party adapters implementing v1.
                     lookup = self.gateway.lookup_order(str(client_order_id))
-            except Exception:
-                return False
+            except Exception as exc:
+                lookup = {
+                    "ok": False, "final": False, "client_order_id": str(client_order_id),
+                    "lookup_stage": "gateway_call", "lookup_reason": "order_lookup_exception",
+                    "error_type": type(exc).__name__,
+                }
             requested_qty = decimal_value((leg.get("request") or {}).get("qty"))
             if requested_qty is None:
                 return False
@@ -1604,7 +1642,7 @@ class WTIPairExecutor:
         sample: dict[str, Any],
         session: SessionWindow | None,
     ) -> dict[str, Any] | None:
-        """Continue only a proven Var-first open whose Lighter leg was never sent."""
+        """Continue a Var-first open only when the missing hedge was provably never sent."""
         if pending.get("kind") != "open" or actual.active_order_count != 0:
             return None
         legs = pending.get("legs") or {}
@@ -1630,6 +1668,7 @@ class WTIPairExecutor:
             return None
 
         lighter_leg = legs.get("lighter")
+        replace_unsendable = False
         if isinstance(lighter_leg, dict):
             if lighter_leg.get("submission_started") is True:
                 lighter_result = lighter_leg.get("result") or {}
@@ -1638,11 +1677,27 @@ class WTIPairExecutor:
                     or lighter_result.get("terminal_confirmed") is not True
                 ):
                     return None
-                return self._manual_review(state, "pending_open_lighter_no_fill_requires_operator")
-            if lighter_leg.get("submission_started") is not False:
+                old_request = lighter_leg.get("request") or {}
+                replace_unsendable = (
+                    lighter_result.get("source") == "local_signer_validation"
+                    and lighter_result.get("error_code") == LEGACY_INDEX_REJECTION
+                    and lighter_result.get("no_order_confirmed") is True
+                    and decimal_value(lighter_result.get("filled_qty")) == 0
+                    and old_request.get("client_order_id") == f"{pending['action_id']}-lighter"
+                    and old_request.get("side") == ("sell" if direction == "long_var_short_lighter" else "buy")
+                    and decimal_value(old_request.get("qty")) == lighter_qty
+                    and integer_value(old_request.get("market_id")) == context.market_id
+                    and old_request.get("reduce_only") is False
+                    and legacy_lighter_index_was_unsendable(
+                        str(old_request.get("client_order_id") or ""), old_request
+                    )
+                )
+                if not replace_unsendable:
+                    return self._manual_review(state, "pending_open_lighter_no_fill_requires_operator")
+            elif lighter_leg.get("submission_started") is not False:
                 return None
             prior = lighter_leg.get("result") or {}
-            if prior and (
+            if not replace_unsendable and prior and (
                 prior.get("classification") != "no_fill"
                 or prior.get("source") != "local_pre_submit_guard"
                 or prior.get("terminal_confirmed") is not True
@@ -1673,6 +1728,16 @@ class WTIPairExecutor:
             )
 
         lighter_side = "sell" if direction == "long_var_short_lighter" else "buy"
+        if replace_unsendable:
+            previous = pending.setdefault("superseded_legs", [])
+            if not isinstance(previous, list) or previous:
+                return self._manual_review(state, "pending_open_lighter_replacement_history_invalid")
+            previous.append({
+                "venue": "lighter", "reason": LEGACY_INDEX_REJECTION,
+                "archived_at": self._now().isoformat(), "leg": deepcopy(lighter_leg),
+            })
+            # _submit_leg atomically saves this archive and the new 48-bit identity
+            # before any SDK call. A crash cannot replay the superseded identity.
         lighter_result = self._submit_leg(
             state,
             context=fresh,
@@ -1714,7 +1779,8 @@ class WTIPairExecutor:
             "market_id": pending["market_id"],
             "multiplier": pending["multiplier"],
             "session_id": pending.get("session_id"),
-            "opened_at": _utc_now(),
+            "opened_at": pending.get("intent_at") or _utc_now(),
+            "recovered_at": _utc_now(),
             "recovered_from_pending": True,
             "entry_execution_id": execution["action_id"],
             **({"single_round_pilot_id": pilot_id} if pilot_id else {}),
@@ -1825,7 +1891,8 @@ class WTIPairExecutor:
                         "market_id": pending["market_id"],
                         "multiplier": pending["multiplier"],
                         "session_id": pending.get("session_id"),
-                        "opened_at": _utc_now(),
+                        "opened_at": pending.get("intent_at") or _utc_now(),
+                        "recovered_at": _utc_now(),
                         "recovered_from_pending": True,
                         "entry_execution_id": execution["action_id"],
                         **({

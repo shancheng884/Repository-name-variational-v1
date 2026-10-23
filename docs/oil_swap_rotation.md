@@ -147,6 +147,35 @@ slippage checks still apply. A failed refresh records its specific validation
 or collector error code in `manual_review_reason`, and no hedge order is sent
 until the full original quantity passes those checks.
 
+Lighter client indexes are restricted to `1..2^48-1`, as enforced by the native
+signer ([constants](https://github.com/elliottech/lighter-go/blob/main/types/txtypes/constants.go),
+[validation](https://github.com/elliottech/lighter-go/blob/main/types/txtypes/create_order.go)).
+New requests persist their `sha256_48_v1` scheme and native index before sending.
+Lookup preserves a saved index, including the original 63-bit mapping for legacy
+requests; it never silently rehashes an already-submitted identity.
+
+An unversioned legacy request whose original index exceeds that range cannot
+have passed the native signer. Only this specific proven local rejection can
+replace a missing Lighter hedge after the confirmed Var fill, exact live position
+and zero-order reconciliation, original-session checks, exact-size fresh quotes,
+and account risk checks. The old leg is archived atomically with the new request
+before sending. An accepted, canceled, or ambiguous order is never retried by
+this path. Absence from both order lists alone does not prove zero fill.
+
+The original submission result and send transaction hash are retained separately
+from later lookups. Health exposes `pending_order_diagnostics` with the failing
+lookup stage and reason. SDK `CreateOrder` objects need not support `to_dict()`:
+an accepted send receipt survives independently of that signed payload. Trade
+history failures leave fees/trade IDs unverified without erasing an independently
+confirmed full order fill. Recovery retains the original intent time for maximum
+hold limits; restarting does not reset the exposure clock.
+
+Execution session freshness uses the same validated subscription heartbeat as
+the collector, retaining the 30-second maximum age. The last market-state-change
+timestamp is retained as evidence, but an unchanged open state does not require
+repeated state-change messages. Missing/disconnected status feeds, stale or
+future heartbeats, and unverified session sources still block execution.
+
 ## Readiness Audit
 
 Run `python tools/oil_swap_readiness.py` against the WTI collector data. For a

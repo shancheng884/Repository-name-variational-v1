@@ -201,6 +201,14 @@ def _session_window(row: dict[str, Any], now: datetime, cutoff_seconds: float):
         exchange_open = None
     else:
         exchange_open = status == "open"
+    if exchange_open is True:
+        # State-change timestamps can remain old throughout an open session. The
+        # validated subscription heartbeat proves that this state is still live.
+        observation = session_observation_for_sample(row)
+        if observation is None:
+            exchange_open = None
+        else:
+            observed_at = datetime.fromisoformat(str(row["session_status_feed_heartbeat_at"]).replace("Z", "+00:00"))
     cutoff_minutes = int(cutoff_seconds // 60)
     return classify_usoil_session(
         now,
@@ -682,6 +690,19 @@ class WTILiveRuntime:
             "open_lots_total": int(exposure),
             "pending_actions_total": int(pending),
             "manual_review_reason": state.get("manual_review_reason"),
+            "pending_order_diagnostics": {
+                venue: {
+                    "submission_started": leg.get("submission_started"),
+                    "classification": (leg.get("result") or {}).get("classification"),
+                    **{key: (leg.get("result") or {})[key] for key in (
+                        "error_code", "error_type", "lookup_stage", "lookup_reason",
+                        "submission_stage", "native_client_order_id", "transaction_hash",
+                    ) if key in (leg.get("result") or {})},
+                    "submission_result": leg.get("submission_result"),
+                }
+                for venue, leg in ((state.get("pending_action") or {}).get("legs") or {}).items()
+                if isinstance(leg, dict)
+            },
             "readiness": self.readiness,
             "errors": [] if error is None else [error],
         }
