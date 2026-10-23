@@ -536,7 +536,9 @@ class WTILiveRuntime:
         self.last_processed_sample_id = sample_id
         if row.get("sample_quality") != "valid" or session_observation_for_sample(row) is None:
             self.last_action = {"action": "blocked", "reason": "wti_sample_or_session_unverified"}
-            self._revoke_entry_authorization("wti_sample_or_session_unverified")
+            self.entry_authorized = False
+            if not self.entry_authorization_permanently_revoked:
+                self.entry_gate_block_reason = "wti_sample_or_session_unverified"
             return False
         try:
             sample_at = datetime.fromisoformat(
@@ -831,7 +833,7 @@ class WTILiveRuntime:
             self._write_health(state=None, row=self.collector.latest_sample)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Standalone WTI pair live runtime; ETH runtime is not imported or stopped.")
     parser.add_argument("--mode", choices=("observe", "live"), default="observe")
     parser.add_argument("--confirm-eth-flat", action="store_true")
@@ -864,7 +866,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--forwarder-command-port", type=int, default=8768)
     parser.add_argument("--lighter-base-url", default=DEFAULT_LIGHTER_URL)
     parser.add_argument("--expected-lighter-market-id", type=int)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if len({args.forwarder_ws_port, args.forwarder_rest_port, args.forwarder_command_port}) != 3:
         parser.error("forwarder ports must be distinct")
     if any(not 1 <= port <= 65535 for port in (
@@ -901,7 +903,7 @@ async def _amain(args: argparse.Namespace) -> None:
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     try:
-        asyncio.run(_amain(build_parser().parse_args()))
+        asyncio.run(_amain(parse_args()))
     except KeyboardInterrupt:
         return 130
     except Exception as exc:

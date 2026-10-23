@@ -12,6 +12,32 @@ import pytest
 from tools import wti_live
 
 
+@pytest.mark.parametrize("mode", ["observe", "live"])
+def test_cli_main_reaches_runtime_with_parsed_arguments(monkeypatch, mode):
+    argv = ["tools/wti_live.py", "--mode", mode]
+    if mode == "live":
+        argv += [
+            "--confirm-eth-flat", "--i-understand-live-orders",
+            "--confirm-bounded-live-pilot", "--allow-unqualified-data-pilot",
+            "--expected-lighter-market-id", "145",
+            "--entry-threshold-bps", "30", "--exit-target-bps", "1",
+            "--roundtrip-cost-bps", "10", "--max-notional-usd", "20",
+        ]
+    captured = []
+
+    async def fake_runtime(args):
+        captured.append(args)
+
+    monkeypatch.setattr(wti_live.sys, "argv", argv)
+    monkeypatch.setattr(wti_live, "_amain", fake_runtime)
+    assert wti_live.main() == 0
+    assert len(captured) == 1
+    assert captured[0].mode == mode
+    if mode == "live":
+        assert captured[0].allow_unqualified_data_pilot is True
+        assert captured[0]._validated_notional == Decimal("20")
+
+
 def test_eth_flat_requires_explicit_confirmation_and_exact_flat_state(tmp_path: Path):
     path = tmp_path / "eth.json"
     path.write_text(json.dumps({
@@ -266,6 +292,31 @@ def test_unqualified_data_pilot_bypasses_history_only_with_fresh_verified_sample
         state, {**row, "var_quote_age_seconds": "3"}, now=now
     )
     assert stale.entry_gate_block_reason == "wti_current_sample_or_session_not_fresh"
+
+
+def test_degraded_startup_sample_blocks_entry_then_recovers_on_valid_sample():
+    now = datetime.now(timezone.utc)
+    runtime = _runtime_for_entry_gate(allow_unqualified=True)
+    runtime.last_processed_sample_id = None
+    runtime.last_processed_sample_at = None
+    runtime.last_sample_gap_seconds = None
+    runtime.pending_gap_exit = False
+    runtime.last_action = {}
+    degraded = {**_live_sample(now), "sample_quality": "degraded"}
+    assert runtime._record_new_sample(degraded) is False
+    assert runtime.entry_authorized is False
+    assert runtime.entry_authorization_permanently_revoked is False
+    valid = _live_sample(now, sample_id="sample-2")
+    assert runtime._record_new_sample(valid) is True
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "single_round_pilot": {
+            "pilot_id": "pilot-1", "status": "available",
+            "completed_roundtrips": 0, "entry_attempts": 0,
+            "max_entry_attempts": 3,
+        },
+    }
+    assert runtime._sync_entry_authorization(state, valid, now=now)
 
 
 def test_single_round_pilot_finishes_only_after_confirmed_flat_state():
