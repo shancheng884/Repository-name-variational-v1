@@ -8,7 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.lib.wti_live_gateway import WTIProductionGateway, lighter_client_order_index
+from tools.lib.wti_live_gateway import (
+    VARIATIONAL_ORDERS_STATUS_FILTER,
+    WTIProductionGateway,
+    lighter_client_order_index,
+)
 from tools.lib.wti_readonly_adapter import WTIReadOnlyError
 
 
@@ -26,6 +30,17 @@ class FakeVariational:
                 "requestId": payload["requestId"],
                 "ok": True,
                 "result": {"ok": True, "httpStatus": 200, "rfqId": "rfq-123"},
+            }
+        if payload.get("status") != VARIATIONAL_ORDERS_STATUS_FILTER:
+            return {
+                "type": "VAR_API_ORDERS_RESULT",
+                "requestId": payload["requestId"],
+                "ok": False,
+                "result": {
+                    "ok": False,
+                    "httpStatus": 400,
+                    "error": "Failed to deserialize query string: Matching variant not found",
+                },
             }
         return {
             "type": "VAR_API_ORDERS_RESULT",
@@ -188,7 +203,7 @@ def test_variational_lookup_matches_nested_order_info_and_separate_native_ids():
     assert result["average_price"] == "71.25"
     assert result["native_order_id"] == "order-live-456"
     assert result["native_client_order_id"] == "rfq-live-123"
-    assert "filled" in var.requests[0]["status"]
+    assert var.requests[0]["status"] == "pending,canceled,cleared,rejected"
     gateway.loop.close()
 
     native_order_only = _gateway(FakeVariational(orders=[order]))

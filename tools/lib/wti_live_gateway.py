@@ -28,6 +28,9 @@ VARIATIONAL_RESULT_TYPES = {
 }
 TERMINAL_VAR_NO_FILL = {"canceled", "cancelled", "rejected", "expired"}
 TERMINAL_VAR_FILLED = {"cleared", "filled", "executed", "complete", "completed"}
+# The orders-v2 endpoint accepts the extension's established status filter;
+# additional aliases such as "cancelled" and "filled" make it return HTTP 400.
+VARIATIONAL_ORDERS_STATUS_FILTER = "pending,canceled,cleared,rejected"
 TERMINAL_LIGHTER_NO_FILL = {
     "canceled", "canceled-post-only", "canceled-reduce-only",
     "canceled-position-not-allowed", "canceled-margin-not-allowed",
@@ -334,7 +337,7 @@ class WTIProductionGateway:
             message = await self.variational.request({
                 "type": "VAR_API_ORDERS",
                 "requestId": request_id,
-                "status": "pending,canceled,cancelled,cleared,filled,executed,completed,rejected,expired",
+                "status": VARIATIONAL_ORDERS_STATUS_FILTER,
                 "createdAtGte": created_at_gte,
                 "limit": 100,
                 "offset": offset,
