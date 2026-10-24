@@ -104,6 +104,9 @@ unverified wherever final fill evidence is missing.
 health file without enabling order submission. It owns the configured forwarder
 ports (8766-8768 by default) and cannot share those listeners with another
 process. Resolve a port conflict explicitly; do not kill an unknown process.
+The read-only `tools/oil_swap_collector.py` also takes an OS-level exclusive
+lock for its output directory; a second writer fails closed, and the lock is
+released automatically when the process exits.
 
 Live mode requires explicit entry, exit, and cost thresholds, the current
 Lighter market ID, confirmation that local ETH state is flat, and explicit
@@ -130,6 +133,49 @@ maximum execution boundary, a six-hour maximum hold, and a minimum 30-minute
 pre-close entry cutoff. Account risk retains the existing 40/50/60/75 percent
 margin thresholds and 0.82/0.74 cross-venue equity balance thresholds. These
 are code guards, not evidence that the strategy is profitable.
+
+The optional `--gradient-live --confirm-bounded-gradient-pilot` path is a
+separate bounded diagnostic, not an averaging-down mode. It permits at most two
+layers in one exchange session and one completed paired roundtrip. Tier two
+must exceed the unchanged base entry threshold; the persisted pilot config,
+attempt budget, aggregate notional cap, exact-size fresh quotes, current session,
+account reconciliation, live account-risk checks, exit logic, and slippage
+limits remain enforced. An exit, risk block, session cutoff, sample gap, or
+execution uncertainty prevents adding a layer. A completed or exhausted pilot
+cannot be reset by restarting with altered settings. The history bypass flag,
+when used, bypasses only historical qualification and is not production
+approval.
+
+`tools/rotation_supervisor.py` coordinates the ETH/WTI handoff. Its default
+`--rehearse` mode is read-only. Live supervision requires both explicit
+automatic-rotation and live-order confirmations, plus a market ID and
+multiplier. It persists a journal and uses a process lock so a restart adopts
+the existing transition instead of issuing a duplicate start. The supervisor
+requests a PID/run-ID-bound drain, waits for fresh paired-flat and zero-order
+proof, then starts only the newly selected runtime. WTI starts only when the
+existing production-readiness assessment passes; no historical-data bypass is
+used. WTI execution retains the bounded gradient-pilot limits documented
+above.
+
+While ETH is the active runtime, the supervisor adopts one fresh, PID-matched
+read-only WTI collector or starts one under its own tmux session after verifying
+the ETH command forwarder is listening. Before starting WTI, it waits for that
+standalone collector to exit; it never kills an unowned collector. The WTI
+runtime then owns collection. Returning to ETH restores the standalone
+collector after the ETH runtime and forwarder are healthy. A completed or
+exhausted bounded gradient pilot is not renewed automatically; that existing
+one-round budget requires explicit operator authorization before another live
+pilot.
+
+If runtime identity, heartbeat, local state, account proof, or order status is
+ambiguous, the supervisor blocks the handoff and requires review. An orphaned
+position can only restart in manage-existing mode with entries disabled. A
+closed-session WTI stop additionally requires a fresh read-only account probe
+for the configured market ID with both venues flat and zero active orders. The
+replay tool can emit input-file hashes, market identity, thresholds, readiness,
+and replay results as an evidence JSON; this is audit evidence, not proof of
+fills or permission to trade. Code tests and a successful read-only rehearsal
+do not establish profitability or production readiness.
 
 The gateway treats a Variational `cleared` order as filled with explicit
 executed quantity and fill price. The observed orders-v2 format also supplies

@@ -45,7 +45,7 @@ from tools.lib.wti_execution import (  # noqa: E402
     WTIExecutionStore,
 )
 from tools.lib.wti_live_gateway import WTIProductionGateway  # noqa: E402
-from tools.lib.wti_live_strategy import decide_wti_action  # noqa: E402
+from tools.lib.wti_live_strategy import decide_wti_action, decide_wti_gradient_action  # noqa: E402
 from tools.lib.wti_replay import ReplayConfig  # noqa: E402
 from tools.oil_swap_collector import OilSwapCollector, parse_args as parse_collector_args  # noqa: E402
 
@@ -55,6 +55,7 @@ DEFAULT_PORTS = (8766, 8767, 8768)
 ETH_STATE_PATH = ROOT / "log" / "live_inventory_state.json"
 WTI_STATE_PATH = ROOT / "log" / "wti_live_state.json"
 WTI_HEALTH_PATH = ROOT / "log" / "wti_live_risk_health.json"
+WTI_CONTROL_PATH = ROOT / "log" / "wti_live_control.json"
 WTI_SAMPLE_ROOT = ROOT / "log" / "oil_swap" / "basis_samples"
 MAX_WTI_NOTIONAL_USD = Decimal("25")
 MAX_WTI_ENTRY_GAP_SECONDS = 120
@@ -110,6 +111,22 @@ def single_round_pilot_owns_exposure(state: dict[str, Any]) -> bool:
         item.get("single_round_pilot_id") == pilot_id
         for item in (position, pending, previous_position)
         if isinstance(item, dict)
+    )
+
+
+def gradient_pilot_owns_exposure(state: dict[str, Any]) -> bool:
+    pilot = state.get("gradient_pilot") or {}
+    if not isinstance(pilot, dict) or pilot.get("status") not in {
+        "entry_pending", "in_position",
+    }:
+        return False
+    pilot_id = pilot.get("pilot_id")
+    position = state.get("open_position") or {}
+    pending = state.get("pending_action") or {}
+    previous = pending.get("previous_position") or {}
+    return any(
+        isinstance(item, dict) and item.get("gradient_pilot_id") == pilot_id
+        for item in (position, pending, previous)
     )
 
 
@@ -268,9 +285,11 @@ class WTILiveRuntime:
         self.last_runtime_error: str | None = None
         self.pilot_store: WTIExecutionStore | None = None
         self.single_round_pilot: dict[str, Any] | None = None
+        self.gradient_pilot: dict[str, Any] | None = None
         self.entry_authorization_permanently_revoked = False
         self.last_readiness_elapsed_ms: float | None = None
         self.last_reconcile_elapsed_ms: float | None = None
+        self.rotation_drain_request: dict[str, Any] | None = None
 
     def request_stop(self, *_args: Any) -> None:
         self.stop = True
@@ -339,10 +358,38 @@ class WTILiveRuntime:
                 and single_round_pilot_owns_exposure(existing)
             ):
                 raise RuntimeError("new_single_round_pilot_requires_flat_wti_state")
+            gradient_mode = bool(getattr(self.args, "gradient_live", False))
             if self.args.manage_existing_wti_position:
                 # Management remains entry-disabled even if a previous run
                 # already flattened the account before this restart.
                 self.manage_existing_only = True
+            elif gradient_mode:
+                if not getattr(self.args, "confirm_bounded_gradient_pilot", False):
+                    raise RuntimeError("explicit_bounded_gradient_pilot_confirmation_required")
+                self.pilot_store = store
+                if local_exposure:
+                    if not gradient_pilot_owns_exposure(existing):
+                        raise RuntimeError("existing_wti_exposure_not_owned_by_gradient_pilot")
+                    self.gradient_pilot = store.initialize_gradient_pilot(
+                        market_id=int(market["market_id"]),
+                        multiplier=Decimal(str(market["multiplier"])),
+                        config=self._gradient_pilot_config(),
+                        max_layers=2,
+                    )
+                else:
+                    if (
+                        not self.readiness.get("market_data_ready", self.readiness["ready"])
+                        and not getattr(self.args, "allow_unqualified_data_pilot", False)
+                    ):
+                        raise RuntimeError(
+                            "wti_new_entries_blocked_by_data_readiness:" + ",".join(self.readiness["reasons"])
+                        )
+                    self.gradient_pilot = store.initialize_gradient_pilot(
+                        market_id=int(market["market_id"]),
+                        multiplier=Decimal(str(market["multiplier"])),
+                        config=self._gradient_pilot_config(),
+                        max_layers=2,
+                    )
             elif local_exposure:
                 pilot_owns_exposure = single_round_pilot_owns_exposure(existing)
                 if not self.readiness["ready"] and not (
@@ -451,31 +498,66 @@ class WTILiveRuntime:
             "max_slippage_bps": str(self.args._validated_slippage),
         }
 
+    def _gradient_pilot_config(self) -> dict[str, Any]:
+        assert self.config is not None
+        second = getattr(self.args, "_validated_gradient_second_tier", None)
+        layer_notional = getattr(self.args, "_validated_gradient_layer_notional", None)
+        if second is None or layer_notional is None:
+            raise RuntimeError("gradient_pilot_configuration_not_validated")
+        return {
+            **self._pilot_config(),
+            "tier_thresholds_bps": [str(self.config.entry_threshold_bps), str(second)],
+            "layer_notional_usd": str(layer_notional),
+            "max_layers": 2,
+            "max_completed_roundtrips": 1,
+        }
+
     def _sync_entry_authorization(
         self, state: dict[str, Any], row: dict[str, Any], *, now: datetime
     ) -> bool:
+        gradient_mode = bool(getattr(self.args, "gradient_live", False))
+        gradient_position = bool(
+            gradient_mode
+            and state.get("status") == "open"
+            and isinstance(state.get("open_position"), dict)
+            and state["open_position"].get("gradient_pilot_id")
+        )
         if (
             self.args.mode != "live"
             or self.entry_authorization_permanently_revoked
             or self.manage_existing_only
-            or state.get("status") != "flat"
-            or state.get("open_position") is not None
+            or (state.get("status") != "flat" and not gradient_position)
+            or (state.get("open_position") is not None and not gradient_position)
             or state.get("pending_action") is not None
         ):
             self.entry_authorized = False
             return False
-        pilot = state.get("single_round_pilot") or {}
-        if (
-            not isinstance(pilot, dict)
-            or not self.single_round_pilot
-            or pilot.get("pilot_id") != self.single_round_pilot.get("pilot_id")
-            or pilot.get("status") != "available"
-            or pilot.get("completed_roundtrips") != 0
-            or pilot.get("entry_attempts", 0) >= pilot.get("max_entry_attempts", 0)
-        ):
-            self.entry_authorized = False
-            self.entry_gate_block_reason = "single_round_pilot_entry_budget_unavailable"
-            return False
+        if gradient_mode:
+            pilot = state.get("gradient_pilot") or {}
+            opened = pilot.get("layers_opened") or []
+            if (
+                not self.gradient_pilot
+                or pilot.get("pilot_id") != self.gradient_pilot.get("pilot_id")
+                or pilot.get("status") != ("in_position" if gradient_position else "available")
+                or pilot.get("completed_roundtrips") != 0
+                or len(opened) >= pilot.get("max_layers", 0)
+            ):
+                self.entry_authorized = False
+                self.entry_gate_block_reason = "gradient_pilot_entry_budget_unavailable"
+                return False
+        else:
+            pilot = state.get("single_round_pilot") or {}
+            if (
+                not isinstance(pilot, dict)
+                or not self.single_round_pilot
+                or pilot.get("pilot_id") != self.single_round_pilot.get("pilot_id")
+                or pilot.get("status") != "available"
+                or pilot.get("completed_roundtrips") != 0
+                or pilot.get("entry_attempts", 0) >= pilot.get("max_entry_attempts", 0)
+            ):
+                self.entry_authorized = False
+                self.entry_gate_block_reason = "single_round_pilot_entry_budget_unavailable"
+                return False
         fresh = self._sample_health_fresh(row, now)
         qualified = bool(self.readiness.get("market_data_ready")) and fresh
         unqualified_pilot = bool(
@@ -502,6 +584,22 @@ class WTILiveRuntime:
             args = getattr(self, "args", None)
             if not (getattr(args, "manage_existing_wti_position", False)
                     or getattr(args, "keep_collecting_after_pilot", False)):
+                self.request_stop()
+            return True
+        return False
+
+    def _finish_gradient_pilot_if_done(self, state: dict[str, Any]) -> bool:
+        pilot = state.get("gradient_pilot") or {}
+        if (
+            pilot.get("status") in {"completed", "exhausted"}
+            and state.get("status") == "flat"
+            and state.get("open_position") is None
+            and state.get("pending_action") is None
+        ):
+            self.gradient_pilot = dict(pilot)
+            self.entry_authorized = False
+            self.entry_gate_block_reason = f"gradient_pilot_{pilot['status']}"
+            if not getattr(self.args, "keep_collecting_after_pilot", False):
                 self.request_stop()
             return True
         return False
@@ -673,7 +771,9 @@ class WTILiveRuntime:
             "updated_at": now.isoformat(),
             "status": "running" if not self.stop else "stopped",
             "execution_mode": (
-                "live_single_round_pilot"
+                "live_bounded_gradient_pilot"
+                if self.args.mode == "live" and getattr(self, "gradient_pilot", None)
+                else "live_single_round_pilot"
                 if self.args.mode == "live" and self.single_round_pilot
                 else "live_bounded" if self.args.mode == "live" else "observe_only"
             ),
@@ -683,6 +783,7 @@ class WTILiveRuntime:
                 and not self.readiness.get("market_data_ready")
             ),
             "single_round_pilot": state.get("single_round_pilot"),
+            "gradient_pilot": state.get("gradient_pilot"),
             "wti_entry_authorized": self.entry_authorized,
             "startup_reconciled": self.startup_reconciled,
             "readiness_elapsed_ms": getattr(self, "last_readiness_elapsed_ms", None),
@@ -690,6 +791,10 @@ class WTILiveRuntime:
             "entry_gate_block_reason": self.entry_gate_block_reason,
             "last_sample_gap_seconds": self.last_sample_gap_seconds,
             "manage_existing_only": self.manage_existing_only,
+            "rotation_drain_status": (
+                (read_json(getattr(self.args, "control_path", WTI_CONTROL_PATH)) or {}).get("status")
+                if getattr(self, "rotation_drain_request", None) else None
+            ),
             "risk_action": action,
             "risk_reason": error or reason,
             "risk_data_complete": risk.get("risk_data_complete"),
@@ -725,6 +830,75 @@ class WTILiveRuntime:
         write_json_atomic(self.args.health_path, health)
         self.last_health_write_monotonic = time.monotonic()
 
+    def _poll_rotation_drain(self) -> bool:
+        control_path = getattr(self.args, "control_path", WTI_CONTROL_PATH)
+        control = read_json(control_path)
+        if (
+            control.get("action") != "drain_after_flat"
+            or control.get("asset") != "WTI"
+            or control.get("target_pid") != os.getpid()
+            or control.get("target_run_id") != self.run_id
+            or control.get("status") not in {"requested", "draining"}
+            or not control.get("request_id")
+        ):
+            return False
+        if getattr(self, "rotation_drain_request", None) is None:
+            self.rotation_drain_request = dict(control)
+            self.manage_existing_only = True
+            self._revoke_entry_authorization("rotation_drain_requested")
+            self.last_action = {"action": "draining", "reason": "rotation_drain_requested"}
+        if control.get("status") == "requested":
+            draining = {**control, "status": "draining", "draining_at": datetime.now(timezone.utc).isoformat()}
+            write_json_atomic(control_path, draining)
+            self.rotation_drain_request = draining
+        return True
+
+    def _complete_rotation_drain_if_verified_flat(self, state: dict[str, Any]) -> bool:
+        request = getattr(self, "rotation_drain_request", None)
+        if request is None:
+            return False
+        proof = state.get("last_account_reconciliation") or {}
+        try:
+            observed_at = datetime.fromisoformat(str(proof["observed_at"]).replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - observed_at.astimezone(timezone.utc)).total_seconds()
+            flat = (
+                proof.get("verified") is True
+                and proof.get("active_order_count") == 0
+                and Decimal(str(proof.get("variational_qty"))) == 0
+                and Decimal(str(proof.get("lighter_qty"))) == 0
+                and -5 <= age <= 20
+                and proof.get("market_id") == getattr(self.args, "expected_lighter_market_id", None)
+            )
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            flat = False
+        if (
+            state.get("status") != "flat"
+            or state.get("open_position") is not None
+            or state.get("pending_action") is not None
+            or not self.startup_reconciled
+            or not flat
+        ):
+            return False
+        control_path = getattr(self.args, "control_path", WTI_CONTROL_PATH)
+        current = read_json(control_path)
+        if current.get("request_id") != request.get("request_id"):
+            self._revoke_entry_authorization("rotation_drain_request_changed")
+            return False
+        completed = {
+            **current,
+            "status": "completed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "variational_position_qty": proof["variational_qty"],
+            "lighter_position_qty": proof["lighter_qty"],
+            "active_order_count": proof["active_order_count"],
+            "reconciliation_observed_at": proof["observed_at"],
+        }
+        write_json_atomic(control_path, completed)
+        self.rotation_drain_request = completed
+        self.last_action = {"action": "rotation_drain_completed", "request_id": request["request_id"]}
+        self.request_stop()
+        return True
+
     async def _read_reconcile(self, row: dict[str, Any]) -> dict[str, Any]:
         assert self.executor is not None
         started = time.monotonic()
@@ -755,6 +929,7 @@ class WTILiveRuntime:
         assert self.executor is not None and self.gateway is not None and self.config is not None
         state = await self._read_reconcile(row)
         self.last_risk = dict(self.gateway.latest_risk)
+        self._poll_rotation_drain()
         if state.get("status") != "flat" and state.get("status") != "open":
             self.last_action = {"action": "reconcile", "reason": state.get("manual_review_reason") or state.get("status")}
             return state
@@ -769,14 +944,22 @@ class WTILiveRuntime:
             return state
         row = decision_sample
         now = datetime.now(timezone.utc)
-        if position is None:
+        if self._complete_rotation_drain_if_verified_flat(state):
+            return state
+        if position is None or getattr(self, "gradient_pilot", None) is not None:
             self._sync_entry_authorization(state, row, now=now)
         else:
             self.entry_authorized = False
         self.gateway.set_current_notional(self._position_notional(state, row))
         risk_action = str(self.last_risk.get("risk_action") or "block_entry")
         window = _session_window(row, now, self.config.entry_cutoff_seconds)
-        decision = decide_wti_action(row, position, config=self.config, now=now)
+        if getattr(self, "gradient_pilot", None) is not None:
+            self.gradient_pilot = dict(state.get("gradient_pilot") or self.gradient_pilot)
+            decision = decide_wti_gradient_action(
+                row, position, self.gradient_pilot, config=self.config, now=now
+            )
+        else:
+            decision = decide_wti_action(row, position, config=self.config, now=now)
         if position is None:
             self.pending_gap_exit = False
         elif self.pending_gap_exit:
@@ -792,56 +975,93 @@ class WTILiveRuntime:
                 return state
             state = await asyncio.to_thread(
                 lambda: self.executor.close(
-                    sample=row, session=window, now=datetime.now(timezone.utc)
+                    sample=row, session=window, decision=decision,
+                    exit_target_bps=self.config.exit_target_bps,
+                    roundtrip_cost_bps=self.config.roundtrip_cost_bps,
+                    now=datetime.now(timezone.utc),
                 )
             )
             if state.get("status") == "flat":
                 self.pending_gap_exit = False
-            self.last_action = {"action": "close", "reason": decision["reason"], "status": state.get("status")}
+            close_check = state.get("last_close_check") or {}
+            if (
+                state.get("status") == "open"
+                and not state.get("pending_action")
+                and close_check.get("reason") == "exit_target_not_reached_after_full_size_refresh"
+            ):
+                self.last_action = {"action": "hold", **close_check}
+            else:
+                self.last_action = {
+                    "action": "close", "reason": decision["reason"],
+                    "status": state.get("status"),
+                }
             self._finish_single_round_pilot_if_done(state)
+            self._finish_gradient_pilot_if_done(state)
             return state
         if (
-            decision["action"] == "open"
+            decision["action"] in {"open", "add"}
             and not self.manage_existing_only
             and self.entry_authorized
             and risk_action in {"normal", "warning"}
             and window.allow_new_entries
         ):
-            assert self.pilot_store is not None and self.single_round_pilot is not None
-            reservation_id = await asyncio.to_thread(
-                self.pilot_store.reserve_single_round_pilot_entry,
-                self.single_round_pilot["pilot_id"],
-            )
-            self.gateway.set_proposed_notional(self.args._validated_notional)
+            gradient_entry = getattr(self, "gradient_pilot", None) is not None
+            reservation_id = None
+            if gradient_entry:
+                pilot_id = self.gradient_pilot["pilot_id"]
+                tier = int(decision["gradient_tier"])
+                notional = Decimal(str(decision["layer_notional_usd"]))
+                layer_id = f"{pilot_id}:tier-{tier}:{uuid.uuid4().hex}"
+            else:
+                assert self.pilot_store is not None and self.single_round_pilot is not None
+                pilot_id = self.single_round_pilot["pilot_id"]
+                tier = None
+                notional = self.args._validated_notional
+                layer_id = None
+                reservation_id = await asyncio.to_thread(
+                    self.pilot_store.reserve_single_round_pilot_entry,
+                    pilot_id,
+                )
+            self.gateway.set_proposed_notional(notional)
             try:
                 state = await asyncio.to_thread(
                     lambda: self.executor.open(
                         sample=row,
                         direction=decision["direction"],
-                        notional_usd=self.args._validated_notional,
+                        notional_usd=notional,
                         session=window,
-                        pilot_id=self.single_round_pilot["pilot_id"],
+                        pilot_id=None if gradient_entry else pilot_id,
                         pilot_reservation_id=reservation_id,
+                        layer_id=layer_id,
+                        gradient_tier=tier,
+                        gradient_pilot_id=pilot_id if gradient_entry else None,
+                        decision=decision,
                         now=datetime.now(timezone.utc),
                     )
                 )
             except Exception:
-                state = await asyncio.to_thread(
-                    self.pilot_store.release_unsubmitted_single_round_pilot_entry,
-                    self.single_round_pilot["pilot_id"], reservation_id,
-                )
-                self._finish_single_round_pilot_if_done(state)
+                if not gradient_entry and reservation_id is not None:
+                    state = await asyncio.to_thread(
+                        self.pilot_store.release_unsubmitted_single_round_pilot_entry,
+                        pilot_id, reservation_id,
+                    )
+                    self._finish_single_round_pilot_if_done(state)
                 raise
             finally:
                 self.gateway.set_proposed_notional(None)
             self.last_risk = dict(self.gateway.latest_risk)
             if state.get("status") == "open":
-                self.entry_authorized = False
-                self.entry_gate_block_reason = "single_round_pilot_position_open"
+                self.entry_authorized = gradient_entry
+                self.entry_gate_block_reason = (
+                    "gradient_pilot_next_tier_pending_or_unavailable"
+                    if gradient_entry else "single_round_pilot_position_open"
+                )
             self._finish_single_round_pilot_if_done(state)
+            self._finish_gradient_pilot_if_done(state)
             self.last_action = {
-                "action": "open", "direction": decision["direction"],
-                "edge_bps": decision["edge_bps"], "status": state.get("status"),
+                "action": decision["action"], "direction": decision["direction"],
+                "edge_bps": decision["edge_bps"], "tier": decision.get("gradient_tier"),
+                "status": state.get("status"),
             }
             return state
         self.last_action = {
@@ -883,6 +1103,7 @@ class WTILiveRuntime:
                         self.last_action = {"action": "startup_reconcile", "status": state.get("status")}
                         self._write_health(state=state, row=sample)
                         self._finish_single_round_pilot_if_done(state)
+                        self._finish_gradient_pilot_if_done(state)
                 else:
                     self._write_health(
                         state=state,
@@ -897,6 +1118,7 @@ class WTILiveRuntime:
                 self.logger.info("wti_observe_started run_id=%s; order submission disabled", self.run_id)
 
             while not self.stop and not self.collector_task.done():
+                self._poll_rotation_drain()
                 row = self.collector.latest_sample
                 state = read_json(self.args.state_path) if self.args.mode == "live" else {}
                 if self.args.mode == "live" and row is not None:
@@ -917,6 +1139,7 @@ class WTILiveRuntime:
                             else:
                                 state = await self._process_sample(dict(row))
                             self._finish_single_round_pilot_if_done(state)
+                            self._finish_gradient_pilot_if_done(state)
                             self.last_runtime_error = None
                             self._write_health(
                                 state=state, row=self.collector.latest_sample or row
@@ -979,6 +1202,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--confirm-eth-flat", action="store_true")
     parser.add_argument("--i-understand-live-orders", action="store_true")
     parser.add_argument("--confirm-bounded-live-pilot", action="store_true")
+    parser.add_argument("--gradient-live", action="store_true")
+    parser.add_argument("--confirm-bounded-gradient-pilot", action="store_true")
+    parser.add_argument("--gradient-second-tier-bps", type=Decimal)
+    parser.add_argument("--gradient-layer-notional-usd", type=Decimal, default=Decimal("10"))
     parser.add_argument("--new-pilot-after", help="authorize one new round after this exact terminal pilot ID")
     parser.add_argument("--keep-collecting-after-pilot", action="store_true")
     parser.add_argument(
@@ -997,6 +1224,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sample-root", type=Path, default=WTI_SAMPLE_ROOT)
     parser.add_argument("--state-path", type=Path, default=WTI_STATE_PATH)
     parser.add_argument("--health-path", type=Path, default=WTI_HEALTH_PATH)
+    parser.add_argument("--control-path", type=Path, default=WTI_CONTROL_PATH)
     parser.add_argument("--output-dir", type=Path, default=ROOT / "log" / "oil_swap")
     parser.add_argument("--collector-notional-usd", type=Decimal, default=Decimal("20"))
     parser.add_argument("--sample-interval-seconds", type=float, default=10)
@@ -1021,6 +1249,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("runtime timeouts and sample interval must be positive")
     if args.expected_lighter_market_id is not None and args.expected_lighter_market_id < 0:
         parser.error("expected Lighter market ID must be non-negative")
+    if args.gradient_live:
+        if args.mode != "live" or not args.confirm_bounded_gradient_pilot:
+            parser.error("gradient-live requires live mode and explicit bounded gradient confirmation")
+        if args.confirm_bounded_live_pilot or args.new_pilot_after or args.manage_existing_wti_position:
+            parser.error("gradient-live is separate from single-round and management modes")
+    elif args.confirm_bounded_gradient_pilot or args.gradient_second_tier_bps is not None:
+        parser.error("gradient options require --gradient-live")
     if args.mode == "live":
         if args.entry_threshold_bps is None or args.exit_target_bps is None or args.roundtrip_cost_bps is None:
             parser.error("live mode requires explicit entry, exit, and roundtrip-cost thresholds")
@@ -1028,10 +1263,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             build_replay_config(args)
         except ValueError as exc:
             parser.error(str(exc))
+        if args.gradient_live:
+            second = args.gradient_second_tier_bps
+            layer = args.gradient_layer_notional_usd
+            if second is None or not second.is_finite() or second <= args.entry_threshold_bps:
+                parser.error("gradient second tier must be finite and higher than the entry threshold")
+            if not layer.is_finite() or layer <= 0:
+                parser.error("gradient layer notional must be positive and finite")
+            if layer * 2 > args._validated_notional:
+                parser.error("two gradient layers must fit within the aggregate notional cap")
+            args._validated_gradient_second_tier = second
+            args._validated_gradient_layer_notional = layer
         if args.manage_existing_wti_position and (
-            args.confirm_bounded_live_pilot or args.allow_unqualified_data_pilot
+            args.confirm_bounded_live_pilot or args.confirm_bounded_gradient_pilot
+            or args.allow_unqualified_data_pilot
         ):
             parser.error("choose either bounded entry pilot or existing-position management")
+    elif args.gradient_live or args.confirm_bounded_gradient_pilot:
+        parser.error("gradient live options require --mode live")
     return args
 
 

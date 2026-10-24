@@ -98,6 +98,8 @@ class OilSwapCollector:
         self.output_dir = Path(args.output_dir).resolve()
         self.sample_root = self.output_dir / "basis_samples"
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.instance_lock_path = self.output_dir / ".oil_swap_collector.lock"
+        self._instance_lock_handle = None
         self.run_id = f"oilbasis-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
         self.commit = self._git_commit()
         config = {key: str(value) for key, value in sorted(vars(args).items())}
@@ -524,6 +526,66 @@ class OilSwapCollector:
             self.logger.warning("variational_session_schedule_unavailable reason=%s", self.session_schedule_error)
 
     async def run(self) -> None:
+        self._acquire_instance_lock()
+        try:
+            await self._run_locked()
+        finally:
+            self._release_instance_lock()
+
+    def _acquire_instance_lock(self) -> None:
+        handle = self.instance_lock_path.open("a+b")
+        locked = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                if self.instance_lock_path.stat().st_size == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+            self._instance_lock_handle = handle
+            handle.seek(0)
+            handle.truncate()
+            handle.write(
+                json.dumps({"pid": os.getpid(), "run_id": self.run_id}).encode("utf-8")
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        except (BlockingIOError, OSError) as exc:
+            if locked:
+                self._release_instance_lock()
+                raise
+            handle.close()
+            raise RuntimeError("oil_swap_collector_already_running_for_output_dir") from exc
+
+    def _release_instance_lock(self) -> None:
+        handle = self._instance_lock_handle
+        if handle is None:
+            return
+        self._instance_lock_handle = None
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            handle.close()
+
+    async def _run_locked(self) -> None:
         if shutil.disk_usage(self.output_dir).free / (1024**3) < self.args.disk_stop_free_gb:
             raise RuntimeError("disk_free_below_stop_threshold")
         self.store.rotate_closed_days()

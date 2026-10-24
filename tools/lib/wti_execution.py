@@ -378,6 +378,8 @@ def _normalized_order_result(
         "trade_ids_confirmed": isinstance(trade_ids, list),
         "fee_usd": str(fee) if fee is not None else None,
         "fee_confirmed": fee is not None,
+        "trade_fee_evidence": deepcopy(payload.get("trade_fee_evidence"))
+        if isinstance(payload.get("trade_fee_evidence"), list) else None,
         "average_price": (
             str(decimal_value(payload.get("average_price")))
             if decimal_value(payload.get("average_price")) is not None
@@ -741,6 +743,77 @@ class WTIExecutionStore:
             self.save(state)
             return state
 
+    def initialize_gradient_pilot(
+        self,
+        *,
+        market_id: int,
+        multiplier: Decimal,
+        config: dict[str, Any],
+        max_layers: int,
+    ) -> dict[str, Any]:
+        if not isinstance(max_layers, int) or isinstance(max_layers, bool) or max_layers < 2:
+            raise ValueError("gradient_pilot_requires_at_least_two_layers")
+        with self.exclusive():
+            state = self.load()
+            pilot = state.get("gradient_pilot")
+            if pilot is None:
+                if (
+                    state.get("status") != "flat"
+                    or state.get("open_position") is not None
+                    or state.get("pending_action") is not None
+                ):
+                    raise WTIExecutionError("gradient_pilot_requires_flat_wti_state")
+                pilot = {
+                    "schema_version": 1,
+                    "pilot_id": uuid.uuid4().hex,
+                    "status": "available",
+                    "market_id": market_id,
+                    "multiplier": str(multiplier),
+                    "config": deepcopy(config),
+                    "max_layers": max_layers,
+                    "layers_opened": [],
+                    "exhausted_tiers": [],
+                    "completed_roundtrips": 0,
+                    "started_at": _utc_now(),
+                }
+                state["gradient_pilot"] = pilot
+                self.save(state)
+            if (
+                not isinstance(pilot, dict)
+                or pilot.get("schema_version") != 1
+                or not pilot.get("pilot_id")
+                or pilot.get("market_id") != market_id
+                or decimal_value(pilot.get("multiplier")) != multiplier
+                or pilot.get("config") != config
+                or pilot.get("max_layers") != max_layers
+                or not isinstance(pilot.get("layers_opened"), list)
+                or not isinstance(pilot.get("exhausted_tiers", []), list)
+                or not isinstance(pilot.get("completed_roundtrips"), int)
+                or pilot.get("status") not in {
+                    "available", "entry_pending", "in_position", "completed", "exhausted",
+                }
+            ):
+                raise WTIExecutionError("gradient_pilot_configuration_or_state_mismatch")
+            if pilot.get("status") in {"completed", "exhausted"}:
+                raise WTIExecutionError("gradient_pilot_budget_unavailable")
+            if pilot.get("completed_roundtrips") != 0:
+                raise CorruptExecutionState("active gradient pilot has completed roundtrips")
+            position = state.get("open_position")
+            pending = state.get("pending_action")
+            if position is not None and position.get("gradient_pilot_id") != pilot.get("pilot_id"):
+                raise WTIExecutionError("gradient_pilot_position_identity_mismatch")
+            if pending is not None and pending.get("gradient_pilot_id") != pilot.get("pilot_id"):
+                raise WTIExecutionError("gradient_pilot_pending_identity_mismatch")
+            if pilot.get("status") == "entry_pending" and pending is None:
+                raise WTIExecutionError("gradient_pilot_pending_action_missing")
+            if pilot.get("status") == "in_position" and not isinstance(position, dict) and pending is None:
+                raise WTIExecutionError("gradient_pilot_position_missing")
+            if pilot.get("status") == "available" and (
+                position is not None or pending is not None or pilot.get("layers_opened")
+            ):
+                raise WTIExecutionError("gradient_pilot_available_state_inconsistent")
+            return deepcopy(pilot)
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1078,10 +1151,143 @@ class WTIPairExecutor:
             "completed_at": _utc_now(),
             "market_id": pending["market_id"],
             "multiplier": pending["multiplier"],
+            "decision": deepcopy(pending.get("decision")),
+            "exit_reason": (pending.get("decision") or {}).get("reason"),
+            "close_check": deepcopy(pending.get("close_check")),
             "legs": deepcopy(pending.get("legs") or {}),
             "superseded_legs": deepcopy(pending.get("superseded_legs") or []),
             "recovered": recovered,
         }
+
+    @staticmethod
+    def _position_after_open(
+        previous: dict[str, Any] | None,
+        pending: dict[str, Any],
+        var_fill: dict[str, Any],
+        lighter_fill: dict[str, Any],
+        execution: dict[str, Any],
+        *,
+        recovered: bool = False,
+    ) -> dict[str, Any]:
+        direction = str(pending["direction"])
+        var_qty = Decimal(str(pending["var_qty"]))
+        lighter_qty = Decimal(str(pending["lighter_qty"]))
+        var_price = decimal_value(var_fill.get("average_price"))
+        lighter_price = decimal_value(lighter_fill.get("average_price"))
+        layer_id = str(pending.get("layer_id") or execution["action_id"])
+        layer = {
+            "layer_id": layer_id,
+            "tier": pending.get("gradient_tier"),
+            "direction": direction,
+            "var_qty": str(var_qty),
+            "lighter_qty": str(lighter_qty),
+            "var_entry_price": None if var_price is None else str(var_price),
+            "lighter_entry_price": None if lighter_price is None else str(lighter_price),
+            "var_entry_fee_usd": var_fill.get("fee_usd"),
+            "lighter_entry_fee_usd": lighter_fill.get("fee_usd"),
+            "opened_at": pending.get("intent_at") or execution.get("completed_at"),
+            "session_id": pending.get("session_id"),
+            "entry_execution_id": execution["action_id"],
+            "entry_decision": deepcopy(pending.get("decision")),
+            "recovered": recovered,
+        }
+        if previous is None:
+            expected_var = Decimal(str(pending["expected_var_qty"]))
+            expected_lighter = Decimal(str(pending["expected_lighter_qty"]))
+            return {
+                "direction": direction,
+                "var_qty": str(var_qty),
+                "lighter_qty": str(lighter_qty),
+                "expected_var_qty": str(expected_var),
+                "expected_lighter_qty": str(expected_lighter),
+                "var_entry_price": layer["var_entry_price"],
+                "lighter_entry_price": layer["lighter_entry_price"],
+                "var_entry_fee_usd": layer["var_entry_fee_usd"],
+                "lighter_entry_fee_usd": layer["lighter_entry_fee_usd"],
+                "market_id": pending["market_id"],
+                "multiplier": pending["multiplier"],
+                "session_id": pending.get("session_id"),
+                "opened_at": layer["opened_at"],
+                "entry_execution_id": execution["action_id"],
+                "entry_decision": layer["entry_decision"],
+                "layers": [layer],
+                "gradient_pilot_id": pending.get("gradient_pilot_id"),
+                "gradient_tier": pending.get("gradient_tier"),
+                **({"single_round_pilot_id": pending.get("single_round_pilot_id")}
+                   if pending.get("single_round_pilot_id") else {}),
+                **({"recovered_at": _utc_now(), "recovered_from_pending": True}
+                   if recovered else {}),
+            }
+
+        if (
+            previous.get("direction") != direction
+            or previous.get("session_id") != pending.get("session_id")
+            or integer_value(previous.get("market_id")) != integer_value(pending.get("market_id"))
+            or decimal_value(previous.get("multiplier")) != decimal_value(pending.get("multiplier"))
+        ):
+            raise CorruptExecutionState("gradient layer does not match existing WTI position")
+        prior_var_qty = decimal_value(previous.get("var_qty"))
+        prior_lighter_qty = decimal_value(previous.get("lighter_qty"))
+        prior_var_price = decimal_value(previous.get("var_entry_price"))
+        prior_lighter_price = decimal_value(previous.get("lighter_entry_price"))
+        if None in (prior_var_qty, prior_lighter_qty, prior_var_price, prior_lighter_price):
+            raise CorruptExecutionState("existing WTI position cannot be safely layered")
+        layers = deepcopy(previous.get("layers"))
+        if not isinstance(layers, list) or not layers:
+            layers = [{
+                "layer_id": str(previous.get("entry_execution_id") or "legacy-entry"),
+                "tier": previous.get("gradient_tier"),
+                "direction": direction,
+                "var_qty": str(prior_var_qty),
+                "lighter_qty": str(prior_lighter_qty),
+                "var_entry_price": str(prior_var_price),
+                "lighter_entry_price": str(prior_lighter_price),
+                "var_entry_fee_usd": previous.get("var_entry_fee_usd"),
+                "lighter_entry_fee_usd": previous.get("lighter_entry_fee_usd"),
+                "opened_at": previous.get("opened_at"),
+                "session_id": previous.get("session_id"),
+                "entry_execution_id": previous.get("entry_execution_id"),
+                "entry_decision": deepcopy(previous.get("entry_decision")),
+                "recovered": False,
+            }]
+        if any(isinstance(item, dict) and item.get("layer_id") == layer_id for item in layers):
+            raise CorruptExecutionState("gradient layer identity was already recorded")
+        layers.append(layer)
+        total_var = prior_var_qty + var_qty
+        total_lighter = prior_lighter_qty + lighter_qty
+        combined_var_price = (
+            prior_var_price * prior_var_qty + var_price * var_qty
+        ) / total_var if var_price is not None else None
+        combined_lighter_price = (
+            prior_lighter_price * prior_lighter_qty + lighter_price * lighter_qty
+        ) / total_lighter if lighter_price is not None else None
+
+        def combined_fee(old: Any, new: Any) -> str | None:
+            old_value = decimal_value(old)
+            new_value = decimal_value(new)
+            return str(old_value + new_value) if old_value is not None and new_value is not None else None
+
+        expected_var = Decimal(str(pending["expected_var_qty"]))
+        expected_lighter = Decimal(str(pending["expected_lighter_qty"]))
+        result = deepcopy(previous)
+        result.update({
+            "var_qty": str(total_var),
+            "lighter_qty": str(total_lighter),
+            "expected_var_qty": str(expected_var),
+            "expected_lighter_qty": str(expected_lighter),
+            "var_entry_price": None if combined_var_price is None else str(combined_var_price),
+            "lighter_entry_price": None if combined_lighter_price is None else str(combined_lighter_price),
+            "var_entry_fee_usd": combined_fee(previous.get("var_entry_fee_usd"), var_fill.get("fee_usd")),
+            "lighter_entry_fee_usd": combined_fee(previous.get("lighter_entry_fee_usd"), lighter_fill.get("fee_usd")),
+            "layers": layers,
+            "last_entry_execution_id": execution["action_id"],
+            "last_entry_decision": layer["entry_decision"],
+            "gradient_pilot_id": pending.get("gradient_pilot_id") or previous.get("gradient_pilot_id"),
+            "gradient_tier": pending.get("gradient_tier") or previous.get("gradient_tier"),
+        })
+        if recovered:
+            result["last_layer_recovered_at"] = _utc_now()
+        return result
 
     def _archive_execution(
         self,
@@ -1093,6 +1299,32 @@ class WTIPairExecutor:
     ) -> dict[str, Any]:
         record = self._execution_record(pending, outcome, recovered=recovered)
         state.setdefault("execution_history", []).append(record)
+        if pending.get("kind") == "open" and pending.get("gradient_pilot_id"):
+            pilot = state.get("gradient_pilot")
+            tier = pending.get("gradient_tier")
+            if (
+                not isinstance(pilot, dict)
+                or pilot.get("pilot_id") != pending.get("gradient_pilot_id")
+                or pilot.get("status") != "entry_pending"
+                or tier != len(pilot.get("layers_opened", [])) + 1
+                or tier > pilot.get("max_layers", 0)
+            ):
+                raise CorruptExecutionState("gradient pilot layer does not match pending entry")
+            if outcome == "filled":
+                pilot.setdefault("layers_opened", []).append({
+                    "tier": tier,
+                    "layer_id": pending.get("layer_id"),
+                    "action_id": pending.get("action_id"),
+                    "completed_at": record["completed_at"],
+                    "recovered": recovered,
+                })
+                pilot["status"] = "in_position"
+            elif outcome in {"no_fill", "compensated"}:
+                pilot.setdefault("exhausted_tiers", []).append(tier)
+                pilot["status"] = "in_position" if pending.get("previous_position") else "exhausted"
+                pilot["last_failed_tier"] = tier
+                pilot["last_failed_action_id"] = pending.get("action_id")
+                pilot["updated_at"] = record["completed_at"]
         if pending.get("kind") == "open" and pending.get("single_round_pilot_id"):
             pilot = state.get("single_round_pilot")
             if (
@@ -1115,6 +1347,33 @@ class WTIPairExecutor:
                 pilot["entry_action_id"] = None
                 pilot["last_no_fill_at"] = record["completed_at"]
         return record
+
+    @staticmethod
+    def _complete_gradient_pilot(
+        state: dict[str, Any],
+        position: dict[str, Any],
+        execution: dict[str, Any],
+    ) -> None:
+        pilot_id = position.get("gradient_pilot_id")
+        if not pilot_id:
+            return
+        pilot = state.get("gradient_pilot")
+        layers = position.get("layers")
+        opened_tiers = [item.get("tier") for item in layers or [] if isinstance(item, dict)]
+        if (
+            not isinstance(pilot, dict)
+            or pilot.get("pilot_id") != pilot_id
+            or pilot.get("status") != "in_position"
+            or pilot.get("completed_roundtrips") != 0
+            or not isinstance(layers, list)
+            or len(layers) != len(pilot.get("layers_opened", []))
+            or any(item.get("tier") != tier for item, tier in zip(pilot["layers_opened"], opened_tiers))
+        ):
+            raise CorruptExecutionState("gradient pilot close does not match confirmed layers")
+        pilot["status"] = "completed"
+        pilot["completed_roundtrips"] = 1
+        pilot["exit_action_id"] = execution["action_id"]
+        pilot["completed_at"] = execution["completed_at"]
 
     @staticmethod
     def _complete_single_round_pilot(
@@ -1201,6 +1460,34 @@ class WTIPairExecutor:
             else "fees_unverified"
         )
         return output
+
+    @staticmethod
+    def _estimated_close_net_bps(
+        position: dict[str, Any], context: MarketContext, roundtrip_cost_bps: Decimal,
+    ) -> Decimal | None:
+        direction = str(position.get("direction"))
+        if direction == "long_var_short_lighter":
+            var_exit, lighter_exit = context.var_bid, context.lighter_buy_price
+        elif direction == "short_var_long_lighter":
+            var_exit, lighter_exit = context.var_ask, context.lighter_sell_price
+        else:
+            return None
+        var_entry = decimal_value(position.get("var_entry_price"))
+        lighter_entry = decimal_value(position.get("lighter_entry_price"))
+        var_qty = decimal_value(position.get("var_qty"))
+        lighter_qty = decimal_value(position.get("lighter_qty"))
+        multiplier = decimal_value(position.get("multiplier"))
+        if None in (var_entry, lighter_entry, var_qty, lighter_qty, multiplier):
+            return None
+        denominator = (var_entry * var_qty + lighter_entry * lighter_qty * multiplier) / 2
+        if denominator <= 0:
+            return None
+        gross = paired_realized_pnl(
+            direction=direction, var_entry=var_entry, var_exit=var_exit,
+            var_qty=var_qty, lighter_entry=lighter_entry, lighter_exit=lighter_exit,
+            lighter_qty=lighter_qty, instrument=context.instrument,
+        )
+        return gross / denominator * Decimal("10000") - roundtrip_cost_bps
 
     def _resolve_pending_orders(self, state: dict[str, Any], pending: dict[str, Any]) -> bool:
         changed = False
@@ -1290,6 +1577,10 @@ class WTIPairExecutor:
         session: SessionWindow | None,
         pilot_id: str | None = None,
         pilot_reservation_id: str | None = None,
+        decision: dict[str, Any] | None = None,
+        layer_id: str | None = None,
+        gradient_tier: int | None = None,
+        gradient_pilot_id: str | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         operation_now = now or self._now()
@@ -1307,6 +1598,15 @@ class WTIPairExecutor:
             raise WTIExecutionError("exchange_session_observation_unverified")
         if bool(pilot_id) != bool(pilot_reservation_id):
             raise WTIExecutionError("single_round_pilot_reservation_incomplete")
+        if (layer_id is None) != (gradient_tier is None):
+            raise WTIExecutionError("gradient_layer_identity_incomplete")
+        if gradient_tier is not None and (
+            not isinstance(gradient_tier, int) or isinstance(gradient_tier, bool)
+            or gradient_tier < 1 or pilot_id is not None
+        ):
+            raise WTIExecutionError("gradient_layer_tier_invalid")
+        if (gradient_pilot_id is None) != (gradient_tier is None):
+            raise WTIExecutionError("gradient_pilot_requires_gradient_layer")
         var_qty, lighter_qty = _size_for_notional(notional_usd, context)
         reference = (context.lighter_bid + context.lighter_ask) / Decimal("2")
         planned_notional = lighter_qty * context.multiplier * reference
@@ -1340,7 +1640,28 @@ class WTIPairExecutor:
 
         with self.store.exclusive():
             state = self.store.load()
-            if state["status"] != "flat" or state.get("pending_action") or state.get("open_position"):
+            if state.get("pending_action"):
+                raise WTIExecutionError("existing_wti_state_blocks_entry")
+            previous_position: dict[str, Any] | None
+            if state["status"] == "flat":
+                if state.get("open_position") is not None:
+                    raise WTIExecutionError("flat_wti_state_contains_open_position")
+                previous_position = None
+            elif state["status"] == "open" and gradient_tier is not None:
+                candidate = state.get("open_position")
+                if not isinstance(candidate, dict) or pilot_id is not None:
+                    raise WTIExecutionError("existing_wti_state_blocks_entry")
+                if candidate.get("direction") != direction:
+                    raise WTIExecutionError("gradient_layer_direction_mismatch")
+                if candidate.get("session_id") != session_id:
+                    raise WTIExecutionError("gradient_layer_session_mismatch")
+                if (
+                    integer_value(candidate.get("market_id")) != context.market_id
+                    or decimal_value(candidate.get("multiplier")) != context.multiplier
+                ):
+                    raise WTIExecutionError("gradient_layer_market_identity_mismatch")
+                previous_position = deepcopy(candidate)
+            else:
                 raise WTIExecutionError("existing_wti_state_blocks_entry")
             if pilot_id:
                 pilot = state.get("single_round_pilot")
@@ -1352,10 +1673,86 @@ class WTIPairExecutor:
                     or pilot.get("completed_roundtrips") != 0
                 ):
                     raise WTIExecutionError("single_round_pilot_reservation_invalid")
+            gradient_pilot = None
+            if gradient_pilot_id:
+                gradient_pilot = state.get("gradient_pilot")
+                opened_layers = (
+                    gradient_pilot.get("layers_opened", [])
+                    if isinstance(gradient_pilot, dict) else []
+                )
+                expected_tier = len(opened_layers) + 1
+                if (
+                    not isinstance(gradient_pilot, dict)
+                    or gradient_pilot.get("pilot_id") != gradient_pilot_id
+                    or gradient_pilot.get("status") != (
+                        "available" if previous_position is None else "in_position"
+                    )
+                    or gradient_pilot.get("completed_roundtrips") != 0
+                    or gradient_pilot.get("max_layers", 0) < gradient_tier
+                    or gradient_tier != expected_tier
+                    or gradient_tier in gradient_pilot.get("exhausted_tiers", [])
+                    or len(opened_layers) >= gradient_pilot.get("max_layers", 0)
+                    or (
+                        previous_position is None
+                        and (gradient_tier != 1 or opened_layers or state.get("status") != "flat")
+                    )
+                    or (
+                        previous_position is not None
+                        and previous_position.get("gradient_pilot_id") != gradient_pilot_id
+                    )
+                    or any(
+                        item.get("layer_id") == layer_id
+                        for item in opened_layers if isinstance(item, dict)
+                    )
+                ):
+                    raise WTIExecutionError("gradient_pilot_layer_budget_unavailable")
+                if state.get("single_round_pilot") and state["single_round_pilot"].get(
+                    "status"
+                ) not in {"completed", "exhausted"}:
+                    raise WTIExecutionError("other_wti_pilot_budget_active")
+            elif gradient_tier is not None:
+                raise WTIExecutionError("gradient_pilot_identity_required")
+            elif isinstance(state.get("gradient_pilot"), dict) and state["gradient_pilot"].get(
+                "status"
+            ) not in {"completed", "exhausted"}:
+                raise WTIExecutionError("gradient_pilot_identity_required")
             baseline = self._read(context)
-            if not _matches(baseline, (Decimal("0"), Decimal("0")), context):
+            if previous_position is None:
+                baseline_expected = (Decimal("0"), Decimal("0"))
+                existing_notional = Decimal("0")
+            else:
+                expected_var = decimal_value(previous_position.get("expected_var_qty"))
+                expected_lighter = decimal_value(previous_position.get("expected_lighter_qty"))
+                previous_var_qty = decimal_value(previous_position.get("var_qty"))
+                previous_lighter_qty = decimal_value(previous_position.get("lighter_qty"))
+                previous_var_price = decimal_value(previous_position.get("var_entry_price"))
+                previous_lighter_price = decimal_value(previous_position.get("lighter_entry_price"))
+                if None in (
+                    expected_var, expected_lighter, previous_var_qty, previous_lighter_qty,
+                    previous_var_price, previous_lighter_price,
+                ):
+                    raise WTIExecutionError("existing_wti_position_not_layerable")
+                baseline_expected = (expected_var, expected_lighter)
+                existing_notional = (
+                    previous_var_price * previous_var_qty
+                    + previous_lighter_price * previous_lighter_qty * context.multiplier
+                ) / Decimal("2")
+            if baseline.active_order_count != 0:
                 raise WTIExecutionError("wti_account_not_flat_or_has_active_orders")
+            if not _matches(baseline, baseline_expected, context):
+                raise WTIExecutionError(
+                    "wti_account_not_flat_or_has_active_orders"
+                    if previous_position is None
+                    else "wti_account_position_mismatch_before_entry"
+                )
+            if existing_notional + planned_notional > self.max_notional_usd:
+                raise WTIExecutionError("gradient_aggregate_notional_limit_exceeded")
             action_id = uuid.uuid4().hex
+            expected_delta = _signed_target(direction, var_qty, lighter_qty)
+            expected = (
+                baseline_expected[0] + expected_delta[0],
+                baseline_expected[1] + expected_delta[1],
+            )
             state.update({
                 "status": "pending",
                 "pending_action": {
@@ -1371,12 +1768,22 @@ class WTIPairExecutor:
                     "session_id": session_id,
                     "single_round_pilot_id": pilot_id,
                     "pilot_reservation_id": pilot_reservation_id,
-                    "previous_position": None,
+                    "previous_position": deepcopy(previous_position),
+                    "layer_id": layer_id or action_id,
+                    "gradient_tier": gradient_tier,
+                    "gradient_pilot_id": gradient_pilot_id,
                     "intent_at": self._now().isoformat(),
+                    "decision": deepcopy(decision) if isinstance(decision, dict) else None,
                     "legs": {},
                 },
                 "manual_review_reason": None,
             })
+            if gradient_pilot is not None:
+                gradient_pilot["status"] = "entry_pending"
+                gradient_pilot["pending_tier"] = gradient_tier
+                gradient_pilot["pending_layer_id"] = layer_id
+                gradient_pilot["pending_action_id"] = action_id
+                gradient_pilot["pending_at"] = state["pending_action"]["intent_at"]
             self.store.save(state)
 
             try:
@@ -1425,23 +1832,13 @@ class WTIPairExecutor:
                 return self._manual_review(state, "post_open_exchange_position_mismatch")
             execution = self._archive_execution(state, state["pending_action"], "filled")
             state["status"] = "open"
-            state["open_position"] = {
-                "direction": direction,
-                "var_qty": str(var_qty),
-                "lighter_qty": str(lighter_qty),
-                "expected_var_qty": str(expected[0]),
-                "expected_lighter_qty": str(expected[1]),
-                "var_entry_price": var_result["average_price"],
-                "lighter_entry_price": lighter_result["average_price"],
-                "var_entry_fee_usd": var_result.get("fee_usd"),
-                "lighter_entry_fee_usd": lighter_result.get("fee_usd"),
-                "market_id": context.market_id,
-                "multiplier": str(context.multiplier),
-                "session_id": session_id,
-                "opened_at": _utc_now(),
-                "entry_execution_id": execution["action_id"],
-                **({"single_round_pilot_id": pilot_id} if pilot_id else {}),
-            }
+            state["open_position"] = self._position_after_open(
+                previous_position,
+                state["pending_action"],
+                var_result,
+                lighter_result,
+                execution,
+            )
             state["pending_action"] = None
             state["manual_review_reason"] = None
             self.store.save(state)
@@ -1477,11 +1874,27 @@ class WTIPairExecutor:
             before = self._read(context)
         except WTIExecutionError:
             return False
-        expected_var = Decimal(str(pending.get("expected_var_qty")))
+        previous_position = pending.get("previous_position")
+        if isinstance(previous_position, dict):
+            base_var = decimal_value(previous_position.get("expected_var_qty"))
+            base_lighter = decimal_value(previous_position.get("expected_lighter_qty"))
+            if base_var is None or base_lighter is None:
+                return False
+        else:
+            base_var = Decimal("0")
+            base_lighter = Decimal("0")
+        delta_var, _ = _signed_target(
+            str(pending.get("direction")),
+            Decimal(str(pending.get("var_qty"))),
+            Decimal(str(pending.get("lighter_qty"))),
+        )
         if (
             before.active_order_count != 0
-            or abs(before.variational_qty - expected_var) > Decimal("0.00000001")
-            or abs(before.lighter_qty) > context.lighter_position_tolerance
+            or not _matches(
+                before,
+                (base_var + delta_var, base_lighter),
+                context,
+            )
         ):
             return False
 
@@ -1529,11 +1942,11 @@ class WTIPairExecutor:
             after = self._read(context, minimum_observed_at=self._now())
         except WTIExecutionError:
             return False
-        if not _matches(after, (Decimal("0"), Decimal("0")), context):
+        if not _matches(after, (base_var, base_lighter), context):
             return False
         self._archive_execution(state, pending, "compensated")
-        state["status"] = "flat"
-        state["open_position"] = None
+        state["status"] = "open" if isinstance(previous_position, dict) else "flat"
+        state["open_position"] = deepcopy(previous_position) if isinstance(previous_position, dict) else None
         state["pending_action"] = None
         state["manual_review_reason"] = None
         state["last_action_resolution"] = "one_leg_open_confirmed_and_reduce_only_compensated"
@@ -1545,6 +1958,9 @@ class WTIPairExecutor:
         *,
         sample: dict[str, Any],
         session: SessionWindow | None,
+        decision: dict[str, Any] | None = None,
+        exit_target_bps: Decimal | None = None,
+        roundtrip_cost_bps: Decimal | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         operation_now = now or self._now()
@@ -1568,22 +1984,51 @@ class WTIPairExecutor:
                 raise WTIExecutionError("wti_market_metadata_changed_since_entry")
             close_var_qty = Decimal(str(position["var_qty"]))
             close_lighter_qty = Decimal(str(position["lighter_qty"]))
+            try:
+                # Every close decision uses a fresh executable quote sized for
+                # the entire paired position, not the collector's probe size.
+                context = self._fresh_context(
+                    context,
+                    var_qty=close_var_qty,
+                    lighter_qty=close_lighter_qty,
+                )
+            except WTIExecutionError as exc:
+                if str(exc) == "readonly_sample_depth_below_order_quantity":
+                    raise WTIExecutionError(
+                        "readonly_sample_depth_below_close_quantity"
+                    ) from exc
+                raise
+            close_decision = deepcopy(decision) if isinstance(decision, dict) else None
+            close_check: dict[str, Any] = {
+                "checked_at": self._now().isoformat(),
+                "reason": "non_profit_exit_bypasses_profit_target",
+                "decision": close_decision,
+            }
             if (
-                context.quoted_var_qty < close_var_qty
-                or context.quoted_lighter_qty < close_lighter_qty
+                close_decision is not None
+                and close_decision.get("reason") == "net_target_reached"
+                and exit_target_bps is not None
+                and roundtrip_cost_bps is not None
             ):
-                try:
-                    context = self._fresh_context(
-                        context,
-                        var_qty=close_var_qty,
-                        lighter_qty=close_lighter_qty,
-                    )
-                except WTIExecutionError as exc:
-                    if str(exc) == "readonly_sample_depth_below_order_quantity":
-                        raise WTIExecutionError(
-                            "readonly_sample_depth_below_close_quantity"
-                        ) from exc
-                    raise
+                refreshed_net_bps = self._estimated_close_net_bps(
+                    position, context, roundtrip_cost_bps
+                )
+                close_check = {
+                    "checked_at": self._now().isoformat(),
+                    "reason": "exit_target_reached_after_full_size_refresh",
+                    "estimated_net_pnl_bps": (
+                        None if refreshed_net_bps is None else str(refreshed_net_bps)
+                    ),
+                    "exit_target_bps": str(exit_target_bps),
+                    "decision": close_decision,
+                }
+                if refreshed_net_bps is None or refreshed_net_bps < exit_target_bps:
+                    close_check["reason"] = "exit_target_not_reached_after_full_size_refresh"
+                    state["last_close_check"] = close_check
+                    self.store.save(state)
+                    return state
+            state["last_close_check"] = close_check
+            self.store.save(state)
             before = self._read(context)
             expected_open = (
                 Decimal(str(position["expected_var_qty"])),
@@ -1610,19 +2055,15 @@ class WTIPairExecutor:
                 "market_id": context.market_id,
                 "session_id": session_id,
                 "previous_position": position,
+                "gradient_pilot_id": position.get("gradient_pilot_id"),
                 "intent_at": self._now().isoformat(),
+                "decision": close_decision,
+                "close_check": close_check,
                 "legs": {},
             }
             self.store.save(state)
 
-            try:
-                first_context = self._fresh_context(
-                    context,
-                    var_qty=Decimal(str(position["var_qty"])),
-                    lighter_qty=Decimal(str(position["lighter_qty"])),
-                )
-            except WTIExecutionError as exc:
-                return self._manual_review(state, str(exc))
+            first_context = context
             var_result = self._submit_leg(
                 state, context=first_context, venue="variational", side=var_close_side,
                 qty=Decimal(str(position["var_qty"])), reduce_only=True,
@@ -1661,6 +2102,9 @@ class WTIPairExecutor:
             state["manual_review_reason"] = None
             state["last_closed_position"] = {
                 **position,
+                "exit_reason": execution.get("exit_reason"),
+                "exit_decision": execution.get("decision"),
+                "exit_check": execution.get("close_check"),
                 **self._closed_pnl_evidence(
                     position, var_exit=var_result, lighter_exit=lighter_result
                 ),
@@ -1668,6 +2112,7 @@ class WTIPairExecutor:
                 "exit_execution_id": execution["action_id"],
             }
             self._complete_single_round_pilot(state, position, execution)
+            self._complete_gradient_pilot(state, position, execution)
             self.store.save(state)
             return state
 
@@ -1692,17 +2137,31 @@ class WTIPairExecutor:
         expected_var = decimal_value(pending.get("expected_var_qty"))
         expected_lighter = decimal_value(pending.get("expected_lighter_qty"))
         direction = pending.get("direction")
+        previous_position = pending.get("previous_position")
+        if isinstance(previous_position, dict):
+            base_var = decimal_value(previous_position.get("expected_var_qty"))
+            base_lighter = decimal_value(previous_position.get("expected_lighter_qty"))
+            if base_var is None or base_lighter is None:
+                return None
+        else:
+            base_var = Decimal("0")
+            base_lighter = Decimal("0")
+        delta_var, delta_lighter = (
+            _signed_target(direction, var_qty, lighter_qty)
+            if direction in VALID_DIRECTIONS and var_qty is not None and lighter_qty is not None
+            else (None, None)
+        )
         if (
             direction not in VALID_DIRECTIONS
             or None in (var_qty, lighter_qty, expected_var, expected_lighter)
             or var_qty <= 0 or lighter_qty <= 0
             or (expected_var, expected_lighter)
-            != _signed_target(direction, var_qty, lighter_qty)
+            != (base_var + delta_var, base_lighter + delta_lighter)
             or var_leg.get("submission_started") is not True
             or var_fill.get("classification") != "filled"
             or var_fill.get("terminal_confirmed") is not True
             or decimal_value(var_fill.get("filled_qty")) != var_qty
-            or not _matches(actual, (expected_var, Decimal("0")), context)
+            or not _matches(actual, (base_var + delta_var, base_lighter), context)
         ):
             return None
 
@@ -1805,25 +2264,14 @@ class WTIPairExecutor:
         execution = self._archive_execution(state, pending, "filled", recovered=True)
         var_fill = (pending.get("legs") or {}).get("variational", {}).get("result") or {}
         lighter_fill = (pending.get("legs") or {}).get("lighter", {}).get("result") or {}
-        state["open_position"] = {
-            "direction": direction,
-            "var_qty": str(var_qty),
-            "lighter_qty": str(lighter_qty),
-            "expected_var_qty": str(expected_var),
-            "expected_lighter_qty": str(expected_lighter),
-            "var_entry_price": var_fill.get("average_price"),
-            "lighter_entry_price": lighter_fill.get("average_price"),
-            "var_entry_fee_usd": var_fill.get("fee_usd"),
-            "lighter_entry_fee_usd": lighter_fill.get("fee_usd"),
-            "market_id": pending["market_id"],
-            "multiplier": pending["multiplier"],
-            "session_id": pending.get("session_id"),
-            "opened_at": pending.get("intent_at") or _utc_now(),
-            "recovered_at": _utc_now(),
-            "recovered_from_pending": True,
-            "entry_execution_id": execution["action_id"],
-            **({"single_round_pilot_id": pilot_id} if pilot_id else {}),
-        }
+        state["open_position"] = self._position_after_open(
+            previous_position,
+            pending,
+            var_fill,
+            lighter_fill,
+            execution,
+            recovered=True,
+        )
         state["status"] = "open"
         state["pending_action"] = None
         state["manual_review_reason"] = None
@@ -1852,6 +2300,9 @@ class WTIPairExecutor:
         state["last_action_resolution"] = "close_confirmed_flat_by_account_snapshot"
         state["last_closed_position"] = {
             **position,
+            "exit_reason": (pending.get("decision") or {}).get("reason"),
+            "exit_decision": deepcopy(pending.get("decision")),
+            "exit_check": deepcopy(pending.get("close_check")),
             **self._closed_pnl_evidence(
                 position, var_exit=var_exit, lighter_exit=lighter_exit
             ),
@@ -1860,6 +2311,7 @@ class WTIPairExecutor:
             "exit_execution_id": execution["action_id"],
         }
         self._complete_single_round_pilot(state, position, execution)
+        self._complete_gradient_pilot(state, position, execution)
         self.store.save(state)
         return state
 
@@ -2088,6 +2540,15 @@ class WTIPairExecutor:
                     return self._manual_review(state, "post_order_account_snapshot_unavailable")
             else:
                 actual = self._read(context)
+            state["last_account_reconciliation"] = {
+                "verified": True,
+                "observed_at": actual.observed_at.isoformat(),
+                "market_id": context.market_id,
+                "variational_qty": str(actual.variational_qty),
+                "lighter_qty": str(actual.lighter_qty),
+                "active_order_count": actual.active_order_count,
+            }
+            self.store.save(state)
             if actual.active_order_count != 0:
                 return self._manual_review(state, "active_wti_orders_require_reconciliation")
             if isinstance(pending, dict):
@@ -2144,27 +2605,14 @@ class WTIPairExecutor:
                 execution = self._archive_execution(state, pending, "filled", recovered=True)
                 if pending.get("kind") == "open":
                     legs = pending.get("legs") or {}
-                    var_fill = (legs.get("variational") or {}).get("result", {}).get("average_price")
-                    lighter_fill = (legs.get("lighter") or {}).get("result", {}).get("average_price")
-                    state["open_position"] = {
-                        "direction": pending["direction"],
-                        "var_qty": pending["var_qty"],
-                        "lighter_qty": pending["lighter_qty"],
-                        "expected_var_qty": str(expected[0]),
-                        "expected_lighter_qty": str(expected[1]),
-                        "var_entry_price": var_fill,
-                        "lighter_entry_price": lighter_fill,
-                        "market_id": pending["market_id"],
-                        "multiplier": pending["multiplier"],
-                        "session_id": pending.get("session_id"),
-                        "opened_at": pending.get("intent_at") or _utc_now(),
-                        "recovered_at": _utc_now(),
-                        "recovered_from_pending": True,
-                        "entry_execution_id": execution["action_id"],
-                        **({
-                            "single_round_pilot_id": pending.get("single_round_pilot_id")
-                        } if pending.get("single_round_pilot_id") else {}),
-                    }
+                    state["open_position"] = self._position_after_open(
+                        pending.get("previous_position"),
+                        pending,
+                        (legs.get("variational") or {}).get("result") or {},
+                        (legs.get("lighter") or {}).get("result") or {},
+                        execution,
+                        recovered=True,
+                    )
                     state["status"] = "open"
                 elif pending.get("kind") == "close":
                     state["open_position"] = None
@@ -2172,6 +2620,9 @@ class WTIPairExecutor:
                     legs = pending.get("legs") or {}
                     state["last_closed_position"] = {
                         **(pending.get("previous_position") or {}),
+                        "exit_reason": (pending.get("decision") or {}).get("reason"),
+                        "exit_decision": deepcopy(pending.get("decision")),
+                        "exit_check": deepcopy(pending.get("close_check")),
                         **self._closed_pnl_evidence(
                             pending.get("previous_position") or {},
                             var_exit=(legs.get("variational") or {}).get("result") or {},
@@ -2186,6 +2637,11 @@ class WTIPairExecutor:
                         pending.get("previous_position") or {},
                         execution,
                     )
+                    self._complete_gradient_pilot(
+                        state,
+                        pending.get("previous_position") or {},
+                        execution,
+                    )
                 else:
                     return self._manual_review(state, "pending_action_kind_invalid")
                 state["pending_action"] = None
@@ -2196,18 +2652,28 @@ class WTIPairExecutor:
             previous = pending.get("previous_position")
             if (
                 pending.get("kind") == "open"
-                and _matches(actual, zero, context)
                 and self._all_known_no_fill(pending)
             ):
-                execution = self._archive_execution(state, pending, "no_fill", recovered=True)
-                state["status"] = "flat"
-                state["open_position"] = None
-                state["pending_action"] = None
-                state["manual_review_reason"] = None
-                state["last_action_resolution"] = "open_confirmed_no_fill"
-                state["last_action_execution_id"] = execution["action_id"]
-                self.store.save(state)
-                return state
+                expected_previous = (
+                    (
+                        decimal_value(previous.get("expected_var_qty")),
+                        decimal_value(previous.get("expected_lighter_qty")),
+                    )
+                    if isinstance(previous, dict)
+                    else zero
+                )
+                if None not in expected_previous and _matches(
+                    actual, (expected_previous[0], expected_previous[1]), context
+                ):
+                    execution = self._archive_execution(state, pending, "no_fill", recovered=True)
+                    state["status"] = "open" if isinstance(previous, dict) else "flat"
+                    state["open_position"] = deepcopy(previous) if isinstance(previous, dict) else None
+                    state["pending_action"] = None
+                    state["manual_review_reason"] = None
+                    state["last_action_resolution"] = "open_confirmed_no_fill"
+                    state["last_action_execution_id"] = execution["action_id"]
+                    self.store.save(state)
+                    return state
             if (
                 pending.get("kind") == "close"
                 and isinstance(previous, dict)

@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
+import json
+from pathlib import Path
 
 import pytest
 
-from tools.lib.wti_replay import ReplayConfig, replay_wti
+from tools.lib.wti_replay import ReplayConfig, replay_wti, replay_wti_gradient
+from tools import wti_strategy_replay
 
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
@@ -30,6 +34,9 @@ def _row(index: int, *, at: datetime | None = None, **overrides):
         "lighter_market_id": 145,
         "lighter_market_status": "active",
         "lighter_multiplier": "1",
+        "lighter_supported_size_decimals": 2,
+        "lighter_min_base_amount": "0.01",
+        "lighter_min_quote_amount": "1",
         "var_quote_age_seconds": "0.1",
         "lighter_book_age_seconds": "0.1",
         "var_bid": "69.9",
@@ -157,13 +164,48 @@ def test_replay_never_closes_on_a_sample_with_the_entry_timestamp():
     assert report.unresolved_position is True
 
 
-def test_replay_stops_at_gap_with_open_position_and_marks_unresolved():
+def test_replay_drains_open_position_at_first_executable_sample_after_gap():
     rows = [_row(0), _row(1, at=NOW + timedelta(minutes=2))]
     report = replay_wti(rows, config=_config(max_sample_gap_seconds=30))
     assert report.sample_gap_count == 1
-    assert report.stopped_reason == "sample_gap_exceeded"
-    assert report.unresolved_position is True
-    assert report.completed_trades == 0
+    assert report.stopped_reason is None
+    assert report.unresolved_position is False
+    assert report.completed_trades == 1
+    assert report.trades[0].exit_reason == "sample_gap_requires_position_drain"
+
+
+def test_replay_revokes_entries_after_flat_gap_until_next_verified_session():
+    gap_row = _row(1, at=NOW + timedelta(minutes=2))
+    same_session_entry = _row(2, at=NOW + timedelta(minutes=2, seconds=10))
+    next_session_entry = _row(
+        3,
+        at=NOW + timedelta(hours=9),
+        session_id="wti-session-2",
+        session_closing_at=(NOW + timedelta(hours=17)).isoformat(),
+    )
+    next_session_exit = _row(
+        4,
+        at=NOW + timedelta(hours=9, seconds=10),
+        session_id="wti-session-2",
+        session_closing_at=(NOW + timedelta(hours=17)).isoformat(),
+        var_bid="70.4",
+        var_ask="70.5",
+        lighter_buy_price="70.3",
+        long_edge_bps="0",
+        short_edge_bps="0",
+    )
+    rows = [
+        _row(0, long_edge_bps="0"),
+        gap_row,
+        same_session_entry,
+        next_session_entry,
+        next_session_exit,
+    ]
+    report = replay_wti(rows, config=_config(max_sample_gap_seconds=30))
+    assert report.sample_count == 5
+    assert report.sample_gap_count == 1
+    assert report.completed_trades == 1
+    assert report.trades[0].entry_at == next_session_entry["logged_at"]
 
 
 def test_replay_deduplicates_identical_ids_and_rejects_conflicts():
@@ -264,4 +306,135 @@ def test_replay_blocks_entries_in_last_thirty_minutes_and_exits_existing_positio
     only_cutoff = _row(2, at=at_cutoff, session_closing_at=close_at.isoformat())
     no_entry = replay_wti([only_cutoff], config=_config())
     assert no_entry.completed_trades == 0
-    assert no_entry.unresolved_position is False
+
+
+def test_gradient_replay_uses_two_bounded_layers_and_closes_aggregate():
+    rows = [
+        _row(0),
+        _row(
+            1,
+            var_bid="69.9", var_ask="70.0",
+            lighter_buy_price="70.3", lighter_sell_price="70.2",
+            long_edge_bps="21", short_edge_bps="0",
+            variational_qty="0.35", lighter_qty="0.35",
+        ),
+        _row(
+            2,
+            var_bid="70.4", var_ask="70.5",
+            lighter_buy_price="70.3", lighter_sell_price="70.2",
+            long_edge_bps="0", short_edge_bps="0",
+            variational_qty="0.35", lighter_qty="0.35",
+        ),
+    ]
+    report = replay_wti_gradient(
+        rows,
+        config=_config(entry_threshold_bps=Decimal("10"), exit_target_bps=Decimal("10")),
+        second_tier_threshold_bps=Decimal("20"),
+        layer_notional_usd=Decimal("9"),
+        aggregate_max_notional_usd=Decimal("20"),
+        expected_market_id=145,
+        expected_multiplier=Decimal("1"),
+    )
+    assert report.live_authorization is False
+    assert report.completed_trades == 1
+    assert report.trades[0].layer_count == 2
+    assert report.trades[0].layer_entry_edges_bps == (
+        "28.57142857142857142857142857", "21",
+    )
+    assert report.unresolved_position is False
+    assert report.config["max_layers"] == 2
+
+
+def test_gradient_replay_preserves_depth_gap_and_aggregate_caps():
+    rows = [
+        _row(0),
+        _row(
+            1,
+            at=NOW + timedelta(seconds=140),
+            var_bid="69.9", var_ask="70.0",
+            lighter_buy_price="70.3", lighter_sell_price="70.2",
+            long_edge_bps="21", short_edge_bps="0",
+            variational_qty="0.1", lighter_qty="0.1",
+        ),
+    ]
+    report = replay_wti_gradient(
+        rows,
+        config=_config(entry_threshold_bps=Decimal("10"), max_sample_gap_seconds=120),
+        second_tier_threshold_bps=Decimal("20"),
+        layer_notional_usd=Decimal("10"),
+        aggregate_max_notional_usd=Decimal("20"),
+    )
+    assert report.sample_gap_count == 1
+    assert report.unresolved_position is True
+    assert report.completed_trades == 0
+
+
+@pytest.mark.parametrize(
+    ("second", "layer", "cap", "error"),
+    [
+        (Decimal("10"), Decimal("10"), Decimal("20"), "second_tier"),
+        (Decimal("20"), Decimal("11"), Decimal("20"), "aggregate_notional"),
+    ],
+)
+def test_gradient_replay_rejects_configuration_that_weakens_or_exceeds_bounds(
+    second, layer, cap, error,
+):
+    with pytest.raises(ValueError, match=error):
+        replay_wti_gradient(
+            [_row(0)],
+            config=_config(entry_threshold_bps=Decimal("10")),
+            second_tier_threshold_bps=second,
+            layer_notional_usd=layer,
+            aggregate_max_notional_usd=cap,
+        )
+
+
+def test_replay_cli_can_emit_side_by_side_baseline_and_gradient(monkeypatch, capsys):
+    rows = [_row(0), _row(1, long_edge_bps="0", short_edge_bps="0")]
+    monkeypatch.setattr(wti_strategy_replay, "read_basis_samples", lambda *args, **kwargs: rows)
+    result = wti_strategy_replay.main([
+        "--sample-root", "unused", "--entry-threshold-bps", "10",
+        "--exit-target-bps", "10", "--roundtrip-cost-bps", "5",
+        "--max-hold-seconds", "60", "--max-sample-gap-seconds", "30",
+        "--lighter-market-id", "145", "--lighter-multiplier", "1",
+        "--compare-gradient", "--gradient-second-tier-bps", "20",
+        "--gradient-layer-notional-usd", "10",
+        "--gradient-aggregate-max-notional-usd", "20",
+    ])
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["live_authorization"] is False
+    assert output["comparison"]["profitability_claim"] is False
+    assert output["baseline"]["replay_kind"] != output["gradient"]["replay_kind"]
+
+
+def test_replay_cli_writes_hash_addressed_readiness_evidence(tmp_path: Path, monkeypatch, capsys):
+    sample_root = tmp_path / "samples"
+    asset_root = sample_root / "WTI"
+    asset_root.mkdir(parents=True)
+    sample_file = asset_root / "2026-10-22.jsonl"
+    sample_file.write_text("{}\n", encoding="utf-8")
+    rows = [_row(0), _row(1)]
+    monkeypatch.setattr(wti_strategy_replay, "read_basis_samples", lambda *args, **kwargs: rows)
+    evidence_path = tmp_path / "evidence.json"
+
+    result = wti_strategy_replay.main([
+        "--sample-root", str(sample_root), "--entry-threshold-bps", "10",
+        "--exit-target-bps", "10", "--roundtrip-cost-bps", "5",
+        "--max-hold-seconds", "60", "--max-sample-gap-seconds", "30",
+        "--lighter-market-id", "145", "--lighter-multiplier", "1",
+        "--evidence-output", str(evidence_path),
+    ])
+
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    saved_hash = evidence.pop("evidence_sha256")
+    canonical = json.dumps(evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    assert saved_hash == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    assert evidence["input_files"][0]["path"] == "WTI/2026-10-22.jsonl"
+    assert evidence["input_files"][0]["sha256"] == hashlib.sha256(sample_file.read_bytes()).hexdigest()
+    assert evidence["market_identity"]["lighter_market_id"] == 145
+    assert evidence["live_authorization"] is False
+    assert evidence["profitability_claim"] is False
+    assert output["evidence"]["sha256"] == saved_hash

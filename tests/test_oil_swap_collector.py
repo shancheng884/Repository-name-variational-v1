@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,6 +42,38 @@ def test_oil_collector_requires_external_forwarder_mode(tmp_path) -> None:
     args = parse_args(["--reuse-forwarder", "--output-dir", str(tmp_path)])
     assert args.forwarder_command_port == 8768
     assert args.interval_seconds == 10
+
+
+def test_oil_collector_serializes_writers_and_releases_lock(tmp_path) -> None:
+    args = parse_args(["--reuse-forwarder", "--output-dir", str(tmp_path)])
+    first = OilSwapCollector(args)
+    second = OilSwapCollector(args)
+
+    first._acquire_instance_lock()
+    try:
+        with pytest.raises(RuntimeError, match="already_running"):
+            second._acquire_instance_lock()
+    finally:
+        first._release_instance_lock()
+
+    second._acquire_instance_lock()
+    second._release_instance_lock()
+
+
+def test_oil_collector_releases_lock_when_startup_preflight_fails(tmp_path, monkeypatch) -> None:
+    args = parse_args(["--reuse-forwarder", "--output-dir", str(tmp_path)])
+    first = OilSwapCollector(args)
+    second = OilSwapCollector(args)
+    monkeypatch.setattr(
+        "tools.oil_swap_collector.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=0),
+    )
+
+    with pytest.raises(RuntimeError, match="disk_free_below_stop_threshold"):
+        asyncio.run(first.run())
+
+    second._acquire_instance_lock()
+    second._release_instance_lock()
 
 
 def test_quantity_rounds_up_and_respects_lighter_minimums() -> None:

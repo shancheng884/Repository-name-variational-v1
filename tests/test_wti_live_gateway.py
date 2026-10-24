@@ -546,3 +546,76 @@ def test_lighter_lookup_preserves_saved_identity_and_reports_specific_evidence(m
             assert result["lookup_stage"] == "inactive_orders"
             assert result["error_type"] == "TimeoutError"
     gateway.loop.close()
+
+
+@pytest.mark.parametrize(
+    ("trade", "expected_fee", "expected_reason"),
+    [
+        ({
+            "trade_id": 501, "market_id": 145, "ask_id": 123456,
+            "bid_id": 123457, "ask_account_id": 10, "bid_account_id": 99,
+            "maker_fee": -12, "taker_fee": 18,
+        }, None, "lighter_trade_fee_usd_unverified"),
+        ({
+            "trade_id": 501, "market_id": 145, "ask_id": 123456,
+            "bid_id": 123457, "ask_account_id": 10, "bid_account_id": 99,
+            "maker_fee": -12, "taker_fee": 18, "fee_usd": "-0.004",
+        }, "-0.004", None),
+        ({
+            "trade_id": 501, "market_id": 145, "ask_id": 123456,
+            "bid_id": 123457, "ask_account_id": 77, "bid_account_id": 99,
+            "fee_usd": "0.004",
+        }, None, "lighter_trade_fee_usd_unverified"),
+        ({
+            "trade_id": 502, "market_id": 145, "ask_id": 123456,
+            "bid_id": 123457, "ask_account_id": 77, "bid_account_id": 10,
+            "fee_usd": "0.004",
+        }, None, "lighter_trade_fee_usd_unverified"),
+    ],
+)
+def test_lighter_trade_fee_requires_exact_identity_and_explicit_usd(
+    monkeypatch, trade, expected_fee, expected_reason,
+):
+    cid = "fee-evidence-lighter"
+    identity = lighter_order_identity(cid)
+    index = int(identity["native_client_order_id"])
+
+    class API:
+        def __init__(self, client):
+            pass
+
+        async def account_inactive_orders(self, **kwargs):
+            return {"code": 200, "orders": [{
+                "market_index": 145, "client_order_index": index, "is_ask": True,
+                "status": "filled", "filled_base_amount": "0.29",
+                "filled_quote_amount": "20.30", "order_index": 123456,
+            }]}
+
+        async def account_active_orders(self, **kwargs):
+            return {"code": 200, "orders": []}
+
+        async def trades(self, **kwargs):
+            return {"code": 200, "trades": [trade]}
+
+    monkeypatch.setitem(sys.modules, "lighter", SimpleNamespace(OrderApi=API))
+    signer = SimpleNamespace(
+        api_client=object(),
+        create_auth_token_with_expiry=lambda **kwargs: ("test-token", None),
+    )
+    gateway = _gateway(FakeVariational(), lighter=signer)
+    result = asyncio.run(gateway._lookup_lighter(cid, {
+        "client_order_id": cid, "venue": "lighter", "side": "sell",
+        "qty": "0.29", **identity,
+    }))
+    assert result["status"] == "filled"
+    assert result["filled_qty"] == "0.29"
+    assert result["fee_usd"] == expected_fee
+    assert result.get("lookup_reason") == expected_reason
+    evidence = result["trade_fee_evidence"][0]
+    assert evidence["identity_verified"] is (
+        trade["ask_id"] == 123456 and trade["ask_account_id"] == 10
+    )
+    assert evidence["raw_fee_unit"] == "unverified"
+    if expected_fee is None:
+        assert evidence["maker_fee_raw"] in (None, trade.get("maker_fee"))
+    gateway.loop.close()

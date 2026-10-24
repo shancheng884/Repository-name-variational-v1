@@ -198,17 +198,33 @@ def _executor(
     ), gateway
 
 
-def _open(executor, *, sample=None, session=None, pilot_id=None, pilot_reservation_id=None):
+def _open(
+    executor, *, sample=None, session=None, pilot_id=None, pilot_reservation_id=None,
+    notional_usd=Decimal("20"), layer_id=None, gradient_tier=None,
+    gradient_pilot_id=None,
+):
     now = datetime.now(timezone.utc)
     sample = sample or _sample(now=now)
     return executor.open(
         sample=sample,
         direction=DIRECTION,
-        notional_usd=Decimal("20"),
+        notional_usd=Decimal(str(notional_usd)),
         session=session or _session_for_sample(sample),
         pilot_id=pilot_id,
         pilot_reservation_id=pilot_reservation_id,
+        layer_id=layer_id,
+        gradient_tier=gradient_tier,
+        gradient_pilot_id=gradient_pilot_id,
         now=now,
+    )
+
+
+def _gradient_pilot(executor):
+    return executor.store.initialize_gradient_pilot(
+        market_id=145,
+        multiplier=Decimal("1"),
+        config={"tier_thresholds_bps": ["30", "45"], "layer_notional_usd": "10"},
+        max_layers=2,
     )
 
 
@@ -251,6 +267,209 @@ def test_full_open_close_uses_exact_contracts_reduce_only_and_confirmed_position
     assert var_evidence["trade_ids"] == ["trade-1"]
     assert var_evidence["fee_usd"] == "0.01"
     assert var_evidence["fee_confirmed"] is True
+
+
+def test_profit_close_rechecks_full_size_refreshed_net_target_without_submitting(tmp_path):
+    refreshed = _sample(
+        var_bid="70.08", var_ask="70.1",
+        lighter_buy_price="70.08",
+    )
+    requested_sizes = []
+    refresh_count = 0
+
+    def refresh_for_qty(var_qty, lighter_qty):
+        nonlocal refresh_count
+        refresh_count += 1
+        if refresh_count <= 2:
+            return _sample()
+        requested_sizes.append((var_qty, lighter_qty))
+        return refreshed
+
+    executor, gateway = _executor(
+        tmp_path,
+        market_reader_for_qty=refresh_for_qty,
+    )
+    assert _open(executor)["status"] == "open"
+    favorable_decision = {
+        "action": "close", "reason": "net_target_reached",
+        "estimated_net_pnl_bps": "10",
+    }
+    state = executor.close(
+        sample=_sample(var_bid="70.1", var_ask="70.11", lighter_buy_price="70.05"),
+        session=_session(), decision=favorable_decision,
+        exit_target_bps=Decimal("1"), roundtrip_cost_bps=Decimal("0"),
+        now=datetime.now(timezone.utc),
+    )
+    assert state["status"] == "open"
+    assert state["pending_action"] is None
+    assert state["last_close_check"]["reason"] == "exit_target_not_reached_after_full_size_refresh"
+    assert Decimal(state["last_close_check"]["estimated_net_pnl_bps"]) < 1
+    assert requested_sizes == [(Decimal("0.29"), Decimal("0.29"))]
+    assert len(gateway.requests) == 2
+
+
+def test_non_profit_forced_close_bypasses_profit_target_and_audits_reason(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    assert _open(executor)["status"] == "open"
+    forced_decision = {"action": "close", "reason": "max_hold"}
+    state = executor.close(
+        sample=_sample(), session=_session(), decision=forced_decision,
+        exit_target_bps=Decimal("999"), roundtrip_cost_bps=Decimal("10"),
+        now=datetime.now(timezone.utc),
+    )
+    assert state["status"] == "flat"
+    assert len(gateway.requests) == 4
+    assert state["last_closed_position"]["exit_reason"] == "max_hold"
+    assert state["last_closed_position"]["exit_decision"] == forced_decision
+    assert state["last_closed_position"]["exit_check"]["reason"] == (
+        "non_profit_exit_bypasses_profit_target"
+    )
+
+
+def test_gradient_layer_adds_only_same_session_exposure_and_closes_as_aggregate(tmp_path):
+    def market_reader_for_qty(var_qty, lighter_qty):
+        return _sample(
+            variational_qty=str(var_qty),
+            lighter_qty=str(lighter_qty),
+        )
+
+    executor, gateway = _executor(tmp_path, market_reader_for_qty=market_reader_for_qty)
+    pilot = _gradient_pilot(executor)
+    opened = _open(
+        executor, notional_usd="10", layer_id="tier-1", gradient_tier=1,
+        gradient_pilot_id=pilot["pilot_id"],
+    )
+    assert opened["status"] == "open"
+    first_session_id = opened["open_position"]["session_id"]
+    now = datetime.now(timezone.utc)
+    row = _sample(now=now)
+    added = executor.open(
+        sample=row,
+        direction=DIRECTION,
+        notional_usd=Decimal("4"),
+        session=_session_for_sample(row),
+        decision={"action": "open", "reason": "gradient_tier", "tier": 2},
+        layer_id="tier-2-attempt-1",
+        gradient_tier=2,
+        gradient_pilot_id=pilot["pilot_id"],
+        now=now,
+    )
+    position = added["open_position"]
+    assert added["status"] == "open"
+    assert Decimal(position["var_qty"]) == Decimal("0.21")
+    assert Decimal(position["lighter_qty"]) == Decimal("0.21")
+    assert [layer["tier"] for layer in position["layers"]] == [1, 2]
+    assert position["layers"][1]["layer_id"] == "tier-2-attempt-1"
+    assert position["session_id"] == first_session_id
+    assert len(gateway.requests) == 4
+
+    close_now = datetime.now(timezone.utc)
+    close_row = _sample(
+        now=close_now,
+        variational_qty="0.21",
+        lighter_qty="0.21",
+    )
+    closed = executor.close(
+        sample=close_row,
+        session=_session_for_sample(close_row),
+        now=close_now,
+    )
+    assert closed["status"] == "flat"
+    assert len(closed["last_closed_position"]["layers"]) == 2
+    assert gateway.var_qty == gateway.lighter_qty == 0
+    assert closed["gradient_pilot"]["status"] == "completed"
+    assert closed["gradient_pilot"]["completed_roundtrips"] == 1
+    with pytest.raises(WTIExecutionError, match="gradient_pilot_budget_unavailable"):
+        executor.store.initialize_gradient_pilot(
+            market_id=145,
+            multiplier=Decimal("1"),
+            config={"tier_thresholds_bps": ["30", "45"], "layer_notional_usd": "10"},
+            max_layers=2,
+        )
+
+
+def test_gradient_pilot_restart_cannot_change_immutable_budget(tmp_path):
+    executor, _ = _executor(tmp_path)
+    pilot = _gradient_pilot(executor)
+    resumed = executor.store.initialize_gradient_pilot(
+        market_id=145,
+        multiplier=Decimal("1"),
+        config={"tier_thresholds_bps": ["30", "45"], "layer_notional_usd": "10"},
+        max_layers=2,
+    )
+    assert resumed["pilot_id"] == pilot["pilot_id"]
+    with pytest.raises(WTIExecutionError, match="configuration_or_state_mismatch"):
+        executor.store.initialize_gradient_pilot(
+            market_id=145,
+            multiplier=Decimal("1"),
+            config={"tier_thresholds_bps": ["30", "46"], "layer_notional_usd": "10"},
+            max_layers=2,
+        )
+
+
+def test_gradient_layer_rejects_aggregate_cap_before_any_order(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    pilot = _gradient_pilot(executor)
+    _open(
+        executor, notional_usd="20", layer_id="tier-1", gradient_tier=1,
+        gradient_pilot_id=pilot["pilot_id"],
+    )
+    before = len(gateway.requests)
+    row = _sample()
+    with pytest.raises(WTIExecutionError, match="gradient_aggregate_notional_limit_exceeded"):
+        executor.open(
+            sample=row,
+            direction=DIRECTION,
+            notional_usd=Decimal("5"),
+            session=_session_for_sample(row),
+            layer_id="tier-2-over-cap",
+            gradient_tier=2,
+            gradient_pilot_id=pilot["pilot_id"],
+            now=datetime.now(timezone.utc),
+        )
+    assert len(gateway.requests) == before
+    state = executor.store.load()
+    assert state["status"] == "open"
+    assert state["pending_action"] is None
+
+
+def test_gradient_layer_rejects_opposite_direction_and_new_session(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    pilot = _gradient_pilot(executor)
+    _open(
+        executor, notional_usd="10", layer_id="tier-1", gradient_tier=1,
+        gradient_pilot_id=pilot["pilot_id"],
+    )
+    before = len(gateway.requests)
+    row = _sample()
+    with pytest.raises(WTIExecutionError, match="gradient_layer_direction_mismatch"):
+        executor.open(
+            sample=row,
+            direction="short_var_long_lighter",
+            notional_usd=Decimal("4"),
+            session=_session_for_sample(row),
+            layer_id="wrong-direction",
+            gradient_tier=2,
+            gradient_pilot_id=pilot["pilot_id"],
+            now=datetime.now(timezone.utc),
+        )
+    next_session = _sample(
+        now=datetime.now(timezone.utc),
+        session_id="wti-session-2",
+        session_closing_at=(datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(),
+    )
+    with pytest.raises(WTIExecutionError, match="gradient_layer_session_mismatch"):
+        executor.open(
+            sample=next_session,
+            direction=DIRECTION,
+            notional_usd=Decimal("4"),
+            session=_session_for_sample(next_session),
+            layer_id="wrong-session",
+            gradient_tier=2,
+            gradient_pilot_id=pilot["pilot_id"],
+            now=datetime.now(timezone.utc),
+        )
+    assert len(gateway.requests) == before
 
 
 def test_single_round_pilot_is_persisted_through_confirmed_open_close_and_restart(tmp_path):

@@ -1883,8 +1883,17 @@ def test_live_inventory_startup_reconcile_rejects_hidden_exchange_position(tmp_p
         async def fake_fetch_lighter_account():
             return {"code": 200, "accounts": [{"positions": []}]}
 
+        async def fake_fetch_variational_pending_orders(*, asset):
+            assert asset == "ETH"
+            return []
+
+        async def fake_fetch_lighter_active_orders():
+            return []
+
         runtime.fetch_variational_positions = fake_fetch_variational_positions
         runtime.fetch_lighter_account = fake_fetch_lighter_account
+        runtime.fetch_all_variational_pending_orders = fake_fetch_variational_pending_orders
+        runtime.fetch_lighter_active_orders = fake_fetch_lighter_active_orders
 
         try:
             await runtime.reconcile_live_inventory_startup_state()
@@ -4451,11 +4460,20 @@ def test_maintenance_drain_waits_for_positions_then_confirms_both_venues_flat(
         async def fake_fetch_lighter_account():
             return {"code": 200, "accounts": [{"positions": []}]}
 
+        async def fake_fetch_variational_pending_orders(*, asset):
+            assert asset == "ETH"
+            return []
+
+        async def fake_fetch_lighter_active_orders():
+            return []
+
         async def fake_capture_live_inventory_account_snapshot(**_kwargs):
             return None
 
         runtime.fetch_variational_positions = fake_fetch_variational_positions
         runtime.fetch_lighter_account = fake_fetch_lighter_account
+        runtime.fetch_all_variational_pending_orders = fake_fetch_variational_pending_orders
+        runtime.fetch_lighter_active_orders = fake_fetch_lighter_active_orders
         runtime.capture_live_inventory_account_snapshot = (
             fake_capture_live_inventory_account_snapshot
         )
@@ -4469,8 +4487,54 @@ def test_maintenance_drain_waits_for_positions_then_confirms_both_venues_flat(
         assert completed["status"] == "completed"
         assert completed["variational_position_qty"] == "0"
         assert completed["lighter_position_qty"] == "0"
+        assert completed["variational_active_orders"] == 0
+        assert completed["lighter_active_orders"] == 0
         assert runtime.shutdown_reason == "maintenance_drain_completed"
         assert runtime.stop_flag is True
+
+    asyncio.run(run())
+
+
+def test_maintenance_drain_refuses_to_complete_while_exchange_order_remains(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_open_lots = []
+        runtime.live_inventory_maintenance_drain_requested = True
+        runtime.live_inventory_maintenance_drain_announced = True
+        runtime.live_inventory_maintenance_control_payload = {
+            "schema_version": 1, "action": "drain_after_flat", "status": "draining",
+            "asset": "ETH", "target_pid": os.getpid(),
+            "target_run_id": runtime.live_inventory_run_id,
+        }
+        runtime.live_inventory_control_file.write_text(json.dumps(
+            runtime.live_inventory_maintenance_control_payload
+        ), encoding="utf-8")
+
+        async def fake_fetch_variational_positions():
+            return {"ok": True, "result": {"positions": []}}
+
+        async def fake_fetch_lighter_account():
+            return {"code": 200, "accounts": [{"positions": []}]}
+
+        async def fake_var_orders(*, asset):
+            assert asset == "ETH"
+            return [{"status": "open"}]
+
+        async def fake_lighter_orders():
+            return []
+
+        runtime.fetch_variational_positions = fake_fetch_variational_positions
+        runtime.fetch_lighter_account = fake_fetch_lighter_account
+        runtime.fetch_all_variational_pending_orders = fake_var_orders
+        runtime.fetch_lighter_active_orders = fake_lighter_orders
+        runtime.live_inventory_maintenance_last_flat_check_monotonic = 0.0
+
+        await runtime.poll_live_inventory_maintenance_control()
+
+        assert runtime.stop_flag is False
+        control = json.loads(runtime.live_inventory_control_file.read_text(encoding="utf-8"))
+        assert control["status"] == "draining"
 
     asyncio.run(run())
 

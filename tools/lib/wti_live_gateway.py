@@ -537,7 +537,7 @@ class WTIProductionGateway:
     def _explicit_fee_usd(row: dict[str, Any]) -> str | None:
         for key in ("fee_usd", "actual_fee_usd", "commission_usd"):
             value = _decimal(row.get(key))
-            if value is not None and value >= 0:
+            if value is not None:
                 return str(value)
         return None
 
@@ -633,19 +633,64 @@ class WTIProductionGateway:
                     trade_rows = None
                     trade_error = type(exc).__name__
                 trade_ids: list[str] = []
+                trade_fee_evidence: list[dict[str, Any]] = []
                 fee_total = Decimal("0")
                 fee_confirmed = bool(trade_rows)
+                seen_trade_ids: set[str] = set()
                 if trade_rows is not None:
                     for trade in trade_rows:
-                        if integer_value(trade.get("market_id")) != int(self.market["market_id"]):
+                        trade_id = trade.get("trade_id")
+                        ask_order_id = integer_value(trade.get("ask_id"))
+                        bid_order_id = integer_value(trade.get("bid_id"))
+                        ask_account_id = integer_value(trade.get("ask_account_id"))
+                        bid_account_id = integer_value(trade.get("bid_account_id"))
+                        requested_side = request.get("side")
+                        expected_order_id, expected_account_id = (
+                            (ask_order_id, ask_account_id)
+                            if requested_side == "sell"
+                            else (bid_order_id, bid_account_id)
+                        )
+                        order_identity_ok = expected_order_id == order_index
+                        account_identity_ok = expected_account_id == self.account_index
+                        identity_ok = (
+                            integer_value(trade.get("market_id")) == int(self.market["market_id"])
+                            and trade_id is not None
+                            and str(trade_id) not in seen_trade_ids
+                            and requested_side in {"buy", "sell"}
+                            and order_identity_ok
+                            and account_identity_ok
+                        )
+                        explicit_fee = self._explicit_fee_usd(trade)
+                        trade_fee_evidence.append({
+                            "trade_id": None if trade_id is None else str(trade_id),
+                            "market_id": trade.get("market_id"),
+                            "ask_id": trade.get("ask_id"),
+                            "bid_id": trade.get("bid_id"),
+                            "ask_account_id": trade.get("ask_account_id"),
+                            "bid_account_id": trade.get("bid_account_id"),
+                            "requested_side": requested_side,
+                            "matched_order_id": expected_order_id,
+                            "matched_account_id": expected_account_id,
+                            "is_maker_ask": trade.get("is_maker_ask"),
+                            "maker_fee_raw": trade.get("maker_fee"),
+                            "taker_fee_raw": trade.get("taker_fee"),
+                            "fee_usd": explicit_fee,
+                            "identity_verified": identity_ok,
+                            "raw_fee_unit": "unverified",
+                        })
+                        if not identity_ok:
                             fee_confirmed = False
                             continue
-                        trade_ids.append(str(trade.get("trade_id")))
-                        explicit_fee = _decimal(trade.get("fee_usd"))
+                        seen_trade_ids.add(str(trade_id))
+                        trade_ids.append(str(trade_id))
                         if explicit_fee is None:
                             fee_confirmed = False
                         else:
-                            fee_total += explicit_fee
+                            fee_value = _decimal(explicit_fee)
+                            if fee_value is None:
+                                fee_confirmed = False
+                            else:
+                                fee_total += fee_value
                 return {
                     **unknown, "ok": True, "final": True,
                     "order_id": str(order.get("order_index")),
@@ -654,8 +699,15 @@ class WTIProductionGateway:
                     "filled_qty": str(filled), "average_price": str(quote / filled),
                     "trade_ids": trade_ids if trade_rows else None,
                     "fee_usd": str(fee_total) if fee_confirmed else None,
-                    **({"lookup_stage": "trades", "lookup_reason": "lighter_trade_evidence_unavailable",
-                        "error_type": trade_error} if not trade_rows else {}),
+                    "trade_fee_evidence": trade_fee_evidence if trade_rows is not None else None,
+                    **({
+                        "lookup_stage": "trades",
+                        "lookup_reason": (
+                            "lighter_trade_evidence_unavailable"
+                            if not trade_rows else "lighter_trade_fee_usd_unverified"
+                        ),
+                        **({"error_type": trade_error} if trade_error else {}),
+                    } if not fee_confirmed else {}),
                 }
             if status in TERMINAL_LIGHTER_NO_FILL and filled == 0:
                 return {

@@ -8132,6 +8132,8 @@ class VariationalToLighterRuntime:
             )
             if variational_qty is None or lighter_qty is None:
                 raise RuntimeError("exchange_position_quantity_unavailable")
+            variational_orders = await self.fetch_all_variational_pending_orders(asset=asset)
+            lighter_orders = await self.fetch_lighter_active_orders()
         except Exception as exc:
             if now - getattr(
                 self,
@@ -8170,6 +8172,24 @@ class VariationalToLighterRuntime:
                     },
                 )
             return
+        if variational_orders or lighter_orders:
+            if now - getattr(
+                self,
+                "live_inventory_maintenance_last_block_log_monotonic",
+                0.0,
+            ) >= 30.0:
+                self.live_inventory_maintenance_last_block_log_monotonic = now
+                await self.append_live_inventory_log(
+                    "live_inventory_maintenance_drain_blocked",
+                    {
+                        "asset": asset,
+                        "reason": "exchange_active_orders_remain",
+                        "variational_active_orders": len(variational_orders),
+                        "lighter_active_orders": len(lighter_orders),
+                        "action": "keep_entries_blocked_and_retry",
+                    },
+                )
+            return
         await self.capture_live_inventory_account_snapshot(
             stage="maintenance_flat",
             asset=asset,
@@ -8189,6 +8209,8 @@ class VariationalToLighterRuntime:
             "completed_at": completed_at,
             "variational_position_qty": decimal_to_str(variational_qty),
             "lighter_position_qty": decimal_to_str(lighter_qty),
+            "variational_active_orders": 0,
+            "lighter_active_orders": 0,
         }
         await asyncio.to_thread(
             write_json_atomic,

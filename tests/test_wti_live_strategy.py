@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from tools.lib.wti_live_strategy import decide_wti_action
+from tools.lib.wti_live_strategy import decide_wti_action, decide_wti_gradient_action
 from tools.lib.wti_replay import ReplayConfig
 
 
@@ -39,6 +39,9 @@ def _row(now: datetime, *, closes_in: timedelta = timedelta(hours=2), **override
         "session_closing_at": (now + closes_in).isoformat(),
         "var_quote_age_seconds": "0.1",
         "lighter_book_age_seconds": "0.1",
+        "lighter_supported_size_decimals": 2,
+        "lighter_min_base_amount": "0.01",
+        "lighter_min_quote_amount": "1",
         "var_bid": "70.2",
         "var_ask": "70.3",
         "lighter_bid": "70.0",
@@ -152,3 +155,98 @@ def test_existing_position_is_closed_at_session_boundary_or_without_entry_sessio
     )
     assert unknown["action"] == "close"
     assert unknown["reason"] == "entry_session_unverified"
+
+
+def _gradient_pilot(*, status="available", opened=None, exhausted=None):
+    return {
+        "pilot_id": "pilot-1",
+        "status": status,
+        "completed_roundtrips": 0,
+        "max_layers": 2,
+        "layers_opened": opened or [],
+        "exhausted_tiers": exhausted or [],
+        "config": {
+            "tier_thresholds_bps": ["4", "8"],
+            "layer_notional_usd": "10",
+            "max_notional_usd": "20",
+        },
+    }
+
+
+def test_gradient_initial_layer_keeps_base_threshold_and_size():
+    now = datetime.now(timezone.utc)
+    result = decide_wti_gradient_action(
+        _row(now), None, _gradient_pilot(), config=_config(), now=now,
+    )
+    assert result["action"] == "open"
+    assert result["gradient_tier"] == 1
+    assert result["layer_notional_usd"] == "10"
+
+
+def test_gradient_add_requires_higher_same_direction_edge_and_pilot_ownership():
+    now = datetime.now(timezone.utc)
+    position = _position(now, gradient_pilot_id="pilot-1")
+    pilot = _gradient_pilot(
+        status="in_position", opened=[{"tier": 1, "layer_id": "layer-1"}],
+    )
+    below = decide_wti_gradient_action(
+        _row(now, var_bid="70.0", lighter_buy_price="70.2", long_edge_bps="7.99"),
+        position, pilot, config=_config(), now=now,
+    )
+    assert below["action"] == "hold"
+    assert below["reason"] == "exit_target_not_reached"
+    reached = decide_wti_gradient_action(
+        _row(now, var_bid="70.0", lighter_buy_price="70.2", long_edge_bps="8"),
+        position, pilot, config=_config(), now=now,
+    )
+    assert reached == {
+        "action": "add", "direction": "long_var_short_lighter", "edge_bps": "8",
+        "reason": "gradient_tier_threshold_reached", "gradient_tier": 2,
+        "layer_notional_usd": "10",
+    }
+
+
+def test_gradient_exit_and_session_guards_take_priority_over_add():
+    now = datetime.now(timezone.utc)
+    position = _position(now, gradient_pilot_id="pilot-1")
+    pilot = _gradient_pilot(
+        status="in_position", opened=[{"tier": 1, "layer_id": "layer-1"}],
+    )
+    close = decide_wti_gradient_action(
+        _row(
+            now, closes_in=timedelta(minutes=29), long_edge_bps="99",
+            var_bid="70.0", lighter_buy_price="70.2",
+        ),
+        position, pilot, config=_config(), now=now,
+    )
+    assert close["action"] == "close"
+    assert close["reason"] == "session_entry_cutoff"
+    unmanaged = decide_wti_gradient_action(
+        _row(now, session_id="session-2", long_edge_bps="99"),
+        position, pilot, config=_config(), now=now,
+    )
+    assert unmanaged["action"] == "close"
+    assert unmanaged["reason"] == "session_boundary"
+
+
+def test_gradient_never_adds_to_unowned_or_exhausted_layer():
+    now = datetime.now(timezone.utc)
+    position = _position(now, gradient_pilot_id="other-pilot")
+    pilot = _gradient_pilot(
+        status="in_position", opened=[{"tier": 1, "layer_id": "layer-1"}],
+    )
+    unowned = decide_wti_gradient_action(
+        _row(now, var_bid="70.0", lighter_buy_price="70.2", long_edge_bps="99"),
+        position, pilot, config=_config(), now=now,
+    )
+    assert unowned["action"] == "hold"
+    exhausted = decide_wti_gradient_action(
+        _row(now, var_bid="70.0", lighter_buy_price="70.2", long_edge_bps="99"),
+        _position(now, gradient_pilot_id="pilot-1"),
+        _gradient_pilot(
+            status="in_position", opened=[{"tier": 1, "layer_id": "layer-1"}],
+            exhausted=[2],
+        ),
+        config=_config(), now=now,
+    )
+    assert exhausted["action"] == "hold"

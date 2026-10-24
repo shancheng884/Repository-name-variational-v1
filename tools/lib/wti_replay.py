@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from typing import Any
 
 from tools.lib.hedge_instruments import (
@@ -45,6 +45,8 @@ class ReplayTrade:
     net_pnl_usd: str
     net_pnl_bps: str
     exit_reason: str
+    layer_count: int = 1
+    layer_entry_edges_bps: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +269,8 @@ def replay_wti(
     stopped_reason: str | None = None
     previous_at: datetime | None = None
     previous_row: dict[str, Any] | None = None
+    entry_revoked_for_session = False
+    position_gap_exit_pending = False
 
     for row in samples:
         at = _timestamp(row["logged_at"])
@@ -292,10 +296,13 @@ def replay_wti(
                 ):
                     stopped_reason = "session_transition_unverified"
                     break
+                entry_revoked_for_session = False
             elif gap > config.max_sample_gap_seconds:
                 gaps += 1
-                stopped_reason = "sample_gap_exceeded"
-                break
+                if current is None:
+                    entry_revoked_for_session = True
+                else:
+                    position_gap_exit_pending = True
         previous_at = at
         previous_row = row
         cutoff_at = observation.closing_at - timedelta(seconds=config.entry_cutoff_seconds)
@@ -315,6 +322,8 @@ def replay_wti(
             )
             duration = (at - current["at"]).total_seconds()
             reason = "target_reached" if net_bps >= config.exit_target_bps else None
+            if reason is None and position_gap_exit_pending:
+                reason = "sample_gap_requires_position_drain"
             if reason is None and duration >= config.max_hold_seconds:
                 reason = "max_hold"
             if reason is None and in_entry_cutoff:
@@ -339,9 +348,10 @@ def replay_wti(
                 ))
                 exit_reasons[reason] += 1
                 current = None
+                position_gap_exit_pending = False
             continue
 
-        if in_entry_cutoff:
+        if in_entry_cutoff or entry_revoked_for_session:
             continue
 
         edges = {
@@ -405,6 +415,290 @@ def replay_wti(
         cost_caveat=(
             "Roundtrip cost is an explicit user assumption; funding, swaps/rolls, real fills, and latency are not inferred. "
             "Only fresh explicit exchange session observations qualify; entries are blocked in the configured pre-close cutoff."
+        ),
+        trades=tuple(trades),
+    )
+
+
+def replay_wti_gradient(
+    rows: list[dict[str, Any]],
+    *,
+    config: ReplayConfig,
+    second_tier_threshold_bps: Decimal,
+    layer_notional_usd: Decimal,
+    aggregate_max_notional_usd: Decimal,
+    expected_market_id: int | None = None,
+    expected_multiplier: Decimal | None = None,
+) -> ReplayReport:
+    """Replay one bounded two-layer cycle without relaxing any market-data gate."""
+    if second_tier_threshold_bps <= config.entry_threshold_bps:
+        raise ValueError("gradient_second_tier_must_exceed_entry_threshold")
+    if layer_notional_usd <= 0 or aggregate_max_notional_usd <= 0:
+        raise ValueError("gradient_notionals_must_be_positive")
+    if layer_notional_usd * 2 > aggregate_max_notional_usd:
+        raise ValueError("gradient_layers_exceed_aggregate_notional_cap")
+    samples, rejected, duplicates, conflicts = _canonical_rows(
+        rows,
+        expected_market_id=expected_market_id,
+        expected_multiplier=expected_multiplier,
+    )
+    trades: list[ReplayTrade] = []
+    exit_reasons: Counter[str] = Counter()
+    current: dict[str, Any] | None = None
+    gaps = 0
+    stopped_reason: str | None = None
+    previous_at: datetime | None = None
+    previous_row: dict[str, Any] | None = None
+    entry_revoked_for_session = False
+    position_gap_exit_pending = False
+    rejected_depth = 0
+    capped_additions = 0
+
+    def make_layer(row: dict[str, Any], direction: str, edge: Decimal, tier: int) -> dict[str, Any] | None:
+        multiplier = _decimal(row.get("lighter_multiplier"))
+        lighter_entry = _decimal(
+            row["lighter_sell_price"] if direction == "long_var_short_lighter"
+            else row["lighter_buy_price"]
+        )
+        var_entry = _decimal(
+            row["var_ask"] if direction == "long_var_short_lighter" else row["var_bid"]
+        )
+        decimals_value = _decimal(row.get("lighter_supported_size_decimals"))
+        if None in (multiplier, lighter_entry, var_entry, decimals_value):
+            return None
+        if decimals_value != decimals_value.to_integral_value() or not 0 <= decimals_value <= 12:
+            return None
+        step = Decimal("1").scaleb(-int(decimals_value))
+        raw_qty = layer_notional_usd / (lighter_entry * multiplier)
+        min_base = _decimal(row.get("lighter_min_base_amount")) or Decimal("0")
+        min_quote = _decimal(row.get("lighter_min_quote_amount")) or Decimal("0")
+        required_qty = max(
+            raw_qty, min_base, min_quote / (lighter_entry * multiplier)
+        )
+        lighter_qty = (required_qty / step).to_integral_value(rounding=ROUND_CEILING) * step
+        var_qty = lighter_qty * multiplier
+        if (
+            lighter_qty <= 0
+            or lighter_qty < min_base
+            or lighter_qty * lighter_entry < min_quote
+            or _decimal(row.get("variational_qty")) < var_qty
+            or _decimal(row.get("lighter_qty")) < lighter_qty
+        ):
+            return None
+        return {
+            "tier": tier,
+            "direction": direction,
+            "edge": edge,
+            "at": _timestamp(row["logged_at"]),
+            "var_entry": var_entry,
+            "lighter_entry": lighter_entry,
+            "var_qty": var_qty,
+            "lighter_qty": lighter_qty,
+            "session_id": row.get("session_id"),
+        }
+
+    def refresh_aggregate(position: dict[str, Any]) -> dict[str, Any]:
+        layers = position["layers"]
+        var_qty = sum((layer["var_qty"] for layer in layers), Decimal("0"))
+        lighter_qty = sum((layer["lighter_qty"] for layer in layers), Decimal("0"))
+        var_entry = sum(
+            (layer["var_entry"] * layer["var_qty"] for layer in layers), Decimal("0")
+        ) / var_qty
+        lighter_entry = sum(
+            (layer["lighter_entry"] * layer["lighter_qty"] for layer in layers), Decimal("0")
+        ) / lighter_qty
+        position.update({
+            "var_qty": var_qty,
+            "lighter_qty": lighter_qty,
+            "var_entry": var_entry,
+            "lighter_entry": lighter_entry,
+        })
+        return position
+
+    for row in samples:
+        at = _timestamp(row["logged_at"])
+        observation = session_observation_for_sample(row)
+        session_changed = (
+            previous_row is not None and row.get("session_id") != previous_row.get("session_id")
+        )
+        if previous_at is not None:
+            gap = (at - previous_at).total_seconds()
+            if gap < 0:
+                stopped_reason = "sample_order_invalid"
+                break
+            if session_changed:
+                previous_observation = session_observation_for_sample(previous_row)
+                if current is not None:
+                    stopped_reason = "position_crossed_session_boundary"
+                    break
+                if (
+                    previous_observation is None
+                    or previous_observation.closing_at < previous_at
+                    or previous_observation.closing_at > at
+                ):
+                    stopped_reason = "session_transition_unverified"
+                    break
+                entry_revoked_for_session = False
+            elif gap > config.max_sample_gap_seconds:
+                gaps += 1
+                if current is None:
+                    entry_revoked_for_session = True
+                else:
+                    position_gap_exit_pending = True
+        previous_at, previous_row = at, row
+        cutoff = observation.closing_at - timedelta(seconds=config.entry_cutoff_seconds)
+        in_cutoff = at >= cutoff
+
+        if current is not None:
+            if at <= current["at"]:
+                continue
+            if (
+                _decimal(row.get("variational_qty")) < current["var_qty"]
+                or _decimal(row.get("lighter_qty")) < current["lighter_qty"]
+            ):
+                exit_reasons["exit_quote_depth_below_position_size"] += 1
+                continue
+            instrument = replace(
+                WTI_HEDGE,
+                lighter=replace(
+                    WTI_HEDGE.lighter,
+                    exposure_multiplier=current["instrument"].lighter.exposure_multiplier,
+                ),
+            )
+            gross, cost, net, net_bps = _trade_pnl(
+                current, row, roundtrip_cost_bps=config.roundtrip_cost_bps
+            )
+            duration = (at - current["at"]).total_seconds()
+            reason = "target_reached" if net_bps >= config.exit_target_bps else None
+            if reason is None and position_gap_exit_pending:
+                reason = "sample_gap_requires_position_drain"
+            if reason is None and duration >= config.max_hold_seconds:
+                reason = "max_hold"
+            if reason is None and in_cutoff:
+                reason = "session_entry_cutoff"
+            if reason is not None:
+                denominator = (
+                    current["var_entry"] * current["var_qty"]
+                    + current["lighter_entry"] * current["lighter_qty"]
+                    * current["instrument"].lighter.exposure_multiplier
+                ) / Decimal("2")
+                trades.append(ReplayTrade(
+                    direction=current["direction"],
+                    entry_at=current["at"].isoformat(),
+                    exit_at=at.isoformat(),
+                    duration_seconds=round(duration, 3),
+                    entry_edge_bps=str(current["layers"][0]["edge"]),
+                    gross_pnl_usd=str(gross),
+                    assumed_cost_usd=str(cost),
+                    net_pnl_usd=str(net),
+                    net_pnl_bps=str(net_bps),
+                    exit_reason=reason,
+                    layer_count=len(current["layers"]),
+                    layer_entry_edges_bps=tuple(str(layer["edge"]) for layer in current["layers"]),
+                ))
+                exit_reasons[reason] += 1
+                current = None
+                position_gap_exit_pending = False
+                # The pilot budget is one complete roundtrip, regardless of outcome.
+                break
+            if len(current["layers"]) == 1 and not in_cutoff:
+                edge = _decimal(row.get(
+                    "long_edge_bps" if current["direction"] == "long_var_short_lighter"
+                    else "short_edge_bps"
+                ))
+                if edge is not None and edge >= second_tier_threshold_bps:
+                    layer = make_layer(row, current["direction"], edge, 2)
+                    aggregate_notional = (
+                        current["var_entry"] * current["var_qty"]
+                        + current["lighter_entry"] * current["lighter_qty"]
+                        * current["instrument"].lighter.exposure_multiplier
+                    ) / Decimal("2")
+                    if layer is None:
+                        rejected_depth += 1
+                    else:
+                        layer_notional = (
+                            layer["var_entry"] * layer["var_qty"]
+                            + layer["lighter_entry"] * layer["lighter_qty"]
+                            * current["instrument"].lighter.exposure_multiplier
+                        ) / Decimal("2")
+                        if aggregate_notional + layer_notional > aggregate_max_notional_usd:
+                            capped_additions += 1
+                        else:
+                            current["layers"].append(layer)
+                            refresh_aggregate(current)
+            continue
+
+        if in_cutoff or entry_revoked_for_session:
+            continue
+        edges = {
+            "long_var_short_lighter": _decimal(row.get("long_edge_bps")),
+            "short_var_long_lighter": _decimal(row.get("short_edge_bps")),
+        }
+        qualified = [(direction, edge) for direction, edge in edges.items()
+                     if edge is not None and edge >= config.entry_threshold_bps]
+        if not qualified:
+            continue
+        direction, edge = max(qualified, key=lambda item: item[1])
+        multiplier = _decimal(row.get("lighter_multiplier"))
+        current = {
+            "direction": direction,
+            "at": at,
+            "edge": edge,
+            "instrument": replace(
+                WTI_HEDGE,
+                lighter=replace(WTI_HEDGE.lighter, exposure_multiplier=multiplier),
+            ),
+            "layers": [],
+        }
+        layer = make_layer(row, direction, edge, 1)
+        if layer is None:
+            current = None
+            rejected_depth += 1
+            continue
+        current["layers"].append(layer)
+        refresh_aggregate(current)
+
+    gross_total = sum((Decimal(trade.gross_pnl_usd) for trade in trades), Decimal("0"))
+    costs_total = sum((Decimal(trade.assumed_cost_usd) for trade in trades), Decimal("0"))
+    net_total = sum((Decimal(trade.net_pnl_usd) for trade in trades), Decimal("0"))
+    wins = sum(Decimal(trade.net_pnl_usd) > 0 for trade in trades)
+    return ReplayReport(
+        replay_kind="indicative_bounded_two_layer_gradient_no_lookahead",
+        live_authorization=False,
+        session_gated=True,
+        sample_count=len(samples),
+        rejected_sample_count=rejected,
+        duplicate_sample_count=duplicates,
+        conflicting_sample_id_count=conflicts,
+        sample_gap_count=gaps,
+        stopped_reason=stopped_reason,
+        completed_trades=len(trades),
+        unresolved_position=current is not None,
+        gross_pnl_usd=str(gross_total),
+        assumed_cost_usd=str(costs_total),
+        net_pnl_usd=str(net_total),
+        win_rate=None if not trades else str(Decimal(wins) / Decimal(len(trades))),
+        exit_reasons={**dict(exit_reasons),
+                      **({"gradient_add_rejected_depth": rejected_depth} if rejected_depth else {}),
+                      **({"gradient_add_aggregate_cap": capped_additions} if capped_additions else {})},
+        config={
+            "entry_threshold_bps": str(config.entry_threshold_bps),
+            "second_tier_threshold_bps": str(second_tier_threshold_bps),
+            "exit_target_bps": str(config.exit_target_bps),
+            "roundtrip_cost_bps": str(config.roundtrip_cost_bps),
+            "layer_notional_usd": str(layer_notional_usd),
+            "aggregate_max_notional_usd": str(aggregate_max_notional_usd),
+            "max_layers": 2,
+            "max_completed_roundtrips": 1,
+            "max_hold_seconds": config.max_hold_seconds,
+            "max_sample_gap_seconds": config.max_sample_gap_seconds,
+            "entry_cutoff_seconds": config.entry_cutoff_seconds,
+            "expected_market_id": expected_market_id,
+            "expected_multiplier": None if expected_multiplier is None else str(expected_multiplier),
+        },
+        cost_caveat=(
+            "One bounded two-layer cycle. Quote-path only; no historical fills, fees, funding, latency, or market impact are inferred. "
+            "Sample-size/depth, exchange-session, 120-second gap, cutoff, hold, and aggregate-notional checks remain active."
         ),
         trades=tuple(trades),
     )

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -40,6 +41,28 @@ def test_cli_main_reaches_runtime_with_parsed_arguments(monkeypatch, mode):
         assert captured[0]._validated_notional == Decimal("20")
 
 
+def test_gradient_cli_requires_explicit_two_tier_bounded_budget():
+    args = wti_live.parse_args([
+        "--mode", "live", "--confirm-eth-flat", "--i-understand-live-orders",
+        "--gradient-live", "--confirm-bounded-gradient-pilot",
+        "--allow-unqualified-data-pilot", "--expected-lighter-market-id", "145",
+        "--entry-threshold-bps", "30", "--gradient-second-tier-bps", "45",
+        "--gradient-layer-notional-usd", "10", "--exit-target-bps", "1",
+        "--roundtrip-cost-bps", "10", "--max-notional-usd", "20",
+    ])
+    assert args.gradient_live is True
+    assert args._validated_gradient_second_tier == Decimal("45")
+    assert args._validated_gradient_layer_notional == Decimal("10")
+    with pytest.raises(SystemExit):
+        wti_live.parse_args([
+            "--mode", "live", "--confirm-eth-flat", "--i-understand-live-orders",
+            "--gradient-live", "--confirm-bounded-gradient-pilot",
+            "--expected-lighter-market-id", "145", "--entry-threshold-bps", "30",
+            "--gradient-second-tier-bps", "30", "--exit-target-bps", "1",
+            "--roundtrip-cost-bps", "10",
+        ])
+
+
 def test_eth_flat_requires_explicit_confirmation_and_exact_flat_state(tmp_path: Path):
     path = tmp_path / "eth.json"
     path.write_text(json.dumps({
@@ -51,6 +74,92 @@ def test_eth_flat_requires_explicit_confirmation_and_exact_flat_state(tmp_path: 
     path.write_text(json.dumps({"asset": "ETH", "status": "open", "open_lots": [{}]}))
     with pytest.raises(RuntimeError, match="eth_local_state_not_confirmed_flat"):
         wti_live.validate_eth_flat_confirmation(path, confirmed=True)
+
+
+def test_rotation_drain_is_bound_to_pid_and_run_and_revokes_entries(tmp_path: Path, monkeypatch):
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    control_path = tmp_path / "wti-control.json"
+    runtime.args = SimpleNamespace(control_path=control_path)
+    runtime.run_id = "run-1"
+    runtime.manage_existing_only = False
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.last_action = {}
+    request = {
+        "schema_version": 1, "action": "drain_after_flat", "status": "requested",
+        "asset": "WTI", "target_pid": __import__("os").getpid(),
+        "target_run_id": "run-1", "request_id": "request-1",
+    }
+    control_path.write_text(json.dumps(request), encoding="utf-8")
+    assert runtime._poll_rotation_drain() is True
+    assert runtime.manage_existing_only is True
+    assert runtime.entry_authorized is False
+    assert runtime.entry_authorization_permanently_revoked is True
+    assert json.loads(control_path.read_text()) ["status"] == "draining"
+
+    runtime.run_id = "different-run"
+    runtime.rotation_drain_request = None
+    runtime.manage_existing_only = False
+    assert runtime._poll_rotation_drain() is False
+    assert runtime.manage_existing_only is False
+
+
+def test_rotation_drain_completes_only_with_fresh_verified_flat_snapshot(tmp_path: Path):
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    control_path = tmp_path / "wti-control.json"
+    now = datetime.now(timezone.utc)
+    request = {
+        "schema_version": 1, "action": "drain_after_flat", "status": "draining",
+        "asset": "WTI", "target_pid": 1, "target_run_id": "run-1",
+        "request_id": "request-1",
+    }
+    control_path.write_text(json.dumps(request), encoding="utf-8")
+    runtime.args = SimpleNamespace(control_path=control_path, expected_lighter_market_id=145)
+    runtime.rotation_drain_request = request
+    runtime.startup_reconciled = True
+    runtime.stop = False
+    runtime.collector = SimpleNamespace(request_stop=lambda: None)
+    runtime.last_action = {}
+    runtime.request_stop = lambda: setattr(runtime, "stop", True)
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "last_account_reconciliation": {
+            "verified": True, "observed_at": now.isoformat(), "market_id": 145,
+            "variational_qty": "0", "lighter_qty": "0", "active_order_count": 0,
+        },
+    }
+    assert runtime._complete_rotation_drain_if_verified_flat(state) is True
+    completed = json.loads(control_path.read_text(encoding="utf-8"))
+    assert completed["status"] == "completed"
+    assert completed["active_order_count"] == 0
+    assert runtime.stop is True
+
+
+def test_rotation_drain_does_not_complete_for_stale_or_nonflat_evidence(tmp_path: Path):
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    control_path = tmp_path / "wti-control.json"
+    request = {
+        "schema_version": 1, "action": "drain_after_flat", "status": "draining",
+        "asset": "WTI", "target_pid": 1, "target_run_id": "run-1",
+        "request_id": "request-1",
+    }
+    control_path.write_text(json.dumps(request), encoding="utf-8")
+    runtime.args = SimpleNamespace(control_path=control_path, expected_lighter_market_id=145)
+    runtime.rotation_drain_request = request
+    runtime.startup_reconciled = True
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "last_account_reconciliation": {
+            "verified": True, "observed_at": "2020-01-01T00:00:00+00:00", "market_id": 145,
+            "variational_qty": "0", "lighter_qty": "0", "active_order_count": 0,
+        },
+    }
+    assert runtime._complete_rotation_drain_if_verified_flat(state) is False
+    state["last_account_reconciliation"]["observed_at"] = datetime.now(timezone.utc).isoformat()
+    state["last_account_reconciliation"]["lighter_qty"] = "0.1"
+    assert runtime._complete_rotation_drain_if_verified_flat(state) is False
+    assert json.loads(control_path.read_text(encoding="utf-8"))["status"] == "draining"
 
 
 def test_observe_mode_does_not_require_live_eth_confirmation(tmp_path: Path):
@@ -538,17 +647,25 @@ class _FlatLoopGateway:
         raise AssertionError("flat state has no orders to recover")
 
 
-def _runtime_with_real_executor(tmp_path, collector, gateway):
+def _runtime_with_real_executor(tmp_path, collector, gateway, *, gradient=False):
     runtime = _runtime_for_entry_gate(allow_unqualified=True)
-    runtime.args = wti_live.parse_args([
+    argv = [
         "--mode", "live", "--confirm-eth-flat", "--i-understand-live-orders",
-        "--confirm-bounded-live-pilot", "--allow-unqualified-data-pilot",
         "--expected-lighter-market-id", "145", "--entry-threshold-bps", "30",
         "--exit-target-bps", "1", "--roundtrip-cost-bps", "10",
         "--state-path", str(tmp_path / "wti-state.json"),
         "--health-path", str(tmp_path / "wti-health.json"),
         "--sample-root", str(tmp_path / "samples"),
-    ])
+    ]
+    if gradient:
+        argv += [
+            "--gradient-live", "--confirm-bounded-gradient-pilot",
+            "--allow-unqualified-data-pilot", "--gradient-second-tier-bps", "45",
+            "--gradient-layer-notional-usd", "9",
+        ]
+    else:
+        argv += ["--confirm-bounded-live-pilot", "--allow-unqualified-data-pilot"]
+    runtime.args = wti_live.parse_args(argv)
     runtime.config = wti_live.build_replay_config(runtime.args)
     runtime.logger = logging.getLogger("test_wti_real_loop")
     runtime.collector = collector
@@ -570,10 +687,18 @@ def _runtime_with_real_executor(tmp_path, collector, gateway):
     runtime.last_health_write_monotonic = 0
     runtime.last_runtime_error = None
     runtime.pilot_store = wti_live.WTIExecutionStore(runtime.args.state_path)
-    runtime.single_round_pilot = runtime.pilot_store.initialize_single_round_pilot(
-        market_id=145, multiplier=Decimal("1"),
-        config=runtime._pilot_config(), readiness=runtime.readiness,
-    )
+    runtime.gradient_pilot = None
+    if gradient:
+        runtime.single_round_pilot = None
+        runtime.gradient_pilot = runtime.pilot_store.initialize_gradient_pilot(
+            market_id=145, multiplier=Decimal("1"),
+            config=runtime._gradient_pilot_config(), max_layers=2,
+        )
+    else:
+        runtime.single_round_pilot = runtime.pilot_store.initialize_single_round_pilot(
+            market_id=145, multiplier=Decimal("1"),
+            config=runtime._pilot_config(), readiness=runtime.readiness,
+        )
     runtime.executor = wti_live.WTIPairExecutor(
         state_path=runtime.args.state_path, gateway=gateway,
         max_slippage_bps=Decimal("8"),
@@ -796,10 +921,127 @@ def test_real_strategy_executor_roundtrip_after_slow_account_read_stops_one_pilo
     assert len(gateway.requests) == 4
     assert all(Decimal(r["qty"]) == Decimal("0.28") for r in gateway.requests)
     assert [r["reduce_only"] for r in gateway.requests] == [False, False, True, True]
+
+
+def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durable_budget(tmp_path):
+    class GradientGateway(_FlatLoopGateway):
+        def __init__(self):
+            super().__init__()
+            self.var_qty = Decimal("0")
+            self.lighter_qty = Decimal("0")
+            self.requests = []
+
+        def read_account(self):
+            snapshot = super().read_account()
+            snapshot["variational_positions"]["positions"] = [{
+                "instrument": {
+                    "underlying": "USOILP", "instrument_type": "swap",
+                    "kind": "commodity", "settlement_asset": "USDC", "funding_interval_s": 0,
+                },
+                "qty": str(self.var_qty),
+            }]
+            snapshot["lighter_positions"]["accounts"][0]["positions"] = [{
+                "market_id": 145, "symbol": "WTI", "position": str(abs(self.lighter_qty)),
+                "sign": 1 if self.lighter_qty >= 0 else -1,
+            }]
+            return snapshot
+
+        def submit_order(self, request):
+            self.requests.append(dict(request))
+            qty = Decimal(request["qty"])
+            signed = qty if request["side"] == "buy" else -qty
+            if request["venue"] == "variational":
+                self.var_qty += signed
+            else:
+                self.lighter_qty += signed
+            return {
+                "ok": True, "final": True, "status": "filled",
+                "client_order_id": request["client_order_id"],
+                "order_id": f"gradient-order-{len(self.requests)}",
+                "filled_qty": str(qty), "average_price": request["reference_price"],
+                "fee_usd": "0", "trade_ids": [f"gradient-trade-{len(self.requests)}"],
+            }
+
+    class GradientCollector:
+        stopped = False
+        latest_sample = None
+
+        def __init__(self):
+            self.phase = "first"
+            self.requested_sizes = []
+            self.closing = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat()
+            self.latest_sample = self.sample()
+
+        def sample(self, *, var_qty=None, lighter_qty=None):
+            row = _live_sample(datetime.now(timezone.utc), sample_id=f"gradient-{uuid.uuid4().hex}")
+            row["session_closing_at"] = self.closing
+            row["variational_qty"] = str(var_qty or "0.29")
+            row["lighter_qty"] = str(lighter_qty or "0.29")
+            row["long_edge_bps"] = "50" if self.phase != "exit" else "0"
+            if self.phase == "add":
+                row["var_bid"] = "70.0"
+                row["lighter_buy_price"] = "70.1"
+            elif self.phase == "exit":
+                row["var_bid"] = "70.3"
+                row["var_ask"] = "70.4"
+                row["lighter_buy_price"] = "69.8"
+            return row
+
+        async def collect_fresh_sample(self, *, var_qty=None, lighter_qty=None):
+            if var_qty is not None and lighter_qty is not None:
+                self.requested_sizes.append((Decimal(str(var_qty)), Decimal(str(lighter_qty))))
+            self.latest_sample = self.sample(var_qty=var_qty, lighter_qty=lighter_qty)
+            return dict(self.latest_sample)
+
+        def request_stop(self):
+            self.stopped = True
+
+    collector = GradientCollector()
+    gateway = GradientGateway()
+    runtime = _runtime_with_real_executor(tmp_path, collector, gateway, gradient=True)
+
+    async def run_cycle():
+        loop = asyncio.get_running_loop()
+        runtime.executor.market_reader = lambda: asyncio.run_coroutine_threadsafe(
+            collector.collect_fresh_sample(), loop
+        ).result(timeout=3)
+        runtime.executor.market_reader_for_qty = lambda var_qty, lighter_qty: asyncio.run_coroutine_threadsafe(
+            collector.collect_fresh_sample(var_qty=var_qty, lighter_qty=lighter_qty), loop
+        ).result(timeout=3)
+        row = dict(collector.latest_sample)
+        assert runtime._record_new_sample(row) is True
+        first = await runtime._process_sample(row)
+        assert first["status"] == "open"
+        assert len(first["open_position"]["layers"]) == 1
+        collector.phase = "add"
+        row = await collector.collect_fresh_sample()
+        assert runtime._record_new_sample(row) is True
+        second = await runtime._process_sample(row)
+        assert second["status"] == "open"
+        assert len(second["open_position"]["layers"]) == 2
+        collector.phase = "exit"
+        row = await collector.collect_fresh_sample()
+        assert runtime._record_new_sample(row) is True
+        return await runtime._process_sample(row)
+
+    closed = asyncio.run(run_cycle())
+    assert closed["status"] == "flat"
+    assert closed["gradient_pilot"]["status"] == "completed"
+    assert closed["gradient_pilot"]["completed_roundtrips"] == 1
+    assert [layer["tier"] for layer in closed["last_closed_position"]["layers"]] == [1, 2]
+    assert gateway.var_qty == gateway.lighter_qty == 0
+    assert len(gateway.requests) == 6
+    assert [request["reduce_only"] for request in gateway.requests] == [
+        False, False, False, False, True, True,
+    ]
+    assert runtime.stop is True and collector.stopped is True
     assert collector.requested_sizes == [
-        (Decimal("0.28"), Decimal("0.28")),
-        (Decimal("0.28"), Decimal("0.28")),
-        (Decimal("0.28"), Decimal("0.28")),
+        (Decimal("0.13"), Decimal("0.13")),
+        (Decimal("0.13"), Decimal("0.13")),
+        (Decimal("0.13"), Decimal("0.13")),
+        (Decimal("0.13"), Decimal("0.13")),
+        (Decimal("0.26"), Decimal("0.26")),
+        (Decimal("0.26"), Decimal("0.26")),
     ]
 
 

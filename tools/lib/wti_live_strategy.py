@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from typing import Any
 
 from tools.lib.hedge_instruments import WTI_HEDGE, paired_realized_pnl
@@ -147,3 +147,105 @@ def decide_wti_action(
         return {"action": "hold", "reason": "entry_edge_below_threshold"}
     direction, edge = max(qualified, key=lambda item: item[1])
     return {"action": "open", "direction": direction, "edge_bps": str(edge)}
+
+
+def decide_wti_gradient_action(
+    row: dict[str, Any],
+    position: dict[str, Any] | None,
+    pilot: dict[str, Any],
+    *,
+    config: ReplayConfig,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Apply strictly increasing, same-direction tiers within a durable pilot."""
+    decision = decide_wti_action(row, position, config=config, now=now)
+    pilot_id = pilot.get("pilot_id")
+    tiers = pilot.get("config", {}).get("tier_thresholds_bps")
+    layer_notional = pilot.get("config", {}).get("layer_notional_usd")
+    if (
+        not pilot_id or not isinstance(tiers, list) or len(tiers) != pilot.get("max_layers")
+        or not tiers or layer_notional is None
+    ):
+        return {"action": "hold", "reason": "gradient_pilot_configuration_invalid"}
+    try:
+        thresholds = [Decimal(str(value)) for value in tiers]
+        layer_notional = Decimal(str(layer_notional))
+    except Exception:
+        return {"action": "hold", "reason": "gradient_pilot_configuration_invalid"}
+    if (
+        any(not value.is_finite() or value <= 0 for value in thresholds)
+        or any(left >= right for left, right in zip(thresholds, thresholds[1:]))
+        or thresholds[0] != config.entry_threshold_bps
+        or not layer_notional.is_finite() or layer_notional <= 0
+    ):
+        return {"action": "hold", "reason": "gradient_pilot_configuration_invalid"}
+
+    if position is None:
+        if decision.get("action") != "open" or pilot.get("status") != "available":
+            return decision
+        if pilot.get("layers_opened") or pilot.get("completed_roundtrips") != 0:
+            return {"action": "hold", "reason": "gradient_pilot_entry_budget_unavailable"}
+        return {
+            **decision,
+            "gradient_tier": 1,
+            "layer_notional_usd": str(layer_notional),
+        }
+
+    if decision.get("action") != "hold" or decision.get("reason") != "exit_target_not_reached":
+        return decision
+    if (
+        pilot.get("status") != "in_position"
+        or position.get("gradient_pilot_id") != pilot_id
+        or pilot.get("completed_roundtrips") != 0
+    ):
+        return decision
+    layers = pilot.get("layers_opened")
+    if not isinstance(layers, list):
+        return {"action": "hold", "reason": "gradient_pilot_state_invalid"}
+    tier = len(layers) + 1
+    if (
+        tier > len(thresholds)
+        or tier > pilot.get("max_layers", 0)
+        or tier in pilot.get("exhausted_tiers", [])
+    ):
+        return decision
+    direction = position.get("direction")
+    edge_field = (
+        "long_edge_bps" if direction == "long_var_short_lighter"
+        else "short_edge_bps" if direction == "short_var_long_lighter" else None
+    )
+    edge = _decimal(row.get(edge_field)) if edge_field else None
+    if edge is None or edge < thresholds[tier - 1]:
+        return decision
+    try:
+        cap = Decimal(str(pilot["config"]["max_notional_usd"]))
+        multiplier = Decimal(str(position["multiplier"]))
+        var_qty = Decimal(str(position["var_qty"]))
+        lighter_qty = Decimal(str(position["lighter_qty"]))
+        var_entry = Decimal(str(position["var_entry_price"]))
+        lighter_entry = Decimal(str(position["lighter_entry_price"]))
+        ref = (Decimal(str(row["lighter_bid"])) + Decimal(str(row["lighter_ask"]))) / 2
+        decimals = int(row["lighter_supported_size_decimals"])
+        min_base = Decimal(str(row.get("lighter_min_base_amount") or "0"))
+        min_quote = Decimal(str(row.get("lighter_min_quote_amount") or "0"))
+        step = Decimal("1").scaleb(-decimals)
+        required = max(
+            layer_notional / (ref * multiplier),
+            min_base,
+            min_quote / (ref * multiplier),
+        )
+        qty = (required / step).to_integral_value(rounding=ROUND_CEILING) * step
+        existing = (var_entry * var_qty + lighter_entry * lighter_qty * multiplier) / 2
+        incremental = qty * ref * multiplier
+        if existing + incremental > cap:
+            return {"action": "hold", "reason": "gradient_aggregate_notional_cap_would_be_exceeded"}
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return {"action": "hold", "reason": "gradient_aggregate_notional_unverifiable"}
+    return {
+        "action": "add",
+        "direction": direction,
+        "edge_bps": str(edge),
+        "reason": "gradient_tier_threshold_reached",
+        "gradient_tier": tier,
+        "layer_notional_usd": str(layer_notional),
+    }
