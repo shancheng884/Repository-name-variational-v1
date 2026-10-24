@@ -169,6 +169,7 @@ def _gradient_pilot(*, status="available", opened=None, exhausted=None):
             "tier_thresholds_bps": ["4", "8"],
             "layer_notional_usd": "10",
             "max_notional_usd": "20",
+            "max_slippage_bps": "8",
         },
     }
 
@@ -204,6 +205,51 @@ def test_gradient_add_requires_higher_same_direction_edge_and_pilot_ownership():
         "reason": "gradient_tier_threshold_reached", "gradient_tier": 2,
         "layer_notional_usd": "10",
     }
+
+
+def test_gradient_second_layer_remains_blocked_when_step_rounding_exceeds_cap():
+    now = datetime.now(timezone.utc)
+    position = _position(
+        now, gradient_pilot_id="pilot-1", var_qty="0.15", lighter_qty="0.15",
+        var_entry_price="70", lighter_entry_price="70",
+    )
+    result = decide_wti_gradient_action(
+        _row(
+            now, var_bid="70.0", lighter_buy_price="70.2",
+            lighter_min_quote_amount="10", long_edge_bps="8",
+        ),
+        position,
+        _gradient_pilot(
+            status="in_position", opened=[{"tier": 1, "layer_id": "layer-1"}],
+        ),
+        config=_config(), now=now,
+    )
+    assert result["action"] == "hold"
+    assert result["reason"] == "gradient_aggregate_notional_cap_would_be_exceeded"
+
+
+def test_gradient_second_layer_blocks_when_minimum_quote_and_basis_exceed_cap():
+    now = datetime.now(timezone.utc)
+    position = _position(
+        now, gradient_pilot_id="pilot-1", var_qty="0.102", lighter_qty="0.102",
+        var_entry_price="97.826", lighter_entry_price="98.128",
+    )
+    result = decide_wti_gradient_action(
+        _row(
+            now, var_bid="97.7", var_ask="97.826",
+            lighter_bid="98.128", lighter_ask="98.129",
+            lighter_buy_price="98.129", lighter_sell_price="98.128",
+            lighter_supported_size_decimals=3, lighter_min_base_amount="0.060",
+            lighter_min_quote_amount="10", long_edge_bps="45.1",
+        ),
+        position,
+        _gradient_pilot(
+            status="in_position", opened=[{"tier": 1, "layer_id": "layer-1"}],
+        ),
+        config=_config(), now=now,
+    )
+    assert result["action"] == "hold"
+    assert result["reason"] == "gradient_aggregate_notional_cap_would_be_exceeded"
 
 
 def test_gradient_exit_and_session_guards_take_priority_over_add():

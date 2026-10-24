@@ -626,7 +626,7 @@ class WTIProductionGateway:
                         market_id=int(self.market["market_id"]),
                         account_index=self.account_index,
                         order_index=order_index,
-                        sort_dir="asc", _request_timeout=5.0,
+                        sort_dir="desc", _request_timeout=5.0,
                     )
                     trade_rows = _rows(trades, "trades")
                 except Exception as exc:
@@ -635,7 +635,9 @@ class WTIProductionGateway:
                 trade_ids: list[str] = []
                 trade_fee_evidence: list[dict[str, Any]] = []
                 fee_total = Decimal("0")
-                fee_confirmed = bool(trade_rows)
+                matched_trade_qty = Decimal("0")
+                all_trade_rows_match = bool(trade_rows)
+                all_fees_explicit = bool(trade_rows)
                 seen_trade_ids: set[str] = set()
                 if trade_rows is not None:
                     for trade in trade_rows:
@@ -661,6 +663,9 @@ class WTIProductionGateway:
                             and account_identity_ok
                         )
                         explicit_fee = self._explicit_fee_usd(trade)
+                        trade_qty = _decimal(
+                            trade.get("size", trade.get("filled_qty", trade.get("base_amount")))
+                        )
                         trade_fee_evidence.append({
                             "trade_id": None if trade_id is None else str(trade_id),
                             "market_id": trade.get("market_id"),
@@ -675,22 +680,34 @@ class WTIProductionGateway:
                             "maker_fee_raw": trade.get("maker_fee"),
                             "taker_fee_raw": trade.get("taker_fee"),
                             "fee_usd": explicit_fee,
+                            "trade_qty": None if trade_qty is None else str(trade_qty),
                             "identity_verified": identity_ok,
                             "raw_fee_unit": "unverified",
                         })
                         if not identity_ok:
-                            fee_confirmed = False
+                            all_trade_rows_match = False
                             continue
+                        if trade_qty is None or trade_qty <= 0:
+                            all_trade_rows_match = False
+                        else:
+                            matched_trade_qty += trade_qty
                         seen_trade_ids.add(str(trade_id))
                         trade_ids.append(str(trade_id))
                         if explicit_fee is None:
-                            fee_confirmed = False
+                            all_fees_explicit = False
                         else:
                             fee_value = _decimal(explicit_fee)
                             if fee_value is None:
-                                fee_confirmed = False
+                                all_fees_explicit = False
                             else:
                                 fee_total += fee_value
+                fill_coverage_complete = (
+                    trade_rows is not None
+                    and 0 < len(trade_rows) < 100
+                    and matched_trade_qty == filled
+                    and all_trade_rows_match
+                )
+                fee_confirmed = fill_coverage_complete and all_fees_explicit
                 return {
                     **unknown, "ok": True, "final": True,
                     "order_id": str(order.get("order_index")),
@@ -698,13 +715,18 @@ class WTIProductionGateway:
                     "native_client_order_id": str(client_index), "status": "filled",
                     "filled_qty": str(filled), "average_price": str(quote / filled),
                     "trade_ids": trade_ids if trade_rows else None,
+                    "matched_trade_qty": str(matched_trade_qty),
+                    "trade_fill_coverage_complete": fill_coverage_complete,
                     "fee_usd": str(fee_total) if fee_confirmed else None,
                     "trade_fee_evidence": trade_fee_evidence if trade_rows is not None else None,
                     **({
                         "lookup_stage": "trades",
                         "lookup_reason": (
                             "lighter_trade_evidence_unavailable"
-                            if not trade_rows else "lighter_trade_fee_usd_unverified"
+                            if not trade_rows
+                            else "lighter_trade_fill_coverage_incomplete"
+                            if not fill_coverage_complete
+                            else "lighter_trade_fee_usd_unverified"
                         ),
                         **({"error_type": trade_error} if trade_error else {}),
                     } if not fee_confirmed else {}),

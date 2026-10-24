@@ -427,8 +427,89 @@ def test_gradient_pilot_rotation_test_identity_is_immutable_across_restart(tmp_p
         )
 
 
+def test_continuous_gradient_round_rollover_requires_fresh_flat_proof_and_is_idempotent(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    config = {
+        "entry_threshold_bps": "30", "tier_thresholds_bps": ["30", "45"],
+        "exit_target_bps": "1", "roundtrip_cost_bps": "10",
+        "layer_notional_usd": "10", "max_layers": 2,
+        "max_completed_roundtrips": 1,
+    }
+    session_id = "c" * 32
+    first = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+        rotation_test_id=session_id, continuous_rotation=True,
+    )
+    opened = _open(
+        executor, notional_usd="10", layer_id="round-1-tier-1",
+        gradient_tier=1, gradient_pilot_id=first["pilot_id"],
+    )
+    assert opened["status"] == "open"
+    closed = executor.close(
+        sample=_sample(), session=_session(),
+        decision={"action": "close", "reason": "test_round_complete"},
+        now=datetime.now(timezone.utc),
+    )
+    assert closed["status"] == "flat"
+    assert closed["gradient_rotation_session"]["rounds_completed"] == 1
+    assert gateway.var_qty == gateway.lighter_qty == 0
+
+    executor.reconcile_account_only(runtime_pid=123, runtime_run_id="continuous-test")
+    second = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+        rotation_test_id=session_id, continuous_rotation=True,
+        new_pilot_after=first["pilot_id"],
+    )
+    repeated = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+        rotation_test_id=session_id, continuous_rotation=True,
+        new_pilot_after=first["pilot_id"],
+    )
+    resumed = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+        rotation_test_id=session_id, continuous_rotation=True,
+    )
+    assert second["pilot_id"] != first["pilot_id"]
+    assert second["round_number"] == 2
+    assert second["pilot_id"] == repeated["pilot_id"] == resumed["pilot_id"]
+    assert executor.store.load()["gradient_rotation_session"]["rounds_started"] == 2
+    assert executor.store.load()["gradient_rotation_session"]["rounds_completed"] == 1
+    assert len(gateway.requests) == 4
+
+
+def test_continuous_gradient_rollover_refuses_stale_or_nonflat_account_proof(tmp_path):
+    executor, _gateway = _executor(tmp_path)
+    config = {"tier_thresholds_bps": ["30", "45"], "layer_notional_usd": "10"}
+    session_id = "d" * 32
+    first = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+        rotation_test_id=session_id, continuous_rotation=True,
+    )
+    state = executor.store.load()
+    state["gradient_pilot"].update(
+        status="completed", completed_roundtrips=1,
+        completed_at=datetime.now(timezone.utc).isoformat(), exit_action_id="exit-1",
+    )
+    state["gradient_rotation_session"].update(
+        rounds_completed=1, last_completed_pilot_id=first["pilot_id"],
+    )
+    state["last_account_reconciliation"] = {
+        "verified": True, "observed_at": (datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat(),
+        "market_id": 145, "variational_qty": "0", "lighter_qty": "0",
+        "active_order_count": 0,
+    }
+    executor.store.save(state)
+    with pytest.raises(WTIExecutionError, match="fresh_dual_flat_proof"):
+        executor.store.initialize_gradient_pilot(
+            market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+            rotation_test_id=session_id, continuous_rotation=True,
+            new_pilot_after=first["pilot_id"],
+        )
+
+
 def test_gradient_layer_rejects_aggregate_cap_before_any_order(tmp_path):
     executor, gateway = _executor(tmp_path)
+    executor.max_notional_usd = Decimal("20")
     pilot = _gradient_pilot(executor)
     _open(
         executor, notional_usd="20", layer_id="tier-1", gradient_tier=1,

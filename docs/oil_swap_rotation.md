@@ -357,6 +357,44 @@ market data can qualify for operator review, while production-rotation
 readiness remains false until a WTI execution path produces verified
 roundtrips.
 
+## Continuous Gradient Rotation
+
+The automatic supervisor can run sequential, small-notional WTI gradient rounds
+and rotate to ETH when the verified WTI session closes. Enable it explicitly
+with `--continuous-gradient-rotation --confirm-continuous-gradient-rotation`
+alongside the normal automatic-rotation/live-order confirmations. Its durable
+session ID and round counter are stored in `rotation_supervisor_state.json`;
+restarting the supervisor resumes that same authorization rather than creating
+a fresh budget or submitting an order. A WTI round remains one completed
+open/close cycle. The next round is armed only after the runtime confirms a
+fresh dual-account zero-position, zero-active-order reconciliation. Pending,
+partial, ambiguous, mismatched, or stale state prevents re-arming. The supervisor
+does not start a second WTI runtime while the existing round is healthy.
+
+The existing thresholds and per-position controls remain pinned: first entry
+30 bps, second gradient tier 45 bps, two layers at 10 USD each, 20 USD aggregate
+notional cap, 1 bps net exit target after the configured 10 bps roundtrip-cost
+assumption, 8 bps maximum slippage, six-hour maximum hold, and a 30-minute
+pre-close entry cutoff. Current sample freshness/quality, exchange session,
+account/risk, order reconciliation, executable depth, and slippage checks remain
+hard gates. The explicit pilot setting bypasses only historical production
+qualification; it does not bypass those live checks.
+The 20 USD cap is measured as the mean of the two hedged legs' notionals, with
+each venue's leg independently capped at 20 USD. Existing inventory is marked
+at the current conservative ask; a new layer is valued at conservative order
+references padded by the configured maximum slippage. Execution, live gradient
+decisions, and gradient replay use this same quantity-step/minimum-size sizing
+rule. The second layer is skipped whenever exchange minimums or rounding would
+breach either limit; the cap is not increased to force two fills.
+
+Continuous mode intentionally has no maximum number of completed rounds or
+cumulative session-loss cap. The 20 USD limit is simultaneous WTI exposure, not
+a cap on cumulative turnover or realized losses. Stop the supervisor if that
+unbounded cumulative risk is not acceptable. The indicative replay supports
+`--compare-gradient --continuous-gradient` to evaluate consecutive quote-path
+rounds; this remains a no-lookahead simulation, not fill or profitability proof,
+and never enables orders. Default replay behavior remains limited to one round.
+
 ## Indicative Quote-Path Replay
 
 `python tools/wti_strategy_replay.py` replays a user-specified entry edge,
@@ -364,7 +402,12 @@ net exit target, roundtrip cost assumption, maximum hold, and maximum sample
 gap against saved WTI samples. It uses only the current and prior sample at
 each decision point, rejects samples without explicit fresh session evidence,
 duplicate/conflicting sample IDs and mixed Lighter market profiles, stops at an
-in-session gap above the unchanged configured limit, blocks entry during the
+gap above the configured live limit latches entry authorization off for the
+remainder of that replay process, matching the live runtime; a session change
+does not by itself prove a reconciled runtime restart. For a supervisor-rotation
+scenario, `--assume-verified-flat-session-restarts` explicitly models a new WTI
+process after independently verified dual-account flat/order reconciliation;
+the quote archive itself does not prove that reconciliation. It blocks entry during the
 last 30 minutes before reported close, and marks any position crossing a session
 boundary unresolved rather than inventing an exit. A long interval is not
 treated as closed-market time unless the prior close and next open are both
@@ -372,10 +415,14 @@ explicitly evidenced. The replay uses recorded executable quote proxies but
 does not establish fills, fees, funding, roll cashflows, or live latency. Its report always has
 `live_authorization: false`; do not use this as production promotion evidence.
 
-The rotation state machine in `tools/lib/pair_rotation.py` is a decision
-primitive only; it does not stop or start trading processes. Unknown positions
-while no active pair is recorded force reconciliation and block new entries.
-The standalone production adapters and bounded runtime are implemented, but
-automatic ETH/WTI process rotation is not. Their regression tests use synthetic
-venue responses. They do not qualify WTI for live trading, replace empirical
-replay, verify live credentials, or establish realized fees/funding.
+Lighter order-fee lookup uses the supported descending trades API and only
+confirms a fee when exact order/account/market identities and trade quantities
+cover the full terminal fill, with each fee explicitly denominated in USD.
+Protocol fee integers with undocumented units remain unverified rather than
+being converted by guesswork. See the [Lighter trades API](https://apidocs.lighter.xyz/reference/trades).
+
+Unknown positions while no active pair is recorded force reconciliation and
+block new entries. The supervisor and runtime regression tests use synthetic
+venue responses; they do not verify live credentials or establish realized
+fees/funding. Production qualification remains separate from the explicit
+historical-data pilot path described above.

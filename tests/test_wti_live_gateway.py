@@ -554,23 +554,28 @@ def test_lighter_lookup_preserves_saved_identity_and_reports_specific_evidence(m
         ({
             "trade_id": 501, "market_id": 145, "ask_id": 123456,
             "bid_id": 123457, "ask_account_id": 10, "bid_account_id": 99,
-            "maker_fee": -12, "taker_fee": 18,
+            "size": "0.29", "maker_fee": -12, "taker_fee": 18,
         }, None, "lighter_trade_fee_usd_unverified"),
         ({
             "trade_id": 501, "market_id": 145, "ask_id": 123456,
             "bid_id": 123457, "ask_account_id": 10, "bid_account_id": 99,
-            "maker_fee": -12, "taker_fee": 18, "fee_usd": "-0.004",
+            "size": "0.29", "maker_fee": -12, "taker_fee": 18, "fee_usd": "-0.004",
         }, "-0.004", None),
         ({
             "trade_id": 501, "market_id": 145, "ask_id": 123456,
             "bid_id": 123457, "ask_account_id": 77, "bid_account_id": 99,
-            "fee_usd": "0.004",
-        }, None, "lighter_trade_fee_usd_unverified"),
+            "size": "0.29", "fee_usd": "0.004",
+        }, None, "lighter_trade_fill_coverage_incomplete"),
         ({
             "trade_id": 502, "market_id": 145, "ask_id": 123456,
             "bid_id": 123457, "ask_account_id": 77, "bid_account_id": 10,
-            "fee_usd": "0.004",
-        }, None, "lighter_trade_fee_usd_unverified"),
+            "size": "0.29", "fee_usd": "0.004",
+        }, None, "lighter_trade_fill_coverage_incomplete"),
+        ({
+            "trade_id": 503, "market_id": 145, "ask_id": 123456,
+            "bid_id": 123457, "ask_account_id": 10, "bid_account_id": 99,
+            "size": "0.20", "fee_usd": "0.004",
+        }, None, "lighter_trade_fill_coverage_incomplete"),
     ],
 )
 def test_lighter_trade_fee_requires_exact_identity_and_explicit_usd(
@@ -595,6 +600,8 @@ def test_lighter_trade_fee_requires_exact_identity_and_explicit_usd(
             return {"code": 200, "orders": []}
 
         async def trades(self, **kwargs):
+            assert kwargs["sort_dir"] == "desc"
+            assert kwargs["order_index"] == 123456
             return {"code": 200, "trades": [trade]}
 
     monkeypatch.setitem(sys.modules, "lighter", SimpleNamespace(OrderApi=API))
@@ -616,6 +623,11 @@ def test_lighter_trade_fee_requires_exact_identity_and_explicit_usd(
         trade["ask_id"] == 123456 and trade["ask_account_id"] == 10
     )
     assert evidence["raw_fee_unit"] == "unverified"
+    assert result["trade_fill_coverage_complete"] is (
+        trade["ask_id"] == 123456
+        and trade["ask_account_id"] == 10
+        and trade.get("size") == "0.29"
+    )
     if expected_fee is None:
         assert evidence["maker_fee_raw"] in (None, trade.get("maker_fee"))
     gateway.loop.close()

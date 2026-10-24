@@ -119,10 +119,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit assumed total cost for both venues, including any operator-selected buffer.",
     )
     parser.add_argument("--max-hold-seconds", required=True, type=_positive_seconds)
-    parser.add_argument("--max-sample-gap-seconds", type=_positive_seconds, default=60.0)
+    parser.add_argument(
+        "--max-sample-gap-seconds", type=_positive_seconds, default=120.0,
+        help="Runtime-matched live entry-authorization gap; the value can be lowered for a stricter sensitivity replay.",
+    )
+    parser.add_argument("--max-slippage-bps", type=_positive_decimal, default=Decimal("8"))
     parser.add_argument("--lighter-market-id", type=int)
     parser.add_argument("--lighter-multiplier", type=_positive_decimal)
     parser.add_argument("--compare-gradient", action="store_true")
+    parser.add_argument(
+        "--continuous-gradient", action="store_true",
+        help="Replay sequential bounded gradient rounds; this is still indicative and never authorizes live trading.",
+    )
+    parser.add_argument(
+        "--assume-verified-flat-session-restarts", action="store_true",
+        help="Model supervisor restarts between sessions only under an explicit independent dual-account flat-reconciliation assumption.",
+    )
     parser.add_argument("--gradient-second-tier-bps", type=_positive_decimal)
     parser.add_argument("--gradient-layer-notional-usd", type=_positive_decimal)
     parser.add_argument("--gradient-aggregate-max-notional-usd", type=_positive_decimal)
@@ -144,6 +156,8 @@ def main(argv: list[str] | None = None) -> int:
         args.gradient_aggregate_max_notional_usd,
     )):
         parser.error("--compare-gradient requires all gradient tier and notional options")
+    if args.continuous_gradient and not args.compare_gradient:
+        parser.error("--continuous-gradient requires --compare-gradient")
     if not args.compare_gradient and any(value is not None for value in (
         args.gradient_second_tier_bps,
         args.gradient_layer_notional_usd,
@@ -162,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
             roundtrip_cost_bps=args.roundtrip_cost_bps,
             max_hold_seconds=args.max_hold_seconds,
             max_sample_gap_seconds=args.max_sample_gap_seconds,
+            max_slippage_bps=args.max_slippage_bps,
         )
         baseline = replay_wti(
             rows,
@@ -179,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
                 aggregate_max_notional_usd=args.gradient_aggregate_max_notional_usd,
                 expected_market_id=args.lighter_market_id,
                 expected_multiplier=args.lighter_multiplier,
+                max_completed_roundtrips=None if args.continuous_gradient else 1,
+                assume_verified_flat_session_restarts=args.assume_verified_flat_session_restarts,
             )
     except ValueError as exc:
         print(json.dumps({"replay_error": str(exc), "live_authorization": False}, indent=2))
@@ -230,7 +247,9 @@ def main(argv: list[str] | None = None) -> int:
                 "roundtrip_cost_bps": str(config.roundtrip_cost_bps),
                 "max_hold_seconds": config.max_hold_seconds,
                 "max_sample_gap_seconds": config.max_sample_gap_seconds,
+                "max_slippage_bps": str(config.max_slippage_bps),
                 "entry_cutoff_seconds": config.entry_cutoff_seconds,
+                "assume_verified_flat_session_restarts": args.assume_verified_flat_session_restarts,
             },
             "readiness": asdict(readiness),
             "replay": payload,

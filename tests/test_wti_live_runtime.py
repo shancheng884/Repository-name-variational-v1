@@ -228,6 +228,82 @@ def test_rotation_drain_does_not_complete_for_stale_or_nonflat_evidence(tmp_path
     assert json.loads(control_path.read_text(encoding="utf-8"))["status"] == "draining"
 
 
+def test_continuous_gradient_runtime_rearms_only_after_fresh_account_reconcile():
+    session_id = "e" * 32
+    previous = {"pilot_id": "pilot-round-1", "status": "completed", "round_number": 1}
+    reconciled = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "last_account_reconciliation": {
+            "verified": True, "variational_qty": "0", "lighter_qty": "0",
+            "active_order_count": 0,
+        },
+    }
+
+    class PilotStore:
+        calls = []
+
+        def initialize_gradient_pilot(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"pilot_id": "pilot-round-2", "round_number": 2, "status": "available"}
+
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.args = SimpleNamespace(
+        continuous_gradient_rotation=True, rotation_test_id=session_id,
+    )
+    runtime.rotation_drain_request = None
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    runtime.pilot_store = PilotStore()
+    runtime.market_metadata = {"market_id": 145, "multiplier": "1"}
+    runtime.logger = logging.getLogger("test_continuous_gradient_runtime_rearm")
+    runtime.gradient_pilot = previous
+    runtime._gradient_pilot_config = lambda: {"max_completed_roundtrips": 1}
+    account_reads = []
+
+    async def read_account_only():
+        account_reads.append(True)
+        return reconciled
+
+    runtime._read_account_only_reconcile = read_account_only
+    runtime._poll_rotation_drain = lambda: None
+
+    result = asyncio.run(runtime._advance_continuous_gradient_round({
+        "status": "flat", "open_position": None, "pending_action": None,
+        "gradient_pilot": previous,
+    }))
+
+    assert result is reconciled
+    assert len(account_reads) == 1
+    assert runtime.pilot_store.calls == [{
+        "market_id": 145, "multiplier": Decimal("1"),
+        "config": {"max_completed_roundtrips": 1}, "max_layers": 2,
+        "rotation_test_id": session_id, "continuous_rotation": True,
+        "new_pilot_after": "pilot-round-1",
+    }]
+    assert runtime.gradient_pilot["pilot_id"] == "pilot-round-2"
+    assert runtime.entry_authorized is False
+
+
+def test_continuous_gradient_runtime_drain_never_rearms_next_round():
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.args = SimpleNamespace(continuous_gradient_rotation=True)
+    runtime.rotation_drain_request = {"status": "draining"}
+    runtime.entry_authorized = True
+    runtime._poll_rotation_drain = lambda: None
+
+    async def should_not_reconcile():
+        pytest.fail("draining runtime must not reconcile into a new entry round")
+
+    runtime._read_account_only_reconcile = should_not_reconcile
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "gradient_pilot": {"pilot_id": "completed", "status": "completed"},
+    }
+    result = asyncio.run(runtime._advance_continuous_gradient_round(state))
+    assert result is state
+    assert runtime.entry_authorized is False
+
+
 def test_observe_mode_does_not_require_live_eth_confirmation(tmp_path: Path):
     args = SimpleNamespace(
         mode="observe", confirm_eth_flat=False,

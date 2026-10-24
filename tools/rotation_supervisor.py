@@ -60,6 +60,9 @@ BOUNDED_TEST_MAX_ROUNDTRIPS = 1
 BOUNDED_TEST_MAX_LAYERS = 2
 BOUNDED_TEST_LAYER_NOTIONAL_USD = Decimal("10")
 BOUNDED_TEST_MAX_NOTIONAL_USD = Decimal("20")
+CONTINUOUS_ROTATION_MAX_LAYERS = 2
+CONTINUOUS_ROTATION_LAYER_NOTIONAL_USD = Decimal("10")
+CONTINUOUS_ROTATION_MAX_NOTIONAL_USD = Decimal("20")
 
 
 def _age(value: Any, now: datetime) -> float | None:
@@ -259,6 +262,8 @@ def collect_snapshot(
     proc_root: Path = Path("/proc"),
     bounded_rotation_test: bool = False,
     rotation_test_status: str | None = None,
+    continuous_gradient_rotation: bool = False,
+    continuous_rotation_status: str | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     eth_state = read_object(root / "log/live_inventory_state.json")
@@ -375,11 +380,90 @@ def collect_snapshot(
         if not identity_matches:
             test_gate_reasons.append("persisted_gradient_pilot_configuration_mismatch")
     bounded_test_ready = bounded_rotation_test and not test_gate_reasons
+    rotation_journal = read_object(root / "log/rotation_supervisor_state.json")
+    continuous_auth = rotation_journal.get("continuous_gradient_rotation") or {}
+    if not isinstance(continuous_auth, dict):
+        continuous_auth = {}
+    if continuous_rotation_status is not None:
+        continuous_auth["status"] = continuous_rotation_status
+    continuous_authorized = continuous_auth.get("status") in {"authorized", "active"}
+    continuous_sample_reasons: list[str] = []
+    if not continuous_gradient_rotation:
+        continuous_sample_reasons.append("continuous_gradient_rotation_not_explicitly_selected")
+    if not continuous_authorized:
+        continuous_sample_reasons.append("continuous_gradient_rotation_not_authorized")
+    if (
+        continuous_auth.get("market_id") != market_id
+        or str(continuous_auth.get("multiplier")) != str(multiplier)
+        or continuous_auth.get("max_layers") != CONTINUOUS_ROTATION_MAX_LAYERS
+        or continuous_auth.get("layer_notional_usd") != str(CONTINUOUS_ROTATION_LAYER_NOTIONAL_USD)
+        or continuous_auth.get("max_notional_usd") != str(CONTINUOUS_ROTATION_MAX_NOTIONAL_USD)
+        or continuous_auth.get("entry_threshold_bps") != "30"
+        or continuous_auth.get("second_tier_bps") != "45"
+        or continuous_auth.get("exit_target_bps") != "1"
+        or continuous_auth.get("roundtrip_cost_bps") != "10"
+        or continuous_auth.get("max_slippage_bps") != "8"
+        or continuous_auth.get("max_hold_seconds") != 21600
+        or continuous_auth.get("entry_cutoff_seconds") != 1800
+    ):
+        continuous_sample_reasons.append("continuous_gradient_rotation_configuration_mismatch")
+    if not sample_identity_ok:
+        continuous_sample_reasons.append("continuous_gradient_rotation_requires_fresh_valid_wti_sample")
+    if not sample_multiplier_ok:
+        continuous_sample_reasons.append("continuous_gradient_rotation_lighter_multiplier_mismatch")
+    continuous_id = continuous_auth.get("session_id")
+    continuous_expected_config = {
+        "entry_threshold_bps": "30",
+        "exit_target_bps": "1",
+        "roundtrip_cost_bps": "10",
+        "max_notional_usd": "20",
+        "max_slippage_bps": "8",
+        "max_hold_seconds": 21600.0,
+        "entry_cutoff_seconds": 1800.0,
+        "tier_thresholds_bps": ["30", "45"],
+        "layer_notional_usd": "10",
+        "max_layers": 2,
+        "max_completed_roundtrips": 1,
+    }
+    pilot_config = wti_pilot.get("config") or {}
+    pilot_config_matches = (
+        wti_pilot.get("market_id") == market_id
+        and str(wti_pilot.get("multiplier")) == str(multiplier)
+        and wti_pilot.get("max_layers") == CONTINUOUS_ROTATION_MAX_LAYERS
+        and all(pilot_config.get(key) == value for key, value in continuous_expected_config.items())
+    ) if wti_pilot else True
+    pilot_current_session = bool(
+        wti_pilot
+        and wti_pilot.get("rotation_test_id") == continuous_id
+        and wti_pilot.get("continuous_rotation") is True
+        and isinstance(wti_pilot.get("round_number"), int)
+        and wti_pilot.get("round_number") >= 1
+    )
+    flat_resolved_wti = bool(
+        wti_state.get("status") == "flat"
+        and wti_state.get("open_position") is None
+        and wti_state.get("pending_action") is None
+    )
+    completed_predecessor = bool(
+        wti_pilot
+        and wti_pilot.get("status") == "completed"
+        and wti_pilot.get("completed_roundtrips") == 1
+        and flat_resolved_wti
+    )
+    if wti_pilot and (not pilot_config_matches or not (pilot_current_session or completed_predecessor)):
+        continuous_sample_reasons.append("continuous_gradient_pilot_identity_mismatch")
+    continuous_pilot_eligible = bool(
+        wti_pilot_available or (continuous_authorized and (not wti_pilot or completed_predecessor))
+    )
+    if not continuous_pilot_eligible:
+        continuous_sample_reasons.append("continuous_gradient_pilot_not_rearmable")
+    continuous_rotation_ready = continuous_gradient_rotation and not continuous_sample_reasons
     wti_ready = bool(
-        wti_pilot_available
+        (wti_pilot_available or continuous_pilot_eligible)
         and (
             production_wti_ready
             or (bounded_test_ready and session.allow_new_entries)
+            or (continuous_rotation_ready and session.allow_new_entries)
         )
     )
     wti_gate_reasons = list(readiness.get("reasons", []))
@@ -389,6 +473,10 @@ def collect_snapshot(
         wti_gate_reasons.extend(test_gate_reasons)
         if bounded_test_ready and not session.allow_new_entries:
             wti_gate_reasons.append("bounded_rotation_test_requires_verified_open_entry_window")
+    if continuous_gradient_rotation:
+        wti_gate_reasons.extend(continuous_sample_reasons)
+        if continuous_rotation_ready and not session.allow_new_entries:
+            wti_gate_reasons.append("continuous_gradient_rotation_requires_verified_open_entry_window")
     target, target_reason = desired_pair(
         session=session,
         wti_ready=wti_ready,
@@ -418,6 +506,12 @@ def collect_snapshot(
         "wti_bounded_test_gate_ready": bounded_test_ready,
         "wti_bounded_test_gate_reasons": list(dict.fromkeys(test_gate_reasons)),
         "rotation_test_id": rotation_auth.get("test_id"),
+        "continuous_gradient_rotation": continuous_gradient_rotation,
+        "continuous_rotation_status": continuous_auth.get("status"),
+        "continuous_rotation_session_id": continuous_id,
+        "continuous_rotation_rounds_completed": continuous_auth.get("rounds_completed"),
+        "continuous_gradient_gate_ready": continuous_rotation_ready,
+        "continuous_gradient_gate_reasons": list(dict.fromkeys(continuous_sample_reasons)),
         "eth_ready": eth_ready,
         "wti_ready": wti_ready,
         "wti_gate_reasons": wti_gate_reasons,
@@ -518,6 +612,11 @@ def rehearsal_plan(snapshot: dict[str, Any], *, session_scenario: str = "live") 
                 and snapshot.get("wti_bounded_test_gate_ready")
                 and session.allow_new_entries
             )
+            or (
+                snapshot.get("continuous_gradient_rotation")
+                and snapshot.get("continuous_gradient_gate_ready")
+                and session.allow_new_entries
+            )
         )
     decision = decide_rotation(
         current=current,
@@ -546,6 +645,10 @@ def rehearsal_plan(snapshot: dict[str, Any], *, session_scenario: str = "live") 
         and not snapshot.get("bounded_test_authorized")
     ):
         reasons.append("bounded_rotation_test_authorization_not_persisted")
+    if target == Pair.WTI and snapshot.get("continuous_gradient_rotation") and not snapshot.get(
+        "continuous_gradient_gate_ready"
+    ):
+        reasons.extend(snapshot.get("continuous_gradient_gate_reasons", []))
     reasons.extend(account_proof.get("reasons", []))
     return {
         "mode": "read_only_rehearsal",
@@ -566,6 +669,8 @@ def rehearsal_plan(snapshot: dict[str, Any], *, session_scenario: str = "live") 
         "account_proof": account_proof,
         "bounded_rotation_test": bool(snapshot.get("bounded_rotation_test")),
         "bounded_test_ready": bool(snapshot.get("wti_bounded_test_gate_ready")),
+        "continuous_gradient_rotation": bool(snapshot.get("continuous_gradient_rotation")),
+        "continuous_gradient_ready": bool(snapshot.get("continuous_gradient_gate_ready")),
         "session_scenario": session_scenario,
     }
 
@@ -573,13 +678,15 @@ def rehearsal_plan(snapshot: dict[str, Any], *, session_scenario: str = "live") 
 class RotationSupervisor:
     def __init__(self, *, root: Path, market_id: int, multiplier: Decimal,
                  confirm_initial_flat: bool, dry_run: bool = False,
-                 bounded_rotation_test: bool = False) -> None:
+                 bounded_rotation_test: bool = False,
+                 continuous_gradient_rotation: bool = False) -> None:
         self.root = root
         self.market_id = market_id
         self.multiplier = multiplier
         self.confirm_initial_flat = confirm_initial_flat
         self.dry_run = dry_run
         self.bounded_rotation_test = bounded_rotation_test
+        self.continuous_gradient_rotation = continuous_gradient_rotation
         self.journal_path = root / "log/rotation_supervisor_state.json"
         self.health_path = root / "log/rotation_supervisor_health.json"
 
@@ -660,6 +767,8 @@ class RotationSupervisor:
         recovery: bool = False,
         bounded_test: bool = False,
         rotation_test_id: str | None = None,
+        continuous_rotation: bool = False,
+        continuous_rotation_id: str | None = None,
     ) -> list[str]:
         python = str(self.root / ".venv" / "bin" / "python")
         if pair == Pair.ETH:
@@ -693,6 +802,15 @@ class RotationSupervisor:
                     if not rotation_test_id or not re.fullmatch(r"[0-9a-f]{32}", rotation_test_id):
                         raise RuntimeError("bounded_rotation_test_id_missing_or_invalid")
                     command.extend(["--allow-unqualified-data-pilot", "--rotation-test-id", rotation_test_id])
+                if continuous_rotation:
+                    if not continuous_rotation_id or not re.fullmatch(r"[0-9a-f]{32}", continuous_rotation_id):
+                        raise RuntimeError("continuous_gradient_rotation_id_missing_or_invalid")
+                    command.extend([
+                        "--allow-unqualified-data-pilot",
+                        "--continuous-gradient-rotation",
+                        "--confirm-continuous-gradient-rotation",
+                        "--rotation-test-id", continuous_rotation_id,
+                    ])
             return command
         raise RuntimeError("rotation_target_invalid")
 
@@ -704,6 +822,8 @@ class RotationSupervisor:
         session_name: str,
         bounded_test: bool = False,
         rotation_test_id: str | None = None,
+        continuous_rotation: bool = False,
+        continuous_rotation_id: str | None = None,
     ) -> str:
         if os.name == "nt":
             raise RuntimeError("automatic_rotation_execution_requires_linux")
@@ -718,6 +838,8 @@ class RotationSupervisor:
         command = self._start_command(
             pair, recovery=recovery, bounded_test=bounded_test,
             rotation_test_id=rotation_test_id,
+            continuous_rotation=continuous_rotation,
+            continuous_rotation_id=continuous_rotation_id,
         )
         shell = (
             f"cd {shlex.quote(str(self.root))} && set -a && . ./.env && set +a && "
@@ -855,10 +977,18 @@ class RotationSupervisor:
                     raise RuntimeError("bounded_rotation_test_authorization_unavailable")
                 if not snapshot.get("wti_bounded_test_gate_ready") or not snapshot.get("session", {}).get("allow_new_entries"):
                     raise RuntimeError("bounded_rotation_test_current_market_gate_not_met")
+            elif self.continuous_gradient_rotation:
+                session = journal.get("continuous_gradient_rotation") or {}
+                if session.get("status") not in {"authorized", "active"}:
+                    raise RuntimeError("continuous_gradient_rotation_authorization_unavailable")
+                if not snapshot.get("continuous_gradient_gate_ready") or not snapshot.get("session", {}).get("allow_new_entries"):
+                    raise RuntimeError("continuous_gradient_rotation_current_market_gate_not_met")
             elif not snapshot["readiness"].get("production_ready"):
                 raise RuntimeError("wti_production_readiness_not_met")
             pilot = state.get("gradient_pilot") or {}
-            if pilot.get("status") in {"completed", "exhausted"}:
+            if pilot.get("status") == "exhausted" or (
+                pilot.get("status") == "completed" and not self.continuous_gradient_rotation
+            ):
                 raise RuntimeError("persisted_gradient_pilot_budget_already_consumed")
         phase = RotationPhase.RECOVERING if recovery else RotationPhase.STARTING
         session_name = journal.get("tmux_session") or f"rotation-{pair.value.lower()}-{datetime.now(timezone.utc).strftime('%m%d%H%M%S')}"
@@ -878,6 +1008,13 @@ class RotationSupervisor:
                 self._launch(
                     pair, recovery=recovery, session_name=session_name,
                     bounded_test=True, rotation_test_id=str(test.get("test_id") or ""),
+                )
+            elif self.continuous_gradient_rotation and pair == Pair.WTI and not recovery:
+                session = journal.get("continuous_gradient_rotation") or {}
+                self._launch(
+                    pair, recovery=False, session_name=session_name,
+                    continuous_rotation=True,
+                    continuous_rotation_id=str(session.get("session_id") or ""),
                 )
             else:
                 self._launch(pair, recovery=recovery, session_name=session_name)
@@ -954,11 +1091,96 @@ class RotationSupervisor:
             raise RuntimeError("bounded_rotation_test_not_reusable")
         return test
 
+    def _prepare_continuous_gradient_rotation(
+        self, journal: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if not self.continuous_gradient_rotation:
+            return None
+        session = journal.get("continuous_gradient_rotation")
+        if session is None:
+            session = {
+                "schema_version": 1,
+                "session_id": uuid.uuid4().hex,
+                "status": "authorized",
+                "market_id": self.market_id,
+                "multiplier": str(self.multiplier),
+                "entry_threshold_bps": "30",
+                "second_tier_bps": "45",
+                "exit_target_bps": "1",
+                "roundtrip_cost_bps": "10",
+                "layer_notional_usd": str(CONTINUOUS_ROTATION_LAYER_NOTIONAL_USD),
+                "max_layers": CONTINUOUS_ROTATION_MAX_LAYERS,
+                "max_notional_usd": str(CONTINUOUS_ROTATION_MAX_NOTIONAL_USD),
+                "max_slippage_bps": "8",
+                "max_hold_seconds": 21600,
+                "entry_cutoff_seconds": 1800,
+                "max_rounds": None,
+                "rounds_completed": 0,
+                "rounds_started": 0,
+                "authorized_at": datetime.now(timezone.utc).isoformat(),
+                "pilot_id": None,
+            }
+            journal["continuous_gradient_rotation"] = session
+            self._save_journal(journal)
+        expected = {
+            "schema_version": 1,
+            "market_id": self.market_id,
+            "multiplier": str(self.multiplier),
+            "entry_threshold_bps": "30",
+            "second_tier_bps": "45",
+            "exit_target_bps": "1",
+            "roundtrip_cost_bps": "10",
+            "layer_notional_usd": str(CONTINUOUS_ROTATION_LAYER_NOTIONAL_USD),
+            "max_layers": CONTINUOUS_ROTATION_MAX_LAYERS,
+            "max_notional_usd": str(CONTINUOUS_ROTATION_MAX_NOTIONAL_USD),
+            "max_slippage_bps": "8",
+            "max_hold_seconds": 21600,
+            "entry_cutoff_seconds": 1800,
+            "max_rounds": None,
+        }
+        if (
+            not isinstance(session, dict)
+            or not isinstance(session.get("session_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", session.get("session_id", ""))
+            or any(session.get(key) != value for key, value in expected.items())
+            or session.get("status") not in {"authorized", "active"}
+        ):
+            raise RuntimeError("continuous_gradient_rotation_journal_invalid")
+        state = read_object(self.root / "log/wti_live_state.json")
+        state_session = state.get("gradient_rotation_session") or {}
+        pilot = state.get("gradient_pilot")
+        if state_session:
+            if (
+                state_session.get("session_id") != session["session_id"]
+                or state_session.get("market_id") != self.market_id
+                or str(state_session.get("multiplier")) != str(self.multiplier)
+                or state_session.get("status") != "active"
+            ):
+                raise RuntimeError("continuous_gradient_state_identity_mismatch_manual_review_required")
+            session["rounds_completed"] = state_session.get("rounds_completed", 0)
+            session["rounds_started"] = state_session.get("rounds_started", 0)
+        if isinstance(pilot, dict):
+            same_session = (
+                pilot.get("rotation_test_id") == session["session_id"]
+                and pilot.get("continuous_rotation") is True
+            )
+            if same_session:
+                if pilot.get("status") == "exhausted":
+                    raise RuntimeError("continuous_gradient_round_exhausted_manual_review_required")
+                session["pilot_id"] = pilot.get("pilot_id")
+                session["status"] = "active"
+            elif pilot.get("status") != "completed":
+                raise RuntimeError("existing_gradient_pilot_not_terminal_manual_review_required")
+        journal["continuous_gradient_rotation"] = session
+        self._save_journal(journal)
+        return session
+
     def run_once(self) -> dict[str, Any]:
         journal = validate_journal(read_object(self.journal_path))
         if journal["phase"] == RotationPhase.BLOCKED.value:
             raise RuntimeError("rotation_journal_blocked_manual_review_required")
         test_authorization = self._prepare_bounded_rotation_test(journal)
+        continuous_authorization = self._prepare_continuous_gradient_rotation(journal)
         snapshot = collect_snapshot(
             self.root,
             market_id=self.market_id,
@@ -966,6 +1188,11 @@ class RotationSupervisor:
             bounded_rotation_test=self.bounded_rotation_test,
             rotation_test_status=(
                 None if test_authorization is None else str(test_authorization["status"])
+            ),
+            continuous_gradient_rotation=self.continuous_gradient_rotation,
+            continuous_rotation_status=(
+                None if continuous_authorization is None
+                else str(continuous_authorization["status"])
             ),
         )
         plan = rehearsal_plan(snapshot)
@@ -1113,6 +1340,76 @@ class RotationSupervisor:
         target = Pair(snapshot["target_pair"])
         if target == current:
             if (
+                self.continuous_gradient_rotation
+                and current == Pair.WTI
+                and snapshot.get("continuous_gradient_gate_ready") is True
+                and snapshot.get("session", {}).get("allow_new_entries") is True
+            ):
+                wti_state = snapshot["states"]["WTI"]
+                health = runtime["health"]
+                pilot = wti_state.get("gradient_pilot")
+                session_id = (journal.get("continuous_gradient_rotation") or {}).get("session_id")
+                current_round = (
+                    isinstance(pilot, dict)
+                    and pilot.get("rotation_test_id") == session_id
+                    and pilot.get("continuous_rotation") is True
+                )
+                active_round = current_round and pilot.get("status") in {
+                    "available", "entry_pending", "in_position",
+                }
+                if active_round:
+                    journal.update({
+                        "phase": RotationPhase.STABLE.value,
+                        "current_pair": current.value,
+                        "target_pair": current.value,
+                    })
+                    self._save_journal(journal)
+                    output.update({
+                        "action": "continue_continuous_gradient_rotation",
+                        "pair": current.value,
+                        "round_number": pilot.get("round_number"),
+                    })
+                    return output
+                if wti_state.get("pending_action") is not None:
+                    output.update({"action": "hold_current_wti_pending_reconciliation"})
+                    return output
+                pilot_matches = pilot is None or (
+                    isinstance(pilot, dict)
+                    and pilot.get("status") == "completed"
+                    and pilot.get("completed_roundtrips") == 1
+                    and _flat_state(Pair.WTI, wti_state)
+                )
+                management_only = (
+                    health.get("manage_existing_only") is True
+                    and health.get("wti_entry_authorized") is False
+                )
+                if management_only and not _flat_state(Pair.WTI, wti_state):
+                    output.update({"action": "continue_management_only_until_flat", "pair": current.value})
+                    return output
+                proof = _wti_account_proof(
+                    wti_state, health,
+                    market_id=self.market_id, now=datetime.now(timezone.utc),
+                )
+                if (
+                    proof.get("verified")
+                    and proof.get("active_orders_zero") is True
+                    and pilot_matches
+                    and _flat_state(Pair.WTI, wti_state)
+                ):
+                    journal.update({
+                        "current_pair": current.value,
+                        "target_pair": current.value,
+                    })
+                    self._write_drain(current, runtime, journal)
+                    output.update({
+                        "action": "request_continuous_rotation_runtime_start",
+                        "source": current.value,
+                        "target": current.value,
+                    })
+                    return output
+                output.update({"action": "hold_current_wti_account_or_round_proof_unverified"})
+                return output
+            if (
                 self.bounded_rotation_test
                 and current == Pair.WTI
                 and snapshot.get("wti_bounded_test_gate_ready") is True
@@ -1239,6 +1536,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--execute", action="store_true", help="Run the automatic live rotation supervisor.")
     parser.add_argument("--bounded-rotation-test", action="store_true", help="Limit the WTI side to one persisted two-layer round trip.")
     parser.add_argument("--confirm-bounded-rotation-test", action="store_true")
+    parser.add_argument("--continuous-gradient-rotation", action="store_true", help="Keep authorizing sequential two-layer WTI rounds under one persistent rotation session.")
+    parser.add_argument("--confirm-continuous-gradient-rotation", action="store_true")
     parser.add_argument("--rehearse-session", choices=("live", "open", "closed"), default="live", help="Read-only session scenario; open/closed do not change exchange state.")
     parser.add_argument("--confirm-automatic-rotation", action="store_true")
     parser.add_argument("--i-understand-live-orders", action="store_true")
@@ -1258,6 +1557,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("bounded rotation test execution requires --confirm-bounded-rotation-test")
     if args.confirm_bounded_rotation_test and not args.bounded_rotation_test:
         parser.error("bounded-test confirmation requires --bounded-rotation-test")
+    if args.bounded_rotation_test and args.continuous_gradient_rotation:
+        parser.error("bounded and continuous gradient rotation modes are mutually exclusive")
+    if args.execute and args.continuous_gradient_rotation and not args.confirm_continuous_gradient_rotation:
+        parser.error("continuous gradient rotation requires --confirm-continuous-gradient-rotation")
+    if args.confirm_continuous_gradient_rotation and not args.continuous_gradient_rotation:
+        parser.error("continuous-rotation confirmation requires --continuous-gradient-rotation")
     if args.execute and args.rehearse_session != "live":
         parser.error("simulated session scenarios are read-only")
     supervisor = RotationSupervisor(
@@ -1267,6 +1572,7 @@ def main(argv: list[str] | None = None) -> int:
         confirm_initial_flat=args.confirm_initial_flat,
         dry_run=not args.execute,
         bounded_rotation_test=args.bounded_rotation_test,
+        continuous_gradient_rotation=args.continuous_gradient_rotation,
     )
     if not args.execute:
         try:
@@ -1275,6 +1581,7 @@ def main(argv: list[str] | None = None) -> int:
                 market_id=args.lighter_market_id,
                 multiplier=args.lighter_multiplier,
                 bounded_rotation_test=args.bounded_rotation_test,
+                continuous_gradient_rotation=args.continuous_gradient_rotation,
             )
             print(json.dumps({"snapshot": {
                 key: value for key, value in snapshot.items()

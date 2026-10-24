@@ -39,6 +39,7 @@ from tools.lib.lighter_order_identity import (
     legacy_lighter_index_was_unsendable,
     lighter_order_identity,
 )
+from tools.lib.wti_sizing import size_paired_layer
 
 
 SCHEMA_VERSION = 2
@@ -261,20 +262,6 @@ def validate_market_sample(
     )
 
 
-def _size_for_notional(notional: Decimal, context: MarketContext) -> tuple[Decimal, Decimal]:
-    if notional <= 0:
-        raise WTIExecutionError("notional_must_be_positive")
-    reference = (context.lighter_bid + context.lighter_ask) / Decimal("2")
-    required = max(
-        notional / (reference * context.multiplier),
-        context.lighter_min_base,
-        context.lighter_min_quote / (reference * context.multiplier),
-    )
-    steps = (required / context.lighter_qty_step).to_integral_value(rounding=ROUND_CEILING)
-    lighter_qty = steps * context.lighter_qty_step
-    return lighter_qty * context.multiplier, lighter_qty
-
-
 def _active_order_count(payload: Any) -> int | None:
     if not isinstance(payload, dict):
         return None
@@ -391,6 +378,9 @@ def _normalized_order_result(
         "trade_ids_confirmed": isinstance(trade_ids, list),
         "fee_usd": str(fee) if fee is not None else None,
         "fee_confirmed": fee is not None,
+        "trade_fill_coverage_complete": payload.get("trade_fill_coverage_complete") is True,
+        "matched_trade_qty": str(decimal_value(payload.get("matched_trade_qty")))
+        if decimal_value(payload.get("matched_trade_qty")) is not None else None,
         "trade_fee_evidence": deepcopy(payload.get("trade_fee_evidence"))
         if isinstance(payload.get("trade_fee_evidence"), list) else None,
         "average_price": (
@@ -764,20 +754,24 @@ class WTIExecutionStore:
         config: dict[str, Any],
         max_layers: int,
         rotation_test_id: str | None = None,
+        continuous_rotation: bool = False,
+        new_pilot_after: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(max_layers, int) or isinstance(max_layers, bool) or max_layers < 2:
             raise ValueError("gradient_pilot_requires_at_least_two_layers")
+        if continuous_rotation and not rotation_test_id:
+            raise ValueError("continuous_gradient_rotation_id_required")
         with self.exclusive():
             state = self.load()
             pilot = state.get("gradient_pilot")
-            if pilot is None:
-                if (
-                    state.get("status") != "flat"
-                    or state.get("open_position") is not None
-                    or state.get("pending_action") is not None
-                ):
-                    raise WTIExecutionError("gradient_pilot_requires_flat_wti_state")
-                pilot = {
+            flat = (
+                state.get("status") == "flat"
+                and state.get("open_position") is None
+                and state.get("pending_action") is None
+            )
+
+            def make_pilot(*, round_number: int, previous_pilot_id: str | None = None) -> dict[str, Any]:
+                return {
                     "schema_version": 1,
                     "pilot_id": uuid.uuid4().hex,
                     "status": "available",
@@ -786,11 +780,120 @@ class WTIExecutionStore:
                     "config": deepcopy(config),
                     "max_layers": max_layers,
                     "rotation_test_id": rotation_test_id,
+                    "continuous_rotation": continuous_rotation,
+                    "round_number": round_number,
+                    "previous_pilot_id": previous_pilot_id,
                     "layers_opened": [],
                     "exhausted_tiers": [],
                     "completed_roundtrips": 0,
                     "started_at": _utc_now(),
                 }
+
+            if new_pilot_after is not None:
+                if not continuous_rotation or not isinstance(pilot, dict):
+                    raise WTIExecutionError("gradient_rotation_predecessor_missing")
+                if pilot.get("pilot_id") == new_pilot_after:
+                    if (
+                        not flat
+                        or pilot.get("status") != "completed"
+                        or pilot.get("completed_roundtrips") != 1
+                        or pilot.get("market_id") != market_id
+                        or decimal_value(pilot.get("multiplier")) != multiplier
+                        or pilot.get("config") != config
+                        or pilot.get("max_layers") != max_layers
+                    ):
+                        raise WTIExecutionError("gradient_rotation_requires_completed_flat_round")
+                    proof = state.get("last_account_reconciliation") or {}
+                    try:
+                        proof_at = datetime.fromisoformat(
+                            str(proof.get("observed_at")).replace("Z", "+00:00")
+                        )
+                        proof_age = (datetime.now(timezone.utc) - proof_at.astimezone(timezone.utc)).total_seconds()
+                        proof_is_fresh = (
+                            proof_at.tzinfo is not None
+                            and proof_at.utcoffset() is not None
+                            and -5 <= proof_age <= 15
+                        )
+                    except (TypeError, ValueError):
+                        proof_is_fresh = False
+                    if (
+                        proof.get("verified") is not True
+                        or proof.get("market_id") != market_id
+                        or proof.get("active_order_count") != 0
+                        or decimal_value(proof.get("variational_qty")) != 0
+                        or decimal_value(proof.get("lighter_qty")) != 0
+                        or not proof_is_fresh
+                    ):
+                        raise WTIExecutionError("gradient_rotation_requires_fresh_dual_flat_proof")
+                    session = state.get("gradient_rotation_session") or {}
+                    if session and (
+                        session.get("session_id") != rotation_test_id
+                        or session.get("status") != "active"
+                        or session.get("market_id") != market_id
+                        or decimal_value(session.get("multiplier")) != multiplier
+                        or session.get("config") != config
+                        or session.get("max_layers") != max_layers
+                        or session.get("last_pilot_id") != pilot.get("pilot_id")
+                    ):
+                        raise WTIExecutionError("gradient_rotation_session_identity_mismatch")
+                    state["last_completed_gradient_pilot"] = {
+                        key: pilot.get(key) for key in (
+                            "pilot_id", "round_number", "completed_at", "exit_action_id",
+                            "completed_roundtrips", "rotation_test_id",
+                        )
+                    }
+                    next_round = int(pilot.get("round_number", 0)) + 1 if session else 1
+                    next_pilot = make_pilot(
+                        round_number=next_round,
+                        previous_pilot_id=pilot["pilot_id"],
+                    )
+                    if not session:
+                        session = {
+                            "schema_version": 1,
+                            "session_id": rotation_test_id,
+                            "status": "active",
+                            "market_id": market_id,
+                            "multiplier": str(multiplier),
+                            "config": deepcopy(config),
+                            "max_layers": max_layers,
+                            "rounds_started": 1,
+                            "rounds_completed": 0,
+                            "started_at": _utc_now(),
+                        }
+                    else:
+                        session["rounds_started"] = int(session.get("rounds_started", 1)) + 1
+                    session["last_pilot_id"] = next_pilot["pilot_id"]
+                    session["updated_at"] = _utc_now()
+                    state["gradient_rotation_session"] = session
+                    state["gradient_pilot"] = next_pilot
+                    self.save(state)
+                    pilot = next_pilot
+                elif pilot.get("previous_pilot_id") != new_pilot_after:
+                    raise WTIExecutionError("gradient_rotation_predecessor_identity_mismatch")
+            if pilot is None:
+                if not flat:
+                    raise WTIExecutionError("gradient_pilot_requires_flat_wti_state")
+                session = state.get("gradient_rotation_session")
+                if continuous_rotation:
+                    if session is not None:
+                        raise WTIExecutionError("gradient_rotation_session_pilot_missing")
+                    pilot = make_pilot(round_number=1)
+                    state["gradient_rotation_session"] = {
+                        "schema_version": 1,
+                        "session_id": rotation_test_id,
+                        "status": "active",
+                        "market_id": market_id,
+                        "multiplier": str(multiplier),
+                        "config": deepcopy(config),
+                        "max_layers": max_layers,
+                        "rounds_started": 1,
+                        "rounds_completed": 0,
+                        "last_pilot_id": pilot["pilot_id"],
+                        "started_at": _utc_now(),
+                        "updated_at": _utc_now(),
+                    }
+                else:
+                    pilot = make_pilot(round_number=1)
                 state["gradient_pilot"] = pilot
                 self.save(state)
             if (
@@ -802,6 +905,7 @@ class WTIExecutionStore:
                 or pilot.get("config") != config
                 or pilot.get("max_layers") != max_layers
                 or pilot.get("rotation_test_id") != rotation_test_id
+                or pilot.get("continuous_rotation", False) != continuous_rotation
                 or not isinstance(pilot.get("layers_opened"), list)
                 or not isinstance(pilot.get("exhausted_tiers", []), list)
                 or not isinstance(pilot.get("completed_roundtrips"), int)
@@ -814,6 +918,8 @@ class WTIExecutionStore:
                 raise WTIExecutionError("gradient_pilot_budget_unavailable")
             if pilot.get("completed_roundtrips") != 0:
                 raise CorruptExecutionState("active gradient pilot has completed roundtrips")
+            if not isinstance(pilot.get("round_number"), int) or pilot["round_number"] < 1:
+                raise CorruptExecutionState("gradient pilot round number is invalid")
             position = state.get("open_position")
             pending = state.get("pending_action")
             if position is not None and position.get("gradient_pilot_id") != pilot.get("pilot_id"):
@@ -1462,6 +1568,19 @@ class WTIPairExecutor:
         pilot["completed_roundtrips"] = 1
         pilot["exit_action_id"] = execution["action_id"]
         pilot["completed_at"] = execution["completed_at"]
+        if pilot.get("continuous_rotation"):
+            session = state.get("gradient_rotation_session")
+            if (
+                not isinstance(session, dict)
+                or session.get("session_id") != pilot.get("rotation_test_id")
+                or session.get("last_pilot_id") != pilot_id
+                or session.get("status") != "active"
+            ):
+                raise CorruptExecutionState("continuous gradient session identity mismatch on close")
+            session["rounds_completed"] = int(session.get("rounds_completed", 0)) + 1
+            session["last_completed_pilot_id"] = pilot_id
+            session["last_completed_at"] = execution["completed_at"]
+            session["updated_at"] = execution["completed_at"]
 
     @staticmethod
     def _complete_single_round_pilot(
@@ -1695,35 +1814,13 @@ class WTIPairExecutor:
             raise WTIExecutionError("gradient_layer_tier_invalid")
         if (gradient_pilot_id is None) != (gradient_tier is None):
             raise WTIExecutionError("gradient_pilot_requires_gradient_layer")
-        var_qty, lighter_qty = _size_for_notional(notional_usd, context)
-        reference = (context.lighter_bid + context.lighter_ask) / Decimal("2")
-        planned_notional = lighter_qty * context.multiplier * reference
-        if planned_notional > self.max_notional_usd:
-            # A target equal to the cap cannot be rounded up past that cap.
-            capped_steps = (
-                self.max_notional_usd / (reference * context.multiplier)
-                / context.lighter_qty_step
-            ).to_integral_value(rounding=ROUND_FLOOR)
-            lighter_qty = capped_steps * context.lighter_qty_step
-            var_qty = lighter_qty * context.multiplier
-            planned_notional = lighter_qty * context.multiplier * reference
-            if (
-                lighter_qty <= 0
-                or lighter_qty < context.lighter_min_base
-                or planned_notional < context.lighter_min_quote
-                or planned_notional > self.max_notional_usd
-            ):
-                raise WTIExecutionError("rounded_order_exceeds_executor_notional_limit")
-        if context.quoted_var_qty < var_qty or context.quoted_lighter_qty < lighter_qty:
-            raise WTIExecutionError("readonly_sample_depth_below_order_quantity")
-        if not context.instrument or not paired_exposure_matches(
-            var_qty=var_qty, lighter_qty=lighter_qty,
-            instrument=context.instrument, tolerance=context.position_tolerance,
-        ):
-            raise WTIExecutionError("planned_pair_exposure_mismatch")
-        expected = _signed_target(direction, var_qty, lighter_qty)
         var_side, lighter_side = (
             ("buy", "sell") if direction == "long_var_short_lighter" else ("sell", "buy")
+        )
+        var_order_price = context.var_ask if var_side == "buy" else context.var_bid
+        lighter_order_price = (
+            context.lighter_sell_price if lighter_side == "sell"
+            else context.lighter_buy_price
         )
 
         with self.store.exclusive():
@@ -1807,24 +1904,16 @@ class WTIPairExecutor:
             baseline = self._read(context)
             if previous_position is None:
                 baseline_expected = (Decimal("0"), Decimal("0"))
-                existing_notional = Decimal("0")
             else:
                 expected_var = decimal_value(previous_position.get("expected_var_qty"))
                 expected_lighter = decimal_value(previous_position.get("expected_lighter_qty"))
                 previous_var_qty = decimal_value(previous_position.get("var_qty"))
                 previous_lighter_qty = decimal_value(previous_position.get("lighter_qty"))
-                previous_var_price = decimal_value(previous_position.get("var_entry_price"))
-                previous_lighter_price = decimal_value(previous_position.get("lighter_entry_price"))
                 if None in (
                     expected_var, expected_lighter, previous_var_qty, previous_lighter_qty,
-                    previous_var_price, previous_lighter_price,
                 ):
                     raise WTIExecutionError("existing_wti_position_not_layerable")
                 baseline_expected = (expected_var, expected_lighter)
-                existing_notional = (
-                    previous_var_price * previous_var_qty
-                    + previous_lighter_price * previous_lighter_qty * context.multiplier
-                ) / Decimal("2")
             if baseline.active_order_count != 0:
                 raise WTIExecutionError("wti_account_not_flat_or_has_active_orders")
             if not _matches(baseline, baseline_expected, context):
@@ -1833,8 +1922,56 @@ class WTIPairExecutor:
                     if previous_position is None
                     else "wti_account_position_mismatch_before_entry"
                 )
-            if existing_notional + planned_notional > self.max_notional_usd:
-                raise WTIExecutionError("gradient_aggregate_notional_limit_exceeded")
+            existing_var_qty = (
+                decimal_value(previous_position.get("var_qty"))
+                if previous_position is not None else Decimal("0")
+            )
+            existing_lighter_qty = (
+                decimal_value(previous_position.get("lighter_qty"))
+                if previous_position is not None else Decimal("0")
+            )
+            if existing_var_qty is None or existing_lighter_qty is None:
+                raise WTIExecutionError("existing_wti_position_not_layerable")
+            safety_markup = Decimal("1") + self.max_slippage_bps / Decimal("10000")
+            lighter_qty = size_paired_layer(
+                target_notional_usd=notional_usd,
+                max_notional_usd=self.max_notional_usd,
+                multiplier=context.multiplier,
+                qty_step=context.lighter_qty_step,
+                min_base_qty=context.lighter_min_base,
+                min_quote_usd=context.lighter_min_quote,
+                var_order_price=max(
+                    context.var_bid, context.var_ask, var_order_price,
+                ) * safety_markup,
+                lighter_order_price=max(
+                    context.lighter_bid, context.lighter_ask,
+                    lighter_order_price,
+                ) * safety_markup,
+                lighter_sizing_price=lighter_order_price,
+                lighter_min_quote_price=lighter_order_price * (
+                    Decimal("1") - self.max_slippage_bps / Decimal("10000")
+                ),
+                allow_reduce_to_cap=previous_position is None,
+                existing_var_qty=existing_var_qty,
+                existing_lighter_qty=existing_lighter_qty,
+                existing_var_mark_price=max(context.var_bid, context.var_ask),
+                existing_lighter_mark_price=max(context.lighter_bid, context.lighter_ask),
+            )
+            if lighter_qty is None:
+                raise WTIExecutionError(
+                    "gradient_aggregate_notional_limit_exceeded"
+                    if previous_position is not None
+                    else "rounded_order_exceeds_executor_notional_limit"
+                )
+            var_qty = lighter_qty * context.multiplier
+            if context.quoted_var_qty < var_qty or context.quoted_lighter_qty < lighter_qty:
+                raise WTIExecutionError("readonly_sample_depth_below_order_quantity")
+            if not context.instrument or not paired_exposure_matches(
+                var_qty=var_qty, lighter_qty=lighter_qty,
+                instrument=context.instrument, tolerance=context.position_tolerance,
+            ):
+                raise WTIExecutionError("planned_pair_exposure_mismatch")
+            expected = _signed_target(direction, var_qty, lighter_qty)
             action_id = uuid.uuid4().hex
             expected_delta = _signed_target(direction, var_qty, lighter_qty)
             expected = (

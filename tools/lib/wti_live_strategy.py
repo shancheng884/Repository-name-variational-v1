@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal
 from typing import Any
 
 from tools.lib.hedge_instruments import WTI_HEDGE, paired_realized_pnl
 from tools.lib.market_sessions import session_observation_for_sample
+from tools.lib.wti_sizing import size_paired_layer
 from tools.lib.wti_replay import ReplayConfig, _decimal
 
 
@@ -222,22 +223,45 @@ def decide_wti_gradient_action(
         multiplier = Decimal(str(position["multiplier"]))
         var_qty = Decimal(str(position["var_qty"]))
         lighter_qty = Decimal(str(position["lighter_qty"]))
-        var_entry = Decimal(str(position["var_entry_price"]))
-        lighter_entry = Decimal(str(position["lighter_entry_price"]))
-        ref = (Decimal(str(row["lighter_bid"])) + Decimal(str(row["lighter_ask"]))) / 2
+        max_slippage = Decimal(str(pilot["config"]["max_slippage_bps"]))
+        if not max_slippage.is_finite() or max_slippage <= 0:
+            raise ValueError("invalid max slippage")
+        markup = Decimal("1") + max_slippage / Decimal("10000")
+        var_order_price = Decimal(str(
+            row["var_ask"] if direction == "long_var_short_lighter" else row["var_bid"]
+        ))
+        lighter_order_price = Decimal(str(
+            row["lighter_sell_price"] if direction == "long_var_short_lighter"
+            else row["lighter_buy_price"]
+        ))
+        var_mark = max(Decimal(str(row["var_bid"])), Decimal(str(row["var_ask"])))
+        lighter_mark = max(
+            Decimal(str(row["lighter_bid"])), Decimal(str(row["lighter_ask"]))
+        )
         decimals = int(row["lighter_supported_size_decimals"])
         min_base = Decimal(str(row.get("lighter_min_base_amount") or "0"))
         min_quote = Decimal(str(row.get("lighter_min_quote_amount") or "0"))
         step = Decimal("1").scaleb(-decimals)
-        required = max(
-            layer_notional / (ref * multiplier),
-            min_base,
-            min_quote / (ref * multiplier),
+        qty = size_paired_layer(
+            target_notional_usd=layer_notional,
+            max_notional_usd=cap,
+            multiplier=multiplier,
+            qty_step=step,
+            min_base_qty=min_base,
+            min_quote_usd=min_quote,
+            var_order_price=max(var_mark, var_order_price) * markup,
+            lighter_order_price=max(lighter_mark, lighter_order_price) * markup,
+            lighter_sizing_price=lighter_order_price,
+            lighter_min_quote_price=lighter_order_price * (
+                Decimal("1") - max_slippage / Decimal("10000")
+            ),
+            allow_reduce_to_cap=False,
+            existing_var_qty=var_qty,
+            existing_lighter_qty=lighter_qty,
+            existing_var_mark_price=var_mark,
+            existing_lighter_mark_price=lighter_mark,
         )
-        qty = (required / step).to_integral_value(rounding=ROUND_CEILING) * step
-        existing = (var_entry * var_qty + lighter_entry * lighter_qty * multiplier) / 2
-        incremental = qty * ref * multiplier
-        if existing + incremental > cap:
+        if qty is None:
             return {"action": "hold", "reason": "gradient_aggregate_notional_cap_would_be_exceeded"}
     except (KeyError, TypeError, ValueError, ArithmeticError):
         return {"action": "hold", "reason": "gradient_aggregate_notional_unverifiable"}

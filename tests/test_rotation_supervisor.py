@@ -264,6 +264,8 @@ def test_open_and_closed_session_rehearsals_route_without_side_effects():
     snapshot["bounded_rotation_test"] = True
     snapshot["bounded_test_authorized"] = True
     snapshot["wti_bounded_test_gate_ready"] = True
+    snapshot["continuous_gradient_rotation"] = True
+    snapshot["continuous_gradient_gate_ready"] = True
     snapshot["wti_ready"] = False
     snapshot["wti_gate_reasons"] = []
     snapshot["runtimes"]["ETH"]["health"].update({
@@ -276,6 +278,8 @@ def test_open_and_closed_session_rehearsals_route_without_side_effects():
     closed_snapshot["bounded_rotation_test"] = True
     closed_snapshot["bounded_test_authorized"] = True
     closed_snapshot["wti_bounded_test_gate_ready"] = True
+    closed_snapshot["continuous_gradient_rotation"] = True
+    closed_snapshot["continuous_gradient_gate_ready"] = False
     closed_snapshot["wti_ready"] = True
     closed_snapshot["wti_production_gate_ready"] = False
     closed_plan = rehearsal_plan(closed_snapshot, session_scenario="closed")
@@ -284,10 +288,36 @@ def test_open_and_closed_session_rehearsals_route_without_side_effects():
     assert open_plan["decision"] == "drain_current"
     assert open_plan["allow_new_entries"] is False
     assert open_plan["side_effects"] is False
+    assert open_plan["continuous_gradient_rotation"] is True
+    assert open_plan["continuous_gradient_ready"] is True
     assert closed_plan["target_pair"] == "ETH"
     assert closed_plan["decision"] == "switch_to_target"
     assert closed_plan["allow_new_entries"] is False
     assert closed_plan["side_effects"] is False
+    assert closed_plan["continuous_gradient_rotation"] is True
+    assert closed_plan["continuous_gradient_ready"] is False
+
+
+def test_continuous_rotation_cli_requires_explicit_live_confirmations(monkeypatch):
+    with pytest.raises(SystemExit):
+        supervisor_module.main([
+            "--execute", "--continuous-gradient-rotation",
+            "--lighter-market-id", "145", "--lighter-multiplier", "1",
+        ])
+    with pytest.raises(SystemExit):
+        supervisor_module.main([
+            "--execute", "--bounded-rotation-test", "--confirm-bounded-rotation-test",
+            "--continuous-gradient-rotation", "--confirm-continuous-gradient-rotation",
+            "--confirm-automatic-rotation", "--i-understand-live-orders",
+            "--lighter-market-id", "145", "--lighter-multiplier", "1",
+        ])
+    monkeypatch.setattr(RotationSupervisor, "run", lambda self, **kwargs: 0)
+    assert supervisor_module.main([
+        "--execute", "--continuous-gradient-rotation",
+        "--confirm-continuous-gradient-rotation",
+        "--confirm-automatic-rotation", "--i-understand-live-orders",
+        "--lighter-market-id", "145", "--lighter-multiplier", "1",
+    ]) == 0
 
 
 def test_bounded_test_authorization_is_durable_and_config_bound(tmp_path: Path):
@@ -356,6 +386,104 @@ def test_completed_bounded_test_cannot_be_reauthorized_after_restart(tmp_path: P
     assert repeated["status"] == "completed"
     assert repeated["test_id"] == test_id
     assert repeated["completed_roundtrips"] == 1
+
+
+def test_continuous_gradient_authorization_is_durable_and_keeps_two_layer_budget(tmp_path: Path):
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=False, continuous_gradient_rotation=True,
+    )
+    first = supervisor._prepare_continuous_gradient_rotation(initial_journal())
+    assert first["status"] == "authorized"
+    assert first["max_rounds"] is None
+    assert first["entry_threshold_bps"] == "30"
+    assert first["second_tier_bps"] == "45"
+    assert first["max_layers"] == 2
+    assert first["layer_notional_usd"] == "10"
+    assert first["max_notional_usd"] == "20"
+
+    restarted = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=False, continuous_gradient_rotation=True,
+    )
+    journal = json.loads(restarted.journal_path.read_text(encoding="utf-8"))
+    resumed = restarted._prepare_continuous_gradient_rotation(journal)
+    assert resumed["session_id"] == first["session_id"]
+    assert resumed["rounds_started"] == 0
+    assert resumed["rounds_completed"] == 0
+
+
+def test_continuous_gradient_restart_adopts_active_round_without_duplicate_launch(tmp_path: Path, monkeypatch):
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=False, continuous_gradient_rotation=True,
+    )
+    journal = initial_journal()
+    authorization = supervisor._prepare_continuous_gradient_rotation(journal)
+    session_id = authorization["session_id"]
+    pilot = {
+        "pilot_id": "pilot-active", "rotation_test_id": session_id,
+        "continuous_rotation": True, "round_number": 3,
+        "status": "in_position", "completed_roundtrips": 0,
+        "max_layers": 2, "market_id": 145, "multiplier": "1",
+        "config": {
+            "entry_threshold_bps": "30", "exit_target_bps": "1",
+            "roundtrip_cost_bps": "10", "max_notional_usd": "20",
+            "max_slippage_bps": "8", "max_hold_seconds": 21600,
+            "entry_cutoff_seconds": 1800,
+            "tier_thresholds_bps": ["30", "45"],
+            "layer_notional_usd": "10", "max_layers": 2,
+            "max_completed_roundtrips": 1,
+        },
+    }
+    state_session = {
+        "session_id": session_id, "status": "active", "market_id": 145,
+        "multiplier": "1", "rounds_started": 3, "rounds_completed": 2,
+    }
+    write_object_atomic(tmp_path / "log/wti_live_state.json", {
+        "asset": "WTI", "status": "open",
+        "open_position": {"gradient_pilot_id": pilot["pilot_id"]},
+        "pending_action": None, "gradient_pilot": pilot,
+        "gradient_rotation_session": state_session,
+    })
+    snapshot = _snapshot(current="WTI", target="WTI")
+    snapshot.update({
+        "continuous_gradient_rotation": True,
+        "continuous_gradient_authorized": True,
+        "continuous_gradient_gate_ready": True,
+    })
+    snapshot["states"]["WTI"].update({
+        "status": "open", "open_position": {"gradient_pilot_id": pilot["pilot_id"]},
+        "gradient_pilot": pilot, "gradient_rotation_session": state_session,
+    })
+    launches = []
+    monkeypatch.setattr(supervisor_module, "collect_snapshot", lambda *a, **kw: snapshot)
+    monkeypatch.setattr(supervisor, "_launch", lambda *a, **kw: launches.append((a, kw)))
+
+    first = supervisor.run_once()
+    second = supervisor.run_once()
+
+    assert first["action"] == second["action"] == "continue_continuous_gradient_rotation"
+    assert first["round_number"] == 3
+    assert launches == []
+
+
+def test_continuous_rotation_start_command_is_explicit_and_config_pinned(tmp_path: Path):
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=True, continuous_gradient_rotation=True,
+    )
+    command = supervisor._start_command(
+        Pair.WTI, continuous_rotation=True, continuous_rotation_id="f" * 32,
+    )
+    assert "--continuous-gradient-rotation" in command
+    assert "--confirm-continuous-gradient-rotation" in command
+    assert "--allow-unqualified-data-pilot" in command
+    assert command[command.index("--entry-threshold-bps") + 1] == "30"
+    assert command[command.index("--gradient-second-tier-bps") + 1] == "45"
+    assert command[command.index("--gradient-layer-notional-usd") + 1] == "10"
+    assert command[command.index("--max-notional-usd") + 1] == "20"
+    assert command[command.index("--rotation-test-id") + 1] == "f" * 32
 
 
 def test_management_only_wti_upgrades_via_verified_drain_not_duplicate_start(tmp_path: Path, monkeypatch):

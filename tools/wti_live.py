@@ -441,7 +441,19 @@ class WTILiveRuntime:
                 if not getattr(self.args, "confirm_bounded_gradient_pilot", False):
                     raise RuntimeError("explicit_bounded_gradient_pilot_confirmation_required")
                 self.pilot_store = store
-                if local_exposure:
+                continuous_rotation = bool(
+                    getattr(self.args, "continuous_gradient_rotation", False)
+                )
+                existing_gradient = existing.get("gradient_pilot") or {}
+                if (
+                    continuous_rotation
+                    and existing_gradient.get("status") == "completed"
+                    and not local_exposure
+                ):
+                    # A new round is armed only after this runtime proves both
+                    # accounts flat with a fresh read.
+                    self.gradient_pilot = dict(existing_gradient)
+                elif local_exposure:
                     if not gradient_pilot_owns_exposure(existing):
                         raise RuntimeError("existing_wti_exposure_not_owned_by_gradient_pilot")
                     self.gradient_pilot = store.initialize_gradient_pilot(
@@ -450,6 +462,7 @@ class WTILiveRuntime:
                         config=self._gradient_pilot_config(),
                         max_layers=2,
                         rotation_test_id=getattr(self.args, "rotation_test_id", None),
+                        continuous_rotation=continuous_rotation,
                     )
                 else:
                     if (
@@ -465,6 +478,7 @@ class WTILiveRuntime:
                         config=self._gradient_pilot_config(),
                         max_layers=2,
                         rotation_test_id=getattr(self.args, "rotation_test_id", None),
+                        continuous_rotation=continuous_rotation,
                     )
             elif local_exposure:
                 pilot_owns_exposure = single_round_pilot_owns_exposure(existing)
@@ -747,6 +761,66 @@ class WTILiveRuntime:
             )
         finally:
             self.last_reconcile_elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+
+    async def _advance_continuous_gradient_round(
+        self, state: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not getattr(self.args, "continuous_gradient_rotation", False):
+            return state
+        self._poll_rotation_drain()
+        if getattr(self, "rotation_drain_request", None) is not None:
+            self.entry_authorized = False
+            return state
+        pilot = state.get("gradient_pilot") or {}
+        if pilot.get("status") != "completed":
+            return state
+        if (
+            state.get("status") != "flat"
+            or state.get("open_position") is not None
+            or state.get("pending_action") is not None
+        ):
+            self.entry_authorized = False
+            self.entry_gate_block_reason = "gradient_next_round_requires_resolved_flat_state"
+            return state
+        assert self.pilot_store is not None and self.market_metadata is not None
+        state = await self._read_account_only_reconcile()
+        if (
+            state.get("status") != "flat"
+            or state.get("open_position") is not None
+            or state.get("pending_action") is not None
+        ):
+            self.entry_authorized = False
+            self.entry_gate_block_reason = "gradient_next_round_requires_verified_flat_account"
+            self.last_action = {
+                "action": "blocked",
+                "reason": state.get("manual_review_reason") or "account_not_flat",
+            }
+            return state
+        predecessor = str(pilot.get("pilot_id") or "")
+        next_pilot = await asyncio.to_thread(
+            self.pilot_store.initialize_gradient_pilot,
+            market_id=int(self.market_metadata["market_id"]),
+            multiplier=Decimal(str(self.market_metadata["multiplier"])),
+            config=self._gradient_pilot_config(),
+            max_layers=2,
+            rotation_test_id=getattr(self.args, "rotation_test_id", None),
+            continuous_rotation=True,
+            new_pilot_after=predecessor,
+        )
+        self.gradient_pilot = dict(next_pilot)
+        self.entry_authorized = False
+        self.entry_gate_block_reason = "gradient_next_round_armed_waiting_for_fresh_sample"
+        self.last_action = {
+            "action": "gradient_round_armed",
+            "round_number": next_pilot.get("round_number"),
+            "pilot_id": next_pilot.get("pilot_id"),
+        }
+        self.logger.info(
+            "wti_gradient_round_armed session_id=%s round=%s pilot_id=%s",
+            next_pilot.get("rotation_test_id"), next_pilot.get("round_number"),
+            next_pilot.get("pilot_id"),
+        )
+        return state
 
     def _refresh_readiness(self) -> None:
         if self.args.mode != "live" or not self.market_metadata:
@@ -1073,6 +1147,8 @@ class WTILiveRuntime:
         state = await self._read_reconcile(row)
         self.last_risk = dict(self.gateway.latest_risk)
         self._poll_rotation_drain()
+        if getattr(self, "rotation_drain_request", None) is None:
+            state = await self._advance_continuous_gradient_round(state)
         if state.get("status") != "flat" and state.get("status") != "open":
             self.last_action = {"action": "reconcile", "reason": state.get("manual_review_reason") or state.get("status")}
             return state
@@ -1232,6 +1308,7 @@ class WTILiveRuntime:
                         state = await self._read_account_only_reconcile()
                         self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
                         self.startup_reconciled = state.get("status") in {"flat", "open"}
+                        state = await self._advance_continuous_gradient_round(state)
                         if not self.startup_reconciled:
                             self.last_action = {
                                 "action": "blocked",
@@ -1259,6 +1336,7 @@ class WTILiveRuntime:
                     else:
                         self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
                         self.startup_reconciled = state.get("status") in {"flat", "open"}
+                        state = await self._advance_continuous_gradient_round(state)
                         self._sync_entry_authorization(
                             state, sample, now=datetime.now(timezone.utc)
                         )
@@ -1291,6 +1369,7 @@ class WTILiveRuntime:
                                 state = await self._read_reconcile(dict(row))
                                 self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
                                 self.startup_reconciled = state.get("status") in {"flat", "open"}
+                                state = await self._advance_continuous_gradient_round(state)
                                 self._sync_entry_authorization(
                                     state, dict(row), now=datetime.now(timezone.utc)
                                 )
@@ -1400,6 +1479,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--confirm-bounded-live-pilot", action="store_true")
     parser.add_argument("--gradient-live", action="store_true")
     parser.add_argument("--confirm-bounded-gradient-pilot", action="store_true")
+    parser.add_argument("--continuous-gradient-rotation", action="store_true")
+    parser.add_argument("--confirm-continuous-gradient-rotation", action="store_true")
     parser.add_argument("--rotation-test-id")
     parser.add_argument("--gradient-second-tier-bps", type=Decimal)
     parser.add_argument("--gradient-layer-notional-usd", type=Decimal, default=Decimal("10"))
@@ -1453,7 +1534,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("gradient-live is separate from single-round and management modes")
         if args.rotation_test_id and not re.fullmatch(r"[0-9a-f]{32}", args.rotation_test_id):
             parser.error("rotation-test-id must be a 32-character lowercase hex ID")
-    elif args.confirm_bounded_gradient_pilot or args.gradient_second_tier_bps is not None:
+        if args.continuous_gradient_rotation:
+            if not args.confirm_continuous_gradient_rotation or not args.rotation_test_id:
+                parser.error("continuous gradient rotation requires explicit confirmation and a persistent session ID")
+        elif args.confirm_continuous_gradient_rotation:
+            parser.error("continuous rotation confirmation requires --continuous-gradient-rotation")
+    elif (args.confirm_bounded_gradient_pilot or args.gradient_second_tier_bps is not None
+          or args.continuous_gradient_rotation or args.confirm_continuous_gradient_rotation):
         parser.error("gradient options require --gradient-live")
     elif args.rotation_test_id:
         parser.error("rotation-test-id requires --gradient-live")

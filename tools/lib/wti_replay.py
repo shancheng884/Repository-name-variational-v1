@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from tools.lib.hedge_instruments import (
@@ -18,6 +18,7 @@ from tools.lib.hedge_instruments import (
     paired_realized_pnl,
 )
 from tools.lib.market_sessions import session_observation_for_sample
+from tools.lib.wti_sizing import size_paired_layer
 
 
 DIRECTIONS = ("long_var_short_lighter", "short_var_long_lighter")
@@ -31,6 +32,7 @@ class ReplayConfig:
     max_hold_seconds: float
     max_sample_gap_seconds: float
     entry_cutoff_seconds: float = 1800
+    max_slippage_bps: Decimal = Decimal("8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,14 +431,24 @@ def replay_wti_gradient(
     aggregate_max_notional_usd: Decimal,
     expected_market_id: int | None = None,
     expected_multiplier: Decimal | None = None,
+    max_completed_roundtrips: int | None = 1,
+    assume_verified_flat_session_restarts: bool = False,
 ) -> ReplayReport:
-    """Replay one bounded two-layer cycle without relaxing any market-data gate."""
+    """Replay bounded two-layer rounds without relaxing any market-data gate."""
     if second_tier_threshold_bps <= config.entry_threshold_bps:
         raise ValueError("gradient_second_tier_must_exceed_entry_threshold")
     if layer_notional_usd <= 0 or aggregate_max_notional_usd <= 0:
         raise ValueError("gradient_notionals_must_be_positive")
+    if not config.max_slippage_bps.is_finite() or config.max_slippage_bps <= 0:
+        raise ValueError("gradient_max_slippage_must_be_positive")
     if layer_notional_usd * 2 > aggregate_max_notional_usd:
         raise ValueError("gradient_layers_exceed_aggregate_notional_cap")
+    if max_completed_roundtrips is not None and (
+        not isinstance(max_completed_roundtrips, int)
+        or isinstance(max_completed_roundtrips, bool)
+        or max_completed_roundtrips < 1
+    ):
+        raise ValueError("gradient_max_completed_roundtrips_must_be_positive_or_none")
     samples, rejected, duplicates, conflicts = _canonical_rows(
         rows,
         expected_market_id=expected_market_id,
@@ -449,12 +461,15 @@ def replay_wti_gradient(
     stopped_reason: str | None = None
     previous_at: datetime | None = None
     previous_row: dict[str, Any] | None = None
-    entry_revoked_for_session = False
+    entry_authorization_revoked = False
     position_gap_exit_pending = False
     rejected_depth = 0
     capped_additions = 0
 
-    def make_layer(row: dict[str, Any], direction: str, edge: Decimal, tier: int) -> dict[str, Any] | None:
+    def make_layer(
+        row: dict[str, Any], direction: str, edge: Decimal, tier: int,
+        existing: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         multiplier = _decimal(row.get("lighter_multiplier"))
         lighter_entry = _decimal(
             row["lighter_sell_price"] if direction == "long_var_short_lighter"
@@ -469,13 +484,43 @@ def replay_wti_gradient(
         if decimals_value != decimals_value.to_integral_value() or not 0 <= decimals_value <= 12:
             return None
         step = Decimal("1").scaleb(-int(decimals_value))
-        raw_qty = layer_notional_usd / (lighter_entry * multiplier)
         min_base = _decimal(row.get("lighter_min_base_amount")) or Decimal("0")
         min_quote = _decimal(row.get("lighter_min_quote_amount")) or Decimal("0")
-        required_qty = max(
-            raw_qty, min_base, min_quote / (lighter_entry * multiplier)
+        var_order_price = _decimal(
+            row["var_ask"] if direction == "long_var_short_lighter" else row["var_bid"]
         )
-        lighter_qty = (required_qty / step).to_integral_value(rounding=ROUND_CEILING) * step
+        lighter_order_price = _decimal(
+            row["lighter_sell_price"] if direction == "long_var_short_lighter"
+            else row["lighter_buy_price"]
+        )
+        var_mark = max(_decimal(row["var_bid"]), _decimal(row["var_ask"]))
+        lighter_mark = max(_decimal(row["lighter_bid"]), _decimal(row["lighter_ask"]))
+        if any(value is None for value in (
+            var_order_price, lighter_order_price, var_mark, lighter_mark,
+        )):
+            return None
+        markup = Decimal("1") + config.max_slippage_bps / Decimal("10000")
+        lighter_qty = size_paired_layer(
+            target_notional_usd=layer_notional_usd,
+            max_notional_usd=aggregate_max_notional_usd,
+            multiplier=multiplier,
+            qty_step=step,
+            min_base_qty=min_base,
+            min_quote_usd=min_quote,
+            var_order_price=max(var_order_price, var_mark) * markup,
+            lighter_order_price=max(lighter_order_price, lighter_mark) * markup,
+            lighter_sizing_price=lighter_entry,
+            lighter_min_quote_price=lighter_entry * (
+                Decimal("1") - config.max_slippage_bps / Decimal("10000")
+            ),
+            allow_reduce_to_cap=existing is None,
+            existing_var_qty=existing["var_qty"] if existing else Decimal("0"),
+            existing_lighter_qty=existing["lighter_qty"] if existing else Decimal("0"),
+            existing_var_mark_price=var_mark,
+            existing_lighter_mark_price=lighter_mark,
+        )
+        if lighter_qty is None:
+            return None
         var_qty = lighter_qty * multiplier
         if (
             lighter_qty <= 0
@@ -526,6 +571,11 @@ def replay_wti_gradient(
             if gap < 0:
                 stopped_reason = "sample_order_invalid"
                 break
+            if gap > config.max_sample_gap_seconds:
+                gaps += 1
+                entry_authorization_revoked = True
+                if current is not None:
+                    position_gap_exit_pending = True
             if session_changed:
                 previous_observation = session_observation_for_sample(previous_row)
                 if current is not None:
@@ -538,13 +588,10 @@ def replay_wti_gradient(
                 ):
                     stopped_reason = "session_transition_unverified"
                     break
-                entry_revoked_for_session = False
-            elif gap > config.max_sample_gap_seconds:
-                gaps += 1
-                if current is None:
-                    entry_revoked_for_session = True
-                else:
-                    position_gap_exit_pending = True
+                if assume_verified_flat_session_restarts:
+                    # This explicitly models a supervisor restart after its independent
+                    # dual-account flat/order reconciliation; quotes alone do not prove it.
+                    entry_authorization_revoked = False
         previous_at, previous_row = at, row
         cutoff = observation.closing_at - timedelta(seconds=config.entry_cutoff_seconds)
         in_cutoff = at >= cutoff
@@ -599,36 +646,27 @@ def replay_wti_gradient(
                 exit_reasons[reason] += 1
                 current = None
                 position_gap_exit_pending = False
-                # The pilot budget is one complete roundtrip, regardless of outcome.
-                break
+                if (
+                    max_completed_roundtrips is not None
+                    and len(trades) >= max_completed_roundtrips
+                ):
+                    break
+                continue
             if len(current["layers"]) == 1 and not in_cutoff:
                 edge = _decimal(row.get(
                     "long_edge_bps" if current["direction"] == "long_var_short_lighter"
                     else "short_edge_bps"
                 ))
                 if edge is not None and edge >= second_tier_threshold_bps:
-                    layer = make_layer(row, current["direction"], edge, 2)
-                    aggregate_notional = (
-                        current["var_entry"] * current["var_qty"]
-                        + current["lighter_entry"] * current["lighter_qty"]
-                        * current["instrument"].lighter.exposure_multiplier
-                    ) / Decimal("2")
+                    layer = make_layer(row, current["direction"], edge, 2, current)
                     if layer is None:
-                        rejected_depth += 1
+                        capped_additions += 1
                     else:
-                        layer_notional = (
-                            layer["var_entry"] * layer["var_qty"]
-                            + layer["lighter_entry"] * layer["lighter_qty"]
-                            * current["instrument"].lighter.exposure_multiplier
-                        ) / Decimal("2")
-                        if aggregate_notional + layer_notional > aggregate_max_notional_usd:
-                            capped_additions += 1
-                        else:
-                            current["layers"].append(layer)
-                            refresh_aggregate(current)
+                        current["layers"].append(layer)
+                        refresh_aggregate(current)
             continue
 
-        if in_cutoff or entry_revoked_for_session:
+        if in_cutoff or entry_authorization_revoked:
             continue
         edges = {
             "long_var_short_lighter": _decimal(row.get("long_edge_bps")),
@@ -663,7 +701,11 @@ def replay_wti_gradient(
     net_total = sum((Decimal(trade.net_pnl_usd) for trade in trades), Decimal("0"))
     wins = sum(Decimal(trade.net_pnl_usd) > 0 for trade in trades)
     return ReplayReport(
-        replay_kind="indicative_bounded_two_layer_gradient_no_lookahead",
+        replay_kind=(
+            "indicative_continuous_two_layer_gradient_no_lookahead"
+            if max_completed_roundtrips is None
+            else "indicative_bounded_two_layer_gradient_no_lookahead"
+        ),
         live_authorization=False,
         session_gated=True,
         sample_count=len(samples),
@@ -689,16 +731,19 @@ def replay_wti_gradient(
             "layer_notional_usd": str(layer_notional_usd),
             "aggregate_max_notional_usd": str(aggregate_max_notional_usd),
             "max_layers": 2,
-            "max_completed_roundtrips": 1,
+            "max_completed_roundtrips": max_completed_roundtrips,
+            "assume_verified_flat_session_restarts": assume_verified_flat_session_restarts,
             "max_hold_seconds": config.max_hold_seconds,
             "max_sample_gap_seconds": config.max_sample_gap_seconds,
+            "max_slippage_bps": str(config.max_slippage_bps),
+            "aggregate_notional_basis": "paired_mean_with_per_leg_cap",
             "entry_cutoff_seconds": config.entry_cutoff_seconds,
             "expected_market_id": expected_market_id,
             "expected_multiplier": None if expected_multiplier is None else str(expected_multiplier),
         },
         cost_caveat=(
-            "One bounded two-layer cycle. Quote-path only; no historical fills, fees, funding, latency, or market impact are inferred. "
-            "Sample-size/depth, exchange-session, 120-second gap, cutoff, hold, and aggregate-notional checks remain active."
+            "Sequential two-layer rounds with the configured completed-round limit. Quote-path only; no historical fills, fees, funding, latency, or market impact are inferred. "
+            "Sample-size/depth, exchange-session, process-latched sample-gap, cutoff, hold, slippage, paired-notional, and per-leg caps remain active. Session re-entry is modeled only when the explicit supervisor-restart assumption is enabled; historical quotes do not prove the external flat-account reconciliation."
         ),
         trades=tuple(trades),
     )
