@@ -152,10 +152,44 @@ automatic-rotation and live-order confirmations, plus a market ID and
 multiplier. It persists a journal and uses a process lock so a restart adopts
 the existing transition instead of issuing a duplicate start. The supervisor
 requests a PID/run-ID-bound drain, waits for fresh paired-flat and zero-order
-proof, then starts only the newly selected runtime. WTI starts only when the
-existing production-readiness assessment passes; no historical-data bypass is
-used. WTI execution retains the bounded gradient-pilot limits documented
-above.
+proof, then starts only the newly selected runtime. The historical production
+gate remains separate from the current live session, account/order, quote,
+depth, and risk gates enforced by the WTI runtime.
+
+For a separately authorized one-round rotation test, both read-only scenarios
+can be rehearsed first:
+
+```sh
+python tools/rotation_supervisor.py --rehearse --bounded-rotation-test --rehearse-session open --lighter-market-id 145 --lighter-multiplier 1
+python tools/rotation_supervisor.py --rehearse --bounded-rotation-test --rehearse-session closed --lighter-market-id 145 --lighter-multiplier 1
+```
+
+These simulated session scenarios never write exchange orders. Open-session
+planning may drain ETH before WTI; closed-session planning selects ETH when
+ready and does not open WTI. A live test requires a separate explicit command:
+
+```sh
+python tools/rotation_supervisor.py --execute --bounded-rotation-test --confirm-bounded-rotation-test --confirm-automatic-rotation --i-understand-live-orders --lighter-market-id 145 --lighter-multiplier 1
+```
+
+If an older WTI runtime is active, first use the management-only takeover
+command below so its next account reconciliation is bound to the new PID/run
+ID; do not use it while ETH is active. If neither runtime is active, the
+supervisor additionally requires `--confirm-initial-flat` after both accounts
+and their orders have been manually verified flat.
+
+The supervisor persists one test ID, exact market/multiplier, and fixed budget:
+one completed round trip, at most two $10 layers ($20 total), 30/45 bps entry
+tiers, 1 bps exit target, 10 bps assumed roundtrip cost, 8 bps slippage cap,
+six-hour maximum hold, and a 30-minute entry cutoff. The history qualification
+bypass applies only to this explicitly confirmed test; it does not bypass
+fresh valid samples, exchange-session status, account reconciliation, zero-order
+proof, executable depth/size, slippage, or live risk checks. The test ID is
+bound into the persisted gradient pilot. A restart resumes the same budget;
+completion/exhaustion consumes it permanently. A management-only WTI runtime
+is upgraded only after it is flat, has no pending action, and presents a fresh
+account proof bound to its PID, run ID, and market ID. The supervisor requests
+its normal verified drain before starting the entry-enabled test runtime.
 
 While ETH is the active runtime, the supervisor adopts one fresh, PID-matched
 read-only WTI collector or starts one under its own tmux session after verifying
@@ -277,11 +311,12 @@ production-promotion audit, provide both `--lighter-market-id` and
 values inferred from historical samples. The JSON
 report separates historical `market_data_ready`, recent `data_fresh`,
 `ready_for_bounded_live_review`, and `historical_promotion_evidence_ready`.
-This read-only audit always returns `ready_for_production_rotation: false` and
-adds `live_execution_and_session_gates_not_verified`: historical records cannot
-verify live order adapters or the current exchange session. The command returns
-exit code 0 when bounded-live review is ready, not when production rotation is
-ready. Neither result submits or enables orders. Historical samples without
+`ready_for_production_rotation` reports only whether strict historical
+promotion evidence passes; it cannot verify live order adapters, account state,
+or the current exchange session. The runtime checks those independently before
+enabling entries. The command returns exit code 0 when bounded-live review is
+ready, not when production rotation is ready. Neither result submits or enables
+orders. Historical samples without
 explicit fresh session status, session ID, and close time are counted as
 unverified and excluded from readiness. A single consistent Lighter WTI market ID is required across the
 sample profile; roundtrip evidence with another market ID is rejected. The

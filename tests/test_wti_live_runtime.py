@@ -63,6 +63,54 @@ def test_gradient_cli_requires_explicit_two_tier_bounded_budget():
         ])
 
 
+def test_rotation_test_id_is_bound_to_gradient_live_mode():
+    args = wti_live.parse_args([
+        "--mode", "live", "--confirm-eth-flat", "--i-understand-live-orders",
+        "--gradient-live", "--confirm-bounded-gradient-pilot",
+        "--allow-unqualified-data-pilot", "--rotation-test-id", "a" * 32,
+        "--expected-lighter-market-id", "145", "--entry-threshold-bps", "30",
+        "--gradient-second-tier-bps", "45", "--gradient-layer-notional-usd", "10",
+        "--exit-target-bps", "1", "--roundtrip-cost-bps", "10",
+        "--max-notional-usd", "20",
+    ])
+    assert args.rotation_test_id == "a" * 32
+    with pytest.raises(SystemExit):
+        wti_live.parse_args([
+            "--mode", "live", "--confirm-eth-flat", "--i-understand-live-orders",
+            "--gradient-live", "--confirm-bounded-gradient-pilot",
+            "--rotation-test-id", "not-an-id", "--expected-lighter-market-id", "145",
+            "--entry-threshold-bps", "30", "--gradient-second-tier-bps", "45",
+            "--exit-target-bps", "1", "--roundtrip-cost-bps", "10",
+        ])
+
+
+def test_closed_session_uses_fresh_status_feed_heartbeat_not_old_change_time():
+    now = datetime.now(timezone.utc)
+    row = _live_sample(now)
+    row.update({
+        "market_status": "closed",
+        "session_status": "closed",
+        "session_status_observed_at": (now - timedelta(hours=3)).isoformat(),
+        "session_status_feed_heartbeat_at": now.isoformat(),
+        "session_closing_at": (now - timedelta(hours=2)).isoformat(),
+    })
+    health = {
+        "market_status": "closed",
+        "market_status_feed_connected": True,
+        "market_status_feed_heartbeat_at": now.isoformat(),
+    }
+    window = wti_live._session_window(row, now, 1800, feed_health=health)
+    assert window.state.value == "exchange_closed"
+    assert window.allow_new_entries is False
+    assert window.allow_position_management is False
+    stale_health = {
+        **health,
+        "market_status_feed_heartbeat_at": (now - timedelta(seconds=31)).isoformat(),
+    }
+    stale = wti_live._session_window(row, now, 1800, feed_health=stale_health)
+    assert stale.state.value == "status_unknown"
+
+
 def test_eth_flat_requires_explicit_confirmation_and_exact_flat_state(tmp_path: Path):
     path = tmp_path / "eth.json"
     path.write_text(json.dumps({

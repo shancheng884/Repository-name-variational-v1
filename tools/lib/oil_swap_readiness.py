@@ -603,12 +603,12 @@ def assess_oil_readiness(
             for reason in reasons
         )
     )
-    # This read-only audit cannot verify production order adapters or live sessions.
-    reasons.append("live_execution_and_session_gates_not_verified")
     return OilReadiness(
         ready_for_bounded_live_review=review_ready,
         historical_promotion_evidence_ready=historical_evidence_ready,
-        ready_for_production_rotation=False,
+        # This field is the strict historical promotion gate. The live runtime
+        # separately verifies the current session, account, orders, and risk.
+        ready_for_production_rotation=historical_evidence_ready,
         market_data_ready=market_data_ready,
         data_fresh=data_fresh,
         latest_sample_age_seconds=None if latest_sample_age is None else round(latest_sample_age, 3),

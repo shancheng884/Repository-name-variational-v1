@@ -407,6 +407,26 @@ def test_gradient_pilot_restart_cannot_change_immutable_budget(tmp_path):
         )
 
 
+def test_gradient_pilot_rotation_test_identity_is_immutable_across_restart(tmp_path):
+    executor, _ = _executor(tmp_path)
+    config = {"tier_thresholds_bps": ["30", "45"], "layer_notional_usd": "10"}
+    pilot = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+        rotation_test_id="a" * 32,
+    )
+    resumed = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+        rotation_test_id="a" * 32,
+    )
+    assert resumed["pilot_id"] == pilot["pilot_id"]
+    assert resumed["rotation_test_id"] == "a" * 32
+    with pytest.raises(WTIExecutionError, match="configuration_or_state_mismatch"):
+        executor.store.initialize_gradient_pilot(
+            market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+            rotation_test_id="b" * 32,
+        )
+
+
 def test_gradient_layer_rejects_aggregate_cap_before_any_order(tmp_path):
     executor, gateway = _executor(tmp_path)
     pilot = _gradient_pilot(executor)

@@ -10,6 +10,7 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import re
 import signal
 import sys
 import time
@@ -205,7 +206,13 @@ def readiness_for_new_entries(
     }
 
 
-def _session_window(row: dict[str, Any], now: datetime, cutoff_seconds: float):
+def _session_window(
+    row: dict[str, Any],
+    now: datetime,
+    cutoff_seconds: float,
+    *,
+    feed_health: dict[str, Any] | None = None,
+):
     observed = row.get("session_status_observed_at")
     closing = row.get("session_closing_at")
     try:
@@ -213,7 +220,12 @@ def _session_window(row: dict[str, Any], now: datetime, cutoff_seconds: float):
         closing_at = datetime.fromisoformat(str(closing).replace("Z", "+00:00"))
     except (TypeError, ValueError):
         observed_at = closing_at = None
-    status = str(row.get("market_status") or "").lower()
+    health = feed_health if isinstance(feed_health, dict) else {}
+    row_status = str(row.get("market_status") or "").lower()
+    health_status = str(health.get("market_status") or "").lower()
+    status = row_status
+    if health_status and health_status != row_status:
+        status = "unknown"
     if status not in {"open", "closed", "halted_trading"}:
         exchange_open = None
     else:
@@ -226,6 +238,36 @@ def _session_window(row: dict[str, Any], now: datetime, cutoff_seconds: float):
             exchange_open = None
         else:
             observed_at = datetime.fromisoformat(str(row["session_status_feed_heartbeat_at"]).replace("Z", "+00:00"))
+    elif exchange_open is False:
+        # A closed state can persist for hours. Its live feed heartbeat, rather
+        # than the old state-change timestamp, proves the exchange status is current.
+        connected = health.get(
+            "market_status_feed_connected", row.get("session_status_feed_connected")
+        )
+        heartbeat = health.get(
+            "market_status_feed_heartbeat_at",
+            row.get("session_status_feed_heartbeat_at"),
+        )
+        source = row.get("session_status_source")
+        if (
+            connected is not True
+            or source != "variational_market_status_websocket"
+            or not heartbeat
+        ):
+            exchange_open = None
+        else:
+            try:
+                heartbeat_at = datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))
+                if heartbeat_at.tzinfo is None or heartbeat_at.utcoffset() is None:
+                    raise ValueError("timezone_required")
+                heartbeat_age = (now - heartbeat_at.astimezone(timezone.utc)).total_seconds()
+            except (TypeError, ValueError):
+                exchange_open = None
+            else:
+                if heartbeat_age < -5 or heartbeat_age > 30:
+                    exchange_open = None
+                else:
+                    observed_at = heartbeat_at
     cutoff_minutes = int(cutoff_seconds // 60)
     return classify_usoil_session(
         now,
@@ -375,6 +417,7 @@ class WTILiveRuntime:
                         multiplier=Decimal(str(market["multiplier"])),
                         config=self._gradient_pilot_config(),
                         max_layers=2,
+                        rotation_test_id=getattr(self.args, "rotation_test_id", None),
                     )
                 else:
                     if (
@@ -389,6 +432,7 @@ class WTILiveRuntime:
                         multiplier=Decimal(str(market["multiplier"])),
                         config=self._gradient_pilot_config(),
                         max_layers=2,
+                        rotation_test_id=getattr(self.args, "rotation_test_id", None),
                     )
             elif local_exposure:
                 pilot_owns_exposure = single_round_pilot_owns_exposure(existing)
@@ -906,7 +950,10 @@ class WTILiveRuntime:
         session = _session_window(row, now, self.args.entry_cutoff_seconds)
         try:
             return await asyncio.to_thread(
-                lambda: self.executor.reconcile(sample=row, now=now, session=session)
+                lambda: self.executor.reconcile(
+                    sample=row, now=now, session=session,
+                    runtime_pid=os.getpid(), runtime_run_id=getattr(self, "run_id", None),
+                )
             )
         finally:
             self.last_reconcile_elapsed_ms = round((time.monotonic() - started) * 1000, 3)
@@ -1204,6 +1251,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--confirm-bounded-live-pilot", action="store_true")
     parser.add_argument("--gradient-live", action="store_true")
     parser.add_argument("--confirm-bounded-gradient-pilot", action="store_true")
+    parser.add_argument("--rotation-test-id")
     parser.add_argument("--gradient-second-tier-bps", type=Decimal)
     parser.add_argument("--gradient-layer-notional-usd", type=Decimal, default=Decimal("10"))
     parser.add_argument("--new-pilot-after", help="authorize one new round after this exact terminal pilot ID")
@@ -1254,8 +1302,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("gradient-live requires live mode and explicit bounded gradient confirmation")
         if args.confirm_bounded_live_pilot or args.new_pilot_after or args.manage_existing_wti_position:
             parser.error("gradient-live is separate from single-round and management modes")
+        if args.rotation_test_id and not re.fullmatch(r"[0-9a-f]{32}", args.rotation_test_id):
+            parser.error("rotation-test-id must be a 32-character lowercase hex ID")
     elif args.confirm_bounded_gradient_pilot or args.gradient_second_tier_bps is not None:
         parser.error("gradient options require --gradient-live")
+    elif args.rotation_test_id:
+        parser.error("rotation-test-id requires --gradient-live")
     if args.mode == "live":
         if args.entry_threshold_bps is None or args.exit_target_bps is None or args.roundtrip_cost_bps is None:
             parser.error("live mode requires explicit entry, exit, and roundtrip-cost thresholds")

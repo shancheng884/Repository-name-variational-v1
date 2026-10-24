@@ -17,32 +17,51 @@ from tools.lib.rotation_supervisor import (
     verified_flat_account_probe,
     write_object_atomic,
 )
-from tools.rotation_supervisor import RotationSupervisor, rehearsal_plan
+from tools.rotation_supervisor import (
+    RotationSupervisor,
+    _wti_account_proof,
+    rehearsal_plan,
+)
 
 
 def _snapshot(*, current="NONE", target="ETH", eth_state=None, wti_state=None):
+    now = datetime.now(timezone.utc)
+    timestamp = now.isoformat()
     return {
-        "observed_at": "2026-10-24T00:00:00+00:00",
+        "observed_at": timestamp,
         "current_pair": current,
         "target_pair": target,
         "target_reason": "test",
         "session": {
             "state": "open", "allow_new_entries": True,
             "allow_position_management": True, "reason": "verified",
-            "observed_at": "2026-10-24T00:00:00+00:00",
-            "closing_at": "2026-10-24T08:00:00+00:00",
+            "observed_at": timestamp,
+            "closing_at": (now + timedelta(hours=8)).isoformat(),
         },
         "readiness": {"production_ready": target == "WTI", "reasons": []},
+        "wti_production_gate_ready": target == "WTI",
+        "wti_bounded_test_gate_ready": False,
+        "bounded_rotation_test": False,
+        "lighter_market_id": 145,
         "wti_pilot_status": None,
         "eth_ready": True,
         "wti_ready": target == "WTI",
         "runtimes": {
             "ETH": {"pids": [123] if current == "ETH" else [], "matched_healthy": current == "ETH", "run_id": "eth-run", "health": {"startup_reconciled": True}},
-            "WTI": {"pids": [456] if current == "WTI" else [], "matched_healthy": current == "WTI", "run_id": "wti-run", "health": {"startup_reconciled": True, "manage_existing_only": False, "wti_entry_authorized": True}},
+            "WTI": {"pids": [456] if current == "WTI" else [], "matched_healthy": current == "WTI", "run_id": "wti-run", "health": {"pid": 456, "run_id": "wti-run", "status": "running", "updated_at": timestamp, "startup_reconciled": True, "manage_existing_only": False, "wti_entry_authorized": True}},
         },
         "states": {
             "ETH": eth_state or {"asset": "ETH", "status": "flat", "open_lots": [], "pending_actions": []},
-            "WTI": wti_state or {"asset": "WTI", "status": "flat", "open_position": None, "pending_action": None},
+            "WTI": wti_state or {
+                "asset": "WTI", "status": "flat", "open_position": None,
+                "pending_action": None,
+                "last_account_reconciliation": {
+                    "verified": True, "observed_at": timestamp, "market_id": 145,
+                    "runtime_pid": 456, "runtime_run_id": "wti-run",
+                    "variational_qty": "0", "lighter_qty": "0",
+                    "active_order_count": 0,
+                },
+            },
         },
         "collector": {},
         "collector_pids": [],
@@ -195,6 +214,196 @@ def test_rotation_commands_keep_production_gate_and_management_recovery_entry_di
     assert "--manage-existing-wti-position" in recovery
     assert "--gradient-live" not in recovery
     assert "--confirm-bounded-gradient-pilot" not in recovery
+    test_id = "a" * 32
+    bounded = supervisor._start_command(
+        Pair.WTI, bounded_test=True, rotation_test_id=test_id,
+    )
+    assert "--gradient-live" in bounded
+    assert "--allow-unqualified-data-pilot" in bounded
+    assert "--rotation-test-id" in bounded
+    assert bounded[bounded.index("--rotation-test-id") + 1] == test_id
+    assert bounded[bounded.index("--max-notional-usd") + 1] == "20"
+    assert bounded[bounded.index("--gradient-layer-notional-usd") + 1] == "10"
+    assert bounded[bounded.index("--gradient-second-tier-bps") + 1] == "45"
+    with pytest.raises(RuntimeError, match="rotation_test_id_missing_or_invalid"):
+        supervisor._start_command(Pair.WTI, bounded_test=True, rotation_test_id="bad")
+
+
+def test_wti_account_proof_is_bound_to_fresh_pid_run_and_market_identity():
+    now = datetime.now(timezone.utc)
+    state = {
+        "asset": "WTI", "status": "flat", "open_position": None,
+        "pending_action": None,
+        "last_account_reconciliation": {
+            "verified": True, "observed_at": now.isoformat(), "market_id": 145,
+            "runtime_pid": 456, "runtime_run_id": "wti-run",
+            "variational_qty": "0", "lighter_qty": "0", "active_order_count": 0,
+        },
+    }
+    health = {"pid": 456, "run_id": "wti-run", "startup_reconciled": True}
+    proof = _wti_account_proof(state, health, market_id=145, now=now)
+    assert proof["verified"] is True
+    assert proof["active_orders_zero"] is True
+    for changed_state, changed_health, expected in (
+        ({**state, "last_account_reconciliation": {**state["last_account_reconciliation"], "market_id": 146}}, health, "wti_account_proof_market_id_mismatch"),
+        (state, {**health, "pid": 457}, "wti_account_proof_pid_mismatch"),
+        (state, {**health, "run_id": "other-run"}, "wti_account_proof_run_id_mismatch"),
+        ({**state, "last_account_reconciliation": {**state["last_account_reconciliation"], "observed_at": (now - timedelta(seconds=21)).isoformat()}}, health, "wti_account_proof_stale_or_invalid"),
+        ({**state, "last_account_reconciliation": {**state["last_account_reconciliation"], "active_order_count": None}}, health, "wti_active_order_count_unverified"),
+        ({**state, "last_account_reconciliation": {**state["last_account_reconciliation"], "variational_qty": "0.1"}}, health, "wti_local_exchange_position_mismatch"),
+    ):
+        rejected = _wti_account_proof(changed_state, changed_health, market_id=145, now=now)
+        assert rejected["verified"] is False
+        assert expected in rejected["reasons"]
+
+
+def test_open_and_closed_session_rehearsals_route_without_side_effects():
+    snapshot = _snapshot(current="ETH", target="ETH")
+    snapshot["readiness"] = {"production_ready": False, "reasons": ["history_short"]}
+    snapshot["wti_production_gate_ready"] = False
+    snapshot["bounded_rotation_test"] = True
+    snapshot["bounded_test_authorized"] = True
+    snapshot["wti_bounded_test_gate_ready"] = True
+    snapshot["wti_ready"] = False
+    snapshot["wti_gate_reasons"] = []
+    snapshot["runtimes"]["ETH"]["health"].update({
+        "account_snapshot_observed_at": datetime.now(timezone.utc).isoformat(),
+        "variational_account_snapshot_usable": True,
+    })
+
+    open_plan = rehearsal_plan(snapshot, session_scenario="open")
+    closed_snapshot = _snapshot(current="WTI", target="WTI")
+    closed_snapshot["bounded_rotation_test"] = True
+    closed_snapshot["bounded_test_authorized"] = True
+    closed_snapshot["wti_bounded_test_gate_ready"] = True
+    closed_snapshot["wti_ready"] = True
+    closed_snapshot["wti_production_gate_ready"] = False
+    closed_plan = rehearsal_plan(closed_snapshot, session_scenario="closed")
+
+    assert open_plan["target_pair"] == "WTI"
+    assert open_plan["decision"] == "drain_current"
+    assert open_plan["allow_new_entries"] is False
+    assert open_plan["side_effects"] is False
+    assert closed_plan["target_pair"] == "ETH"
+    assert closed_plan["decision"] == "switch_to_target"
+    assert closed_plan["allow_new_entries"] is False
+    assert closed_plan["side_effects"] is False
+
+
+def test_bounded_test_authorization_is_durable_and_config_bound(tmp_path: Path):
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=False, bounded_rotation_test=True,
+    )
+    first_journal = initial_journal()
+    first = supervisor._prepare_bounded_rotation_test(first_journal)
+    assert first["status"] == "authorized"
+    test_id = first["test_id"]
+    assert first["max_completed_roundtrips"] == 1
+    assert first["max_layers"] == 2
+    assert first["layer_notional_usd"] == "10"
+    assert first["max_notional_usd"] == "20"
+
+    restarted = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=False, bounded_rotation_test=True,
+    )
+    resumed = restarted._prepare_bounded_rotation_test(
+        json.loads(restarted.journal_path.read_text(encoding="utf-8"))
+    )
+    assert resumed["test_id"] == test_id
+    assert resumed["entry_threshold_bps"] == "30"
+    assert resumed["second_tier_bps"] == "45"
+    assert resumed["max_slippage_bps"] == "8"
+
+    changed_market = RotationSupervisor(
+        root=tmp_path, market_id=146, multiplier=Decimal("1"),
+        confirm_initial_flat=False, bounded_rotation_test=True,
+    )
+    with pytest.raises(RuntimeError, match="journal_invalid"):
+        changed_market._prepare_bounded_rotation_test(
+            json.loads(changed_market.journal_path.read_text(encoding="utf-8"))
+        )
+
+
+def test_completed_bounded_test_cannot_be_reauthorized_after_restart(tmp_path: Path):
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=False, bounded_rotation_test=True,
+    )
+    journal = initial_journal()
+    test = supervisor._prepare_bounded_rotation_test(journal)
+    test_id = test["test_id"]
+    test["pilot_id"] = "pilot-1"
+    test["status"] = "active"
+    supervisor._save_journal(journal)
+    write_object_atomic(tmp_path / "log/wti_live_state.json", {
+        "gradient_pilot": {
+            "pilot_id": "pilot-1", "rotation_test_id": test_id,
+            "status": "completed", "completed_at": datetime.now(timezone.utc).isoformat(),
+            "completed_roundtrips": 1,
+        },
+    })
+
+    completed = supervisor._prepare_bounded_rotation_test(
+        json.loads(supervisor.journal_path.read_text(encoding="utf-8"))
+    )
+    repeated = supervisor._prepare_bounded_rotation_test(
+        json.loads(supervisor.journal_path.read_text(encoding="utf-8"))
+    )
+
+    assert completed["status"] == "completed"
+    assert repeated["status"] == "completed"
+    assert repeated["test_id"] == test_id
+    assert repeated["completed_roundtrips"] == 1
+
+
+def test_management_only_wti_upgrades_via_verified_drain_not_duplicate_start(tmp_path: Path, monkeypatch):
+    snapshot = _snapshot(current="WTI", target="WTI")
+    snapshot["bounded_rotation_test"] = True
+    snapshot["wti_bounded_test_gate_ready"] = True
+    snapshot["wti_ready"] = True
+    snapshot["runtimes"]["WTI"]["health"].update({
+        "manage_existing_only": True, "wti_entry_authorized": False,
+    })
+    monkeypatch.setattr(supervisor_module, "collect_snapshot", lambda *args, **kwargs: snapshot)
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=False, bounded_rotation_test=True,
+    )
+
+    first = supervisor.run_once()
+    control = json.loads((tmp_path / "log/wti_live_control.json").read_text(encoding="utf-8"))
+    second = supervisor.run_once()
+    journal = json.loads(supervisor.journal_path.read_text(encoding="utf-8"))
+
+    assert first["action"] == "request_bounded_test_runtime_upgrade"
+    assert second["action"] == "wait_for_drain"
+    assert control["target_pid"] == 456
+    assert control["target_run_id"] == "wti-run"
+    assert control["request_id"] == journal["request_id"]
+    assert journal["bounded_rotation_test"]["test_id"]
+
+
+def test_management_only_wti_without_fresh_flat_account_proof_is_not_restarted(tmp_path: Path, monkeypatch):
+    snapshot = _snapshot(current="WTI", target="WTI")
+    snapshot["bounded_rotation_test"] = True
+    snapshot["wti_bounded_test_gate_ready"] = True
+    snapshot["wti_ready"] = True
+    snapshot["runtimes"]["WTI"]["health"].update({
+        "manage_existing_only": True, "wti_entry_authorized": False,
+    })
+    snapshot["states"]["WTI"].pop("last_account_reconciliation")
+    monkeypatch.setattr(supervisor_module, "collect_snapshot", lambda *args, **kwargs: snapshot)
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=False, bounded_rotation_test=True,
+    )
+
+    result = supervisor.run_once()
+
+    assert result["action"] == "hold_current_wti_account_or_pilot_proof_unverified"
+    assert not (tmp_path / "log/wti_live_control.json").exists()
 
 
 def test_drain_request_is_durable_and_idempotent_across_supervisor_iterations(tmp_path: Path, monkeypatch):

@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import signal
 import socket
@@ -14,7 +15,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -52,8 +53,13 @@ JOURNAL = ROOT / "log" / "rotation_supervisor_state.json"
 HEALTH = ROOT / "log" / "rotation_supervisor_health.json"
 PORTS = (8766, 8767, 8768)
 HEARTBEAT_MAX_AGE_SECONDS = 20
+ACCOUNT_PROOF_MAX_AGE_SECONDS = 20
 ROTATION_POLL_SECONDS = 5
 MAX_CONSECUTIVE_FAILURES = 3
+BOUNDED_TEST_MAX_ROUNDTRIPS = 1
+BOUNDED_TEST_MAX_LAYERS = 2
+BOUNDED_TEST_LAYER_NOTIONAL_USD = Decimal("10")
+BOUNDED_TEST_MAX_NOTIONAL_USD = Decimal("20")
 
 
 def _age(value: Any, now: datetime) -> float | None:
@@ -64,6 +70,114 @@ def _age(value: Any, now: datetime) -> float | None:
         return (now - parsed.astimezone(timezone.utc)).total_seconds()
     except (TypeError, ValueError):
         return None
+
+
+def _wti_account_proof(
+    state: dict[str, Any],
+    health: dict[str, Any],
+    *,
+    market_id: int,
+    now: datetime,
+) -> dict[str, Any]:
+    proof = state.get("last_account_reconciliation")
+    proof = proof if isinstance(proof, dict) else {}
+    reasons: list[str] = []
+    age = _age(proof.get("observed_at"), now)
+    if health.get("startup_reconciled") is not True:
+        reasons.append("wti_startup_reconciliation_not_confirmed")
+    if proof.get("verified") is not True:
+        reasons.append("wti_account_read_not_verified")
+    if proof.get("runtime_pid") != health.get("pid") or not health.get("pid"):
+        reasons.append("wti_account_proof_pid_mismatch")
+    if proof.get("runtime_run_id") != health.get("run_id") or not health.get("run_id"):
+        reasons.append("wti_account_proof_run_id_mismatch")
+    if proof.get("market_id") != market_id:
+        reasons.append("wti_account_proof_market_id_mismatch")
+    if age is None or not -5 <= age <= ACCOUNT_PROOF_MAX_AGE_SECONDS:
+        reasons.append("wti_account_proof_stale_or_invalid")
+    try:
+        var_qty = Decimal(str(proof.get("variational_qty")))
+        lighter_qty = Decimal(str(proof.get("lighter_qty")))
+        active_count = proof.get("active_order_count")
+        quantities_valid = var_qty.is_finite() and lighter_qty.is_finite()
+        active_count_valid = (
+            isinstance(active_count, int) and not isinstance(active_count, bool)
+            and active_count >= 0
+        )
+    except (ArithmeticError, TypeError, ValueError):
+        quantities_valid = False
+        active_count_valid = False
+        active_count = None
+    if not quantities_valid:
+        reasons.append("wti_account_quantities_unverified")
+    if not active_count_valid:
+        reasons.append("wti_active_order_count_unverified")
+    try:
+        if (
+            state.get("asset") == "WTI"
+            and state.get("status") == "flat"
+            and state.get("open_position") is None
+            and state.get("pending_action") is None
+        ):
+            expected_var_qty = Decimal("0")
+            expected_lighter_qty = Decimal("0")
+        elif (
+            state.get("asset") == "WTI"
+            and state.get("status") == "open"
+            and state.get("pending_action") is None
+            and isinstance(state.get("open_position"), dict)
+        ):
+            position = state["open_position"]
+            expected_var_qty = Decimal(str(position["expected_var_qty"]))
+            expected_lighter_qty = Decimal(str(position["expected_lighter_qty"]))
+        else:
+            expected_var_qty = expected_lighter_qty = None
+        local_quantities_valid = (
+            expected_var_qty is not None
+            and expected_lighter_qty is not None
+            and expected_var_qty.is_finite()
+            and expected_lighter_qty.is_finite()
+        )
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        expected_var_qty = expected_lighter_qty = None
+        local_quantities_valid = False
+    if not local_quantities_valid:
+        reasons.append("wti_local_state_not_reconcilable")
+    elif quantities_valid and (
+        var_qty != expected_var_qty or lighter_qty != expected_lighter_qty
+    ):
+        reasons.append("wti_local_exchange_position_mismatch")
+    active_orders_zero = active_count == 0 if active_count_valid else None
+    if active_orders_zero is False:
+        reasons.append("wti_active_orders_present")
+    return {
+        "verified": not any(reason != "wti_active_orders_present" for reason in reasons),
+        "active_orders_zero": active_orders_zero,
+        "age_seconds": age,
+        "market_id": proof.get("market_id"),
+        "variational_qty": proof.get("variational_qty"),
+        "lighter_qty": proof.get("lighter_qty"),
+        "active_order_count": active_count,
+        "reasons": reasons,
+    }
+
+
+def _eth_account_proof(health: dict[str, Any], *, now: datetime) -> dict[str, Any]:
+    age = _age(health.get("account_snapshot_observed_at"), now)
+    usable = health.get("variational_account_snapshot_usable") is True
+    fresh = age is not None and -5 <= age <= 60
+    reasons = []
+    if not usable:
+        reasons.append("eth_account_snapshot_unusable")
+    if not fresh:
+        reasons.append("eth_account_snapshot_stale_or_invalid")
+    return {
+        "verified": usable and fresh,
+        "active_orders_zero": None,
+        "age_seconds": age,
+        "reasons": reasons,
+        "active_orders_checked_on_drain": True,
+    }
 
 
 def script_processes(root: Path, script: str, proc_root: Path = Path("/proc")) -> list[int]:
@@ -143,6 +257,8 @@ def collect_snapshot(
     multiplier: Decimal = Decimal("1"),
     now: datetime | None = None,
     proc_root: Path = Path("/proc"),
+    bounded_rotation_test: bool = False,
+    rotation_test_status: str | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     eth_state = read_object(root / "log/live_inventory_state.json")
@@ -159,7 +275,7 @@ def collect_snapshot(
         now=now,
     )
     sample = rows[-1] if rows else {}
-    session = _session_window(sample, now, 1800)
+    session = _session_window(sample, now, 1800, feed_health=collector)
     eth_pids = script_processes(root, "main.py", proc_root)
     wti_pids = script_processes(root, "tools/wti_live.py", proc_root)
     collector_pids = script_processes(root, "tools/oil_swap_collector.py", proc_root)
@@ -193,10 +309,86 @@ def collect_snapshot(
     eth_ready = (root / "live_config.json").is_file() and bool(eth_health.get("risk_action") != "block_all")
     wti_pilot = wti_state.get("gradient_pilot") or {}
     wti_pilot_available = wti_pilot.get("status") in {None, "available", "in_position", "entry_pending"}
-    wti_ready = bool(readiness.get("production_ready") and wti_pilot_available)
+    production_wti_ready = bool(readiness.get("production_ready") and wti_pilot_available)
+    test_status = rotation_test_status
+    rotation_auth: dict[str, Any] = {}
+    if test_status is None:
+        rotation_journal = read_object(root / "log/rotation_supervisor_state.json")
+        test_auth = rotation_journal.get("bounded_rotation_test")
+        if isinstance(test_auth, dict):
+            rotation_auth = test_auth
+            test_status = str(test_auth.get("status") or "")
+    else:
+        rotation_auth = read_object(root / "log/rotation_supervisor_state.json").get(
+            "bounded_rotation_test", {}
+        )
+        rotation_auth = rotation_auth if isinstance(rotation_auth, dict) else {}
+    test_budget_available = test_status not in {"completed", "consumed", "blocked"}
+    test_authorized = test_status in {"authorized", "active"}
+    sample_age = _age(sample.get("logged_at"), now)
+    sample_identity_ok = (
+        sample.get("sample_quality") == "valid"
+        and sample.get("asset") == "WTI"
+        and sample_age is not None
+        and -5 <= sample_age <= 120
+        and str(sample.get("lighter_market_id")) == str(market_id)
+    )
+    try:
+        sample_multiplier_ok = Decimal(str(sample.get("lighter_multiplier"))) == multiplier
+    except (ArithmeticError, TypeError, ValueError):
+        sample_multiplier_ok = False
+    test_gate_reasons: list[str] = []
+    if not bounded_rotation_test:
+        test_gate_reasons.append("bounded_rotation_test_not_explicitly_selected")
+    if not test_budget_available:
+        test_gate_reasons.append("bounded_rotation_test_budget_already_consumed")
+    if not sample_identity_ok:
+        test_gate_reasons.append("bounded_rotation_test_requires_fresh_valid_wti_sample")
+    if not sample_multiplier_ok:
+        test_gate_reasons.append("bounded_rotation_test_lighter_multiplier_mismatch")
+    if not wti_pilot_available:
+        test_gate_reasons.append("persisted_gradient_pilot_budget_already_consumed")
+    if wti_pilot:
+        expected_pilot_config = {
+            "entry_threshold_bps": "30",
+            "exit_target_bps": "1",
+            "roundtrip_cost_bps": "10",
+            "max_notional_usd": "20",
+            "max_slippage_bps": "8",
+            "max_hold_seconds": 21600.0,
+            "entry_cutoff_seconds": 1800.0,
+            "tier_thresholds_bps": ["30", "45"],
+            "layer_notional_usd": "10",
+            "max_layers": 2,
+            "max_completed_roundtrips": 1,
+        }
+        existing_config = wti_pilot.get("config") or {}
+        identity_matches = (
+            wti_pilot.get("market_id") == market_id
+            and str(wti_pilot.get("multiplier")) == str(multiplier)
+            and wti_pilot.get("max_layers") == BOUNDED_TEST_MAX_LAYERS
+            and all(existing_config.get(key) == value for key, value in expected_pilot_config.items())
+        )
+        if bounded_rotation_test:
+            test_id = rotation_auth.get("test_id")
+            identity_matches = identity_matches and bool(test_id) and wti_pilot.get("rotation_test_id") == test_id
+        if not identity_matches:
+            test_gate_reasons.append("persisted_gradient_pilot_configuration_mismatch")
+    bounded_test_ready = bounded_rotation_test and not test_gate_reasons
+    wti_ready = bool(
+        wti_pilot_available
+        and (
+            production_wti_ready
+            or (bounded_test_ready and session.allow_new_entries)
+        )
+    )
     wti_gate_reasons = list(readiness.get("reasons", []))
-    if readiness.get("production_ready") and not wti_pilot_available:
+    if not wti_pilot_available:
         wti_gate_reasons.append("persisted_gradient_pilot_budget_already_consumed")
+    if bounded_rotation_test:
+        wti_gate_reasons.extend(test_gate_reasons)
+        if bounded_test_ready and not session.allow_new_entries:
+            wti_gate_reasons.append("bounded_rotation_test_requires_verified_open_entry_window")
     target, target_reason = desired_pair(
         session=session,
         wti_ready=wti_ready,
@@ -205,6 +397,7 @@ def collect_snapshot(
     )
     return {
         "observed_at": now.isoformat(),
+        "lighter_market_id": market_id,
         "current_pair": current.value,
         "target_pair": target.value,
         "target_reason": target_reason,
@@ -218,6 +411,13 @@ def collect_snapshot(
         },
         "readiness": readiness,
         "wti_pilot_status": wti_pilot.get("status"),
+        "bounded_rotation_test": bounded_rotation_test,
+        "rotation_test_status": test_status,
+        "bounded_test_authorized": test_authorized,
+        "wti_production_gate_ready": production_wti_ready,
+        "wti_bounded_test_gate_ready": bounded_test_ready,
+        "wti_bounded_test_gate_reasons": list(dict.fromkeys(test_gate_reasons)),
+        "rotation_test_id": rotation_auth.get("test_id"),
         "eth_ready": eth_ready,
         "wti_ready": wti_ready,
         "wti_gate_reasons": wti_gate_reasons,
@@ -237,32 +437,92 @@ def collect_snapshot(
     }
 
 
-def rehearsal_plan(snapshot: dict[str, Any]) -> dict[str, Any]:
+def rehearsal_plan(snapshot: dict[str, Any], *, session_scenario: str = "live") -> dict[str, Any]:
     current = Pair(snapshot["current_pair"])
     target = Pair(snapshot["target_pair"])
     state = snapshot["states"].get(current.value, {}) if current != Pair.NONE else {}
     valid, exposure, pending = _state_exposure(current, state) if current != Pair.NONE else (True, False, False)
     runtime = snapshot["runtimes"].get(current.value, {}) if current != Pair.NONE else {}
-    session_state = snapshot.get("session", {}).get("state")
+    session_data = snapshot.get("session", {})
+    session_state = session_data.get("state")
     from tools.lib.market_sessions import SessionWindow
 
-    # Rehearsal only needs the verified session gates and does not execute the plan.
-    session = SessionWindow(
-        OilSession(session_state or OilSession.STATUS_UNKNOWN.value),
-        "rehearsal", None,
-        bool(snapshot.get("session", {}).get("allow_new_entries")),
-        bool(snapshot.get("session", {}).get("allow_position_management")),
-        str(snapshot.get("session", {}).get("reason") or "session_unknown"),
-        snapshot.get("session", {}).get("observed_at"),
-        exchange_open=(True if session_state in {"open", "entry_cutoff"} else False if session_state == "exchange_closed" else None),
+    if session_scenario not in {"live", "open", "closed"}:
+        raise ValueError("session_scenario_invalid")
+    target_reason = snapshot.get("target_reason")
+    if session_scenario != "live":
+        now = datetime.now(timezone.utc)
+        if session_scenario == "open":
+            session_state = OilSession.OPEN.value
+            allow_entries = bool(
+                snapshot.get("wti_production_gate_ready")
+                or snapshot.get("wti_bounded_test_gate_ready")
+            )
+            closing_at = (now.replace(microsecond=0) + timedelta(hours=2)).isoformat()
+            session = SessionWindow(
+                OilSession.OPEN, "simulated", None, allow_entries, True,
+                "read_only_simulated_open_session", now.isoformat(),
+                exchange_open=True, closing_at=closing_at,
+            )
+        else:
+            session_state = OilSession.EXCHANGE_CLOSED.value
+            session = SessionWindow(
+                OilSession.EXCHANGE_CLOSED, "simulated", None, False, False,
+                "read_only_simulated_closed_session", now.isoformat(),
+                exchange_open=False,
+            )
+        target, target_reason = desired_pair(
+            session=session,
+            wti_ready=bool(
+                snapshot.get("wti_production_gate_ready")
+                or snapshot.get("wti_bounded_test_gate_ready")
+            ),
+            eth_ready=bool(snapshot.get("eth_ready")),
+            current=current,
+        )
+    else:
+        session = SessionWindow(
+            OilSession(session_state or OilSession.STATUS_UNKNOWN.value),
+            "rehearsal", None,
+            bool(session_data.get("allow_new_entries")),
+            bool(session_data.get("allow_position_management")),
+            str(session_data.get("reason") or "session_unknown"),
+            session_data.get("observed_at"),
+            exchange_open=(True if session_state in {"open", "entry_cutoff"} else False if session_state == "exchange_closed" else None),
+        )
+    if current == Pair.WTI:
+        account_proof = _wti_account_proof(
+            state, runtime.get("health", {}),
+            market_id=int(snapshot.get("lighter_market_id") or 145),
+            now=datetime.now(timezone.utc),
+        )
+        active_orders_zero = account_proof.get("active_orders_zero")
+        reconciled = account_proof.get("verified") is True
+    elif current == Pair.ETH:
+        account_proof = _eth_account_proof(runtime.get("health", {}), now=datetime.now(timezone.utc))
+        active_orders_zero = None
+        reconciled = account_proof.get("verified") is True
+    else:
+        account_proof = {"verified": False, "active_orders_zero": None, "reasons": ["initial_account_probe_required"]}
+        active_orders_zero = None
+        reconciled = None
+    target_ready = bool(
+        snapshot.get("wti_ready") if target == Pair.WTI
+        else snapshot.get("eth_ready") if target == Pair.ETH else False
     )
-    proof = state.get("last_account_reconciliation") or {}
-    active_orders_zero = proof.get("active_order_count") == 0 if current == Pair.WTI else None
-    reconciled = runtime.get("health", {}).get("startup_reconciled") is True if current == Pair.WTI else None
+    if session_scenario == "open" and target == Pair.WTI:
+        target_ready = bool(
+            snapshot.get("wti_production_gate_ready")
+            or (
+                snapshot.get("bounded_rotation_test")
+                and snapshot.get("wti_bounded_test_gate_ready")
+                and session.allow_new_entries
+            )
+        )
     decision = decide_rotation(
         current=current,
         target=target,
-        target_ready=bool(snapshot.get("wti_ready") if target == Pair.WTI else snapshot.get("eth_ready") if target == Pair.ETH else False),
+        target_ready=target_ready,
         session=session,
         has_open_position=exposure,
         has_pending_action=pending,
@@ -278,13 +538,20 @@ def rehearsal_plan(snapshot: dict[str, Any]) -> dict[str, Any]:
         reasons.append("current_local_state_invalid")
     if current == Pair.NONE and target != Pair.NONE:
         reasons.append("initial_both_account_flat_confirmation_required")
-    if target == Pair.WTI and not snapshot.get("wti_ready"):
+    if target == Pair.WTI and not target_ready:
         reasons.extend(snapshot.get("wti_gate_reasons", snapshot.get("readiness", {}).get("reasons", [])))
+    if (
+        target == Pair.WTI
+        and snapshot.get("bounded_rotation_test")
+        and not snapshot.get("bounded_test_authorized")
+    ):
+        reasons.append("bounded_rotation_test_authorization_not_persisted")
+    reasons.extend(account_proof.get("reasons", []))
     return {
         "mode": "read_only_rehearsal",
         "current_pair": current.value,
         "target_pair": target.value,
-        "target_reason": snapshot.get("target_reason"),
+        "target_reason": target_reason,
         "decision": decision.action.value,
         "decision_reason": decision.reason,
         "allow_new_entries": decision.allow_new_entries,
@@ -296,17 +563,23 @@ def rehearsal_plan(snapshot: dict[str, Any]) -> dict[str, Any]:
         "side_effects": False,
         "wti_production_ready": bool(snapshot.get("readiness", {}).get("production_ready")),
         "wti_readiness_reasons": snapshot.get("wti_gate_reasons", snapshot.get("readiness", {}).get("reasons", [])),
+        "account_proof": account_proof,
+        "bounded_rotation_test": bool(snapshot.get("bounded_rotation_test")),
+        "bounded_test_ready": bool(snapshot.get("wti_bounded_test_gate_ready")),
+        "session_scenario": session_scenario,
     }
 
 
 class RotationSupervisor:
     def __init__(self, *, root: Path, market_id: int, multiplier: Decimal,
-                 confirm_initial_flat: bool, dry_run: bool = False) -> None:
+                 confirm_initial_flat: bool, dry_run: bool = False,
+                 bounded_rotation_test: bool = False) -> None:
         self.root = root
         self.market_id = market_id
         self.multiplier = multiplier
         self.confirm_initial_flat = confirm_initial_flat
         self.dry_run = dry_run
+        self.bounded_rotation_test = bounded_rotation_test
         self.journal_path = root / "log/rotation_supervisor_state.json"
         self.health_path = root / "log/rotation_supervisor_health.json"
 
@@ -380,7 +653,14 @@ class RotationSupervisor:
         self._launch_oil_collector(session_name)
         return "collector_started"
 
-    def _start_command(self, pair: Pair, *, recovery: bool = False) -> list[str]:
+    def _start_command(
+        self,
+        pair: Pair,
+        *,
+        recovery: bool = False,
+        bounded_test: bool = False,
+        rotation_test_id: str | None = None,
+    ) -> list[str]:
         python = str(self.root / ".venv" / "bin" / "python")
         if pair == Pair.ETH:
             command = [
@@ -409,10 +689,22 @@ class RotationSupervisor:
                     "--gradient-layer-notional-usd", "10",
                     "--keep-collecting-after-pilot",
                 ])
+                if bounded_test:
+                    if not rotation_test_id or not re.fullmatch(r"[0-9a-f]{32}", rotation_test_id):
+                        raise RuntimeError("bounded_rotation_test_id_missing_or_invalid")
+                    command.extend(["--allow-unqualified-data-pilot", "--rotation-test-id", rotation_test_id])
             return command
         raise RuntimeError("rotation_target_invalid")
 
-    def _launch(self, pair: Pair, *, recovery: bool = False, session_name: str) -> str:
+    def _launch(
+        self,
+        pair: Pair,
+        *,
+        recovery: bool = False,
+        session_name: str,
+        bounded_test: bool = False,
+        rotation_test_id: str | None = None,
+    ) -> str:
         if os.name == "nt":
             raise RuntimeError("automatic_rotation_execution_requires_linux")
         if not (self.root / ".env").is_file() or not (self.root / ".venv/bin/python").is_file():
@@ -423,7 +715,10 @@ class RotationSupervisor:
                     sock.bind(("127.0.0.1", port))
         session = session_name
         log_path = self.root / "log" / f"{session}.log"
-        command = self._start_command(pair, recovery=recovery)
+        command = self._start_command(
+            pair, recovery=recovery, bounded_test=bounded_test,
+            rotation_test_id=rotation_test_id,
+        )
         shell = (
             f"cd {shlex.quote(str(self.root))} && set -a && . ./.env && set +a && "
             f"exec {shlex.join(command)} >> {shlex.quote(str(log_path))} 2>&1"
@@ -554,7 +849,13 @@ class RotationSupervisor:
         elif not _flat_state(pair, state, allow_missing=allow_missing_flat):
             raise RuntimeError("target_local_state_not_flat")
         if not recovery and pair == Pair.WTI:
-            if not snapshot["readiness"].get("production_ready"):
+            if self.bounded_rotation_test:
+                test = journal.get("bounded_rotation_test") or {}
+                if test.get("status") not in {"authorized", "active"}:
+                    raise RuntimeError("bounded_rotation_test_authorization_unavailable")
+                if not snapshot.get("wti_bounded_test_gate_ready") or not snapshot.get("session", {}).get("allow_new_entries"):
+                    raise RuntimeError("bounded_rotation_test_current_market_gate_not_met")
+            elif not snapshot["readiness"].get("production_ready"):
                 raise RuntimeError("wti_production_readiness_not_met")
             pilot = state.get("gradient_pilot") or {}
             if pilot.get("status") in {"completed", "exhausted"}:
@@ -572,15 +873,101 @@ class RotationSupervisor:
         })
         self._save_journal(journal)
         if not self._tmux_session_exists(session_name):
-            self._launch(pair, recovery=recovery, session_name=session_name)
+            if self.bounded_rotation_test and pair == Pair.WTI and not recovery:
+                test = journal.get("bounded_rotation_test") or {}
+                self._launch(
+                    pair, recovery=recovery, session_name=session_name,
+                    bounded_test=True, rotation_test_id=str(test.get("test_id") or ""),
+                )
+            else:
+                self._launch(pair, recovery=recovery, session_name=session_name)
+
+    def _prepare_bounded_rotation_test(self, journal: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.bounded_rotation_test:
+            return None
+        test = journal.get("bounded_rotation_test")
+        if test is None:
+            test = {
+                "schema_version": 1,
+                "test_id": uuid.uuid4().hex,
+                "status": "authorized",
+                "market_id": self.market_id,
+                "multiplier": str(self.multiplier),
+                "max_completed_roundtrips": BOUNDED_TEST_MAX_ROUNDTRIPS,
+                "max_layers": BOUNDED_TEST_MAX_LAYERS,
+                "layer_notional_usd": str(BOUNDED_TEST_LAYER_NOTIONAL_USD),
+                "max_notional_usd": str(BOUNDED_TEST_MAX_NOTIONAL_USD),
+                "entry_threshold_bps": "30",
+                "second_tier_bps": "45",
+                "exit_target_bps": "1",
+                "roundtrip_cost_bps": "10",
+                "max_slippage_bps": "8",
+                "max_hold_seconds": 21600,
+                "entry_cutoff_seconds": 1800,
+                "authorized_at": datetime.now(timezone.utc).isoformat(),
+                "pilot_id": None,
+            }
+            journal["bounded_rotation_test"] = test
+            self._save_journal(journal)
+        if (
+            not isinstance(test, dict)
+            or test.get("schema_version") != 1
+            or not isinstance(test.get("test_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", test.get("test_id", ""))
+            or test.get("max_completed_roundtrips") != BOUNDED_TEST_MAX_ROUNDTRIPS
+            or test.get("max_layers") != BOUNDED_TEST_MAX_LAYERS
+            or test.get("layer_notional_usd") != str(BOUNDED_TEST_LAYER_NOTIONAL_USD)
+            or test.get("max_notional_usd") != str(BOUNDED_TEST_MAX_NOTIONAL_USD)
+            or test.get("market_id") != self.market_id
+            or test.get("multiplier") != str(self.multiplier)
+            or test.get("entry_threshold_bps") != "30"
+            or test.get("second_tier_bps") != "45"
+            or test.get("exit_target_bps") != "1"
+            or test.get("roundtrip_cost_bps") != "10"
+            or test.get("max_slippage_bps") != "8"
+            or test.get("max_hold_seconds") != 21600
+            or test.get("entry_cutoff_seconds") != 1800
+        ):
+            raise RuntimeError("bounded_rotation_test_journal_invalid")
+        state = read_object(self.root / "log/wti_live_state.json")
+        pilot = state.get("gradient_pilot")
+        if isinstance(pilot, dict):
+            if pilot.get("rotation_test_id") != test["test_id"]:
+                raise RuntimeError("bounded_rotation_test_pilot_identity_mismatch_manual_review_required")
+            if test.get("pilot_id") not in {None, pilot.get("pilot_id")}:
+                raise RuntimeError("bounded_rotation_test_pilot_id_changed_manual_review_required")
+            test["pilot_id"] = pilot.get("pilot_id")
+            if pilot.get("status") in {"completed", "exhausted"}:
+                test.update({
+                    "status": "completed",
+                    "completed_at": pilot.get("completed_at") or datetime.now(timezone.utc).isoformat(),
+                    "completed_roundtrips": pilot.get("completed_roundtrips"),
+                })
+            else:
+                test["status"] = "active"
+            self._save_journal(journal)
+        elif test.get("pilot_id") and journal.get("phase") != RotationPhase.STARTING.value:
+            raise RuntimeError("bounded_rotation_test_pilot_state_missing_manual_review_required")
+        if test.get("status") == "completed":
+            return test
+        if test.get("status") not in {"authorized", "active"}:
+            raise RuntimeError("bounded_rotation_test_not_reusable")
+        return test
 
     def run_once(self) -> dict[str, Any]:
-        snapshot = collect_snapshot(
-            self.root, market_id=self.market_id, multiplier=self.multiplier,
-        )
         journal = validate_journal(read_object(self.journal_path))
         if journal["phase"] == RotationPhase.BLOCKED.value:
             raise RuntimeError("rotation_journal_blocked_manual_review_required")
+        test_authorization = self._prepare_bounded_rotation_test(journal)
+        snapshot = collect_snapshot(
+            self.root,
+            market_id=self.market_id,
+            multiplier=self.multiplier,
+            bounded_rotation_test=self.bounded_rotation_test,
+            rotation_test_status=(
+                None if test_authorization is None else str(test_authorization["status"])
+            ),
+        )
         plan = rehearsal_plan(snapshot)
         output: dict[str, Any] = {"snapshot": {
             key: value for key, value in snapshot.items()
@@ -725,6 +1112,61 @@ class RotationSupervisor:
 
         target = Pair(snapshot["target_pair"])
         if target == current:
+            if (
+                self.bounded_rotation_test
+                and current == Pair.WTI
+                and snapshot.get("wti_bounded_test_gate_ready") is True
+                and snapshot.get("session", {}).get("allow_new_entries") is True
+            ):
+                wti_state = snapshot["states"]["WTI"]
+                health = runtime["health"]
+                pilot = wti_state.get("gradient_pilot")
+                test_id = (journal.get("bounded_rotation_test") or {}).get("test_id")
+                already_bound = (
+                    isinstance(pilot, dict)
+                    and pilot.get("rotation_test_id") == test_id
+                    and pilot.get("status") in {"available", "entry_pending", "in_position"}
+                )
+                if already_bound:
+                    journal.update({"phase": RotationPhase.STABLE.value, "current_pair": current.value, "target_pair": current.value})
+                    self._save_journal(journal)
+                    output.update({"action": "continue_bounded_test_runtime", "pair": current.value})
+                    return output
+                if wti_state.get("pending_action") is not None:
+                    output.update({"action": "hold_current_wti_pending_reconciliation"})
+                    return output
+                proof = _wti_account_proof(
+                    wti_state, health,
+                    market_id=self.market_id, now=datetime.now(timezone.utc),
+                )
+                pilot_matches = pilot is None or (
+                    isinstance(pilot, dict)
+                    and pilot.get("status") == "available"
+                    and pilot.get("rotation_test_id") == test_id
+                )
+                management_only = (
+                    health.get("manage_existing_only") is True
+                    and health.get("wti_entry_authorized") is False
+                )
+                if management_only and not _flat_state(Pair.WTI, wti_state):
+                    output.update({"action": "continue_management_only_until_flat", "pair": current.value})
+                    return output
+                if (
+                    proof.get("verified")
+                    and proof.get("active_orders_zero") is True
+                    and pilot_matches
+                    and (not management_only or _flat_state(Pair.WTI, wti_state))
+                ):
+                    journal.update({"current_pair": current.value, "target_pair": current.value})
+                    self._write_drain(current, runtime, journal)
+                    output.update({
+                        "action": "request_bounded_test_runtime_upgrade" if management_only else "request_safe_drain_for_bounded_test",
+                        "source": current.value,
+                        "target": current.value,
+                    })
+                    return output
+                output.update({"action": "hold_current_wti_account_or_pilot_proof_unverified"})
+                return output
             journal.update({"phase": RotationPhase.STABLE.value, "current_pair": current.value, "target_pair": current.value})
             self._save_journal(journal)
             collector_action = self._ensure_oil_collector(journal, snapshot) if current == Pair.ETH else "not_required_for_current_pair"
@@ -795,6 +1237,9 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--rehearse", action="store_true", help="Read-only snapshot and rotation rehearsal (default).")
     mode.add_argument("--execute", action="store_true", help="Run the automatic live rotation supervisor.")
+    parser.add_argument("--bounded-rotation-test", action="store_true", help="Limit the WTI side to one persisted two-layer round trip.")
+    parser.add_argument("--confirm-bounded-rotation-test", action="store_true")
+    parser.add_argument("--rehearse-session", choices=("live", "open", "closed"), default="live", help="Read-only session scenario; open/closed do not change exchange state.")
     parser.add_argument("--confirm-automatic-rotation", action="store_true")
     parser.add_argument("--i-understand-live-orders", action="store_true")
     parser.add_argument("--confirm-initial-flat", action="store_true", help="Confirm both exchange accounts and all orders were manually checked flat before first supervised start.")
@@ -809,20 +1254,32 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("poll interval must be between 1 and 60 seconds")
     if args.execute and not (args.confirm_automatic_rotation and args.i_understand_live_orders):
         parser.error("execute requires explicit automatic-rotation and live-order confirmations")
+    if args.execute and args.bounded_rotation_test and not args.confirm_bounded_rotation_test:
+        parser.error("bounded rotation test execution requires --confirm-bounded-rotation-test")
+    if args.confirm_bounded_rotation_test and not args.bounded_rotation_test:
+        parser.error("bounded-test confirmation requires --bounded-rotation-test")
+    if args.execute and args.rehearse_session != "live":
+        parser.error("simulated session scenarios are read-only")
     supervisor = RotationSupervisor(
         root=ROOT,
         market_id=args.lighter_market_id,
         multiplier=args.lighter_multiplier,
         confirm_initial_flat=args.confirm_initial_flat,
         dry_run=not args.execute,
+        bounded_rotation_test=args.bounded_rotation_test,
     )
     if not args.execute:
         try:
-            snapshot = collect_snapshot(ROOT, market_id=args.lighter_market_id, multiplier=args.lighter_multiplier)
+            snapshot = collect_snapshot(
+                ROOT,
+                market_id=args.lighter_market_id,
+                multiplier=args.lighter_multiplier,
+                bounded_rotation_test=args.bounded_rotation_test,
+            )
             print(json.dumps({"snapshot": {
                 key: value for key, value in snapshot.items()
                 if key not in {"states", "runtimes", "collector", "collector_pids"}
-            }, "plan": rehearsal_plan(snapshot), "side_effects": False}, ensure_ascii=True, indent=2, sort_keys=True))
+            }, "plan": rehearsal_plan(snapshot, session_scenario=args.rehearse_session), "side_effects": False}, ensure_ascii=True, indent=2, sort_keys=True))
             return 0
         except Exception as exc:
             print(json.dumps({"mode": "read_only_rehearsal", "error": f"{type(exc).__name__}:{exc}", "side_effects": False}, ensure_ascii=True))

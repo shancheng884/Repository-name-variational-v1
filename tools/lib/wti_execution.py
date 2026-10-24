@@ -750,6 +750,7 @@ class WTIExecutionStore:
         multiplier: Decimal,
         config: dict[str, Any],
         max_layers: int,
+        rotation_test_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(max_layers, int) or isinstance(max_layers, bool) or max_layers < 2:
             raise ValueError("gradient_pilot_requires_at_least_two_layers")
@@ -771,6 +772,7 @@ class WTIExecutionStore:
                     "multiplier": str(multiplier),
                     "config": deepcopy(config),
                     "max_layers": max_layers,
+                    "rotation_test_id": rotation_test_id,
                     "layers_opened": [],
                     "exhausted_tiers": [],
                     "completed_roundtrips": 0,
@@ -786,6 +788,7 @@ class WTIExecutionStore:
                 or decimal_value(pilot.get("multiplier")) != multiplier
                 or pilot.get("config") != config
                 or pilot.get("max_layers") != max_layers
+                or pilot.get("rotation_test_id") != rotation_test_id
                 or not isinstance(pilot.get("layers_opened"), list)
                 or not isinstance(pilot.get("exhausted_tiers", []), list)
                 or not isinstance(pilot.get("completed_roundtrips"), int)
@@ -2504,6 +2507,8 @@ class WTIPairExecutor:
         sample: dict[str, Any],
         now: datetime | None = None,
         session: SessionWindow | None = None,
+        runtime_pid: int | None = None,
+        runtime_run_id: str | None = None,
     ) -> dict[str, Any]:
         """Recover only from exact venue evidence; pending client IDs are never resubmitted."""
         context = self._validate_sample(sample, now=now or self._now())
@@ -2547,6 +2552,8 @@ class WTIPairExecutor:
                 "variational_qty": str(actual.variational_qty),
                 "lighter_qty": str(actual.lighter_qty),
                 "active_order_count": actual.active_order_count,
+                "runtime_pid": runtime_pid,
+                "runtime_run_id": runtime_run_id,
             }
             self.store.save(state)
             if actual.active_order_count != 0:

@@ -244,7 +244,8 @@ def test_rotation_drains_and_requires_verified_flat_before_switch() -> None:
         target_ready=True, has_pending_action=False, active_orders_zero=False,
         exchange_reconciled=True,
     )
-    assert decision.action == RotationAction.PAUSE_AND_RECONCILE
+    assert decision.action == RotationAction.DRAIN_CURRENT
+    assert decision.reason == "source_active_orders_must_be_verified_before_handoff"
 
 
 def test_closed_venue_does_not_request_one_sided_flatten_or_switch() -> None:
@@ -482,8 +483,8 @@ def test_oil_readiness_needs_three_sessions_and_cashflow_cost_evidence() -> None
     )
     assert promoted.ready_for_bounded_live_review
     assert promoted.historical_promotion_evidence_ready
-    assert not promoted.ready_for_production_rotation
-    assert "live_execution_and_session_gates_not_verified" in promoted.reasons
+    assert promoted.ready_for_production_rotation
+    assert "live_execution_and_session_gates_not_verified" not in promoted.reasons
     assert promoted.lighter_market_id_explicitly_configured
     assert promoted.lighter_exposure_multiplier == "1"
     assert promoted.lighter_exposure_multiplier_explicitly_configured

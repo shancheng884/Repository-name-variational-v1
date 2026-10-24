@@ -62,7 +62,7 @@ def decide_rotation(
     active_orders_zero: bool | None,
     exchange_reconciled: bool | None,
 ) -> RotationDecision:
-    if active_orders_zero is not True or exchange_reconciled is not True:
+    if exchange_reconciled is not True:
         return RotationDecision(
             RotationAction.PAUSE_AND_RECONCILE,
             current,
@@ -77,6 +77,25 @@ def decide_rotation(
             target,
             False,
             "pending_execution_requires_reconciliation",
+        )
+    if active_orders_zero is not True:
+        if current != Pair.NONE and target not in {Pair.NONE, current}:
+            # Requesting a source-runtime drain is safe; the supervisor still
+            # requires its PID/run-bound flat-and-zero-orders acknowledgement
+            # before it can start the target runtime.
+            return RotationDecision(
+                RotationAction.DRAIN_CURRENT,
+                current,
+                target,
+                False,
+                "source_active_orders_must_be_verified_before_handoff",
+            )
+        return RotationDecision(
+            RotationAction.PAUSE_AND_RECONCILE,
+            current,
+            target,
+            False,
+            "exchange_positions_or_active_orders_not_confirmed",
         )
     if current == Pair.NONE and has_open_position:
         return RotationDecision(

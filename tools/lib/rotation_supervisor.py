@@ -69,6 +69,7 @@ def initial_journal() -> dict[str, Any]:
         "target_run_id_before_start": None,
         "launch_attempts": 0,
         "collector_launch_attempts": 0,
+        "bounded_rotation_test": None,
         "consecutive_failures": 0,
         "updated_at": utc_now(),
     }
@@ -85,6 +86,7 @@ def validate_journal(value: dict[str, Any]) -> dict[str, Any]:
     ):
         raise RuntimeError("rotation_journal_schema_invalid")
     value.setdefault("collector_launch_attempts", 0)
+    value.setdefault("bounded_rotation_test", None)
     value.setdefault("consecutive_failures", 0)
     return value
 
