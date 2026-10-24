@@ -211,6 +211,106 @@ def script_processes(root: Path, script: str, proc_root: Path = Path("/proc")) -
     return sorted(result)
 
 
+def supervisor_processes(root: Path, proc_root: Path = Path("/proc")) -> list[int]:
+    pids = []
+    for pid in script_processes(root, "tools/rotation_supervisor.py", proc_root):
+        try:
+            argv = (proc_root / str(pid) / "cmdline").read_bytes().split(b"\0")
+        except FileNotFoundError:
+            continue
+        if b"--execute" in argv and b"--restart-supervisor" not in argv:
+            pids.append(pid)
+    return pids
+
+
+def terminate_supervisor(root: Path, pid: int) -> None:
+    if not callable(getattr(os, "pidfd_open", None)) or not callable(getattr(signal, "pidfd_send_signal", None)):
+        raise RuntimeError("supervisor_restart_pidfd_unavailable")
+    try:
+        descriptor = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        if supervisor_processes(root) != [pid]:
+            raise RuntimeError("rotation_supervisor_identity_changed")
+        signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def restart_supervisor(
+    root: Path, arguments: list[str], *, timeout_seconds: float = 20,
+) -> dict[str, Any]:
+    if sys.platform != "linux":
+        raise RuntimeError("supervisor_restart_requires_linux")
+    python = root / ".venv/bin/python"
+    if not python.is_file() or not (root / ".env").is_file():
+        raise RuntimeError("rotation_runtime_environment_missing")
+    with exclusive_lock(root / "log/rotation_supervisor_restart.lock"):
+        pids = supervisor_processes(root)
+        if len(pids) > 1:
+            raise RuntimeError("rotation_supervisor_process_count_conflict")
+        if pids:
+            terminate_supervisor(root, pids[0])
+            deadline = time.monotonic() + timeout_seconds
+            while supervisor_processes(root):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("rotation_supervisor_did_not_stop")
+                time.sleep(0.2)
+        # A missing process alone is insufficient: its execution lock must be released.
+        with exclusive_lock(root / "log/rotation_supervisor.lock"):
+            if supervisor_processes(root):
+                raise RuntimeError("rotation_supervisor_restart_race")
+        session = f"rotation-{datetime.now(timezone.utc).strftime('%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        log_path = root / "log" / f"{session}.log"
+        command = [str(python), "tools/rotation_supervisor.py", *[
+            item for item in arguments if item != "--restart-supervisor"
+        ]]
+        shell = (
+            f"cd {shlex.quote(str(root))} && set -a && . ./.env && set +a && "
+            f"exec {shlex.join(command)} >> {shlex.quote(str(log_path))} 2>&1"
+        )
+        requested_at = datetime.now(timezone.utc)
+        subprocess.run(["tmux", "new-session", "-d", "-s", session, shell], check=True)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            pids = supervisor_processes(root)
+            health = read_object(root / "log/rotation_supervisor_health.json")
+            published_age = _age(health.get("updated_at"), requested_at)
+            age = _age(health.get("updated_at"), datetime.now(timezone.utc))
+            current_health = (
+                published_age is not None and published_age <= 0
+                and age is not None and -5 <= age <= HEARTBEAT_MAX_AGE_SECONDS
+                and bool(health.get("supervisor_id"))
+            )
+            ready = (
+                len(pids) == 1 and health.get("pid") == pids[0]
+                and current_health and health.get("status") == "running"
+            )
+            if ready or (current_health and health.get("status") == "blocked"):
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.2)
+        result = (health.get("last_result") or {}) if current_health else {}
+        snapshot = result.get("snapshot") or {}
+        return {
+            "restarted": True, "ready": ready, "pids": pids,
+            "supervisor_id": health.get("supervisor_id") if current_health else None,
+            "status": health.get("status") if current_health else "awaiting_current_health",
+            "current_pair": snapshot.get("current_pair"),
+            "target_pair": snapshot.get("target_pair"), "action": result.get("action"),
+            "market_session": (snapshot.get("session") or {}).get("state"),
+            "error": None if ready else (
+                (health.get("last_error") if current_health else None)
+                or "current_supervisor_health_unconfirmed"
+            ),
+            "session": session, "log": str(log_path),
+        }
+
+
 def _state_exposure(pair: Pair, state: dict[str, Any]) -> tuple[bool, bool, bool]:
     """Return (valid, exposure, pending), treating malformed state as unsafe."""
     if pair == Pair.ETH:
@@ -687,6 +787,8 @@ class RotationSupervisor:
         self.dry_run = dry_run
         self.bounded_rotation_test = bounded_rotation_test
         self.continuous_gradient_rotation = continuous_gradient_rotation
+        self.supervisor_id = uuid.uuid4().hex
+        self.stop_requested = False
         self.journal_path = root / "log/rotation_supervisor_state.json"
         self.health_path = root / "log/rotation_supervisor_health.json"
 
@@ -694,8 +796,15 @@ class RotationSupervisor:
         journal["updated_at"] = datetime.now(timezone.utc).isoformat()
         write_object_atomic(self.journal_path, journal)
 
+    def request_stop(self, *_args: Any) -> None:
+        self.stop_requested = True
+
     def _save_health(self, payload: dict[str, Any]) -> None:
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        payload["pid"] = os.getpid()
+        payload["supervisor_id"] = self.supervisor_id
+        payload["continuous_gradient_rotation"] = self.continuous_gradient_rotation
+        payload["confirm_initial_flat"] = self.confirm_initial_flat
         write_object_atomic(self.health_path, payload)
 
     def _forwarder_available(self) -> bool:
@@ -1268,6 +1377,10 @@ class RotationSupervisor:
                 session_unknown = (
                     snapshot.get("session", {}).get("state") == "status_unknown"
                 )
+                interrupted_eth_start = (
+                    journal["phase"] == RotationPhase.STARTING.value
+                    and journal["target_pair"] == Pair.ETH.value
+                )
                 if (
                     session_unknown
                     and self.continuous_gradient_rotation
@@ -1297,8 +1410,14 @@ class RotationSupervisor:
                 if (
                     session_unknown
                     and self.continuous_gradient_rotation
-                    and journal["phase"] == RotationPhase.STABLE.value
+                    and (
+                        journal["phase"] == RotationPhase.STABLE.value
+                        or interrupted_eth_start
+                    )
                 ):
+                    if interrupted_eth_start and self._tmux_session_exists(journal.get("tmux_session")):
+                        output["action"] = "await_interrupted_eth_start_runtime"
+                        return output
                     if not self.confirm_initial_flat:
                         output["action"] = "wait_for_initial_both_accounts_flat_confirmation"
                         return output
@@ -1311,12 +1430,31 @@ class RotationSupervisor:
                     if snapshot.get("collector_pids"):
                         output["action"] = "wait_for_standalone_collector_exit"
                         return output
+                    if interrupted_eth_start:
+                        superseded = journal.get("superseded_starts", [])
+                        if not isinstance(superseded, list):
+                            raise RuntimeError("rotation_superseded_starts_invalid")
+                        journal["superseded_starts"] = [*superseded, {
+                            "target_pair": journal["target_pair"],
+                            "phase": journal["phase"],
+                            "tmux_session": journal.get("tmux_session"),
+                            "launch_attempts": journal.get("launch_attempts"),
+                            "target_run_id_before_start": journal.get("target_run_id_before_start"),
+                            "recorded_at": datetime.now(timezone.utc).isoformat(),
+                            "reason": "session_unknown_after_interrupted_eth_start",
+                        }]
+                        # Save the prior attempt and the new management intent atomically below.
+                        journal.update({"tmux_session": None, "launch_attempts": 0})
                     self._start_target(
                         Pair.WTI, journal, snapshot, recovery=True,
                         allow_missing_flat=True,
                     )
                     output.update({
-                        "action": "start_wti_session_bootstrap_management_only",
+                        "action": (
+                            "recover_interrupted_eth_start_via_wti_session_bootstrap"
+                            if interrupted_eth_start
+                            else "start_wti_session_bootstrap_management_only"
+                        ),
                         "pair": Pair.WTI.value,
                     })
                     return output
@@ -1540,7 +1678,7 @@ class RotationSupervisor:
         lock_path = self.root / "log/rotation_supervisor.lock"
         try:
             with exclusive_lock(lock_path):
-                while True:
+                while not self.stop_requested:
                     try:
                         result = self.run_once()
                         journal = validate_journal(read_object(self.journal_path))
@@ -1578,17 +1716,22 @@ class RotationSupervisor:
                             return 2
                     if once:
                         return 0
-                    time.sleep(poll_seconds)
+                    if not self.stop_requested:
+                        time.sleep(poll_seconds)
+                self._save_health({"status": "stopped", "last_error": None})
+                return 0
         except RuntimeError as exc:
             print(json.dumps({"action": "blocked", "reason": str(exc), "side_effects": False}, ensure_ascii=True))
             return 2
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--rehearse", action="store_true", help="Read-only snapshot and rotation rehearsal (default).")
     mode.add_argument("--execute", action="store_true", help="Run the automatic live rotation supervisor.")
+    parser.add_argument("--restart-supervisor", action="store_true", help="Replace only the supervisor process, preserving workers and the durable rotation journal.")
     parser.add_argument("--bounded-rotation-test", action="store_true", help="Limit the WTI side to one persisted two-layer round trip.")
     parser.add_argument("--confirm-bounded-rotation-test", action="store_true")
     parser.add_argument("--continuous-gradient-rotation", action="store_true", help="Keep authorizing sequential two-layer WTI rounds under one persistent rotation session.")
@@ -1620,6 +1763,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("continuous-rotation confirmation requires --continuous-gradient-rotation")
     if args.execute and args.rehearse_session != "live":
         parser.error("simulated session scenarios are read-only")
+    if args.restart_supervisor:
+        if not args.execute or args.once:
+            parser.error("supervisor restart requires persistent --execute mode")
+        try:
+            result = restart_supervisor(ROOT, argv)
+        except Exception as exc:
+            print(json.dumps({"restarted": False, "ready": False, "error": f"{type(exc).__name__}:{exc}"}))
+            return 2
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True))
+        return 0 if result["ready"] else 2
     supervisor = RotationSupervisor(
         root=ROOT,
         market_id=args.lighter_market_id,
@@ -1646,7 +1799,14 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(json.dumps({"mode": "read_only_rehearsal", "error": f"{type(exc).__name__}:{exc}", "side_effects": False}, ensure_ascii=True))
             return 2
-    return supervisor.run(once=args.once, poll_seconds=args.poll_seconds)
+    previous_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        for sig in previous_handlers:
+            signal.signal(sig, supervisor.request_stop)
+        return supervisor.run(once=args.once, poll_seconds=args.poll_seconds)
+    finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
 
 
 if __name__ == "__main__":

@@ -386,6 +386,24 @@ fresh dual-account zero-position, zero-active-order reconciliation. Pending,
 partial, ambiguous, mismatched, or stale state prevents re-arming. The supervisor
 does not start a second WTI runtime while the existing round is healthy.
 
+Use `--restart-supervisor` with the normal `--execute` and authorization flags
+to replace an older supervisor. It resolves Python script paths through `/proc`,
+accepts relative or absolute Python paths, excludes tmux wrappers and restart
+helpers, and terminates only the verified supervisor through a Linux pidfd.
+Updated supervisors finish their current persisted transition before exiting on SIGTERM.
+The replacement must publish a fresh heartbeat with its own PID and instance ID
+before takeover is reported ready. Worker processes, rotation authorization,
+pending-order identities, and journals are preserved.
+
+If an interrupted ETH start remains in the journal while the live session is
+unknown, the supervisor waits for its original tmux session and any starting
+worker. Once both are absent, explicit initial-flat confirmation and flat local
+states permit a WTI management-only bootstrap. The superseded ETH launch is
+retained in `superseded_starts`; the WTI launch and its audit record are written
+atomically before starting the process. A subsequent restart reuses that WTI
+launch intent. Current exchange-session, account, order, and entry checks still
+control the eventual trading runtime.
+
 The existing thresholds and per-position controls remain pinned: first entry
 30 bps, second gradient tier 45 bps, two layers at 10 USD each, 20 USD aggregate
 notional cap, 1 bps net exit target after the configured 10 bps roundtrip-cost

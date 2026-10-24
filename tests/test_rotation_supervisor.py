@@ -710,6 +710,82 @@ def test_cold_start_unknown_session_without_flat_confirmation_does_not_launch(tm
     assert not launches
 
 
+def test_interrupted_eth_start_bootstraps_session_once_and_keeps_authorization(
+    tmp_path: Path, monkeypatch,
+):
+    snapshot = _unknown_cold_start_snapshot()
+    monkeypatch.setattr(supervisor_module, "collect_snapshot", lambda *args, **kwargs: snapshot)
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=True, continuous_gradient_rotation=True,
+    )
+    journal = initial_journal()
+    authorization = dict(supervisor._prepare_continuous_gradient_rotation(journal))
+    journal.update({
+        "phase": "starting", "target_pair": "ETH", "launch_attempts": 1,
+        "tmux_session": "rotation-eth-1024083341",
+    })
+    write_object_atomic(supervisor.journal_path, journal)
+    live_sessions = set()
+    monkeypatch.setattr(supervisor, "_tmux_session_exists", lambda name: name in live_sessions)
+    launches = []
+
+    def launch(pair, **kwargs):
+        launches.append((pair, kwargs))
+        live_sessions.add(kwargs["session_name"])
+
+    monkeypatch.setattr(supervisor, "_launch", launch)
+    result = supervisor.run_once()
+    repeated = supervisor.run_once()
+    saved = json.loads(supervisor.journal_path.read_text(encoding="utf-8"))
+
+    assert result["action"] == "recover_interrupted_eth_start_via_wti_session_bootstrap"
+    assert repeated["action"] == "await_wti_session_bootstrap_runtime"
+    assert len(launches) == 1
+    assert launches[0][0] == Pair.WTI and launches[0][1]["recovery"] is True
+    assert saved["phase"] == "recovering" and saved["target_pair"] == "WTI"
+    assert saved["tmux_session"] != "rotation-eth-1024083341"
+    assert saved["launch_attempts"] == 1
+    assert saved["continuous_gradient_rotation"] == authorization
+    assert saved["superseded_starts"][0]["tmux_session"] == "rotation-eth-1024083341"
+    assert saved["superseded_starts"][0]["launch_attempts"] == 1
+
+
+@pytest.mark.parametrize("blocker, expected", [
+    ("session", "await_interrupted_eth_start_runtime"),
+    ("confirmation", "wait_for_initial_both_accounts_flat_confirmation"),
+    ("collector", "wait_for_standalone_collector_exit"),
+    ("process", "await_starting_runtime_health"),
+])
+def test_interrupted_eth_start_never_retargets_while_start_is_unconfirmed(
+    tmp_path: Path, monkeypatch, blocker, expected,
+):
+    snapshot = _unknown_cold_start_snapshot()
+    if blocker == "collector":
+        snapshot["collector_pids"] = [789]
+    if blocker == "process":
+        snapshot["process_conflict"] = True
+        snapshot["runtimes"]["ETH"]["pids"] = [123]
+    monkeypatch.setattr(supervisor_module, "collect_snapshot", lambda *args, **kwargs: snapshot)
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=blocker != "confirmation", continuous_gradient_rotation=True,
+    )
+    journal = initial_journal()
+    journal.update({
+        "phase": "starting", "target_pair": "ETH", "launch_attempts": 1,
+        "tmux_session": "rotation-eth-existing",
+    })
+    write_object_atomic(supervisor.journal_path, journal)
+    monkeypatch.setattr(supervisor, "_tmux_session_exists", lambda _name: blocker == "session")
+    monkeypatch.setattr(supervisor, "_launch", lambda *a, **kw: pytest.fail("duplicate launch"))
+
+    assert supervisor.run_once()["action"] == expected
+    saved = json.loads(supervisor.journal_path.read_text(encoding="utf-8"))
+    assert saved["target_pair"] == "ETH" and saved["launch_attempts"] == 1
+    assert "superseded_starts" not in saved
+
+
 def test_cold_start_bootstrap_resume_is_idempotent_after_supervisor_interrupt(
     tmp_path: Path, monkeypatch,
 ):
