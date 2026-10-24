@@ -104,6 +104,19 @@ class MarketContext:
         return self.lighter_qty_step / Decimal("2")
 
 
+@dataclass(frozen=True, slots=True)
+class WTIAccountContext:
+    """Market identity required for account reconciliation without live quotes."""
+
+    instrument: HedgeInstrument
+    market_id: int
+    lighter_qty_step: Decimal
+
+    @property
+    def lighter_position_tolerance(self) -> Decimal:
+        return self.lighter_qty_step / Decimal("2")
+
+
 def _positive_decimal(value: Any, name: str) -> Decimal:
     parsed = decimal_value(value)
     if parsed is None or parsed <= 0:
@@ -285,7 +298,7 @@ def _signed_target(direction: str, var_qty: Decimal, lighter_qty: Decimal) -> tu
 
 def _account_positions(
     payload: Any,
-    context: MarketContext,
+    context: MarketContext | WTIAccountContext,
     *,
     now: datetime,
     minimum_observed_at: datetime | None = None,
@@ -324,7 +337,7 @@ class AccountSnapshot:
 def _matches(
     actual: AccountSnapshot,
     expected: tuple[Decimal, Decimal],
-    context: MarketContext,
+    context: MarketContext | WTIAccountContext,
 ) -> bool:
     return (
         actual.active_order_count == 0
@@ -950,7 +963,7 @@ class WTIPairExecutor:
 
     def _read(
         self,
-        context: MarketContext,
+        context: MarketContext | WTIAccountContext,
         *,
         minimum_observed_at: datetime | None = None,
     ) -> AccountSnapshot:
@@ -966,6 +979,78 @@ class WTIPairExecutor:
         if parsed is None:
             raise WTIExecutionError("account_snapshot_unverifiable")
         return parsed
+
+    def reconcile_account_only(
+        self,
+        *,
+        now: datetime | None = None,
+        runtime_pid: int | None = None,
+        runtime_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Verify an existing flat/open state while quotes are unavailable.
+
+        This path never resolves pending orders or submits orders. A pending or
+        manual-review state must wait for normal sample-based reconciliation.
+        """
+        observed_now = now or self._now()
+        if observed_now.tzinfo is None or observed_now.utcoffset() is None:
+            raise WTIExecutionError("account_reconcile_clock_must_be_timezone_aware")
+        observed_now = observed_now.astimezone(timezone.utc)
+        instrument = replace(
+            WTI_HEDGE,
+            lighter=replace(
+                WTI_HEDGE.lighter,
+                exposure_multiplier=self.expected_lighter_multiplier,
+            ),
+        )
+        context = WTIAccountContext(
+            instrument=instrument,
+            market_id=self.expected_lighter_market_id,
+            lighter_qty_step=Decimal(1).scaleb(-self.expected_lighter_size_decimals),
+        )
+        with self.store.exclusive():
+            state = self.store.load()
+            if state.get("status") not in {"flat", "open"} or state.get("pending_action") is not None:
+                raise WTIExecutionError("account_only_reconcile_requires_resolved_state")
+            position = state.get("open_position")
+            if state.get("status") == "flat":
+                if position is not None:
+                    return self._manual_review(state, "flat_state_contains_open_position")
+                expected = (Decimal("0"), Decimal("0"))
+            else:
+                if not isinstance(position, dict):
+                    return self._manual_review(state, "open_state_position_missing")
+                if (
+                    integer_value(position.get("market_id")) != context.market_id
+                    or decimal_value(position.get("multiplier")) != self.expected_lighter_multiplier
+                ):
+                    return self._manual_review(state, "wti_market_metadata_changed_during_recovery")
+                expected_var = decimal_value(position.get("expected_var_qty"))
+                expected_lighter = decimal_value(position.get("expected_lighter_qty"))
+                if expected_var is None or expected_lighter is None:
+                    return self._manual_review(state, "open_local_position_quantities_unverifiable")
+                expected = (expected_var, expected_lighter)
+
+            actual = self._read(context)
+            state["last_account_reconciliation"] = {
+                "verified": True,
+                "observed_at": actual.observed_at.isoformat(),
+                "market_id": context.market_id,
+                "variational_qty": str(actual.variational_qty),
+                "lighter_qty": str(actual.lighter_qty),
+                "active_order_count": actual.active_order_count,
+                "runtime_pid": runtime_pid,
+                "runtime_run_id": runtime_run_id,
+                "reconciliation_mode": "account_only_closed_session",
+            }
+            self.store.save(state)
+            if actual.active_order_count != 0:
+                return self._manual_review(state, "active_wti_orders_require_reconciliation")
+            if not _matches(actual, expected, context):
+                return self._manual_review(state, "local_exchange_position_mismatch")
+            state["manual_review_reason"] = None
+            self.store.save(state)
+            return state
 
     def _order_request(
         self,

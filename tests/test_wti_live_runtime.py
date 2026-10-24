@@ -111,6 +111,24 @@ def test_closed_session_uses_fresh_status_feed_heartbeat_not_old_change_time():
     assert stale.state.value == "status_unknown"
 
 
+def test_stale_sample_yields_to_fresh_closed_feed_but_fresh_conflict_blocks():
+    now = datetime.now(timezone.utc)
+    closed_health = {
+        "market_status": "closed",
+        "market_status_feed_connected": True,
+        "market_status_feed_heartbeat_at": now.isoformat(),
+    }
+    stale_open_row = _live_sample(now - timedelta(minutes=5))
+    closed = wti_live._session_window(stale_open_row, now, 1800, feed_health=closed_health)
+    assert closed.state == wti_live.OilSession.EXCHANGE_CLOSED
+    assert closed.allow_new_entries is False
+    assert closed.allow_position_management is False
+
+    fresh_conflict = _live_sample(now)
+    blocked = wti_live._session_window(fresh_conflict, now, 1800, feed_health=closed_health)
+    assert blocked.state == wti_live.OilSession.STATUS_UNKNOWN
+
+
 def test_eth_flat_requires_explicit_confirmation_and_exact_flat_state(tmp_path: Path):
     path = tmp_path / "eth.json"
     path.write_text(json.dumps({
@@ -661,6 +679,91 @@ def test_run_defers_startup_reconcile_age_race_and_recovers_in_live_loop(
     assert runtime.startup_reconciled is True
     assert runtime.entry_authorization_permanently_revoked is False
     assert runtime.last_runtime_error is None
+
+
+def test_management_runtime_reconciles_account_and_stays_alive_when_market_closed(
+    monkeypatch, tmp_path: Path,
+):
+    class ClosedCollector:
+        def __init__(self):
+            self.latest_sample = None
+            self.stopped = False
+            self.market_status_feed = SimpleNamespace(
+                status="closed", connected=True, heartbeat_at=datetime.now(timezone.utc),
+            )
+
+        async def run(self):
+            await asyncio.sleep(0.05)
+
+        def request_stop(self):
+            self.stopped = True
+
+    class AccountOnlyExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def reconcile_account_only(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"status": "flat", "open_position": None, "pending_action": None}
+
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.args = SimpleNamespace(
+        mode="live", manage_existing_wti_position=True,
+        initial_sample_timeout_seconds=1, entry_cutoff_seconds=1800,
+        state_path=tmp_path / "wti-state.json",
+    )
+    runtime.args.state_path.write_text(json.dumps({
+        "status": "flat", "open_position": None, "pending_action": None,
+    }))
+    runtime.logger = logging.getLogger("test_wti_closed_management_startup")
+    runtime.collector = ClosedCollector()
+    runtime.collector_task = None
+    runtime.servers = []
+    runtime.account_client = None
+    runtime.signer_client = None
+    runtime.gateway = None
+    runtime.executor = None
+    runtime.run_id = "closed-session-run"
+    runtime.stop = False
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    runtime.manage_existing_only = True
+    runtime.startup_reconciled = False
+    runtime.last_risk = {}
+    runtime.last_action = {"action": "starting"}
+    runtime.last_health_write_monotonic = 0.0
+    runtime.last_account_only_reconcile_monotonic = 0.0
+    runtime.last_runtime_error = None
+    runtime.last_reconcile_elapsed_ms = None
+    runtime.rotation_drain_request = None
+    runtime.readiness = {"ready": False, "reasons": ["closed"]}
+    runtime.single_round_pilot = None
+    runtime.gradient_pilot = None
+    executor = AccountOnlyExecutor()
+    health_writes = []
+
+    async def initialize():
+        runtime.executor = executor
+        runtime.gateway = SimpleNamespace(latest_risk={"risk_action": "normal"})
+
+    async def no_op():
+        return None
+
+    runtime._start_forwarder = no_op
+    runtime._initialize_execution = initialize
+    runtime._write_health = lambda **kwargs: health_writes.append(kwargs)
+    runtime._poll_rotation_drain = lambda: False
+    runtime._complete_rotation_drain_if_verified_flat = lambda _state: False
+    monkeypatch.setattr(wti_live, "validate_startup_preconditions", lambda _args: None)
+
+    asyncio.run(runtime.run())
+
+    assert runtime.startup_reconciled is True
+    assert runtime.entry_authorized is False
+    assert runtime.last_action == {"action": "hold", "reason": "exchange_closed_no_market_sample"}
+    assert len(executor.calls) == 1
+    assert executor.calls[0]["runtime_run_id"] == "closed-session-run"
+    assert all(call["row"] is None for call in health_writes)
 
 
 class _FlatLoopGateway:

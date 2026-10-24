@@ -64,6 +64,7 @@ MIN_ENTRY_CUTOFF_SECONDS = 1800
 MAX_HOLD_SECONDS = 21600
 MAX_SLIPPAGE_BPS = Decimal("8")
 MAX_SINGLE_ROUND_PILOT_ENTRY_ATTEMPTS = 3
+ACCOUNT_ONLY_RECONCILE_INTERVAL_SECONDS = 10
 RETRYABLE_SAMPLE_VALIDATION_ERRORS = frozenset({
     "market_sample_stale_or_future",
     "variational_quote_stale_or_invalid",
@@ -225,7 +226,35 @@ def _session_window(
     health_status = str(health.get("market_status") or "").lower()
     status = row_status
     if health_status and health_status != row_status:
-        status = "unknown"
+        row_age = None
+        try:
+            row_at = datetime.fromisoformat(str(row.get("logged_at")).replace("Z", "+00:00"))
+            if row_at.tzinfo is not None and row_at.utcoffset() is not None:
+                row_age = (now - row_at.astimezone(timezone.utc)).total_seconds()
+        except (TypeError, ValueError):
+            pass
+        heartbeat = health.get("market_status_feed_heartbeat_at")
+        heartbeat_fresh = False
+        try:
+            heartbeat_at = datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))
+            if heartbeat_at.tzinfo is not None and heartbeat_at.utcoffset() is not None:
+                heartbeat_age = (now - heartbeat_at.astimezone(timezone.utc)).total_seconds()
+                heartbeat_fresh = (
+                    health.get("market_status_feed_connected") is True
+                    and -5 <= heartbeat_age <= 30
+                )
+        except (TypeError, ValueError):
+            pass
+        if (
+            health_status in {"closed", "halted_trading"}
+            and heartbeat_fresh
+            and (row_age is None or row_age > 30)
+        ):
+            status = health_status
+        else:
+            status = "unknown"
+    elif not row_status and health_status in {"closed", "halted_trading"}:
+        status = health_status
     if status not in {"open", "closed", "halted_trading"}:
         exchange_open = None
     else:
@@ -249,6 +278,8 @@ def _session_window(
             row.get("session_status_feed_heartbeat_at"),
         )
         source = row.get("session_status_source")
+        if source is None and health.get("market_status_feed_connected") is True:
+            source = "variational_market_status_websocket"
         if (
             connected is not True
             or source != "variational_market_status_websocket"
@@ -332,6 +363,7 @@ class WTILiveRuntime:
         self.last_readiness_elapsed_ms: float | None = None
         self.last_reconcile_elapsed_ms: float | None = None
         self.rotation_drain_request: dict[str, Any] | None = None
+        self.last_account_only_reconcile_monotonic = 0.0
 
     def request_stop(self, *_args: Any) -> None:
         self.stop = True
@@ -643,21 +675,78 @@ class WTILiveRuntime:
             self.gradient_pilot = dict(pilot)
             self.entry_authorized = False
             self.entry_gate_block_reason = f"gradient_pilot_{pilot['status']}"
-            if not getattr(self.args, "keep_collecting_after_pilot", False):
+            if not (
+                getattr(self.args, "keep_collecting_after_pilot", False)
+                or getattr(self.args, "manage_existing_wti_position", False)
+            ):
                 self.request_stop()
             return True
         return False
 
-    async def _wait_for_first_sample(self) -> dict[str, Any]:
+    def _confirmed_closed_session_window(self, now: datetime):
+        feed = getattr(getattr(self, "collector", None), "market_status_feed", None)
+        if feed is None or getattr(feed, "connected", None) is not True:
+            return None
+        status = str(getattr(feed, "status", "") or "").lower()
+        if status not in {"closed", "halted_trading"}:
+            return None
+        heartbeat = getattr(feed, "heartbeat_at", None)
+        if not isinstance(heartbeat, datetime) or heartbeat.tzinfo is None or heartbeat.utcoffset() is None:
+            return None
+        heartbeat = heartbeat.astimezone(timezone.utc)
+        heartbeat_age = (now.astimezone(timezone.utc) - heartbeat).total_seconds()
+        if heartbeat_age < -5 or heartbeat_age > 30:
+            return None
+        row = {
+            "market_status": status,
+            "session_status": "closed",
+            "session_status_source": "variational_market_status_websocket",
+            "session_status_observed_at": heartbeat.isoformat(),
+            "session_status_feed_connected": True,
+            "session_status_feed_heartbeat_at": heartbeat.isoformat(),
+        }
+        window = _session_window(
+            row,
+            now,
+            self.args.entry_cutoff_seconds,
+            feed_health={
+                "market_status": status,
+                "market_status_feed_connected": True,
+                "market_status_feed_heartbeat_at": heartbeat.isoformat(),
+            },
+        )
+        return window if window.state == OilSession.EXCHANGE_CLOSED else None
+
+    async def _wait_for_first_sample(self) -> dict[str, Any] | None:
         deadline = time.monotonic() + self.args.initial_sample_timeout_seconds
         while not self.stop and time.monotonic() < deadline:
             if self.collector.latest_sample is not None:
                 return dict(self.collector.latest_sample)
+            if (
+                getattr(self.args, "manage_existing_wti_position", False)
+                and self._confirmed_closed_session_window(datetime.now(timezone.utc)) is not None
+            ):
+                return None
             if self.collector_task is not None and self.collector_task.done():
                 await self.collector_task
                 raise RuntimeError("wti_collector_stopped_before_first_sample")
             await asyncio.sleep(0.25)
         raise RuntimeError("wti_first_sample_timeout")
+
+    async def _read_account_only_reconcile(self) -> dict[str, Any]:
+        assert self.executor is not None
+        started = time.monotonic()
+        now = datetime.now(timezone.utc)
+        try:
+            return await asyncio.to_thread(
+                lambda: self.executor.reconcile_account_only(
+                    now=now,
+                    runtime_pid=os.getpid(),
+                    runtime_run_id=self.run_id,
+                )
+            )
+        finally:
+            self.last_reconcile_elapsed_ms = round((time.monotonic() - started) * 1000, 3)
 
     def _refresh_readiness(self) -> None:
         if self.args.mode != "live" or not self.market_metadata:
@@ -797,11 +886,15 @@ class WTILiveRuntime:
                 at = datetime.fromisoformat(str(sample_at).replace("Z", "+00:00"))
                 age = (now - at.astimezone(timezone.utc)).total_seconds()
         stale = not self._sample_health_fresh(row, now)
+        closed_window = self._confirmed_closed_session_window(now)
         risk = dict(self.last_risk)
         if self.args.mode == "observe":
             action, reason = "block_entry", "observe_only_mode"
         elif stale:
-            action, reason = "block_entry", "wti_market_sample_or_session_unavailable"
+            action, reason = "block_entry", (
+                "wti_exchange_closed" if closed_window is not None
+                else "wti_market_sample_or_session_unavailable"
+            )
         elif self.entry_gate_block_reason:
             action, reason = "block_entry", self.entry_gate_block_reason
         else:
@@ -850,7 +943,10 @@ class WTILiveRuntime:
             "market_sample_at": sample_at,
             "market_sample_age_seconds": None if age is None else round(age, 3),
             "market_sample_fresh": not stale,
-            "market_session": None if not row else row.get("session_status"),
+            "market_session": (
+                row.get("session_status") if row else
+                OilSession.EXCHANGE_CLOSED.value if closed_window is not None else None
+            ),
             "last_action": self.last_action,
             "open_lots_total": int(exposure),
             "pending_actions_total": int(pending),
@@ -1128,7 +1224,26 @@ class WTILiveRuntime:
                 await self._initialize_execution()
                 sample = await self._wait_for_first_sample()
                 state = read_json(self.args.state_path)
-                if self._record_new_sample(dict(sample)) is True:
+                if sample is None:
+                    self.entry_authorized = False
+                    self.entry_gate_block_reason = "wti_exchange_closed"
+                    self.last_action = {"action": "hold", "reason": "exchange_closed_no_market_sample"}
+                    try:
+                        state = await self._read_account_only_reconcile()
+                        self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
+                        self.startup_reconciled = state.get("status") in {"flat", "open"}
+                        if not self.startup_reconciled:
+                            self.last_action = {
+                                "action": "blocked",
+                                "reason": state.get("manual_review_reason") or state.get("status"),
+                            }
+                    except WTIExecutionError as exc:
+                        self.last_runtime_error = str(exc)
+                        self.last_action = {"action": "blocked", "reason": str(exc)}
+                        self.logger.warning("wti_closed_session_account_reconcile_failed reason=%s", exc)
+                    self.last_account_only_reconcile_monotonic = time.monotonic()
+                    self._write_health(state=state, row=None, error=self.last_runtime_error)
+                elif self._record_new_sample(dict(sample)) is True:
                     try:
                         state = await self._read_reconcile(dict(sample))
                     except WTIExecutionError as exc:
@@ -1218,6 +1333,40 @@ class WTILiveRuntime:
                         self._write_health(state=state, row=row, error=self.last_runtime_error)
                 elif self.args.mode == "observe":
                     self._write_health(state={}, row=row)
+                elif (
+                    self.args.mode == "live"
+                    and self.manage_existing_only
+                    and self._confirmed_closed_session_window(datetime.now(timezone.utc)) is not None
+                ):
+                    if (
+                        not self.startup_reconciled
+                        or time.monotonic() - self.last_account_only_reconcile_monotonic
+                        >= ACCOUNT_ONLY_RECONCILE_INTERVAL_SECONDS
+                    ):
+                        try:
+                            state = await self._read_account_only_reconcile()
+                            self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
+                            self.startup_reconciled = state.get("status") in {"flat", "open"}
+                            if self.startup_reconciled:
+                                self.last_runtime_error = None
+                                self.last_action = {
+                                    "action": "account_only_reconcile",
+                                    "status": state.get("status"),
+                                }
+                            else:
+                                self.last_action = {
+                                    "action": "blocked",
+                                    "reason": state.get("manual_review_reason") or state.get("status"),
+                                }
+                        except WTIExecutionError as exc:
+                            self.startup_reconciled = False
+                            self.last_runtime_error = str(exc)
+                            self.last_action = {"action": "blocked", "reason": str(exc)}
+                            self.logger.warning("wti_closed_session_account_reconcile_failed reason=%s", exc)
+                        self.last_account_only_reconcile_monotonic = time.monotonic()
+                        self._complete_rotation_drain_if_verified_flat(state)
+                    if time.monotonic() - self.last_health_write_monotonic >= 5:
+                        self._write_health(state=state, row=None, error=self.last_runtime_error)
                 elif (
                     self.args.mode == "live"
                     and time.monotonic() - self.last_health_write_monotonic >= 5

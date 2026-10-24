@@ -211,6 +211,41 @@ def test_success_requires_current_runtime_collection(monkeypatch, tmp_path, coll
     assert report["collecting"] is (collector_pid == 42)
 
 
+@pytest.mark.parametrize(("heartbeat_age", "expected"), [(3, True), (31, False)])
+def test_closed_market_takeover_accepts_fresh_feed_without_samples(
+    monkeypatch, tmp_path, heartbeat_age, expected,
+):
+    _state_files(tmp_path)
+    (tmp_path / "log/wti_live_state.json").write_text(json.dumps({
+        "status": "flat", "open_position": None, "pending_action": None,
+    }))
+    now = datetime.now(timezone.utc)
+    (tmp_path / "log/wti_live_risk_health.json").write_text(json.dumps({
+        "pid": 42, "run_id": "closed-run", "updated_at": now.isoformat(),
+        "status": "running", "startup_reconciled": True, "manage_existing_only": True,
+        "wti_entry_authorized": False,
+    }))
+    collector_root = tmp_path / "log/oil_swap/basis_samples"
+    collector_root.mkdir(parents=True)
+    (collector_root / "health.json").write_text(json.dumps({
+        "pid": 42, "status": "running", "samples_this_run": 0,
+        "last_sample_at": None, "updated_at": now.isoformat(),
+        "market_status": "closed", "market_status_feed_connected": True,
+        "market_status_feed_heartbeat_at": (
+            now - timedelta(seconds=heartbeat_age)
+        ).isoformat(),
+    }))
+    monkeypatch.setattr(takeover, "runtime_processes", lambda *_args: [42])
+
+    report = takeover.recovery_status(tmp_path, previous_run="previous")
+
+    assert report["collecting"] is expected
+    assert report["recovered"] is expected
+    assert report["collector_mode"] == (
+        "closed_market_monitoring" if expected else "unverified"
+    )
+
+
 def test_new_live_test_launches_exact_completed_predecessor(monkeypatch, tmp_path):
     _state_files(tmp_path)
     (tmp_path / "log/wti_live_state.json").write_text(json.dumps({

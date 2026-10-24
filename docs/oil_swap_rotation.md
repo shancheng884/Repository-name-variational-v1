@@ -283,8 +283,14 @@ then reconnects the extension, performs fresh account/order reconciliation, and
 applies the existing execution guards. It does not delete state or submit orders
 itself. Success requires a new PID/run heartbeat, reconciled flat or open state,
 no pending action, entry authorization disabled, and fresh collector samples
-from the same process. A timeout prints the current blocking diagnostics and
-leaves the new runtime running; it does not repeatedly restart or resubmit.
+from the same process while the market is open. During a confirmed closed
+session, the management runtime uses fresh account-only reconciliation and the
+live market-status heartbeat instead; it accepts only a resolved flat/open local
+state with matching venue quantities and zero active orders. It refreshes that
+proof periodically, keeps entries disabled, and never resolves a pending order
+without normal sample-based evidence. A timeout prints the current blocking
+diagnostics and leaves the new runtime running; it does not repeatedly restart
+or resubmit.
 
 Explicit existing-position management also accepts an already-flat local state
 so that recovery is safe to repeat after a completed close. It never initializes

@@ -659,6 +659,53 @@ def test_reconciled_close_completes_pilot_only_after_both_venues_are_flat(tmp_pa
     assert recovered["single_round_pilot"]["completed_roundtrips"] == 1
 
 
+def test_account_only_reconcile_proves_flat_without_market_sample_or_orders(tmp_path):
+    executor, gateway = _executor(tmp_path)
+
+    state = executor.reconcile_account_only(runtime_pid=123, runtime_run_id="closed-run")
+
+    proof = state["last_account_reconciliation"]
+    assert state["status"] == "flat"
+    assert proof["verified"] is True
+    assert proof["reconciliation_mode"] == "account_only_closed_session"
+    assert proof["runtime_pid"] == 123
+    assert proof["runtime_run_id"] == "closed-run"
+    assert proof["active_order_count"] == 0
+    assert gateway.read_calls == 1
+    assert gateway.requests == []
+
+
+def test_account_only_reconcile_checks_existing_open_position_exactly(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    opened = _open(executor)
+
+    reconciled = executor.reconcile_account_only(runtime_pid=123, runtime_run_id="closed-run")
+
+    assert opened["status"] == reconciled["status"] == "open"
+    assert reconciled["last_account_reconciliation"]["variational_qty"] == "0.29"
+    assert reconciled["last_account_reconciliation"]["lighter_qty"] == "-0.29"
+    assert len(gateway.requests) == 2
+
+
+def test_account_only_reconcile_never_resolves_pending_or_active_orders(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    state = executor.store.load()
+    state.update({"status": "pending", "pending_action": {"kind": "open", "legs": {}}})
+    executor.store.save(state)
+
+    with pytest.raises(WTIExecutionError, match="account_only_reconcile_requires_resolved_state"):
+        executor.reconcile_account_only()
+    assert gateway.read_calls == 0
+    assert gateway.requests == []
+
+    executor, gateway = _executor(tmp_path / "active")
+    gateway.active_orders = [{"venue": "lighter", "order_id": "still-active"}]
+    blocked = executor.reconcile_account_only()
+    assert blocked["status"] == "manual_review_required"
+    assert blocked["manual_review_reason"] == "active_wti_orders_require_reconciliation"
+    assert gateway.requests == []
+
+
 def test_unverified_session_snapshot_blocks_before_any_order(tmp_path):
     executor, gateway = _executor(tmp_path)
     now = datetime.now(timezone.utc)

@@ -20,6 +20,16 @@ ROOT = Path(__file__).resolve().parents[1]
 PORTS = (8766, 8767, 8768)
 
 
+def timestamp_age(value: object, now: datetime) -> float | None:
+    try:
+        at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if at.tzinfo is None or at.utcoffset() is None:
+        return None
+    return (now - at.astimezone(timezone.utc)).total_seconds()
+
+
 def read_json(path: Path) -> dict:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -141,16 +151,33 @@ def recovery_status(root: Path, *, previous_run: str | None, new_pilot_after: st
                and health.get("status") == "running")
     try:
         collector = read_json(root / "log/oil_swap/basis_samples/health.json")
-        sample_at = datetime.fromisoformat(str(collector["last_sample_at"]).replace("Z", "+00:00"))
-        sample_age = (datetime.now(timezone.utc) - sample_at).total_seconds()
+        sample_age = timestamp_age(collector.get("last_sample_at"), datetime.now(timezone.utc))
     except (OSError, ValueError, KeyError):
         collector, sample_age = {}, None
-    collecting = bool(
+    sample_collection_live = bool(
         current and collector.get("pid") == health.get("pid")
         and collector.get("status") == "running"
         and collector.get("samples_this_run", 0) >= 2
         and sample_age is not None and -5 <= sample_age <= 30
     )
+    closed_monitoring_live = False
+    now = datetime.now(timezone.utc)
+    if (
+        current
+        and collector.get("pid") == health.get("pid")
+        and collector.get("status") == "running"
+        and collector.get("market_status") in {"closed", "halted_trading"}
+        and collector.get("market_status_feed_connected") is True
+    ):
+        collector_age = timestamp_age(collector.get("updated_at"), now)
+        status_heartbeat_age = timestamp_age(
+            collector.get("market_status_feed_heartbeat_at"), now
+        )
+        closed_monitoring_live = bool(
+            collector_age is not None and -5 <= collector_age <= 20
+            and status_heartbeat_age is not None and -5 <= status_heartbeat_age <= 30
+        )
+    collecting = sample_collection_live or closed_monitoring_live
     complete = (current and health.get("startup_reconciled") is True
                 and health.get("manage_existing_only") is True
                 and health.get("wti_entry_authorized") is False
@@ -177,6 +204,10 @@ def recovery_status(root: Path, *, previous_run: str | None, new_pilot_after: st
         "pids": pids, "run_id": health.get("run_id"), "state": state.get("status"),
         "pending": bool(state.get("pending_action")),
         "collecting": collecting, "samples": collector.get("samples_this_run"),
+        "collector_mode": (
+            "closed_market_monitoring" if closed_monitoring_live
+            else "fresh_samples" if sample_collection_live else "unverified"
+        ),
         "market_status": collector.get("market_status"),
         "purpose": "single_round_live_test" if new_pilot_after else "manage_existing",
         "entry_authorized": health.get("wti_entry_authorized"),
