@@ -296,3 +296,78 @@ def test_gradient_never_adds_to_unowned_or_exhausted_layer():
         config=_config(), now=now,
     )
     assert exhausted["action"] == "hold"
+
+
+def test_gradient_adaptive_entry_requires_eth_style_directional_threshold_above_floor():
+    now = datetime.now(timezone.utc)
+    profiles = {
+        "long_var_short_lighter": (Decimal("30"), Decimal("45")),
+        "short_var_long_lighter": (Decimal("32"), Decimal("48")),
+    }
+    below = decide_wti_gradient_action(
+        _row(now, long_edge_bps="29", short_edge_bps="0"),
+        None, _gradient_pilot(), config=_config(), now=now,
+        thresholds_by_direction=profiles,
+    )
+    assert below["action"] == "hold"
+    assert below["reason"] == "gradient_entry_below_adaptive_threshold"
+    assert below["effective_tier_thresholds_bps"]["long_var_short_lighter"] == ["30", "45"]
+
+    reached = decide_wti_gradient_action(
+        _row(now, long_edge_bps="30", short_edge_bps="0"),
+        None, _gradient_pilot(), config=_config(), now=now,
+        thresholds_by_direction=profiles,
+    )
+    assert reached["action"] == "open"
+    assert reached["direction"] == "long_var_short_lighter"
+    assert reached["gradient_tier"] == 1
+
+
+def test_gradient_adaptive_profile_cannot_lower_floor_and_controls_second_layer():
+    now = datetime.now(timezone.utc)
+    invalid = decide_wti_gradient_action(
+        _row(now), None, _gradient_pilot(), config=_config(), now=now,
+        thresholds_by_direction={
+            "long_var_short_lighter": (Decimal("3"), Decimal("7")),
+            "short_var_long_lighter": (Decimal("4"), Decimal("8")),
+        },
+    )
+    assert invalid == {"action": "hold", "reason": "gradient_threshold_profile_invalid"}
+
+    position = _position(now, gradient_pilot_id="pilot-1")
+    pilot = _gradient_pilot(
+        status="in_position", opened=[{"tier": 1, "layer_id": "layer-1"}],
+    )
+    profiles = {
+        "long_var_short_lighter": (Decimal("30"), Decimal("45")),
+        "short_var_long_lighter": (Decimal("32"), Decimal("48")),
+    }
+    below = decide_wti_gradient_action(
+        _row(now, var_bid="70.0", lighter_buy_price="70.2", long_edge_bps="44"),
+        position, pilot, config=_config(), now=now,
+        thresholds_by_direction=profiles,
+    )
+    assert below["action"] == "hold"
+    assert below["reason"] == "gradient_add_below_adaptive_threshold"
+    assert below["gradient_threshold_bps"] == "45"
+
+    reached = decide_wti_gradient_action(
+        _row(now, var_bid="70.0", lighter_buy_price="70.2", long_edge_bps="45"),
+        position, pilot, config=_config(), now=now,
+        thresholds_by_direction=profiles,
+    )
+    assert reached["action"] == "add"
+    assert reached["gradient_tier"] == 2
+
+
+def test_adaptive_entry_profile_never_blocks_risk_reducing_exit():
+    now = datetime.now(timezone.utc)
+    result = decide_wti_gradient_action(
+        _row(now, var_bid="70.2", lighter_buy_price="70.1"),
+        _position(now),
+        _gradient_pilot(status="in_position", opened=[{"tier": 1}]),
+        config=_config(exit_target_bps=Decimal("1")), now=now,
+        thresholds_by_direction={"long_var_short_lighter": (Decimal("1"),)},
+    )
+    assert result["action"] == "close"
+    assert result["reason"] == "net_target_reached"

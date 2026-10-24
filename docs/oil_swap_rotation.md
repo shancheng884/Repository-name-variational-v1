@@ -30,10 +30,15 @@ process. Exchange position reads, active-order reads, final fill lookup, and
 state reconciliation are required before a position can be treated as flat or
 open.
 
-The ETH V4 live runner remains ETH-only. Do not add WTI to its allowlist or reuse
-the ETH calibration profile for WTI. ETH must be locally flat and explicitly
-confirmed before WTI live mode starts; the live runner also reconciles both
-venues before enabling entries.
+The ETH V4 live runner remains ETH-only. WTI never reads or reuses ETH market
+observations. Its continuous two-tier gradient uses the same rolling,
+directional percentile method on WTI-only samples: a 7-day anchor, 97.5/98.25
+percentiles, and a 36-hour effective-history minimum. The existing 30/45 bps
+tiers remain hard floors; when history is immature or unavailable, those floors
+remain in force. Mature thresholds add the configured 10 bps roundtrip-cost and
+1 bps exit-target reserve and cannot move below either floor. ETH and WTI must
+both be manually confirmed flat before the first supervised start; the WTI
+manager runtime independently reconciles its own venue positions and orders.
 
 ## Read-Only Account Probe
 
@@ -155,6 +160,16 @@ requests a PID/run-ID-bound drain, waits for fresh paired-flat and zero-order
 proof, then starts only the newly selected runtime. The historical production
 gate remains separate from the current live session, account/order, quote,
 depth, and risk gates enforced by the WTI runtime.
+
+If a continuous-rotation cold start has no runtime and no verified exchange
+session status, it does not wait on the collector that cannot yet start. After
+`--confirm-initial-flat` and local flat-state checks, it starts WTI in
+management-only mode to establish the live session feed and account proof. This
+bootstrap cannot submit entries. Once the verified session is available, the
+supervisor either drains to ETH for a closed session or upgrades WTI only after
+a fresh dual-flat, zero-order proof. An interrupted bootstrap resumes from the
+persisted journal and existing tmux session; recovery never relaunches an
+entry-enabled runtime.
 
 For a separately authorized one-round rotation test, both read-only scenarios
 can be rehearsed first:

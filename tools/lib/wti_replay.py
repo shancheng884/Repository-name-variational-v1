@@ -6,7 +6,7 @@ exchange session status, funding, roll cashflows, or live execution latency.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -19,6 +19,11 @@ from tools.lib.hedge_instruments import (
 )
 from tools.lib.market_sessions import session_observation_for_sample
 from tools.lib.wti_sizing import size_paired_layer
+from tools.lib.wti_thresholds import (
+    THRESHOLD_REFRESH_SECONDS as WTI_THRESHOLD_REFRESH_SECONDS,
+    WTIGradientThresholdProfile,
+    build_wti_gradient_threshold_profiles,
+)
 
 
 DIRECTIONS = ("long_var_short_lighter", "short_var_long_lighter")
@@ -433,6 +438,7 @@ def replay_wti_gradient(
     expected_multiplier: Decimal | None = None,
     max_completed_roundtrips: int | None = 1,
     assume_verified_flat_session_restarts: bool = False,
+    adaptive_threshold_refresh_seconds: int = WTI_THRESHOLD_REFRESH_SECONDS,
 ) -> ReplayReport:
     """Replay bounded two-layer rounds without relaxing any market-data gate."""
     if second_tier_threshold_bps <= config.entry_threshold_bps:
@@ -443,6 +449,8 @@ def replay_wti_gradient(
         raise ValueError("gradient_max_slippage_must_be_positive")
     if layer_notional_usd * 2 > aggregate_max_notional_usd:
         raise ValueError("gradient_layers_exceed_aggregate_notional_cap")
+    if adaptive_threshold_refresh_seconds <= 0:
+        raise ValueError("gradient_threshold_refresh_seconds_must_be_positive")
     if max_completed_roundtrips is not None and (
         not isinstance(max_completed_roundtrips, int)
         or isinstance(max_completed_roundtrips, bool)
@@ -465,6 +473,32 @@ def replay_wti_gradient(
     position_gap_exit_pending = False
     rejected_depth = 0
     capped_additions = 0
+    threshold_history: deque[dict[str, Any]] = deque()
+    threshold_profiles: dict[str, WTIGradientThresholdProfile] = {}
+    threshold_refreshed_at: datetime | None = None
+
+    def refresh_thresholds(at: datetime, current_row: dict[str, Any]) -> None:
+        nonlocal threshold_profiles, threshold_refreshed_at
+        if (
+            threshold_refreshed_at is None
+            or (at - threshold_refreshed_at).total_seconds()
+            >= adaptive_threshold_refresh_seconds
+        ):
+            threshold_profiles = build_wti_gradient_threshold_profiles(
+                list(threshold_history),
+                as_of=at,
+                market_id=expected_market_id if expected_market_id is not None else int(
+                    _decimal(current_row.get("lighter_market_id")) or Decimal("0")
+                ),
+                multiplier=expected_multiplier if expected_multiplier is not None else (
+                    _decimal(current_row.get("lighter_multiplier")) or Decimal("1")
+                ),
+                first_floor_bps=config.entry_threshold_bps,
+                second_floor_bps=second_tier_threshold_bps,
+                roundtrip_cost_bps=config.roundtrip_cost_bps,
+                exit_target_bps=config.exit_target_bps,
+            )
+            threshold_refreshed_at = at
 
     def make_layer(
         row: dict[str, Any], direction: str, edge: Decimal, tier: int,
@@ -562,6 +596,16 @@ def replay_wti_gradient(
 
     for row in samples:
         at = _timestamp(row["logged_at"])
+        assert at is not None
+        refresh_thresholds(at, row)
+        threshold_cutoff = at - timedelta(days=7)
+        while threshold_history:
+            oldest_at = _timestamp(threshold_history[0].get("logged_at"))
+            if oldest_at is not None and oldest_at > threshold_cutoff:
+                break
+            threshold_history.popleft()
+        # Refresh happens before append, so the current row never influences its own decision.
+        threshold_history.append(row)
         observation = session_observation_for_sample(row)
         session_changed = (
             previous_row is not None and row.get("session_id") != previous_row.get("session_id")
@@ -657,7 +701,10 @@ def replay_wti_gradient(
                     "long_edge_bps" if current["direction"] == "long_var_short_lighter"
                     else "short_edge_bps"
                 ))
-                if edge is not None and edge >= second_tier_threshold_bps:
+                tier_two_threshold = threshold_profiles[
+                    current["direction"]
+                ].thresholds_bps[1]
+                if edge is not None and edge >= tier_two_threshold:
                     layer = make_layer(row, current["direction"], edge, 2, current)
                     if layer is None:
                         capped_additions += 1
@@ -672,8 +719,12 @@ def replay_wti_gradient(
             "long_var_short_lighter": _decimal(row.get("long_edge_bps")),
             "short_var_long_lighter": _decimal(row.get("short_edge_bps")),
         }
-        qualified = [(direction, edge) for direction, edge in edges.items()
-                     if edge is not None and edge >= config.entry_threshold_bps]
+        qualified = [
+            (direction, edge)
+            for direction, edge in edges.items()
+            if edge is not None
+            and edge >= threshold_profiles[direction].thresholds_bps[0]
+        ]
         if not qualified:
             continue
         direction, edge = max(qualified, key=lambda item: item[1])
@@ -740,6 +791,11 @@ def replay_wti_gradient(
             "entry_cutoff_seconds": config.entry_cutoff_seconds,
             "expected_market_id": expected_market_id,
             "expected_multiplier": None if expected_multiplier is None else str(expected_multiplier),
+            "gradient_threshold_mode": "eth_style_directional_7d_percentiles_with_wti_floors",
+            "gradient_threshold_percentiles": ["97.5", "98.25"],
+            "gradient_threshold_refresh_seconds": adaptive_threshold_refresh_seconds,
+            "gradient_threshold_sample_floor": 100,
+            "gradient_threshold_effective_seconds_floor": 129600,
         },
         cost_caveat=(
             "Sequential two-layer rounds with the configured completed-round limit. Quote-path only; no historical fills, fees, funding, latency, or market impact are inferred. "

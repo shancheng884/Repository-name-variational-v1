@@ -651,6 +651,159 @@ def test_wti_start_waits_for_existing_standalone_collector_to_exit(tmp_path: Pat
     assert result["action"] == "wait_for_standalone_collector_exit"
 
 
+def _unknown_cold_start_snapshot():
+    snapshot = _snapshot(current="NONE", target="NONE")
+    snapshot["session"].update({
+        "state": "status_unknown",
+        "allow_new_entries": False,
+        "allow_position_management": False,
+        "reason": "exchange_session_status_unconfirmed",
+        "closing_at": None,
+    })
+    snapshot["wti_ready"] = False
+    snapshot["readiness"] = {"production_ready": False, "reasons": ["no_fresh_session_sample"]}
+    return snapshot
+
+
+def test_cold_start_unknown_session_bootstraps_wti_management_only_after_flat_confirmation(
+    tmp_path: Path, monkeypatch,
+):
+    snapshot = _unknown_cold_start_snapshot()
+    monkeypatch.setattr(supervisor_module, "collect_snapshot", lambda *args, **kwargs: snapshot)
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=True, continuous_gradient_rotation=True,
+    )
+    monkeypatch.setattr(supervisor, "_tmux_session_exists", lambda _name: False)
+    launches = []
+    monkeypatch.setattr(
+        supervisor, "_launch",
+        lambda pair, **kwargs: launches.append((pair, kwargs)),
+    )
+
+    result = supervisor.run_once()
+    journal = json.loads(supervisor.journal_path.read_text(encoding="utf-8"))
+
+    assert result["action"] == "start_wti_session_bootstrap_management_only"
+    assert launches == [(Pair.WTI, {"recovery": True, "session_name": journal["tmux_session"]})]
+    assert journal["phase"] == RotationPhase.RECOVERING.value
+    assert journal["target_pair"] == "WTI"
+    command = supervisor._start_command(Pair.WTI, recovery=True)
+    assert "--manage-existing-wti-position" in command
+    assert "--gradient-live" not in command
+    assert "--confirm-continuous-gradient-rotation" not in command
+
+
+def test_cold_start_unknown_session_without_flat_confirmation_does_not_launch(tmp_path: Path, monkeypatch):
+    snapshot = _unknown_cold_start_snapshot()
+    monkeypatch.setattr(supervisor_module, "collect_snapshot", lambda *args, **kwargs: snapshot)
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=False, continuous_gradient_rotation=True,
+    )
+    launches = []
+    monkeypatch.setattr(supervisor, "_launch", lambda *args, **kwargs: launches.append(args))
+
+    result = supervisor.run_once()
+
+    assert result["action"] == "wait_for_initial_both_accounts_flat_confirmation"
+    assert not launches
+
+
+def test_cold_start_bootstrap_resume_is_idempotent_after_supervisor_interrupt(
+    tmp_path: Path, monkeypatch,
+):
+    snapshot = _unknown_cold_start_snapshot()
+    monkeypatch.setattr(supervisor_module, "collect_snapshot", lambda *args, **kwargs: snapshot)
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=True, continuous_gradient_rotation=True,
+    )
+    session_present = False
+    monkeypatch.setattr(supervisor, "_tmux_session_exists", lambda _name: session_present)
+    launches = []
+    monkeypatch.setattr(
+        supervisor, "_launch",
+        lambda pair, **kwargs: launches.append((pair, kwargs)),
+    )
+
+    first = supervisor.run_once()
+    session_present = True
+    interrupted = supervisor.run_once()
+    assert first["action"] == "start_wti_session_bootstrap_management_only"
+    assert interrupted["action"] == "await_wti_session_bootstrap_runtime"
+    assert len(launches) == 1
+
+    session_present = False
+    snapshot["collector_pids"] = [987]
+    collector_blocked = supervisor.run_once()
+    assert collector_blocked["action"] == "wait_for_standalone_collector_exit"
+    assert len(launches) == 1
+
+    snapshot["collector_pids"] = []
+    retried = supervisor.run_once()
+    assert retried["action"] == "retry_wti_session_bootstrap_management_only"
+    assert launches[1][0] == Pair.WTI
+    assert launches[1][1]["recovery"] is True
+
+    session_present = True
+    resumed = supervisor.run_once()
+    assert resumed["action"] == "await_wti_session_bootstrap_runtime"
+    assert len(launches) == 2
+
+
+def test_bootstrapped_wti_closed_session_drains_to_eth_without_enabling_entries(
+    tmp_path: Path, monkeypatch,
+):
+    snapshot = _snapshot(current="WTI", target="ETH")
+    snapshot["session"].update({
+        "state": "exchange_closed", "allow_new_entries": False,
+        "allow_position_management": False, "closing_at": None,
+    })
+    snapshot["runtimes"]["WTI"]["health"].update({
+        "manage_existing_only": True, "wti_entry_authorized": False,
+    })
+    monkeypatch.setattr(supervisor_module, "collect_snapshot", lambda *args, **kwargs: snapshot)
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=False, continuous_gradient_rotation=True,
+    )
+
+    result = supervisor.run_once()
+    control = json.loads((tmp_path / "log/wti_live_control.json").read_text(encoding="utf-8"))
+
+    assert result["action"] == "request_safe_drain"
+    assert control["action"] == "drain_after_flat"
+    assert control["status"] == "requested"
+    assert control["asset"] == "WTI"
+
+
+def test_bootstrapped_wti_open_session_upgrades_only_after_fresh_flat_account_proof(
+    tmp_path: Path, monkeypatch,
+):
+    snapshot = _snapshot(current="WTI", target="WTI")
+    snapshot["continuous_gradient_rotation"] = True
+    snapshot["continuous_gradient_authorized"] = True
+    snapshot["continuous_gradient_gate_ready"] = True
+    snapshot["session"].update({"state": "open", "allow_new_entries": True})
+    snapshot["runtimes"]["WTI"]["health"].update({
+        "manage_existing_only": True, "wti_entry_authorized": False,
+    })
+    monkeypatch.setattr(supervisor_module, "collect_snapshot", lambda *args, **kwargs: snapshot)
+    supervisor = RotationSupervisor(
+        root=tmp_path, market_id=145, multiplier=Decimal("1"),
+        confirm_initial_flat=False, continuous_gradient_rotation=True,
+    )
+
+    result = supervisor.run_once()
+    control = json.loads((tmp_path / "log/wti_live_control.json").read_text(encoding="utf-8"))
+
+    assert result["action"] == "request_continuous_rotation_runtime_start"
+    assert control["target_pid"] == 456
+    assert control["target_run_id"] == "wti-run"
+    assert control["status"] == "requested"
+
+
 def test_supervisor_retries_transient_errors_then_clears_failure_streak(tmp_path: Path, monkeypatch):
     supervisor = RotationSupervisor(
         root=tmp_path, market_id=145, multiplier=Decimal("1"), confirm_initial_flat=False,

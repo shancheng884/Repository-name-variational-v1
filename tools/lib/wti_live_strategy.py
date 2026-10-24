@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from tools.lib.hedge_instruments import WTI_HEDGE, paired_realized_pnl
 from tools.lib.market_sessions import session_observation_for_sample
@@ -157,6 +157,7 @@ def decide_wti_gradient_action(
     *,
     config: ReplayConfig,
     now: datetime | None = None,
+    thresholds_by_direction: Mapping[str, Sequence[Decimal]] | None = None,
 ) -> dict[str, Any]:
     """Apply strictly increasing, same-direction tiers within a durable pilot."""
     decision = decide_wti_action(row, position, config=config, now=now)
@@ -180,16 +181,66 @@ def decide_wti_gradient_action(
         or not layer_notional.is_finite() or layer_notional <= 0
     ):
         return {"action": "hold", "reason": "gradient_pilot_configuration_invalid"}
+    if decision.get("action") == "close":
+        return decision
+
+    effective_thresholds: dict[str, list[Decimal]] | None = None
+    if thresholds_by_direction is not None:
+        effective_thresholds = {}
+        try:
+            for direction in ("long_var_short_lighter", "short_var_long_lighter"):
+                values = [Decimal(str(value)) for value in thresholds_by_direction[direction]]
+                if (
+                    len(values) != len(thresholds)
+                    or any(not value.is_finite() for value in values)
+                    or any(value < floor for value, floor in zip(values, thresholds))
+                    or any(left >= right for left, right in zip(values, values[1:]))
+                ):
+                    raise ValueError("invalid adaptive threshold profile")
+                effective_thresholds[direction] = values
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return {"action": "hold", "reason": "gradient_threshold_profile_invalid"}
 
     if position is None:
-        if decision.get("action") != "open" or pilot.get("status") != "available":
+        if pilot.get("status") != "available":
             return decision
         if pilot.get("layers_opened") or pilot.get("completed_roundtrips") != 0:
             return {"action": "hold", "reason": "gradient_pilot_entry_budget_unavailable"}
+        if effective_thresholds is not None:
+            edges = {
+                "long_var_short_lighter": _decimal(row.get("long_edge_bps")),
+                "short_var_long_lighter": _decimal(row.get("short_edge_bps")),
+            }
+            qualified = [
+                (direction, edge)
+                for direction, edge in edges.items()
+                if edge is not None and edge >= effective_thresholds[direction][0]
+            ]
+            if not qualified:
+                return {
+                    "action": "hold",
+                    "reason": "gradient_entry_below_adaptive_threshold",
+                    "effective_tier_thresholds_bps": {
+                        direction: [str(value) for value in values]
+                        for direction, values in effective_thresholds.items()
+                    },
+                }
+            direction, edge = max(qualified, key=lambda item: item[1])
+            decision = {
+                "action": "open", "direction": direction, "edge_bps": str(edge),
+            }
+        elif decision.get("action") != "open":
+            return decision
         return {
             **decision,
             "gradient_tier": 1,
             "layer_notional_usd": str(layer_notional),
+            **({
+                "effective_tier_thresholds_bps": {
+                    direction: [str(value) for value in values]
+                    for direction, values in effective_thresholds.items()
+                }
+            } if effective_thresholds is not None else {}),
         }
 
     if decision.get("action") != "hold" or decision.get("reason") != "exit_target_not_reached":
@@ -216,7 +267,24 @@ def decide_wti_gradient_action(
         else "short_edge_bps" if direction == "short_var_long_lighter" else None
     )
     edge = _decimal(row.get(edge_field)) if edge_field else None
-    if edge is None or edge < thresholds[tier - 1]:
+    active_thresholds = (
+        effective_thresholds.get(str(direction))
+        if effective_thresholds is not None else thresholds
+    )
+    if active_thresholds is None:
+        return {"action": "hold", "reason": "gradient_threshold_profile_invalid"}
+    if edge is None or edge < active_thresholds[tier - 1]:
+        if effective_thresholds is not None and edge is not None:
+            return {
+                "action": "hold",
+                "reason": "gradient_add_below_adaptive_threshold",
+                "edge_bps": str(edge),
+                "gradient_threshold_bps": str(active_thresholds[tier - 1]),
+                "effective_tier_thresholds_bps": {
+                    key: [str(value) for value in values]
+                    for key, values in effective_thresholds.items()
+                },
+            }
         return decision
     try:
         cap = Decimal(str(pilot["config"]["max_notional_usd"]))
@@ -272,4 +340,10 @@ def decide_wti_gradient_action(
         "reason": "gradient_tier_threshold_reached",
         "gradient_tier": tier,
         "layer_notional_usd": str(layer_notional),
+        **({
+            "effective_tier_thresholds_bps": {
+                key: [str(value) for value in values]
+                for key, values in effective_thresholds.items()
+            }
+        } if effective_thresholds is not None else {}),
     }

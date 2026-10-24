@@ -1265,6 +1265,61 @@ class RotationSupervisor:
                 return output
             target = Pair(snapshot["target_pair"])
             if target == Pair.NONE:
+                session_unknown = (
+                    snapshot.get("session", {}).get("state") == "status_unknown"
+                )
+                if (
+                    session_unknown
+                    and self.continuous_gradient_rotation
+                    and journal.get("target_pair") == Pair.WTI.value
+                    and journal.get("phase") in {
+                        RotationPhase.STARTING.value,
+                        RotationPhase.RECOVERING.value,
+                    }
+                ):
+                    if self._tmux_session_exists(journal.get("tmux_session")):
+                        output["action"] = "await_wti_session_bootstrap_runtime"
+                        return output
+                    if snapshot.get("collector_pids"):
+                        output["action"] = "wait_for_standalone_collector_exit"
+                        return output
+                    if int(journal.get("launch_attempts") or 0) >= 2:
+                        raise RuntimeError("wti_session_bootstrap_retries_exhausted_manual_review_required")
+                    self._start_target(
+                        Pair.WTI, journal, snapshot, recovery=True,
+                        allow_missing_flat=True,
+                    )
+                    output.update({
+                        "action": "retry_wti_session_bootstrap_management_only",
+                        "pair": Pair.WTI.value,
+                    })
+                    return output
+                if (
+                    session_unknown
+                    and self.continuous_gradient_rotation
+                    and journal["phase"] == RotationPhase.STABLE.value
+                ):
+                    if not self.confirm_initial_flat:
+                        output["action"] = "wait_for_initial_both_accounts_flat_confirmation"
+                        return output
+                    if not all(_flat_state(
+                        pair,
+                        snapshot["states"][pair.value],
+                        allow_missing=True,
+                    ) for pair in (Pair.ETH, Pair.WTI)):
+                        raise RuntimeError("initial_rotation_requires_both_local_states_flat")
+                    if snapshot.get("collector_pids"):
+                        output["action"] = "wait_for_standalone_collector_exit"
+                        return output
+                    self._start_target(
+                        Pair.WTI, journal, snapshot, recovery=True,
+                        allow_missing_flat=True,
+                    )
+                    output.update({
+                        "action": "start_wti_session_bootstrap_management_only",
+                        "pair": Pair.WTI.value,
+                    })
+                    return output
                 output["action"] = "wait_for_verified_session_and_readiness"
                 return output
             if not self.confirm_initial_flat:

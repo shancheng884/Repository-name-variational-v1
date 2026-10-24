@@ -15,7 +15,7 @@ import signal
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -48,6 +48,12 @@ from tools.lib.wti_execution import (  # noqa: E402
 from tools.lib.wti_live_gateway import WTIProductionGateway  # noqa: E402
 from tools.lib.wti_live_strategy import decide_wti_action, decide_wti_gradient_action  # noqa: E402
 from tools.lib.wti_replay import ReplayConfig  # noqa: E402
+from tools.lib.wti_thresholds import (  # noqa: E402
+    ANCHOR_WINDOW_SECONDS as WTI_THRESHOLD_WINDOW_SECONDS,
+    THRESHOLD_REFRESH_SECONDS as WTI_THRESHOLD_REFRESH_SECONDS,
+    WTIGradientThresholdProfile,
+    build_wti_gradient_threshold_profiles,
+)
 from tools.oil_swap_collector import OilSwapCollector, parse_args as parse_collector_args  # noqa: E402
 
 
@@ -364,6 +370,9 @@ class WTILiveRuntime:
         self.last_reconcile_elapsed_ms: float | None = None
         self.rotation_drain_request: dict[str, Any] | None = None
         self.last_account_only_reconcile_monotonic = 0.0
+        self.wti_gradient_threshold_profiles: dict[str, WTIGradientThresholdProfile] = {}
+        self.wti_gradient_threshold_refreshed_monotonic = 0.0
+        self.wti_gradient_threshold_source = "not_loaded"
 
     def request_stop(self, *_args: Any) -> None:
         self.stop = True
@@ -842,6 +851,90 @@ class WTILiveRuntime:
                 "reasons": [f"wti_readiness_recheck_failed:{type(exc).__name__}"],
             }
 
+    async def _gradient_thresholds_for_sample(
+        self, row: dict[str, Any]
+    ) -> dict[str, tuple[Decimal, Decimal]] | None:
+        if (
+            getattr(self, "gradient_pilot", None) is None
+            or getattr(self, "market_metadata", None) is None
+            or getattr(self, "config", None) is None
+        ):
+            return None
+        now_monotonic = time.monotonic()
+        profiles = getattr(self, "wti_gradient_threshold_profiles", {})
+        refreshed_monotonic = getattr(
+            self, "wti_gradient_threshold_refreshed_monotonic", 0.0
+        )
+        if (
+            not profiles
+            or now_monotonic - refreshed_monotonic
+            >= WTI_THRESHOLD_REFRESH_SECONDS
+        ):
+            try:
+                sample_at = datetime.fromisoformat(
+                    str(row["logged_at"]).replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
+                pilot_config = self.gradient_pilot.get("config") or {}
+                floors = [
+                    Decimal(str(value))
+                    for value in pilot_config.get("tier_thresholds_bps", [])
+                ]
+                if len(floors) != 2:
+                    raise ValueError("gradient_pilot_tier_floors_invalid")
+                rows = await asyncio.to_thread(
+                    read_basis_samples,
+                    self.args.sample_root,
+                    limit=200000,
+                    asset_filter="WTI",
+                    sample_kind_filter="baseline",
+                    sample_quality_filter="valid",
+                    since_utc=sample_at - timedelta(seconds=WTI_THRESHOLD_WINDOW_SECONDS),
+                    until_utc=sample_at,
+                )
+                profiles = build_wti_gradient_threshold_profiles(
+                    rows,
+                    as_of=sample_at,
+                    market_id=int(self.market_metadata["market_id"]),
+                    multiplier=Decimal(str(self.market_metadata["multiplier"])),
+                    first_floor_bps=floors[0],
+                    second_floor_bps=floors[1],
+                    roundtrip_cost_bps=self.config.roundtrip_cost_bps,
+                    exit_target_bps=self.config.exit_target_bps,
+                    sample_interval_seconds=int(self.args.sample_interval_seconds),
+                )
+                self.wti_gradient_threshold_profiles = profiles
+                self.wti_gradient_threshold_source = "directional_7d_percentiles"
+            except Exception as exc:
+                self.logger.warning(
+                    "wti_gradient_threshold_refresh_failed reason=%s; retaining hard floor tiers",
+                    type(exc).__name__,
+                )
+                pilot_config = self.gradient_pilot.get("config") or {}
+                floors = [Decimal(str(value)) for value in pilot_config.get("tier_thresholds_bps", [])]
+                if len(floors) != 2:
+                    return None
+                self.wti_gradient_threshold_profiles = build_wti_gradient_threshold_profiles(
+                    [],
+                    as_of=datetime.fromisoformat(
+                        str(row["logged_at"]).replace("Z", "+00:00")
+                    ).astimezone(timezone.utc),
+                    market_id=int(self.market_metadata["market_id"]),
+                    multiplier=Decimal(str(self.market_metadata["multiplier"])),
+                    first_floor_bps=floors[0],
+                    second_floor_bps=floors[1],
+                    roundtrip_cost_bps=self.config.roundtrip_cost_bps,
+                    exit_target_bps=self.config.exit_target_bps,
+                    sample_interval_seconds=int(self.args.sample_interval_seconds),
+                )
+                self.wti_gradient_threshold_source = "history_error_floor_fallback"
+            self.wti_gradient_threshold_refreshed_monotonic = now_monotonic
+        return {
+            direction: profile.thresholds_bps
+            for direction, profile in getattr(
+                self, "wti_gradient_threshold_profiles", {}
+            ).items()
+        }
+
     async def _load_startup_readiness(self) -> None:
         started = time.monotonic()
         await asyncio.to_thread(self._refresh_readiness)
@@ -1022,6 +1115,15 @@ class WTILiveRuntime:
                 OilSession.EXCHANGE_CLOSED.value if closed_window is not None else None
             ),
             "last_action": self.last_action,
+            "gradient_threshold_source": getattr(
+                self, "wti_gradient_threshold_source", "not_loaded"
+            ),
+            "gradient_threshold_profiles": {
+                direction: profile.as_dict()
+                for direction, profile in getattr(
+                    self, "wti_gradient_threshold_profiles", {}
+                ).items()
+            },
             "open_lots_total": int(exposure),
             "pending_actions_total": int(pending),
             "manual_review_reason": state.get("manual_review_reason"),
@@ -1174,8 +1276,10 @@ class WTILiveRuntime:
         window = _session_window(row, now, self.config.entry_cutoff_seconds)
         if getattr(self, "gradient_pilot", None) is not None:
             self.gradient_pilot = dict(state.get("gradient_pilot") or self.gradient_pilot)
+            thresholds_by_direction = await self._gradient_thresholds_for_sample(row)
             decision = decide_wti_gradient_action(
-                row, position, self.gradient_pilot, config=self.config, now=now
+                row, position, self.gradient_pilot, config=self.config, now=now,
+                thresholds_by_direction=thresholds_by_direction,
             )
         else:
             decision = decide_wti_action(row, position, config=self.config, now=now)
