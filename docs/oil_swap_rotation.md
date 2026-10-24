@@ -404,6 +404,22 @@ atomically before starting the process. A subsequent restart reuses that WTI
 launch intent. Current exchange-session, account, order, and entry checks still
 control the eventual trading runtime.
 
+WTI drain receipts now emit both venue zero-order fields expected by the
+supervisor. Legacy WTI receipts remain usable only with exact request/PID/run
+identity, zero paired positions, an integer verified total order count of zero,
+and an explicit reconciliation timestamp within 20 seconds of completion.
+Partial or contradictory venue-order fields cannot use that compatibility path.
+
+When no trading runtime exists and its former session connection is gone, the
+supervisor can independently read the public USOILP market-status websocket.
+A fresh closed observation still uses the existing 30-second session limit;
+an open observation cannot establish WTI entry readiness without the existing
+schedule and valid-sample checks. Failed status reads leave a completed drain
+waiting for live confirmation instead of repeatedly restarting the bootstrap.
+After a verified ETH drain and source-process exit, the supervisor gracefully
+stops only the identified read-only standalone collector, then waits for its
+exit before launching WTI's embedded collector and execution runtime.
+
 The existing thresholds and per-position controls remain pinned: first entry
 30 bps, second gradient tier 45 bps, two layers at 10 USD each, 20 USD aggregate
 notional cap, 1 bps net exit target after the configured 10 bps roundtrip-cost

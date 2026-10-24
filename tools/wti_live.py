@@ -1207,6 +1207,8 @@ class WTILiveRuntime:
             "variational_position_qty": proof["variational_qty"],
             "lighter_position_qty": proof["lighter_qty"],
             "active_order_count": proof["active_order_count"],
+            "variational_active_orders": 0,
+            "lighter_active_orders": 0,
             "reconciliation_observed_at": proof["observed_at"],
         }
         write_json_atomic(control_path, completed)

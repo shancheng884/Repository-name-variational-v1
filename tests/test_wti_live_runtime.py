@@ -199,6 +199,10 @@ def test_rotation_drain_completes_only_with_fresh_verified_flat_snapshot(tmp_pat
     completed = json.loads(control_path.read_text(encoding="utf-8"))
     assert completed["status"] == "completed"
     assert completed["active_order_count"] == 0
+    from tools.lib.rotation_supervisor import verified_drain_completion
+    assert verified_drain_completion(
+        completed, request_id="request-1", source_pid=1, source_run_id="run-1",
+    )
     assert runtime.stop is True
 
 

@@ -104,10 +104,34 @@ def verified_drain_completion(
         or control.get("request_id") != request_id
         or control.get("target_pid") != source_pid
         or control.get("target_run_id") != source_run_id
-        or control.get("variational_active_orders") != 0
-        or control.get("lighter_active_orders") != 0
     ):
         return False
+    orders_zero = all(
+        type(control.get(key)) is int and control[key] == 0
+        for key in ("variational_active_orders", "lighter_active_orders")
+    )
+    if not orders_zero:
+        # Older WTI runtimes emitted the verified combined count, not venue counts.
+        if (
+            control.get("schema_version") != 1
+            or control.get("asset") != "WTI"
+            or control.get("action") != "drain_after_flat"
+            or "variational_active_orders" in control
+            or "lighter_active_orders" in control
+            or type(control.get("active_order_count")) is not int
+            or control["active_order_count"] != 0
+        ):
+            return False
+        try:
+            completed_at = datetime.fromisoformat(str(control["completed_at"]).replace("Z", "+00:00"))
+            observed_at = datetime.fromisoformat(str(control["reconciliation_observed_at"]).replace("Z", "+00:00"))
+            if (
+                completed_at.utcoffset() is None or observed_at.utcoffset() is None
+                or not 0 <= (completed_at - observed_at).total_seconds() <= 20
+            ):
+                return False
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
     try:
         variational_qty = Decimal(str(control.get("variational_position_qty")))
         lighter_qty = Decimal(str(control.get("lighter_position_qty")))

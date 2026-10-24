@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -24,7 +26,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.lib.basis_store import read_basis_samples  # noqa: E402
-from tools.lib.market_sessions import OilSession  # noqa: E402
+from tools.lib.market_sessions import OilSession, VariationalMarketStatusFeed  # noqa: E402
 from tools.lib.pair_rotation import Pair, RotationAction, decide_rotation, desired_pair  # noqa: E402
 from tools.lib.rotation_supervisor import (  # noqa: E402
     RotationPhase,
@@ -303,6 +305,7 @@ def restart_supervisor(
             "current_pair": snapshot.get("current_pair"),
             "target_pair": snapshot.get("target_pair"), "action": result.get("action"),
             "market_session": (snapshot.get("session") or {}).get("state"),
+            "drain_diagnostics": result.get("drain_diagnostics"),
             "error": None if ready else (
                 (health.get("last_error") if current_health else None)
                 or "current_supervisor_health_unconfirmed"
@@ -353,6 +356,37 @@ def _flat_state(pair: Pair, state: dict[str, Any], *, allow_missing: bool = Fals
     return True
 
 
+def probe_exchange_session_status(*, timeout_seconds: float = 3) -> dict[str, Any]:
+    async def probe() -> dict[str, Any]:
+        feed = VariationalMarketStatusFeed()
+        task = asyncio.create_task(feed.run())
+        try:
+            known = await feed.wait_for_status(timeout=timeout_seconds)
+            return {
+                "market_status": feed.status if known else "unknown",
+                "market_status_feed_connected": feed.connected if known else False,
+                "market_status_feed_heartbeat_at": (
+                    feed.heartbeat_at.isoformat() if known and feed.heartbeat_at else None
+                ),
+                "market_status_feed_error": None if known else feed.error or "session_probe_timeout",
+                "source": "variational_market_status_websocket",
+                "mode": "read_only_handoff_probe",
+            }
+        finally:
+            feed.stop = True
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    try:
+        return asyncio.run(probe())
+    except Exception as exc:
+        return {
+            "market_status": "unknown", "market_status_feed_connected": False,
+            "market_status_feed_error": f"session_probe_failed:{type(exc).__name__}",
+        }
+
+
 def collect_snapshot(
     root: Path = ROOT,
     *,
@@ -364,7 +398,9 @@ def collect_snapshot(
     rotation_test_status: str | None = None,
     continuous_gradient_rotation: bool = False,
     continuous_rotation_status: str | None = None,
+    probe_exchange_session: bool = False,
 ) -> dict[str, Any]:
+    use_wall_clock = now is None
     now = now or datetime.now(timezone.utc)
     eth_state = read_object(root / "log/live_inventory_state.json")
     eth_health = read_object(root / "log/live_inventory_risk_health.json")
@@ -373,17 +409,22 @@ def collect_snapshot(
     collector = read_object(root / "log/oil_swap/basis_samples/health.json")
     rows = read_basis_samples(root / "log/oil_swap/basis_samples", limit=200000, asset_filter="WTI")
     rows.sort(key=lambda row: str(row.get("logged_at") or ""))
-    readiness = readiness_for_new_entries(
-        rows,
-        market_id=market_id,
-        multiplier=multiplier,
-        now=now,
-    )
     sample = rows[-1] if rows else {}
     session = _session_window(sample, now, 1800, feed_health=collector)
     eth_pids = script_processes(root, "main.py", proc_root)
     wti_pids = script_processes(root, "tools/wti_live.py", proc_root)
     collector_pids = script_processes(root, "tools/oil_swap_collector.py", proc_root)
+    session_probe: dict[str, Any] | None = None
+    if probe_exchange_session and not eth_pids and not wti_pids and session.state == OilSession.STATUS_UNKNOWN:
+        session_probe = probe_exchange_session_status()
+        if use_wall_clock:
+            now = datetime.now(timezone.utc)
+        probed_session = _session_window({}, now, 1800, feed_health=session_probe)
+        if probed_session.state == OilSession.EXCHANGE_CLOSED:
+            session = probed_session
+    readiness = readiness_for_new_entries(
+        rows, market_id=market_id, multiplier=multiplier, now=now,
+    )
     runtimes: dict[str, Any] = {}
     for name, pids, health in (
         ("ETH", eth_pids, eth_health),
@@ -616,6 +657,7 @@ def collect_snapshot(
         "wti_ready": wti_ready,
         "wti_gate_reasons": wti_gate_reasons,
         "collector_process_count": len(collector_pids),
+        "session_probe": session_probe,
         "runtimes": runtimes,
         "collector_pids": collector_pids,
         "states": {"ETH": eth_state, "WTI": wti_state},
@@ -868,6 +910,51 @@ class RotationSupervisor:
         self._save_journal(journal)
         self._launch_oil_collector(session_name)
         return "collector_started"
+
+    def _stop_collector_after_verified_drain(self, journal: dict[str, Any], snapshot: dict[str, Any]) -> str:
+        pids = snapshot.get("collector_pids") or []
+        health = snapshot.get("collector") or {}
+        age = _age(health.get("updated_at"), datetime.now(timezone.utc))
+        if (
+            len(pids) != 1 or health.get("pid") != pids[0]
+            or not health.get("run_id") or health.get("execution_mode") != "collect_only"
+            or health.get("orders_attempted") is not False
+            or age is None or not -5 <= age <= HEARTBEAT_MAX_AGE_SECONDS
+        ):
+            return "wait_for_standalone_collector_identity"
+        prior = journal.get("collector_stop_request") or {}
+        if (
+            prior.get("pid") == pids[0] and prior.get("run_id") == health["run_id"]
+            and prior.get("request_id") == journal.get("request_id")
+            and prior.get("signal_sent_at")
+        ):
+            return "wait_for_standalone_collector_exit"
+        request = {
+            "pid": pids[0], "run_id": health["run_id"],
+            "request_id": journal.get("request_id"),
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+        }
+        journal["collector_stop_request"] = request
+        self._save_journal(journal)
+        try:
+            descriptor = os.pidfd_open(pids[0])
+        except ProcessLookupError:
+            return "wait_for_standalone_collector_exit"
+        try:
+            if (
+                script_processes(self.root, "tools/oil_swap_collector.py") != pids
+                or script_processes(self.root, "main.py")
+                or script_processes(self.root, "tools/wti_live.py")
+            ):
+                raise RuntimeError("collector_handoff_process_identity_changed")
+            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        except ProcessLookupError:
+            return "wait_for_standalone_collector_exit"
+        finally:
+            os.close(descriptor)
+        request["signal_sent_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_journal(journal)
+        return "stop_standalone_collector_for_wti_handoff"
 
     def _start_command(
         self,
@@ -1303,6 +1390,7 @@ class RotationSupervisor:
                 None if continuous_authorization is None
                 else str(continuous_authorization["status"])
             ),
+            probe_exchange_session=not self.dry_run,
         )
         plan = rehearsal_plan(snapshot)
         output: dict[str, Any] = {"snapshot": {
@@ -1353,7 +1441,22 @@ class RotationSupervisor:
                     source_run_id=str(journal.get("source_run_id") or ""),
                 )
                 if not ack or not _flat_state(source, source_state):
-                    output.update({"action": "wait_for_verified_drain", "source": source.value})
+                    output.update({
+                        "action": "wait_for_verified_drain", "source": source.value,
+                        "drain_diagnostics": {
+                            "receipt_status": control.get("status"),
+                            "request_matches": control.get("request_id") == journal.get("request_id"),
+                            "pid_matches": control.get("target_pid") == journal.get("source_pid"),
+                            "run_matches": control.get("target_run_id") == journal.get("source_run_id"),
+                            "receipt_verified": ack,
+                            "local_state_flat": _flat_state(source, source_state),
+                            **{key: control.get(key) for key in (
+                                "variational_position_qty", "lighter_position_qty",
+                                "variational_active_orders", "lighter_active_orders",
+                                "active_order_count", "reconciliation_observed_at", "completed_at",
+                            )},
+                        },
+                    })
                     return output
                 target = Pair(journal["target_pair"])
                 if target == Pair.NONE:
@@ -1362,9 +1465,22 @@ class RotationSupervisor:
                     output["action"] = "drain_complete_no_ready_target"
                     return output
                 if target == Pair.WTI and snapshot.get("collector_pids"):
-                    output["action"] = "wait_for_standalone_collector_exit"
+                    output["action"] = self._stop_collector_after_verified_drain(journal, snapshot)
                     return output
                 if snapshot["target_pair"] != target.value:
+                    if snapshot.get("session", {}).get("state") == OilSession.STATUS_UNKNOWN.value:
+                        probe = snapshot.get("session_probe") or {}
+                        probe_age = _age(probe.get("market_status_feed_heartbeat_at"), datetime.now(timezone.utc))
+                        verified_open = (
+                            probe.get("market_status") == "open"
+                            and probe.get("market_status_feed_connected") is True
+                            and probe.get("source") == "variational_market_status_websocket"
+                            and probe_age is not None and -5 <= probe_age <= 30
+                        )
+                        if not verified_open:
+                            output.update({"action": "wait_for_live_handoff_session_confirmation",
+                                           "source": source.value, "target": target.value})
+                            return output
                     output.update({"action": "target_changed_replan", "previous_target": target.value})
                     journal.update({"phase": RotationPhase.STABLE.value, "current_pair": "NONE", "request_id": None})
                     self._save_journal(journal)
@@ -1790,6 +1906,7 @@ def main(argv: list[str] | None = None) -> int:
                 multiplier=args.lighter_multiplier,
                 bounded_rotation_test=args.bounded_rotation_test,
                 continuous_gradient_rotation=args.continuous_gradient_rotation,
+                probe_exchange_session=True,
             )
             print(json.dumps({"snapshot": {
                 key: value for key, value in snapshot.items()
