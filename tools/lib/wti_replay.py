@@ -38,6 +38,7 @@ class ReplayConfig:
     max_sample_gap_seconds: float
     entry_cutoff_seconds: float = 1800
     max_slippage_bps: Decimal = Decimal("8")
+    max_order_notional_usd: Decimal = Decimal("20")
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,6 +562,7 @@ def replay_wti_gradient(
         markup = Decimal("1") + config.max_slippage_bps / Decimal("10000")
         lighter_qty = size_paired_layer(
             target_notional_usd=layer_notional_usd,
+            max_child_notional_usd=config.max_order_notional_usd,
             max_notional_usd=(
                 aggregate_max_notional_usd if aggregate_cap is None else aggregate_cap
             ),
@@ -837,6 +839,7 @@ def replay_wti_gradient(
             "exit_target_bps": str(config.exit_target_bps),
             "roundtrip_cost_bps": str(config.roundtrip_cost_bps),
             "layer_notional_usd": str(layer_notional_usd),
+            "max_order_notional_usd": str(config.max_order_notional_usd),
             "aggregate_max_notional_usd": str(aggregate_max_notional_usd),
             "max_layers": max_layers,
             "equity_scenario_usd": None if equity_usd is None else str(equity_usd),

@@ -14,6 +14,7 @@ import socket
 import subprocess
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -178,7 +179,51 @@ def recovery_status(root: Path, *, previous_run: str | None, new_pilot_after: st
             and status_heartbeat_age is not None and -5 <= status_heartbeat_age <= 30
         )
     collecting = sample_collection_live or closed_monitoring_live
-    complete = (current and health.get("startup_reconciled") is True
+    cycle_age = timestamp_age(health.get("last_verified_cycle_at"), now)
+    cycle_count = health.get("verified_cycle_count")
+    last_action = health.get("last_action") or {}
+    runtime_error = health.get("runtime_error") or health.get("runtime_cycle_error")
+    runtime_clean = bool(
+        health.get("entry_authorization_permanently_revoked") is False
+        and not runtime_error and not health.get("errors")
+        and last_action.get("action") not in {
+            "blocked", "blocked_entry", "blocked_close", "deferred", "reconcile"
+        }
+    )
+    cycle_verified = bool(
+        current and runtime_clean
+        and isinstance(cycle_count, int) and not isinstance(cycle_count, bool)
+        and cycle_count >= 1 and cycle_age is not None and -5 <= cycle_age <= 30
+        and (
+            (sample_collection_live and health.get("last_verified_cycle_kind") == "market_strategy")
+            or (closed_monitoring_live and health.get("last_verified_cycle_kind") == "closed_account_only")
+        )
+    )
+    proof = state.get("last_account_reconciliation") or {}
+    proof_age = timestamp_age(proof.get("observed_at"), now)
+    try:
+        position = state.get("open_position") or {}
+        expected_var = Decimal("0") if state.get("status") == "flat" else Decimal(str(position["expected_var_qty"]))
+        expected_lighter = Decimal("0") if state.get("status") == "flat" else Decimal(str(position["expected_lighter_qty"]))
+        actual_var = Decimal(str(proof["variational_qty"]))
+        actual_lighter = Decimal(str(proof["lighter_qty"]))
+        proof_positions_match = (
+            all(value.is_finite() for value in (expected_var, expected_lighter, actual_var, actual_lighter))
+            and actual_var == expected_var and actual_lighter == expected_lighter
+        )
+    except (KeyError, TypeError, ValueError, InvalidOperation):
+        proof_positions_match = False
+    account_reconciled = bool(
+        current and proof.get("verified") is True
+        and proof.get("runtime_pid") == health.get("pid")
+        and proof.get("runtime_run_id") == health.get("run_id")
+        and proof.get("market_id") == 145 and proof.get("active_order_count") == 0
+        and proof_age is not None and -5 <= proof_age <= 15
+        and proof_positions_match
+        and not state.get("manual_review_reason")
+    )
+    complete = (current and cycle_verified and account_reconciled
+                and health.get("startup_reconciled") is True
                 and health.get("manage_existing_only") is True
                 and health.get("wti_entry_authorized") is False
                 and state.get("status") in {"flat", "open"}
@@ -186,7 +231,8 @@ def recovery_status(root: Path, *, previous_run: str | None, new_pilot_after: st
     pilot = state.get("single_round_pilot") or {}
     if new_pilot_after is not None:
         complete = bool(
-            current and collecting and health.get("startup_reconciled") is True
+            current and collecting and cycle_verified and account_reconciled
+            and health.get("startup_reconciled") is True
             and health.get("manage_existing_only") is False and not state.get("pending_action")
             and pilot.get("previous_pilot_id") == new_pilot_after
             and pilot.get("pilot_id") != new_pilot_after
@@ -199,8 +245,18 @@ def recovery_status(root: Path, *, previous_run: str | None, new_pilot_after: st
                 or (pilot.get("status") == "completed" and state.get("status") == "flat")
             )
         )
+    reason = runtime_error or state.get("manual_review_reason") or health.get("risk_reason")
+    if current and not runtime_error and not complete:
+        if not runtime_clean:
+            reason = last_action.get("reason") or "runtime_error_or_entry_revocation_requires_review"
+        elif not account_reconciled:
+            reason = "awaiting_current_runtime_account_reconciliation"
+        elif not cycle_verified:
+            reason = "awaiting_verified_runtime_cycle"
     return {
         "recovered": bool(complete), "current_runtime": bool(current),
+        "account_reconciled": account_reconciled, "cycle_verified": cycle_verified,
+        "verified_cycle_count": cycle_count, "runtime_error": runtime_error,
         "pids": pids, "run_id": health.get("run_id"), "state": state.get("status"),
         "pending": bool(state.get("pending_action")),
         "collecting": collecting, "samples": collector.get("samples_this_run"),
@@ -213,7 +269,7 @@ def recovery_status(root: Path, *, previous_run: str | None, new_pilot_after: st
         "entry_authorized": health.get("wti_entry_authorized"),
         "risk_action": health.get("risk_action"),
         "pilot_id": pilot.get("pilot_id"), "pilot_status": pilot.get("status"),
-        "reason": state.get("manual_review_reason") or health.get("risk_reason"),
+        "reason": reason,
         "action": health.get("last_action"),
         "order_diagnostics": health.get("pending_order_diagnostics"),
     }

@@ -1,5 +1,7 @@
 from decimal import Decimal as D
 
+import pytest
+
 from tools.lib.wti_sizing import (
     equity_gradient_slot_caps,
     equity_position_cap_usd,
@@ -79,3 +81,26 @@ def test_equity_capacity_rounding_never_exceeds_hard_cap_or_invents_missing_equi
         child_notional_usd=D("20"), tier_count=5,
     ) is None
     assert equity_position_cap_usd(D("100"), None) is None
+
+
+@pytest.mark.parametrize("existing", ["0", "0.10"])
+def test_large_aggregate_budget_never_expands_twenty_dollar_child_cap(existing):
+    qty = size_paired_layer(
+        target_notional_usd=D("20"), max_notional_usd=D("100"),
+        max_child_notional_usd=D("20"), multiplier=D("1"), qty_step=D("0.01"),
+        min_base_qty=D("0.01"), min_quote_usd=D("1"),
+        var_order_price=D("100.5"), lighter_order_price=D("100.4"),
+        lighter_sizing_price=D("100"), allow_reduce_to_cap=False,
+        existing_var_qty=D(existing), existing_lighter_qty=D(existing),
+    )
+    assert qty == D("0.19")
+    assert qty * D("100.5") <= D("20")
+
+
+def test_child_cap_below_market_minimum_never_rounds_up_past_limit():
+    assert size_paired_layer(
+        target_notional_usd=D("20"), max_notional_usd=D("100"),
+        max_child_notional_usd=D("20"), multiplier=D("1"), qty_step=D("0.01"),
+        min_base_qty=D("0.20"), min_quote_usd=D("20.1"),
+        var_order_price=D("100.5"), lighter_order_price=D("100.5"),
+    ) is None

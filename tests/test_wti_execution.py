@@ -326,6 +326,29 @@ def test_non_profit_forced_close_bypasses_profit_target_and_audits_reason(tmp_pa
     )
 
 
+def test_gradient_aggregate_budget_never_overrides_executor_child_order_cap(tmp_path):
+    row = _sample()
+    executor, gateway = _executor(tmp_path, sample=row)
+    executor.max_notional_usd = Decimal("20")
+    pilot = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), max_layers=2,
+        config={"tier_thresholds_bps": ["30", "45"], "layer_notional_usd": "20"},
+    )
+    for tier in (1, 2):
+        state = executor.open(
+            sample=row, direction=DIRECTION, notional_usd=Decimal("20"),
+            session=_session_for_sample(row), layer_id=f"child-{tier}",
+            gradient_tier=tier, gradient_pilot_id=pilot["pilot_id"],
+            aggregate_max_notional_usd=Decimal("100"),
+        )
+        assert state["status"] == "open"
+    assert len(gateway.requests) == 4
+    for request in gateway.requests:
+        qty = Decimal(request["qty"])
+        assert qty == Decimal("0.28")
+        assert qty * Decimal("70.1") * Decimal("1.0008") <= Decimal("20")
+
+
 def test_gradient_layer_adds_only_same_session_exposure_and_closes_as_aggregate(tmp_path):
     def market_reader_for_qty(var_qty, lighter_qty):
         return _sample(

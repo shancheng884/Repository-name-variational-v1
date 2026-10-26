@@ -180,6 +180,8 @@ def build_replay_config(args: argparse.Namespace) -> ReplayConfig:
         max_hold_seconds=hold,
         max_sample_gap_seconds=float(MAX_WTI_ENTRY_GAP_SECONDS),
         entry_cutoff_seconds=cutoff,
+        max_slippage_bps=slippage,
+        max_order_notional_usd=notional,
     )
     args._validated_notional = notional
     args._validated_slippage = slippage
@@ -416,6 +418,10 @@ class WTILiveRuntime:
         self.last_action: dict[str, Any] = {"action": "none", "reason": "starting"}
         self.last_health_write_monotonic = 0.0
         self.last_runtime_error: str | None = None
+        self.last_verified_cycle_at: str | None = None
+        self.last_verified_cycle_kind: str | None = None
+        self.verified_cycle_count = 0
+        self.last_cycle_error: str | None = None
         self.pilot_store: WTIExecutionStore | None = None
         self.single_round_pilot: dict[str, Any] | None = None
         self.gradient_pilot: dict[str, Any] | None = None
@@ -859,7 +865,11 @@ class WTILiveRuntime:
     async def _advance_continuous_gradient_round(
         self, state: dict[str, Any]
     ) -> dict[str, Any]:
-        if not getattr(self.args, "continuous_gradient_rotation", False):
+        if (
+            getattr(self, "manage_existing_only", False)
+            or not getattr(self.args, "gradient_live", False)
+            or not getattr(self.args, "continuous_gradient_rotation", False)
+        ):
             return state
         self._poll_rotation_drain()
         if getattr(self, "rotation_drain_request", None) is not None:
@@ -1025,6 +1035,11 @@ class WTILiveRuntime:
         }
 
     def _gradient_equity_capacity_by_tier(self) -> tuple[Decimal, ...] | None:
+        if (
+            getattr(self, "manage_existing_only", False)
+            or not getattr(self.args, "gradient_live", False)
+        ):
+            return None
         risk = self.last_risk
         if risk.get("risk_data_complete") is not True:
             return None
@@ -1035,12 +1050,15 @@ class WTILiveRuntime:
             age = (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds()
             var_equity = Decimal(str(risk["variational_equity_usd"]))
             lighter_equity = Decimal(str(risk["lighter_equity_usd"]))
-            layer = Decimal(str(self.args._validated_gradient_layer_notional))
+            layer = Decimal(str(getattr(self.args, "_validated_gradient_layer_notional", None)))
+            order_limit = Decimal(str(getattr(self.args, "_validated_notional", None)))
             if (
                 observed.tzinfo is None or observed.utcoffset() is None
                 or age < -5 or age > 15
                 or not var_equity.is_finite() or not lighter_equity.is_finite()
                 or var_equity <= 0 or lighter_equity <= 0
+                or not layer.is_finite() or not order_limit.is_finite()
+                or layer <= 0 or layer > order_limit
             ):
                 return None
         except (KeyError, TypeError, ValueError, ArithmeticError):
@@ -1324,6 +1342,12 @@ class WTILiveRuntime:
             "gradient_pilot": state.get("gradient_pilot"),
             "wti_entry_authorized": self.entry_authorized,
             "startup_reconciled": self.startup_reconciled,
+            "entry_authorization_permanently_revoked": self.entry_authorization_permanently_revoked,
+            "runtime_error": getattr(self, "last_runtime_error", None),
+            "runtime_cycle_error": getattr(self, "last_cycle_error", None),
+            "verified_cycle_count": getattr(self, "verified_cycle_count", 0),
+            "last_verified_cycle_at": getattr(self, "last_verified_cycle_at", None),
+            "last_verified_cycle_kind": getattr(self, "last_verified_cycle_kind", None),
             "readiness_elapsed_ms": getattr(self, "last_readiness_elapsed_ms", None),
             "reconcile_elapsed_ms": getattr(self, "last_reconcile_elapsed_ms", None),
             "entry_gate_block_reason": self.entry_gate_block_reason,
@@ -1656,15 +1680,27 @@ class WTILiveRuntime:
         self.gateway.set_current_notional(self._position_notional(state, row))
         risk_action = str(self.last_risk.get("risk_action") or "block_entry")
         window = _session_window(row, now, self.config.entry_cutoff_seconds)
-        if getattr(self, "gradient_pilot", None) is not None:
+        gradient_entry_mode = bool(
+            getattr(self.args, "gradient_live", False)
+            and not self.manage_existing_only
+            and getattr(self, "gradient_pilot", None) is not None
+        )
+        if gradient_entry_mode:
             self.gradient_pilot = dict(state.get("gradient_pilot") or self.gradient_pilot)
             thresholds_by_direction = await self._gradient_thresholds_for_sample(row)
             equity_capacity = self._gradient_equity_capacity_by_tier()
-            decision = decide_wti_gradient_action(
-                row, position, self.gradient_pilot, config=self.config, now=now,
-                thresholds_by_direction=thresholds_by_direction,
-                aggregate_capacity_by_tier_usd=equity_capacity,
-            )
+            if equity_capacity is None:
+                decision = decide_wti_action(row, position, config=self.config, now=now)
+                if decision.get("action") != "close":
+                    decision = {"action": "hold", "reason": "gradient_equity_capacity_unavailable"}
+            else:
+                decision = decide_wti_gradient_action(
+                    row, position, self.gradient_pilot, config=self.config, now=now,
+                    thresholds_by_direction=thresholds_by_direction,
+                    aggregate_capacity_by_tier_usd=equity_capacity,
+                )
+        elif self.manage_existing_only and position is None:
+            decision = {"action": "hold", "reason": "management_only_flat_no_new_entries"}
         else:
             decision = decide_wti_action(row, position, config=self.config, now=now)
         if position is None:
@@ -1712,7 +1748,7 @@ class WTILiveRuntime:
             and risk_action in {"normal", "warning"}
             and window.allow_new_entries
         ):
-            gradient_entry = getattr(self, "gradient_pilot", None) is not None
+            gradient_entry = gradient_entry_mode
             reservation_id = None
             if gradient_entry:
                 pilot_id = self.gradient_pilot["pilot_id"]
@@ -1787,6 +1823,24 @@ class WTILiveRuntime:
         }
         return state
 
+    def _note_verified_cycle(self, state: dict[str, Any], *, kind: str) -> bool:
+        if (
+            self.entry_authorization_permanently_revoked
+            or state.get("status") not in {"flat", "open"}
+            or state.get("pending_action") is not None
+            or state.get("manual_review_reason")
+            or self.last_action.get("action") in {
+                "blocked", "blocked_entry", "blocked_close", "deferred", "reconcile"
+            }
+        ):
+            return False
+        self.last_verified_cycle_at = datetime.now(timezone.utc).isoformat()
+        self.last_verified_cycle_kind = kind
+        self.verified_cycle_count = getattr(self, "verified_cycle_count", 0) + 1
+        self.last_cycle_error = None
+        self.last_runtime_error = None
+        return True
+
     async def run(self) -> None:
         validate_startup_preconditions(self.args)
         await self._start_forwarder()
@@ -1810,6 +1864,8 @@ class WTILiveRuntime:
                                 "action": "blocked",
                                 "reason": state.get("manual_review_reason") or state.get("status"),
                             }
+                        else:
+                            self._note_verified_cycle(state, kind="closed_account_only")
                     except WTIExecutionError as exc:
                         self.last_runtime_error = str(exc)
                         self.last_action = {"action": "blocked", "reason": str(exc)}
@@ -1849,6 +1905,7 @@ class WTILiveRuntime:
                                 state = await self._startup_reconcile_sample(dict(row))
                             else:
                                 state = await self._process_sample(dict(row))
+                                self._note_verified_cycle(state, kind="market_strategy")
                             self._finish_single_round_pilot_if_done(state)
                             self._finish_gradient_pilot_if_done(state)
                             if self.last_action.get("action") not in {
@@ -1859,6 +1916,7 @@ class WTILiveRuntime:
                                 state=state, row=self.collector.latest_sample or row
                             )
                         except Exception as exc:
+                            self.last_cycle_error = f"{type(exc).__name__}:{str(exc)[:160]}"
                             if _retryable_sample_validation_error(exc):
                                 self.entry_authorized = False
                                 if not self.entry_authorization_permanently_revoked:
@@ -1905,6 +1963,7 @@ class WTILiveRuntime:
                                     "action": "account_only_reconcile",
                                     "status": state.get("status"),
                                 }
+                                self._note_verified_cycle(state, kind="closed_account_only")
                             else:
                                 self.last_action = {
                                     "action": "blocked",

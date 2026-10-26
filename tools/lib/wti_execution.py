@@ -2002,6 +2002,7 @@ class WTIPairExecutor:
             lighter_qty = size_paired_layer(
                 target_notional_usd=notional_usd,
                 max_notional_usd=aggregate_cap,
+                max_child_notional_usd=self.max_notional_usd,
                 multiplier=context.multiplier,
                 qty_step=context.lighter_qty_step,
                 min_base_qty=context.lighter_min_base,

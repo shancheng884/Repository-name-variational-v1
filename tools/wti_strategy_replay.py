@@ -124,6 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Runtime-matched live entry-authorization gap; the value can be lowered for a stricter sensitivity replay.",
     )
     parser.add_argument("--max-slippage-bps", type=_positive_decimal, default=Decimal("8"))
+    parser.add_argument("--max-order-notional-usd", type=_positive_decimal, default=Decimal("20"))
     parser.add_argument("--lighter-market-id", type=int)
     parser.add_argument("--lighter-multiplier", type=_positive_decimal)
     parser.add_argument("--compare-gradient", action="store_true")
@@ -185,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
             max_hold_seconds=args.max_hold_seconds,
             max_sample_gap_seconds=args.max_sample_gap_seconds,
             max_slippage_bps=args.max_slippage_bps,
+            max_order_notional_usd=args.max_order_notional_usd,
         )
         baseline = replay_wti(
             rows,

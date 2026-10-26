@@ -496,6 +496,22 @@ historical-data pilot path described above.
 
 ## Booked Variational Order Recovery
 
+Management-only takeover never selects the gradient entry strategy, calculates
+entry capacity, or arms another round from a saved gradient record. Completed
+and exhausted pilots remain historical evidence only. Existing positions still
+use the ordinary exit decision and exact-quantity execution/reconciliation path.
+Missing or invalid verified equity capacity blocks gradient entries; it cannot
+fall back to the legacy aggregate budget. The executor enforces its per-child
+notional limit independently of the aggregate equity budget, including quantity
+rounding and the existing slippage padding. Replay uses the same sizing cap
+(`--max-order-notional-usd`, default 20 USD).
+
+Takeover success requires a current-PID/current-run account proof matching the
+local position with no active orders, plus at least one successful non-startup
+strategy cycle (or closed-market account-only cycle). Runtime exceptions,
+permanently revoked authorization, incomplete/stale proofs and blocked cycles
+cannot be reported as recovered merely because a process remains alive.
+
 An orders-v2 `cleared` record with `success_trades_booked_into_pool` may have an
 `execution_timestamp` slightly earlier than the local submission clock. Such a
 record is accepted only when a persisted native RFQ/order ID matches exactly,

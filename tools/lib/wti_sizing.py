@@ -64,6 +64,7 @@ def size_paired_layer(
     *,
     target_notional_usd: Decimal,
     max_notional_usd: Decimal,
+    max_child_notional_usd: Decimal | None = None,
     multiplier: Decimal,
     qty_step: Decimal,
     min_base_qty: Decimal,
@@ -102,6 +103,11 @@ def size_paired_layer(
     ):
         return None
 
+    if max_child_notional_usd is not None and (
+        not max_child_notional_usd.is_finite() or max_child_notional_usd <= 0
+    ):
+        return None
+
     existing_var_price = (
         var_order_price if existing_var_mark_price is None else existing_var_mark_price
     )
@@ -127,6 +133,12 @@ def size_paired_layer(
     )
     target_steps = (target_qty / qty_step).to_integral_value(rounding=ROUND_CEILING)
     target_qty = target_steps * qty_step
+    if max_child_notional_usd is not None:
+        child_qty_limit = max_child_notional_usd / (
+            max(var_order_price, lighter_order_price) * multiplier
+        )
+        child_steps = (child_qty_limit / qty_step).to_integral_value(rounding=ROUND_FLOOR)
+        target_qty = min(target_qty, child_steps * qty_step)
 
     remaining_var = max_notional_usd - existing_var_notional
     remaining_lighter = max_notional_usd - existing_lighter_notional
@@ -158,6 +170,10 @@ def size_paired_layer(
     if (
         max(var_total, lighter_total) > max_notional_usd
         or (var_total + lighter_total) / Decimal("2") > max_notional_usd
+        or (
+            max_child_notional_usd is not None
+            and qty * multiplier * max(var_order_price, lighter_order_price) > max_child_notional_usd
+        )
     ):
         return None
     return qty

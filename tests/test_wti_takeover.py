@@ -20,6 +20,25 @@ def _state_files(root):
     }))
 
 
+def _cycle_evidence(root, *, run_id, kind="market_strategy"):
+    now = datetime.now(timezone.utc).isoformat()
+    path = root / "log/wti_live_state.json"
+    state = json.loads(path.read_text())
+    state["last_account_reconciliation"] = {
+        "verified": True, "runtime_pid": 42, "runtime_run_id": run_id,
+        "observed_at": now, "market_id": 145, "active_order_count": 0,
+        "variational_qty": "0", "lighter_qty": "0",
+    }
+    path.write_text(json.dumps(state))
+    return {
+        "verified_cycle_count": 2, "last_verified_cycle_at": now,
+        "last_verified_cycle_kind": kind,
+        "entry_authorization_permanently_revoked": False,
+        "runtime_error": None, "runtime_cycle_error": None, "errors": [],
+        "last_action": {"action": "hold", "reason": "management_only_flat_no_new_entries"},
+    }
+
+
 def test_process_identity_accepts_relative_and_absolute_python_but_not_tmux(monkeypatch, tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
@@ -147,16 +166,21 @@ def test_missing_env_does_not_stop_existing_runtime(monkeypatch, tmp_path):
         takeover.execute_takeover(tmp_path)
 
 
-@pytest.mark.parametrize("case", ["stale", "old_run", "old_pid", "pending", "entry_enabled", "wrong_mode"])
+@pytest.mark.parametrize("case", [
+    "stale", "old_run", "old_pid", "pending", "entry_enabled", "wrong_mode",
+    "cycle_missing", "cycle_stale", "cycle_error", "revoked", "errors",
+    "proof_pid", "proof_run", "proof_stale", "proof_orders", "proof_positions", "blocked_cycle",
+])
 def test_takeover_never_accepts_old_or_incomplete_health(monkeypatch, tmp_path, case):
     _state_files(tmp_path)
+    if case != "pending":
+        (tmp_path / "log/wti_live_state.json").write_text(json.dumps({"status": "flat"}))
     health = {
+        **_cycle_evidence(tmp_path, run_id="new-run"),
         "pid": 42, "run_id": "new-run", "updated_at": datetime.now(timezone.utc).isoformat(),
         "status": "running", "startup_reconciled": True, "manage_existing_only": True,
         "wti_entry_authorized": False,
     }
-    if case != "pending":
-        (tmp_path / "log/wti_live_state.json").write_text(json.dumps({"status": "flat"}))
     if case == "stale":
         health["updated_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
     elif case == "old_run":
@@ -167,7 +191,40 @@ def test_takeover_never_accepts_old_or_incomplete_health(monkeypatch, tmp_path, 
         health["wti_entry_authorized"] = True
     elif case == "wrong_mode":
         health["manage_existing_only"] = False
+    elif case == "cycle_missing":
+        health["verified_cycle_count"] = 0
+    elif case == "cycle_stale":
+        health["last_verified_cycle_at"] = (datetime.now(timezone.utc) - timedelta(seconds=31)).isoformat()
+    elif case == "cycle_error":
+        health["runtime_cycle_error"] = "AttributeError:missing_gradient_layer_notional"
+    elif case == "revoked":
+        health["entry_authorization_permanently_revoked"] = True
+    elif case == "errors":
+        health["errors"] = ["AttributeError"]
+    elif case == "blocked_cycle":
+        health["last_action"] = {"action": "blocked", "reason": "AttributeError"}
+    elif case.startswith("proof_"):
+        path = tmp_path / "log/wti_live_state.json"
+        state = json.loads(path.read_text())
+        proof = state["last_account_reconciliation"]
+        if case == "proof_pid":
+            proof["runtime_pid"] = 41
+        elif case == "proof_run":
+            proof["runtime_run_id"] = "old-run"
+        elif case == "proof_orders":
+            proof["active_order_count"] = 1
+        elif case == "proof_positions":
+            proof["variational_qty"] = "0.198"
+        else:
+            proof["observed_at"] = (datetime.now(timezone.utc) - timedelta(seconds=16)).isoformat()
+        path.write_text(json.dumps(state))
     (tmp_path / "log/wti_live_risk_health.json").write_text(json.dumps(health))
+    collector_root = tmp_path / "log/oil_swap/basis_samples"
+    collector_root.mkdir(parents=True)
+    (collector_root / "health.json").write_text(json.dumps({
+        "pid": 42, "status": "running", "samples_this_run": 3,
+        "last_sample_at": datetime.now(timezone.utc).isoformat(),
+    }))
     monkeypatch.setattr(takeover, "runtime_processes", lambda *_args: [42])
     assert takeover.recovery_status(tmp_path, previous_run="previous")["recovered"] is False
 
@@ -195,6 +252,7 @@ def test_success_requires_current_runtime_collection(monkeypatch, tmp_path, coll
     _state_files(tmp_path)
     (tmp_path / "log/wti_live_state.json").write_text(json.dumps({"status": "flat"}))
     (tmp_path / "log/wti_live_risk_health.json").write_text(json.dumps({
+        **_cycle_evidence(tmp_path, run_id="new"),
         "pid": 42, "run_id": "new", "updated_at": datetime.now(timezone.utc).isoformat(),
         "status": "running", "startup_reconciled": True, "manage_existing_only": True,
         "wti_entry_authorized": False,
@@ -221,6 +279,7 @@ def test_closed_market_takeover_accepts_fresh_feed_without_samples(
     }))
     now = datetime.now(timezone.utc)
     (tmp_path / "log/wti_live_risk_health.json").write_text(json.dumps({
+        **_cycle_evidence(tmp_path, run_id="closed-run", kind="closed_account_only"),
         "pid": 42, "run_id": "closed-run", "updated_at": now.isoformat(),
         "status": "running", "startup_reconciled": True, "manage_existing_only": True,
         "wti_entry_authorized": False,
@@ -289,6 +348,7 @@ def test_new_live_test_acceptance_requires_actual_new_entry_authorization(monkey
         },
     }))
     (tmp_path / "log/wti_live_risk_health.json").write_text(json.dumps({
+        **_cycle_evidence(tmp_path, run_id="new-run"),
         "pid": 42, "run_id": "new-run", "updated_at": datetime.now(timezone.utc).isoformat(),
         "status": "running", "startup_reconciled": True,
         "manage_existing_only": False, "wti_entry_authorized": authorized,

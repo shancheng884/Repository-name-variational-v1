@@ -395,6 +395,7 @@ def decide_wti_gradient_action(
         qty = size_paired_layer(
             target_notional_usd=layer_notional,
             max_notional_usd=cap,
+            max_child_notional_usd=Decimal(str(pilot["config"]["max_notional_usd"])),
             multiplier=multiplier,
             qty_step=step,
             min_base_qty=min_base,

@@ -103,6 +103,27 @@ def test_replay_is_no_lookahead_and_exits_on_net_target():
     assert report.unresolved_position is False
 
 
+def test_gradient_replay_uses_same_explicit_child_cap_as_live_sizing(monkeypatch):
+    from tools.lib import wti_replay
+
+    sizes = []
+    original = wti_replay.size_paired_layer
+
+    def sizing(**kwargs):
+        sizes.append(kwargs["max_child_notional_usd"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(wti_replay, "size_paired_layer", sizing)
+    report = replay_wti_gradient(
+        [_row(0), _row(1, var_bid="70.5", lighter_buy_price="70.1", long_edge_bps="0")],
+        config=_config(max_order_notional_usd=Decimal("20")),
+        second_tier_threshold_bps=Decimal("20"), layer_notional_usd=Decimal("20"),
+        aggregate_max_notional_usd=Decimal("100"), max_layers=5, equity_usd=Decimal("100"),
+    )
+    assert sizes and all(value == Decimal("20") for value in sizes)
+    assert report.config["max_order_notional_usd"] == "20"
+
+
 def test_replay_waits_for_exit_quotes_covering_the_open_position_size():
     rows = [
         _row(0),

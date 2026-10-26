@@ -273,7 +273,7 @@ def test_continuous_gradient_runtime_rearms_only_after_fresh_account_reconcile()
 
     runtime = object.__new__(wti_live.WTILiveRuntime)
     runtime.args = SimpleNamespace(
-        continuous_gradient_rotation=True, rotation_test_id=session_id,
+        continuous_gradient_rotation=True, rotation_test_id=session_id, gradient_live=True,
     )
     runtime.rotation_drain_request = None
     runtime.entry_authorized = True
@@ -311,7 +311,7 @@ def test_continuous_gradient_runtime_rearms_only_after_fresh_account_reconcile()
 
 def test_continuous_gradient_runtime_drain_never_rearms_next_round():
     runtime = object.__new__(wti_live.WTILiveRuntime)
-    runtime.args = SimpleNamespace(continuous_gradient_rotation=True)
+    runtime.args = SimpleNamespace(continuous_gradient_rotation=True, gradient_live=True)
     runtime.rotation_drain_request = {"status": "draining"}
     runtime.entry_authorized = True
     runtime._poll_rotation_drain = lambda: None
@@ -327,6 +327,15 @@ def test_continuous_gradient_runtime_drain_never_rearms_next_round():
     result = asyncio.run(runtime._advance_continuous_gradient_round(state))
     assert result is state
     assert runtime.entry_authorized is False
+
+
+def test_management_override_never_rearms_historical_continuous_gradient():
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.args = SimpleNamespace(continuous_gradient_rotation=True, gradient_live=True)
+    runtime.manage_existing_only = True
+    runtime._poll_rotation_drain = lambda: pytest.fail("management must not arm a new round")
+    state = {"status": "flat", "gradient_pilot": {"status": "completed"}}
+    assert asyncio.run(runtime._advance_continuous_gradient_round(state)) is state
 
 
 def test_observe_mode_does_not_require_live_eth_confirmation(tmp_path: Path):
@@ -1135,6 +1144,7 @@ def test_management_runtime_reconciles_account_and_stays_alive_when_market_close
     runtime.entry_authorized = True
     runtime.entry_gate_block_reason = None
     runtime.manage_existing_only = True
+    runtime.entry_authorization_permanently_revoked = False
     runtime.startup_reconciled = False
     runtime.last_risk = {}
     runtime.last_action = {"action": "starting"}
@@ -1271,7 +1281,10 @@ def _runtime_with_real_executor(tmp_path, collector, gateway, *, gradient=False)
 
 def test_gradient_equity_capacity_requires_fresh_complete_dual_equity_snapshot():
     runtime = object.__new__(wti_live.WTILiveRuntime)
-    runtime.args = SimpleNamespace(_validated_gradient_layer_notional=Decimal("20"))
+    runtime.args = SimpleNamespace(
+        gradient_live=True, _validated_gradient_layer_notional=Decimal("20"),
+        _validated_notional=Decimal("20"),
+    )
     runtime.last_risk = {
         "risk_data_complete": True,
         "observed_at": datetime.now(timezone.utc).isoformat(),
@@ -1289,6 +1302,35 @@ def test_gradient_equity_capacity_requires_fresh_complete_dual_equity_snapshot()
     runtime.last_risk["observed_at"] = datetime.now(timezone.utc).isoformat()
     runtime.last_risk["risk_data_complete"] = False
     assert runtime._gradient_equity_capacity_by_tier() is None
+
+
+@pytest.mark.parametrize("layer", [None, "NaN", "0", "21"])
+def test_gradient_capacity_missing_or_invalid_validated_amount_fails_closed(layer):
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.args = SimpleNamespace(gradient_live=True, _validated_notional=Decimal("20"))
+    if layer is not None:
+        runtime.args._validated_gradient_layer_notional = Decimal(layer)
+    runtime.last_risk = {
+        "risk_data_complete": True, "observed_at": datetime.now(timezone.utc).isoformat(),
+        "variational_equity_usd": "100", "lighter_equity_usd": "100",
+    }
+    assert runtime._gradient_equity_capacity_by_tier() is None
+
+
+def test_live_gradient_missing_equity_never_falls_back_to_legacy_entry_budget(tmp_path):
+    row = _live_sample(datetime.now(timezone.utc), sample_id="missing-equity")
+    row["long_edge_bps"] = "100"
+    collector = SimpleNamespace(latest_sample=row)
+    runtime = _runtime_with_real_executor(tmp_path, collector, _FlatLoopGateway(), gradient=True)
+
+    async def no_adaptive_thresholds(_row):
+        return None
+
+    runtime._gradient_thresholds_for_sample = no_adaptive_thresholds
+    state = asyncio.run(runtime._process_sample(row))
+    assert state["status"] == "flat" and state["pending_action"] is None
+    assert runtime.last_action["reason"] == "gradient_equity_capacity_unavailable"
+    assert state["gradient_pilot"]["layers_opened"] == []
 
 
 def test_run_keeps_collector_alive_during_slow_history_scan_and_reconciles_fresh_sample(
@@ -1524,6 +1566,10 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
 
         def read_account(self):
             snapshot = super().read_account()
+            self.latest_risk.update({
+                "risk_data_complete": True, "observed_at": snapshot["observed_at"],
+                "variational_equity_usd": "9", "lighter_equity_usd": "9",
+            })
             snapshot["variational_positions"]["positions"] = [{
                 "instrument": {
                     "underlying": "USOILP", "instrument_type": "swap",
@@ -1653,8 +1699,15 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
             assert second["status"] == "manual_review_required"
             assert len(gateway.requests) == 3
             runtime = _runtime_with_real_executor(tmp_path, collector, gateway, gradient=True)
+            from tools.wti_takeover import management_command
+            runtime.args = wti_live.parse_args(management_command(tmp_path)[2:] + [
+                "--state-path", str(tmp_path / "wti-state.json"),
+                "--health-path", str(tmp_path / "wti-health.json"),
+                "--control-path", str(tmp_path / "wti-control.json"),
+            ])
+            runtime.config = wti_live.build_replay_config(runtime.args)
+            assert not hasattr(runtime.args, "_validated_gradient_layer_notional")
             runtime.manage_existing_only = True
-            runtime.args.manage_existing_wti_position = True
             connect_market_readers()
             # Exercise startup reconciliation against persisted pending intent,
             # then the ordinary loop; neither may send the Var order again.
@@ -1686,12 +1739,12 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
     assert runtime.stop is (not skewed_second_fill)
     assert collector.stopped is (not skewed_second_fill)
     expected_sizes = [
+        (Decimal("0.12"), Decimal("0.12")),
+        (Decimal("0.12"), Decimal("0.12")),
         (Decimal("0.13"), Decimal("0.13")),
         (Decimal("0.13"), Decimal("0.13")),
-        (Decimal("0.13"), Decimal("0.13")),
-        (Decimal("0.13"), Decimal("0.13")),
-        (Decimal("0.26"), Decimal("0.26")),
-        (Decimal("0.26"), Decimal("0.26")),
+        (Decimal("0.25"), Decimal("0.25")),
+        (Decimal("0.25"), Decimal("0.25")),
     ]
     assert collector.requested_sizes == expected_sizes
 
@@ -1869,6 +1922,146 @@ def test_initialization_handles_management_and_explicit_new_test_without_renewin
     else:
         assert runtime.args.state_path.read_bytes() == before
     assert runtime.entry_authorized is False
+
+
+@pytest.mark.parametrize("terminal_gradient_status", ["completed", "exhausted"])
+def test_real_management_cli_initialization_and_restarts_ignore_terminal_gradient(
+    monkeypatch, tmp_path, terminal_gradient_status,
+):
+    import lighter.signer_client
+    from tools import wti_account_probe
+    from tools.lib import wti_readonly_adapter
+    from tools.wti_takeover import management_command
+
+    class Signer:
+        def __init__(self, **_kwargs):
+            pass
+
+        def check_client(self):
+            return None
+
+        async def close(self):
+            pass
+
+    class Forwarder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+    class Gateway(_FlatLoopGateway):
+        def read_account(self):
+            result = super().read_account()
+            self.latest_risk.update({
+                "risk_data_complete": True, "observed_at": result["observed_at"],
+                "variational_equity_usd": "100", "lighter_equity_usd": "100",
+            })
+            return result
+
+    class Collector:
+        def __init__(self, runtime):
+            self.runtime = runtime
+            self.latest_sample = None
+            self.stopped = False
+            self.frames = 0
+
+        async def collect_fresh_sample(self, *, sample_kind="baseline", **_kwargs):
+            self.frames += 1
+            self.latest_sample = _live_sample(
+                datetime.now(timezone.utc), sample_id=f"manager-{self.frames}"
+            )
+            self.latest_sample.update(sample_kind=sample_kind, long_edge_bps="100")
+            return dict(self.latest_sample)
+
+        async def run(self):
+            while not self.stopped:
+                await self.collect_fresh_sample()
+                if self.runtime.verified_cycle_count >= 3:
+                    self.runtime.request_stop()
+                    return
+                await asyncio.sleep(0.02)
+
+        def request_stop(self):
+            self.stopped = True
+
+    monkeypatch.setattr(wti_live, "ROOT", tmp_path)
+    monkeypatch.setenv("LIGHTER_ACCOUNT_INDEX", "1")
+    monkeypatch.setenv("LIGHTER_API_KEY_INDEX", "2")
+    monkeypatch.setenv("API_KEY_PRIVATE_KEY", "test-only-not-used")
+    monkeypatch.setattr(lighter.signer_client, "SignerClient", Signer)
+    monkeypatch.setattr(wti_readonly_adapter, "VariationalForwarderClient", Forwarder)
+    market = {
+        "market_id": 145, "symbol": "WTI", "market_type": "perp", "status": "active",
+        "multiplier": Decimal("1"), "supported_size_decimals": 2,
+        "supported_price_decimals": 2, "min_base_amount": "0.01", "min_quote_amount": "1",
+    }
+    monkeypatch.setattr(wti_account_probe, "fetch_lighter_market_metadata", lambda *_a, **_k: market)
+    monkeypatch.setattr(
+        wti_live, "decide_wti_gradient_action",
+        lambda *_a, **_k: pytest.fail("management must not select gradient entry strategy"),
+    )
+    state_path = tmp_path / "log/wti_live_state.json"
+    state_path.parent.mkdir(parents=True)
+    eth_path = tmp_path / "log/live_inventory_state.json"
+    eth_path.write_text(json.dumps({"asset": "ETH", "status": "flat"}))
+    original_validate = wti_live.validate_startup_preconditions
+    monkeypatch.setattr(
+        wti_live, "validate_startup_preconditions",
+        lambda args: original_validate(args, eth_state_path=eth_path),
+    )
+    store = wti_live.WTIExecutionStore(state_path)
+    seed = store.load()
+    old_gradient = {
+        "pilot_id": "saved-gradient", "status": terminal_gradient_status,
+        "completed_roundtrips": 1, "max_layers": 5,
+        "config": {"layer_notional_usd": "20", "tier_thresholds_bps": ["30", "45", "45.25", "45.50", "45.75"]},
+    }
+    seed.update(
+        gradient_pilot=old_gradient,
+        single_round_pilot={"pilot_id": "old-single", "status": "completed", "completed_roundtrips": 1},
+    )
+    store.save(seed)
+
+    for _restart in range(2):
+        args = wti_live.parse_args(management_command(tmp_path)[2:] + [
+            "--state-path", str(state_path), "--health-path", str(tmp_path / "log/health.json"),
+            "--control-path", str(tmp_path / "log/control.json"),
+            "--output-dir", str(tmp_path / "oil"), "--sample-root", str(tmp_path / "oil/basis_samples"),
+        ])
+        assert not args.gradient_live and not hasattr(args, "_validated_gradient_layer_notional")
+        runtime = wti_live.WTILiveRuntime(args)
+        runtime.collector = Collector(runtime)
+        gateway = Gateway()
+        monkeypatch.setattr(wti_live, "WTIProductionGateway", lambda **_kwargs: gateway)
+
+        async def readiness():
+            runtime.readiness = {"ready": False, "market_data_ready": False, "reasons": ["history_insufficient"]}
+
+        async def no_forwarder():
+            pass
+
+        runtime._load_startup_readiness = readiness
+        runtime._start_forwarder = no_forwarder
+        runtime._gradient_equity_capacity_by_tier = lambda: pytest.fail("management must not compute entry capacity")
+        asyncio.run(asyncio.wait_for(runtime.run(), timeout=8))
+
+        assert runtime.startup_reconciled and runtime.manage_existing_only
+        assert runtime.verified_cycle_count >= 3
+        assert not runtime.entry_authorized and not runtime.entry_authorization_permanently_revoked
+        assert runtime.last_cycle_error is None and runtime.last_runtime_error is None
+        assert runtime.last_action["reason"] == "management_only_flat_no_new_entries"
+        after = store.load()
+        assert after["status"] == "flat" and after["pending_action"] is None
+        assert after["gradient_pilot"] == old_gradient
+        assert after["execution_history"] == seed["execution_history"]
+        assert after["last_account_reconciliation"]["runtime_run_id"] == runtime.run_id
+        for handler in runtime.logger.handlers:
+            handler.close()
+        runtime.logger.handlers.clear()
 
 
 def test_full_run_recovers_real_0198_close_once_then_continues_collecting(monkeypatch, tmp_path):
