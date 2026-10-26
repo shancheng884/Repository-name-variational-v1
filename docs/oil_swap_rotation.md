@@ -493,3 +493,24 @@ block new entries. The supervisor and runtime regression tests use synthetic
 venue responses; they do not verify live credentials or establish realized
 fees/funding. Production qualification remains separate from the explicit
 historical-data pilot path described above.
+
+## Booked Variational Order Recovery
+
+An orders-v2 `cleared` record with `success_trades_booked_into_pool` may have an
+`execution_timestamp` slightly earlier than the local submission clock. Such a
+record is accepted only when a persisted native RFQ/order ID matches exactly,
+the order is unique, instrument/side/quantity match, and `created_at` falls
+between submission and the current time. The execution clock lead must stay
+within the existing gateway operation timeout; missing, future or older execution
+timestamps remain unconfirmed. Requests without an exact native identity retain
+the original execution-time lower bound. This does not relax market freshness,
+session, account-risk, size, slippage or position-reconciliation gates.
+
+The persisted result records the clock lead and its evidence source. Unknown
+lookups now include a specific failure reason, including missing/ambiguous
+records, response errors, incomplete clearing or inconsistent time evidence.
+Use management-only takeover for an interrupted layer: it re-queries the existing
+Var order, verifies both accounts and zero active orders, and only then submits
+the provably missing Lighter hedge. It does not re-submit the Var order or
+authorize further gradient entries. A lost hedge acknowledgement is looked up
+on the next restart, never blindly repeated. No state/history file is cleared.

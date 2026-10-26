@@ -1274,7 +1274,8 @@ def test_real_strategy_executor_roundtrip_after_slow_account_read_stops_one_pilo
     assert [r["reduce_only"] for r in gateway.requests] == [False, False, True, True]
 
 
-def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durable_budget(tmp_path):
+@pytest.mark.parametrize("skewed_second_fill", [False, True])
+def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durable_budget(tmp_path, skewed_second_fill):
     class GradientGateway(_FlatLoopGateway):
         def __init__(self):
             super().__init__()
@@ -1305,6 +1306,12 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
                 self.var_qty += signed
             else:
                 self.lighter_qty += signed
+            if skewed_second_fill and len(self.requests) == 3:
+                return {
+                    "ok": False, "final": False, "status": "unknown",
+                    "client_order_id": request["client_order_id"],
+                    "native_client_order_id": "second-layer-rfq",
+                }
             return {
                 "ok": True, "final": True, "status": "filled",
                 "client_order_id": request["client_order_id"],
@@ -1312,6 +1319,36 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
                 "filled_qty": str(qty), "average_price": request["reference_price"],
                 "fee_usd": "0", "trade_ids": [f"gradient-trade-{len(self.requests)}"],
             }
+
+        def lookup_order(self, client_order_id, request=None):
+            from tools.lib.wti_live_gateway import WTIProductionGateway
+
+            assert request["native_client_order_id"] == "second-layer-rfq"
+            assert client_order_id == self.requests[2]["client_order_id"]
+
+            class OrdersAPI:
+                async def request(self, payload):
+                    submitted = datetime.fromisoformat(request["submitted_at"])
+                    return {
+                        "type": "VAR_API_ORDERS_RESULT", "requestId": payload["requestId"], "ok": True,
+                        "result": {"ok": True, "orders": {"pagination": {}, "result": [{
+                            "instrument": {"underlying": "USOILP"}, "side": request["side"],
+                            "qty": request["qty"], "price": request["reference_price"],
+                            "status": "cleared", "clearing_status": "success_trades_booked_into_pool",
+                            "order_id": "second-layer-order", "rfq_id": "second-layer-rfq",
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "execution_timestamp": (submitted - timedelta(microseconds=209486)).isoformat(),
+                        }]}},
+                    }
+
+            proof = WTIProductionGateway(
+                loop=asyncio.new_event_loop(), variational=OrdersAPI(), account_reader=object(),
+                lighter_client=None, account_index=10, api_key_index=1, market={"market_id": 145},
+            )
+            try:
+                return asyncio.run(proof._lookup_variational(client_order_id, request))
+            finally:
+                proof.loop.close()
 
     class GradientCollector:
         stopped = False
@@ -1352,13 +1389,18 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
     runtime = _runtime_with_real_executor(tmp_path, collector, gateway, gradient=True)
 
     async def run_cycle():
+        nonlocal runtime
         loop = asyncio.get_running_loop()
-        runtime.executor.market_reader = lambda: asyncio.run_coroutine_threadsafe(
-            collector.collect_fresh_sample(), loop
-        ).result(timeout=3)
-        runtime.executor.market_reader_for_qty = lambda var_qty, lighter_qty: asyncio.run_coroutine_threadsafe(
-            collector.collect_fresh_sample(var_qty=var_qty, lighter_qty=lighter_qty), loop
-        ).result(timeout=3)
+
+        def connect_market_readers():
+            runtime.executor.market_reader = lambda: asyncio.run_coroutine_threadsafe(
+                collector.collect_fresh_sample(), loop
+            ).result(timeout=3)
+            runtime.executor.market_reader_for_qty = lambda var_qty, lighter_qty: asyncio.run_coroutine_threadsafe(
+                collector.collect_fresh_sample(var_qty=var_qty, lighter_qty=lighter_qty), loop
+            ).result(timeout=3)
+
+        connect_market_readers()
         row = dict(collector.latest_sample)
         assert runtime._record_new_sample(row) is True
         first = await runtime._process_sample(row)
@@ -1368,6 +1410,23 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
         row = await collector.collect_fresh_sample()
         assert runtime._record_new_sample(row) is True
         second = await runtime._process_sample(row)
+        if skewed_second_fill:
+            assert second["status"] == "manual_review_required"
+            assert len(gateway.requests) == 3
+            runtime = _runtime_with_real_executor(tmp_path, collector, gateway, gradient=True)
+            runtime.manage_existing_only = True
+            runtime.args.manage_existing_wti_position = True
+            connect_market_readers()
+            # Exercise startup reconciliation against persisted pending intent,
+            # then the ordinary loop; neither may send the Var order again.
+            row = await collector.collect_fresh_sample()
+            second = await runtime._read_reconcile(row)
+            assert second["pending_action"] is None
+            runtime.startup_reconciled = True
+            assert len(gateway.requests) == 4
+            row = await collector.collect_fresh_sample()
+            second = await runtime._process_sample(row)
+            assert len(gateway.requests) == 4
         assert second["status"] == "open"
         assert len(second["open_position"]["layers"]) == 2
         collector.phase = "exit"
@@ -1385,8 +1444,9 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
     assert [request["reduce_only"] for request in gateway.requests] == [
         False, False, False, False, True, True,
     ]
-    assert runtime.stop is True and collector.stopped is True
-    assert collector.requested_sizes == [
+    assert runtime.stop is (not skewed_second_fill)
+    assert collector.stopped is (not skewed_second_fill)
+    expected_sizes = [
         (Decimal("0.13"), Decimal("0.13")),
         (Decimal("0.13"), Decimal("0.13")),
         (Decimal("0.13"), Decimal("0.13")),
@@ -1394,6 +1454,7 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
         (Decimal("0.26"), Decimal("0.26")),
         (Decimal("0.26"), Decimal("0.26")),
     ]
+    assert collector.requested_sizes == expected_sizes
 
 
 def test_single_round_pilot_finishes_only_after_confirmed_flat_state():

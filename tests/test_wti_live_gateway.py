@@ -207,6 +207,76 @@ def test_variational_canonical_fill_requires_complete_success_evidence(override)
     assert result["final"] is False
 
 
+@pytest.mark.parametrize("native_key", ["rfq_id", "native_client_order_id", "native_order_id"])
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_variational_booked_fill_with_exact_identity_uses_created_time_for_clock_lead(native_key, side):
+    submitted = datetime.now(timezone.utc) - timedelta(seconds=2)
+    row = {
+        **_booked_wti_order(), "side": side,
+        "created_at": (submitted + timedelta(microseconds=226490)).isoformat(),
+        "execution_timestamp": (submitted - timedelta(microseconds=209486)).isoformat(),
+    }
+    request = {
+        **_booked_wti_request(), "side": side, "submitted_at": submitted.isoformat(),
+    }
+    request.pop("rfq_id")
+    request[native_key] = row["order_id" if native_key == "native_order_id" else "rfq_id"]
+    var = FakeVariational(orders={"pagination": {"offset": 0}, "result": [row]})
+    gateway = _gateway(var)
+    try:
+        result = asyncio.run(gateway._lookup_variational("action-variational", request))
+    finally:
+        gateway.loop.close()
+    assert result["final"] is True
+    assert result["filled_qty"] == "0.198"
+    assert result["native_order_id"] == row["order_id"]
+    assert result["lookup_reason"] == "variational_booked_execution_clock_lead"
+    assert result["execution_timestamp_lead_ms"] == 210
+    assert all(call["type"] == "VAR_API_ORDERS" for call in var.requests)
+
+
+@pytest.mark.parametrize("scenario, reason", [
+    ("no_native_id", "variational_execution_clock_lead_without_exact_identity"),
+    ("outside_request_window", "variational_execution_timestamp_outside_request_window"),
+    ("no_rows", "variational_order_not_found"),
+    ("duplicate", "variational_order_identity_ambiguous"),
+    ("wrong_rfq", "variational_order_not_found"),
+    ("pending", "variational_order_not_terminal"),
+    ("clearing_failed", "variational_clearing_status_unconfirmed"),
+])
+def test_variational_lookup_reports_exact_block_without_accepting_ambiguous_evidence(scenario, reason):
+    submitted = datetime.now(timezone.utc) - timedelta(seconds=2)
+    row = {
+        **_booked_wti_order(),
+        "created_at": (submitted + timedelta(milliseconds=226)).isoformat(),
+        "execution_timestamp": (submitted - timedelta(milliseconds=210)).isoformat(),
+    }
+    request = {**_booked_wti_request(), "submitted_at": submitted.isoformat()}
+    rows = [row]
+    if scenario == "no_native_id":
+        request.pop("rfq_id")
+    elif scenario == "outside_request_window":
+        row["execution_timestamp"] = (submitted - timedelta(seconds=13)).isoformat()
+    elif scenario == "no_rows":
+        rows = []
+    elif scenario == "duplicate":
+        rows.append({**row, "order_id": "other-order"})
+    elif scenario == "wrong_rfq":
+        row["rfq_id"] = "unrelated-rfq"
+    elif scenario == "pending":
+        row["status"] = "pending"
+    elif scenario == "clearing_failed":
+        row["clearing_status"] = "rejected_failed_taker_funding"
+    gateway = _gateway(FakeVariational(orders=rows))
+    try:
+        result = asyncio.run(gateway._lookup_variational("action-variational", request))
+    finally:
+        gateway.loop.close()
+    assert result["final"] is False
+    assert result["lookup_reason"] == reason
+    assert result["lookup_stage"] == "variational_orders"
+
+
 def test_variational_booked_order_without_known_native_id_still_requires_unique_match():
     order = _booked_wti_order()
     gateway = _gateway(FakeVariational(orders=[order, {**order, "order_id": "other-order"}]))

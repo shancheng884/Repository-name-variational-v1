@@ -1626,6 +1626,123 @@ def test_restart_uses_production_booked_order_lookup_and_hedges_only_once(tmp_pa
     assert var_evidence["fee_confirmed"] is False
 
 
+@pytest.mark.parametrize("lost_hedge_ack", [False, True])
+def test_second_gradient_layer_recovers_booked_clock_lead_without_repeating_either_leg(tmp_path, lost_hedge_ack):
+    def market(var_qty=None, lighter_qty=None):
+        return _sample(
+            var_bid="100.427", var_ask="100.431", lighter_bid="100.9",
+            lighter_ask="100.91", lighter_buy_price="100.91", lighter_sell_price="100.9",
+            variational_qty=str(var_qty or "0.198"), lighter_qty=str(lighter_qty or "0.198"),
+            lighter_supported_size_decimals=3,
+        )
+
+    gateway = SimulatedWTIGateway(results={venue: {
+        "ok": True, "final": True, "status": "filled", "filled_qty": "0.198",
+        "order_id": f"initial-{venue}-order",
+        "average_price": "100.431" if venue == "variational" else "100.9",
+    } for venue in ("variational", "lighter")})
+
+    def executor():
+        return WTIPairExecutor(
+            state_path=tmp_path / "state.json", gateway=gateway,
+            max_slippage_bps=Decimal("8"), market_reader=market,
+            market_reader_for_qty=market, expected_lighter_market_id=145,
+            expected_lighter_multiplier=Decimal("1"), expected_lighter_size_decimals=3,
+        )
+
+    first = executor()
+    pilot = first.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), max_layers=5,
+        config={"tier_thresholds_bps": ["30", "45"], "layer_notional_usd": "20"},
+    )
+
+    def open_layer(tier):
+        row = market()
+        return first.open(
+            sample=row, session=_session_for_sample(row), direction=DIRECTION,
+            notional_usd=Decimal("19.9"), aggregate_max_notional_usd=Decimal("40"),
+            layer_id=f"tier-{tier}", gradient_tier=tier,
+            gradient_pilot_id=pilot["pilot_id"], now=datetime.now(timezone.utc),
+        )
+
+    initial = open_layer(1)
+    assert initial["status"] == "open", initial.get("manual_review_reason")
+    gateway.results["variational"] = {
+        "ok": False, "status": "unknown", "execute_status": "filled",
+        "native_client_order_id": "second-layer-rfq",
+    }
+    interrupted = open_layer(2)
+    assert interrupted["status"] == "manual_review_required"
+    assert gateway.var_qty == Decimal("0.396")
+    assert gateway.lighter_qty == Decimal("-0.198")
+    pending_id = interrupted["pending_action"]["action_id"]
+    original_request = interrupted["pending_action"]["legs"]["variational"]["request"]
+    submitted = datetime.fromisoformat(original_request["submitted_at"])
+
+    class OrdersAPI:
+        calls = 0
+
+        async def request(self, payload):
+            self.calls += 1
+            assert payload["type"] == "VAR_API_ORDERS"
+            return {
+                "type": "VAR_API_ORDERS_RESULT", "requestId": payload["requestId"], "ok": True,
+                "result": {"ok": True, "orders": {"pagination": {}, "result": [{
+                    "instrument": {"underlying": "USOILP"}, "side": "buy", "qty": "0.198",
+                    "price": "100.431", "status": "cleared",
+                    "clearing_status": "success_trades_booked_into_pool",
+                    "order_id": "second-layer-booked-order", "rfq_id": "second-layer-rfq",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "execution_timestamp": (submitted - timedelta(microseconds=209486)).isoformat(),
+                }]}},
+            }
+
+    api = OrdersAPI()
+    proof = WTIProductionGateway(
+        loop=asyncio.new_event_loop(), variational=api, account_reader=object(),
+        lighter_client=None, account_index=10, api_key_index=1, market={"market_id": 145},
+    )
+    simulated_lookup = gateway.lookup_order
+
+    def lookup(client_order_id, request=None):
+        if request["venue"] == "variational":
+            return asyncio.run(proof._lookup_variational(client_order_id, request))
+        return simulated_lookup(client_order_id, request=request)
+
+    gateway.lookup_order = lookup
+    if lost_hedge_ack:
+        gateway.results["lighter"] = {"ok": False, "status": "unknown", "execute_status": "filled"}
+        gateway.lookup_results["lighter"] = {
+            "ok": True, "final": True, "status": "filled", "filled_qty": "0.198",
+            "average_price": "100.9", "order_id": "second-layer-hedge",
+        }
+    try:
+        row = market()
+        recovered = executor().reconcile(
+            sample=row, session=_session_for_sample(row), now=datetime.now(timezone.utc),
+        )
+        if lost_hedge_ack:
+            assert recovered["status"] == "manual_review_required"
+            assert recovered["pending_action"]["legs"]["lighter"]["submission_started"] is True
+        for _ in range(2):
+            row = market()
+            recovered = executor().reconcile(
+                sample=row, session=_session_for_sample(row), now=datetime.now(timezone.utc),
+            )
+    finally:
+        proof.loop.close()
+    assert recovered["status"] == "open" and recovered["pending_action"] is None
+    assert gateway.var_qty == -gateway.lighter_qty == Decimal("0.396")
+    assert [r["venue"] for r in gateway.requests] == ["variational", "lighter", "variational", "lighter"]
+    assert gateway.requests[-1]["client_order_id"] == f"{pending_id}-lighter"
+    assert [layer["tier"] for layer in recovered["open_position"]["layers"]] == [1, 2]
+    assert len(recovered["gradient_pilot"]["layers_opened"]) == 2
+    evidence = recovered["execution_history"][-1]["legs"]["variational"]["result"]
+    assert evidence["native_order_id"] == "second-layer-booked-order"
+    assert evidence["execution_timestamp_lead_ms"] == 210
+    assert api.calls == 1
+
+
 def test_restart_does_not_submit_missing_hedge_without_original_live_session(tmp_path):
     sample = _sample()
     gateway = SimulatedWTIGateway()

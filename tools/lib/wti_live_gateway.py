@@ -12,6 +12,7 @@ import time
 from concurrent.futures import Future, TimeoutError as FutureTimeout
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from math import ceil
 from typing import Any
 
 from tools.lib.hedge_instruments import WTI_HEDGE, integer_value
@@ -408,6 +409,18 @@ class WTIProductionGateway:
     async def _lookup_variational(
         self, client_order_id: str, request: dict[str, Any]
     ) -> dict[str, Any]:
+        explicit_rfq = str(request.get("native_client_order_id") or request.get("rfq_id") or "")
+        explicit_order_id = str(request.get("native_order_id") or "")
+
+        def unknown(reason: str) -> dict[str, Any]:
+            return {
+                "ok": False, "final": False, "status": "unknown",
+                "client_order_id": client_order_id,
+                "native_client_order_id": explicit_rfq or None,
+                "native_order_id": explicit_order_id or None,
+                "lookup_stage": "variational_orders", "lookup_reason": reason,
+            }
+
         submitted = _timestamp(request.get("submitted_at") or request.get("intent_at"))
         created_at_gte = None if submitted is None else submitted.isoformat()
         matching: list[dict[str, Any]] = []
@@ -426,19 +439,19 @@ class WTIProductionGateway:
             })
             rows = self._var_order_rows(message, request_id)
             if rows is None:
-                return {"ok": False, "final": False, "client_order_id": client_order_id}
+                return unknown("variational_orders_response_invalid")
             for row in rows:
                 identity = self._var_identity(row)
                 if identity == "ambiguous":
-                    return {"ok": False, "final": False, "client_order_id": client_order_id}
+                    return unknown("variational_order_instrument_ambiguous")
                 if identity not in {WTI_HEDGE.var.symbol, "WTI"}:
                     continue
                 if self._var_order_matches(row, request):
                     matching.append(row)
             if len(rows) < 100:
                 break
-        explicit_rfq = str(request.get("native_client_order_id") or request.get("rfq_id") or "")
-        explicit_order_id = str(request.get("native_order_id") or "")
+        else:
+            return unknown("variational_orders_pagination_exhausted")
         if explicit_rfq:
             matching = [row for row in matching if str(self._var_order_value(row, "rfq_id") or "") == explicit_rfq]
         if explicit_order_id:
@@ -447,7 +460,10 @@ class WTIProductionGateway:
                 if str(self._var_order_value(row, "order_id") or "") == explicit_order_id
             ]
         if len(matching) != 1:
-            return {"ok": False, "final": False, "client_order_id": client_order_id}
+            return unknown(
+                "variational_order_not_found" if not matching
+                else "variational_order_identity_ambiguous"
+            )
         row = matching[0]
         status = str(self._var_order_value(row, "status") or "").strip().lower().replace("-", "_")
         filled_raw = next((self._var_order_value(row, key) for key in (
@@ -458,7 +474,8 @@ class WTIProductionGateway:
         ) if self._var_order_value(row, key) is not None), None)
         clearing_status = self._var_order_value(row, "clearing_status")
         if status == "cleared" and clearing_status not in (None, "success_trades_booked_into_pool"):
-            return {"ok": False, "final": False, "client_order_id": client_order_id}
+            return unknown("variational_clearing_status_unconfirmed")
+        clock_evidence: dict[str, Any] = {}
         if filled_raw is None and fill_price_raw is None:
             execution_at = _timestamp(self._var_order_value(row, "execution_timestamp"))
             # In orders-v2, successfully booked cleared records carry fills as
@@ -467,10 +484,27 @@ class WTIProductionGateway:
                 status == "cleared"
                 and clearing_status == "success_trades_booked_into_pool"
                 and submitted is not None
-                and execution_at is not None
-                and submitted <= execution_at <= datetime.now(timezone.utc)
                 and self._var_order_value(row, "order_id")
             ):
+                if execution_at is None:
+                    return unknown("variational_execution_timestamp_missing")
+                if execution_at > datetime.now(timezone.utc):
+                    return unknown("variational_execution_timestamp_future")
+                if execution_at < submitted:
+                    if not (explicit_rfq or explicit_order_id):
+                        return unknown("variational_execution_clock_lead_without_exact_identity")
+                    lead_seconds = (submitted - execution_at).total_seconds()
+                    if lead_seconds > self.operation_timeout_seconds:
+                        return unknown("variational_execution_timestamp_outside_request_window")
+                    # Exact native identity and post-submit created_at were checked
+                    # above. Booked records may carry an earlier exchange clock;
+                    # only this stronger proof admits a lead within the RPC window.
+                    clock_evidence = {
+                        "source": "variational_booked_exact_native_identity",
+                        "lookup_stage": "variational_orders",
+                        "lookup_reason": "variational_booked_execution_clock_lead",
+                        "execution_timestamp_lead_ms": ceil(lead_seconds * 1000),
+                    }
                 filled_raw = self._var_order_value(row, "qty")
                 fill_price_raw = self._var_order_value(row, "price")
         qty = _decimal(filled_raw)
@@ -483,6 +517,7 @@ class WTIProductionGateway:
                 "native_client_order_id": str(self._var_order_value(row, "rfq_id") or ""),
                 "status": "filled", "filled_qty": str(qty), "average_price": str(price),
                 "trade_ids": [], "fee_usd": self._explicit_fee_usd(row),
+                **clock_evidence,
             }
             return result
         if status in TERMINAL_VAR_NO_FILL and qty == 0:
@@ -491,7 +526,10 @@ class WTIProductionGateway:
                 "order_id": str(order_id or ""), "status": "canceled",
                 "filled_qty": "0", "no_order_confirmed": False,
             }
-        return {"ok": False, "final": False, "client_order_id": client_order_id}
+        return unknown(
+            "variational_order_not_terminal" if status not in TERMINAL_VAR_FILLED | TERMINAL_VAR_NO_FILL
+            else "variational_fill_evidence_unverifiable"
+        )
 
     @staticmethod
     def _var_order_rows(message: Any, expected_id: str) -> list[dict[str, Any]] | None:

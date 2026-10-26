@@ -348,6 +348,7 @@ def _normalized_order_result(
     diagnostics = {key: payload[key] for key in (
         "source", "error_code", "error_type", "submission_stage", "submission_acknowledged",
         "transaction_hash", "lookup_stage", "lookup_reason", "risk_reason",
+        "execution_timestamp_lead_ms",
     ) if key in payload and isinstance(payload[key], (str, bool, int, type(None)))}
     if payload.get("ok") is not True or payload.get("final") is not True:
         return {
