@@ -138,6 +138,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-second-tier-bps", type=_positive_decimal)
     parser.add_argument("--gradient-layer-notional-usd", type=_positive_decimal)
     parser.add_argument("--gradient-aggregate-max-notional-usd", type=_positive_decimal)
+    parser.add_argument("--gradient-tier-count", type=int, default=5)
+    parser.add_argument(
+        "--gradient-equity-usd", type=_positive_decimal,
+        help="Explicit symmetric equity scenario for the paired 1x-to-5x tier capacity; not inferred from historical data.",
+    )
     parser.add_argument("--limit", type=int, default=200000)
     parser.add_argument("--evidence-output", type=Path, help="Write a hash-addressed replay/readiness evidence JSON file.")
     return parser
@@ -150,6 +155,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--limit must be positive")
     if args.lighter_market_id is not None and args.lighter_market_id < 0:
         parser.error("--lighter-market-id must be non-negative")
+    if not 2 <= args.gradient_tier_count <= 5:
+        parser.error("--gradient-tier-count must be between 2 and 5")
     if args.compare_gradient and any(value is None for value in (
         args.gradient_second_tier_bps,
         args.gradient_layer_notional_usd,
@@ -162,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         args.gradient_second_tier_bps,
         args.gradient_layer_notional_usd,
         args.gradient_aggregate_max_notional_usd,
+        args.gradient_equity_usd,
     )):
         parser.error("gradient options require --compare-gradient")
     try:
@@ -192,6 +200,8 @@ def main(argv: list[str] | None = None) -> int:
                 second_tier_threshold_bps=args.gradient_second_tier_bps,
                 layer_notional_usd=args.gradient_layer_notional_usd,
                 aggregate_max_notional_usd=args.gradient_aggregate_max_notional_usd,
+                max_layers=args.gradient_tier_count,
+                equity_usd=args.gradient_equity_usd,
                 expected_market_id=args.lighter_market_id,
                 expected_multiplier=args.lighter_multiplier,
                 max_completed_roundtrips=None if args.continuous_gradient else 1,

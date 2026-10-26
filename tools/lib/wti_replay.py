@@ -18,7 +18,7 @@ from tools.lib.hedge_instruments import (
     paired_realized_pnl,
 )
 from tools.lib.market_sessions import session_observation_for_sample
-from tools.lib.wti_sizing import size_paired_layer
+from tools.lib.wti_sizing import equity_gradient_slot_caps, size_paired_layer
 from tools.lib.wti_thresholds import (
     THRESHOLD_REFRESH_SECONDS as WTI_THRESHOLD_REFRESH_SECONDS,
     WTIGradientThresholdProfile,
@@ -434,20 +434,26 @@ def replay_wti_gradient(
     second_tier_threshold_bps: Decimal,
     layer_notional_usd: Decimal,
     aggregate_max_notional_usd: Decimal,
+    max_layers: int = 2,
+    equity_usd: Decimal | None = None,
     expected_market_id: int | None = None,
     expected_multiplier: Decimal | None = None,
     max_completed_roundtrips: int | None = 1,
     assume_verified_flat_session_restarts: bool = False,
     adaptive_threshold_refresh_seconds: int = WTI_THRESHOLD_REFRESH_SECONDS,
 ) -> ReplayReport:
-    """Replay bounded two-layer rounds without relaxing any market-data gate."""
+    """Replay conservative multi-tier WTI rounds; equity is an explicit scenario input."""
     if second_tier_threshold_bps <= config.entry_threshold_bps:
         raise ValueError("gradient_second_tier_must_exceed_entry_threshold")
     if layer_notional_usd <= 0 or aggregate_max_notional_usd <= 0:
         raise ValueError("gradient_notionals_must_be_positive")
     if not config.max_slippage_bps.is_finite() or config.max_slippage_bps <= 0:
         raise ValueError("gradient_max_slippage_must_be_positive")
-    if layer_notional_usd * 2 > aggregate_max_notional_usd:
+    if not isinstance(max_layers, int) or isinstance(max_layers, bool) or not 2 <= max_layers <= 5:
+        raise ValueError("gradient_layer_count_must_be_between_two_and_five")
+    if equity_usd is not None and (not equity_usd.is_finite() or equity_usd <= 0):
+        raise ValueError("gradient_equity_scenario_must_be_positive")
+    if equity_usd is None and max_layers == 2 and layer_notional_usd * 2 > aggregate_max_notional_usd:
         raise ValueError("gradient_layers_exceed_aggregate_notional_cap")
     if adaptive_threshold_refresh_seconds <= 0:
         raise ValueError("gradient_threshold_refresh_seconds_must_be_positive")
@@ -476,6 +482,23 @@ def replay_wti_gradient(
     threshold_history: deque[dict[str, Any]] = deque()
     threshold_profiles: dict[str, WTIGradientThresholdProfile] = {}
     threshold_refreshed_at: datetime | None = None
+    hard_floors = (
+        config.entry_threshold_bps,
+        second_tier_threshold_bps,
+        second_tier_threshold_bps + Decimal("0.25"),
+        second_tier_threshold_bps + Decimal("0.50"),
+        second_tier_threshold_bps + Decimal("0.75"),
+    )
+    capacity_slots = None if equity_usd is None else equity_gradient_slot_caps(
+        variational_equity_usd=equity_usd,
+        lighter_equity_usd=equity_usd,
+        child_notional_usd=layer_notional_usd,
+        tier_count=max_layers,
+    )
+    tier_caps = tuple(
+        min(aggregate_max_notional_usd, Decimal(slots) * layer_notional_usd)
+        for slots in capacity_slots
+    ) if capacity_slots is not None else (aggregate_max_notional_usd,) * max_layers
 
     def refresh_thresholds(at: datetime, current_row: dict[str, Any]) -> None:
         nonlocal threshold_profiles, threshold_refreshed_at
@@ -495,6 +518,7 @@ def replay_wti_gradient(
                 ),
                 first_floor_bps=config.entry_threshold_bps,
                 second_floor_bps=second_tier_threshold_bps,
+                tier_floors_bps=hard_floors,
                 roundtrip_cost_bps=config.roundtrip_cost_bps,
                 exit_target_bps=config.exit_target_bps,
             )
@@ -503,6 +527,7 @@ def replay_wti_gradient(
     def make_layer(
         row: dict[str, Any], direction: str, edge: Decimal, tier: int,
         existing: dict[str, Any] | None = None,
+        aggregate_cap: Decimal | None = None,
     ) -> dict[str, Any] | None:
         multiplier = _decimal(row.get("lighter_multiplier"))
         lighter_entry = _decimal(
@@ -536,7 +561,9 @@ def replay_wti_gradient(
         markup = Decimal("1") + config.max_slippage_bps / Decimal("10000")
         lighter_qty = size_paired_layer(
             target_notional_usd=layer_notional_usd,
-            max_notional_usd=aggregate_max_notional_usd,
+            max_notional_usd=(
+                aggregate_max_notional_usd if aggregate_cap is None else aggregate_cap
+            ),
             multiplier=multiplier,
             qty_step=step,
             min_base_qty=min_base,
@@ -696,16 +723,43 @@ def replay_wti_gradient(
                 ):
                     break
                 continue
-            if len(current["layers"]) == 1 and not in_cutoff:
+            if not in_cutoff and len(current["layers"]) < max_layers:
                 edge = _decimal(row.get(
                     "long_edge_bps" if current["direction"] == "long_var_short_lighter"
                     else "short_edge_bps"
                 ))
-                tier_two_threshold = threshold_profiles[
-                    current["direction"]
-                ].thresholds_bps[1]
-                if edge is not None and edge >= tier_two_threshold:
-                    layer = make_layer(row, current["direction"], edge, 2, current)
+                direction_thresholds = threshold_profiles[current["direction"]].thresholds_bps
+                opened_tiers = [layer["tier"] for layer in current["layers"]]
+                active_tier = max(opened_tiers)
+                if capacity_slots is None:
+                    # Preserve the legacy one-child-per-tier replay mode.
+                    tier = len(current["layers"]) + 1
+                else:
+                    tier = active_tier
+                    mark_var = max(_decimal(row.get("var_bid")) or Decimal("0"),
+                                   _decimal(row.get("var_ask")) or Decimal("0"))
+                    mark_lighter = max(_decimal(row.get("lighter_bid")) or Decimal("0"),
+                                       _decimal(row.get("lighter_ask")) or Decimal("0"))
+                    current_notional = max(
+                        current["var_qty"] * mark_var,
+                        current["lighter_qty"] * mark_lighter
+                        * current["instrument"].lighter.exposure_multiplier,
+                    )
+                    if current_notional + layer_notional_usd >= tier_caps[tier - 1]:
+                        tier += 1
+                tier_threshold = (
+                    direction_thresholds[tier - 1]
+                    if 1 <= tier <= len(direction_thresholds) else None
+                )
+                if (
+                    tier <= max_layers
+                    and tier_threshold is not None
+                    and edge is not None and edge >= tier_threshold
+                ):
+                    layer = make_layer(
+                        row, current["direction"], edge, tier, current,
+                        aggregate_cap=tier_caps[tier - 1],
+                    )
                     if layer is None:
                         capped_additions += 1
                     else:
@@ -723,6 +777,7 @@ def replay_wti_gradient(
             (direction, edge)
             for direction, edge in edges.items()
             if edge is not None
+            and threshold_profiles[direction].thresholds_bps[0] is not None
             and edge >= threshold_profiles[direction].thresholds_bps[0]
         ]
         if not qualified:
@@ -739,7 +794,9 @@ def replay_wti_gradient(
             ),
             "layers": [],
         }
-        layer = make_layer(row, direction, edge, 1)
+        layer = make_layer(
+            row, direction, edge, 1, aggregate_cap=tier_caps[0],
+        )
         if layer is None:
             current = None
             rejected_depth += 1
@@ -753,9 +810,9 @@ def replay_wti_gradient(
     wins = sum(Decimal(trade.net_pnl_usd) > 0 for trade in trades)
     return ReplayReport(
         replay_kind=(
-            "indicative_continuous_two_layer_gradient_no_lookahead"
+            f"indicative_continuous_{max_layers}_tier_gradient_no_lookahead"
             if max_completed_roundtrips is None
-            else "indicative_bounded_two_layer_gradient_no_lookahead"
+            else f"indicative_bounded_{max_layers}_tier_gradient_no_lookahead"
         ),
         live_authorization=False,
         session_gated=True,
@@ -781,7 +838,10 @@ def replay_wti_gradient(
             "roundtrip_cost_bps": str(config.roundtrip_cost_bps),
             "layer_notional_usd": str(layer_notional_usd),
             "aggregate_max_notional_usd": str(aggregate_max_notional_usd),
-            "max_layers": 2,
+            "max_layers": max_layers,
+            "equity_scenario_usd": None if equity_usd is None else str(equity_usd),
+            "max_equity_multiple": "5" if equity_usd is not None else None,
+            "tier_capacity_notional_usd": [str(value) for value in tier_caps],
             "max_completed_roundtrips": max_completed_roundtrips,
             "assume_verified_flat_session_restarts": assume_verified_flat_session_restarts,
             "max_hold_seconds": config.max_hold_seconds,
@@ -792,13 +852,13 @@ def replay_wti_gradient(
             "expected_market_id": expected_market_id,
             "expected_multiplier": None if expected_multiplier is None else str(expected_multiplier),
             "gradient_threshold_mode": "eth_style_directional_7d_percentiles_with_wti_floors",
-            "gradient_threshold_percentiles": ["97.5", "98.25"],
+            "gradient_threshold_percentiles": ["97.5", "98.25", "99", "99.5", "99.8"][:max_layers],
             "gradient_threshold_refresh_seconds": adaptive_threshold_refresh_seconds,
             "gradient_threshold_sample_floor": 100,
             "gradient_threshold_effective_seconds_floor": 129600,
         },
         cost_caveat=(
-            "Sequential two-layer rounds with the configured completed-round limit. Quote-path only; no historical fills, fees, funding, latency, or market impact are inferred. "
+            f"Sequential {max_layers}-tier rounds with the configured completed-round limit. Quote-path only; no historical fills, fees, funding, latency, or market impact are inferred. "
             "Sample-size/depth, exchange-session, process-latched sample-gap, cutoff, hold, slippage, paired-notional, and per-leg caps remain active. Session re-entry is modeled only when the explicit supervisor-restart assumption is enabled; historical quotes do not prove the external flat-account reconciliation."
         ),
         trades=tuple(trades),

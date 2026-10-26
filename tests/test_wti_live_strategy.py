@@ -360,6 +360,92 @@ def test_gradient_adaptive_profile_cannot_lower_floor_and_controls_second_layer(
     assert reached["gradient_tier"] == 2
 
 
+def test_five_tier_equity_capacity_allows_same_tier_adds_then_requires_next_tier_edge():
+    now = datetime.now(timezone.utc)
+    pilot = _gradient_pilot()
+    pilot["max_layers"] = 5
+    pilot["config"]["tier_thresholds_bps"] = ["4", "8", "8.25", "8.5", "8.75"]
+    pilot["config"]["max_notional_usd"] = "100"
+    profiles = {
+        "long_var_short_lighter": tuple(map(Decimal, ("30", "45", "46", "47", "48"))),
+        "short_var_long_lighter": tuple(map(Decimal, ("30", "45", "46", "47", "48"))),
+    }
+    capacities = tuple(map(Decimal, ("40", "80", "120", "160", "200")))
+
+    first = decide_wti_gradient_action(
+        _row(now, long_edge_bps="30"), None, pilot, config=_config(), now=now,
+        thresholds_by_direction=profiles,
+        aggregate_capacity_by_tier_usd=capacities,
+    )
+    assert first["action"] == "open"
+    assert first["gradient_tier"] == 1
+    assert first["aggregate_max_notional_usd"] == "40"
+
+    same_tier_pilot = {**pilot, "status": "in_position", "layers_opened": [{"tier": 1}]}
+    same_tier = decide_wti_gradient_action(
+        _row(now, var_bid="70.0", lighter_buy_price="70.2", long_edge_bps="30"),
+        _position(now, gradient_pilot_id="pilot-1", var_qty="0.1", lighter_qty="0.1"),
+        same_tier_pilot, config=_config(), now=now,
+        thresholds_by_direction=profiles,
+        aggregate_capacity_by_tier_usd=capacities,
+    )
+    assert same_tier["action"] == "add"
+    assert same_tier["gradient_tier"] == 1
+
+    near_tier_cap_pilot = {**pilot, "status": "in_position", "layers_opened": [{"tier": 1}]}
+    below_next = decide_wti_gradient_action(
+        _row(now, var_bid="70.0", lighter_buy_price="70.2", long_edge_bps="44"),
+        _position(now, gradient_pilot_id="pilot-1", var_qty="0.29", lighter_qty="0.29"),
+        near_tier_cap_pilot, config=_config(), now=now,
+        thresholds_by_direction=profiles,
+        aggregate_capacity_by_tier_usd=(Decimal("20"), *capacities[1:]),
+    )
+    assert below_next["action"] == "hold"
+    assert below_next["reason"] == "gradient_add_below_adaptive_threshold"
+    assert below_next["gradient_threshold_bps"] == "45"
+
+    next_tier = decide_wti_gradient_action(
+        _row(now, var_bid="70.0", lighter_buy_price="70.2", long_edge_bps="45"),
+        _position(now, gradient_pilot_id="pilot-1", var_qty="0.29", lighter_qty="0.29"),
+        near_tier_cap_pilot, config=_config(), now=now,
+        thresholds_by_direction=profiles,
+        aggregate_capacity_by_tier_usd=(Decimal("20"), *capacities[1:]),
+    )
+    assert next_tier["action"] == "add"
+    assert next_tier["gradient_tier"] == 2
+    assert next_tier["aggregate_max_notional_usd"] == "80"
+
+
+def test_five_tier_strategy_blocks_unmatured_tier_and_missing_equity_capacity():
+    now = datetime.now(timezone.utc)
+    pilot = _gradient_pilot(status="in_position", opened=[{"tier": 2}])
+    pilot["max_layers"] = 5
+    pilot["config"]["tier_thresholds_bps"] = ["4", "8", "8.25", "8.5", "8.75"]
+    position = _position(
+        now, gradient_pilot_id="pilot-1", var_qty="0.60", lighter_qty="0.60",
+    )
+    immature = {
+        "long_var_short_lighter": (Decimal("30"), Decimal("45"), None, None, None),
+        "short_var_long_lighter": (Decimal("30"), Decimal("45"), None, None, None),
+    }
+    blocked = decide_wti_gradient_action(
+        _row(now, var_bid="70.0", lighter_buy_price="70.2", long_edge_bps="100"), position, pilot,
+        config=_config(), now=now, thresholds_by_direction=immature,
+        aggregate_capacity_by_tier_usd=tuple(map(Decimal, ("20", "40", "60", "80", "100"))),
+    )
+    assert blocked["action"] == "hold"
+    assert blocked["reason"] == "gradient_threshold_history_not_mature"
+
+    no_equity = decide_wti_gradient_action(
+        _row(now, long_edge_bps="100"), None,
+        {**pilot, "status": "available", "layers_opened": []},
+        config=_config(), now=now, thresholds_by_direction=immature,
+        aggregate_capacity_by_tier_usd=(Decimal("20"), None, Decimal("60"), Decimal("80"), Decimal("100")),
+    )
+    assert no_equity["action"] == "hold"
+    assert no_equity["reason"] == "gradient_equity_capacity_unavailable"
+
+
 def test_adaptive_entry_profile_never_blocks_risk_reducing_exit():
     now = datetime.now(timezone.utc)
     result = decide_wti_gradient_action(

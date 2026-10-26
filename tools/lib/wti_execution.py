@@ -789,6 +789,43 @@ class WTIExecutionStore:
                     "started_at": _utc_now(),
                 }
 
+            if (
+                isinstance(pilot, dict)
+                and new_pilot_after is None
+                and not continuous_rotation
+                and rotation_test_id is None
+                and (pilot.get("config") != config or pilot.get("max_layers") != max_layers)
+            ):
+                if not flat:
+                    raise WTIExecutionError(
+                        "gradient_pilot_migration_requires_resolved_flat_state"
+                    )
+                old_layers = pilot.get("layers_opened")
+                old_status = pilot.get("status")
+                safe_terminal_state = (
+                    old_status == "available" and not old_layers
+                    and not pilot.get("exhausted_tiers")
+                    and pilot.get("completed_roundtrips") == 0
+                ) or (
+                    old_status == "exhausted" and not old_layers
+                    and pilot.get("completed_roundtrips") == 0
+                ) or (
+                    old_status == "completed"
+                    and pilot.get("completed_roundtrips") == 1
+                )
+                if (
+                    not safe_terminal_state
+                    or pilot.get("continuous_rotation")
+                    or state.get("gradient_rotation_session") is not None
+                    or pilot.get("market_id") != market_id
+                    or decimal_value(pilot.get("multiplier")) != multiplier
+                ):
+                    raise WTIExecutionError("gradient_pilot_migration_requires_resolved_flat_state")
+                state.setdefault("gradient_pilot_history", []).append(deepcopy(pilot))
+                state["gradient_pilot"] = None
+                self.save(state)
+                pilot = None
+
             if new_pilot_after is not None:
                 if not continuous_rotation or not isinstance(pilot, dict):
                     raise WTIExecutionError("gradient_rotation_predecessor_missing")
@@ -1496,11 +1533,24 @@ class WTIPairExecutor:
         if pending.get("kind") == "open" and pending.get("gradient_pilot_id"):
             pilot = state.get("gradient_pilot")
             tier = pending.get("gradient_tier")
+            opened = pilot.get("layers_opened", []) if isinstance(pilot, dict) else []
+            prior_tiers = [
+                item.get("tier") for item in opened if isinstance(item, dict)
+            ]
+            previous_position = pending.get("previous_position")
+            valid_tier = (
+                tier == 1 and not prior_tiers and previous_position is None
+            ) or (
+                previous_position is not None
+                and prior_tiers
+                and isinstance(tier, int)
+                and tier in {max(prior_tiers), max(prior_tiers) + 1}
+            )
             if (
                 not isinstance(pilot, dict)
                 or pilot.get("pilot_id") != pending.get("gradient_pilot_id")
                 or pilot.get("status") != "entry_pending"
-                or tier != len(pilot.get("layers_opened", [])) + 1
+                or not valid_tier
                 or tier > pilot.get("max_layers", 0)
             ):
                 raise CorruptExecutionState("gradient pilot layer does not match pending entry")
@@ -1788,6 +1838,7 @@ class WTIPairExecutor:
         layer_id: str | None = None,
         gradient_tier: int | None = None,
         gradient_pilot_id: str | None = None,
+        aggregate_max_notional_usd: Decimal | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         operation_now = now or self._now()
@@ -1799,6 +1850,12 @@ class WTIPairExecutor:
             raise WTIExecutionError("exchange_session_does_not_allow_entry")
         if notional_usd <= 0 or notional_usd > self.max_notional_usd:
             raise WTIExecutionError("notional_outside_executor_limit")
+        aggregate_cap = (
+            self.max_notional_usd
+            if aggregate_max_notional_usd is None else aggregate_max_notional_usd
+        )
+        if not aggregate_cap.is_finite() or aggregate_cap <= 0:
+            raise WTIExecutionError("aggregate_notional_cap_invalid")
         context = self._validate_sample(sample, now=operation_now)
         session_id = _session_matches_sample(sample, session)
         if session_id is None:
@@ -1865,7 +1922,16 @@ class WTIPairExecutor:
                     gradient_pilot.get("layers_opened", [])
                     if isinstance(gradient_pilot, dict) else []
                 )
-                expected_tier = len(opened_layers) + 1
+                opened_tiers = [
+                    item.get("tier") for item in opened_layers if isinstance(item, dict)
+                ]
+                valid_tier = (
+                    gradient_tier == 1 and not opened_layers and previous_position is None
+                ) or (
+                    previous_position is not None
+                    and opened_tiers
+                    and gradient_tier in {max(opened_tiers), max(opened_tiers) + 1}
+                )
                 if (
                     not isinstance(gradient_pilot, dict)
                     or gradient_pilot.get("pilot_id") != gradient_pilot_id
@@ -1874,9 +1940,8 @@ class WTIPairExecutor:
                     )
                     or gradient_pilot.get("completed_roundtrips") != 0
                     or gradient_pilot.get("max_layers", 0) < gradient_tier
-                    or gradient_tier != expected_tier
+                    or not valid_tier
                     or gradient_tier in gradient_pilot.get("exhausted_tiers", [])
-                    or len(opened_layers) >= gradient_pilot.get("max_layers", 0)
                     or (
                         previous_position is None
                         and (gradient_tier != 1 or opened_layers or state.get("status") != "flat")
@@ -1935,7 +2000,7 @@ class WTIPairExecutor:
             safety_markup = Decimal("1") + self.max_slippage_bps / Decimal("10000")
             lighter_qty = size_paired_layer(
                 target_notional_usd=notional_usd,
-                max_notional_usd=self.max_notional_usd,
+                max_notional_usd=aggregate_cap,
                 multiplier=context.multiplier,
                 qty_step=context.lighter_qty_step,
                 min_base_qty=context.lighter_min_base,
@@ -1997,6 +2062,7 @@ class WTIPairExecutor:
                     "layer_id": layer_id or action_id,
                     "gradient_tier": gradient_tier,
                     "gradient_pilot_id": gradient_pilot_id,
+                    "aggregate_max_notional_usd": str(aggregate_cap),
                     "intent_at": self._now().isoformat(),
                     "decision": deepcopy(decision) if isinstance(decision, dict) else None,
                     "legs": {},

@@ -363,11 +363,28 @@ def test_gradient_layer_adds_only_same_session_exposure_and_closes_as_aggregate(
     assert position["session_id"] == first_session_id
     assert len(gateway.requests) == 4
 
+    repeated = executor.open(
+        sample=row,
+        direction=DIRECTION,
+        notional_usd=Decimal("4"),
+        session=_session_for_sample(row),
+        decision={"action": "add", "reason": "same-tier-equity-capacity", "tier": 2},
+        layer_id="tier-2-attempt-2",
+        gradient_tier=2,
+        gradient_pilot_id=pilot["pilot_id"],
+        now=now,
+    )
+    position = repeated["open_position"]
+    assert [layer["tier"] for layer in position["layers"]] == [1, 2, 2]
+    assert position["layers"][2]["layer_id"] == "tier-2-attempt-2"
+    assert len(gateway.requests) == 6
+    assert executor.store.load()["gradient_pilot"]["layers_opened"][-2]["tier"] == 2
+
     close_now = datetime.now(timezone.utc)
     close_row = _sample(
         now=close_now,
-        variational_qty="0.21",
-        lighter_qty="0.21",
+        variational_qty=position["var_qty"],
+        lighter_qty=position["lighter_qty"],
     )
     closed = executor.close(
         sample=close_row,
@@ -375,7 +392,7 @@ def test_gradient_layer_adds_only_same_session_exposure_and_closes_as_aggregate(
         now=close_now,
     )
     assert closed["status"] == "flat"
-    assert len(closed["last_closed_position"]["layers"]) == 2
+    assert len(closed["last_closed_position"]["layers"]) == 3
     assert gateway.var_qty == gateway.lighter_qty == 0
     assert closed["gradient_pilot"]["status"] == "completed"
     assert closed["gradient_pilot"]["completed_roundtrips"] == 1
@@ -388,7 +405,7 @@ def test_gradient_layer_adds_only_same_session_exposure_and_closes_as_aggregate(
         )
 
 
-def test_gradient_pilot_restart_cannot_change_immutable_budget(tmp_path):
+def test_flat_unused_gradient_pilot_migrates_once_to_new_tier_budget(tmp_path):
     executor, _ = _executor(tmp_path)
     pilot = _gradient_pilot(executor)
     resumed = executor.store.initialize_gradient_pilot(
@@ -398,13 +415,37 @@ def test_gradient_pilot_restart_cannot_change_immutable_budget(tmp_path):
         max_layers=2,
     )
     assert resumed["pilot_id"] == pilot["pilot_id"]
-    with pytest.raises(WTIExecutionError, match="configuration_or_state_mismatch"):
+    new_config = {
+        "tier_thresholds_bps": ["30", "45", "45.25", "45.50", "45.75"],
+        "layer_notional_usd": "20",
+        "max_equity_multiple": "5",
+    }
+    migrated = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=new_config, max_layers=5,
+    )
+    assert migrated["pilot_id"] != pilot["pilot_id"]
+    state = executor.store.load()
+    assert state["gradient_pilot_history"] == [pilot]
+    assert state["gradient_pilot"]["config"] == new_config
+    resumed = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=new_config, max_layers=5,
+    )
+    assert resumed["pilot_id"] == migrated["pilot_id"]
+
+
+def test_gradient_budget_migration_refuses_open_or_pending_state(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    pilot = _gradient_pilot(executor)
+    _open(executor, gradient_tier=1, gradient_pilot_id=pilot["pilot_id"], layer_id="old-tier-1")
+    with pytest.raises(WTIExecutionError, match="gradient_pilot_migration_requires_resolved_flat_state"):
         executor.store.initialize_gradient_pilot(
-            market_id=145,
-            multiplier=Decimal("1"),
-            config={"tier_thresholds_bps": ["30", "46"], "layer_notional_usd": "10"},
-            max_layers=2,
+            market_id=145, multiplier=Decimal("1"),
+            config={"tier_thresholds_bps": ["30", "45", "46", "47", "48"],
+                    "layer_notional_usd": "20", "max_equity_multiple": "5"},
+            max_layers=5,
         )
+    assert len(gateway.requests) == 2
+    assert executor.store.load()["gradient_pilot"]["pilot_id"] == pilot["pilot_id"]
 
 
 def test_gradient_pilot_rotation_test_identity_is_immutable_across_restart(tmp_path):

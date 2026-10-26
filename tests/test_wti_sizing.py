@@ -1,6 +1,10 @@
 from decimal import Decimal as D
 
-from tools.lib.wti_sizing import size_paired_layer
+from tools.lib.wti_sizing import (
+    equity_gradient_slot_caps,
+    equity_position_cap_usd,
+    size_paired_layer,
+)
 
 
 def _size(*, var_price="99.8", lighter_price="100", existing="0"):
@@ -46,3 +50,32 @@ def test_invalid_or_nonpositive_market_inputs_fail_closed():
         min_quote_usd=D("10"), var_order_price=D("0"),
         lighter_order_price=D("100"),
     ) is None
+
+
+def test_five_tier_capacity_uses_the_lower_verified_equity_and_hard_five_x_cap():
+    slots = equity_gradient_slot_caps(
+        variational_equity_usd=D("100"),
+        lighter_equity_usd=D("80"),
+        child_notional_usd=D("20"),
+        tier_count=5,
+    )
+    assert slots == (4, 8, 12, 16, 20)
+    assert [D(value) * D("20") for value in slots] == [
+        D("80"), D("160"), D("240"), D("320"), D("400"),
+    ]
+    assert equity_position_cap_usd(D("100"), D("80")) == D("400")
+
+
+def test_equity_capacity_rounding_never_exceeds_hard_cap_or_invents_missing_equity():
+    slots = equity_gradient_slot_caps(
+        variational_equity_usd=D("53"), lighter_equity_usd=D("47"),
+        child_notional_usd=D("20"), tier_count=5,
+    )
+    assert slots == (2, 4, 7, 9, 11)
+    assert slots[-1] * D("20") <= D("47") * D("5")
+    assert all(slots[index - 1] * D("20") <= D("47") * index for index in range(1, 6))
+    assert equity_gradient_slot_caps(
+        variational_equity_usd=None, lighter_equity_usd=D("100"),
+        child_notional_usd=D("20"), tier_count=5,
+    ) is None
+    assert equity_position_cap_usd(D("100"), None) is None

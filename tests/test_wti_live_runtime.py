@@ -280,7 +280,7 @@ def test_continuous_gradient_runtime_rearms_only_after_fresh_account_reconcile()
     assert len(account_reads) == 1
     assert runtime.pilot_store.calls == [{
         "market_id": 145, "multiplier": Decimal("1"),
-        "config": {"max_completed_roundtrips": 1}, "max_layers": 2,
+        "config": {"max_completed_roundtrips": 1}, "max_layers": 5,
         "rotation_test_id": session_id, "continuous_rotation": True,
         "new_pilot_after": "pilot-round-1",
     }]
@@ -868,7 +868,7 @@ class _FlatLoopGateway:
     def set_current_notional(self, _value):
         pass
 
-    def set_proposed_notional(self, _value):
+    def set_proposed_notional(self, _value, *, equity_multiple=None):
         pass
 
     def submit_order(self, _request):
@@ -923,7 +923,8 @@ def _runtime_with_real_executor(tmp_path, collector, gateway, *, gradient=False)
         runtime.single_round_pilot = None
         runtime.gradient_pilot = runtime.pilot_store.initialize_gradient_pilot(
             market_id=145, multiplier=Decimal("1"),
-            config=runtime._gradient_pilot_config(), max_layers=2,
+            config=runtime._gradient_pilot_config(),
+            max_layers=wti_live.WTI_GRADIENT_MAX_LAYERS,
         )
     else:
         runtime.single_round_pilot = runtime.pilot_store.initialize_single_round_pilot(
@@ -939,6 +940,28 @@ def _runtime_with_real_executor(tmp_path, collector, gateway, *, gradient=False)
         max_notional_usd=Decimal("20"),
     )
     return runtime
+
+
+def test_gradient_equity_capacity_requires_fresh_complete_dual_equity_snapshot():
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.args = SimpleNamespace(_validated_gradient_layer_notional=Decimal("20"))
+    runtime.last_risk = {
+        "risk_data_complete": True,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "variational_equity_usd": "100",
+        "lighter_equity_usd": "80",
+    }
+    assert runtime._gradient_equity_capacity_by_tier() == tuple(map(
+        Decimal, ("80", "160", "240", "320", "400"),
+    ))
+
+    runtime.last_risk["observed_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=16)
+    ).isoformat()
+    assert runtime._gradient_equity_capacity_by_tier() is None
+    runtime.last_risk["observed_at"] = datetime.now(timezone.utc).isoformat()
+    runtime.last_risk["risk_data_complete"] = False
+    assert runtime._gradient_equity_capacity_by_tier() is None
 
 
 def test_run_keeps_collector_alive_during_slow_history_scan_and_reconciles_fresh_sample(

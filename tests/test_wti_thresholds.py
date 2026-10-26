@@ -66,10 +66,10 @@ def test_immature_history_keeps_existing_directional_floors():
     profiles = _build(rows)
 
     assert profiles["long_var_short_lighter"].thresholds_bps == (
-        Decimal("30"), Decimal("45")
+        Decimal("30"), Decimal("45"), None, None, None
     )
     assert profiles["short_var_long_lighter"].thresholds_bps == (
-        Decimal("30"), Decimal("45")
+        Decimal("30"), Decimal("45"), None, None, None
     )
     assert not profiles["long_var_short_lighter"].mature
 
@@ -87,9 +87,13 @@ def test_mature_profile_uses_eth_percentiles_and_adds_conservative_cost_reserve(
     assert long.sample_count == 400
     assert long.p975_bps == Decimal("389")
     assert long.p9825_bps == Decimal("392")
-    assert long.thresholds_bps == (Decimal("400"), Decimal("403"))
+    assert long.thresholds_bps == (
+        Decimal("400"), Decimal("403"), Decimal("406"),
+        Decimal("408"), Decimal("409"),
+    )
     assert profiles["short_var_long_lighter"].thresholds_bps == (
-        Decimal("30"), Decimal("45")
+        Decimal("30"), Decimal("45"), Decimal("45.25"),
+        Decimal("45.50"), Decimal("45.75"),
     )
 
 
@@ -104,7 +108,7 @@ def test_history_effective_time_gate_is_not_satisfied_by_sample_count_alone():
     assert profile.sample_count == 100
     assert profile.effective_seconds == 1000
     assert not profile.mature
-    assert profile.thresholds_bps == (Decimal("30"), Decimal("45"))
+    assert profile.thresholds_bps == (Decimal("30"), Decimal("45"), None, None, None)
 
 
 def test_future_wrong_market_and_conflicting_duplicate_samples_are_excluded():
@@ -122,7 +126,10 @@ def test_future_wrong_market_and_conflicting_duplicate_samples_are_excluded():
 
     assert profile.sample_count == 1
     assert profile.p975_bps == Decimal("100")
-    assert profile.thresholds_bps == (Decimal("111"), Decimal("111.25"))
+    assert profile.thresholds_bps == (
+        Decimal("111"), Decimal("111.25"), Decimal("111.50"),
+        Decimal("111.75"), Decimal("112.00"),
+    )
 
 
 def test_bad_parameters_fail_closed():

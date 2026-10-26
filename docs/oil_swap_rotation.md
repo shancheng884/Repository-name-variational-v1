@@ -31,14 +31,15 @@ state reconciliation are required before a position can be treated as flat or
 open.
 
 The ETH V4 live runner remains ETH-only. WTI never reads or reuses ETH market
-observations. Its continuous two-tier gradient uses the same rolling,
-directional percentile method on WTI-only samples: a 7-day anchor, 97.5/98.25
+observations. Its five-tier gradient uses the same rolling, directional
+percentile method on WTI-only samples: a 7-day anchor, 97.5/98.25/99/99.5/99.8
 percentiles, and a 36-hour effective-history minimum. The existing 30/45 bps
-tiers remain hard floors; when history is immature or unavailable, those floors
-remain in force. Mature thresholds add the configured 10 bps roundtrip-cost and
-1 bps exit-target reserve and cannot move below either floor. ETH and WTI must
-both be manually confirmed flat before the first supervised start; the WTI
-manager runtime independently reconciles its own venue positions and orders.
+tiers remain hard floors; tiers three through five have strictly increasing
+floors and remain unavailable until history matures. Mature thresholds add the
+configured 10 bps roundtrip-cost and 1 bps exit-target reserve and cannot move
+below their floors. ETH and WTI must both be manually confirmed flat before the
+first supervised start; the WTI manager runtime independently reconciles its
+own venue positions and orders.
 
 ## Read-Only Account Probe
 
@@ -140,16 +141,18 @@ margin thresholds and 0.82/0.74 cross-venue equity balance thresholds. These
 are code guards, not evidence that the strategy is profitable.
 
 The optional `--gradient-live --confirm-bounded-gradient-pilot` path is a
-separate bounded diagnostic, not an averaging-down mode. It permits at most two
+separate bounded diagnostic, not an averaging-down mode. It permits at most five
 layers in one exchange session and one completed paired roundtrip. Tier two
-must exceed the unchanged base entry threshold; the persisted pilot config,
-attempt budget, aggregate notional cap, exact-size fresh quotes, current session,
-account reconciliation, live account-risk checks, exit logic, and slippage
-limits remain enforced. An exit, risk block, session cutoff, sample gap, or
-execution uncertainty prevents adding a layer. A completed or exhausted pilot
-cannot be reset by restarting with altered settings. The history bypass flag,
-when used, bypasses only historical qualification and is not production
-approval.
+retains its 45 bps hard floor; tiers three through five require mature rolling
+history and higher thresholds. Each child is capped at $20. Cumulative paired
+notional is capped at 1x through 5x the smaller fresh, verified venue equity;
+missing, stale, or inconsistent equity blocks additions. The persisted pilot
+config, attempt budget, exact-size fresh quotes, current session, account
+reconciliation, live account-risk checks, exit logic, and slippage limits remain
+enforced. An exit, risk block, session cutoff, sample gap, or execution
+uncertainty prevents adding a layer. A completed or exhausted pilot cannot be
+reset by restarting with altered settings. The history bypass flag, when used,
+bypasses only historical qualification and is not production approval.
 
 `tools/rotation_supervisor.py` coordinates the ETH/WTI handoff. Its default
 `--rehearse` mode is read-only. Live supervision requires both explicit
@@ -193,10 +196,12 @@ ID; do not use it while ETH is active. If neither runtime is active, the
 supervisor additionally requires `--confirm-initial-flat` after both accounts
 and their orders have been manually verified flat.
 
-The supervisor persists one test ID, exact market/multiplier, and fixed budget:
-one completed round trip, at most two $10 layers ($20 total), 30/45 bps entry
-tiers, 1 bps exit target, 10 bps assumed roundtrip cost, 8 bps slippage cap,
-six-hour maximum hold, and a 30-minute entry cutoff. The history qualification
+The supervisor's separate bounded rotation test persists one test ID, exact
+market/multiplier, and fixed budget: one completed round trip, at most two $10
+layers ($20 total), 30/45 bps entry tiers, 1 bps exit target, 10 bps assumed
+roundtrip cost, 8 bps slippage cap, six-hour maximum hold, and a 30-minute entry
+cutoff. This two-layer automatic-rotation test is distinct from the five-tier
+manual WTI gradient pilot above. The history qualification
 bypass applies only to this explicitly confirmed test; it does not bypass
 fresh valid samples, exchange-session status, account reconciliation, zero-order
 proof, executable depth/size, slippage, or live risk checks. The test ID is
@@ -420,29 +425,40 @@ After a verified ETH drain and source-process exit, the supervisor gracefully
 stops only the identified read-only standalone collector, then waits for its
 exit before launching WTI's embedded collector and execution runtime.
 
-The existing thresholds and per-position controls remain pinned: first entry
-30 bps, second gradient tier 45 bps, two layers at 10 USD each, 20 USD aggregate
-notional cap, 1 bps net exit target after the configured 10 bps roundtrip-cost
-assumption, 8 bps maximum slippage, six-hour maximum hold, and a 30-minute
-pre-close entry cutoff. Current sample freshness/quality, exchange session,
-account/risk, order reconciliation, executable depth, and slippage checks remain
-hard gates. The explicit pilot setting bypasses only historical production
-qualification; it does not bypass those live checks.
-The 20 USD cap is measured as the mean of the two hedged legs' notionals, with
-each venue's leg independently capped at 20 USD. Existing inventory is marked
-at the current conservative ask; a new layer is valued at conservative order
-references padded by the configured maximum slippage. Execution, live gradient
-decisions, and gradient replay use this same quantity-step/minimum-size sizing
-rule. The second layer is skipped whenever exchange minimums or rounding would
-breach either limit; the cap is not increased to force two fills.
+The WTI manual gradient pilot uses five increasing directional thresholds. The
+first two hard floors remain 30 bps and 45 bps; tiers three through five have
+strictly higher floors and remain unavailable until the same rolling-history
+sample-count and effective-time gates mature. Mature thresholds use the existing
+conservative roundtrip-cost and exit-target reserve at the 97.5, 98.25, 99, 99.5,
+and 99.8 percentiles. No history, session, freshness, risk, depth, reconciliation,
+or slippage gate is relaxed.
 
-Continuous mode intentionally has no maximum number of completed rounds or
-cumulative session-loss cap. The 20 USD limit is simultaneous WTI exposure, not
-a cap on cumulative turnover or realized losses. Stop the supervisor if that
-unbounded cumulative risk is not acceptable. The indicative replay supports
-`--compare-gradient --continuous-gradient` to evaluate consecutive quote-path
-rounds; this remains a no-lookahead simulation, not fill or profitability proof,
-and never enables orders. Default replay behavior remains limited to one round.
+Each child order remains capped at 20 USD. The paired open-position ceiling is
+the lower fresh verified equity of Variational and Lighter multiplied by at most
+5, with cumulative tier budgets at 1x through 5x that lower equity. Missing,
+stale, nonpositive, or mismatched equity blocks new exposure. Existing inventory
+is marked at the current conservative ask; proposed orders use conservative
+references padded by maximum slippage. Each new child requires a fresh two-venue
+risk read, exact local/exchange position reconciliation, and durable pending
+intent before submission. After restart an unresolved intent is looked up and
+reconciled; it is never submitted again. Legacy positions under an old tier
+budget remain manageable but cannot receive additional layers.
+
+The 1 bps net exit target after the configured 10 bps roundtrip-cost assumption,
+8 bps maximum slippage, six-hour maximum hold, and 30-minute pre-close entry
+cutoff remain unchanged. A pilot still ends after one completed open/close round.
+This change does not start the rotation supervisor or authorize automatic
+ETH/WTI switching. Historical replay requires an explicit equity scenario because
+the archived samples do not contain verified account-equity snapshots; replay is
+indicative only and cannot authorize live orders.
+
+Any separately authorized continuous mode intentionally has no maximum number
+of completed rounds or cumulative session-loss cap. The five-times-equity ceiling
+limits simultaneous paired WTI exposure, not cumulative turnover or realized
+losses. Do not start continuous mode as part of a manual WTI switch. The
+indicative replay supports explicit tier-count and equity-scenario inputs; it
+remains a no-lookahead simulation, not fill or profitability proof, and never
+enables orders. Default replay behavior remains limited to one round.
 
 ## Indicative Quote-Path Replay
 

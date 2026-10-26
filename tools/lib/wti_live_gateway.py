@@ -27,6 +27,7 @@ from tools.lib.wti_readonly_adapter import (
     WTIReadOnlyError,
     VariationalForwarderClient,
 )
+from tools.lib.wti_sizing import DEFAULT_MAX_EQUITY_MULTIPLE, equity_position_cap_usd
 
 
 VARIATIONAL_RESULT_TYPES = {
@@ -109,8 +110,13 @@ class WTIProductionGateway:
         market: dict[str, Any],
         max_order_wait_seconds: float = 4.0,
         operation_timeout_seconds: float = 12.0,
+        max_equity_multiple: Decimal = DEFAULT_MAX_EQUITY_MULTIPLE,
     ) -> None:
-        if max_order_wait_seconds <= 0 or operation_timeout_seconds <= 0:
+        if (
+            max_order_wait_seconds <= 0 or operation_timeout_seconds <= 0
+            or not max_equity_multiple.is_finite()
+            or max_equity_multiple <= 0 or max_equity_multiple > Decimal("5")
+        ):
             raise ValueError("order and operation timeouts must be positive")
         self.loop = loop
         self.variational = variational
@@ -121,8 +127,10 @@ class WTIProductionGateway:
         self.market = dict(market)
         self.max_order_wait_seconds = max_order_wait_seconds
         self.operation_timeout_seconds = operation_timeout_seconds
+        self.max_equity_multiple = max_equity_multiple
         self.current_notional_usd = Decimal("0")
         self.proposed_notional_usd: Decimal | None = None
+        self.proposed_equity_multiple: Decimal | None = None
         self.latest_risk: dict[str, Any] = {}
 
     def _call(self, coroutine: Any) -> dict[str, Any]:
@@ -155,10 +163,22 @@ class WTIProductionGateway:
             raise ValueError("current WTI notional must be finite and non-negative")
         self.current_notional_usd = value
 
-    def set_proposed_notional(self, value: Decimal | None) -> None:
+    def set_proposed_notional(
+        self,
+        value: Decimal | None,
+        *,
+        equity_multiple: Decimal | None = None,
+    ) -> None:
         if value is not None and (not value.is_finite() or value <= 0):
             raise ValueError("proposed WTI notional must be finite and positive")
+        if equity_multiple is not None and (
+            not equity_multiple.is_finite()
+            or equity_multiple <= 0
+            or equity_multiple > self.max_equity_multiple
+        ):
+            raise ValueError("proposed WTI equity multiple must be within the hard cap")
         self.proposed_notional_usd = value
+        self.proposed_equity_multiple = equity_multiple if value is not None else None
 
     async def _read_account(self) -> dict[str, Any]:
         snapshot = await self.account_reader.read_account()
@@ -170,11 +190,30 @@ class WTIProductionGateway:
 
         var_metrics = extract_variational_account_metrics(snapshot.get("variational_portfolio"))
         lighter_metrics = extract_lighter_account_metrics(snapshot.get("lighter_positions"))
+        var_equity = _decimal(var_metrics.get("equity_usd"))
+        lighter_equity = _decimal(lighter_metrics.get("equity_usd"))
+        projected_wti_notional = self.current_notional_usd + (
+            self.proposed_notional_usd or Decimal("0")
+        )
+        active_equity_multiple = (
+            self.proposed_equity_multiple
+            if self.proposed_notional_usd is not None
+            and self.proposed_equity_multiple is not None
+            else self.max_equity_multiple
+        )
+        equity_cap = equity_position_cap_usd(
+            var_equity, lighter_equity,
+            max_equity_multiple=active_equity_multiple,
+        )
         risk = account_risk_context(
             variational_metrics=var_metrics,
             lighter_metrics=lighter_metrics,
             current_notional_usd=self.current_notional_usd,
-            proposed_notional_usd=self.proposed_notional_usd,
+            # account_risk_context treats proposed_notional as the projected total
+            # target, not an increment. Keep that existing margin model unchanged.
+            proposed_notional_usd=(
+                projected_wti_notional if self.proposed_notional_usd is not None else None
+            ),
             max_venue_leverage=Decimal("5"),
             margin_warning_pct=Decimal("40"),
             margin_block_entry_pct=Decimal("50"),
@@ -190,13 +229,22 @@ class WTIProductionGateway:
             "lighter_initial_margin_usage_pct": lighter_metrics.get("initial_margin_usage_pct"),
             "lighter_maintenance_margin_usage_pct": lighter_metrics.get("maintenance_margin_usage_pct"),
             "risk_data_complete": (
-                var_metrics.get("equity_usd") is not None
-                and lighter_metrics.get("equity_usd") is not None
+                var_equity is not None and lighter_equity is not None
+                and var_equity.is_finite() and lighter_equity.is_finite()
+                and var_equity > 0 and lighter_equity > 0
             ),
+            "wti_equity_position_cap_usd": None if equity_cap is None else str(equity_cap),
+            "wti_projected_position_notional_usd": str(projected_wti_notional),
+            "wti_max_equity_multiple": str(active_equity_multiple),
         })
         if not risk["risk_data_complete"]:
             risk["risk_action"] = "block_entry"
             risk["risk_reason"] = "wti_account_risk_data_incomplete"
+        elif self.proposed_notional_usd is not None and (
+            equity_cap is None or projected_wti_notional > equity_cap
+        ):
+            risk["risk_action"] = "block_entry"
+            risk["risk_reason"] = "wti_equity_position_cap_exceeded"
         self.latest_risk = risk
         return {**snapshot, "risk": risk}
 

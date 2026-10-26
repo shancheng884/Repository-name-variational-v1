@@ -20,26 +20,35 @@ MIN_HISTORY_SAMPLES = 100
 MIN_EFFECTIVE_SECONDS = 36 * 60 * 60
 THRESHOLD_REFRESH_SECONDS = 5 * 60
 MIN_TIER_SPACING_BPS = Decimal("0.25")
-ENTRY_PERCENTILES = (Decimal("97.5"), Decimal("98.25"))
+ENTRY_PERCENTILES = (
+    Decimal("97.5"), Decimal("98.25"), Decimal("99"),
+    Decimal("99.5"), Decimal("99.8"),
+)
 
 
 @dataclass(frozen=True, slots=True)
 class WTIGradientThresholdProfile:
-    thresholds_bps: tuple[Decimal, Decimal]
+    thresholds_bps: tuple[Decimal | None, ...]
     sample_count: int
     effective_seconds: int
     mature: bool
     p975_bps: Decimal | None
     p9825_bps: Decimal | None
+    p99_bps: Decimal | None
+    p995_bps: Decimal | None
+    p998_bps: Decimal | None
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "thresholds_bps": [str(value) for value in self.thresholds_bps],
+            "thresholds_bps": [None if value is None else str(value) for value in self.thresholds_bps],
             "sample_count": self.sample_count,
             "effective_seconds": self.effective_seconds,
             "mature": self.mature,
             "p975_bps": None if self.p975_bps is None else str(self.p975_bps),
             "p9825_bps": None if self.p9825_bps is None else str(self.p9825_bps),
+            "p99_bps": None if self.p99_bps is None else str(self.p99_bps),
+            "p995_bps": None if self.p995_bps is None else str(self.p995_bps),
+            "p998_bps": None if self.p998_bps is None else str(self.p998_bps),
         }
 
 
@@ -81,6 +90,7 @@ def build_wti_gradient_threshold_profiles(
     multiplier: Decimal,
     first_floor_bps: Decimal,
     second_floor_bps: Decimal,
+    tier_floors_bps: tuple[Decimal, ...] | None = None,
     roundtrip_cost_bps: Decimal,
     exit_target_bps: Decimal,
     sample_interval_seconds: int = 10,
@@ -92,6 +102,8 @@ def build_wti_gradient_threshold_profiles(
     if as_of.tzinfo is None or as_of.utcoffset() is None:
         raise ValueError("wti_threshold_as_of_must_be_timezone_aware")
     numeric = (multiplier, first_floor_bps, second_floor_bps, roundtrip_cost_bps, exit_target_bps)
+    if tier_floors_bps is not None:
+        numeric += tuple(tier_floors_bps)
     if any(not value.is_finite() for value in numeric):
         raise ValueError("wti_threshold_parameters_must_be_finite")
     if (
@@ -100,6 +112,21 @@ def build_wti_gradient_threshold_profiles(
         or roundtrip_cost_bps < 0 or exit_target_bps < 0
         or sample_interval_seconds <= 0 or window_seconds <= 0
         or min_samples < 1 or min_effective_seconds < 0
+    ):
+        raise ValueError("wti_threshold_parameters_invalid")
+    hard_floors = tier_floors_bps or (
+        first_floor_bps,
+        second_floor_bps,
+        second_floor_bps + MIN_TIER_SPACING_BPS,
+        second_floor_bps + MIN_TIER_SPACING_BPS * 2,
+        second_floor_bps + MIN_TIER_SPACING_BPS * 3,
+    )
+    if (
+        len(hard_floors) != len(ENTRY_PERCENTILES)
+        or hard_floors[0] != first_floor_bps
+        or hard_floors[1] != second_floor_bps
+        or any(value <= 0 for value in hard_floors)
+        or any(left >= right for left, right in zip(hard_floors, hard_floors[1:]))
     ):
         raise ValueError("wti_threshold_parameters_invalid")
 
@@ -155,19 +182,30 @@ def build_wti_gradient_threshold_profiles(
         values = edge_values[direction]
         effective = min(len(values) * sample_interval_seconds, window_seconds)
         mature = len(values) >= min_samples and effective >= min_effective_seconds
-        p975 = _percentile(values, ENTRY_PERCENTILES[0]) if mature else None
-        p9825 = _percentile(values, ENTRY_PERCENTILES[1]) if mature else None
-        first = max(first_floor_bps, (p975 + reserve) if p975 is not None else first_floor_bps)
-        second_candidates = [second_floor_bps, first + MIN_TIER_SPACING_BPS]
-        if p9825 is not None:
-            second_candidates.append(p9825 + reserve)
-        second = max(second_candidates)
+        percentile_values = (
+            tuple(_percentile(values, percentile) for percentile in ENTRY_PERCENTILES)
+            if mature else (None,) * len(ENTRY_PERCENTILES)
+        )
+        thresholds: list[Decimal | None] = []
+        for index, (floor, percentile_value) in enumerate(zip(hard_floors, percentile_values)):
+            if not mature and index >= 2:
+                thresholds.append(None)
+                continue
+            candidates = [floor]
+            if index and thresholds[index - 1] is not None:
+                candidates.append(thresholds[index - 1] + MIN_TIER_SPACING_BPS)
+            if percentile_value is not None:
+                candidates.append(percentile_value + reserve)
+            thresholds.append(max(candidates))
         profiles[direction] = WTIGradientThresholdProfile(
-            thresholds_bps=(first, second),
+            thresholds_bps=tuple(thresholds),
             sample_count=len(values),
             effective_seconds=effective,
             mature=mature,
-            p975_bps=p975,
-            p9825_bps=p9825,
+            p975_bps=percentile_values[0],
+            p9825_bps=percentile_values[1],
+            p99_bps=percentile_values[2],
+            p995_bps=percentile_values[3],
+            p998_bps=percentile_values[4],
         )
     return profiles

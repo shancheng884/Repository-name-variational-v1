@@ -157,7 +157,8 @@ def decide_wti_gradient_action(
     *,
     config: ReplayConfig,
     now: datetime | None = None,
-    thresholds_by_direction: Mapping[str, Sequence[Decimal]] | None = None,
+    thresholds_by_direction: Mapping[str, Sequence[Decimal | None]] | None = None,
+    aggregate_capacity_by_tier_usd: Sequence[Decimal] | None = None,
 ) -> dict[str, Any]:
     """Apply strictly increasing, same-direction tiers within a durable pilot."""
     decision = decide_wti_action(row, position, config=config, now=now)
@@ -184,28 +185,63 @@ def decide_wti_gradient_action(
     if decision.get("action") == "close":
         return decision
 
-    effective_thresholds: dict[str, list[Decimal]] | None = None
+    effective_thresholds: dict[str, list[Decimal | None]] | None = None
     if thresholds_by_direction is not None:
         effective_thresholds = {}
         try:
             for direction in ("long_var_short_lighter", "short_var_long_lighter"):
-                values = [Decimal(str(value)) for value in thresholds_by_direction[direction]]
+                values = [
+                    None if value is None else Decimal(str(value))
+                    for value in thresholds_by_direction[direction]
+                ]
+                concrete = [value for value in values if value is not None]
+                unavailable_then_available = False
+                saw_unavailable = False
+                for value in values:
+                    if value is None:
+                        saw_unavailable = True
+                    elif saw_unavailable:
+                        unavailable_then_available = True
                 if (
                     len(values) != len(thresholds)
-                    or any(not value.is_finite() for value in values)
-                    or any(value < floor for value, floor in zip(values, thresholds))
-                    or any(left >= right for left, right in zip(values, values[1:]))
+                    or not values or values[0] is None
+                    or any(not value.is_finite() for value in concrete)
+                    or any(
+                        value is not None and value < floor
+                        for value, floor in zip(values, thresholds)
+                    )
+                    or unavailable_then_available
+                    or any(left >= right for left, right in zip(concrete, concrete[1:]))
                 ):
                     raise ValueError("invalid adaptive threshold profile")
                 effective_thresholds[direction] = values
         except (KeyError, TypeError, ValueError, ArithmeticError):
             return {"action": "hold", "reason": "gradient_threshold_profile_invalid"}
 
+    tier_capacities: list[Decimal] | None = None
+    if aggregate_capacity_by_tier_usd is not None:
+        try:
+            tier_capacities = [Decimal(str(value)) for value in aggregate_capacity_by_tier_usd]
+            if (
+                len(tier_capacities) != len(thresholds)
+                or any(not value.is_finite() or value < 0 for value in tier_capacities)
+                or any(left > right for left, right in zip(tier_capacities, tier_capacities[1:]))
+            ):
+                raise ValueError("invalid aggregate equity capacity")
+        except (TypeError, ValueError, ArithmeticError):
+            return {"action": "hold", "reason": "gradient_equity_capacity_unavailable"}
+
     if position is None:
         if pilot.get("status") != "available":
             return decision
         if pilot.get("layers_opened") or pilot.get("completed_roundtrips") != 0:
             return {"action": "hold", "reason": "gradient_pilot_entry_budget_unavailable"}
+        first_capacity = (
+            tier_capacities[0] if tier_capacities is not None
+            else Decimal(str(pilot.get("config", {}).get("max_notional_usd", "0")))
+        )
+        if first_capacity <= 0:
+            return {"action": "hold", "reason": "gradient_equity_capacity_unavailable"}
         if effective_thresholds is not None:
             edges = {
                 "long_var_short_lighter": _decimal(row.get("long_edge_bps")),
@@ -221,7 +257,7 @@ def decide_wti_gradient_action(
                     "action": "hold",
                     "reason": "gradient_entry_below_adaptive_threshold",
                     "effective_tier_thresholds_bps": {
-                        direction: [str(value) for value in values]
+                        direction: [None if value is None else str(value) for value in values]
                         for direction, values in effective_thresholds.items()
                     },
                 }
@@ -235,9 +271,10 @@ def decide_wti_gradient_action(
             **decision,
             "gradient_tier": 1,
             "layer_notional_usd": str(layer_notional),
+            **({"aggregate_max_notional_usd": str(first_capacity)} if tier_capacities is not None else {}),
             **({
                 "effective_tier_thresholds_bps": {
-                    direction: [str(value) for value in values]
+                    direction: [None if value is None else str(value) for value in values]
                     for direction, values in effective_thresholds.items()
                 }
             } if effective_thresholds is not None else {}),
@@ -252,15 +289,17 @@ def decide_wti_gradient_action(
     ):
         return decision
     layers = pilot.get("layers_opened")
-    if not isinstance(layers, list):
+    if not isinstance(layers, list) or not layers:
         return {"action": "hold", "reason": "gradient_pilot_state_invalid"}
-    tier = len(layers) + 1
+    opened_tiers = [item.get("tier") for item in layers if isinstance(item, dict)]
     if (
-        tier > len(thresholds)
-        or tier > pilot.get("max_layers", 0)
-        or tier in pilot.get("exhausted_tiers", [])
+        len(opened_tiers) != len(layers)
+        or any(not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= len(thresholds)
+               for value in opened_tiers)
+        or any(left > right for left, right in zip(opened_tiers, opened_tiers[1:]))
     ):
-        return decision
+        return {"action": "hold", "reason": "gradient_pilot_state_invalid"}
+    active_tier = max(opened_tiers)
     direction = position.get("direction")
     edge_field = (
         "long_edge_bps" if direction == "long_var_short_lighter"
@@ -273,21 +312,64 @@ def decide_wti_gradient_action(
     )
     if active_thresholds is None:
         return {"action": "hold", "reason": "gradient_threshold_profile_invalid"}
-    if edge is None or edge < active_thresholds[tier - 1]:
+    if edge is None:
+        return decision
+    if tier_capacities is None:
+        # Legacy pilots have one immutable child per tier; their restart
+        # behavior is preserved while the live five-tier pilot uses equity slots.
+        tier = len(layers) + 1
+        if tier > len(thresholds) or tier > pilot.get("max_layers", 0):
+            return decision
+    else:
+        tier = active_tier
+        current_cap = tier_capacities[tier - 1]
+        multiplier_for_mark = _decimal(position.get("multiplier"))
+        var_qty_for_mark = _decimal(position.get("var_qty"))
+        lighter_qty_for_mark = _decimal(position.get("lighter_qty"))
+        var_mark_for_cap = _decimal(row.get("var_ask"))
+        lighter_mark_for_cap = _decimal(row.get("lighter_ask"))
+        if any(value is None or value <= 0 for value in (
+            multiplier_for_mark, var_qty_for_mark, lighter_qty_for_mark,
+            var_mark_for_cap, lighter_mark_for_cap,
+        )):
+            return {"action": "hold", "reason": "gradient_equity_capacity_unavailable"}
+        current_notional = max(
+            var_qty_for_mark * var_mark_for_cap,
+            lighter_qty_for_mark * lighter_mark_for_cap * multiplier_for_mark,
+        )
+        # Graduate when another standard child would consume or exceed the
+        # current tier's remaining allowance. Waiting for an exact cap touch can
+        # deadlock on exchange quantity steps and slippage padding.
+        if current_notional + layer_notional >= current_cap:
+            tier += 1
+            if tier > len(thresholds) or tier > pilot.get("max_layers", 0):
+                return {"action": "hold", "reason": "gradient_equity_position_cap_reached"}
+            tier_threshold = active_thresholds[tier - 1]
+            if tier_threshold is None:
+                return {"action": "hold", "reason": "gradient_threshold_history_not_mature"}
+    if tier in pilot.get("exhausted_tiers", []):
+        return decision
+    tier_threshold = active_thresholds[tier - 1]
+    if tier_threshold is None:
+        return {"action": "hold", "reason": "gradient_threshold_history_not_mature"}
+    if edge < tier_threshold:
         if effective_thresholds is not None and edge is not None:
             return {
                 "action": "hold",
                 "reason": "gradient_add_below_adaptive_threshold",
                 "edge_bps": str(edge),
-                "gradient_threshold_bps": str(active_thresholds[tier - 1]),
+                "gradient_threshold_bps": str(tier_threshold),
                 "effective_tier_thresholds_bps": {
-                    key: [str(value) for value in values]
+                    key: [None if value is None else str(value) for value in values]
                     for key, values in effective_thresholds.items()
                 },
             }
         return decision
     try:
-        cap = Decimal(str(pilot["config"]["max_notional_usd"]))
+        cap = (tier_capacities[tier - 1] if tier_capacities is not None
+               else Decimal(str(pilot["config"]["max_notional_usd"])))
+        if cap <= 0:
+            return {"action": "hold", "reason": "gradient_equity_capacity_unavailable"}
         multiplier = Decimal(str(position["multiplier"]))
         var_qty = Decimal(str(position["var_qty"]))
         lighter_qty = Decimal(str(position["lighter_qty"]))
@@ -340,9 +422,10 @@ def decide_wti_gradient_action(
         "reason": "gradient_tier_threshold_reached",
         "gradient_tier": tier,
         "layer_notional_usd": str(layer_notional),
+        **({"aggregate_max_notional_usd": str(cap)} if tier_capacities is not None else {}),
         **({
             "effective_tier_thresholds_bps": {
-                key: [str(value) for value in values]
+                key: [None if value is None else str(value) for value in values]
                 for key, values in effective_thresholds.items()
             }
         } if effective_thresholds is not None else {}),

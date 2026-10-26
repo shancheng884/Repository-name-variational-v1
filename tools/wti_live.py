@@ -47,6 +47,7 @@ from tools.lib.wti_execution import (  # noqa: E402
 )
 from tools.lib.wti_live_gateway import WTIProductionGateway  # noqa: E402
 from tools.lib.wti_live_strategy import decide_wti_action, decide_wti_gradient_action  # noqa: E402
+from tools.lib.wti_sizing import equity_gradient_slot_caps  # noqa: E402
 from tools.lib.wti_replay import ReplayConfig  # noqa: E402
 from tools.lib.wti_thresholds import (  # noqa: E402
     ANCHOR_WINDOW_SECONDS as WTI_THRESHOLD_WINDOW_SECONDS,
@@ -65,6 +66,8 @@ WTI_HEALTH_PATH = ROOT / "log" / "wti_live_risk_health.json"
 WTI_CONTROL_PATH = ROOT / "log" / "wti_live_control.json"
 WTI_SAMPLE_ROOT = ROOT / "log" / "oil_swap" / "basis_samples"
 MAX_WTI_NOTIONAL_USD = Decimal("25")
+WTI_GRADIENT_MAX_LAYERS = 5
+WTI_MAX_EQUITY_MULTIPLE = Decimal("5")
 MAX_WTI_ENTRY_GAP_SECONDS = 120
 MIN_ENTRY_CUTOFF_SECONDS = 1800
 MAX_HOLD_SECONDS = 21600
@@ -465,14 +468,25 @@ class WTILiveRuntime:
                 elif local_exposure:
                     if not gradient_pilot_owns_exposure(existing):
                         raise RuntimeError("existing_wti_exposure_not_owned_by_gradient_pilot")
-                    self.gradient_pilot = store.initialize_gradient_pilot(
-                        market_id=int(market["market_id"]),
-                        multiplier=Decimal(str(market["multiplier"])),
-                        config=self._gradient_pilot_config(),
-                        max_layers=2,
-                        rotation_test_id=getattr(self.args, "rotation_test_id", None),
-                        continuous_rotation=continuous_rotation,
-                    )
+                    old_pilot = dict(existing_gradient)
+                    if (
+                        old_pilot.get("max_layers") != WTI_GRADIENT_MAX_LAYERS
+                        or old_pilot.get("config") != self._gradient_pilot_config()
+                    ):
+                        # Keep legacy exposure manageable, but never layer it under
+                        # a changed budget or tier map.
+                        self.gradient_pilot = old_pilot
+                        self.manage_existing_only = True
+                        self.entry_gate_block_reason = "legacy_gradient_position_management_only"
+                    else:
+                        self.gradient_pilot = store.initialize_gradient_pilot(
+                            market_id=int(market["market_id"]),
+                            multiplier=Decimal(str(market["multiplier"])),
+                            config=self._gradient_pilot_config(),
+                            max_layers=WTI_GRADIENT_MAX_LAYERS,
+                            rotation_test_id=getattr(self.args, "rotation_test_id", None),
+                            continuous_rotation=continuous_rotation,
+                        )
                 else:
                     if (
                         not self.readiness.get("market_data_ready", self.readiness["ready"])
@@ -485,7 +499,7 @@ class WTILiveRuntime:
                         market_id=int(market["market_id"]),
                         multiplier=Decimal(str(market["multiplier"])),
                         config=self._gradient_pilot_config(),
-                        max_layers=2,
+                        max_layers=WTI_GRADIENT_MAX_LAYERS,
                         rotation_test_id=getattr(self.args, "rotation_test_id", None),
                         continuous_rotation=continuous_rotation,
                     )
@@ -603,11 +617,17 @@ class WTILiveRuntime:
         layer_notional = getattr(self.args, "_validated_gradient_layer_notional", None)
         if second is None or layer_notional is None:
             raise RuntimeError("gradient_pilot_configuration_not_validated")
+        floors = [self.config.entry_threshold_bps, second]
+        floors.extend(
+            second + Decimal("0.25") * tier
+            for tier in range(1, WTI_GRADIENT_MAX_LAYERS - 1)
+        )
         return {
             **self._pilot_config(),
-            "tier_thresholds_bps": [str(self.config.entry_threshold_bps), str(second)],
+            "tier_thresholds_bps": [str(value) for value in floors],
             "layer_notional_usd": str(layer_notional),
-            "max_layers": 2,
+            "max_layers": WTI_GRADIENT_MAX_LAYERS,
+            "max_equity_multiple": str(WTI_MAX_EQUITY_MULTIPLE),
             "max_completed_roundtrips": 1,
         }
 
@@ -639,7 +659,6 @@ class WTILiveRuntime:
                 or pilot.get("pilot_id") != self.gradient_pilot.get("pilot_id")
                 or pilot.get("status") != ("in_position" if gradient_position else "available")
                 or pilot.get("completed_roundtrips") != 0
-                or len(opened) >= pilot.get("max_layers", 0)
             ):
                 self.entry_authorized = False
                 self.entry_gate_block_reason = "gradient_pilot_entry_budget_unavailable"
@@ -811,7 +830,7 @@ class WTILiveRuntime:
             market_id=int(self.market_metadata["market_id"]),
             multiplier=Decimal(str(self.market_metadata["multiplier"])),
             config=self._gradient_pilot_config(),
-            max_layers=2,
+            max_layers=WTI_GRADIENT_MAX_LAYERS,
             rotation_test_id=getattr(self.args, "rotation_test_id", None),
             continuous_rotation=True,
             new_pilot_after=predecessor,
@@ -853,8 +872,10 @@ class WTILiveRuntime:
 
     async def _gradient_thresholds_for_sample(
         self, row: dict[str, Any]
-    ) -> dict[str, tuple[Decimal, Decimal]] | None:
+    ) -> dict[str, tuple[Decimal | None, ...]] | None:
         if (
+            getattr(self, "manage_existing_only", False)
+            or
             getattr(self, "gradient_pilot", None) is None
             or getattr(self, "market_metadata", None) is None
             or getattr(self, "config", None) is None
@@ -879,7 +900,7 @@ class WTILiveRuntime:
                     Decimal(str(value))
                     for value in pilot_config.get("tier_thresholds_bps", [])
                 ]
-                if len(floors) != 2:
+                if len(floors) != WTI_GRADIENT_MAX_LAYERS:
                     raise ValueError("gradient_pilot_tier_floors_invalid")
                 rows = await asyncio.to_thread(
                     read_basis_samples,
@@ -898,6 +919,7 @@ class WTILiveRuntime:
                     multiplier=Decimal(str(self.market_metadata["multiplier"])),
                     first_floor_bps=floors[0],
                     second_floor_bps=floors[1],
+                    tier_floors_bps=tuple(floors),
                     roundtrip_cost_bps=self.config.roundtrip_cost_bps,
                     exit_target_bps=self.config.exit_target_bps,
                     sample_interval_seconds=int(self.args.sample_interval_seconds),
@@ -911,7 +933,7 @@ class WTILiveRuntime:
                 )
                 pilot_config = self.gradient_pilot.get("config") or {}
                 floors = [Decimal(str(value)) for value in pilot_config.get("tier_thresholds_bps", [])]
-                if len(floors) != 2:
+                if len(floors) != WTI_GRADIENT_MAX_LAYERS:
                     return None
                 self.wti_gradient_threshold_profiles = build_wti_gradient_threshold_profiles(
                     [],
@@ -922,6 +944,7 @@ class WTILiveRuntime:
                     multiplier=Decimal(str(self.market_metadata["multiplier"])),
                     first_floor_bps=floors[0],
                     second_floor_bps=floors[1],
+                    tier_floors_bps=tuple(floors),
                     roundtrip_cost_bps=self.config.roundtrip_cost_bps,
                     exit_target_bps=self.config.exit_target_bps,
                     sample_interval_seconds=int(self.args.sample_interval_seconds),
@@ -934,6 +957,36 @@ class WTILiveRuntime:
                 self, "wti_gradient_threshold_profiles", {}
             ).items()
         }
+
+    def _gradient_equity_capacity_by_tier(self) -> tuple[Decimal, ...] | None:
+        risk = self.last_risk
+        if risk.get("risk_data_complete") is not True:
+            return None
+        try:
+            observed = datetime.fromisoformat(
+                str(risk["observed_at"]).replace("Z", "+00:00")
+            )
+            age = (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds()
+            var_equity = Decimal(str(risk["variational_equity_usd"]))
+            lighter_equity = Decimal(str(risk["lighter_equity_usd"]))
+            layer = Decimal(str(self.args._validated_gradient_layer_notional))
+            if (
+                observed.tzinfo is None or observed.utcoffset() is None
+                or age < -5 or age > 15
+                or not var_equity.is_finite() or not lighter_equity.is_finite()
+                or var_equity <= 0 or lighter_equity <= 0
+            ):
+                return None
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return None
+        slots = equity_gradient_slot_caps(
+            variational_equity_usd=var_equity,
+            lighter_equity_usd=lighter_equity,
+            child_notional_usd=layer,
+            tier_count=WTI_GRADIENT_MAX_LAYERS,
+            max_equity_multiple=WTI_MAX_EQUITY_MULTIPLE,
+        )
+        return None if slots is None else tuple(Decimal(count) * layer for count in slots)
 
     async def _load_startup_readiness(self) -> None:
         started = time.monotonic()
@@ -1279,9 +1332,11 @@ class WTILiveRuntime:
         if getattr(self, "gradient_pilot", None) is not None:
             self.gradient_pilot = dict(state.get("gradient_pilot") or self.gradient_pilot)
             thresholds_by_direction = await self._gradient_thresholds_for_sample(row)
+            equity_capacity = self._gradient_equity_capacity_by_tier()
             decision = decide_wti_gradient_action(
                 row, position, self.gradient_pilot, config=self.config, now=now,
                 thresholds_by_direction=thresholds_by_direction,
+                aggregate_capacity_by_tier_usd=equity_capacity,
             )
         else:
             decision = decide_wti_action(row, position, config=self.config, now=now)
@@ -1347,7 +1402,10 @@ class WTILiveRuntime:
                     self.pilot_store.reserve_single_round_pilot_entry,
                     pilot_id,
                 )
-            self.gateway.set_proposed_notional(notional)
+            self.gateway.set_proposed_notional(
+                notional,
+                equity_multiple=Decimal(tier) if gradient_entry else None,
+            )
             try:
                 state = await asyncio.to_thread(
                     lambda: self.executor.open(
@@ -1360,6 +1418,11 @@ class WTILiveRuntime:
                         layer_id=layer_id,
                         gradient_tier=tier,
                         gradient_pilot_id=pilot_id if gradient_entry else None,
+                        aggregate_max_notional_usd=(
+                            Decimal(str(decision["aggregate_max_notional_usd"]))
+                            if gradient_entry and decision.get("aggregate_max_notional_usd") is not None
+                            else None
+                        ),
                         decision=decision,
                         now=datetime.now(timezone.utc),
                     )
@@ -1589,7 +1652,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--confirm-continuous-gradient-rotation", action="store_true")
     parser.add_argument("--rotation-test-id")
     parser.add_argument("--gradient-second-tier-bps", type=Decimal)
-    parser.add_argument("--gradient-layer-notional-usd", type=Decimal, default=Decimal("10"))
+    parser.add_argument("--gradient-layer-notional-usd", type=Decimal, default=Decimal("20"))
     parser.add_argument("--new-pilot-after", help="authorize one new round after this exact terminal pilot ID")
     parser.add_argument("--keep-collecting-after-pilot", action="store_true")
     parser.add_argument(
@@ -1664,8 +1727,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 parser.error("gradient second tier must be finite and higher than the entry threshold")
             if not layer.is_finite() or layer <= 0:
                 parser.error("gradient layer notional must be positive and finite")
-            if layer * 2 > args._validated_notional:
-                parser.error("two gradient layers must fit within the aggregate notional cap")
+            if layer > args._validated_notional:
+                parser.error("gradient child notional exceeds the per-order limit")
             args._validated_gradient_second_tier = second
             args._validated_gradient_layer_notional = layer
         if args.manage_existing_wti_position and (

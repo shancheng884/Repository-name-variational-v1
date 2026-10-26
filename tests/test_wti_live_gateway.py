@@ -432,6 +432,66 @@ def test_entry_risk_block_prevents_any_order_submission(monkeypatch):
     gateway.loop.close()
 
 
+def test_read_account_applies_lower_venue_equity_cap_to_total_existing_plus_proposed():
+    class AccountReader:
+        lighter_equity = "80"
+
+        async def read_account(self):
+            return {
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "variational_portfolio": {
+                    "balance": "100", "upnl": "0",
+                    "margin_usage": {"initial_margin": "0", "maintenance_margin": "0"},
+                },
+                "lighter_positions": {"accounts": [{
+                    "collateral": self.lighter_equity,
+                    "available_balance": self.lighter_equity,
+                    "total_asset_value": self.lighter_equity,
+                    "cross_initial_margin_requirement": "0",
+                    "cross_maintenance_margin_requirement": "0",
+                    "positions": [],
+                }]},
+            }
+
+    reader = AccountReader()
+    gateway = WTIProductionGateway(
+        loop=asyncio.new_event_loop(), variational=FakeVariational(),
+        account_reader=reader, lighter_client=None,
+        account_index=10, api_key_index=1,
+        market={"market_id": 145, "supported_size_decimals": 2,
+                "supported_price_decimals": 2},
+        max_equity_multiple=Decimal("4"),
+    )
+    gateway.set_current_notional(Decimal("300"))
+    gateway.set_proposed_notional(Decimal("20"))
+    result = asyncio.run(gateway._read_account())
+    assert result["risk"]["risk_data_complete"] is True
+    assert result["risk"]["wti_equity_position_cap_usd"] == "320"
+    assert result["risk"]["wti_projected_position_notional_usd"] == "320"
+    assert result["risk"]["risk_reason"] != "wti_equity_position_cap_exceeded"
+
+    gateway.set_current_notional(Decimal("301"))
+    result = asyncio.run(gateway._read_account())
+    assert result["risk"]["wti_projected_position_notional_usd"] == "321"
+    assert result["risk"]["risk_action"] == "block_entry"
+    assert result["risk"]["risk_reason"] == "wti_equity_position_cap_exceeded"
+
+    # Recheck the current tier against fresh equity at submit time, not the
+    # older equity snapshot used to select the tier in the strategy loop.
+    gateway.set_current_notional(Decimal("80"))
+    gateway.set_proposed_notional(Decimal("20"), equity_multiple=Decimal("2"))
+    reader.lighter_equity = "50"
+    result = asyncio.run(gateway._read_account())
+    assert result["risk"]["wti_equity_position_cap_usd"] == "100"
+    assert result["risk"]["risk_reason"] != "wti_equity_position_cap_exceeded"
+    reader.lighter_equity = "45"
+    result = asyncio.run(gateway._read_account())
+    assert result["risk"]["wti_equity_position_cap_usd"] == "90"
+    assert result["risk"]["risk_action"] == "block_entry"
+    assert result["risk"]["risk_reason"] == "wti_equity_position_cap_exceeded"
+    gateway.loop.close()
+
+
 def test_real_sdk_create_order_object_does_not_erase_accepted_send_receipt():
     from lighter.transactions import CreateOrder
 

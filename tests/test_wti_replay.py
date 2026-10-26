@@ -378,7 +378,7 @@ def test_continuous_gradient_replay_runs_sequential_rounds_without_raising_per_r
     )
 
     assert report.live_authorization is False
-    assert report.replay_kind == "indicative_continuous_two_layer_gradient_no_lookahead"
+    assert report.replay_kind == "indicative_continuous_2_tier_gradient_no_lookahead"
     assert report.completed_trades == 2
     assert [trade.layer_count for trade in report.trades] == [2, 2]
     assert report.trades[0].exit_at < report.trades[1].entry_at
@@ -567,13 +567,16 @@ def test_replay_cli_can_emit_side_by_side_baseline_and_gradient(monkeypatch, cap
         "--lighter-market-id", "145", "--lighter-multiplier", "1",
         "--compare-gradient", "--gradient-second-tier-bps", "20",
         "--gradient-layer-notional-usd", "10",
-        "--gradient-aggregate-max-notional-usd", "20",
+        "--gradient-aggregate-max-notional-usd", "100",
+        "--gradient-equity-usd", "20",
     ])
     assert result == 0
     output = json.loads(capsys.readouterr().out)
     assert output["live_authorization"] is False
     assert output["comparison"]["profitability_claim"] is False
     assert output["baseline"]["replay_kind"] != output["gradient"]["replay_kind"]
+    assert output["gradient"]["config"]["max_layers"] == 5
+    assert output["gradient"]["config"]["equity_scenario_usd"] == "20"
 
 
 def test_replay_cli_continuous_gradient_is_explicit_and_never_authorizes_live(monkeypatch, capsys):
@@ -607,6 +610,40 @@ def test_replay_cli_continuous_gradient_is_explicit_and_never_authorizes_live(mo
     assert output["gradient"]["completed_trades"] == 2
     assert output["gradient"]["config"]["max_completed_roundtrips"] is None
     assert output["gradient"]["config"]["assume_verified_flat_session_restarts"] is True
+
+
+def test_five_tier_equity_scenario_replay_adds_within_tier_and_keeps_higher_tiers_maturity_gated():
+    rows = [
+        _row(0, long_edge_bps="0", short_edge_bps="0", variational_qty="1", lighter_qty="1"),
+        _row(1, long_edge_bps="25", short_edge_bps="0", variational_qty="1", lighter_qty="1"),
+        _row(2, long_edge_bps="25", short_edge_bps="0", variational_qty="1", lighter_qty="1"),
+        _row(3, long_edge_bps="25", short_edge_bps="0", variational_qty="1", lighter_qty="1"),
+        _row(4, long_edge_bps="25", short_edge_bps="0", variational_qty="1", lighter_qty="1"),
+        _row(5, long_edge_bps="100", short_edge_bps="0", variational_qty="1", lighter_qty="1"),
+        _row(6, long_edge_bps="100", short_edge_bps="0", variational_qty="1", lighter_qty="1"),
+    ]
+    report = replay_wti_gradient(
+        rows,
+        config=_config(
+            entry_threshold_bps=Decimal("10"), exit_target_bps=Decimal("10"),
+            max_hold_seconds=50,
+        ),
+        second_tier_threshold_bps=Decimal("20"),
+        layer_notional_usd=Decimal("10"),
+        aggregate_max_notional_usd=Decimal("100"),
+        max_layers=5,
+        equity_usd=Decimal("20"),
+        expected_market_id=145,
+        expected_multiplier=Decimal("1"),
+    )
+    assert report.live_authorization is False
+    assert report.config["max_layers"] == 5
+    assert report.config["tier_capacity_notional_usd"] == ["20", "40", "60", "80", "100"]
+    assert report.config["equity_scenario_usd"] == "20"
+    assert report.completed_trades == 1
+    assert report.trades[0].layer_count == 3
+    assert report.trades[0].layer_entry_edges_bps == ("25", "25", "25")
+    assert report.trades[0].exit_reason == "max_hold"
 
 
 def test_replay_cli_writes_hash_addressed_readiness_evidence(tmp_path: Path, monkeypatch, capsys):

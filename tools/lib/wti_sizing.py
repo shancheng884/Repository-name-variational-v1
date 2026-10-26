@@ -2,7 +2,62 @@
 
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
+
+
+DEFAULT_MAX_EQUITY_MULTIPLE = Decimal("5")
+
+
+def equity_gradient_slot_caps(
+    *,
+    variational_equity_usd: Decimal | None,
+    lighter_equity_usd: Decimal | None,
+    child_notional_usd: Decimal,
+    tier_count: int = 5,
+    max_equity_multiple: Decimal = DEFAULT_MAX_EQUITY_MULTIPLE,
+) -> tuple[int, ...] | None:
+    """Return cumulative child slots from 1x to the hard per-venue equity cap."""
+    values = (variational_equity_usd, lighter_equity_usd, child_notional_usd, max_equity_multiple)
+    if (
+        any(value is None or not value.is_finite() for value in values)
+        or variational_equity_usd <= 0
+        or lighter_equity_usd <= 0
+        or child_notional_usd <= 0
+        or max_equity_multiple <= 0
+        or tier_count < 1
+    ):
+        return None
+    smaller_equity = min(variational_equity_usd, lighter_equity_usd)
+    hard_slots = int(
+        (smaller_equity * max_equity_multiple / child_notional_usd)
+        .to_integral_value(rounding=ROUND_DOWN)
+    )
+    return tuple(
+        min(
+            hard_slots,
+            int((smaller_equity * tier / child_notional_usd)
+                .to_integral_value(rounding=ROUND_DOWN)),
+        )
+        for tier in range(1, tier_count + 1)
+    )
+
+
+def equity_position_cap_usd(
+    variational_equity_usd: Decimal | None,
+    lighter_equity_usd: Decimal | None,
+    *,
+    max_equity_multiple: Decimal = DEFAULT_MAX_EQUITY_MULTIPLE,
+) -> Decimal | None:
+    """Conservative paired cap: the smaller verified venue equity times leverage."""
+    if (
+        variational_equity_usd is None or lighter_equity_usd is None
+        or not variational_equity_usd.is_finite()
+        or not lighter_equity_usd.is_finite()
+        or not max_equity_multiple.is_finite()
+        or min(variational_equity_usd, lighter_equity_usd, max_equity_multiple) <= 0
+    ):
+        return None
+    return min(variational_equity_usd, lighter_equity_usd) * max_equity_multiple
 
 
 def size_paired_layer(
