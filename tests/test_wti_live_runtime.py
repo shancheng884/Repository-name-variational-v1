@@ -63,17 +63,38 @@ def test_gradient_cli_requires_explicit_two_tier_bounded_budget():
         ])
 
 
+def test_history_bypass_requires_live_mode_and_explicit_bounded_confirmation():
+    with pytest.raises(SystemExit):
+        wti_live.parse_args([
+            "--mode", "observe", "--allow-unqualified-data-pilot",
+            "--confirm-bounded-live-pilot",
+        ])
+    with pytest.raises(SystemExit):
+        wti_live.parse_args(["--mode", "live", "--allow-unqualified-data-pilot"])
+
+
 def test_rotation_test_id_is_bound_to_gradient_live_mode():
     args = wti_live.parse_args([
         "--mode", "live", "--confirm-eth-flat", "--i-understand-live-orders",
         "--gradient-live", "--confirm-bounded-gradient-pilot",
-        "--allow-unqualified-data-pilot", "--rotation-test-id", "a" * 32,
+        "--rotation-test-id", "a" * 32,
         "--expected-lighter-market-id", "145", "--entry-threshold-bps", "30",
         "--gradient-second-tier-bps", "45", "--gradient-layer-notional-usd", "10",
         "--exit-target-bps", "1", "--roundtrip-cost-bps", "10",
         "--max-notional-usd", "20",
     ])
     assert args.rotation_test_id == "a" * 32
+    continuous = wti_live.parse_args([
+        "--mode", "live", "--confirm-eth-flat", "--i-understand-live-orders",
+        "--gradient-live", "--confirm-bounded-gradient-pilot",
+        "--continuous-gradient-rotation", "--confirm-continuous-gradient-rotation",
+        "--allow-unqualified-data-pilot", "--rotation-test-id", "a" * 32,
+        "--expected-lighter-market-id", "145", "--entry-threshold-bps", "30",
+        "--gradient-second-tier-bps", "45", "--gradient-layer-notional-usd", "10",
+        "--exit-target-bps", "1", "--roundtrip-cost-bps", "10",
+        "--max-notional-usd", "20",
+    ])
+    assert wti_live._unqualified_data_pilot_enabled(continuous)
     with pytest.raises(SystemExit):
         wti_live.parse_args([
             "--mode", "live", "--confirm-eth-flat", "--i-understand-live-orders",
@@ -385,6 +406,11 @@ def test_readiness_for_entries_keeps_three_session_sample_and_gap_rules(monkeypa
             market_data_ready=False,
             data_fresh=True,
             ready_for_production_rotation=False,
+            lighter_market_id=145,
+            lighter_market_id_explicitly_configured=True,
+            lighter_exposure_multiplier="1",
+            lighter_exposure_multiplier_explicitly_configured=True,
+            sessions=(SimpleNamespace(valid_samples=54, max_gap_seconds=120),),
             reasons=("not_enough_sessions",),
             session_count=1,
             valid_sample_count=54,
@@ -399,6 +425,8 @@ def test_readiness_for_entries_keeps_three_session_sample_and_gap_rules(monkeypa
     assert report["ready"] is False
     assert report["market_data_ready"] is False
     assert report["data_fresh"] is True
+    assert report["historical_volume_bypass_ready"] is True
+    assert report["historical_volume_bypass_evidence_sessions"] == 1
     assert captured["minimum_sessions"] == 3
     assert captured["minimum_valid_samples_per_session"] == 1200
     assert captured["minimum_coverage_seconds"] == 21600
@@ -406,6 +434,40 @@ def test_readiness_for_entries_keeps_three_session_sample_and_gap_rules(monkeypa
     assert captured["maximum_sample_age_seconds"] == 120
     assert captured["expected_lighter_market_id"] == 145
     assert captured["expected_lighter_exposure_multiplier"] == Decimal("1")
+
+
+@pytest.mark.parametrize(
+    ("session_gap", "market_id", "multiplier", "expected"),
+    [
+        (120, 145, "1", True),
+        (120.01, 145, "1", False),
+        (120, 146, "1", False),
+        (120, 145, "2", False),
+    ],
+)
+def test_history_volume_bypass_keeps_identity_and_gap_evidence(
+    monkeypatch, session_gap, market_id, multiplier, expected,
+):
+    report = SimpleNamespace(
+        ready_for_bounded_live_review=False,
+        market_data_ready=False,
+        data_fresh=False,
+        ready_for_production_rotation=False,
+        lighter_market_id=market_id,
+        lighter_market_id_explicitly_configured=True,
+        lighter_exposure_multiplier=multiplier,
+        lighter_exposure_multiplier_explicitly_configured=True,
+        sessions=(SimpleNamespace(valid_samples=1, max_gap_seconds=session_gap),),
+        reasons=("insufficient_qualified_sessions_or_holdout",),
+        session_count=0,
+        valid_sample_count=1,
+        confirmed_roundtrips=0,
+    )
+    monkeypatch.setattr(wti_live, "assess_oil_readiness", lambda *_args, **_kwargs: report)
+    result = wti_live.readiness_for_new_entries(
+        [], market_id=145, multiplier=Decimal("1"), now=datetime.now(timezone.utc)
+    )
+    assert result["historical_volume_bypass_ready"] is expected
 
 
 def test_live_start_rechecks_readiness_instead_of_reusing_old_pass(monkeypatch, tmp_path):
@@ -583,8 +645,17 @@ def test_runtime_keeps_entry_gate_when_sample_gap_is_within_existing_limit():
 
 def _runtime_for_entry_gate(*, allow_unqualified: bool):
     runtime = object.__new__(wti_live.WTILiveRuntime)
-    runtime.args = SimpleNamespace(mode="live", allow_unqualified_data_pilot=allow_unqualified)
-    runtime.readiness = {"ready": False, "market_data_ready": False}
+    runtime.args = SimpleNamespace(
+        mode="live", allow_unqualified_data_pilot=allow_unqualified,
+        confirm_bounded_live_pilot=allow_unqualified,
+        confirm_bounded_gradient_pilot=False, gradient_live=False,
+        continuous_gradient_rotation=False, manage_existing_wti_position=False,
+        rotation_test_id=None,
+    )
+    runtime.readiness = {
+        "ready": False, "market_data_ready": False,
+        "historical_volume_bypass_ready": True,
+    }
     runtime.single_round_pilot = {"pilot_id": "pilot-1"}
     runtime.manage_existing_only = False
     runtime.entry_authorized = False
@@ -645,6 +716,22 @@ def test_unqualified_data_pilot_bypasses_history_only_with_fresh_verified_sample
     assert stale.entry_gate_block_reason == "wti_current_sample_or_session_not_fresh"
 
 
+def test_history_volume_bypass_does_not_authorize_without_clean_historical_evidence():
+    now = datetime.now(timezone.utc)
+    runtime = _runtime_for_entry_gate(allow_unqualified=True)
+    runtime.readiness["historical_volume_bypass_ready"] = False
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "single_round_pilot": {
+            "pilot_id": "pilot-1", "status": "available",
+            "completed_roundtrips": 0, "entry_attempts": 0,
+            "max_entry_attempts": 3,
+        },
+    }
+    assert not runtime._sync_entry_authorization(state, _live_sample(now), now=now)
+    assert runtime.entry_gate_block_reason == "wti_historical_volume_bypass_evidence_not_met"
+
+
 def test_degraded_startup_sample_blocks_entry_then_recovers_on_valid_sample():
     now = datetime.now(timezone.utc)
     runtime = _runtime_for_entry_gate(allow_unqualified=True)
@@ -696,6 +783,12 @@ def test_run_defers_startup_reconcile_age_race_and_recovers_in_live_loop(
         state_path=tmp_path / "wti-state.json",
         health_path=tmp_path / "wti-health.json",
         allow_unqualified_data_pilot=True,
+        confirm_bounded_live_pilot=True,
+        confirm_bounded_gradient_pilot=False,
+        gradient_live=False,
+        continuous_gradient_rotation=False,
+        manage_existing_wti_position=False,
+        rotation_test_id=None,
     )
     runtime.args.state_path.write_text(json.dumps({
         "status": "flat", "open_position": None, "pending_action": None,
@@ -1005,6 +1098,10 @@ def test_run_keeps_collector_alive_during_slow_history_scan_and_reconciles_fresh
     runtime._start_forwarder = no_op
     runtime._initialize_execution = initialize
     monkeypatch.setattr(wti_live, "read_basis_samples", slow_history)
+    monkeypatch.setattr(wti_live, "readiness_for_new_entries", lambda *_args, **_kwargs: {
+        "ready": False, "market_data_ready": False, "data_fresh": False,
+        "historical_volume_bypass_ready": True,
+    })
     monkeypatch.setattr(wti_live, "validate_startup_preconditions", lambda _args: None)
 
     async def run_bounded():
@@ -1419,7 +1516,10 @@ def test_initialization_handles_management_and_explicit_new_test_without_renewin
     before = runtime.args.state_path.read_bytes()
 
     async def readiness():
-        runtime.readiness = {"ready": False, "market_data_ready": False}
+        runtime.readiness = {
+            "ready": False, "market_data_ready": False,
+            "historical_volume_bypass_ready": True,
+        }
 
     market = {
         "market_id": 145, "symbol": "WTI", "market_type": "perp", "status": "active",

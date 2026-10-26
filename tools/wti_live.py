@@ -204,6 +204,21 @@ def readiness_for_new_entries(
         expected_lighter_market_id=market_id,
         expected_lighter_exposure_multiplier=multiplier,
     )
+    identity_is_consistent = bool(
+        report.lighter_market_id_explicitly_configured
+        and report.lighter_market_id == market_id
+        and report.lighter_exposure_multiplier_explicitly_configured
+        and report.lighter_exposure_multiplier is not None
+        and Decimal(str(report.lighter_exposure_multiplier)) == multiplier
+    )
+    has_clean_verified_history = any(
+        session.valid_samples > 0
+        and session.max_gap_seconds <= MAX_WTI_ENTRY_GAP_SECONDS
+        for session in report.sessions
+    )
+    historical_volume_bypass_ready = (
+        identity_is_consistent and has_clean_verified_history
+    )
     return {
         "ready": report.ready_for_bounded_live_review,
         "market_data_ready": report.market_data_ready,
@@ -213,7 +228,37 @@ def readiness_for_new_entries(
         "session_count": report.session_count,
         "valid_sample_count": report.valid_sample_count,
         "confirmed_roundtrips": report.confirmed_roundtrips,
+        "historical_volume_bypass_ready": historical_volume_bypass_ready,
+        "historical_volume_bypass_evidence_sessions": sum(
+            session.valid_samples > 0
+            and session.max_gap_seconds <= MAX_WTI_ENTRY_GAP_SECONDS
+            for session in report.sessions
+        ),
     }
+
+
+def _unqualified_data_pilot_enabled(args: argparse.Namespace) -> bool:
+    bounded_live = bool(
+        getattr(args, "confirm_bounded_live_pilot", False)
+        and not getattr(args, "gradient_live", False)
+    )
+    bounded_gradient = bool(
+        getattr(args, "gradient_live", False)
+        and getattr(args, "confirm_bounded_gradient_pilot", False)
+        and (
+            not getattr(args, "continuous_gradient_rotation", False)
+            or (
+                getattr(args, "confirm_continuous_gradient_rotation", False)
+                and bool(getattr(args, "rotation_test_id", None))
+            )
+        )
+    )
+    return bool(
+        getattr(args, "mode", None) == "live"
+        and getattr(args, "allow_unqualified_data_pilot", False)
+        and (bounded_live or bounded_gradient)
+        and not getattr(args, "manage_existing_wti_position", False)
+    )
 
 
 def _session_window(
@@ -490,7 +535,7 @@ class WTILiveRuntime:
                 else:
                     if (
                         not self.readiness.get("market_data_ready", self.readiness["ready"])
-                        and not getattr(self.args, "allow_unqualified_data_pilot", False)
+                        and not self._historical_volume_bypass_authorized()
                     ):
                         raise RuntimeError(
                             "wti_new_entries_blocked_by_data_readiness:" + ",".join(self.readiness["reasons"])
@@ -517,7 +562,7 @@ class WTILiveRuntime:
                     raise RuntimeError("explicit_bounded_live_pilot_confirmation_required")
                 if (
                     not self.readiness.get("market_data_ready", self.readiness["ready"])
-                    and not getattr(self.args, "allow_unqualified_data_pilot", False)
+                    and not self._historical_volume_bypass_authorized()
                 ):
                     raise RuntimeError(
                         "wti_new_entries_blocked_by_data_readiness:" + ",".join(self.readiness["reasons"])
@@ -609,6 +654,11 @@ class WTILiveRuntime:
             "entry_cutoff_seconds": self.config.entry_cutoff_seconds,
             "max_notional_usd": str(self.args._validated_notional),
             "max_slippage_bps": str(self.args._validated_slippage),
+            "historical_readiness_mode": (
+                "bounded_pilot_history_volume_bypass"
+                if _unqualified_data_pilot_enabled(self.args)
+                else "qualified_history_required"
+            ),
         }
 
     def _gradient_pilot_config(self) -> dict[str, Any]:
@@ -678,15 +728,23 @@ class WTILiveRuntime:
                 return False
         fresh = self._sample_health_fresh(row, now)
         qualified = bool(self.readiness.get("market_data_ready")) and fresh
-        unqualified_pilot = bool(
-            getattr(self.args, "allow_unqualified_data_pilot", False)
-        )
-        self.entry_authorized = fresh and (qualified or unqualified_pilot)
+        volume_bypass = self._historical_volume_bypass_authorized()
+        self.entry_authorized = fresh and (qualified or volume_bypass)
         self.entry_gate_block_reason = None if self.entry_authorized else (
             "wti_current_sample_or_session_not_fresh"
-            if not fresh else "wti_data_readiness_not_met"
+            if not fresh else (
+                "wti_historical_volume_bypass_evidence_not_met"
+                if _unqualified_data_pilot_enabled(self.args) and not volume_bypass
+                else "wti_data_readiness_not_met"
+            )
         )
         return self.entry_authorized
+
+    def _historical_volume_bypass_authorized(self) -> bool:
+        return bool(
+            _unqualified_data_pilot_enabled(self.args)
+            and self.readiness.get("historical_volume_bypass_ready") is True
+        )
 
     def _finish_single_round_pilot_if_done(self, state: dict[str, Any]) -> bool:
         pilot = state.get("single_round_pilot") or {}
@@ -1136,8 +1194,20 @@ class WTILiveRuntime:
             ),
             "historical_readiness_gate_bypassed": bool(
                 self.args.mode == "live"
-                and getattr(self.args, "allow_unqualified_data_pilot", False)
+                and _unqualified_data_pilot_enabled(self.args)
                 and not self.readiness.get("market_data_ready")
+                and self.readiness.get("historical_volume_bypass_ready") is True
+            ),
+            "historical_readiness_bypass_scope": (
+                "session_count_sample_count_and_coverage_only"
+                if self.args.mode == "live"
+                and _unqualified_data_pilot_enabled(self.args)
+                and not self.readiness.get("market_data_ready")
+                and self.readiness.get("historical_volume_bypass_ready") is True
+                else None
+            ),
+            "historical_volume_bypass_evidence_ready": bool(
+                self.readiness.get("historical_volume_bypass_ready")
             ),
             "single_round_pilot": state.get("single_round_pilot"),
             "gradient_pilot": state.get("gradient_pilot"),
@@ -1658,7 +1728,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--allow-unqualified-data-pilot",
         action="store_true",
-        help="allow one durable live round with unqualified history; current market/account guards still apply",
+        help="bypass only historical session/sample/coverage counts for an explicitly confirmed live pilot; live gates still apply",
     )
     parser.add_argument("--manage-existing-wti-position", action="store_true")
     parser.add_argument("--entry-threshold-bps", type=Decimal)
@@ -1684,6 +1754,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lighter-base-url", default=DEFAULT_LIGHTER_URL)
     parser.add_argument("--expected-lighter-market-id", type=int)
     args = parser.parse_args(argv)
+    bounded_history_mode = bool(
+        args.mode == "live"
+        and (
+            (args.confirm_bounded_live_pilot and not args.gradient_live)
+            or (args.gradient_live and args.confirm_bounded_gradient_pilot)
+        )
+    )
+    explicitly_confirmed_continuous_mode = bool(
+        args.mode == "live" and args.gradient_live
+        and args.confirm_bounded_gradient_pilot
+        and args.continuous_gradient_rotation
+        and args.confirm_continuous_gradient_rotation
+        and args.rotation_test_id
+    )
+    if args.allow_unqualified_data_pilot and not (
+        bounded_history_mode or explicitly_confirmed_continuous_mode
+    ):
+        parser.error(
+            "historical data bypass requires an explicitly confirmed live pilot or rotation mode"
+        )
+    if args.allow_unqualified_data_pilot and args.manage_existing_wti_position:
+        parser.error("historical data bypass cannot be used for management-only mode")
     if args.new_pilot_after and (args.mode != "live" or not args.confirm_bounded_live_pilot):
         parser.error("new-pilot-after requires explicit bounded live pilot mode")
     if len({args.forwarder_ws_port, args.forwarder_rest_port, args.forwarder_command_port}) != 3:

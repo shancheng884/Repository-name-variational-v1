@@ -123,16 +123,16 @@ and at most 120 seconds of latest-sample age.
 
 For a deliberately unqualified-history trial, add
 `--allow-unqualified-data-pilot` together with
-`--confirm-bounded-live-pilot`. This bypasses only the historical session-count
-gate. Every entry still requires a fresh valid two-venue sample, verified open
-session, continuity within 120 seconds, exact instrument metadata, reconciled
-flat positions and passing live account-risk checks. The runner persists one
-pilot in `log/wti_live_state.json`, allows at most three entry attempts, and
-stops entry authorization permanently after one paired open/close confirmed
-flat. If a position or order is uncertain, it keeps reconciling and managing
-exposure; it does not treat the pilot as complete. Restarting with changed pilot
-thresholds or after completion is rejected. The readiness report remains
-unqualified and this mode is not production-rotation approval.
+an explicit bounded-pilot confirmation. This waives only the historical
+minimum of three sessions, 1,200 samples per session, and six hours of coverage
+per session. It still requires at least one verified historical WTI session
+with matching instrument identity and no in-session sample gap above 120
+seconds. Every entry still requires a fresh valid two-venue sample, verified
+open session, continuity within 120 seconds, exact instrument metadata,
+reconciled positions and orders, and passing live account-risk checks. The
+runner records the bypass scope in its durable pilot configuration and health
+report. The readiness report remains unqualified and this mode is not
+production-rotation approval.
 
 The bounded pilot defaults to $20 notional and has a hard $25 maximum, an 8 bps
 maximum execution boundary, a six-hour maximum hold, and a minimum 30-minute
@@ -152,7 +152,9 @@ reconciliation, live account-risk checks, exit logic, and slippage limits remain
 enforced. An exit, risk block, session cutoff, sample gap, or execution
 uncertainty prevents adding a layer. A completed or exhausted pilot cannot be
 reset by restarting with altered settings. The history bypass flag, when used,
-bypasses only historical qualification and is not production approval.
+skips only historical session/sample/coverage counts; instrument identity,
+verified-session and historical-gap evidence, real-time entry checks, live risk,
+and production-rotation approval are not bypassed.
 
 `tools/rotation_supervisor.py` coordinates the ETH/WTI handoff. Its default
 `--rehearse` mode is read-only. Live supervision requires both explicit
