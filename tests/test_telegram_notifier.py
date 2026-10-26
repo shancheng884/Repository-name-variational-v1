@@ -1,10 +1,31 @@
 import asyncio
 import logging
+import json
+
+import pytest
+
+from tools.lib import telegram_notifier as telegram_module
 
 from tools.lib.telegram_notifier import (
     TelegramNotifier,
     format_telegram_trade_message,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated_alert_control(monkeypatch, tmp_path):
+    monkeypatch.setattr(telegram_module, "ALERT_CONTROL_PATH", tmp_path / "alert-control.json")
+
+
+def test_operator_silence_still_blocks_queue_without_sending():
+    telegram_module.ALERT_CONTROL_PATH.write_text(json.dumps({
+        "notifications_enabled": False, "reason": "operator_silence",
+    }))
+    notifier = TelegramNotifier(
+        bot_token="test-only-token", chat_id="123", logger=logging.getLogger("test_telegram_silence"),
+    )
+    assert notifier.enqueue("live_inventory_final_pnl", {}) is False
+    assert notifier.queue.empty()
 
 
 def test_telegram_entry_message_contains_execution_details() -> None:
