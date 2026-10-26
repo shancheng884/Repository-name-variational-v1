@@ -122,7 +122,12 @@ def stop_old_runtime(root: Path, *, timeout: float = 30) -> None:
     raise RuntimeError("old_wti_runtime_did_not_exit_no_force_kill")
 
 
-def management_command(root: Path, *, new_pilot_after: str | None = None) -> list[str]:
+def management_command(
+    root: Path, *, new_pilot_after: str | None = None,
+    new_gradient_after: str | None = None,
+) -> list[str]:
+    if new_pilot_after and new_gradient_after:
+        raise RuntimeError("choose_single_or_gradient_round")
     command = [
         str(root / ".venv/bin/python"), "tools/wti_live.py", "--mode", "live",
         "--confirm-eth-flat", "--i-understand-live-orders",
@@ -131,7 +136,13 @@ def management_command(root: Path, *, new_pilot_after: str | None = None) -> lis
         "--max-notional-usd", "20", "--max-slippage-bps", "8",
         "--max-hold-seconds", "21600", "--entry-cutoff-seconds", "1800",
     ]
-    if new_pilot_after is None:
+    if new_gradient_after is not None:
+        command.extend([
+            "--gradient-live", "--confirm-bounded-gradient-pilot", "--allow-unqualified-data-pilot",
+            "--gradient-second-tier-bps", "45", "--gradient-layer-notional-usd", "20",
+            "--new-gradient-pilot-after", new_gradient_after, "--keep-collecting-after-pilot",
+        ])
+    elif new_pilot_after is None:
         command.append("--manage-existing-wti-position")
     else:
         command.extend([
@@ -141,7 +152,10 @@ def management_command(root: Path, *, new_pilot_after: str | None = None) -> lis
     return command
 
 
-def recovery_status(root: Path, *, previous_run: str | None, new_pilot_after: str | None = None) -> dict:
+def recovery_status(
+    root: Path, *, previous_run: str | None, new_pilot_after: str | None = None,
+    new_gradient_after: str | None = None,
+) -> dict:
     state = read_json(root / "log/wti_live_state.json")
     health = read_json(root / "log/wti_live_risk_health.json")
     pids = runtime_processes(root)
@@ -245,6 +259,29 @@ def recovery_status(root: Path, *, previous_run: str | None, new_pilot_after: st
                 or (pilot.get("status") == "completed" and state.get("status") == "flat")
             )
         )
+    if new_gradient_after is not None:
+        pilot = state.get("gradient_pilot") or {}
+        complete = bool(
+            current and collecting and cycle_verified and account_reconciled
+            and health.get("startup_reconciled") is True
+            and health.get("manage_existing_only") is False and not state.get("pending_action")
+            and pilot.get("previous_pilot_id") == new_gradient_after
+            and pilot.get("pilot_id") != new_gradient_after
+            and pilot.get("authorization_kind") == "manual_new_round"
+            and pilot.get("continuous_rotation") is False and pilot.get("rotation_test_id") is None
+            and (
+                state.get("status") != "open"
+                or (state.get("open_position") or {}).get("gradient_pilot_id") == pilot.get("pilot_id")
+            )
+            and (
+                (pilot.get("status") == "available" and state.get("status") == "flat"
+                 and health.get("wti_entry_authorized") is True
+                 and health.get("risk_action") in {"normal", "warning"}
+                 and health.get("risk_data_complete") is True)
+                or (pilot.get("status") == "in_position" and state.get("status") == "open")
+                or (pilot.get("status") in {"completed", "exhausted"} and state.get("status") == "flat")
+            )
+        )
     reason = runtime_error or state.get("manual_review_reason") or health.get("risk_reason")
     if current and not runtime_error and not complete:
         if not runtime_clean:
@@ -265,7 +302,10 @@ def recovery_status(root: Path, *, previous_run: str | None, new_pilot_after: st
             else "fresh_samples" if sample_collection_live else "unverified"
         ),
         "market_status": collector.get("market_status"),
-        "purpose": "single_round_live_test" if new_pilot_after else "manage_existing",
+        "purpose": (
+            "manual_gradient_live" if new_gradient_after else
+            "single_round_live_test" if new_pilot_after else "manage_existing"
+        ),
         "entry_authorized": health.get("wti_entry_authorized"),
         "risk_action": health.get("risk_action"),
         "pilot_id": pilot.get("pilot_id"), "pilot_status": pilot.get("status"),
@@ -275,8 +315,55 @@ def recovery_status(root: Path, *, previous_run: str | None, new_pilot_after: st
     }
 
 
-def execute_takeover(root: Path, *, wait_seconds: float = 90, start_pilot: bool = False) -> dict:
+def _validate_manual_gradient_request(state: dict, predecessor: str) -> None:
+    if not re.fullmatch(r"[0-9a-f]{32}", predecessor):
+        raise RuntimeError("manual_gradient_predecessor_invalid")
+    pilot = state.get("gradient_pilot") or {}
+    if (pilot.get("continuous_rotation") or pilot.get("rotation_test_id")
+            or state.get("gradient_rotation_session") is not None):
+        raise RuntimeError("manual_gradient_request_cannot_take_over_rotation")
+    if pilot.get("pilot_id") == predecessor:
+        if (state.get("status") != "flat" or state.get("pending_action") or state.get("open_position")
+                or pilot.get("status") not in {"completed", "exhausted"}):
+            raise RuntimeError("manual_gradient_start_requires_terminal_flat_predecessor")
+    elif (pilot.get("previous_pilot_id") != predecessor
+          or pilot.get("authorization_kind") != "manual_new_round"):
+        raise RuntimeError("manual_gradient_predecessor_identity_mismatch")
+    position = state.get("open_position")
+    if position is not None and position.get("gradient_pilot_id") != pilot.get("pilot_id"):
+        raise RuntimeError("manual_gradient_position_identity_mismatch")
+
+
+def _runtime_command(pid: int) -> list[str]:
+    return [os.fsdecode(x) for x in Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")]
+
+
+def execute_takeover(
+    root: Path, *, wait_seconds: float = 90, start_pilot: bool = False,
+    start_gradient_after: str | None = None,
+) -> dict:
+    if start_pilot and start_gradient_after:
+        raise RuntimeError("choose_single_or_gradient_round")
     state = validate_local_state(root)
+    if start_gradient_after:
+        _validate_manual_gradient_request(state, start_gradient_after)
+        if script_processes(root, "main.py"):
+            raise RuntimeError("eth_runtime_still_running")
+        if script_processes(root, "tools/rotation_supervisor.py"):
+            raise RuntimeError("rotation_supervisor_still_running")
+        pids = runtime_processes(root)
+        if len(pids) > 1:
+            raise RuntimeError("multiple_wti_runtimes")
+        if pids:
+            argv = _runtime_command(pids[0])
+            flag = "--new-gradient-pilot-after"
+            if flag in argv and argv[argv.index(flag) + 1:argv.index(flag) + 2] == [start_gradient_after]:
+                return {
+                    **recovery_status(root, previous_run=None, new_gradient_after=start_gradient_after),
+                    "existing_runtime_preserved": True,
+                }
+            if "--manage-existing-wti-position" not in argv:
+                raise RuntimeError("manual_gradient_start_requires_management_or_matching_runtime")
     previous_pilot = state.get("single_round_pilot") or {}
     new_pilot_after = None
     if start_pilot:
@@ -290,13 +377,17 @@ def execute_takeover(root: Path, *, wait_seconds: float = 90, start_pilot: bool 
     old_health = root / "log/wti_live_risk_health.json"
     previous_run = read_json(old_health).get("run_id") if old_health.exists() else None
     subprocess.run(["tmux", "-V"], check=True, capture_output=True)
-    command = management_command(root, new_pilot_after=new_pilot_after)
+    command = management_command(
+        root, new_pilot_after=new_pilot_after, new_gradient_after=start_gradient_after
+    )
     if not Path(command[0]).is_file():
         raise RuntimeError("workspace_python_missing")
     if not (root / ".env").is_file():
         raise RuntimeError("workspace_env_missing")
     stop_old_runtime(root)
     stopped_state = validate_local_state(root)
+    if start_gradient_after:
+        _validate_manual_gradient_request(stopped_state, start_gradient_after)
     if start_pilot and (
         stopped_state.get("status") != "flat" or stopped_state.get("pending_action")
         or (stopped_state.get("single_round_pilot") or {}).get("pilot_id") != new_pilot_after
@@ -317,7 +408,10 @@ def execute_takeover(root: Path, *, wait_seconds: float = 90, start_pilot: bool 
     result = {}
     while True:
         try:
-            result = recovery_status(root, previous_run=previous_run, new_pilot_after=new_pilot_after)
+            result = recovery_status(
+                root, previous_run=previous_run, new_pilot_after=new_pilot_after,
+                **({"new_gradient_after": start_gradient_after} if start_gradient_after else {}),
+            )
         except (OSError, ValueError, KeyError):
             result = {"recovered": False, "reason": "awaiting_current_runtime_health"}
         result.update({"session": session, "log": str(log)})
@@ -334,7 +428,9 @@ def execute_takeover(root: Path, *, wait_seconds: float = 90, start_pilot: bool 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--start-pilot", action="store_true", help="explicitly authorize one new live test round")
+    start_group = parser.add_mutually_exclusive_group()
+    start_group.add_argument("--start-pilot", action="store_true", help="explicitly authorize one new live test round")
+    start_group.add_argument("--start-gradient-pilot-after", help="authorize one manual five-tier round after this exact terminal predecessor; repeated requests never renew it")
     parser.add_argument("--confirm-eth-flat", action="store_true")
     parser.add_argument("--i-understand-live-orders", action="store_true")
     args = parser.parse_args(argv)
@@ -349,7 +445,9 @@ def main(argv: list[str] | None = None) -> int:
 
         with (ROOT / "log/wti_takeover.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            result = execute_takeover(ROOT, start_pilot=args.start_pilot)
+            result = execute_takeover(
+                ROOT, start_pilot=args.start_pilot, start_gradient_after=args.start_gradient_pilot_after
+            )
         print(json.dumps(result, ensure_ascii=True))
         return 0 if result["recovered"] else 2
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:

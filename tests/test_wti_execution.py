@@ -2310,3 +2310,112 @@ def test_terminal_fill_response_must_include_quantity_order_id_and_final_flag(tm
     assert state["status"] == "manual_review_required"
     assert state["pending_action"]["legs"]["variational"]["result"]["classification"] == "unknown"
     assert len(gateway.requests) == 1
+
+
+def _completed_manual_gradient(executor):
+    pilot = _gradient_pilot(executor)
+    _open(executor, notional_usd="10", layer_id="original-layer", gradient_tier=1,
+          gradient_pilot_id=pilot["pilot_id"])
+    state = executor.close(sample=_sample(), session=_session())
+    assert state["gradient_pilot"]["status"] == "completed"
+    executor.reconcile_account_only(runtime_pid=777, runtime_run_id="manual-runtime")
+    return state["gradient_pilot"]
+
+
+def test_manual_gradient_archives_once_and_retry_never_renews_budget(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    old = _completed_manual_gradient(executor)
+    kwargs = dict(
+        market_id=145, multiplier=Decimal("1"), config=old["config"], max_layers=2,
+        manual_new_pilot_after=old["pilot_id"], runtime_pid=777, runtime_run_id="manual-runtime",
+    )
+    new = executor.store.initialize_gradient_pilot(**kwargs)
+    assert new["pilot_id"] != old["pilot_id"]
+    assert new["authorization_kind"] == "manual_new_round"
+    assert new["previous_pilot_id"] == old["pilot_id"]
+    assert new["continuous_rotation"] is False and new["rotation_test_id"] is None
+    assert executor.store.load()["gradient_pilot_history"] == [old]
+    assert executor.store.initialize_gradient_pilot(**kwargs)["pilot_id"] == new["pilot_id"]
+    _open(executor, notional_usd="10", layer_id="manual-layer", gradient_tier=1,
+          gradient_pilot_id=new["pilot_id"])
+    assert len(gateway.requests) == 6
+    assert executor.store.initialize_gradient_pilot(**kwargs)["pilot_id"] == new["pilot_id"]
+    assert len(gateway.requests) == 6
+    executor.close(sample=_sample(), session=_session())
+    repeated = executor.store.initialize_gradient_pilot(**kwargs)
+    assert repeated["pilot_id"] == new["pilot_id"] and repeated["status"] == "completed"
+    assert len(executor.store.load()["gradient_pilot_history"]) == 1
+    assert len(gateway.requests) == 8
+    assert not executor.store.load().get("gradient_rotation_session")
+
+
+@pytest.mark.parametrize("case", [
+    "stale", "future", "pid", "run", "position", "orders", "unverified", "config", "predecessor", "pending",
+])
+def test_manual_gradient_requires_exact_terminal_budget_and_current_flat_proof(tmp_path, case):
+    executor, gateway = _executor(tmp_path)
+    old = _completed_manual_gradient(executor)
+    state = executor.store.load()
+    proof = state["last_account_reconciliation"]
+    config = deepcopy(old["config"])
+    predecessor = old["pilot_id"]
+    if case == "stale":
+        proof["observed_at"] = (datetime.now(timezone.utc) - timedelta(seconds=16)).isoformat()
+    elif case == "future":
+        proof["observed_at"] = (datetime.now(timezone.utc) + timedelta(seconds=6)).isoformat()
+    elif case == "pid":
+        proof["runtime_pid"] = 776
+    elif case == "run":
+        proof["runtime_run_id"] = "previous-runtime"
+    elif case == "position":
+        proof["variational_qty"] = "0.1"
+    elif case == "orders":
+        proof["active_order_count"] = 1
+    elif case == "unverified":
+        proof["verified"] = False
+    elif case == "config":
+        config["layer_notional_usd"] = "11"
+    elif case == "predecessor":
+        predecessor = "wrong-predecessor"
+    elif case == "pending":
+        state.update(status="pending", pending_action={"kind": "open"})
+    executor.store.save(state)
+    before = executor.store.path.read_bytes()
+    with pytest.raises(WTIExecutionError):
+        executor.store.initialize_gradient_pilot(
+            market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+            manual_new_pilot_after=predecessor, runtime_pid=777, runtime_run_id="manual-runtime",
+        )
+    assert executor.store.path.read_bytes() == before
+    assert len(gateway.requests) == 4
+
+
+def test_manual_gradient_start_cannot_be_combined_with_rotation(tmp_path):
+    executor, _ = _executor(tmp_path)
+    old = _completed_manual_gradient(executor)
+    with pytest.raises(ValueError, match="cannot_enable_rotation"):
+        executor.store.initialize_gradient_pilot(
+            market_id=145, multiplier=Decimal("1"), config=old["config"], max_layers=2,
+            manual_new_pilot_after=old["pilot_id"], continuous_rotation=True, rotation_test_id="a" * 32,
+        )
+
+
+def test_manual_gradient_retry_preserves_unknown_submitted_leg_without_resend(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    old = _completed_manual_gradient(executor)
+    kwargs = dict(
+        market_id=145, multiplier=Decimal("1"), config=old["config"], max_layers=2,
+        manual_new_pilot_after=old["pilot_id"], runtime_pid=777, runtime_run_id="manual-runtime",
+    )
+    new = executor.store.initialize_gradient_pilot(**kwargs)
+    gateway.results["variational"] = {"ok": False, "status": "unknown", "execute_status": "filled"}
+    state = _open(executor, notional_usd="10", layer_id="manual-unknown-layer", gradient_tier=1,
+                  gradient_pilot_id=new["pilot_id"])
+    assert state["status"] == "manual_review_required" and len(gateway.requests) == 5
+    intent = state["pending_action"]["action_id"]
+    for _ in range(3):
+        assert executor.store.initialize_gradient_pilot(**kwargs)["pilot_id"] == new["pilot_id"]
+        reconciled = executor.reconcile(sample=_sample(), session=_session())
+        assert reconciled["pending_action"]["action_id"] == intent
+        assert len(gateway.requests) == 5
+    assert len(executor.store.load()["gradient_pilot_history"]) == 1

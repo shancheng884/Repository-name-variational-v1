@@ -496,6 +496,23 @@ historical-data pilot path described above.
 
 ## Booked Variational Order Recovery
 
+For a separately authorized manual five-tier round, use the takeover command
+with `--start-gradient-pilot-after` and the exact confirmed terminal gradient
+pilot ID. It is separate from `--start-pilot` (single round without gradient)
+and never enables the rotation supervisor or continuous rounds. Keep this
+predecessor ID fixed when retrying; do not replace it with the newly created
+pilot ID. The runtime first reconciles its own two accounts and active orders,
+checks live risk/session/freshness and the unchanged configuration, then
+atomically archives the terminal predecessor and creates one successor. The
+historical-volume exemption remains the existing explicitly bounded pilot mode;
+real-time guards and higher-tier history maturity gates are unchanged.
+
+Repeated requests adopt that same successor and preserve submitted order intents.
+An already running process with the same request is never restarted by a repeat
+command, even while it is waiting for reconciliation. A completed successor is
+not renewed by repeating the old request. After completion the runtime keeps
+collecting with entries disabled until another separately authorized request.
+
 Management-only takeover never selects the gradient entry strategy, calculates
 entry capacity, or arms another round from a saved gradient record. Completed
 and exhausted pilots remain historical evidence only. Existing positions still

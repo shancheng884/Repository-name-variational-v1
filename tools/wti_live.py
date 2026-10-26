@@ -514,7 +514,33 @@ class WTILiveRuntime:
                     getattr(self.args, "continuous_gradient_rotation", False)
                 )
                 existing_gradient = existing.get("gradient_pilot") or {}
-                if (
+                manual_after = getattr(self.args, "new_gradient_pilot_after", None)
+                if manual_after:
+                    if existing_gradient.get("pilot_id") == manual_after:
+                        if (
+                            local_exposure or existing_gradient.get("status") not in {"completed", "exhausted"}
+                            or existing_gradient.get("config") != self._gradient_pilot_config()
+                            or existing_gradient.get("max_layers") != WTI_GRADIENT_MAX_LAYERS
+                        ):
+                            raise RuntimeError("manual_gradient_requires_terminal_flat_unchanged_predecessor")
+                        if (
+                            not self.readiness.get("market_data_ready", self.readiness["ready"])
+                            and not self._historical_volume_bypass_authorized()
+                        ):
+                            raise RuntimeError("manual_gradient_history_gate_not_met")
+                        # Arming waits for this runtime's fresh dual-account
+                        # reconciliation, not an inherited manager heartbeat.
+                        self.gradient_pilot = dict(existing_gradient)
+                    else:
+                        if local_exposure and not gradient_pilot_owns_exposure(existing):
+                            raise RuntimeError("manual_gradient_successor_exposure_identity_mismatch")
+                        self.gradient_pilot = store.initialize_gradient_pilot(
+                            market_id=int(market["market_id"]),
+                            multiplier=Decimal(str(market["multiplier"])),
+                            config=self._gradient_pilot_config(), max_layers=WTI_GRADIENT_MAX_LAYERS,
+                            manual_new_pilot_after=manual_after,
+                        )
+                elif (
                     continuous_rotation
                     and existing_gradient.get("status") == "completed"
                     and not local_exposure
@@ -925,6 +951,48 @@ class WTILiveRuntime:
             next_pilot.get("pilot_id"),
         )
         return state
+
+    async def _arm_manual_gradient_round(
+        self, state: dict[str, Any], row: dict[str, Any]
+    ) -> dict[str, Any]:
+        predecessor = getattr(self.args, "new_gradient_pilot_after", None)
+        if not predecessor or (state.get("gradient_pilot") or {}).get("pilot_id") != predecessor:
+            return state
+        if (
+            self.manage_existing_only or self.entry_authorization_permanently_revoked
+            or getattr(self, "rotation_drain_request", None) is not None
+            or state.get("status") != "flat" or state.get("open_position") is not None
+            or state.get("pending_action") is not None
+        ):
+            self.entry_authorized = False
+            return state
+        candidate = await self._decision_sample(row)
+        if candidate is None:
+            return state
+        now = datetime.now(timezone.utc)
+        if (
+            self.last_risk.get("risk_action") not in {"normal", "warning"}
+            or self._gradient_equity_capacity_by_tier() is None
+            or not _session_window(candidate, now, self.config.entry_cutoff_seconds).allow_new_entries
+        ):
+            self.entry_authorized = False
+            self.entry_gate_block_reason = "manual_gradient_start_waiting_for_live_risk_and_session"
+            return state
+        assert self.pilot_store is not None and self.market_metadata is not None
+        self.gradient_pilot = await asyncio.to_thread(
+            self.pilot_store.initialize_gradient_pilot,
+            market_id=int(self.market_metadata["market_id"]),
+            multiplier=Decimal(str(self.market_metadata["multiplier"])),
+            config=self._gradient_pilot_config(), max_layers=WTI_GRADIENT_MAX_LAYERS,
+            manual_new_pilot_after=predecessor, runtime_pid=os.getpid(), runtime_run_id=self.run_id,
+        )
+        self.entry_authorized = False
+        self.entry_gate_block_reason = "manual_gradient_round_armed_waiting_for_fresh_sample"
+        self.logger.info(
+            "manual_gradient_round_armed predecessor=%s pilot_id=%s",
+            predecessor, self.gradient_pilot["pilot_id"],
+        )
+        return self.pilot_store.load()
 
     def _refresh_readiness(self) -> None:
         if self.args.mode != "live" or not self.market_metadata:
@@ -1619,6 +1687,7 @@ class WTILiveRuntime:
 
         self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
         self.startup_reconciled = state.get("status") in {"flat", "open"}
+        state = await self._arm_manual_gradient_round(state, candidate)
         state = await self._advance_continuous_gradient_round(state)
         self._sync_entry_authorization(
             state, candidate, now=datetime.now(timezone.utc)
@@ -1650,6 +1719,7 @@ class WTILiveRuntime:
         self.last_risk = dict(self.gateway.latest_risk)
         self._poll_rotation_drain()
         if getattr(self, "rotation_drain_request", None) is None:
+            state = await self._arm_manual_gradient_round(state, row)
             state = await self._advance_continuous_gradient_round(state)
         if state.get("status") != "flat" and state.get("status") != "open":
             self.last_action = {"action": "reconcile", "reason": state.get("manual_review_reason") or state.get("status")}
@@ -2010,6 +2080,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--i-understand-live-orders", action="store_true")
     parser.add_argument("--confirm-bounded-live-pilot", action="store_true")
     parser.add_argument("--gradient-live", action="store_true")
+    parser.add_argument("--new-gradient-pilot-after", help="explicit manual new round after this exact terminal gradient pilot; never enables rotation")
     parser.add_argument("--confirm-bounded-gradient-pilot", action="store_true")
     parser.add_argument("--continuous-gradient-rotation", action="store_true")
     parser.add_argument("--confirm-continuous-gradient-rotation", action="store_true")
@@ -2071,6 +2142,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("historical data bypass cannot be used for management-only mode")
     if args.new_pilot_after and (args.mode != "live" or not args.confirm_bounded_live_pilot):
         parser.error("new-pilot-after requires explicit bounded live pilot mode")
+    if args.new_gradient_pilot_after and (
+        args.mode != "live" or not args.gradient_live or not args.confirm_bounded_gradient_pilot
+        or args.continuous_gradient_rotation or args.rotation_test_id
+        or not re.fullmatch(r"[0-9a-f]{32}", args.new_gradient_pilot_after)
+    ):
+        parser.error("new-gradient-pilot-after requires an exact manual bounded gradient predecessor without rotation")
     if len({args.forwarder_ws_port, args.forwarder_rest_port, args.forwarder_command_port}) != 3:
         parser.error("forwarder ports must be distinct")
     if any(not 1 <= port <= 65535 for port in (

@@ -757,11 +757,16 @@ class WTIExecutionStore:
         rotation_test_id: str | None = None,
         continuous_rotation: bool = False,
         new_pilot_after: str | None = None,
+        manual_new_pilot_after: str | None = None,
+        runtime_pid: int | None = None,
+        runtime_run_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(max_layers, int) or isinstance(max_layers, bool) or max_layers < 2:
             raise ValueError("gradient_pilot_requires_at_least_two_layers")
         if continuous_rotation and not rotation_test_id:
             raise ValueError("continuous_gradient_rotation_id_required")
+        if manual_new_pilot_after and (continuous_rotation or rotation_test_id or new_pilot_after):
+            raise ValueError("manual_gradient_round_cannot_enable_rotation")
         with self.exclusive():
             state = self.load()
             pilot = state.get("gradient_pilot")
@@ -790,8 +795,65 @@ class WTIExecutionStore:
                     "started_at": _utc_now(),
                 }
 
+            manual_successor = False
+            if manual_new_pilot_after is not None:
+                if not isinstance(pilot, dict) or not manual_new_pilot_after:
+                    raise WTIExecutionError("manual_gradient_predecessor_missing")
+                if pilot.get("pilot_id") == manual_new_pilot_after:
+                    terminal = (
+                        pilot.get("status") == "completed"
+                        and pilot.get("completed_roundtrips") == 1
+                    ) or (
+                        pilot.get("status") == "exhausted"
+                        and pilot.get("completed_roundtrips") == 0
+                        and not pilot.get("layers_opened")
+                    )
+                    if (
+                        not flat or not terminal or pilot.get("schema_version") != 1
+                        or pilot.get("market_id") != market_id
+                        or decimal_value(pilot.get("multiplier")) != multiplier
+                        or pilot.get("config") != config or pilot.get("max_layers") != max_layers
+                        or pilot.get("continuous_rotation") or pilot.get("rotation_test_id")
+                        or state.get("gradient_rotation_session") is not None
+                    ):
+                        raise WTIExecutionError("manual_gradient_requires_terminal_flat_unchanged_predecessor")
+                    proof = state.get("last_account_reconciliation") or {}
+                    try:
+                        observed = _sample_time(proof.get("observed_at"))
+                        proof_age = (datetime.now(timezone.utc) - observed).total_seconds()
+                    except WTIExecutionError:
+                        proof_age = float("inf")
+                    if (
+                        not runtime_pid or not runtime_run_id
+                        or proof.get("verified") is not True
+                        or proof.get("runtime_pid") != runtime_pid
+                        or proof.get("runtime_run_id") != runtime_run_id
+                        or proof.get("market_id") != market_id
+                        or proof.get("active_order_count") != 0
+                        or decimal_value(proof.get("variational_qty")) != 0
+                        or decimal_value(proof.get("lighter_qty")) != 0
+                        or not -5 <= proof_age <= 15
+                    ):
+                        raise WTIExecutionError("manual_gradient_requires_current_runtime_dual_flat_proof")
+                    successor = make_pilot(
+                        round_number=int(pilot.get("round_number", 0)) + 1,
+                        previous_pilot_id=manual_new_pilot_after,
+                    )
+                    successor["authorization_kind"] = "manual_new_round"
+                    state.setdefault("gradient_pilot_history", []).append(deepcopy(pilot))
+                    state["gradient_pilot"] = successor
+                    self.save(state)
+                    pilot = successor
+                elif (
+                    pilot.get("previous_pilot_id") != manual_new_pilot_after
+                    or pilot.get("authorization_kind") != "manual_new_round"
+                ):
+                    raise WTIExecutionError("manual_gradient_predecessor_identity_mismatch")
+                manual_successor = True
+
             if (
                 isinstance(pilot, dict)
+                and manual_new_pilot_after is None
                 and new_pilot_after is None
                 and not continuous_rotation
                 and rotation_test_id is None
@@ -953,6 +1015,12 @@ class WTIExecutionStore:
             ):
                 raise WTIExecutionError("gradient_pilot_configuration_or_state_mismatch")
             if pilot.get("status") in {"completed", "exhausted"}:
+                if manual_successor and flat and (
+                    (pilot.get("status") == "completed" and pilot.get("completed_roundtrips") == 1)
+                    or (pilot.get("status") == "exhausted" and pilot.get("completed_roundtrips") == 0
+                        and not pilot.get("layers_opened"))
+                ):
+                    return deepcopy(pilot)
                 raise WTIExecutionError("gradient_pilot_budget_unavailable")
             if pilot.get("completed_roundtrips") != 0:
                 raise CorruptExecutionState("active gradient pilot has completed roundtrips")

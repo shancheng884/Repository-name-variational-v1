@@ -364,3 +364,91 @@ def test_new_live_test_acceptance_requires_actual_new_entry_authorization(monkey
     report = takeover.recovery_status(tmp_path, previous_run="old-run", new_pilot_after="old-pilot")
     assert report["recovered"] is (authorized and risk_action == "normal")
     assert report["purpose"] == "single_round_live_test"
+
+
+def test_manual_gradient_launch_has_exact_predecessor_and_no_rotation(monkeypatch, tmp_path):
+    _state_files(tmp_path)
+    predecessor = "a" * 32
+    (tmp_path / "log/wti_live_state.json").write_text(json.dumps({
+        "status": "flat", "gradient_pilot": {"pilot_id": predecessor, "status": "completed"},
+    }))
+    (tmp_path / ".venv/bin").mkdir(parents=True)
+    (tmp_path / ".venv/bin/python").touch()
+    monkeypatch.setattr(takeover, "script_processes", lambda *_a: [])
+    monkeypatch.setattr(takeover, "runtime_processes", lambda *_a: [])
+    monkeypatch.setattr(takeover, "stop_old_runtime", lambda *_a: None)
+    monkeypatch.setattr(takeover, "require_free_ports", lambda: None)
+    commands = []
+    monkeypatch.setattr(takeover.subprocess, "run", lambda c, **_k: commands.append(c))
+
+    def recovered(*_a, **kwargs):
+        assert kwargs["new_gradient_after"] == predecessor
+        return {"recovered": True}
+
+    monkeypatch.setattr(takeover, "recovery_status", recovered)
+    assert takeover.execute_takeover(tmp_path, start_gradient_after=predecessor)["recovered"]
+    launched = commands[-1][-1]
+    assert f"--new-gradient-pilot-after {predecessor}" in launched
+    assert "--gradient-live" in launched and "--confirm-bounded-gradient-pilot" in launched
+    assert "--gradient-layer-notional-usd 20" in launched
+    assert "continuous-gradient" not in launched and "rotation-test-id" not in launched
+    assert "--manage-existing-wti-position" not in launched
+
+
+@pytest.mark.parametrize("healthy", [False, True])
+def test_repeated_manual_gradient_request_preserves_existing_runtime(monkeypatch, tmp_path, healthy):
+    _state_files(tmp_path)
+    predecessor = "a" * 32
+    (tmp_path / "log/wti_live_state.json").write_text(json.dumps({
+        "status": "flat", "gradient_pilot": {
+            "pilot_id": "b" * 32, "previous_pilot_id": predecessor,
+            "authorization_kind": "manual_new_round", "status": "available",
+        },
+    }))
+    monkeypatch.setattr(takeover, "script_processes", lambda *_a: [])
+    monkeypatch.setattr(takeover, "runtime_processes", lambda *_a: [42])
+    monkeypatch.setattr(takeover, "_runtime_command", lambda _pid: ["python", "tools/wti_live.py", "--new-gradient-pilot-after", predecessor])
+    monkeypatch.setattr(takeover, "recovery_status", lambda *_a, **_k: {"recovered": healthy})
+    monkeypatch.setattr(takeover, "stop_old_runtime", lambda *_a: pytest.fail("must not restart existing authorized round"))
+    monkeypatch.setattr(takeover.subprocess, "run", lambda *_a, **_k: pytest.fail("must not launch again"))
+    result = takeover.execute_takeover(tmp_path, start_gradient_after=predecessor)
+    assert result["existing_runtime_preserved"] is True
+    assert result["recovered"] is healthy
+
+
+@pytest.mark.parametrize("changed", ["authorization", "predecessor", "rotation", "entry"])
+def test_manual_gradient_acceptance_requires_authorized_nonrotating_new_round(monkeypatch, tmp_path, changed):
+    _state_files(tmp_path)
+    predecessor = "a" * 32
+    state = {"status": "flat", "gradient_pilot": {
+        "pilot_id": "b" * 32, "previous_pilot_id": predecessor,
+        "authorization_kind": "manual_new_round", "status": "available", "continuous_rotation": False,
+    }}
+    if changed == "authorization":
+        state["gradient_pilot"]["authorization_kind"] = "unverified"
+    elif changed == "predecessor":
+        state["gradient_pilot"]["previous_pilot_id"] = "c" * 32
+    elif changed == "rotation":
+        state["gradient_pilot"]["continuous_rotation"] = True
+    (tmp_path / "log/wti_live_state.json").write_text(json.dumps(state))
+    health = {
+        **_cycle_evidence(tmp_path, run_id="manual-run"),
+        "pid": 42, "run_id": "manual-run", "updated_at": datetime.now(timezone.utc).isoformat(),
+        "status": "running", "startup_reconciled": True, "manage_existing_only": False,
+        "wti_entry_authorized": changed != "entry", "risk_action": "normal", "risk_data_complete": True,
+    }
+    (tmp_path / "log/wti_live_risk_health.json").write_text(json.dumps(health))
+    collector = tmp_path / "log/oil_swap/basis_samples"
+    collector.mkdir(parents=True)
+    (collector / "health.json").write_text(json.dumps({
+        "pid": 42, "status": "running", "samples_this_run": 3,
+        "last_sample_at": datetime.now(timezone.utc).isoformat(),
+    }))
+    monkeypatch.setattr(takeover, "runtime_processes", lambda *_a: [42])
+    assert not takeover.recovery_status(tmp_path, previous_run="old-run", new_gradient_after=predecessor)["recovered"]
+    state = json.loads((tmp_path / "log/wti_live_state.json").read_text())
+    state["gradient_pilot"].update(previous_pilot_id=predecessor, authorization_kind="manual_new_round", continuous_rotation=False)
+    health["wti_entry_authorized"] = True
+    (tmp_path / "log/wti_live_state.json").write_text(json.dumps(state))
+    (tmp_path / "log/wti_live_risk_health.json").write_text(json.dumps(health))
+    assert takeover.recovery_status(tmp_path, previous_run="old-run", new_gradient_after=predecessor)["recovered"]

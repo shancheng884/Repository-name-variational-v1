@@ -1840,7 +1840,10 @@ def test_explicit_live_test_keeps_collecting_without_renewing_entry_budget():
     assert not runtime._sync_entry_authorization(state, _live_sample(datetime.now(timezone.utc)), now=datetime.now(timezone.utc))
 
 
-@pytest.mark.parametrize("scenario", ["manage_flat", "manage_exposure", "new_test", "resume_test", "wrong_test"])
+@pytest.mark.parametrize("scenario", [
+    "manage_flat", "manage_exposure", "new_test", "resume_test", "wrong_test",
+    "manual_gradient_stage", "manual_gradient_resume",
+])
 def test_initialization_handles_management_and_explicit_new_test_without_renewing_budget(
     monkeypatch, tmp_path, scenario,
 ):
@@ -1863,11 +1866,23 @@ def test_initialization_handles_management_and_explicit_new_test_without_renewin
             return self
 
     collector = SimpleNamespace(latest_sample=None)
-    runtime = _runtime_with_real_executor(tmp_path, collector, _FlatLoopGateway())
+    manual_gradient = scenario.startswith("manual_gradient")
+    runtime = _runtime_with_real_executor(tmp_path, collector, _FlatLoopGateway(), gradient=manual_gradient)
     runtime.args.manage_existing_wti_position = True
     runtime.args.confirm_bounded_live_pilot = False
     runtime.args.allow_unqualified_data_pilot = False
     state = runtime.pilot_store.load()
+    if manual_gradient:
+        runtime.args.manage_existing_wti_position = False
+        runtime.args.allow_unqualified_data_pilot = True
+        old = state["gradient_pilot"]
+        runtime.args.new_gradient_pilot_after = old["pilot_id"]
+        old.update(status="completed", completed_roundtrips=1)
+        state["last_account_reconciliation"] = {
+            "verified": True, "runtime_pid": 777, "runtime_run_id": "old-manager",
+            "market_id": 145, "active_order_count": 0, "variational_qty": "0", "lighter_qty": "0",
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        }
     if scenario == "manage_exposure":
         state.update(status="manual_review_required", pending_action={"kind": "close"})
     if scenario in {"new_test", "resume_test", "wrong_test"}:
@@ -1887,6 +1902,12 @@ def test_initialization_handles_management_and_explicit_new_test_without_renewin
     if scenario == "wrong_test":
         runtime.args.new_pilot_after = "wrong-previous-test"
     runtime.pilot_store.save(state)
+    if scenario == "manual_gradient_resume":
+        runtime.pilot_store.initialize_gradient_pilot(
+            market_id=145, multiplier=Decimal("1"), config=state["gradient_pilot"]["config"],
+            max_layers=5, manual_new_pilot_after=runtime.args.new_gradient_pilot_after,
+            runtime_pid=777, runtime_run_id="old-manager",
+        )
     before = runtime.args.state_path.read_bytes()
 
     async def readiness():
@@ -1913,7 +1934,7 @@ def test_initialization_handles_management_and_explicit_new_test_without_renewin
         assert runtime.args.state_path.read_bytes() == before
         return
     asyncio.run(runtime._initialize_execution())
-    assert runtime.manage_existing_only is (scenario != "new_test")
+    assert runtime.manage_existing_only is (scenario != "new_test" and not manual_gradient)
     if scenario == "new_test":
         after = runtime.pilot_store.load()
         assert after["single_round_pilot"]["previous_pilot_id"] == runtime.args.new_pilot_after
@@ -1922,6 +1943,11 @@ def test_initialization_handles_management_and_explicit_new_test_without_renewin
     else:
         assert runtime.args.state_path.read_bytes() == before
     assert runtime.entry_authorized is False
+
+    if scenario == "manual_gradient_stage":
+        assert runtime.gradient_pilot["pilot_id"] == runtime.args.new_gradient_pilot_after
+        assert runtime.gradient_pilot["status"] == "completed"
+        assert not runtime.pilot_store.load().get("gradient_pilot_history")
 
 
 @pytest.mark.parametrize("terminal_gradient_status", ["completed", "exhausted"])
@@ -2249,3 +2275,85 @@ def test_unqualified_pilot_does_not_bypass_live_account_risk_block(monkeypatch):
     assert result is state
     assert runtime.last_action["risk_action"] == "block_entry"
     assert runtime.entry_authorized is True  # Data gate is clear; account risk still blocks submission.
+
+
+def test_manual_gradient_cli_requires_exact_predecessor_and_excludes_rotation(tmp_path):
+    from tools.wti_takeover import management_command
+    argv = management_command(tmp_path, new_gradient_after="a" * 32)[2:]
+    args = wti_live.parse_args(argv)
+    assert args.gradient_live and args.confirm_bounded_gradient_pilot
+    assert args.new_gradient_pilot_after == "a" * 32
+    assert not args.continuous_gradient_rotation and args.rotation_test_id is None
+    assert args._validated_notional == args._validated_gradient_layer_notional == Decimal("20")
+    assert args._validated_slippage == Decimal("8")
+    with pytest.raises(SystemExit):
+        wti_live.parse_args(argv + ["--continuous-gradient-rotation", "--confirm-continuous-gradient-rotation", "--rotation-test-id", "b" * 32])
+    argv[argv.index("--new-gradient-pilot-after") + 1] = "not-an-exact-id"
+    with pytest.raises(SystemExit):
+        wti_live.parse_args(argv)
+
+
+def test_manual_gradient_live_loop_arms_after_reconcile_and_restarts_same_round(monkeypatch, tmp_path):
+    class Gateway(_FlatLoopGateway):
+        def read_account(self):
+            snapshot = super().read_account()
+            self.latest_risk.update({
+                "risk_data_complete": True, "observed_at": snapshot["observed_at"],
+                "variational_equity_usd": "100", "lighter_equity_usd": "100",
+            })
+            return snapshot
+
+    class Collector:
+        latest_sample = None
+        stopped = False
+        frames = 0
+
+        async def run(self):
+            while not self.stopped:
+                self.frames += 1
+                self.latest_sample = _live_sample(
+                    datetime.now(timezone.utc), sample_id=f"manual-{self.frames}"
+                )
+                if getattr(runtime, "verified_cycle_count", 0) >= 2:
+                    runtime.request_stop()
+                    return
+                await asyncio.sleep(0.02)
+
+        def request_stop(self):
+            self.stopped = True
+
+    async def no_op():
+        pass
+
+    monkeypatch.setattr(wti_live, "validate_startup_preconditions", lambda _args: None)
+    predecessor = None
+    successor = None
+    for restart in range(2):
+        collector, gateway = Collector(), Gateway()
+        runtime = _runtime_with_real_executor(tmp_path, collector, gateway, gradient=True)
+        runtime.run_id = f"manual-runtime-{restart}"
+        runtime.args.keep_collecting_after_pilot = True
+        if predecessor is None:
+            state = runtime.pilot_store.load()
+            state["gradient_pilot"].update(status="completed", completed_roundtrips=1)
+            predecessor = state["gradient_pilot"]["pilot_id"]
+            runtime.pilot_store.save(state)
+            runtime.gradient_pilot = dict(state["gradient_pilot"])
+        runtime.args.new_gradient_pilot_after = predecessor
+        runtime._initialize_execution = no_op
+        runtime._start_forwarder = no_op
+        assert not runtime.entry_authorized
+        asyncio.run(asyncio.wait_for(runtime.run(), timeout=8))
+        state = runtime.pilot_store.load()
+        pilot = state["gradient_pilot"]
+        assert pilot["previous_pilot_id"] == predecessor
+        assert pilot["status"] == "available" and pilot["completed_roundtrips"] == 0
+        assert pilot["authorization_kind"] == "manual_new_round" and not pilot["continuous_rotation"]
+        assert len(state["gradient_pilot_history"]) == 1
+        assert state["last_account_reconciliation"]["runtime_run_id"] == runtime.run_id
+        assert runtime.entry_authorized and runtime.startup_reconciled
+        assert not runtime.last_runtime_error and not getattr(runtime, "last_cycle_error", None)
+        if successor is None:
+            successor = pilot["pilot_id"]
+        assert pilot["pilot_id"] == successor
+        assert not state.get("gradient_rotation_session")
