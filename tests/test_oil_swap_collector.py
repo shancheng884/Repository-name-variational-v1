@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tools.lib.basis_store import read_basis_samples
 from tools.oil_swap_collector import (
     OilSwapCollector,
     parse_args,
@@ -264,10 +265,15 @@ def test_execution_refresh_preserves_requested_pair_quantity(tmp_path) -> None:
         )
 
         assert row["sample_quality"] == "valid"
+        assert row["sample_kind"] == "burst"
         assert Decimal(row["variational_qty"]) == Decimal("0.198")
         assert Decimal(row["lighter_qty"]) == Decimal("0.198")
         assert requested_depth == [Decimal("0.198"), Decimal("0.198")]
         assert quoted_qty == [Decimal("0.198")]
+        persisted = read_basis_samples(
+            collector.sample_root, limit=10, asset_filter="WTI"
+        )
+        assert [item["sample_kind"] for item in persisted] == ["burst"]
 
     asyncio.run(run())
 

@@ -583,8 +583,9 @@ def test_execution_session_uses_validated_heartbeat_without_requiring_state_chan
         assert blocked.allow_position_management is False
 
 
-def test_runtime_skips_sample_that_ages_past_executor_quote_limit():
+def test_runtime_routes_expired_cached_sample_to_refresh_without_consuming_it():
     runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.last_seen_sample_id = None
     runtime.last_processed_sample_id = None
     runtime.last_processed_sample_at = None
     runtime.last_sample_gap_seconds = None
@@ -597,14 +598,236 @@ def test_runtime_skips_sample_that_ages_past_executor_quote_limit():
     now = datetime.now(timezone.utc)
     aged = _live_sample(now - timedelta(seconds=0.5), sample_id="aged-quote")
     aged["var_quote_age_seconds"] = "1.8"
-    assert runtime._record_new_sample(aged) is False
-    assert runtime.last_action["reason"] == "wti_current_sample_or_session_not_fresh"
+    diagnostics = runtime._sample_freshness_diagnostics(aged, now)
+    assert diagnostics["fresh"] is False
+    assert diagnostics["quote_age_effective_seconds"] > 2
+    assert diagnostics["refreshable_cache_expiry"] is True
+    assert runtime._record_new_sample(aged) is True
+    assert runtime.last_action["reason"] == "wti_cached_sample_expired_execution_refresh_required"
     assert runtime.entry_authorized is False
     assert runtime.entry_authorization_permanently_revoked is False
+    assert runtime.last_processed_sample_id is None
+    assert runtime._record_new_sample(aged) is None
 
     assert runtime._record_new_sample(
         _live_sample(now, sample_id="fresh-quote")
     ) is True
+
+
+def test_expired_baseline_gets_one_strict_burst_refresh_and_recovers():
+    now = datetime.now(timezone.utc)
+    baseline = _live_sample(now - timedelta(seconds=0.5), sample_id="baseline-10s")
+    baseline["var_quote_age_seconds"] = "1.8"
+
+    class RefreshingCollector:
+        latest_sample = baseline
+        calls = []
+
+        async def collect_fresh_sample(self, *, sample_kind):
+            self.calls.append(sample_kind)
+            self.latest_sample = _live_sample(
+                datetime.now(timezone.utc), sample_id="refresh-burst"
+            )
+            self.latest_sample["sample_kind"] = sample_kind
+            return dict(self.latest_sample)
+
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.last_seen_sample_id = None
+    runtime.last_processed_sample_id = None
+    runtime.last_processed_sample_at = None
+    runtime.last_sample_gap_seconds = None
+    runtime.pending_gap_exit = False
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.last_action = {}
+    runtime.last_sample_freshness_diagnostics = {}
+    runtime.last_execution_refresh_status = "not_attempted"
+    runtime.last_execution_refresh_at = None
+    runtime.last_execution_refresh_elapsed_ms = None
+    runtime.last_execution_refresh_error = None
+    runtime.logger = logging.getLogger("test_wti_execution_refresh")
+    runtime.collector = RefreshingCollector()
+
+    assert runtime._record_new_sample(baseline) is True
+    refreshed = asyncio.run(runtime._decision_sample(baseline))
+
+    assert runtime.collector.calls == ["burst"]
+    assert refreshed["sample_id"] == "refresh-burst"
+    assert refreshed["sample_kind"] == "burst"
+    assert wti_live.WTILiveRuntime._sample_health_fresh(
+        refreshed, datetime.now(timezone.utc)
+    )
+    assert runtime.last_processed_sample_id == "refresh-burst"
+    assert runtime.last_execution_refresh_status == "fresh"
+    assert runtime.entry_authorization_permanently_revoked is False
+
+
+def test_execution_refresh_quote_over_two_seconds_is_still_rejected():
+    now = datetime.now(timezone.utc)
+    baseline = _live_sample(now - timedelta(seconds=0.5), sample_id="baseline-expired")
+    baseline["var_quote_age_seconds"] = "1.8"
+
+    class StaleRefreshCollector:
+        latest_sample = baseline
+
+        async def collect_fresh_sample(self, *, sample_kind):
+            row = _live_sample(
+                datetime.now(timezone.utc), sample_id="stale-refresh"
+            )
+            row["sample_kind"] = sample_kind
+            row["var_quote_age_seconds"] = "2.01"
+            self.latest_sample = row
+            return dict(row)
+
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.last_seen_sample_id = None
+    runtime.last_processed_sample_id = None
+    runtime.last_processed_sample_at = None
+    runtime.last_sample_gap_seconds = None
+    runtime.pending_gap_exit = False
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.last_action = {}
+    runtime.last_sample_freshness_diagnostics = {}
+    runtime.last_execution_refresh_status = "not_attempted"
+    runtime.last_execution_refresh_at = None
+    runtime.last_execution_refresh_elapsed_ms = None
+    runtime.last_execution_refresh_error = None
+    runtime.logger = logging.getLogger("test_wti_refresh_still_enforces_two_seconds")
+    runtime.collector = StaleRefreshCollector()
+
+    assert runtime._record_new_sample(baseline) is True
+    assert asyncio.run(runtime._decision_sample(baseline)) is None
+    assert runtime.last_execution_refresh_status == "invalid"
+    assert "quote_age_at_capture" in runtime.last_sample_freshness_diagnostics[
+        "failed_checks"
+    ]
+    assert runtime.last_processed_sample_id is None
+    assert runtime.entry_authorized is False
+    assert runtime.entry_authorization_permanently_revoked is False
+
+
+def test_execution_refresh_failure_blocks_cycle_without_permanent_revocation():
+    now = datetime.now(timezone.utc)
+    baseline = _live_sample(now - timedelta(seconds=0.5), sample_id="baseline-timeout")
+    baseline["var_quote_age_seconds"] = "1.8"
+
+    class OfflineCollector:
+        latest_sample = baseline
+        calls = 0
+
+        async def collect_fresh_sample(self, *, sample_kind):
+            self.calls += 1
+            raise TimeoutError("Variational quote timed out")
+
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.last_seen_sample_id = None
+    runtime.last_processed_sample_id = None
+    runtime.last_processed_sample_at = None
+    runtime.last_sample_gap_seconds = None
+    runtime.pending_gap_exit = False
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.last_action = {}
+    runtime.last_sample_freshness_diagnostics = {}
+    runtime.last_execution_refresh_status = "not_attempted"
+    runtime.last_execution_refresh_at = None
+    runtime.last_execution_refresh_elapsed_ms = None
+    runtime.last_execution_refresh_error = None
+    runtime.logger = logging.getLogger("test_wti_execution_refresh_timeout")
+    runtime.collector = OfflineCollector()
+
+    assert runtime._record_new_sample(baseline) is True
+    assert asyncio.run(runtime._decision_sample(baseline)) is None
+    assert runtime.collector.calls == 1
+    assert runtime.last_execution_refresh_status == "unavailable"
+    assert "TimeoutError" in runtime.last_execution_refresh_error
+    assert runtime.entry_authorized is False
+    assert runtime.entry_authorization_permanently_revoked is False
+    assert runtime._record_new_sample(baseline) is None
+
+
+def test_expired_sample_refresh_reconciles_pending_order_without_resubmitting(tmp_path):
+    now = datetime.now(timezone.utc)
+    baseline = _live_sample(now - timedelta(seconds=0.5), sample_id="pending-baseline")
+    baseline["var_quote_age_seconds"] = "1.8"
+    pending_state = {
+        "status": "manual_review_required",
+        "open_position": None,
+        "pending_action": {
+            "kind": "open",
+            "action_id": "already-submitted-action",
+            "legs": {"variational": {"submission_started": True}},
+        },
+        "manual_review_reason": "pending_order_terminal_status_unconfirmed",
+    }
+
+    class RefreshingCollector:
+        latest_sample = baseline
+        refreshes = 0
+
+        async def collect_fresh_sample(self, *, sample_kind):
+            self.refreshes += 1
+            self.latest_sample = _live_sample(
+                datetime.now(timezone.utc), sample_id="pending-refresh"
+            )
+            self.latest_sample["sample_kind"] = sample_kind
+            return dict(self.latest_sample)
+
+    class SubmitSpy:
+        calls = []
+
+        def submit_order(self, request):
+            self.calls.append(request)
+            raise AssertionError("refresh/reconcile must never resubmit a pending leg")
+
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.args = SimpleNamespace(state_path=tmp_path / "wti-state.json")
+    runtime.args.state_path.write_text(json.dumps(pending_state))
+    runtime.collector = RefreshingCollector()
+    runtime.executor = SubmitSpy()
+    runtime.gateway = SimpleNamespace(latest_risk={})
+    runtime.config = SimpleNamespace()
+    runtime.last_seen_sample_id = None
+    runtime.last_processed_sample_id = None
+    runtime.last_processed_sample_at = None
+    runtime.last_sample_gap_seconds = None
+    runtime.pending_gap_exit = False
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.last_action = {}
+    runtime.last_sample_freshness_diagnostics = {}
+    runtime.last_execution_refresh_status = "not_attempted"
+    runtime.last_execution_refresh_at = None
+    runtime.last_execution_refresh_elapsed_ms = None
+    runtime.last_execution_refresh_error = None
+    runtime.logger = logging.getLogger("test_wti_pending_refresh")
+    reconciled = []
+
+    async def read_reconcile(sample):
+        reconciled.append(sample)
+        return pending_state
+
+    async def advance(state):
+        return state
+
+    runtime._read_reconcile = read_reconcile
+    runtime._advance_continuous_gradient_round = advance
+    runtime._poll_rotation_drain = lambda: False
+
+    assert runtime._record_new_sample(baseline) is True
+    result = asyncio.run(runtime._process_sample(baseline))
+
+    assert result["manual_review_reason"] == "pending_order_terminal_status_unconfirmed"
+    assert len(reconciled) == 1
+    assert reconciled[0]["sample_id"] == "pending-refresh"
+    assert reconciled[0]["sample_kind"] == "burst"
+    assert runtime.collector.refreshes == 1
+    assert runtime.executor.calls == []
 
 
 def test_runtime_revokes_entry_after_sample_gap_without_reprocessing_same_id():
@@ -761,17 +984,27 @@ def test_run_defers_startup_reconcile_age_race_and_recovers_in_live_loop(
     monkeypatch, tmp_path: Path
 ):
     now = datetime.now(timezone.utc)
-    first = _live_sample(now, sample_id="startup-sample")
-    following = _live_sample(now, sample_id="loop-sample")
-
+    first = _live_sample(now - timedelta(seconds=3), sample_id="startup-sample")
+    first["var_quote_age_seconds"] = "1.8"
     class FakeCollector:
         def __init__(self):
             self.latest_sample = first
             self.stopped = False
+            self.refresh_kinds = []
+
+        async def collect_fresh_sample(self, *, sample_kind):
+            self.refresh_kinds.append(sample_kind)
+            self.latest_sample = _live_sample(
+                datetime.now(timezone.utc), sample_id="startup-refresh"
+            )
+            self.latest_sample["sample_kind"] = sample_kind
+            return dict(self.latest_sample)
 
         async def run(self):
             await asyncio.sleep(0.1)
-            self.latest_sample = following
+            self.latest_sample = _live_sample(
+                datetime.now(timezone.utc), sample_id="loop-sample"
+            )
             await asyncio.sleep(1.5)
 
         def request_stop(self):
@@ -848,7 +1081,8 @@ def test_run_defers_startup_reconcile_age_race_and_recovers_in_live_loop(
 
     asyncio.run(runtime.run())
 
-    assert reconciled_samples == ["startup-sample", "loop-sample"]
+    assert reconciled_samples == ["startup-refresh", "loop-sample"]
+    assert runtime.collector.refresh_kinds == ["burst"]
     assert runtime.startup_reconciled is True
     assert runtime.entry_authorization_permanently_revoked is False
     assert runtime.last_runtime_error is None
@@ -1122,14 +1356,16 @@ def test_run_keeps_collector_alive_during_slow_history_scan_and_reconciles_fresh
 @pytest.mark.parametrize("quality", ["valid", "degraded"])
 def test_real_reconcile_refreshes_quote_after_slow_account_read(tmp_path, quality):
     class RefreshingCollector:
-        latest_sample = _live_sample(datetime.now(timezone.utc))
-        refreshes = 0
+        def __init__(self):
+            self.latest_sample = _live_sample(datetime.now(timezone.utc))
+            self.refreshes = 0
 
-        async def collect_fresh_sample(self):
+        async def collect_fresh_sample(self, *, sample_kind="burst"):
             self.refreshes += 1
             self.latest_sample = {
                 **_live_sample(datetime.now(timezone.utc), sample_id="after-account"),
                 "sample_quality": quality,
+                "sample_kind": sample_kind,
             }
             return self.latest_sample
 
@@ -1151,7 +1387,7 @@ def test_real_reconcile_refreshes_quote_after_slow_account_read(tmp_path, qualit
         assert runtime.last_action["reason"] == "entry_edge_below_threshold"
     else:
         assert runtime.entry_authorized is False
-        assert runtime.last_action["reason"] == "wti_current_sample_or_session_not_fresh"
+        assert runtime.last_action["reason"] == "wti_execution_refresh_sample_invalid"
 
 
 def test_real_strategy_executor_roundtrip_after_slow_account_read_stops_one_pilot(tmp_path):
@@ -1227,10 +1463,13 @@ def test_real_strategy_executor_roundtrip_after_slow_account_read_stops_one_pilo
                 row["lighter_qty"] = str(lighter_qty)
             return row
 
-        async def collect_fresh_sample(self, *, var_qty=None, lighter_qty=None):
+        async def collect_fresh_sample(
+            self, *, var_qty=None, lighter_qty=None, sample_kind="burst"
+        ):
             if var_qty is not None or lighter_qty is not None:
                 self.requested_sizes.append((var_qty, lighter_qty))
             self.latest_sample = self.sample(var_qty=var_qty, lighter_qty=lighter_qty)
+            self.latest_sample["sample_kind"] = sample_kind
             return dict(self.latest_sample)
 
         def request_stop(self):

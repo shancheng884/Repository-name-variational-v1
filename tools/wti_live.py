@@ -400,8 +400,14 @@ class WTILiveRuntime:
         self.readiness: dict[str, Any] = {"ready": False, "reasons": ["observe_only"]}
         self.entry_authorized = False
         self.manage_existing_only = False
+        self.last_seen_sample_id: str | None = None
         self.last_processed_sample_id: str | None = None
         self.last_processed_sample_at: datetime | None = None
+        self.last_sample_freshness_diagnostics: dict[str, Any] = {}
+        self.last_execution_refresh_status = "not_attempted"
+        self.last_execution_refresh_at: str | None = None
+        self.last_execution_refresh_elapsed_ms: float | None = None
+        self.last_execution_refresh_error: str | None = None
         self.startup_reconciled = False
         self.entry_gate_block_reason: str | None = None
         self.last_sample_gap_seconds: float | None = None
@@ -609,7 +615,7 @@ class WTILiveRuntime:
 
         def fresh_market_reader() -> dict[str, Any]:
             future = asyncio.run_coroutine_threadsafe(
-                self.collector.collect_fresh_sample(), loop
+                self.collector.collect_fresh_sample(sample_kind="burst"), loop
             )
             sample = future.result(timeout=self.args.command_timeout_seconds + 3)
             if not isinstance(sample, dict):
@@ -621,7 +627,7 @@ class WTILiveRuntime:
         ) -> dict[str, Any]:
             future = asyncio.run_coroutine_threadsafe(
                 self.collector.collect_fresh_sample(
-                    var_qty=var_qty, lighter_qty=lighter_qty
+                    var_qty=var_qty, lighter_qty=lighter_qty, sample_kind="burst"
                 ),
                 loop,
             )
@@ -1067,37 +1073,125 @@ class WTILiveRuntime:
         return Decimal("0")
 
     @staticmethod
-    def _sample_health_fresh(row: dict[str, Any] | None, now: datetime) -> bool:
-        if not isinstance(row, dict):
-            return False
-        if now.tzinfo is None or now.utcoffset() is None:
-            return False
+    def _sample_freshness_diagnostics(
+        row: dict[str, Any] | None, now: datetime
+    ) -> dict[str, Any]:
+        checks: dict[str, bool] = {
+            "sample_timestamp": False,
+            "sample_age": False,
+            "sample_quality": False,
+            "both_feeds_live": False,
+            "lighter_continuity": False,
+            "session_evidence": False,
+            "quote_age_at_capture": False,
+            "quote_age_effective": False,
+            "book_age_at_capture": False,
+            "book_age_effective": False,
+        }
+        result: dict[str, Any] = {
+            "sample_id": row.get("sample_id") if isinstance(row, dict) else None,
+            "sample_kind": row.get("sample_kind") if isinstance(row, dict) else None,
+            "sample_quality": row.get("sample_quality") if isinstance(row, dict) else None,
+            "sample_quality_reasons": (
+                row.get("sample_quality_reasons") if isinstance(row, dict) else None
+            ),
+            "market_availability": (
+                row.get("market_availability") if isinstance(row, dict) else None
+            ),
+            "lighter_continuity_ok": (
+                row.get("lighter_continuity_ok") if isinstance(row, dict) else None
+            ),
+            "capture_age_seconds": None,
+            "quote_age_at_capture_seconds": None,
+            "quote_age_effective_seconds": None,
+            "book_age_at_capture_seconds": None,
+            "book_age_effective_seconds": None,
+            "session_heartbeat_age_seconds": None,
+            "checks": checks,
+        }
+        if not isinstance(row, dict) or now.tzinfo is None or now.utcoffset() is None:
+            result["failed_checks"] = list(checks)
+            result["refreshable_cache_expiry"] = False
+            result["fresh"] = False
+            return result
+
         try:
             at = datetime.fromisoformat(str(row.get("logged_at")).replace("Z", "+00:00"))
+            if at.tzinfo is None or at.utcoffset() is None:
+                raise ValueError("sample_timestamp_timezone_missing")
+            age = (now.astimezone(timezone.utc) - at.astimezone(timezone.utc)).total_seconds()
+            result["capture_age_seconds"] = round(age, 3)
+            checks["sample_timestamp"] = True
+            checks["sample_age"] = -5 <= age <= 20
         except (TypeError, ValueError):
-            return False
-        if at.tzinfo is None or at.utcoffset() is None:
-            return False
-        age = (now - at.astimezone(timezone.utc)).total_seconds()
+            age = None
+
+        quote_age: Decimal | None = None
+        book_age: Decimal | None = None
         try:
             quote_age = Decimal(str(row.get("var_quote_age_seconds")))
-            book_age = Decimal(str(row.get("lighter_book_age_seconds")))
+            if quote_age.is_finite():
+                result["quote_age_at_capture_seconds"] = float(quote_age)
+                checks["quote_age_at_capture"] = (
+                    Decimal("-1") <= quote_age <= Decimal("2")
+                )
         except Exception:
-            return False
-        elapsed = Decimal(str(max(0.0, age)))
-        current_quote_age = quote_age + elapsed
-        current_book_age = book_age + elapsed
-        return (
-            -5 <= age <= 20
-            and row.get("sample_quality") == "valid"
-            and row.get("market_availability") == "both_feeds_live"
-            and row.get("lighter_continuity_ok") is True
-            and session_observation_for_sample(row) is not None
-            and quote_age.is_finite() and Decimal("-1") <= quote_age
-            and current_quote_age <= Decimal("2")
-            and book_age.is_finite() and Decimal("0") <= book_age
-            and current_book_age <= Decimal("2")
+            pass
+        try:
+            book_age = Decimal(str(row.get("lighter_book_age_seconds")))
+            if book_age.is_finite():
+                result["book_age_at_capture_seconds"] = float(book_age)
+                checks["book_age_at_capture"] = Decimal("0") <= book_age <= Decimal("2")
+        except Exception:
+            pass
+
+        if age is not None and quote_age is not None and quote_age.is_finite():
+            effective_quote_age = quote_age + Decimal(str(max(0.0, age)))
+            result["quote_age_effective_seconds"] = float(effective_quote_age)
+            checks["quote_age_effective"] = effective_quote_age <= Decimal("2")
+        if age is not None and book_age is not None and book_age.is_finite():
+            effective_book_age = book_age + Decimal(str(max(0.0, age)))
+            result["book_age_effective_seconds"] = float(effective_book_age)
+            checks["book_age_effective"] = effective_book_age <= Decimal("2")
+
+        checks["sample_quality"] = row.get("sample_quality") == "valid"
+        checks["both_feeds_live"] = row.get("market_availability") == "both_feeds_live"
+        checks["lighter_continuity"] = row.get("lighter_continuity_ok") is True
+        checks["session_evidence"] = session_observation_for_sample(row) is not None
+        heartbeat = row.get("session_status_feed_heartbeat_at")
+        try:
+            heartbeat_at = datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))
+            if heartbeat_at.tzinfo is not None and heartbeat_at.utcoffset() is not None:
+                result["session_heartbeat_age_seconds"] = round(
+                    (now.astimezone(timezone.utc) - heartbeat_at.astimezone(timezone.utc)).total_seconds(),
+                    3,
+                )
+        except (TypeError, ValueError):
+            pass
+
+        failed = [name for name, passed in checks.items() if not passed]
+        result["failed_checks"] = failed
+        # Only cached age expiry is recoverable in-cycle. Feed, continuity,
+        # instrument/session evidence and source-clock failures remain hard blocks.
+        cache_age_checks = {"sample_age", "quote_age_effective", "book_age_effective"}
+        result["refreshable_cache_expiry"] = bool(
+            failed
+            and set(failed).issubset(cache_age_checks)
+            and checks["sample_timestamp"]
+            and age is not None and age >= -5
+            and checks["quote_age_at_capture"]
+            and checks["book_age_at_capture"]
+            and checks["sample_quality"]
+            and checks["both_feeds_live"]
+            and checks["lighter_continuity"]
+            and checks["session_evidence"]
         )
+        result["fresh"] = not failed
+        return result
+
+    @staticmethod
+    def _sample_health_fresh(row: dict[str, Any] | None, now: datetime) -> bool:
+        return bool(WTILiveRuntime._sample_freshness_diagnostics(row, now).get("fresh"))
 
     def _revoke_entry_authorization(self, reason: str) -> None:
         self.entry_authorized = False
@@ -1106,22 +1200,34 @@ class WTILiveRuntime:
 
     def _record_new_sample(self, row: dict[str, Any]) -> bool | None:
         sample_id = str(row.get("sample_id") or "")
-        if not sample_id or sample_id == self.last_processed_sample_id:
+        if not sample_id or sample_id in {
+            getattr(self, "last_seen_sample_id", None),
+            getattr(self, "last_processed_sample_id", None),
+        }:
             return None
-        self.last_processed_sample_id = sample_id
+        self.last_seen_sample_id = sample_id
         if row.get("sample_quality") != "valid" or session_observation_for_sample(row) is None:
+            self.last_sample_freshness_diagnostics = self._sample_freshness_diagnostics(
+                row, datetime.now(timezone.utc)
+            )
             self.last_action = {"action": "blocked", "reason": "wti_sample_or_session_unverified"}
             self.entry_authorized = False
             if not self.entry_authorization_permanently_revoked:
                 self.entry_gate_block_reason = "wti_sample_or_session_unverified"
             return False
-        if not self._sample_health_fresh(row, datetime.now(timezone.utc)):
-            reason = "wti_current_sample_or_session_not_fresh"
+        diagnostics = self._sample_freshness_diagnostics(row, datetime.now(timezone.utc))
+        self.last_sample_freshness_diagnostics = diagnostics
+        if not diagnostics["fresh"]:
+            reason = (
+                "wti_cached_sample_expired_execution_refresh_required"
+                if diagnostics["refreshable_cache_expiry"]
+                else "wti_current_sample_or_session_not_fresh"
+            )
             self.last_action = {"action": "blocked", "reason": reason}
             self.entry_authorized = False
             if not self.entry_authorization_permanently_revoked:
                 self.entry_gate_block_reason = reason
-            return False
+            return bool(diagnostics["refreshable_cache_expiry"])
         try:
             sample_at = datetime.fromisoformat(
                 str(row.get("logged_at")).replace("Z", "+00:00")
@@ -1129,9 +1235,10 @@ class WTILiveRuntime:
             if sample_at.tzinfo is None or sample_at.utcoffset() is None:
                 raise ValueError("sample_timestamp_timezone_missing")
             sample_at = sample_at.astimezone(timezone.utc)
-            if self.last_processed_sample_at is not None:
+            last_processed_at = getattr(self, "last_processed_sample_at", None)
+            if last_processed_at is not None:
                 self.last_sample_gap_seconds = (
-                    sample_at - self.last_processed_sample_at
+                    sample_at - last_processed_at
                 ).total_seconds()
                 if (
                     self.last_sample_gap_seconds < 0
@@ -1145,6 +1252,7 @@ class WTILiveRuntime:
         except (TypeError, ValueError):
             self._revoke_entry_authorization("wti_sample_timestamp_unverified")
             return False
+        self.last_processed_sample_id = sample_id
         return True
 
     def _write_health(
@@ -1166,6 +1274,7 @@ class WTILiveRuntime:
                 at = datetime.fromisoformat(str(sample_at).replace("Z", "+00:00"))
                 age = (now - at.astimezone(timezone.utc)).total_seconds()
         stale = not self._sample_health_fresh(row, now)
+        freshness_diagnostics = self._sample_freshness_diagnostics(row, now)
         closed_window = self._confirmed_closed_session_window(now)
         risk = dict(self.last_risk)
         if self.args.mode == "observe":
@@ -1235,6 +1344,22 @@ class WTILiveRuntime:
             "market_sample_at": sample_at,
             "market_sample_age_seconds": None if age is None else round(age, 3),
             "market_sample_fresh": not stale,
+            "market_sample_freshness_diagnostics": freshness_diagnostics,
+            "last_seen_sample_id": getattr(self, "last_seen_sample_id", None),
+            "last_processed_sample_id": getattr(self, "last_processed_sample_id", None),
+            "execution_refresh_status": getattr(
+                self, "last_execution_refresh_status", "not_attempted"
+            ),
+            "execution_refresh_at": getattr(self, "last_execution_refresh_at", None),
+            "execution_refresh_elapsed_ms": getattr(
+                self, "last_execution_refresh_elapsed_ms", None
+            ),
+            "execution_refresh_error": getattr(
+                self, "last_execution_refresh_error", None
+            ),
+            "last_sample_processing_diagnostics": getattr(
+                self, "last_sample_freshness_diagnostics", {}
+            ),
             "market_session": (
                 row.get("session_status") if row else
                 OilSession.EXCHANGE_CLOSED.value if closed_window is not None else None
@@ -1358,21 +1483,145 @@ class WTILiveRuntime:
             self.last_reconcile_elapsed_ms = round((time.monotonic() - started) * 1000, 3)
 
     async def _decision_sample(self, row: dict[str, Any]) -> dict[str, Any] | None:
-        if self._sample_health_fresh(row, datetime.now(timezone.utc)):
-            return row
-        latest = self.collector.latest_sample
-        if self._sample_health_fresh(latest, datetime.now(timezone.utc)):
-            candidate = dict(latest)
-        else:
-            candidate = await self.collector.collect_fresh_sample()
+        now = datetime.now(timezone.utc)
+        diagnostics = self._sample_freshness_diagnostics(row, now)
+        candidate: dict[str, Any] | None = row if diagnostics["fresh"] else None
+        refresh_trigger = list(diagnostics.get("failed_checks") or [])
+        if candidate is None:
+            latest = self.collector.latest_sample
+            latest_diagnostics = self._sample_freshness_diagnostics(latest, now)
+            if latest_diagnostics["fresh"] and isinstance(latest, dict):
+                candidate = dict(latest)
+                diagnostics = latest_diagnostics
+            else:
+                self.entry_authorized = False
+                if not self.entry_authorization_permanently_revoked:
+                    self.entry_gate_block_reason = "wti_current_sample_or_session_not_fresh"
+                self.last_execution_refresh_status = "running"
+                self.last_execution_refresh_at = now.isoformat()
+                self.last_execution_refresh_error = None
+                started = time.monotonic()
+                try:
+                    candidate = await self.collector.collect_fresh_sample(sample_kind="burst")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    detail = " ".join(str(exc).split())[:160] or type(exc).__name__
+                    self.last_execution_refresh_status = "unavailable"
+                    self.last_execution_refresh_error = f"{type(exc).__name__}:{detail}"
+                    self.last_execution_refresh_elapsed_ms = round(
+                        (time.monotonic() - started) * 1000, 3
+                    )
+                    self.last_sample_freshness_diagnostics = {
+                        **diagnostics,
+                        "refresh_trigger_checks": refresh_trigger,
+                        "refresh_error_type": type(exc).__name__,
+                        "refresh_error": detail,
+                    }
+                    self.logger.warning(
+                        "wti_execution_refresh_unavailable trigger=%s error_type=%s reason=%s",
+                        ",".join(refresh_trigger), type(exc).__name__, detail,
+                    )
+                    return None
+                self.last_execution_refresh_elapsed_ms = round(
+                    (time.monotonic() - started) * 1000, 3
+                )
+                self.last_execution_refresh_status = "returned"
+                self.last_execution_refresh_error = None
+                if not isinstance(candidate, dict):
+                    self.last_execution_refresh_status = "invalid"
+                    self.last_sample_freshness_diagnostics = {
+                        **diagnostics,
+                        "refresh_trigger_checks": refresh_trigger,
+                        "refresh_error": "wti_fresh_sample_unavailable",
+                    }
+                    return None
+                candidate = dict(candidate)
+
         if self._record_new_sample(candidate) is False:
+            self.last_execution_refresh_status = (
+                "invalid" if candidate.get("sample_kind") == "burst"
+                else self.last_execution_refresh_status
+            )
+            self.last_sample_freshness_diagnostics = self._sample_freshness_diagnostics(
+                candidate, datetime.now(timezone.utc)
+            )
             return None
-        if not self._sample_health_fresh(candidate, datetime.now(timezone.utc)):
+        diagnostics = self._sample_freshness_diagnostics(
+            candidate, datetime.now(timezone.utc)
+        )
+        if not diagnostics["fresh"]:
+            self.last_execution_refresh_status = (
+                "stale" if candidate.get("sample_kind") == "burst"
+                else self.last_execution_refresh_status
+            )
+            self.last_sample_freshness_diagnostics = {
+                **diagnostics,
+                "refresh_trigger_checks": refresh_trigger,
+            }
             return None
+        self.last_sample_freshness_diagnostics = diagnostics
+        if candidate.get("sample_kind") == "burst":
+            self.last_execution_refresh_status = "fresh"
         return candidate
+
+    async def _startup_reconcile_sample(self, row: dict[str, Any]) -> dict[str, Any]:
+        candidate = await self._decision_sample(row)
+        if candidate is None:
+            self.entry_authorized = False
+            self.last_action = {
+                "action": "blocked",
+                "reason": (
+                    "wti_execution_refresh_unavailable"
+                    if self.last_execution_refresh_status == "unavailable"
+                    else "wti_execution_refresh_sample_invalid"
+                    if self.last_execution_refresh_status in {"invalid", "stale"}
+                    else "wti_current_sample_or_session_not_fresh"
+                ),
+            }
+            return read_json(self.args.state_path)
+        try:
+            state = await self._read_reconcile(candidate)
+        except WTIExecutionError as exc:
+            if not _retryable_sample_validation_error(exc):
+                raise
+            self.entry_authorized = False
+            if not self.entry_authorization_permanently_revoked:
+                self.entry_gate_block_reason = "wti_current_sample_or_session_not_fresh"
+            self.last_runtime_error = str(exc)
+            self.last_action = {"action": "deferred", "reason": str(exc)}
+            self.logger.warning("wti_startup_reconcile_deferred reason=%s", exc)
+            return read_json(self.args.state_path)
+
+        self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
+        self.startup_reconciled = state.get("status") in {"flat", "open"}
+        state = await self._advance_continuous_gradient_round(state)
+        self._sync_entry_authorization(
+            state, candidate, now=datetime.now(timezone.utc)
+        )
+        self.last_action = {"action": "startup_reconcile", "status": state.get("status")}
+        self.last_runtime_error = None
+        return state
 
     async def _process_sample(self, row: dict[str, Any]) -> dict[str, Any]:
         assert self.executor is not None and self.gateway is not None and self.config is not None
+        decision_sample = await self._decision_sample(row)
+        if decision_sample is None:
+            state = read_json(self.args.state_path)
+            position = state.get("open_position")
+            self.entry_authorized = False
+            self.last_action = {
+                "action": "blocked_close" if position else "blocked_entry",
+                "reason": (
+                    "wti_execution_refresh_unavailable"
+                    if self.last_execution_refresh_status == "unavailable"
+                    else "wti_execution_refresh_sample_invalid"
+                    if self.last_execution_refresh_status in {"invalid", "stale"}
+                    else "wti_current_sample_or_session_not_fresh"
+                ),
+            }
+            return state
+        row = decision_sample
         state = await self._read_reconcile(row)
         self.last_risk = dict(self.gateway.latest_risk)
         self._poll_rotation_drain()
@@ -1387,7 +1636,13 @@ class WTILiveRuntime:
             self.entry_authorized = False
             self.last_action = {
                 "action": "blocked_close" if position else "blocked_entry",
-                "reason": "wti_current_sample_or_session_not_fresh",
+                "reason": (
+                    "wti_execution_refresh_unavailable"
+                    if self.last_execution_refresh_status == "unavailable"
+                    else "wti_execution_refresh_sample_invalid"
+                    if self.last_execution_refresh_status in {"invalid", "stale"}
+                    else "wti_current_sample_or_session_not_fresh"
+                ),
             }
             return state
         row = decision_sample
@@ -1562,29 +1817,13 @@ class WTILiveRuntime:
                     self.last_account_only_reconcile_monotonic = time.monotonic()
                     self._write_health(state=state, row=None, error=self.last_runtime_error)
                 elif self._record_new_sample(dict(sample)) is True:
-                    try:
-                        state = await self._read_reconcile(dict(sample))
-                    except WTIExecutionError as exc:
-                        if not _retryable_sample_validation_error(exc):
-                            raise
-                        self.entry_authorized = False
-                        if not self.entry_authorization_permanently_revoked:
-                            self.entry_gate_block_reason = "wti_current_sample_or_session_not_fresh"
-                        self.last_runtime_error = str(exc)
-                        self.last_action = {"action": "deferred", "reason": str(exc)}
-                        self.logger.warning("wti_startup_reconcile_deferred reason=%s", exc)
-                        self._write_health(state=state, row=sample, error=str(exc))
-                    else:
-                        self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
-                        self.startup_reconciled = state.get("status") in {"flat", "open"}
-                        state = await self._advance_continuous_gradient_round(state)
-                        self._sync_entry_authorization(
-                            state, sample, now=datetime.now(timezone.utc)
-                        )
-                        self.last_action = {"action": "startup_reconcile", "status": state.get("status")}
-                        self._write_health(state=state, row=sample)
-                        self._finish_single_round_pilot_if_done(state)
-                        self._finish_gradient_pilot_if_done(state)
+                    state = await self._startup_reconcile_sample(dict(sample))
+                    self._write_health(
+                        state=state, row=self.collector.latest_sample or sample,
+                        error=self.last_runtime_error,
+                    )
+                    self._finish_single_round_pilot_if_done(state)
+                    self._finish_gradient_pilot_if_done(state)
                 else:
                     self._write_health(
                         state=state,
@@ -1607,22 +1846,15 @@ class WTILiveRuntime:
                     if new_valid_sample is True:
                         try:
                             if not self.startup_reconciled:
-                                state = await self._read_reconcile(dict(row))
-                                self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
-                                self.startup_reconciled = state.get("status") in {"flat", "open"}
-                                state = await self._advance_continuous_gradient_round(state)
-                                self._sync_entry_authorization(
-                                    state, dict(row), now=datetime.now(timezone.utc)
-                                )
-                                self.last_action = {
-                                    "action": "startup_reconcile",
-                                    "status": state.get("status"),
-                                }
+                                state = await self._startup_reconcile_sample(dict(row))
                             else:
                                 state = await self._process_sample(dict(row))
                             self._finish_single_round_pilot_if_done(state)
                             self._finish_gradient_pilot_if_done(state)
-                            self.last_runtime_error = None
+                            if self.last_action.get("action") not in {
+                                "blocked", "blocked_entry", "blocked_close", "deferred"
+                            }:
+                                self.last_runtime_error = None
                             self._write_health(
                                 state=state, row=self.collector.latest_sample or row
                             )

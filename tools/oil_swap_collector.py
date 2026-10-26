@@ -229,16 +229,22 @@ class OilSwapCollector:
         *,
         var_qty: Decimal | None = None,
         lighter_qty: Decimal | None = None,
+        sample_kind: str = "baseline",
     ) -> dict[str, Any] | None:
         async with self.sample_lock:
-            return await self._collect_once_unlocked(var_qty=var_qty, lighter_qty=lighter_qty)
+            return await self._collect_once_unlocked(
+                var_qty=var_qty, lighter_qty=lighter_qty, sample_kind=sample_kind
+            )
 
     async def _collect_once_unlocked(
         self,
         *,
         var_qty: Decimal | None = None,
         lighter_qty: Decimal | None = None,
+        sample_kind: str = "baseline",
     ) -> dict[str, Any] | None:
+        if sample_kind not in {"baseline", "burst"}:
+            raise ValueError("unsupported_wti_sample_kind")
         metadata = self.books.market_metadata[ASSET]
         multiplier = Decimal(str(metadata.get("multiplier") or "1"))
         requested_pair = var_qty is not None or lighter_qty is not None
@@ -386,7 +392,7 @@ class OilSwapCollector:
             "event": "live_inventory_basis_state",
             "logged_at": now.isoformat(),
             "sample_id": uuid.uuid4().hex,
-            "sample_kind": "baseline",
+            "sample_kind": sample_kind,
             "sample_quality": sample_quality,
             "sample_quality_reasons": reasons,
             "record_kind": "basis_market_sample",
@@ -472,9 +478,12 @@ class OilSwapCollector:
         *,
         var_qty: Decimal | None = None,
         lighter_qty: Decimal | None = None,
+        sample_kind: str = "burst",
     ) -> dict[str, Any]:
         """Serialize execution refreshes with the normal collector poll loop."""
-        row = await self._collect_once(var_qty=var_qty, lighter_qty=lighter_qty)
+        row = await self._collect_once(
+            var_qty=var_qty, lighter_qty=lighter_qty, sample_kind=sample_kind
+        )
         if not isinstance(row, dict):
             raise RuntimeError("wti_fresh_sample_unavailable")
         self._record_sample(row)
