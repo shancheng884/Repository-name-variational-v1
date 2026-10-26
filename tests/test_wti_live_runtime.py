@@ -1422,6 +1422,27 @@ def test_single_round_pilot_finishes_only_after_confirmed_flat_state():
     assert runtime.entry_gate_block_reason == "single_round_pilot_completed"
 
 
+def test_completed_legacy_single_round_does_not_stop_gradient_pilot():
+    runtime = _runtime_for_entry_gate(allow_unqualified=False)
+    runtime.args.gradient_live = True
+    runtime.stop = False
+    runtime.collector = SimpleNamespace(
+        request_stop=lambda: pytest.fail("legacy single-round record must not stop gradient runtime")
+    )
+    runtime.entry_authorized = True
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "single_round_pilot": {"status": "completed", "completed_roundtrips": 1},
+        "gradient_pilot": {
+            "pilot_id": "gradient-pilot-1", "status": "available",
+            "completed_roundtrips": 0,
+        },
+    }
+    assert not runtime._finish_single_round_pilot_if_done(state)
+    assert runtime.stop is False
+    assert runtime.entry_authorized is True
+
+
 @pytest.mark.parametrize("pilot_status", ["completed", "exhausted"])
 def test_management_keeps_collector_and_forwarder_after_pilot_finishes(pilot_status):
     runtime = _runtime_for_entry_gate(allow_unqualified=False)

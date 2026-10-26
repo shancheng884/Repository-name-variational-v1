@@ -747,6 +747,8 @@ class WTILiveRuntime:
         )
 
     def _finish_single_round_pilot_if_done(self, state: dict[str, Any]) -> bool:
+        if getattr(getattr(self, "args", None), "gradient_live", False):
+            return False
         pilot = state.get("single_round_pilot") or {}
         if (
             pilot.get("status") in {"completed", "exhausted"}
