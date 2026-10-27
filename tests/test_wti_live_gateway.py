@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -56,6 +57,52 @@ class FakeVariational:
 
 
 def _gateway(var, *, market=None, lighter=None):
+    async def dispatch_market_reader(**_kwargs):
+        now = datetime.now(timezone.utc)
+        return {
+            "sample_id": "dispatch-sample",
+            "asset": "WTI",
+            "sample_quality": "valid",
+            "market_availability": "both_feeds_live",
+            "logged_at": now.isoformat(),
+            "variational_underlying": "USOILP",
+            "variational_instrument_type": "swap",
+            "variational_instrument_kind": "commodity",
+            "variational_funding_interval_s": 0,
+            "lighter_symbol": "WTI",
+            "lighter_market_type": "perp",
+            "lighter_market_status": "active",
+            "lighter_market_id": 145,
+            "lighter_multiplier": "1",
+            "lighter_supported_size_decimals": 2,
+            "lighter_supported_price_decimals": 2,
+            "lighter_min_base_amount": "0.01",
+            "lighter_min_quote_amount": "1",
+            "variational_qty": "1",
+            "lighter_qty": "1",
+            "var_bid": "99.99",
+            "var_ask": "100",
+            "lighter_bid": "100.4",
+            "lighter_ask": "100.5",
+            "lighter_buy_price": "100.5",
+            "lighter_sell_price": "100.4",
+            "long_edge_bps": "40",
+            "short_edge_bps": "-40",
+            "var_quote_age_seconds": "0.1",
+            "lighter_book_age_seconds": "0.1",
+            "market_status": "open",
+            "session_status": "open",
+            "session_status_source": "variational_market_status_websocket",
+            "session_status_observed_at": now.isoformat(),
+            "session_status_feed_connected": True,
+            "session_status_feed_heartbeat_at": now.isoformat(),
+            "session_schedule_source": "variational_supported_assets_api",
+            "session_id": "wti-session-1",
+            "session_closing_at": (now + timedelta(hours=4)).isoformat(),
+            "quote_id": "dispatch-quote-id",
+            "quote_timestamp": now.isoformat(),
+        }
+
     return WTIProductionGateway(
         loop=asyncio.new_event_loop(),
         variational=var,
@@ -68,6 +115,7 @@ def _gateway(var, *, market=None, lighter=None):
             "supported_size_decimals": 2,
             "supported_price_decimals": 2,
         },
+        dispatch_market_reader=dispatch_market_reader,
     )
 
 
@@ -153,6 +201,10 @@ def _booked_wti_request():
         "venue": "variational", "side": "buy", "qty": "0.198",
         "submitted_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
         "rfq_id": "rfq-123",
+        "session_id": "wti-session-1",
+        "session_entry_cutoff_at": (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat(),
+        "expected_direction": "long_var_short_lighter",
+        "minimum_entry_edge_bps": "30",
     }
 
 
@@ -328,6 +380,118 @@ def test_variational_submit_confirms_booked_record_without_resubmitting(reduce_o
     assert result["filled_qty"] == "0.198"
     assert result["average_price"] == "100.426"
     assert [r["type"] for r in var.requests] == ["VAR_API_ORDER", "VAR_API_ORDERS"]
+
+
+def test_final_dispatch_rejects_expired_quote_before_any_variational_order_request():
+    var = FakeVariational()
+    gateway = _gateway(var)
+    reader = gateway.dispatch_market_reader
+
+    async def stale_reader(**kwargs):
+        row = await reader(**kwargs)
+        row["var_quote_age_seconds"] = "2.01"
+        return row
+
+    gateway.dispatch_market_reader = stale_reader
+    request = {
+        **_booked_wti_request(),
+        "client_order_id": "stale-dispatch",
+        "reduce_only": True,
+        "max_slippage_bps": "8",
+    }
+    try:
+        result = asyncio.run(gateway._submit_order(request))
+    finally:
+        gateway.loop.close()
+    assert result["no_order_confirmed"] is True
+    assert result["error_code"] == "variational_quote_stale_or_invalid"
+    assert var.requests == []
+
+
+def test_final_dispatch_rechecks_entry_edge_after_account_preflight():
+    var = FakeVariational()
+    gateway = _gateway(var)
+    reader = gateway.dispatch_market_reader
+
+    async def below_threshold_reader(**kwargs):
+        row = await reader(**kwargs)
+        row["long_edge_bps"] = "29.99"
+        return row
+
+    async def healthy_account():
+        return {"risk": {
+            "risk_action": "normal", "risk_data_complete": True,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        }}
+
+    gateway.dispatch_market_reader = below_threshold_reader
+    gateway._read_account = healthy_account
+    request = {
+        **_booked_wti_request(),
+        "client_order_id": "edge-moved-before-dispatch",
+        "reduce_only": False,
+        "max_slippage_bps": "8",
+    }
+    try:
+        result = asyncio.run(gateway._submit_order(request))
+    finally:
+        gateway.loop.close()
+    assert result["no_order_confirmed"] is True
+    assert result["error_code"] == "wti_final_dispatch_entry_threshold_not_met"
+    assert var.requests == []
+
+
+def test_final_dispatch_allows_required_hedge_without_reapplying_entry_cutoff():
+    gateway = _gateway(FakeVariational())
+    request = {
+        **_booked_wti_request(),
+        "venue": "lighter",
+        "side": "sell",
+        "reduce_only": False,
+        "expected_direction": "long_var_short_lighter",
+        "minimum_entry_edge_bps": "300",
+        "session_entry_cutoff_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        "must_complete_hedge": True,
+        "max_slippage_bps": "8",
+    }
+    try:
+        result = asyncio.run(gateway._prepare_final_dispatch(request))
+    finally:
+        gateway.loop.close()
+    assert result is None
+    assert request["dispatch_quote_age_seconds"]
+
+
+@pytest.mark.parametrize(
+    "operation, retryable",
+    [("account_read", True), ("order_lookup", True), ("order_submit", False)],
+)
+def test_gateway_timeout_diagnostics_are_operation_specific(operation, retryable):
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    gateway = WTIProductionGateway(
+        loop=loop, variational=FakeVariational(), account_reader=object(),
+        lighter_client=None, account_index=1, api_key_index=1,
+        market={"market_id": 145, "supported_size_decimals": 2,
+                "supported_price_decimals": 2},
+        operation_timeout_seconds=0.01,
+    )
+
+    async def slow_operation():
+        await asyncio.sleep(1)
+        return {}
+
+    try:
+        with pytest.raises(WTIReadOnlyError) as raised:
+            gateway._call(slow_operation(), operation=operation)
+        assert raised.value.operation == operation
+        assert raised.value.retryable is retryable
+        assert raised.value.diagnostic_code == "operation_timeout"
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
 
 
 def test_variational_order_lookup_requires_unique_exact_native_rfq_match():

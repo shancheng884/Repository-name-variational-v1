@@ -106,3 +106,39 @@ test("rejects duplicate exact market listings", async () => {
   assert.equal(result.ok, false);
   assert.equal(result.error, "Market metadata is ambiguous.");
 });
+
+test("refuses an expired execution quote before posting an order", async () => {
+  const requests = [];
+  const context = {
+    location: { host: "omni.variational.io" },
+    localStorage: { length: 0, key: () => null, getItem: () => null },
+    performance: { now: () => 0 },
+    AbortController: class {
+      constructor() { this.signal = { aborted: false }; }
+      abort() { this.signal.aborted = true; }
+    },
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      return {
+        ok: true, status: 200, text: async () => JSON.stringify({ rfq_id: "unexpected" }),
+        headers: { get: () => null },
+      };
+    },
+  };
+  const result = await vm.runInNewContext(
+    buildVariationalApiScript("ORDER", {
+      market: "USOILP", instrumentType: "swap", kind: "commodity",
+      side: "BUY", amount: "0.198", reuseQuoteId: "expired-quote",
+      quoteTimestamp: "2020-01-01T00:00:00Z", expectedQuotePrice: "100",
+      dispatchQuoteAgeLimitMs: 2000, requestTimeoutMs: 1000,
+      operationTimeoutMs: 2000,
+    }),
+    context,
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.noOrderConfirmed, true);
+  assert.equal(result.step, "dispatch_preflight");
+  assert.equal(requests.length, 0);
+});

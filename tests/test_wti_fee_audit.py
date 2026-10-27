@@ -123,3 +123,80 @@ def test_fee_audit_does_not_call_exchange_when_exact_persisted_identity_missing(
     assert report["fees_usd"] is None
     assert calls == []
     assert any(leg.get("reason") == "persisted_execution_identity_missing" for leg in report["legs"])
+
+
+def test_fee_audit_covers_every_gradient_entry_layer_and_exit():
+    state = _state()
+    first_entry = state["execution_history"][0]
+    second_entry = deepcopy(first_entry)
+    second_entry["action_id"] = "entry-2"
+    for venue, leg in second_entry["legs"].items():
+        leg["request"]["client_order_id"] = f"entry-2-{venue}"
+        leg["result"]["client_order_id"] = f"entry-2-{venue}"
+    state["execution_history"].insert(1, second_entry)
+    state["last_closed_position"]["layers"] = [
+        {"entry_execution_id": "entry-1"},
+        {"entry_execution_id": "entry-2"},
+    ]
+    seen = []
+
+    async def lookup(client_order_id, request):
+        seen.append(client_order_id)
+        expected = next(
+            leg["result"]
+            for execution in state["execution_history"]
+            for leg in execution["legs"].values()
+            if leg["request"]["client_order_id"] == client_order_id
+        )
+        fee = "0.01" if request["venue"] == "variational" else "0.02"
+        return {
+            **expected,
+            "status": "filled",
+            "fee_usd": fee,
+            "fee_evidence": {
+                "status": "confirmed_usd", "raw_fee_unit": "USD", "fee_usd": fee,
+            },
+        }
+
+    report = asyncio.run(audit_latest_closed_position_fees(state, lookup))
+    assert report["status"] == "confirmed"
+    assert report["expected_order_leg_count"] == report["audited_order_leg_count"] == 6
+    assert report["entry_execution_ids"] == ["entry-1", "entry-2"]
+    assert report["fees_usd"] == "0.09"
+    assert len(seen) == 6
+
+
+def test_fee_audit_keeps_multilayer_position_unverified_when_one_fee_is_missing():
+    state = _state()
+    second_entry = deepcopy(state["execution_history"][0])
+    second_entry["action_id"] = "entry-2"
+    for venue, leg in second_entry["legs"].items():
+        leg["request"]["client_order_id"] = f"entry-2-{venue}"
+        leg["result"]["client_order_id"] = f"entry-2-{venue}"
+    state["execution_history"].insert(1, second_entry)
+    state["last_closed_position"]["layers"] = [
+        {"entry_execution_id": "entry-1"},
+        {"entry_execution_id": "entry-2"},
+    ]
+
+    async def lookup(client_order_id, request):
+        expected = next(
+            leg["result"]
+            for execution in state["execution_history"]
+            for leg in execution["legs"].values()
+            if leg["request"]["client_order_id"] == client_order_id
+        )
+        if client_order_id == "entry-2-lighter":
+            return {**expected, "status": "filled", "fee_usd": None}
+        fee = "0.01" if request["venue"] == "variational" else "0.02"
+        return {
+            **expected, "status": "filled", "fee_usd": fee,
+            "fee_evidence": {
+                "status": "confirmed_usd", "raw_fee_unit": "USD", "fee_usd": fee,
+            },
+        }
+
+    report = asyncio.run(audit_latest_closed_position_fees(state, lookup))
+    assert report["status"] == "unverified"
+    assert report["fees_usd"] is None
+    assert report["audited_order_leg_count"] == 6

@@ -14,6 +14,7 @@ from tools.lib.wti_execution import (
     WTIAccountSnapshotUnavailable,
     WTIExecutionError,
     WTIExecutionStore,
+    validate_market_sample,
 )
 from tools.lib.wti_live_gateway import WTIProductionGateway
 from tools.lib.lighter_order_identity import LEGACY_INDEX_REJECTION, MAX_LIGHTER_CLIENT_ORDER_INDEX
@@ -272,6 +273,48 @@ def test_unexpected_account_snapshot_error_is_not_retryable(tmp_path):
     assert raised.value.phase == "cycle_reconcile"
     assert raised.value.diagnostic_code == "runtimeerror"
     assert gateway.requests == []
+
+
+def test_http_401_account_error_is_not_made_retryable_by_transport_diagnostic(tmp_path):
+    from tools.lib.wti_readonly_adapter import WTIReadOnlyError
+
+    class UnauthorizedGateway(SimulatedWTIGateway):
+        def read_account(self):
+            raise WTIReadOnlyError(
+                "account authorization rejected",
+                retryable=True,
+                operation="positions",
+                http_status=401,
+                diagnostic_code="connection_closed",
+            )
+
+    executor, gateway = _executor(tmp_path, UnauthorizedGateway())
+    sample = _sample()
+    with pytest.raises(WTIAccountSnapshotUnavailable) as raised:
+        executor.reconcile(
+            sample=sample, now=datetime.now(timezone.utc),
+            session=_session_for_sample(sample),
+        )
+    assert raised.value.retryable is False
+    assert raised.value.operation == "positions"
+    assert raised.value.http_status == 401
+    assert raised.value.diagnostic_code == "connection_closed"
+    assert gateway.requests == []
+
+
+def test_market_context_parses_millisecond_quote_timestamps():
+    now = datetime.now(timezone.utc)
+    row = _sample(now=now, quote_id="quote-1", quote_timestamp=int(now.timestamp() * 1000))
+    context = validate_market_sample(
+        row,
+        expected_lighter_market_id=145,
+        expected_lighter_multiplier=Decimal("1"),
+        expected_lighter_size_decimals=2,
+        expected_lighter_price_decimals=2,
+        now=now,
+    )
+    assert context.quote_id == "quote-1"
+    assert context.quote_timestamp == now.replace(microsecond=(now.microsecond // 1000) * 1000)
 
 
 def test_full_open_close_uses_exact_contracts_reduce_only_and_confirmed_positions(tmp_path):
@@ -1443,6 +1486,20 @@ def test_startup_recovery_uses_production_submission_and_lookup_without_duplicat
             market={"market_id": 145, "supported_size_decimals": 2, "supported_price_decimals": 2},
             max_order_wait_seconds=0.01,
         )
+
+        async def fresh_dispatch_sample(**_kwargs):
+            current = datetime.now(timezone.utc)
+            return {
+                **sample,
+                "logged_at": current.isoformat(),
+                "var_quote_age_seconds": "0.1",
+                "lighter_book_age_seconds": "0.1",
+                "session_status_observed_at": current.isoformat(),
+                "session_status_feed_heartbeat_at": current.isoformat(),
+                "session_closing_at": (current + timedelta(hours=4)).isoformat(),
+            }
+
+        production.dispatch_market_reader = fresh_dispatch_sample
 
         async def read_account():
             observed = simulation.read_account()

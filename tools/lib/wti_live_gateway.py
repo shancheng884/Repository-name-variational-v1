@@ -11,9 +11,9 @@ import hashlib
 import time
 from concurrent.futures import Future, TimeoutError as FutureTimeout
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from math import ceil
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from tools.lib.hedge_instruments import WTI_HEDGE, integer_value
 from tools.lib.lighter_order_identity import (
@@ -28,6 +28,8 @@ from tools.lib.wti_readonly_adapter import (
     WTIReadOnlyError,
     VariationalForwarderClient,
 )
+from tools.lib.market_sessions import session_observation_for_sample
+from tools.lib.wti_execution import validate_market_sample
 from tools.lib.wti_sizing import DEFAULT_MAX_EQUITY_MULTIPLE, equity_position_cap_usd
 
 
@@ -112,6 +114,7 @@ class WTIProductionGateway:
         max_order_wait_seconds: float = 4.0,
         operation_timeout_seconds: float = 12.0,
         max_equity_multiple: Decimal = DEFAULT_MAX_EQUITY_MULTIPLE,
+        dispatch_market_reader: Callable[..., Awaitable[dict[str, Any]]] | None = None,
     ) -> None:
         if (
             max_order_wait_seconds <= 0 or operation_timeout_seconds <= 0
@@ -129,12 +132,13 @@ class WTIProductionGateway:
         self.max_order_wait_seconds = max_order_wait_seconds
         self.operation_timeout_seconds = operation_timeout_seconds
         self.max_equity_multiple = max_equity_multiple
+        self.dispatch_market_reader = dispatch_market_reader
         self.current_notional_usd = Decimal("0")
         self.proposed_notional_usd: Decimal | None = None
         self.proposed_equity_multiple: Decimal | None = None
         self.latest_risk: dict[str, Any] = {}
 
-    def _call(self, coroutine: Any) -> dict[str, Any]:
+    def _call(self, coroutine: Any, *, operation: str) -> dict[str, Any]:
         if self.loop.is_closed() or not self.loop.is_running():
             coroutine.close()
             raise WTIReadOnlyError("wti_gateway_event_loop_unavailable")
@@ -145,8 +149,8 @@ class WTIProductionGateway:
             future.cancel()
             raise WTIReadOnlyError(
                 "wti_gateway_operation_timeout",
-                retryable=True,
-                operation="account_read",
+                retryable=operation in {"account_read", "order_lookup"},
+                operation=operation,
                 diagnostic_code="operation_timeout",
             ) from exc
         if not isinstance(result, dict):
@@ -154,15 +158,18 @@ class WTIProductionGateway:
         return result
 
     def read_account(self) -> dict[str, Any]:
-        return self._call(self._read_account())
+        return self._call(self._read_account(), operation="account_read")
 
     def submit_order(self, request: dict[str, Any]) -> dict[str, Any]:
-        return self._call(self._submit_order(dict(request)))
+        return self._call(self._submit_order(request), operation="order_submit")
 
     def lookup_order(
         self, client_order_id: str, request: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        return self._call(self._lookup_order(client_order_id, dict(request or {})))
+        return self._call(
+            self._lookup_order(client_order_id, dict(request or {})),
+            operation="order_lookup",
+        )
 
     def set_current_notional(self, value: Decimal) -> None:
         if not value.is_finite() or value < 0:
@@ -185,6 +192,141 @@ class WTIProductionGateway:
             raise ValueError("proposed WTI equity multiple must be within the hard cap")
         self.proposed_notional_usd = value
         self.proposed_equity_multiple = equity_multiple if value is not None else None
+
+    async def _prepare_final_dispatch(self, request: dict[str, Any]) -> dict[str, Any] | None:
+        """Refresh both books after account preflight and bind the send to that quote."""
+        if self.dispatch_market_reader is None:
+            return {
+                "ok": True, "final": True, "status": "rejected", "filled_qty": "0",
+                "no_order_confirmed": True, "source": "dispatch_market_preflight",
+                "error_code": "wti_final_dispatch_quote_reader_unavailable",
+            }
+        qty = _decimal(request.get("qty"))
+        multiplier = _decimal(self.market.get("multiplier")) or _decimal(
+            self.market.get("exposure_multiplier")
+        ) or Decimal("1")
+        if qty is None or qty <= 0 or multiplier <= 0:
+            return {
+                "ok": True, "final": True, "status": "rejected", "filled_qty": "0",
+                "no_order_confirmed": True, "source": "dispatch_market_preflight",
+                "error_code": "wti_final_dispatch_quantity_invalid",
+            }
+        if request.get("venue") == "variational":
+            var_qty, lighter_qty = qty, qty / multiplier
+        else:
+            var_qty, lighter_qty = qty * multiplier, qty
+        try:
+            sample = await self.dispatch_market_reader(
+                var_qty=var_qty, lighter_qty=lighter_qty, sample_kind="burst"
+            )
+            if not isinstance(sample, dict):
+                raise WTIReadOnlyError("wti_final_dispatch_sample_invalid")
+            context = validate_market_sample(
+                sample,
+                expected_lighter_market_id=int(self.market["market_id"]),
+                expected_lighter_multiplier=multiplier,
+                expected_lighter_size_decimals=int(self.market["supported_size_decimals"]),
+                expected_lighter_price_decimals=int(self.market["supported_price_decimals"]),
+                now=datetime.now(timezone.utc),
+                max_quote_age_seconds=2,
+                max_book_age_seconds=2,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            reason = getattr(exc, "reason", None) or str(exc) or type(exc).__name__
+            safe = "".join(ch if ch.isalnum() or ch in "_.:-" else "_" for ch in reason.lower())[:120]
+            return {
+                "ok": True, "final": True, "status": "rejected", "filled_qty": "0",
+                "no_order_confirmed": True, "source": "dispatch_market_preflight",
+                "error_code": safe or "wti_final_dispatch_sample_invalid",
+            }
+        now = datetime.now(timezone.utc)
+        session = session_observation_for_sample(sample)
+        heartbeat = _timestamp(sample.get("session_status_feed_heartbeat_at"))
+        if (
+            session is None or heartbeat is None
+            or (now - heartbeat).total_seconds() < -5
+            or (now - heartbeat).total_seconds() > 30
+        ):
+            reason = "wti_final_dispatch_session_stale"
+        elif request.get("session_id") and session.session_id != request.get("session_id"):
+            reason = "wti_final_dispatch_session_changed"
+        elif context.quoted_var_qty < var_qty or context.quoted_lighter_qty < lighter_qty:
+            reason = "wti_final_dispatch_depth_below_order_quantity"
+        else:
+            reason = None
+        opening = request.get("reduce_only") is not True
+        must_complete_hedge = request.get("must_complete_hedge") is True
+        if reason is None and opening and not must_complete_hedge:
+            cutoff = _timestamp(request.get("session_entry_cutoff_at"))
+            if cutoff is None or now >= cutoff:
+                reason = "wti_final_dispatch_entry_cutoff"
+            else:
+                direction = str(request.get("expected_direction") or "")
+                edge_key = (
+                    "long_edge_bps" if direction == "long_var_short_lighter"
+                    else "short_edge_bps" if direction == "short_var_long_lighter"
+                    else None
+                )
+                required = _decimal(request.get("minimum_entry_edge_bps"))
+                edge = _decimal(sample.get(edge_key)) if edge_key else None
+                if required is None or edge is None or (
+                    edge < required if direction == "long_var_short_lighter" else edge > -required
+                ):
+                    reason = "wti_final_dispatch_entry_threshold_not_met"
+        if reason is not None:
+            return {
+                "ok": True, "final": True, "status": "rejected", "filled_qty": "0",
+                "no_order_confirmed": True, "source": "dispatch_market_preflight",
+                "error_code": reason,
+            }
+
+        if request["venue"] == "variational":
+            if not context.quote_id or context.quote_timestamp is None:
+                return {
+                    "ok": True, "final": True, "status": "rejected", "filled_qty": "0",
+                    "no_order_confirmed": True, "source": "dispatch_market_preflight",
+                    "error_code": "wti_variational_dispatch_quote_identity_missing",
+                }
+            quote_age = (now - context.quote_timestamp).total_seconds()
+            if quote_age < -5 or quote_age > 2:
+                return {
+                    "ok": True, "final": True, "status": "rejected", "filled_qty": "0",
+                    "no_order_confirmed": True, "source": "dispatch_market_preflight",
+                    "error_code": "wti_variational_dispatch_quote_expired",
+                }
+            reference = context.var_ask if request.get("side") == "buy" else context.var_bid
+            request["reuse_quote_id"] = context.quote_id
+            request["quote_timestamp"] = context.quote_timestamp.isoformat()
+        else:
+            reference = (
+                context.lighter_buy_price if request.get("side") == "buy"
+                else context.lighter_sell_price
+            )
+        slip = _decimal(request.get("max_slippage_bps"))
+        if slip is None or slip <= 0:
+            return {
+                "ok": True, "final": True, "status": "rejected", "filled_qty": "0",
+                "no_order_confirmed": True, "source": "dispatch_market_preflight",
+                "error_code": "wti_final_dispatch_slippage_invalid",
+            }
+        move = slip / Decimal("10000")
+        limit = reference * (Decimal("1") + move if request.get("side") == "buy" else Decimal("1") - move)
+        if request["venue"] == "lighter":
+            tick = Decimal(1).scaleb(-context.lighter_price_decimals)
+            rounding = ROUND_CEILING if request.get("side") == "buy" else ROUND_FLOOR
+            limit = (limit / tick).to_integral_value(rounding=rounding) * tick
+        request.update({
+            "reference_price": str(reference),
+            "limit_price": str(limit),
+            "dispatch_sample_id": context.sample_id,
+            "dispatch_at": now.isoformat(),
+            "dispatch_quote_age_seconds": str(context.var_quote_age_seconds),
+            "dispatch_book_age_seconds": str(context.lighter_book_age_seconds),
+            "dispatch_session_id": context.session_id,
+        })
+        return None
 
     async def _read_account(self) -> dict[str, Any]:
         snapshot = await self.account_reader.read_account()
@@ -280,6 +422,9 @@ class WTIProductionGateway:
                     "no_order_confirmed": True,
                     "native_client_order_id": request.get("native_client_order_id"),
                 }
+        final_guard = await self._prepare_final_dispatch(request)
+        if final_guard is not None:
+            return final_guard
         if request["venue"] == "variational":
             request_id = str(request["client_order_id"])
             message = await self.variational.request({
@@ -293,18 +438,37 @@ class WTIProductionGateway:
                 "side": request["side"].upper(),
                 "amount": str(request["qty"]),
                 "confirm": True,
+                "reuseQuoteId": request.get("reuse_quote_id"),
+                "quoteTimestamp": request.get("quote_timestamp"),
+                "expectedQuotePrice": request.get("reference_price"),
+                "dispatchQuoteAgeLimitMs": 2000,
                 "maxSlippage": float(Decimal(str(request["max_slippage_bps"])) / Decimal("10000")),
                 "reduceOnly": request["reduce_only"] is True,
                 "requestTimeoutMs": int(self.operation_timeout_seconds * 1000),
                 "operationTimeoutMs": int(self.operation_timeout_seconds * 1000),
             })
+            result = message.get("result") if isinstance(message, dict) else None
+            if (
+                isinstance(message, dict)
+                and message.get("type") == VARIATIONAL_RESULT_TYPES["VAR_API_ORDER"]
+                and str(message.get("requestId")) == request_id
+                and isinstance(result, dict)
+                and result.get("noOrderConfirmed") is True
+            ):
+                return {
+                    "ok": True, "final": True, "client_order_id": request_id,
+                    "status": "rejected", "filled_qty": "0",
+                    "no_order_confirmed": True,
+                    "source": "extension_final_dispatch_guard",
+                    "error_code": result.get("error") or "wti_extension_dispatch_guard_rejected",
+                }
             if (
                 not isinstance(message, dict)
                 or message.get("type") != VARIATIONAL_RESULT_TYPES["VAR_API_ORDER"]
                 or str(message.get("requestId")) != request_id
                 or message.get("ok") is not True
-                or not isinstance(message.get("result"), dict)
-                or message["result"].get("ok") is not True
+                or not isinstance(result, dict)
+                or result.get("ok") is not True
             ):
                 return {
                     "ok": False,
@@ -313,7 +477,6 @@ class WTIProductionGateway:
                     "status": "unknown",
                     "response_error": (message.get("error") if isinstance(message, dict) else None),
                 }
-            result = message["result"]
             http_status = integer_value(result.get("httpStatus"))
             if http_status is None or not 200 <= http_status < 300:
                 return {

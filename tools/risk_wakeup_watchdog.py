@@ -58,6 +58,14 @@ ALERT_CONTROL_PATH = ROOT / "log" / "risk_wakeup_alert_control.json"
 WATCHDOG_LOCK_PATH = ROOT / "log" / "risk_wakeup_watchdog.lock"
 WTI_STATE_PATH = ROOT / "log" / "wti_live_state.json"
 WTI_RISK_HEALTH_PATH = ROOT / "log" / "wti_live_risk_health.json"
+WTI_MARKET_DATA_NOTIFICATION_REASONS = frozenset({
+    "wti_current_sample_or_session_not_fresh",
+    "wti_sample_or_session_unverified",
+    "wti_market_sample_or_session_unavailable",
+    "wti_execution_refresh_unavailable",
+    "wti_execution_refresh_sample_invalid",
+    "variational_quote_stale_or_invalid",
+})
 
 
 CRITICAL_MANUAL_REVIEW_MARKERS = (
@@ -142,6 +150,55 @@ def parse_time(value: Any) -> datetime | None:
         return result.astimezone(timezone.utc)
     except ValueError:
         return None
+
+
+def fresh_runtime_health(health: dict[str, Any], now: datetime, max_age: float) -> bool:
+    at = parse_time(health.get("updated_at"))
+    return at is not None and -5 <= (now - at).total_seconds() <= max_age
+
+
+def confirmed_flat_state(state: dict[str, Any], health: dict[str, Any]) -> bool:
+    try:
+        return bool(
+            state.get("status") == "flat"
+            and state.get("open_lots") == []
+            and state.get("pending_actions") == []
+            and not state.get("manual_review_reason")
+            and int(health.get("open_lots_total") or 0) == 0
+            and int(health.get("pending_actions_total") or 0) == 0
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def wti_notification_health(health: dict[str, Any]) -> dict[str, Any]:
+    """Keep notification episodes stable without changing execution gates."""
+    result = dict(health)
+    if health.get("risk_action") in {"force_reduce", "emergency_exit"}:
+        return result
+    account_action = health.get("account_risk_action")
+    if account_action in {"warning", "block_entry", "force_reduce", "emergency_exit"}:
+        result["risk_notification_action"] = account_action
+        result["risk_notification_reason"] = health.get("account_risk_reason")
+        if account_action in {"force_reduce", "emergency_exit"}:
+            result["risk_action"] = account_action
+            result["risk_reason"] = health.get("account_risk_reason")
+    elif health.get("entry_authorization_permanently_revoked") is True:
+        result["risk_notification_action"] = "block_entry"
+        result["risk_notification_reason"] = (
+            health.get("entry_gate_block_reason") or "wti_entry_authorization_revoked"
+        )
+    elif health.get("risk_reason") in WTI_MARKET_DATA_NOTIFICATION_REASONS:
+        result["risk_notification_action"] = "block_entry"
+        result["risk_notification_reason"] = "wti_market_data_unavailable"
+    return result
+
+
+def canonical_wti_incident_key(key: str) -> str:
+    prefix = "wti:account_risk:block_entry:"
+    if key.startswith(prefix) and key[len(prefix):] in WTI_MARKET_DATA_NOTIFICATION_REASONS:
+        return prefix + "wti_market_data_unavailable"
+    return key
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -242,6 +299,7 @@ class WatchdogConfig:
     reference_feed_rearm_seconds: float = 1800.0
     reference_feed_recovery_max_attempts: int = 2
     account_risk_rearm_seconds: float = 900.0
+    wti_recovery_confirmation_seconds: float = 30.0
 
     @classmethod
     def from_env(cls) -> "WatchdogConfig":
@@ -305,6 +363,10 @@ class WatchdogConfig:
             account_risk_rearm_seconds=max(
                 0.0,
                 env_float("RISK_WAKEUP_ACCOUNT_RISK_REARM_SECONDS", 900.0),
+            ),
+            wti_recovery_confirmation_seconds=max(
+                10.0,
+                env_float("RISK_WAKEUP_WTI_RECOVERY_CONFIRMATION_SECONDS", 30.0),
             ),
         )
 
@@ -848,7 +910,41 @@ class RiskWakeupWatchdog:
             self.memory["active_incidents"] = {}
         if not isinstance(self.memory.get("incident_rearm_until"), dict):
             self.memory["incident_rearm_until"] = {}
+        self._migrate_wti_notification_memory()
         self.stop_requested = False
+
+    def _migrate_wti_notification_memory(self) -> None:
+        active = self.memory["active_incidents"]
+        for key in list(active):
+            record = active[key]
+            if not key.startswith("wti:account_risk:") or not isinstance(record, dict):
+                continue
+            if record.get("severity") != "warning":
+                continue
+            canonical = canonical_wti_incident_key(key)
+            signature = hashlib.sha256(
+                f"warning\nWTI:{canonical[4:]}".encode("utf-8")
+            ).hexdigest()[:16]
+            if record.get("acknowledged_signature") == record.get("incident_signature"):
+                record["acknowledged_signature"] = signature
+            record["incident_signature"] = signature
+            if canonical != key:
+                active.pop(key)
+                existing = active.get(canonical)
+                if not isinstance(existing, dict) or (
+                    bool(record.get("acknowledged_at")), bool(record.get("telegram_sent_at"))
+                ) > (
+                    bool(existing.get("acknowledged_at")), bool(existing.get("telegram_sent_at"))
+                ):
+                    active[canonical] = record
+        deadlines = self.memory["incident_rearm_until"]
+        for key in list(deadlines):
+            canonical = canonical_wti_incident_key(key)
+            if canonical != key:
+                deadline = parse_time(deadlines.pop(key))
+                existing = parse_time(deadlines.get(canonical))
+                if deadline is not None and (existing is None or deadline > existing):
+                    deadlines[canonical] = iso_time(deadline)
 
     def configuration_errors(self) -> list[str]:
         errors: list[str] = []
@@ -1156,9 +1252,18 @@ class RiskWakeupWatchdog:
                 "updated_at": iso_time(now),
                 "status": "running" if self.config.enabled else "disabled",
                 "strategy_running": strategy_running,
-                "active_incidents": [item.key for item in incidents],
+                "monitored_assets": getattr(self, "monitored_assets", []),
+                "primary_asset": self.memory.get("primary_asset"),
+                "observed_incidents": getattr(self, "observed_incident_keys", []),
+                "cooldown_suppressed_incidents": getattr(self, "cooldown_suppressed_incident_keys", []),
+                "active_incidents": list(self.memory["active_incidents"]),
+                "recovering_incidents": [
+                    key for key, record in self.memory["active_incidents"].items()
+                    if record.get("recovery_candidate_at")
+                ],
                 "critical_incidents": sum(
-                    item.severity == "critical" for item in incidents
+                    record.get("severity") == "critical"
+                    for record in self.memory["active_incidents"].values()
                 ),
                 "monitor_strategy": self.monitor_strategy_enabled(),
                 "mode": (
@@ -1389,38 +1494,46 @@ class RiskWakeupWatchdog:
         except (TypeError, ValueError):
             pid = None
         strategy_running = self.strategy_check(pid)
+        primary_state, primary_health = state, risk_health
+        any_strategy_running = strategy_running
+        self.monitored_assets = []
+        self.observed_incident_keys = []
+        self.cooldown_suppressed_incident_keys = []
+        wti_health: dict[str, Any] = {}
+        inactive_base_flat = False
+        inactive_wti_flat = False
         incidents = [synthetic] if synthetic is not None else []
         if synthetic is None and self.monitor_strategy_enabled():
-            incidents = evaluate_incidents(
-                state=state,
-                risk_health=risk_health,
-                events=events,
-                strategy_running=strategy_running,
-                config=self.config,
-                now=now,
-            )
-            rearm_until = self.memory["incident_rearm_until"]
-            for key, value in list(rearm_until.items()):
-                deadline = parse_time(value)
-                if deadline is None or deadline <= now:
-                    rearm_until.pop(key, None)
-            incidents = [
-                incident
-                for incident in incidents
-                if (
-                    (deadline := parse_time(rearm_until.get(incident.key))) is None
-                    or deadline <= now
-                )
-            ]
             wti_state_raw = read_json(self.wti_state_path)
             wti_health = read_json(self.wti_risk_health_path)
+            try:
+                wti_pid = int(wti_health.get("pid") or 0)
+            except (TypeError, ValueError):
+                wti_pid = None
+            wti_running = self.wti_strategy_check(wti_pid)
+            any_strategy_running = strategy_running or wti_running
+            if (
+                wti_running and not strategy_running
+                and fresh_runtime_health(wti_health, now, self.config.risk_heartbeat_max_age_seconds)
+            ):
+                self.memory["primary_asset"] = "WTI"
+            elif (
+                strategy_running and not wti_running
+                and fresh_runtime_health(risk_health, now, self.config.risk_heartbeat_max_age_seconds)
+            ):
+                self.memory["primary_asset"] = str(state.get("asset") or "ETH")
+            inactive_base_flat = bool(
+                not strategy_running and self.memory.get("primary_asset") == "WTI"
+                and (wti_state_raw or wti_health)
+                and confirmed_flat_state(state, risk_health)
+            )
+            if not inactive_base_flat:
+                self.monitored_assets.append(str(state.get("asset") or "ETH"))
+                incidents = evaluate_incidents(
+                    state=state, risk_health=risk_health, events=events,
+                    strategy_running=strategy_running, config=self.config, now=now,
+                )
             if wti_state_raw or wti_health:
-                raw_pid = wti_health.get("pid")
-                try:
-                    wti_pid = int(raw_pid) if raw_pid not in (None, "") else None
-                except (TypeError, ValueError):
-                    wti_pid = None
-                wti_running = self.wti_strategy_check(wti_pid)
                 open_position = wti_state_raw.get("open_position")
                 pending_action = wti_state_raw.get("pending_action")
                 wti_pending: list[dict[str, Any]] = []
@@ -1449,14 +1562,24 @@ class RiskWakeupWatchdog:
                     "last_blocked_reason": wti_health.get("risk_reason"),
                     "updated_at": wti_state_raw.get("updated_at"),
                 }
-                wti_events = evaluate_incidents(
+                inactive_wti_flat = bool(
+                    not wti_running and self.memory.get("primary_asset") not in {None, "WTI"}
+                    and wti_state_raw.get("open_position") is None
+                    and wti_state_raw.get("pending_action") is None
+                    and confirmed_flat_state(wti_state, wti_health)
+                )
+                wti_events = [] if inactive_wti_flat else evaluate_incidents(
                     state=wti_state,
-                    risk_health=wti_health,
+                    risk_health=wti_notification_health(wti_health),
                     events=[],
                     strategy_running=wti_running,
                     config=self.config,
                     now=now,
                 )
+                if not inactive_wti_flat:
+                    self.monitored_assets.append("WTI")
+                if inactive_base_flat:
+                    primary_state, primary_health = wti_state, wti_health
                 has_wti_exposure = bool(wti_state["open_lots"] or wti_state["pending_actions"])
                 if has_wti_exposure and wti_health.get("market_sample_fresh") is not True:
                     wti_events.append(Incident(
@@ -1473,12 +1596,33 @@ class RiskWakeupWatchdog:
                         title=item.title,
                         message=item.message,
                         alert_params=("WTI", *(item.alert_params[1:] or ("WTI 风险监控",))),
-                        fingerprint=item.fingerprint,
+                        fingerprint=(
+                            f"WTI:{item.key}"
+                            if item.severity == "warning" and item.key.startswith("account_risk:")
+                            else item.fingerprint
+                        ),
                         rearm_seconds=item.rearm_seconds,
                         notify_recovery=item.notify_recovery,
                     )
                     for item in wti_events
                 )
+            # Apply cooldowns only after venue-specific keys have been scoped.
+            self.observed_incident_keys = [item.key for item in incidents]
+            rearm_until = self.memory["incident_rearm_until"]
+            for key, value in list(rearm_until.items()):
+                deadline = parse_time(value)
+                if deadline is None or deadline <= now:
+                    rearm_until.pop(key, None)
+            incidents = [
+                incident for incident in incidents
+                if incident.key in self.memory["active_incidents"]
+                or (incident.severity == "critical" and incident.rearm_seconds == 0)
+                or (deadline := parse_time(rearm_until.get(incident.key))) is None
+                or deadline <= now
+            ]
+            self.cooldown_suppressed_incident_keys = sorted(
+                set(self.observed_incident_keys) - {item.key for item in incidents}
+            )
         active = self.memory["active_incidents"]
         if not any(item.severity == "critical" for item in incidents):
             promoted: list[Incident] = []
@@ -1585,6 +1729,7 @@ class RiskWakeupWatchdog:
             record["rearm_seconds"] = incident.rearm_seconds
             record["notify_recovery"] = incident.notify_recovery
             record["last_seen_at"] = iso_time(now)
+            record.pop("recovery_candidate_at", None)
             self._deliver_incident(
                 incident,
                 record,
@@ -1594,6 +1739,40 @@ class RiskWakeupWatchdog:
         for key in list(active):
             if key in current_keys:
                 continue
+            record = active[key]
+            dormant_asset = inactive_wti_flat if key.startswith("wti:") else inactive_base_flat
+            if dormant_asset:
+                active.pop(key)
+                continue
+            if key.startswith("wti:") and isinstance(record, dict):
+                unresolved_data = key in {
+                    "wti:account_risk:block_entry:wti_market_data_unavailable",
+                    "wti:wti_market_data_unavailable_with_exposure",
+                } and wti_health.get("market_sample_fresh") is not True
+                unresolved_lock = bool(
+                    wti_health.get("entry_authorization_permanently_revoked") is True
+                    and key.endswith(":" + str(wti_health.get("entry_gate_block_reason") or "wti_entry_authorization_revoked"))
+                )
+                if not (
+                    inactive_wti_flat
+                    or fresh_runtime_health(wti_health, now, self.config.risk_heartbeat_max_age_seconds)
+                ) or unresolved_data or unresolved_lock:
+                    record.pop("recovery_candidate_at", None)
+                    continue
+                candidate = parse_time(record.get("recovery_candidate_at"))
+                if candidate is None:
+                    record["recovery_candidate_at"] = iso_time(now)
+                    continue
+                health_at = parse_time(wti_health.get("updated_at"))
+                recovery_evidence = inactive_wti_flat or (
+                    fresh_runtime_health(wti_health, now, self.config.risk_heartbeat_max_age_seconds)
+                    and health_at is not None and health_at > candidate
+                )
+                if (
+                    not recovery_evidence
+                    or (now - candidate).total_seconds() < self.config.wti_recovery_confirmation_seconds
+                ):
+                    continue
             record = active.pop(key)
             if isinstance(record, dict):
                 try:
@@ -1614,15 +1793,15 @@ class RiskWakeupWatchdog:
         self._persist(now=now)
         self._write_health(
             now=now,
-            strategy_running=strategy_running,
+            strategy_running=any_strategy_running,
             incidents=incidents,
         )
         self.remote_publisher.publish(
             build_heartbeat_payload(
                 node_id=self.remote_publisher.node_id,
-                state=state,
-                risk_health=risk_health,
-                strategy_running=strategy_running,
+                state=primary_state,
+                risk_health=primary_health,
+                strategy_running=any_strategy_running,
                 watchdog_memory=self.memory,
                 alert_control=read_alert_control(self.alert_control_path),
                 sent_at=now,

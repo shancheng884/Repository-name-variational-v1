@@ -20,7 +20,7 @@ def _decimal(value: Any) -> Decimal | None:
 async def audit_latest_closed_position_fees(
     state: dict[str, Any], lookup_order: Lookup,
 ) -> dict[str, Any]:
-    """Recheck four persisted fills by exact venue order identity; never mutates state."""
+    """Recheck every persisted entry-layer and exit fill; never mutates state."""
     position = state.get("last_closed_position")
     if not isinstance(position, dict):
         return {
@@ -37,10 +37,23 @@ async def audit_latest_closed_position_fees(
         str(item.get("action_id")): item
         for item in executions if isinstance(item, dict) and item.get("action_id")
     } if isinstance(executions, list) else {}
-    leg_specs = (
-        ("entry", position.get("entry_execution_id"), "open"),
-        ("exit", position.get("exit_execution_id"), "close"),
-    )
+    layers = position.get("layers")
+    entry_ids = [
+        str(layer.get("entry_execution_id"))
+        for layer in layers
+        if isinstance(layer, dict) and layer.get("entry_execution_id")
+    ] if isinstance(layers, list) else []
+    if not entry_ids:
+        fallback_id = position.get("last_entry_execution_id") or position.get("entry_execution_id")
+        if fallback_id:
+            entry_ids = [str(fallback_id)]
+    entry_ids = list(dict.fromkeys(entry_ids))
+    leg_specs = [
+        (f"entry_layer_{index}", action_id, "open")
+        for index, action_id in enumerate(entry_ids, start=1)
+    ]
+    leg_specs.append(("exit", position.get("exit_execution_id"), "close"))
+    expected_leg_count = len(leg_specs) * 2
     legs: list[dict[str, Any]] = []
     fee_total = Decimal("0")
     all_confirmed = True
@@ -118,13 +131,16 @@ async def audit_latest_closed_position_fees(
                 "error_type": result.get("error_type"),
             })
     return {
-        "status": "confirmed" if all_confirmed and len(legs) == 4 else "unverified",
-        "reason": None if all_confirmed and len(legs) == 4 else "one_or_more_exact_usd_fee_proofs_missing",
+        "status": "confirmed" if all_confirmed and len(legs) == expected_leg_count else "unverified",
+        "reason": None if all_confirmed and len(legs) == expected_leg_count else "one_or_more_exact_usd_fee_proofs_missing",
         "orders_attempted": False,
         "state_modified": False,
         "entry_execution_id": position.get("entry_execution_id"),
+        "entry_execution_ids": entry_ids,
         "exit_execution_id": position.get("exit_execution_id"),
-        "fees_usd": str(fee_total) if all_confirmed and len(legs) == 4 else None,
+        "expected_order_leg_count": expected_leg_count,
+        "audited_order_leg_count": len(legs),
+        "fees_usd": str(fee_total) if all_confirmed and len(legs) == expected_leg_count else None,
         "funding_status": "unverified",
         "legs": legs,
     }

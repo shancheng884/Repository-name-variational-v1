@@ -670,6 +670,7 @@ def test_expired_baseline_gets_one_strict_burst_refresh_and_recovers():
     )
     assert runtime.last_processed_sample_id == "refresh-burst"
     assert runtime.last_execution_refresh_status == "fresh"
+    assert runtime.last_execution_refresh_at == refreshed["logged_at"]
     assert runtime.entry_authorization_permanently_revoked is False
 
 
@@ -844,6 +845,7 @@ def test_runtime_revokes_entry_after_sample_gap_without_reprocessing_same_id():
     runtime = object.__new__(wti_live.WTILiveRuntime)
     runtime.last_processed_sample_id = "sample-1"
     runtime.last_processed_sample_at = datetime.now(timezone.utc) - timedelta(seconds=121)
+    runtime.last_baseline_sample_at = runtime.last_processed_sample_at
     runtime.last_sample_gap_seconds = None
     runtime.entry_authorized = True
     runtime.entry_gate_block_reason = None
@@ -857,6 +859,30 @@ def test_runtime_revokes_entry_after_sample_gap_without_reprocessing_same_id():
     assert runtime.pending_gap_exit is True
     assert runtime.last_sample_gap_seconds > 120
     assert runtime._record_new_sample(_live_sample(now, sample_id="sample-2")) is None
+
+
+def test_execution_burst_does_not_reset_baseline_gap_clock():
+    now = datetime.now(timezone.utc)
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.last_seen_sample_id = None
+    runtime.last_processed_sample_id = "recent-burst"
+    runtime.last_processed_sample_at = now - timedelta(seconds=1)
+    runtime.last_baseline_sample_id = "baseline-1"
+    runtime.last_baseline_sample_at = now - timedelta(seconds=121)
+    runtime.last_baseline_session_id = "wti-session-1"
+    runtime.last_sample_gap_seconds = None
+    runtime.pending_gap_exit = False
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.last_action = {}
+
+    assert runtime._record_new_sample(
+        _live_sample(now, sample_id="baseline-2")
+    ) is True
+    assert runtime.last_sample_gap_seconds > 120
+    assert runtime.pending_gap_exit is True
+    assert runtime.entry_authorized is False
 
 
 def test_runtime_keeps_entry_gate_when_sample_gap_is_within_existing_limit():
@@ -1667,7 +1693,7 @@ def test_account_read_retries_are_bounded_and_keep_entries_locked(tmp_path):
     assert runtime.entry_authorized is False
     assert runtime.entry_authorization_permanently_revoked is False
     assert runtime.startup_reconciled is False
-    assert runtime.last_account_read_failure == "cycle_reconcile:service_unavailable:http_503"
+    assert runtime.last_account_read_failure == "cycle_reconcile:positions:service_unavailable:http_503"
     assert gateway.attempts == len(wti_live.ACCOUNT_READ_RETRY_DELAYS_SECONDS) + 1
     assert state["execution_history"] == []
 
@@ -1701,6 +1727,75 @@ def test_account_recovery_snapshot_rejects_mismatch_or_non_normal_risk(tmp_path)
     assert not runtime._account_recovery_snapshot_verified(
         state, {**risk, "risk_data_complete": False},
     )
+
+
+def test_verified_open_position_can_be_reduced_during_account_recovery_lock(monkeypatch):
+    now = datetime.now(timezone.utc)
+    row = _live_sample(now, sample_id="emergency-reduce")
+    state = {
+        "status": "open",
+        "open_position": {
+            "direction": "long_var_short_lighter", "var_qty": "0.198",
+            "lighter_qty": "0.198", "multiplier": "1",
+            "opened_at": (now - timedelta(minutes=5)).isoformat(),
+        },
+        "pending_action": None,
+        "manual_review_reason": None,
+    }
+    gateway = SimpleNamespace(latest_risk={
+        "risk_action": "emergency_exit", "risk_reason": "maintenance_margin_emergency",
+    })
+    close_calls = []
+
+    class Executor:
+        def close(self, **kwargs):
+            close_calls.append(kwargs)
+            return {
+                **state,
+                "status": "flat", "open_position": None,
+                "pending_action": None,
+            }
+
+        def open(self, **_kwargs):
+            raise AssertionError("recovery risk must never allow a new order")
+
+    gateway.set_current_notional = lambda _value: None
+
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.args = SimpleNamespace(
+        gradient_live=False, entry_cutoff_seconds=1800,
+        manage_existing_wti_position=True, keep_collecting_after_pilot=False,
+    )
+    runtime.config = SimpleNamespace(
+        entry_cutoff_seconds=1800, exit_target_bps=Decimal("1"),
+        roundtrip_cost_bps=Decimal("10"),
+    )
+    runtime.executor = Executor()
+    runtime.gateway = gateway
+    runtime.manage_existing_only = True
+    runtime.account_read_recovery_cycle_blocked = True
+    runtime.account_read_recovery_position_management_allowed = True
+    runtime.entry_authorized = True
+    runtime.pending_gap_exit = False
+    runtime.last_action = {}
+    runtime.rotation_drain_request = None
+    runtime._decision_sample = lambda _row: asyncio.sleep(0, result=row)
+    runtime._read_reconcile = lambda _row: asyncio.sleep(0, result=state)
+    runtime._poll_rotation_drain = lambda: False
+    runtime._arm_manual_gradient_round = lambda current, _row: asyncio.sleep(0, result=current)
+    runtime._advance_continuous_gradient_round = lambda current: asyncio.sleep(0, result=current)
+    runtime._finish_single_round_pilot_if_done = lambda _state: False
+    runtime._finish_gradient_pilot_if_done = lambda _state: False
+    monkeypatch.setattr(
+        wti_live, "decide_wti_action",
+        lambda *_args, **_kwargs: {"action": "hold", "reason": "test"},
+    )
+
+    result = asyncio.run(runtime._process_sample(row))
+    assert result["status"] == "flat"
+    assert len(close_calls) == 1
+    assert close_calls[0]["decision"]["reason"] == "account_risk_emergency_exit"
+    assert runtime.entry_authorized is False
 
 
 def test_account_read_recovery_marker_is_restored_after_process_restart(tmp_path, monkeypatch):

@@ -423,6 +423,7 @@ class WTILiveRuntime:
         self.account_read_recovery_verified_snapshots = 0
         self.account_read_recovery_cycle_blocked = False
         self.account_read_recovery_snapshot_verified = False
+        self.account_read_recovery_position_management_allowed = False
         self.last_account_read_failure = saved_recovery.get("diagnostic")
         self.stop = False
         self.servers: list[Any] = []
@@ -438,6 +439,12 @@ class WTILiveRuntime:
         self.last_seen_sample_id: str | None = None
         self.last_processed_sample_id: str | None = None
         self.last_processed_sample_at: datetime | None = None
+        self.last_baseline_sample_id: str | None = None
+        self.last_baseline_sample_at: datetime | None = None
+        self.last_baseline_session_id: str | None = None
+        self.last_validated_session_id: str | None = None
+        self.last_execution_sample_id: str | None = None
+        self.last_execution_sample_at: datetime | None = None
         self.last_sample_freshness_diagnostics: dict[str, Any] = {}
         self.last_execution_refresh_status = "not_attempted"
         self.last_execution_refresh_at: str | None = None
@@ -684,6 +691,9 @@ class WTILiveRuntime:
             api_key_index=api_key_index,
             market=market,
             operation_timeout_seconds=self.args.command_timeout_seconds,
+            dispatch_market_reader=getattr(
+                self.collector, "collect_fresh_sample", None
+            ),
         )
 
         def fresh_market_reader() -> dict[str, Any]:
@@ -1413,26 +1423,37 @@ class WTILiveRuntime:
             if sample_at.tzinfo is None or sample_at.utcoffset() is None:
                 raise ValueError("sample_timestamp_timezone_missing")
             sample_at = sample_at.astimezone(timezone.utc)
-            last_processed_at = getattr(self, "last_processed_sample_at", None)
-            if last_processed_at is not None:
-                self.last_sample_gap_seconds = (
-                    sample_at - last_processed_at
-                ).total_seconds()
-                if (
-                    self.last_sample_gap_seconds < 0
-                    or self.last_sample_gap_seconds > MAX_WTI_ENTRY_GAP_SECONDS
-                ):
-                    self._reset_gradient_confirmation()
-                    self.pending_gap_exit = True
-                    self._revoke_entry_authorization(
-                        "wti_entry_authorization_revoked_after_sample_gap"
-                    )
             observation = session_observation_for_sample(row)
             current_session_id = observation.session_id if observation else None
-            previous_session_id = getattr(self, "last_processed_session_id", None)
+            is_execution_refresh = row.get("sample_kind", "baseline") == "burst"
+            if is_execution_refresh:
+                self.last_execution_sample_id = sample_id
+                self.last_execution_sample_at = sample_at
+            else:
+                previous_baseline_at = getattr(self, "last_baseline_sample_at", None)
+                if previous_baseline_at is not None:
+                    self.last_sample_gap_seconds = (
+                        sample_at - previous_baseline_at
+                    ).total_seconds()
+                    if (
+                        self.last_sample_gap_seconds < 0
+                        or self.last_sample_gap_seconds > MAX_WTI_ENTRY_GAP_SECONDS
+                    ):
+                        self._reset_gradient_confirmation()
+                        self.pending_gap_exit = True
+                        self._revoke_entry_authorization(
+                            "wti_entry_authorization_revoked_after_sample_gap"
+                        )
+                previous_session_id = getattr(self, "last_baseline_session_id", None)
+                if previous_session_id and current_session_id != previous_session_id:
+                    self._reset_gradient_confirmation()
+                self.last_baseline_sample_id = sample_id
+                self.last_baseline_sample_at = sample_at
+                self.last_baseline_session_id = current_session_id
+            previous_session_id = getattr(self, "last_validated_session_id", None)
             if previous_session_id and current_session_id != previous_session_id:
                 self._reset_gradient_confirmation()
-            self.last_processed_session_id = current_session_id
+            self.last_validated_session_id = current_session_id
             self.last_processed_sample_at = sample_at
         except (TypeError, ValueError):
             self._revoke_entry_authorization("wti_sample_timestamp_unverified")
@@ -1469,6 +1490,25 @@ class WTILiveRuntime:
         stale = not self._sample_health_fresh(decision_row, now)
         freshness_diagnostics = self._sample_freshness_diagnostics(decision_row, now)
         collector_diagnostics = self._sample_freshness_diagnostics(collector_row, now)
+        execution_refresh_at = getattr(self, "last_execution_refresh_at", None)
+        execution_refresh_age: float | None = None
+        if execution_refresh_at:
+            with contextlib.suppress(TypeError, ValueError):
+                refresh_time = datetime.fromisoformat(
+                    str(execution_refresh_at).replace("Z", "+00:00")
+                )
+                execution_refresh_age = (
+                    now - refresh_time.astimezone(timezone.utc)
+                ).total_seconds()
+        execution_refresh_status = getattr(
+            self, "last_execution_refresh_status", "not_attempted"
+        )
+        if execution_refresh_status == "fresh" and (
+            execution_refresh_age is None
+            or execution_refresh_age < -5
+            or execution_refresh_age > 2
+        ):
+            execution_refresh_status = "stale"
         closed_window = self._confirmed_closed_session_window(now)
         risk = dict(self.last_risk)
         account_risk_action = str(risk.get("risk_action") or "block_entry")
@@ -1617,10 +1657,22 @@ class WTILiveRuntime:
             "collector_sample_freshness_diagnostics": collector_diagnostics,
             "last_seen_sample_id": getattr(self, "last_seen_sample_id", None),
             "last_processed_sample_id": getattr(self, "last_processed_sample_id", None),
-            "execution_refresh_status": getattr(
-                self, "last_execution_refresh_status", "not_attempted"
+            "last_baseline_sample_id": getattr(self, "last_baseline_sample_id", None),
+            "last_baseline_sample_at": (
+                None if getattr(self, "last_baseline_sample_at", None) is None
+                else self.last_baseline_sample_at.isoformat()
             ),
-            "execution_refresh_at": getattr(self, "last_execution_refresh_at", None),
+            "last_execution_sample_id": getattr(self, "last_execution_sample_id", None),
+            "last_execution_sample_at": (
+                None if getattr(self, "last_execution_sample_at", None) is None
+                else self.last_execution_sample_at.isoformat()
+            ),
+            "execution_refresh_status": execution_refresh_status,
+            "execution_refresh_at": execution_refresh_at,
+            "execution_refresh_age_seconds": (
+                None if execution_refresh_age is None else round(execution_refresh_age, 3)
+            ),
+            "execution_refresh_fresh": execution_refresh_status == "fresh",
             "execution_refresh_elapsed_ms": getattr(
                 self, "last_execution_refresh_elapsed_ms", None
             ),
@@ -1790,6 +1842,7 @@ class WTILiveRuntime:
         session: Any,
     ) -> dict[str, Any]:
         assert self.executor is not None
+        self.account_read_recovery_position_management_allowed = False
         for attempt in range(len(ACCOUNT_READ_RETRY_DELAYS_SECONDS) + 1):
             try:
                 state = await asyncio.to_thread(
@@ -1806,6 +1859,7 @@ class WTILiveRuntime:
                 if attempt >= len(ACCOUNT_READ_RETRY_DELAYS_SECONDS):
                     self.account_read_recovery_cycle_blocked = True
                     self.account_read_recovery_snapshot_verified = False
+                    self.account_read_recovery_position_management_allowed = False
                     self.last_runtime_error = self.last_account_read_failure
                     self.last_action = {
                         "action": "blocked_entry",
@@ -1818,6 +1872,10 @@ class WTILiveRuntime:
         self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
         self.account_read_recovery_cycle_blocked = False
         self.account_read_recovery_snapshot_verified = False
+        self.account_read_recovery_position_management_allowed = bool(
+            state.get("status") == "open"
+            and self._account_recovery_positions_match(state)
+        ) if self.account_read_recovery_required else False
         if self.account_read_recovery_required:
             if self._account_recovery_snapshot_verified(state, self.last_risk):
                 self.account_read_recovery_verified_snapshots += 1
@@ -1887,7 +1945,9 @@ class WTILiveRuntime:
             or not _safe_account_recovery_state(state)
         ):
             return False
-        diagnostic = f"{exc.phase}:{exc.diagnostic_code}"
+        diagnostic = (
+            f"{exc.phase}:{exc.operation or 'unknown_operation'}:{exc.diagnostic_code}"
+        )
         if exc.http_status is not None:
             diagnostic += f":http_{exc.http_status}"
         self.entry_authorized = False
@@ -1950,6 +2010,24 @@ class WTILiveRuntime:
         state: dict[str, Any],
         risk: dict[str, Any],
     ) -> bool:
+        if not self._account_recovery_positions_match(state):
+            return False
+        try:
+            risk_at = datetime.fromisoformat(
+                str(risk.get("observed_at")).replace("Z", "+00:00")
+            )
+            if risk_at.tzinfo is None:
+                return False
+            risk_age = (datetime.now(timezone.utc) - risk_at.astimezone(timezone.utc)).total_seconds()
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            -5 <= risk_age <= 5
+            and risk.get("risk_action") == "normal"
+            and risk.get("risk_data_complete") is True
+        )
+
+    def _account_recovery_positions_match(self, state: dict[str, Any]) -> bool:
         if not _safe_account_recovery_state(state):
             return False
         proof = state.get("last_account_reconciliation")
@@ -1965,17 +2043,11 @@ class WTILiveRuntime:
             observed_at = datetime.fromisoformat(
                 str(proof.get("observed_at")).replace("Z", "+00:00")
             )
-            risk_at = datetime.fromisoformat(
-                str(risk.get("observed_at")).replace("Z", "+00:00")
-            )
-            if observed_at.tzinfo is None or risk_at.tzinfo is None:
+            if observed_at.tzinfo is None:
                 return False
             current = datetime.now(timezone.utc)
-            if any(
-                (current - value.astimezone(timezone.utc)).total_seconds() < -5
-                or (current - value.astimezone(timezone.utc)).total_seconds() > 5
-                for value in (observed_at, risk_at)
-            ):
+            proof_age = (current - observed_at.astimezone(timezone.utc)).total_seconds()
+            if proof_age < -5 or proof_age > 5:
                 return False
             actual_var = Decimal(str(proof["variational_qty"]))
             actual_lighter = Decimal(str(proof["lighter_qty"]))
@@ -1996,11 +2068,7 @@ class WTILiveRuntime:
             )
         except (KeyError, TypeError, ValueError, ArithmeticError):
             return False
-        return bool(
-            quantities_match
-            and risk.get("risk_action") == "normal"
-            and risk.get("risk_data_complete") is True
-        )
+        return quantities_match
 
     async def _decision_sample(self, row: dict[str, Any]) -> dict[str, Any] | None:
         now = datetime.now(timezone.utc)
@@ -2084,6 +2152,7 @@ class WTILiveRuntime:
         self.last_decision_sample = dict(candidate)
         if candidate.get("sample_kind") == "burst":
             self.last_execution_refresh_status = "fresh"
+            self.last_execution_refresh_at = str(candidate.get("logged_at") or "") or None
         return candidate
 
     async def _startup_reconcile_sample(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -2156,7 +2225,15 @@ class WTILiveRuntime:
         self.last_risk = dict(self.gateway.latest_risk)
         if getattr(self, "account_read_recovery_cycle_blocked", False):
             self.entry_authorized = False
-            return state
+            recovery_management = bool(
+                state.get("status") == "open"
+                and getattr(
+                    self, "account_read_recovery_position_management_allowed", False
+                )
+                and self.last_risk.get("risk_action") in {"force_reduce", "emergency_exit"}
+            )
+            if not recovery_management:
+                return state
         self._poll_rotation_drain()
         if getattr(self, "rotation_drain_request", None) is None:
             state = await self._arm_manual_gradient_round(state, row)

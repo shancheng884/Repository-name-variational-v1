@@ -18,6 +18,16 @@ ACTION_LABELS = {
 
 
 REASON_LABELS = {
+    "wti_strategy_cycle_requires_review": "WTI 策略循环发生异常，开仓授权已锁定，需人工复核",
+    "wti_entry_authorization_revoked": "WTI 开仓授权已撤销，需人工复核",
+    "wti_entry_authorization_revoked_after_sample_gap": "WTI 样本断档，开仓授权已锁定",
+    "wti_market_data_unavailable": "WTI 行情或交易时段证据未满足实时风控，等待刷新确认",
+    "wti_current_sample_or_session_not_fresh": "WTI 当前行情或交易时段证据已过期",
+    "wti_sample_or_session_unverified": "WTI 样本质量或交易时段证据未通过校验",
+    "wti_market_sample_or_session_unavailable": "WTI 行情或交易时段证据不可用",
+    "wti_execution_refresh_unavailable": "WTI 执行报价刷新失败",
+    "wti_execution_refresh_sample_invalid": "WTI 刷新后的执行报价未通过校验",
+    "wti_exchange_closed": "WTI 交易所已闭市",
     "account_risk_normal": "账户风险正常",
     "account_risk_not_configured": "账户风险监控未配置",
     "account_equity_unavailable": "账户权益暂不可用，禁止新开仓",
@@ -117,6 +127,7 @@ REASON_LABELS = {
 
 
 INCIDENT_KEY_LABELS = {
+    "wti_market_data_unavailable_with_exposure": "WTI 持仓期间行情或交易时段数据失效",
     "critical_account_risk": "账户出现紧急风险",
     "strategy_stopped_with_exposure": "策略停止但仍有仓位",
     "strategy_stopped_flat": "策略已停止且当前空仓",
@@ -146,7 +157,7 @@ def reason_cn(value: Any) -> str:
         return "暂不可用"
     if any("\u4e00" <= char <= "\u9fff" for char in text):
         return text
-    return REASON_LABELS.get(text, "未分类风险原因")
+    return REASON_LABELS.get(text, f"未分类风险原因（{text}）")
 
 
 def incident_key_cn(value: Any) -> str:
@@ -155,6 +166,8 @@ def incident_key_cn(value: Any) -> str:
         return "未分类风险事件"
     if text in INCIDENT_KEY_LABELS:
         return INCIDENT_KEY_LABELS[text]
+    if text.startswith("wti:"):
+        return f"WTI：{incident_key_cn(text[4:])}"
     parts = text.split(":")
     if parts[0] == "account_risk" and len(parts) >= 3:
         return f"账户风险：{action_cn(parts[1])}；{reason_cn(':'.join(parts[2:]))}"
@@ -162,4 +175,4 @@ def incident_key_cn(value: Any) -> str:
         return f"人工核对：{reason_cn(':'.join(parts[1:]))}"
     if parts[0] == "data_visibility" and len(parts) >= 2:
         return f"账户数据可见性：{reason_cn(':'.join(parts[1:]))}"
-    return "未分类风险事件"
+    return f"未分类风险事件（{text}）"

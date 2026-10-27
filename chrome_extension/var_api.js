@@ -242,6 +242,30 @@ export function buildVariationalApiScript(action, params) {
       const side = String(o.side || "").toUpperCase() === "BUY" ? "buy" : "sell";
       let quoteId = o.reuseQuoteId || null;
       let quote = null;
+      if (quoteId) {
+        const quotedAt = Date.parse(o.quoteTimestamp);
+        const maxAgeMs = Number(o.dispatchQuoteAgeLimitMs);
+        const expectedPrice = Number(o.expectedQuotePrice);
+        const ageMs = Date.now() - quotedAt;
+        if (
+          !Number.isFinite(quotedAt)
+          || !Number.isFinite(maxAgeMs)
+          || maxAgeMs <= 0
+          || !Number.isFinite(expectedPrice)
+          || expectedPrice <= 0
+          || ageMs < -5000
+          || ageMs > maxAgeMs
+        ) {
+          return {
+            ok: false,
+            noOrderConfirmed: true,
+            step: "dispatch_preflight",
+            error: "execution_quote_expired_or_invalid",
+            quoteId,
+            quoteTimestamp: o.quoteTimestamp || null
+          };
+        }
+      }
       if (!quoteId) {
         const quoteResponse = await request("POST", "/api/quotes/indicative", { instrument, qty: String(o.amount) });
         if (!quoteResponse.ok || !quoteResponse.json || !quoteResponse.json.quote_id) {

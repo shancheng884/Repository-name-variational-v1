@@ -60,12 +60,14 @@ class WTIAccountSnapshotUnavailable(WTIExecutionError):
         phase: str,
         retryable: bool,
         diagnostic_code: str,
+        operation: str | None = None,
         http_status: int | None = None,
     ) -> None:
         super().__init__("account_snapshot_unavailable")
         self.phase = phase
         self.retryable = retryable
         self.diagnostic_code = diagnostic_code
+        self.operation = operation
         self.http_status = http_status
 
 
@@ -113,6 +115,9 @@ class MarketContext:
     validated_at: datetime
     var_quote_age_seconds: Decimal
     lighter_book_age_seconds: Decimal
+    sample_id: str = ""
+    quote_id: str | None = None
+    quote_timestamp: datetime | None = None
 
     @property
     def position_tolerance(self) -> Decimal:
@@ -144,10 +149,28 @@ def _positive_decimal(value: Any, name: str) -> Decimal:
 
 
 def _sample_time(value: Any) -> datetime:
+    if isinstance(value, (int, float, Decimal)):
+        numeric = float(value)
+        if not isfinite(numeric):
+            raise WTIExecutionError("invalid_market_sample_timestamp")
+        if abs(numeric) > 100_000_000_000:
+            numeric /= 1000
+        try:
+            return datetime.fromtimestamp(numeric, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise WTIExecutionError("invalid_market_sample_timestamp") from exc
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError) as exc:
-        raise WTIExecutionError("invalid_market_sample_timestamp") from exc
+    except (TypeError, ValueError):
+        try:
+            numeric = float(value)
+            if not isfinite(numeric):
+                raise ValueError("non-finite timestamp")
+            if abs(numeric) > 100_000_000_000:
+                numeric /= 1000
+            return datetime.fromtimestamp(numeric, tz=timezone.utc)
+        except (OverflowError, OSError, TypeError, ValueError) as exc:
+            raise WTIExecutionError("invalid_market_sample_timestamp") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise WTIExecutionError("market_sample_timestamp_timezone_missing")
     return parsed.astimezone(timezone.utc)
@@ -277,6 +300,12 @@ def validate_market_sample(
         validated_at=current_utc,
         var_quote_age_seconds=quote_age,
         lighter_book_age_seconds=book_age,
+        sample_id=str(sample.get("sample_id") or ""),
+        quote_id=(str(sample.get("quote_id")) if sample.get("quote_id") else None),
+        quote_timestamp=(
+            _sample_time(sample.get("quote_timestamp"))
+            if sample.get("quote_timestamp") else None
+        ),
     )
 
 
@@ -1218,20 +1247,28 @@ class WTIPairExecutor:
                 char if char.isalnum() or char in "_.:-" else "_"
                 for char in cause.lower()
             )[:80] or "unknown"
-            retryable = getattr(exc, "retryable", False) is True
-            retryable = retryable or status in {408, 425, 429} or (
-                status is not None and status >= 500
-            )
-            retryable = retryable or isinstance(exc, (TimeoutError, ConnectionError, OSError))
-            retryable = retryable or cause in {
-                "no_extension_command_client_connected", "connection_closed",
-                "connectionclosed", "connectionclosederror", "connectionclosedok",
-                "serverdisconnectederror", "websocketdisconnect",
-            }
+            explicit_retryable = getattr(exc, "retryable", None)
+            if isinstance(explicit_retryable, bool):
+                retryable = explicit_retryable
+            else:
+                retryable = status in {408, 425, 429} or (
+                    status is not None and status >= 500
+                )
+                retryable = retryable or isinstance(
+                    exc, (TimeoutError, ConnectionError, OSError)
+                )
+                retryable = retryable or cause in {
+                    "no_extension_command_client_connected", "connection_closed",
+                    "connectionclosed", "connectionclosederror", "connectionclosedok",
+                    "serverdisconnectederror", "websocketdisconnect",
+                }
+            if status is not None and 400 <= status < 500 and status not in {408, 425, 429}:
+                retryable = False
             raise WTIAccountSnapshotUnavailable(
                 phase=phase,
                 retryable=retryable,
                 diagnostic_code=cause,
+                operation=getattr(exc, "operation", None),
                 http_status=status,
             ) from exc
         if parsed is None:
@@ -1378,6 +1415,21 @@ class WTIPairExecutor:
             reduce_only=reduce_only, action_id=action_id,
         )
         request["intent_at"] = pending.get("intent_at")
+        request["session_id"] = context.session_id
+        request["session_entry_cutoff_at"] = getattr(session, "entry_cutoff_at", None)
+        request["expected_direction"] = pending.get("direction")
+        request["must_complete_hedge"] = bool(
+            opening and any(
+                isinstance(other, dict)
+                and isinstance(other.get("result"), dict)
+                and other["result"].get("classification") == "filled"
+                for name, other in (pending.get("legs") or {}).items()
+                if name != venue
+            )
+        )
+        decision = pending.get("decision")
+        if opening and isinstance(decision, dict):
+            request["minimum_entry_edge_bps"] = decision.get("minimum_entry_edge_bps")
         leg = {
             "request": request,
             "intent_at": self._now().isoformat(),

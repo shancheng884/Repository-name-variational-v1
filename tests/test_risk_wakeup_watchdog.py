@@ -151,6 +151,292 @@ def isolated_watchdog_paths(tmp_path):
     }
 
 
+def write_wti_notification_health(tmp_path, now, *, reason="account_risk_normal", revoked=False):
+    write_json(tmp_path / "state.json", {
+        "asset": "ETH", "status": "flat", "open_lots": [], "pending_actions": [],
+    })
+    write_json(tmp_path / "risk.json", {
+        "updated_at": (now - timedelta(days=2)).isoformat(),
+        "risk_action": "normal", "variational_reference_quote_fresh": False,
+        "variational_reference_quote_stale_seconds": 172800,
+    })
+    write_json(tmp_path / "wti-state.json", {
+        "asset": "WTI", "status": "flat", "open_position": None, "pending_action": None,
+    })
+    write_json(tmp_path / "wti-risk.json", {
+        "asset": "WTI", "pid": 999, "updated_at": now.isoformat(),
+        "risk_action": "normal" if reason == "account_risk_normal" else "block_entry",
+        "risk_reason": reason,
+        "account_risk_action": "normal", "account_risk_reason": "account_risk_normal",
+        "entry_authorization_permanently_revoked": revoked,
+        "entry_gate_block_reason": "wti_strategy_cycle_requires_review" if revoked else None,
+        "market_sample_fresh": reason == "account_risk_normal",
+    })
+
+
+def wti_notification_watchdog(tmp_path, current):
+    watchdog = build_watchdog(tmp_path, current=current)
+    watchdog.strategy_check = lambda _pid: False
+    watchdog.wti_strategy_check = lambda pid: pid == 999
+    return watchdog
+
+
+def test_wti_short_freshness_pulses_do_not_recover_or_realert(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    key = "wti:account_risk:block_entry:wti_market_data_unavailable"
+    for reason in (
+        "wti_current_sample_or_session_not_fresh", "account_risk_normal",
+        "wti_sample_or_session_unverified", "account_risk_normal",
+        "wti_market_sample_or_session_unavailable",
+    ):
+        write_wti_notification_health(tmp_path, current[0], reason=reason)
+        watchdog.run_once()
+        current[0] += timedelta(seconds=5)
+    assert len(watchdog.telegram.sent) == 1
+    assert key in watchdog.memory["active_incidents"]
+    health = json.loads((tmp_path / "health.json").read_text())
+    assert health["strategy_running"] is True
+    assert health["monitored_assets"] == ["WTI"]
+    assert health["active_incidents"] == [key]
+
+
+def test_wti_permanent_entry_lock_is_not_recovered_when_quote_freshness_changes(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    key = "wti:account_risk:block_entry:wti_strategy_cycle_requires_review"
+    for reason in (
+        "wti_strategy_cycle_requires_review", "wti_current_sample_or_session_not_fresh",
+        "wti_sample_or_session_unverified", "account_risk_normal",
+    ):
+        write_wti_notification_health(tmp_path, current[0], reason=reason, revoked=True)
+        watchdog.run_once()
+        current[0] += timedelta(seconds=15)
+    assert list(watchdog.memory["active_incidents"]) == [key]
+    assert len(watchdog.telegram.sent) == 1
+    assert "开仓授权已锁定" in watchdog.telegram.sent[0][0]
+    assert "未分类" not in watchdog.telegram.sent[0][0]
+    assert json.loads((tmp_path / "wti-risk.json").read_text())["entry_authorization_permanently_revoked"] is True
+
+
+def test_wti_confirmed_recovery_and_namespaced_cooldown_survive_restart(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    telegram = watchdog.telegram
+    key = "wti:account_risk:block_entry:wti_market_data_unavailable"
+    write_wti_notification_health(tmp_path, current[0], reason="wti_sample_or_session_unverified")
+    watchdog.run_once()
+    current[0] += timedelta(seconds=5)
+    write_wti_notification_health(tmp_path, current[0])
+    watchdog.run_once()
+    assert key in watchdog.memory["active_incidents"]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    watchdog.telegram = telegram
+    current[0] += timedelta(seconds=31)
+    write_wti_notification_health(tmp_path, current[0])
+    watchdog.run_once()
+    assert key not in watchdog.memory["active_incidents"]
+    assert len(telegram.sent) == 2
+    assert "风险监控已恢复" in telegram.sent[-1][0]
+    assert "WTI" in telegram.sent[-1][0] and "未分类" not in telegram.sent[-1][0]
+    current[0] += timedelta(seconds=5)
+    write_wti_notification_health(tmp_path, current[0], reason="wti_execution_refresh_unavailable")
+    assert watchdog.run_once() == []
+    assert len(telegram.sent) == 2
+    health = json.loads((tmp_path / "health.json").read_text())
+    assert health["observed_incidents"] == [key]
+    assert health["cooldown_suppressed_incidents"] == [key]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    watchdog.telegram = telegram
+    assert watchdog.run_once() == []
+    current[0] += timedelta(seconds=901)
+    write_wti_notification_health(tmp_path, current[0], reason="wti_current_sample_or_session_not_fresh")
+    assert watchdog.run_once()[0].key == key
+    assert len(telegram.sent) == 3
+
+
+def test_wti_missing_health_resets_recovery_confirmation(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    key = "wti:account_risk:block_entry:wti_market_data_unavailable"
+    write_wti_notification_health(tmp_path, current[0], reason="wti_sample_or_session_unverified")
+    watchdog.run_once()
+    current[0] += timedelta(seconds=5)
+    write_wti_notification_health(tmp_path, current[0])
+    watchdog.run_once()
+    current[0] += timedelta(seconds=60)
+    write_json(tmp_path / "wti-risk.json", {})
+    watchdog.run_once()
+    assert "recovery_candidate_at" not in watchdog.memory["active_incidents"][key]
+    current[0] += timedelta(seconds=5)
+    write_wti_notification_health(tmp_path, current[0])
+    watchdog.run_once()
+    assert key in watchdog.memory["active_incidents"]
+    assert not any("风险监控已恢复" in text and "WTI" in text for text, _ in watchdog.telegram.sent)
+
+
+def test_wti_acknowledged_lock_does_not_realert_after_watchdog_restart(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    write_wti_notification_health(tmp_path, current[0], revoked=True)
+    watchdog.run_once()
+    key = "wti:account_risk:block_entry:wti_strategy_cycle_requires_review"
+    record = watchdog.memory["active_incidents"][key]
+    record["acknowledged_at"] = current[0].isoformat()
+    record["acknowledged_signature"] = record["incident_signature"]
+    watchdog._persist(now=current[0])
+    telegram = watchdog.telegram
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    watchdog.telegram = telegram
+    current[0] += timedelta(seconds=10)
+    write_wti_notification_health(tmp_path, current[0], reason="wti_sample_or_session_unverified", revoked=True)
+    watchdog.run_once()
+    assert watchdog.memory["active_incidents"][key]["acknowledged_at"]
+    assert len(telegram.sent) == 1
+
+
+def test_wti_upgrade_preserves_legacy_alert_acknowledgement_and_cooldown(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    legacy = "wti:account_risk:block_entry:wti_current_sample_or_session_not_fresh"
+    canonical = "wti:account_risk:block_entry:wti_market_data_unavailable"
+    deadline = (current[0] + timedelta(minutes=15)).isoformat()
+    write_json(tmp_path / "watchdog.json", {
+        "active_incidents": {legacy: {
+            "severity": "warning", "incident_signature": "legacy-message-signature",
+            "acknowledged_at": current[0].isoformat(),
+            "acknowledged_signature": "legacy-message-signature",
+            "acknowledgement_token": "old-button-token", "telegram_status": "sent",
+            "telegram_sent_at": current[0].isoformat(),
+        }},
+        "incident_rearm_until": {legacy: deadline},
+    })
+    write_wti_notification_health(tmp_path, current[0], reason="wti_sample_or_session_unverified")
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    watchdog.run_once()
+    record = watchdog.memory["active_incidents"][canonical]
+    assert record["acknowledged_signature"] == record["incident_signature"]
+    assert record["acknowledgement_token"] == "old-button-token"
+    assert watchdog.memory["incident_rearm_until"] == {canonical: deadline}
+    assert watchdog.telegram.sent == []
+
+
+def test_wti_lock_does_not_fake_market_recovery_or_inactive_eth_recovery(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    write_wti_notification_health(tmp_path, current[0], reason="wti_sample_or_session_unverified")
+    watchdog.run_once()
+    watchdog.memory["active_incidents"]["strategy_stopped_flat"] = {
+        "severity": "warning", "notify_recovery": True,
+    }
+    for _ in range(9):
+        current[0] += timedelta(seconds=5)
+        write_wti_notification_health(tmp_path, current[0], reason="wti_current_sample_or_session_not_fresh", revoked=True)
+        watchdog.run_once()
+    assert "strategy_stopped_flat" not in watchdog.memory["active_incidents"]
+    assert "wti:account_risk:block_entry:wti_market_data_unavailable" in watchdog.memory["active_incidents"]
+    assert not any("风险监控已恢复" in text for text, _ in watchdog.telegram.sent)
+
+
+def test_wti_critical_risk_is_immediate_even_during_warning_cooldown(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    write_wti_notification_health(tmp_path, current[0], revoked=True)
+    health = json.loads((tmp_path / "wti-risk.json").read_text())
+    health.update(risk_action="emergency_exit", risk_reason="maintenance_margin_usage_emergency")
+    write_json(tmp_path / "wti-risk.json", health)
+    watchdog.memory["incident_rearm_until"]["wti:critical_account_risk"] = (
+        current[0] + timedelta(minutes=15)
+    ).isoformat()
+    incidents = watchdog.run_once()
+    assert any(item.key == "wti:critical_account_risk" and item.severity == "critical" for item in incidents)
+    assert len(watchdog.feishu.phones) == 1
+
+
+@pytest.mark.parametrize("unsafe", ["position", "pending", "manual_review", "health_exposure", "unreadable"])
+def test_wti_activity_does_not_hide_unresolved_eth_state(tmp_path, unsafe):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    write_wti_notification_health(tmp_path, current[0])
+    state = json.loads((tmp_path / "state.json").read_text())
+    if unsafe == "position":
+        state.update(status="open", open_lots=[{"lot_id": 1}])
+    elif unsafe == "pending":
+        state["pending_actions"] = [{"role": "entry", "submitted_at": current[0].isoformat()}]
+    elif unsafe == "manual_review":
+        state.update(status="manual_review_required", manual_review_reason="position_mismatch")
+    elif unsafe == "health_exposure":
+        write_json(tmp_path / "risk.json", {"open_lots_total": 1})
+    else:
+        state = {}
+    write_json(tmp_path / "state.json", state)
+    incidents = watchdog.run_once()
+    assert "ETH" in watchdog.monitored_assets
+    assert any(not item.key.startswith("wti:") for item in incidents)
+
+
+def test_inactive_flat_wti_is_ignored_only_when_eth_runtime_is_healthy(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    write_wti_notification_health(tmp_path, current[0], reason="wti_sample_or_session_unverified")
+    watchdog.strategy_check = lambda _pid: True
+    watchdog.wti_strategy_check = lambda _pid: False
+    write_json(tmp_path / "risk.json", {"updated_at": current[0].isoformat(), "risk_action": "normal"})
+    assert watchdog.run_once() == []
+    assert watchdog.monitored_assets == ["ETH"]
+    current[0] += timedelta(seconds=60)
+    assert watchdog.run_once() == []
+    assert watchdog.monitored_assets == ["ETH"]
+    write_json(tmp_path / "wti-state.json", {
+        "status": "open", "open_position": {"var_qty": "0.198"},
+    })
+    assert any(item.key.startswith("wti:") and item.severity == "critical" for item in watchdog.run_once())
+
+
+def test_wti_primary_asset_survives_stale_heartbeat_and_watchdog_restart(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    write_wti_notification_health(tmp_path, current[0])
+    watchdog.run_once()
+    assert watchdog.memory["primary_asset"] == "WTI"
+    current[0] += timedelta(seconds=60)
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    watchdog.wti_strategy_check = lambda _pid: False
+    incidents = watchdog.run_once()
+    assert watchdog.monitored_assets == ["WTI"]
+    assert any(item.key == "wti:strategy_stopped_flat" for item in incidents)
+    assert all(item.key.startswith("wti:") for item in incidents)
+
+
+@pytest.mark.parametrize("skew, expected", [(1, True), (60, False), (-60, False)])
+def test_runtime_health_allows_concurrent_write_but_not_clock_corruption(skew, expected):
+    now = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
+    assert watchdog_module.fresh_runtime_health(
+        {"updated_at": (now + timedelta(seconds=skew)).isoformat()}, now, 45,
+    ) is expected
+
+
+def test_telegram_acknowledgement_retries_after_poll_failure_without_realert(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    write_wti_notification_health(tmp_path, current[0], revoked=True)
+    watchdog.run_once()
+    record = next(iter(watchdog.memory["active_incidents"].values()))
+    watchdog.telegram.updates = [{
+        "update_id": 1, "callback_query": {
+            "id": "ack", "data": "risk_ack:" + record["acknowledgement_token"],
+            "message": {"chat": {"id": "123"}, "message_id": 42},
+        },
+    }]
+    original_poll = watchdog.telegram.get_updates
+    watchdog.telegram.get_updates = lambda **kwargs: ([], "request_failed:ConnectionError")
+    watchdog.run_once()
+    assert not record.get("acknowledged_at")
+    watchdog.telegram.get_updates = original_poll
+    watchdog.run_once()
+    assert record["acknowledged_at"]
+    assert len(watchdog.telegram.sent) == 1
+
+
 def test_open_position_and_stopped_strategy_is_critical() -> None:
     now = datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc)
     incidents = evaluate_incidents(
