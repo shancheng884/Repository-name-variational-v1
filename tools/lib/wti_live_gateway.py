@@ -143,7 +143,12 @@ class WTIProductionGateway:
             result = future.result(timeout=self.operation_timeout_seconds)
         except FutureTimeout as exc:
             future.cancel()
-            raise WTIReadOnlyError("wti_gateway_operation_timeout") from exc
+            raise WTIReadOnlyError(
+                "wti_gateway_operation_timeout",
+                retryable=True,
+                operation="account_read",
+                diagnostic_code="operation_timeout",
+            ) from exc
         if not isinstance(result, dict):
             raise WTIReadOnlyError("wti_gateway_result_invalid")
         return result

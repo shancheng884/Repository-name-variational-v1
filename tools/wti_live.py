@@ -33,6 +33,7 @@ from tools.basis_collector import (  # noqa: E402
 )
 from variational.listener import EventSink as ListenerEventSink  # noqa: E402
 from tools.lib.basis_store import basis_sample_paths, read_basis_samples  # noqa: E402
+from tools.lib.hedge_instruments import integer_value  # noqa: E402
 from tools.lib.gradient_entry_confirmation import (  # noqa: E402
     confirm_gradient_entry_with_execution_refresh,
     elastic_addon_confirmation_allowed,
@@ -48,6 +49,7 @@ from tools.lib.oil_swap_readiness import assess_oil_readiness  # noqa: E402
 from tools.lib.runtime_files import read_json, write_json_atomic  # noqa: E402
 from tools.lib.wti_execution import (  # noqa: E402
     WTIPairExecutor,
+    WTIAccountSnapshotUnavailable,
     WTIExecutionError,
     WTIExecutionStore,
 )
@@ -80,6 +82,11 @@ MAX_HOLD_SECONDS = 21600
 MAX_SLIPPAGE_BPS = Decimal("8")
 MAX_SINGLE_ROUND_PILOT_ENTRY_ATTEMPTS = 3
 ACCOUNT_ONLY_RECONCILE_INTERVAL_SECONDS = 10
+ACCOUNT_READ_RECOVERY_REQUIRED_SNAPSHOTS = 2
+ACCOUNT_READ_RETRY_DELAYS_SECONDS = (0.2, 0.4)
+ACCOUNT_READ_RECOVERY_PHASES = frozenset({
+    "cycle_reconcile", "entry_preflight", "exit_preflight", "account_only_reconcile",
+})
 RETRYABLE_SAMPLE_VALIDATION_ERRORS = frozenset({
     "market_sample_stale_or_future",
     "variational_quote_stale_or_invalid",
@@ -90,6 +97,19 @@ RETRYABLE_SAMPLE_VALIDATION_ERRORS = frozenset({
 
 def _retryable_sample_validation_error(exc: BaseException) -> bool:
     return isinstance(exc, WTIExecutionError) and str(exc) in RETRYABLE_SAMPLE_VALIDATION_ERRORS
+
+
+def _safe_account_recovery_state(state: dict[str, Any]) -> bool:
+    if (
+        state.get("status") not in {"flat", "open"}
+        or state.get("pending_action") is not None
+        or state.get("manual_review_reason")
+    ):
+        return False
+    position = state.get("open_position")
+    return (state.get("status") == "flat" and position is None) or (
+        state.get("status") == "open" and isinstance(position, dict)
+    )
 
 
 def _decimal(value: Any, name: str, *, minimum: Decimal, maximum: Decimal | None = None) -> Decimal:
@@ -397,6 +417,13 @@ class WTILiveRuntime:
         ])
         self.collector = OilSwapCollector(collector_args)
         self.run_id = f"wti-live-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        saved_recovery = read_json(args.state_path).get("account_read_recovery")
+        saved_recovery = saved_recovery if isinstance(saved_recovery, dict) else {}
+        self.account_read_recovery_required = saved_recovery.get("required") is True
+        self.account_read_recovery_verified_snapshots = 0
+        self.account_read_recovery_cycle_blocked = False
+        self.account_read_recovery_snapshot_verified = False
+        self.last_account_read_failure = saved_recovery.get("diagnostic")
         self.stop = False
         self.servers: list[Any] = []
         self.collector_task: asyncio.Task[Any] | None = None
@@ -417,7 +444,10 @@ class WTILiveRuntime:
         self.last_execution_refresh_elapsed_ms: float | None = None
         self.last_execution_refresh_error: str | None = None
         self.startup_reconciled = False
-        self.entry_gate_block_reason: str | None = None
+        self.entry_gate_block_reason: str | None = (
+            "wti_account_read_recovery_pending"
+            if self.account_read_recovery_required else None
+        )
         self.last_sample_gap_seconds: float | None = None
         self.pending_gap_exit = False
         self.last_risk: dict[str, Any] = {}
@@ -746,6 +776,7 @@ class WTILiveRuntime:
         if (
             self.args.mode != "live"
             or self.entry_authorization_permanently_revoked
+            or getattr(self, "account_read_recovery_required", False)
             or self.manage_existing_only
             or (state.get("status") != "flat" and not gradient_position)
             or (state.get("open_position") is not None and not gradient_position)
@@ -1450,6 +1481,8 @@ class WTILiveRuntime:
             entry_block_reason = account_risk_reason
         elif self.args.mode == "observe":
             entry_block_reason = "observe_only_mode"
+        elif getattr(self, "account_read_recovery_required", False):
+            entry_block_reason = "wti_account_read_recovery_pending"
         elif stale:
             entry_block_reason = (
                 "wti_exchange_closed" if closed_window is not None
@@ -1462,6 +1495,7 @@ class WTILiveRuntime:
             and not stale
             and self.startup_reconciled
             and not self.entry_authorization_permanently_revoked
+            and not getattr(self, "account_read_recovery_required", False)
             and not pending
             and account_risk_action in {"normal", "warning"}
         )
@@ -1526,6 +1560,14 @@ class WTILiveRuntime:
             "wti_entry_authorized": entry_currently_authorized,
             "startup_reconciled": self.startup_reconciled,
             "entry_authorization_permanently_revoked": self.entry_authorization_permanently_revoked,
+            "account_read_recovery_required": getattr(
+                self, "account_read_recovery_required", False
+            ),
+            "account_read_recovery_verified_snapshots": getattr(
+                self, "account_read_recovery_verified_snapshots", 0
+            ),
+            "account_read_recovery_required_snapshots": ACCOUNT_READ_RECOVERY_REQUIRED_SNAPSHOTS,
+            "last_account_read_failure": getattr(self, "last_account_read_failure", None),
             "runtime_error": getattr(self, "last_runtime_error", None),
             "runtime_cycle_error": getattr(self, "last_cycle_error", None),
             "verified_cycle_count": getattr(self, "verified_cycle_count", 0),
@@ -1695,20 +1737,270 @@ class WTILiveRuntime:
         self.request_stop()
         return True
 
+    async def _handle_account_read_failure(
+        self,
+        exc: BaseException,
+        *,
+        state: dict[str, Any],
+        row: dict[str, Any] | None,
+    ) -> bool:
+        if not isinstance(exc, WTIAccountSnapshotUnavailable):
+            return False
+        if not await self._begin_account_read_recovery(
+            exc, state=read_json(self.args.state_path),
+        ):
+            return False
+        self.last_cycle_error = (
+            f"account_snapshot_unavailable:{self.last_account_read_failure}"
+        )
+        self.logger.warning(
+            "wti_account_read_recovery_started phase=%s retryable=%s diagnostic=%s",
+            exc.phase, exc.retryable, self.last_account_read_failure,
+        )
+        self._write_health(
+            state=read_json(self.args.state_path) or state,
+            row=row,
+            error=self.last_runtime_error,
+        )
+        return True
+
     async def _read_reconcile(self, row: dict[str, Any]) -> dict[str, Any]:
         assert self.executor is not None
+        self.account_read_recovery_required = getattr(
+            self, "account_read_recovery_required", False
+        )
+        self.account_read_recovery_verified_snapshots = getattr(
+            self, "account_read_recovery_verified_snapshots", 0
+        )
+        self.account_read_recovery_cycle_blocked = False
+        self.account_read_recovery_snapshot_verified = False
         started = time.monotonic()
         now = datetime.now(timezone.utc)
         session = _session_window(row, now, self.args.entry_cutoff_seconds)
         try:
-            return await asyncio.to_thread(
-                lambda: self.executor.reconcile(
-                    sample=row, now=now, session=session,
-                    runtime_pid=os.getpid(), runtime_run_id=getattr(self, "run_id", None),
-                )
-            )
+            state = await self._reconcile_with_account_read_retries(row, now, session)
+            return state
         finally:
             self.last_reconcile_elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+
+    async def _reconcile_with_account_read_retries(
+        self,
+        row: dict[str, Any],
+        now: datetime,
+        session: Any,
+    ) -> dict[str, Any]:
+        assert self.executor is not None
+        for attempt in range(len(ACCOUNT_READ_RETRY_DELAYS_SECONDS) + 1):
+            try:
+                state = await asyncio.to_thread(
+                    lambda: self.executor.reconcile(
+                        sample=row, now=datetime.now(timezone.utc), session=session,
+                        runtime_pid=os.getpid(), runtime_run_id=getattr(self, "run_id", None),
+                    )
+                )
+                break
+            except WTIAccountSnapshotUnavailable as exc:
+                safe_state = read_json(self.args.state_path)
+                if not await self._begin_account_read_recovery(exc, state=safe_state):
+                    raise
+                if attempt >= len(ACCOUNT_READ_RETRY_DELAYS_SECONDS):
+                    self.account_read_recovery_cycle_blocked = True
+                    self.account_read_recovery_snapshot_verified = False
+                    self.last_runtime_error = self.last_account_read_failure
+                    self.last_action = {
+                        "action": "blocked_entry",
+                        "reason": "wti_account_read_recovery_pending",
+                    }
+                    self.startup_reconciled = False
+                    return safe_state
+                await asyncio.sleep(ACCOUNT_READ_RETRY_DELAYS_SECONDS[attempt])
+
+        self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
+        self.account_read_recovery_cycle_blocked = False
+        self.account_read_recovery_snapshot_verified = False
+        if self.account_read_recovery_required:
+            if self._account_recovery_snapshot_verified(state, self.last_risk):
+                self.account_read_recovery_verified_snapshots += 1
+                self.account_read_recovery_snapshot_verified = True
+                self.last_account_read_failure = None
+                recovered = (
+                    self.account_read_recovery_verified_snapshots
+                    >= ACCOUNT_READ_RECOVERY_REQUIRED_SNAPSHOTS
+                )
+                persisted = await self._persist_account_read_recovery(
+                    required=not recovered,
+                    verified_snapshots=(
+                        0 if recovered else self.account_read_recovery_verified_snapshots
+                    ),
+                    diagnostic=None if recovered else "awaiting_second_verified_snapshot",
+                )
+                if recovered and persisted:
+                    state.pop("account_read_recovery", None)
+                    self.account_read_recovery_required = False
+                    self.entry_gate_block_reason = None
+                    self.startup_reconciled = True
+                    self.last_runtime_error = None
+                    self.last_action = {
+                        "action": "blocked_entry",
+                        "reason": "wti_account_read_recovery_confirmed_next_sample_required",
+                    }
+                else:
+                    if recovered and not persisted:
+                        self.account_read_recovery_verified_snapshots = (
+                            ACCOUNT_READ_RECOVERY_REQUIRED_SNAPSHOTS - 1
+                        )
+                    self.entry_authorized = False
+                    self.entry_gate_block_reason = "wti_account_read_recovery_pending"
+                    self.startup_reconciled = False
+                    self.last_action = {
+                        "action": "blocked_entry",
+                        "reason": "wti_account_read_recovery_pending",
+                    }
+                self.account_read_recovery_cycle_blocked = True
+            else:
+                self.account_read_recovery_verified_snapshots = 0
+                self.account_read_recovery_snapshot_verified = False
+                self.entry_authorized = False
+                self.entry_gate_block_reason = "wti_account_read_recovery_pending"
+                self.startup_reconciled = False
+                self.last_action = {
+                    "action": "blocked_entry",
+                    "reason": "wti_account_read_recovery_confirmation_failed",
+                }
+                await self._persist_account_read_recovery(
+                    required=True, verified_snapshots=0,
+                    diagnostic="recovery_snapshot_confirmation_failed",
+                )
+                self.account_read_recovery_cycle_blocked = True
+        return state
+
+    async def _begin_account_read_recovery(
+        self,
+        exc: WTIAccountSnapshotUnavailable,
+        *,
+        state: dict[str, Any],
+    ) -> bool:
+        if (
+            not exc.retryable
+            or exc.phase not in ACCOUNT_READ_RECOVERY_PHASES
+            or getattr(self, "entry_authorization_permanently_revoked", False)
+            or not _safe_account_recovery_state(state)
+        ):
+            return False
+        diagnostic = f"{exc.phase}:{exc.diagnostic_code}"
+        if exc.http_status is not None:
+            diagnostic += f":http_{exc.http_status}"
+        self.entry_authorized = False
+        self.startup_reconciled = False
+        self.account_read_recovery_required = True
+        self.account_read_recovery_verified_snapshots = 0
+        self.account_read_recovery_snapshot_verified = False
+        self.account_read_recovery_cycle_blocked = True
+        self.last_account_read_failure = diagnostic[:160]
+        self.entry_gate_block_reason = "wti_account_read_recovery_pending"
+        self.last_action = {
+            "action": "blocked_entry",
+            "reason": "wti_account_read_recovery_pending",
+        }
+        self.last_runtime_error = f"account_snapshot_unavailable:{self.last_account_read_failure}"
+        return await self._persist_account_read_recovery(
+            required=True, verified_snapshots=0, diagnostic=self.last_account_read_failure,
+        )
+
+    async def _persist_account_read_recovery(
+        self,
+        *,
+        required: bool,
+        verified_snapshots: int,
+        diagnostic: str | None,
+    ) -> bool:
+        store = self.pilot_store or WTIExecutionStore(self.args.state_path)
+
+        def persist() -> bool:
+            try:
+                with store.exclusive():
+                    state = store.load()
+                    if not _safe_account_recovery_state(state):
+                        return False
+                    if required:
+                        state["account_read_recovery"] = {
+                            "required": True,
+                            "verified_snapshots": max(
+                                0,
+                                min(
+                                    verified_snapshots,
+                                    ACCOUNT_READ_RECOVERY_REQUIRED_SNAPSHOTS - 1,
+                                ),
+                            ),
+                            "runtime_run_id": self.run_id,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                            "diagnostic": diagnostic,
+                        }
+                    else:
+                        state.pop("account_read_recovery", None)
+                    store.save(state)
+                return True
+            except (WTIExecutionError, OSError):
+                return False
+
+        return await asyncio.to_thread(persist)
+
+    def _account_recovery_snapshot_verified(
+        self,
+        state: dict[str, Any],
+        risk: dict[str, Any],
+    ) -> bool:
+        if not _safe_account_recovery_state(state):
+            return False
+        proof = state.get("last_account_reconciliation")
+        if (
+            not isinstance(proof, dict)
+            or proof.get("verified") is not True
+            or proof.get("active_order_count") != 0
+            or integer_value(proof.get("market_id"))
+            != getattr(self.args, "expected_lighter_market_id", None)
+        ):
+            return False
+        try:
+            observed_at = datetime.fromisoformat(
+                str(proof.get("observed_at")).replace("Z", "+00:00")
+            )
+            risk_at = datetime.fromisoformat(
+                str(risk.get("observed_at")).replace("Z", "+00:00")
+            )
+            if observed_at.tzinfo is None or risk_at.tzinfo is None:
+                return False
+            current = datetime.now(timezone.utc)
+            if any(
+                (current - value.astimezone(timezone.utc)).total_seconds() < -5
+                or (current - value.astimezone(timezone.utc)).total_seconds() > 5
+                for value in (observed_at, risk_at)
+            ):
+                return False
+            actual_var = Decimal(str(proof["variational_qty"]))
+            actual_lighter = Decimal(str(proof["lighter_qty"]))
+            if state["status"] == "flat":
+                expected_var = expected_lighter = Decimal("0")
+            else:
+                position = state["open_position"]
+                expected_var = Decimal(str(position["expected_var_qty"]))
+                expected_lighter = Decimal(str(position["expected_lighter_qty"]))
+            market = self.market_metadata if isinstance(self.market_metadata, dict) else {}
+            size_decimals = int(market.get("supported_size_decimals", 8))
+            lighter_tolerance = Decimal(1).scaleb(-size_decimals) / Decimal("2")
+            quantities_match = (
+                actual_var.is_finite()
+                and actual_lighter.is_finite()
+                and abs(actual_var - expected_var) <= Decimal("0.00000001")
+                and abs(actual_lighter - expected_lighter) <= lighter_tolerance
+            )
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return False
+        return bool(
+            quantities_match
+            and risk.get("risk_action") == "normal"
+            and risk.get("risk_data_complete") is True
+        )
 
     async def _decision_sample(self, row: dict[str, Any]) -> dict[str, Any] | None:
         now = datetime.now(timezone.utc)
@@ -1823,6 +2115,9 @@ class WTILiveRuntime:
             return read_json(self.args.state_path)
 
         self.last_risk = dict(self.gateway.latest_risk) if self.gateway else {}
+        if getattr(self, "account_read_recovery_cycle_blocked", False):
+            self.entry_authorized = False
+            return state
         self.startup_reconciled = state.get("status") in {"flat", "open"}
         state = await self._arm_manual_gradient_round(state, candidate)
         state = await self._advance_continuous_gradient_round(state)
@@ -1859,6 +2154,9 @@ class WTILiveRuntime:
             signal_sample = dict(row)
         state = await self._read_reconcile(row)
         self.last_risk = dict(self.gateway.latest_risk)
+        if getattr(self, "account_read_recovery_cycle_blocked", False):
+            self.entry_authorized = False
+            return state
         self._poll_rotation_drain()
         if getattr(self, "rotation_drain_request", None) is None:
             state = await self._arm_manual_gradient_round(state, row)
@@ -2256,9 +2554,12 @@ class WTILiveRuntime:
                         else:
                             self._note_verified_cycle(state, kind="closed_account_only")
                     except WTIExecutionError as exc:
-                        self.last_runtime_error = str(exc)
-                        self.last_action = {"action": "blocked", "reason": str(exc)}
-                        self.logger.warning("wti_closed_session_account_reconcile_failed reason=%s", exc)
+                        if not await self._handle_account_read_failure(
+                            exc, state=state, row=None,
+                        ):
+                            self.last_runtime_error = str(exc)
+                            self.last_action = {"action": "blocked", "reason": str(exc)}
+                            self.logger.warning("wti_closed_session_account_reconcile_failed reason=%s", exc)
                     self.last_account_only_reconcile_monotonic = time.monotonic()
                     self._write_health(state=state, row=None, error=self.last_runtime_error)
                 elif self._record_new_sample(dict(sample)) is True:
@@ -2306,7 +2607,11 @@ class WTILiveRuntime:
                             )
                         except Exception as exc:
                             self.last_cycle_error = f"{type(exc).__name__}:{str(exc)[:160]}"
-                            if _retryable_sample_validation_error(exc):
+                            if await self._handle_account_read_failure(
+                                exc, state=state, row=row,
+                            ):
+                                pass
+                            elif _retryable_sample_validation_error(exc):
                                 self.entry_authorized = False
                                 if not self.entry_authorization_permanently_revoked:
                                     self.entry_gate_block_reason = "wti_current_sample_or_session_not_fresh"
@@ -2336,7 +2641,11 @@ class WTILiveRuntime:
                             except Exception as exc:
                                 self.last_cycle_error = f"{type(exc).__name__}:{str(exc)[:160]}"
                                 self.entry_authorized = False
-                                if _retryable_sample_validation_error(exc):
+                                if await self._handle_account_read_failure(
+                                    exc, state=state, row=row,
+                                ):
+                                    pass
+                                elif _retryable_sample_validation_error(exc):
                                     if not self.entry_authorization_permanently_revoked:
                                         self.entry_gate_block_reason = "wti_current_sample_or_session_not_fresh"
                                     self.last_runtime_error = str(exc)
@@ -2387,10 +2696,13 @@ class WTILiveRuntime:
                                     "reason": state.get("manual_review_reason") or state.get("status"),
                                 }
                         except WTIExecutionError as exc:
-                            self.startup_reconciled = False
-                            self.last_runtime_error = str(exc)
-                            self.last_action = {"action": "blocked", "reason": str(exc)}
-                            self.logger.warning("wti_closed_session_account_reconcile_failed reason=%s", exc)
+                            if not await self._handle_account_read_failure(
+                                exc, state=state, row=None,
+                            ):
+                                self.startup_reconciled = False
+                                self.last_runtime_error = str(exc)
+                                self.last_action = {"action": "blocked", "reason": str(exc)}
+                                self.logger.warning("wti_closed_session_account_reconcile_failed reason=%s", exc)
                         self.last_account_only_reconcile_monotonic = time.monotonic()
                         self._complete_rotation_drain_if_verified_flat(state)
                     if time.monotonic() - self.last_health_write_monotonic >= 5:

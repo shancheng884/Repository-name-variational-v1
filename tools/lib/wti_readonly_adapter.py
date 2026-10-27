@@ -24,6 +24,68 @@ from tools.lib.hedge_instruments import (
 class WTIReadOnlyError(RuntimeError):
     """A read failed or its response could not prove the requested WTI state."""
 
+    def __init__(
+        self,
+        reason: str,
+        *,
+        retryable: bool = False,
+        operation: str | None = None,
+        http_status: int | None = None,
+        diagnostic_code: str | None = None,
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retryable = retryable
+        self.operation = operation
+        self.http_status = http_status
+        self.diagnostic_code = diagnostic_code
+
+
+def _retryable_http_status(status: int | None) -> bool:
+    return status in {408, 425, 429} or (status is not None and status >= 500)
+
+
+def _safe_error_code(value: Any) -> str | None:
+    if isinstance(value, dict):
+        value = value.get("error_code") or value.get("code") or value.get("error")
+    if not isinstance(value, (str, int)):
+        return None
+    normalized = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(value).strip().lower())[:80]
+    normalized = normalized.strip("_.:-")
+    return normalized or None
+
+
+def _transient_transport_error(exc: BaseException) -> bool:
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+        return True
+    name = type(exc).__name__.lower()
+    return name in {
+        "connectionclosed", "connectionclosederror", "connectionclosedok",
+        "websocketdisconnect", "serverdisconnectederror",
+    }
+
+
+async def _request_var(
+    client: VariationalCommandClient,
+    payload: dict[str, Any],
+    *,
+    operation: str,
+) -> Any:
+    try:
+        return await client.request(payload)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if isinstance(exc, WTIReadOnlyError):
+            raise
+        error_type = _safe_error_code(type(exc).__name__) or "unknown"
+        raise WTIReadOnlyError(
+            f"variational_{operation}_request_failed",
+            retryable=_transient_transport_error(exc),
+            operation=operation,
+            diagnostic_code=error_type,
+        ) from exc
+
 
 class VariationalCommandClient(Protocol):
     async def request(self, payload: dict[str, Any]) -> dict[str, Any]: ...
@@ -51,11 +113,45 @@ def _require_var_response(message: Any, *, expected_type: str, key: str) -> Any:
     if not isinstance(message, dict) or message.get("type") != expected_type:
         raise WTIReadOnlyError("variational_command_response_type_mismatch")
     result = message.get("result")
-    if message.get("ok") is not True or not isinstance(result, dict) or result.get("ok") is not True:
-        raise WTIReadOnlyError("variational_read_failed")
-    status = integer_value(result.get("httpStatus"))
+    status = integer_value(
+        (result.get("httpStatus") if isinstance(result, dict) else None)
+        or message.get("httpStatus")
+    )
+    error_code = _safe_error_code(
+        (result.get("error") or result.get("error_code") if isinstance(result, dict) else None)
+        or message.get("error") or message.get("error_code")
+    )
+    failed = (
+        message.get("ok") is not True
+        or not isinstance(result, dict)
+        or result.get("ok") is not True
+    )
+    if failed:
+        retryable_code = error_code in {
+            "timeout", "request_timeout", "temporarily_unavailable",
+            "service_unavailable", "rate_limit_exceeded",
+            "no_extension_command_client_connected", "connection_closed",
+        }
+        retryable = (
+            _retryable_http_status(status)
+            if status is not None
+            else retryable_code
+        )
+        raise WTIReadOnlyError(
+            "variational_read_failed",
+            retryable=retryable,
+            operation=key,
+            http_status=status,
+            diagnostic_code=error_code,
+        )
     if status is None or not 200 <= status < 300:
-        raise WTIReadOnlyError("variational_read_http_status_invalid")
+        raise WTIReadOnlyError(
+            "variational_read_http_status_invalid",
+            retryable=_retryable_http_status(status),
+            operation=key,
+            http_status=status,
+            diagnostic_code=error_code,
+        )
     if key not in result:
         raise WTIReadOnlyError(f"variational_{key}_missing")
     return result[key]
@@ -134,7 +230,7 @@ async def fetch_variational_wti_pending_orders(
     matched: list[dict[str, Any]] = []
     for page in range(max_pages):
         request_id = uuid.uuid4().hex
-        message = await client.request({
+        message = await _request_var(client, {
             "type": "VAR_API_ORDERS",
             "requestId": request_id,
             "status": "pending",
@@ -143,7 +239,7 @@ async def fetch_variational_wti_pending_orders(
             "orderBy": "created_at",
             "order": "desc",
             "requestTimeoutMs": timeout_ms,
-        })
+        }, operation="orders")
         if not isinstance(message, dict) or str(message.get("requestId")) != request_id:
             raise WTIReadOnlyError("variational_orders_request_id_mismatch")
         payload = _require_var_response(
@@ -218,7 +314,13 @@ def normalize_lighter_account(payload: Any) -> dict[str, Any]:
         raise WTIReadOnlyError("lighter_account_response_invalid")
     code = account.get("code")
     if code is not None and integer_value(code) not in {0, 200}:
-        raise WTIReadOnlyError("lighter_account_read_failed")
+        status = integer_value(code)
+        raise WTIReadOnlyError(
+            "lighter_account_read_failed",
+            retryable=_retryable_http_status(status),
+            operation="lighter_account",
+            http_status=status,
+        )
     if not isinstance(account.get("accounts"), list) or not account["accounts"]:
         raise WTIReadOnlyError("lighter_account_rows_missing")
     normalized = dict(account)
@@ -232,7 +334,13 @@ def normalize_lighter_active_orders(payload: Any, *, market_id: int) -> tuple[di
         raise WTIReadOnlyError("lighter_active_orders_response_invalid")
     code = response.get("code")
     if code is not None and integer_value(code) not in {0, 200}:
-        raise WTIReadOnlyError("lighter_active_orders_read_failed")
+        status = integer_value(code)
+        raise WTIReadOnlyError(
+            "lighter_active_orders_read_failed",
+            retryable=_retryable_http_status(status),
+            operation="lighter_active_orders",
+            http_status=status,
+        )
     orders = response.get("orders")
     if not isinstance(orders, list) or any(not isinstance(order, dict) for order in orders):
         raise WTIReadOnlyError("lighter_active_orders_shape_unrecognized")
@@ -283,11 +391,11 @@ class WTIReadOnlyAccountAdapter:
     async def read_account(self) -> dict[str, Any]:
         started = self._now_utc()
         position_id = uuid.uuid4().hex
-        position_message = await self.variational.request({
+        position_message = await _request_var(self.variational, {
             "type": "VAR_API_POSITIONS",
             "requestId": position_id,
             "requestTimeoutMs": self.request_timeout_ms,
-        })
+        }, operation="positions")
         if not isinstance(position_message, dict) or str(position_message.get("requestId")) != position_id:
             raise WTIReadOnlyError("variational_positions_request_id_mismatch")
         raw_positions = _require_var_response(
@@ -308,11 +416,11 @@ class WTIReadOnlyAccountAdapter:
             timeout_ms=self.request_timeout_ms,
         )
         portfolio_id = uuid.uuid4().hex
-        portfolio_message = await self.variational.request({
+        portfolio_message = await _request_var(self.variational, {
             "type": "VAR_API_PORTFOLIO",
             "requestId": portfolio_id,
             "requestTimeoutMs": self.request_timeout_ms,
-        })
+        }, operation="portfolio")
         if not isinstance(portfolio_message, dict) or str(portfolio_message.get("requestId")) != portfolio_id:
             raise WTIReadOnlyError("variational_portfolio_request_id_mismatch")
         raw_portfolio = _require_var_response(
@@ -339,7 +447,12 @@ class WTIReadOnlyAccountAdapter:
         completed = self._now_utc()
         window = (completed - started).total_seconds()
         if window < 0 or window > self.max_read_window_seconds:
-            raise WTIReadOnlyError("account_snapshot_read_window_exceeded")
+            raise WTIReadOnlyError(
+                "account_snapshot_read_window_exceeded",
+                retryable=True,
+                operation="account_snapshot",
+                diagnostic_code="read_window_exceeded",
+            )
         active_orders = [
             {"venue": "variational", "order": order} for order in var_orders
         ] + [{"venue": "lighter", "order": order} for order in lighter_orders]

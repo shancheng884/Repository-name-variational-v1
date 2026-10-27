@@ -9,7 +9,12 @@ from decimal import Decimal
 import pytest
 
 from tools.lib.market_sessions import classify_usoil_session
-from tools.lib.wti_execution import WTIPairExecutor, WTIExecutionError, WTIExecutionStore
+from tools.lib.wti_execution import (
+    WTIPairExecutor,
+    WTIAccountSnapshotUnavailable,
+    WTIExecutionError,
+    WTIExecutionStore,
+)
 from tools.lib.wti_live_gateway import WTIProductionGateway
 from tools.lib.lighter_order_identity import LEGACY_INDEX_REJECTION, MAX_LIGHTER_CLIENT_ORDER_INDEX
 
@@ -226,6 +231,47 @@ def _gradient_pilot(executor):
         config={"tier_thresholds_bps": ["30", "45"], "layer_notional_usd": "10"},
         max_layers=2,
     )
+
+
+def test_account_snapshot_error_keeps_retryability_and_pre_submit_phase(tmp_path):
+    gateway = SimulatedWTIGateway(fail_read_calls={1})
+    executor, _ = _executor(tmp_path, gateway)
+    sample = _sample()
+    with pytest.raises(WTIAccountSnapshotUnavailable) as raised:
+        executor.reconcile(
+            sample=sample,
+            now=datetime.now(timezone.utc),
+            session=_session_for_sample(sample),
+        )
+    assert str(raised.value) == "account_snapshot_unavailable"
+    assert raised.value.retryable is True
+    assert raised.value.phase == "cycle_reconcile"
+    assert raised.value.diagnostic_code == "timeouterror"
+    state = executor.store.load()
+    assert state["status"] == "flat"
+    assert state["pending_action"] is None
+    assert state["execution_history"] == []
+    assert gateway.requests == []
+
+
+def test_unexpected_account_snapshot_error_is_not_retryable(tmp_path):
+    class FailingGateway(SimulatedWTIGateway):
+        def read_account(self):
+            raise RuntimeError("unexpected response parser bug")
+
+    gateway = FailingGateway()
+    executor, _ = _executor(tmp_path, gateway)
+    sample = _sample()
+    with pytest.raises(WTIAccountSnapshotUnavailable) as raised:
+        executor.reconcile(
+            sample=sample,
+            now=datetime.now(timezone.utc),
+            session=_session_for_sample(sample),
+        )
+    assert raised.value.retryable is False
+    assert raised.value.phase == "cycle_reconcile"
+    assert raised.value.diagnostic_code == "runtimeerror"
+    assert gateway.requests == []
 
 
 def test_full_open_close_uses_exact_contracts_reduce_only_and_confirmed_positions(tmp_path):

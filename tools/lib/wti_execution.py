@@ -51,6 +51,24 @@ class WTIExecutionError(RuntimeError):
     """An unsafe or unverified execution condition; no blind retry is allowed."""
 
 
+class WTIAccountSnapshotUnavailable(WTIExecutionError):
+    """A failed account read, with retryability scoped to read-only preflight phases."""
+
+    def __init__(
+        self,
+        *,
+        phase: str,
+        retryable: bool,
+        diagnostic_code: str,
+        http_status: int | None = None,
+    ) -> None:
+        super().__init__("account_snapshot_unavailable")
+        self.phase = phase
+        self.retryable = retryable
+        self.diagnostic_code = diagnostic_code
+        self.http_status = http_status
+
+
 class ExecutionBusy(WTIExecutionError):
     pass
 
@@ -1180,6 +1198,7 @@ class WTIPairExecutor:
         context: MarketContext | WTIAccountContext,
         *,
         minimum_observed_at: datetime | None = None,
+        phase: str = "account_reconciliation",
     ) -> AccountSnapshot:
         try:
             parsed = _account_positions(
@@ -1189,7 +1208,32 @@ class WTIPairExecutor:
                 minimum_observed_at=minimum_observed_at,
             )
         except Exception as exc:
-            raise WTIExecutionError("account_snapshot_unavailable") from exc
+            status = integer_value(
+                getattr(exc, "http_status", None) or getattr(exc, "status", None)
+            )
+            cause = getattr(exc, "diagnostic_code", None) or getattr(exc, "reason", None)
+            if not isinstance(cause, str) or not cause:
+                cause = type(exc).__name__
+            cause = "".join(
+                char if char.isalnum() or char in "_.:-" else "_"
+                for char in cause.lower()
+            )[:80] or "unknown"
+            retryable = getattr(exc, "retryable", False) is True
+            retryable = retryable or status in {408, 425, 429} or (
+                status is not None and status >= 500
+            )
+            retryable = retryable or isinstance(exc, (TimeoutError, ConnectionError, OSError))
+            retryable = retryable or cause in {
+                "no_extension_command_client_connected", "connection_closed",
+                "connectionclosed", "connectionclosederror", "connectionclosedok",
+                "serverdisconnectederror", "websocketdisconnect",
+            }
+            raise WTIAccountSnapshotUnavailable(
+                phase=phase,
+                retryable=retryable,
+                diagnostic_code=cause,
+                http_status=status,
+            ) from exc
         if parsed is None:
             raise WTIExecutionError("account_snapshot_unverifiable")
         return parsed
@@ -1245,7 +1289,7 @@ class WTIPairExecutor:
                     return self._manual_review(state, "open_local_position_quantities_unverifiable")
                 expected = (expected_var, expected_lighter)
 
-            actual = self._read(context)
+            actual = self._read(context, phase="account_only_reconcile")
             state["last_account_reconciliation"] = {
                 "verified": True,
                 "observed_at": actual.observed_at.isoformat(),
@@ -2132,7 +2176,7 @@ class WTIPairExecutor:
                 "status"
             ) not in {"completed", "exhausted"}:
                 raise WTIExecutionError("gradient_pilot_identity_required")
-            baseline = self._read(context)
+            baseline = self._read(context, phase="entry_preflight")
             if previous_position is None:
                 baseline_expected = (Decimal("0"), Decimal("0"))
             else:
@@ -2373,7 +2417,7 @@ class WTIPairExecutor:
         ):
             return False
         try:
-            before = self._read(context)
+            before = self._read(context, phase="compensation_preflight")
         except WTIExecutionError:
             return False
         previous_position = pending.get("previous_position")
@@ -2531,7 +2575,7 @@ class WTIPairExecutor:
                     return state
             state["last_close_check"] = close_check
             self.store.save(state)
-            before = self._read(context)
+            before = self._read(context, phase="exit_preflight")
             expected_open = (
                 Decimal(str(position["expected_var_qty"])),
                 Decimal(str(position["expected_lighter_qty"])),
@@ -3039,11 +3083,12 @@ class WTIPairExecutor:
                     actual = self._read(
                         context,
                         minimum_observed_at=self._latest_order_time(pending),
+                        phase="pending_order_reconcile",
                     )
                 except WTIExecutionError:
                     return self._manual_review(state, "post_order_account_snapshot_unavailable")
             else:
-                actual = self._read(context)
+                actual = self._read(context, phase="cycle_reconcile")
             state["last_account_reconciliation"] = {
                 "verified": True,
                 "observed_at": actual.observed_at.isoformat(),

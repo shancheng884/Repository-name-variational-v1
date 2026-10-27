@@ -9,6 +9,7 @@ from tools.wti_account_probe import LighterSDKReadOnlyReader
 from tools.lib.wti_readonly_adapter import (
     WTIReadOnlyAccountAdapter,
     WTIReadOnlyError,
+    _require_var_response,
     fetch_variational_wti_pending_orders,
     normalize_lighter_active_orders,
     normalize_lighter_account,
@@ -297,6 +298,50 @@ def test_var_pending_order_command_error_does_not_become_zero_orders():
 
     with pytest.raises(WTIReadOnlyError, match="variational_read_failed"):
         asyncio_call(fetch_variational_wti_pending_orders(FailedClient()))
+
+
+@pytest.mark.parametrize(
+    "status, retryable",
+    [(503, True), (429, True), (401, False), (400, False), (200, False)],
+)
+def test_var_read_failure_preserves_safe_http_diagnostics_and_retry_class(status, retryable):
+    message = {
+        "type": "VAR_API_POSITIONS_RESULT",
+        "ok": False,
+        "error": "credential details must not be copied into diagnostics",
+        "result": {
+            "ok": False,
+            "httpStatus": status,
+            "error": "service unavailable",
+        },
+    }
+    with pytest.raises(WTIReadOnlyError, match="variational_read_failed") as raised:
+        _require_var_response(
+            message, expected_type="VAR_API_POSITIONS_RESULT", key="positions",
+        )
+    assert raised.value.retryable is retryable
+    assert raised.value.http_status == status
+    assert raised.value.operation == "positions"
+    assert "credential" not in str(raised.value)
+
+
+def test_var_transport_timeout_is_retryable_but_other_client_errors_are_not():
+    class FailedClient:
+        def __init__(self, error):
+            self.error = error
+
+        async def request(self, _payload):
+            raise self.error
+
+    with pytest.raises(WTIReadOnlyError) as timeout:
+        asyncio_call(fetch_variational_wti_pending_orders(FailedClient(TimeoutError())))
+    assert timeout.value.retryable is True
+    assert timeout.value.operation == "orders"
+    assert timeout.value.diagnostic_code == "timeouterror"
+
+    with pytest.raises(WTIReadOnlyError) as unexpected:
+        asyncio_call(fetch_variational_wti_pending_orders(FailedClient(AttributeError())))
+    assert unexpected.value.retryable is False
 
 
 def test_lighter_account_and_active_orders_validate_shapes_and_market_scope():

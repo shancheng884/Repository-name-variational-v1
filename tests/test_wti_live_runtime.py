@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from tools import wti_live
+from tools.lib.wti_readonly_adapter import WTIReadOnlyError
 
 
 @pytest.mark.parametrize("mode", ["observe", "live"])
@@ -1578,6 +1579,158 @@ def _runtime_with_real_executor(tmp_path, collector, gateway, *, gradient=False)
         max_notional_usd=Decimal("20"),
     )
     return runtime
+
+
+def test_transient_account_read_recovers_only_after_two_verified_snapshots_without_orders(tmp_path):
+    class RecoveringGateway(_FlatLoopGateway):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+            self.failures_remaining = 1
+
+        def read_account(self):
+            self.attempts += 1
+            if self.failures_remaining:
+                self.failures_remaining -= 1
+                raise WTIReadOnlyError(
+                    "variational_read_failed", retryable=True,
+                    operation="positions", http_status=503,
+                    diagnostic_code="service_unavailable",
+                )
+            snapshot = super().read_account()
+            self.latest_risk.update({
+                "risk_action": "normal", "risk_reason": "account_risk_normal",
+                "risk_data_complete": True, "observed_at": snapshot["observed_at"],
+            })
+            return snapshot
+
+    class Collector:
+        latest_sample = _live_sample(datetime.now(timezone.utc), sample_id="recovery-start")
+
+    gateway = RecoveringGateway()
+    runtime = _runtime_with_real_executor(tmp_path, Collector(), gateway)
+    first = Collector.latest_sample
+
+    first_state = asyncio.run(runtime._read_reconcile(first))
+    assert first_state["status"] == "flat"
+    assert gateway.attempts == 2  # one bounded retry, read-only only
+    assert runtime.account_read_recovery_required is True
+    assert runtime.account_read_recovery_verified_snapshots == 1
+    assert runtime.entry_authorization_permanently_revoked is False
+    assert runtime.entry_authorized is False
+    assert first_state["account_read_recovery"]["required"] is True
+    assert gateway.attempts == 2
+    assert first_state["execution_history"] == []
+
+    second = _live_sample(datetime.now(timezone.utc), sample_id="recovery-confirmation")
+    second["long_edge_bps"] = "100"
+    second["short_edge_bps"] = "-100"
+    second_state = asyncio.run(runtime._process_sample(second))
+
+    assert second_state["status"] == "flat"
+    assert runtime.account_read_recovery_required is False
+    assert runtime.account_read_recovery_cycle_blocked is True
+    assert runtime.startup_reconciled is True
+    assert runtime.entry_authorized is False
+    assert runtime.last_action["reason"] == "wti_account_read_recovery_confirmed_next_sample_required"
+    assert "account_read_recovery" not in second_state
+    assert second_state["pending_action"] is None
+    assert second_state["execution_history"] == []
+    assert gateway.attempts == 3
+
+
+def test_account_read_retries_are_bounded_and_keep_entries_locked(tmp_path):
+    class UnavailableGateway(_FlatLoopGateway):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def read_account(self):
+            self.attempts += 1
+            raise WTIReadOnlyError(
+                "variational_read_failed", retryable=True,
+                operation="positions", http_status=503,
+                diagnostic_code="service_unavailable",
+            )
+
+    class Collector:
+        latest_sample = _live_sample(datetime.now(timezone.utc), sample_id="recovery-retry")
+
+    gateway = UnavailableGateway()
+    runtime = _runtime_with_real_executor(tmp_path, Collector(), gateway)
+    state = asyncio.run(runtime._read_reconcile(Collector.latest_sample))
+
+    assert gateway.attempts == len(wti_live.ACCOUNT_READ_RETRY_DELAYS_SECONDS) + 1
+    assert state["status"] == "flat" and state["pending_action"] is None
+    assert runtime.account_read_recovery_required is True
+    assert runtime.account_read_recovery_verified_snapshots == 0
+    assert runtime.entry_authorized is False
+    assert runtime.entry_authorization_permanently_revoked is False
+    assert runtime.startup_reconciled is False
+    assert runtime.last_account_read_failure == "cycle_reconcile:service_unavailable:http_503"
+    assert gateway.attempts == len(wti_live.ACCOUNT_READ_RETRY_DELAYS_SECONDS) + 1
+    assert state["execution_history"] == []
+
+
+def test_account_recovery_snapshot_rejects_mismatch_or_non_normal_risk(tmp_path):
+    class Collector:
+        latest_sample = _live_sample(datetime.now(timezone.utc), sample_id="proof")
+
+    runtime = _runtime_with_real_executor(tmp_path, Collector(), _FlatLoopGateway())
+    now = datetime.now(timezone.utc).isoformat()
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "manual_review_reason": None,
+        "last_account_reconciliation": {
+            "verified": True, "observed_at": now, "market_id": 145,
+            "variational_qty": "0", "lighter_qty": "0", "active_order_count": 0,
+        },
+    }
+    risk = {
+        "risk_action": "normal", "risk_data_complete": True, "observed_at": now,
+    }
+    assert runtime._account_recovery_snapshot_verified(state, risk)
+    assert not runtime._account_recovery_snapshot_verified(
+        {**state, "last_account_reconciliation": {
+            **state["last_account_reconciliation"], "variational_qty": "0.198",
+        }}, risk,
+    )
+    assert not runtime._account_recovery_snapshot_verified(
+        state, {**risk, "risk_action": "warning"},
+    )
+    assert not runtime._account_recovery_snapshot_verified(
+        state, {**risk, "risk_data_complete": False},
+    )
+
+
+def test_account_read_recovery_marker_is_restored_after_process_restart(tmp_path, monkeypatch):
+    monkeypatch.setattr(wti_live, "ROOT", tmp_path)
+    state_path = tmp_path / "log/wti_live_state.json"
+    store = wti_live.WTIExecutionStore(state_path)
+    state = store.load()
+    state["account_read_recovery"] = {
+        "required": True, "verified_snapshots": 1,
+        "runtime_run_id": "previous-run", "diagnostic": "cycle_reconcile:service_unavailable:http_503",
+    }
+    store.save(state)
+    args = wti_live.parse_args([
+        "--mode", "observe", "--state-path", str(state_path),
+        "--health-path", str(tmp_path / "log/health.json"),
+        "--control-path", str(tmp_path / "log/control.json"),
+        "--sample-root", str(tmp_path / "log/samples"),
+        "--output-dir", str(tmp_path / "log/oil_swap"),
+    ])
+
+    runtime = wti_live.WTILiveRuntime(args)
+    try:
+        assert runtime.account_read_recovery_required is True
+        assert runtime.account_read_recovery_verified_snapshots == 0
+        assert runtime.entry_gate_block_reason == "wti_account_read_recovery_pending"
+        assert runtime.entry_authorized is False
+    finally:
+        for handler in runtime.logger.handlers:
+            handler.close()
+        runtime.logger.handlers.clear()
 
 
 def test_gradient_equity_capacity_requires_fresh_complete_dual_equity_snapshot():
