@@ -18,6 +18,8 @@ EDGE_FIELDS = {
 ANCHOR_WINDOW_SECONDS = 7 * 24 * 60 * 60
 MIN_HISTORY_SAMPLES = 100
 MIN_EFFECTIVE_SECONDS = 36 * 60 * 60
+FAST_WINDOW_SECONDS = 24 * 60 * 60
+FAST_MIN_EFFECTIVE_SECONDS = 6 * 60 * 60
 THRESHOLD_REFRESH_SECONDS = 5 * 60
 MIN_TIER_SPACING_BPS = Decimal("0.25")
 ENTRY_PERCENTILES = (
@@ -37,6 +39,11 @@ class WTIGradientThresholdProfile:
     p99_bps: Decimal | None
     p995_bps: Decimal | None
     p998_bps: Decimal | None
+    fast_p95_bps: Decimal | None
+    fast_sample_count: int
+    fast_effective_seconds: int
+    fast_mature: bool
+    tier_spacing_bps: Decimal
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +56,11 @@ class WTIGradientThresholdProfile:
             "p99_bps": None if self.p99_bps is None else str(self.p99_bps),
             "p995_bps": None if self.p995_bps is None else str(self.p995_bps),
             "p998_bps": None if self.p998_bps is None else str(self.p998_bps),
+            "fast_p95_bps": None if self.fast_p95_bps is None else str(self.fast_p95_bps),
+            "fast_sample_count": self.fast_sample_count,
+            "fast_effective_seconds": self.fast_effective_seconds,
+            "fast_mature": self.fast_mature,
+            "tier_spacing_bps": str(self.tier_spacing_bps),
         }
 
 
@@ -82,6 +94,18 @@ def _percentile(values: list[Decimal], percentile: Decimal) -> Decimal | None:
     return ordered[max(0, min(index, len(ordered) - 1))]
 
 
+def _effective_coverage_seconds(
+    timestamps: list[datetime], *, sample_interval_seconds: int, window_seconds: int
+) -> int:
+    """Count observed time, capping each gap so outages cannot count as coverage."""
+    unique = sorted(set(timestamps))
+    covered = sum(
+        min((right - left).total_seconds(), sample_interval_seconds)
+        for left, right in zip(unique, unique[1:])
+    )
+    return min(int(covered), window_seconds)
+
+
 def build_wti_gradient_threshold_profiles(
     rows: list[dict[str, Any]],
     *,
@@ -97,6 +121,8 @@ def build_wti_gradient_threshold_profiles(
     window_seconds: int = ANCHOR_WINDOW_SECONDS,
     min_samples: int = MIN_HISTORY_SAMPLES,
     min_effective_seconds: int = MIN_EFFECTIVE_SECONDS,
+    fast_window_seconds: int = FAST_WINDOW_SECONDS,
+    min_fast_effective_seconds: int = FAST_MIN_EFFECTIVE_SECONDS,
 ) -> dict[str, WTIGradientThresholdProfile]:
     """Build no-lookahead thresholds, retaining configured tiers as hard floors."""
     if as_of.tzinfo is None or as_of.utcoffset() is None:
@@ -111,7 +137,9 @@ def build_wti_gradient_threshold_profiles(
         or second_floor_bps <= first_floor_bps
         or roundtrip_cost_bps < 0 or exit_target_bps < 0
         or sample_interval_seconds <= 0 or window_seconds <= 0
+        or fast_window_seconds <= 0 or fast_window_seconds > window_seconds
         or min_samples < 1 or min_effective_seconds < 0
+        or min_fast_effective_seconds < 0
     ):
         raise ValueError("wti_threshold_parameters_invalid")
     hard_floors = tier_floors_bps or (
@@ -167,21 +195,68 @@ def build_wti_gradient_threshold_profiles(
         elif old[0] != row:
             conflicting_ids.add(sample_id)
 
-    edge_values: dict[str, list[Decimal]] = {direction: [] for direction in DIRECTIONS}
-    for sample_id, (row, _at) in latest_by_id.items():
+    accepted_rows: list[tuple[dict[str, Any], datetime]] = []
+    for sample_id, (row, at) in latest_by_id.items():
         if sample_id in conflicting_ids:
             continue
+        accepted_rows.append((row, at))
+    accepted_rows.sort(key=lambda item: item[1])
+
+    edge_values: dict[str, list[Decimal]] = {direction: [] for direction in DIRECTIONS}
+    fast_edge_values: dict[str, list[Decimal]] = {direction: [] for direction in DIRECTIONS}
+    timestamps_by_direction: dict[str, list[datetime]] = {direction: [] for direction in DIRECTIONS}
+    fast_timestamps_by_direction: dict[str, list[datetime]] = {direction: [] for direction in DIRECTIONS}
+    noise_by_direction: dict[str, list[Decimal]] = {direction: [] for direction in DIRECTIONS}
+    previous_by_direction: dict[str, tuple[dict[str, Any], datetime, Decimal] | None] = {
+        direction: None for direction in DIRECTIONS
+    }
+    fast_cutoff = as_of.astimezone(timezone.utc) - timedelta(seconds=fast_window_seconds)
+    for row, at in accepted_rows:
         for direction in DIRECTIONS:
             edge = _decimal(row.get(EDGE_FIELDS[direction]))
             if edge is not None:
                 edge_values[direction].append(edge)
+                timestamps_by_direction[direction].append(at)
+                if at > fast_cutoff:
+                    fast_edge_values[direction].append(edge)
+                    fast_timestamps_by_direction[direction].append(at)
+                previous = previous_by_direction[direction]
+                if previous is not None:
+                    previous_row, previous_at, previous_edge = previous
+                    gap = (at - previous_at).total_seconds()
+                    if (
+                        row.get("session_id") == previous_row.get("session_id")
+                        and 0 < gap <= sample_interval_seconds * 2
+                    ):
+                        noise_by_direction[direction].append(abs(edge - previous_edge))
+                previous_by_direction[direction] = (row, at, edge)
 
     profiles: dict[str, WTIGradientThresholdProfile] = {}
     reserve = roundtrip_cost_bps + exit_target_bps
     for direction in DIRECTIONS:
         values = edge_values[direction]
-        effective = min(len(values) * sample_interval_seconds, window_seconds)
+        effective = _effective_coverage_seconds(
+            timestamps_by_direction[direction],
+            sample_interval_seconds=sample_interval_seconds,
+            window_seconds=window_seconds,
+        )
         mature = len(values) >= min_samples and effective >= min_effective_seconds
+        fast_values = fast_edge_values[direction]
+        fast_effective = _effective_coverage_seconds(
+            fast_timestamps_by_direction[direction],
+            sample_interval_seconds=sample_interval_seconds,
+            window_seconds=fast_window_seconds,
+        )
+        fast_mature = (
+            len(fast_values) >= min_samples
+            and fast_effective >= min_fast_effective_seconds
+        )
+        fast_p95 = _percentile(fast_values, Decimal("95")) if fast_mature else None
+        tier_spacing = max(
+            MIN_TIER_SPACING_BPS,
+            _percentile(noise_by_direction[direction], Decimal("80"))
+            or Decimal("0"),
+        )
         percentile_values = (
             tuple(_percentile(values, percentile) for percentile in ENTRY_PERCENTILES)
             if mature else (None,) * len(ENTRY_PERCENTILES)
@@ -193,9 +268,11 @@ def build_wti_gradient_threshold_profiles(
                 continue
             candidates = [floor]
             if index and thresholds[index - 1] is not None:
-                candidates.append(thresholds[index - 1] + MIN_TIER_SPACING_BPS)
+                candidates.append(thresholds[index - 1] + tier_spacing)
             if percentile_value is not None:
                 candidates.append(percentile_value + reserve)
+            if index == 0 and fast_p95 is not None:
+                candidates.append(fast_p95 + reserve)
             thresholds.append(max(candidates))
         profiles[direction] = WTIGradientThresholdProfile(
             thresholds_bps=tuple(thresholds),
@@ -207,5 +284,10 @@ def build_wti_gradient_threshold_profiles(
             p99_bps=percentile_values[2],
             p995_bps=percentile_values[3],
             p998_bps=percentile_values[4],
+            fast_p95_bps=fast_p95,
+            fast_sample_count=len(fast_values),
+            fast_effective_seconds=fast_effective,
+            fast_mature=fast_mature,
+            tier_spacing_bps=tier_spacing,
         )
     return profiles

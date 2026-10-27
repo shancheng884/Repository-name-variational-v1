@@ -92,8 +92,8 @@ def test_mature_profile_uses_eth_percentiles_and_adds_conservative_cost_reserve(
         Decimal("408"), Decimal("409"),
     )
     assert profiles["short_var_long_lighter"].thresholds_bps == (
-        Decimal("30"), Decimal("45"), Decimal("45.25"),
-        Decimal("45.50"), Decimal("45.75"),
+        Decimal("30"), Decimal("45"), Decimal("46"),
+        Decimal("47"), Decimal("48"),
     )
 
 
@@ -106,9 +106,52 @@ def test_history_effective_time_gate_is_not_satisfied_by_sample_count_alone():
     profile = _build(rows)["long_var_short_lighter"]
 
     assert profile.sample_count == 100
-    assert profile.effective_seconds == 1000
+    assert profile.effective_seconds == 990
     assert not profile.mature
     assert profile.thresholds_bps == (Decimal("30"), Decimal("45"), None, None, None)
+
+
+def test_duplicate_and_clustered_samples_do_not_inflate_observed_coverage():
+    rows = [
+        _row(i, AS_OF - timedelta(seconds=(100 - i)), long_edge=i)
+        for i in range(100)
+    ]
+    rows.extend(rows[-20:])
+
+    profile = _build(rows)["long_var_short_lighter"]
+
+    assert profile.sample_count == 100
+    assert profile.effective_seconds == 99
+    assert not profile.mature
+
+
+def test_fast_window_exposes_directional_p95_and_recent_noise_spacing():
+    rows = [
+        _row(
+            i,
+            AS_OF - timedelta(seconds=(40 - i) * 10),
+            long_edge=i + (i % 2),
+            short_edge=-i - (i % 2),
+        )
+        for i in range(40)
+    ]
+
+    profile = _build(
+        rows,
+        min_samples=10,
+        min_effective_seconds=0,
+        min_fast_effective_seconds=0,
+        fast_window_seconds=3600,
+    )["long_var_short_lighter"]
+
+    assert profile.fast_mature
+    assert profile.fast_p95_bps is not None
+    assert profile.tier_spacing_bps >= Decimal("1")
+    assert all(
+        right - left >= profile.tier_spacing_bps
+        for left, right in zip(profile.thresholds_bps, profile.thresholds_bps[1:])
+        if left is not None and right is not None
+    )
 
 
 def test_future_wrong_market_and_conflicting_duplicate_samples_are_excluded():

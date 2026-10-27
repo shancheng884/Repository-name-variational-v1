@@ -384,6 +384,8 @@ def _normalized_order_result(
         if decimal_value(payload.get("matched_trade_qty")) is not None else None,
         "trade_fee_evidence": deepcopy(payload.get("trade_fee_evidence"))
         if isinstance(payload.get("trade_fee_evidence"), list) else None,
+        "fee_evidence": deepcopy(payload.get("fee_evidence"))
+        if isinstance(payload.get("fee_evidence"), dict) else None,
         "average_price": (
             str(decimal_value(payload.get("average_price")))
             if decimal_value(payload.get("average_price")) is not None
@@ -1485,6 +1487,8 @@ class WTIPairExecutor:
             "lighter_entry_price": None if lighter_price is None else str(lighter_price),
             "var_entry_fee_usd": var_fill.get("fee_usd"),
             "lighter_entry_fee_usd": lighter_fill.get("fee_usd"),
+            "var_entry_fee_evidence": deepcopy(var_fill.get("fee_evidence")),
+            "lighter_entry_fee_evidence": deepcopy(lighter_fill.get("fee_evidence")),
             "opened_at": pending.get("intent_at") or execution.get("completed_at"),
             "session_id": pending.get("session_id"),
             "entry_execution_id": execution["action_id"],
@@ -1504,6 +1508,10 @@ class WTIPairExecutor:
                 "lighter_entry_price": layer["lighter_entry_price"],
                 "var_entry_fee_usd": layer["var_entry_fee_usd"],
                 "lighter_entry_fee_usd": layer["lighter_entry_fee_usd"],
+                "entry_fee_evidence_by_venue": {
+                    "variational": [deepcopy(layer["var_entry_fee_evidence"])],
+                    "lighter": [deepcopy(layer["lighter_entry_fee_evidence"])],
+                },
                 "market_id": pending["market_id"],
                 "multiplier": pending["multiplier"],
                 "session_id": pending.get("session_id"),
@@ -1544,6 +1552,8 @@ class WTIPairExecutor:
                 "lighter_entry_price": str(prior_lighter_price),
                 "var_entry_fee_usd": previous.get("var_entry_fee_usd"),
                 "lighter_entry_fee_usd": previous.get("lighter_entry_fee_usd"),
+                "var_entry_fee_evidence": deepcopy(previous.get("var_entry_fee_evidence")),
+                "lighter_entry_fee_evidence": deepcopy(previous.get("lighter_entry_fee_evidence")),
                 "opened_at": previous.get("opened_at"),
                 "session_id": previous.get("session_id"),
                 "entry_execution_id": previous.get("entry_execution_id"),
@@ -1570,6 +1580,27 @@ class WTIPairExecutor:
         expected_var = Decimal(str(pending["expected_var_qty"]))
         expected_lighter = Decimal(str(pending["expected_lighter_qty"]))
         result = deepcopy(previous)
+        prior_fee_evidence = previous.get("entry_fee_evidence_by_venue")
+        prior_fee_evidence = prior_fee_evidence if isinstance(prior_fee_evidence, dict) else {}
+
+        def append_fee_evidence(venue: str, new_evidence: Any) -> list[Any]:
+            existing = prior_fee_evidence.get(venue)
+            if isinstance(existing, list):
+                values = deepcopy(existing)
+            else:
+                legacy_fee = previous.get(
+                    "var_entry_fee_usd" if venue == "variational"
+                    else "lighter_entry_fee_usd"
+                )
+                values = [{
+                    "venue": venue,
+                    "status": "confirmed_usd" if legacy_fee is not None else "legacy_unavailable",
+                    "fee_usd": legacy_fee,
+                    "source": "persisted_position_without_fee_evidence",
+                }]
+            values.append(deepcopy(new_evidence))
+            return values
+
         result.update({
             "var_qty": str(total_var),
             "lighter_qty": str(total_lighter),
@@ -1579,6 +1610,10 @@ class WTIPairExecutor:
             "lighter_entry_price": None if combined_lighter_price is None else str(combined_lighter_price),
             "var_entry_fee_usd": combined_fee(previous.get("var_entry_fee_usd"), var_fill.get("fee_usd")),
             "lighter_entry_fee_usd": combined_fee(previous.get("lighter_entry_fee_usd"), lighter_fill.get("fee_usd")),
+            "entry_fee_evidence_by_venue": {
+                "variational": append_fee_evidence("variational", var_fill.get("fee_evidence")),
+                "lighter": append_fee_evidence("lighter", lighter_fill.get("fee_evidence")),
+            },
             "layers": layers,
             "last_entry_execution_id": execution["action_id"],
             "last_entry_decision": layer["entry_decision"],
@@ -1624,13 +1659,20 @@ class WTIPairExecutor:
             ):
                 raise CorruptExecutionState("gradient pilot layer does not match pending entry")
             if outcome == "filled":
-                pilot.setdefault("layers_opened", []).append({
+                decision = pending.get("decision") or {}
+                opened_layer = {
                     "tier": tier,
                     "layer_id": pending.get("layer_id"),
                     "action_id": pending.get("action_id"),
                     "completed_at": record["completed_at"],
                     "recovered": recovered,
-                })
+                }
+                if isinstance(decision, dict):
+                    if decision.get("confirmation_mode") in {"two_of_three", "strong_single_probe"}:
+                        opened_layer["confirmation_mode"] = decision["confirmation_mode"]
+                    if decision.get("elastic_capacity_addon") is True:
+                        opened_layer["elastic_capacity_addon"] = True
+                pilot.setdefault("layers_opened", []).append(opened_layer)
                 pilot["status"] = "in_position"
             elif outcome in {"no_fill", "compensated"}:
                 pilot.setdefault("exhausted_tiers", []).append(tier)
@@ -1777,12 +1819,67 @@ class WTIPairExecutor:
             decimal_value(var_exit.get("fee_usd")),
             decimal_value(lighter_exit.get("fee_usd")),
         ]
-        output["actual_fees_usd"] = (
-            str(sum(fee_values, Decimal("0"))) if all(value is not None for value in fee_values) else None
+        stored_entry_evidence = position.get("entry_fee_evidence_by_venue")
+        stored_entry_evidence = stored_entry_evidence if isinstance(stored_entry_evidence, dict) else {}
+
+        def entry_evidence(venue: str, fee_key: str) -> list[dict[str, Any]]:
+            values = stored_entry_evidence.get(venue)
+            if isinstance(values, list):
+                records = [deepcopy(value) for value in values if isinstance(value, dict)]
+                if records:
+                    return records
+            fee = position.get(fee_key)
+            return [{
+                "venue": venue,
+                "source": "persisted_fill_result",
+                "fee_usd": fee,
+                "status": "confirmed_usd" if decimal_value(fee) is not None else "unverified",
+            }]
+
+        def exit_evidence(venue: str, leg: dict[str, Any]) -> dict[str, Any]:
+            evidence = leg.get("fee_evidence")
+            if isinstance(evidence, dict):
+                return deepcopy(evidence)
+            fee = leg.get("fee_usd")
+            return {
+                "venue": venue,
+                "source": "persisted_fill_result",
+                "fee_usd": fee,
+                "status": "confirmed_usd" if decimal_value(fee) is not None else "unverified",
+            }
+
+        var_entry_evidence = entry_evidence("variational", "var_entry_fee_usd")
+        lighter_entry_evidence = entry_evidence("lighter", "lighter_entry_fee_usd")
+        var_exit_evidence = exit_evidence("variational", var_exit)
+        lighter_exit_evidence = exit_evidence("lighter", lighter_exit)
+        all_fees_confirmed = (
+            all(value is not None for value in fee_values)
+            and all(
+                item.get("status") == "confirmed_usd"
+                and decimal_value(item.get("fee_usd")) is not None
+                for item in (
+                    *var_entry_evidence, *lighter_entry_evidence,
+                    var_exit_evidence, lighter_exit_evidence,
+                )
+            )
         )
+        output["actual_fees_usd"] = (
+            str(sum(fee_values, Decimal("0"))) if all_fees_confirmed else None
+        )
+        output["fee_evidence"] = {
+            "variational": {
+                "entry": var_entry_evidence,
+                "exit": var_exit_evidence,
+            },
+            "lighter": {
+                "entry": lighter_entry_evidence,
+                "exit": lighter_exit_evidence,
+            },
+            "all_leg_fees_confirmed_usd": all_fees_confirmed,
+        }
         output["actual_net_pnl_status"] = (
             "funding_unverified"
-            if output["actual_gross_pnl_usd"] is not None and output["actual_fees_usd"] is not None
+            if output["actual_gross_pnl_usd"] is not None and all_fees_confirmed
             else "fees_unverified"
         )
         return output
@@ -2113,6 +2210,48 @@ class WTIPairExecutor:
                 baseline_expected[0] + expected_delta[0],
                 baseline_expected[1] + expected_delta[1],
             )
+            first_context: MarketContext | None = None
+            if gradient_tier is not None:
+                try:
+                    first_context = self._fresh_context(
+                        context, var_qty=var_qty, lighter_qty=lighter_qty
+                    )
+                except WTIExecutionError as exc:
+                    state["last_entry_block"] = {
+                        "reason": str(exc),
+                        "checked_at": self._now().isoformat(),
+                    }
+                    self.store.save(state)
+                    return state
+                minimum_edge = None
+                if isinstance(decision, dict) and decision.get("minimum_entry_edge_bps") is not None:
+                    minimum_edge = decimal_value(decision.get("minimum_entry_edge_bps"))
+                    if minimum_edge is None or minimum_edge <= 0:
+                        state["last_entry_block"] = {
+                            "reason": "gradient_exact_entry_threshold_invalid",
+                            "checked_at": self._now().isoformat(),
+                        }
+                        self.store.save(state)
+                        return state
+                if minimum_edge is not None:
+                    if direction == "long_var_short_lighter":
+                        exact_edge = (
+                            first_context.lighter_sell_price - first_context.var_ask
+                        ) / first_context.var_ask * Decimal("10000")
+                    else:
+                        exact_edge = (
+                            first_context.var_bid - first_context.lighter_buy_price
+                        ) / first_context.lighter_buy_price * Decimal("10000")
+                    if exact_edge < minimum_edge:
+                        state["last_entry_block"] = {
+                            "reason": "gradient_exact_entry_edge_below_threshold",
+                            "exact_edge_bps": str(exact_edge),
+                            "minimum_entry_edge_bps": str(minimum_edge),
+                            "sample_id": sample.get("sample_id"),
+                            "checked_at": self._now().isoformat(),
+                        }
+                        self.store.save(state)
+                        return state
             state.update({
                 "status": "pending",
                 "pending_action": {
@@ -2139,6 +2278,7 @@ class WTIPairExecutor:
                 },
                 "manual_review_reason": None,
             })
+            state.pop("last_entry_block", None)
             if gradient_pilot is not None:
                 gradient_pilot["status"] = "entry_pending"
                 gradient_pilot["pending_tier"] = gradient_tier
@@ -2147,12 +2287,13 @@ class WTIPairExecutor:
                 gradient_pilot["pending_at"] = state["pending_action"]["intent_at"]
             self.store.save(state)
 
-            try:
-                first_context = self._fresh_context(
-                    context, var_qty=var_qty, lighter_qty=lighter_qty
-                )
-            except WTIExecutionError as exc:
-                return self._manual_review(state, str(exc))
+            if first_context is None:
+                try:
+                    first_context = self._fresh_context(
+                        context, var_qty=var_qty, lighter_qty=lighter_qty
+                    )
+                except WTIExecutionError as exc:
+                    return self._manual_review(state, str(exc))
             var_result = self._submit_leg(
                 state, context=first_context, venue="variational", side=var_side,
                 qty=var_qty, reduce_only=False, session=session, opening=True,

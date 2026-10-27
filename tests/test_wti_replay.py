@@ -115,13 +115,120 @@ def test_gradient_replay_uses_same_explicit_child_cap_as_live_sizing(monkeypatch
 
     monkeypatch.setattr(wti_replay, "size_paired_layer", sizing)
     report = replay_wti_gradient(
-        [_row(0), _row(1, var_bid="70.5", lighter_buy_price="70.1", long_edge_bps="0")],
+        [
+            _row(0), _row(1),
+            _row(2, var_bid="70.5", lighter_buy_price="70.1",
+                 long_edge_bps="0", short_edge_bps="0"),
+        ],
         config=_config(max_order_notional_usd=Decimal("20")),
         second_tier_threshold_bps=Decimal("20"), layer_notional_usd=Decimal("20"),
         aggregate_max_notional_usd=Decimal("100"), max_layers=5, equity_usd=Decimal("100"),
     )
     assert sizes and all(value == Decimal("20") for value in sizes)
     assert report.config["max_order_notional_usd"] == "20"
+
+
+@pytest.mark.parametrize(("refresh_edge", "expected_trades", "expected_refresh_used"), [
+    ("29", 0, 0),
+    ("31", 1, 1),
+])
+def test_gradient_strong_single_replay_requires_linked_two_second_execution_refresh(
+    monkeypatch, refresh_edge, expected_trades, expected_refresh_used,
+):
+    from types import SimpleNamespace
+    from tools.lib import wti_replay
+
+    profile = SimpleNamespace(thresholds_bps=(
+        Decimal("10"), Decimal("20"), Decimal("30"), Decimal("40"), Decimal("50"),
+    ))
+    monkeypatch.setattr(
+        wti_replay, "build_wti_gradient_threshold_profiles",
+        lambda *_args, **_kwargs: {
+            "long_var_short_lighter": profile,
+            "short_var_long_lighter": profile,
+        },
+    )
+    signal = _row(0, long_edge_bps="31")
+    refresh = _row(
+        1, at=NOW + timedelta(seconds=1), sample_id="refresh-0",
+        sample_kind="burst", signal_sample_id=signal["sample_id"],
+        long_edge_bps=refresh_edge,
+    )
+    exit_row = _row(
+        2, at=NOW + timedelta(seconds=10), long_edge_bps="0", short_edge_bps="0",
+        var_bid="70.4", var_ask="70.5", lighter_bid="70.0", lighter_ask="70.1",
+        lighter_buy_price="70.1", lighter_sell_price="70.0",
+    )
+
+    report = replay_wti_gradient(
+        [signal, refresh, exit_row],
+        config=_config(entry_threshold_bps=Decimal("10"), exit_target_bps=Decimal("0")),
+        second_tier_threshold_bps=Decimal("20"),
+        layer_notional_usd=Decimal("10"),
+        aggregate_max_notional_usd=Decimal("100"),
+        max_layers=5,
+        expected_market_id=145,
+        expected_multiplier=Decimal("1"),
+    )
+
+    assert report.completed_trades == expected_trades
+    assert report.config["execution_refresh_samples_used"] == expected_refresh_used
+    assert report.config["execution_refresh_replayed"] is bool(expected_refresh_used)
+    if expected_trades:
+        assert report.trades[0].entry_at == refresh["logged_at"]
+    else:
+        assert report.config["strong_probe_refresh_rejections"] == {
+            "gradient_strong_signal_refresh_below_required_tier": 1,
+        }
+
+
+def test_equity_capacity_replay_allows_many_children_but_stops_at_five_tier_cap(monkeypatch):
+    from types import SimpleNamespace
+    from tools.lib import wti_replay
+
+    thresholds = (
+        Decimal("10"), Decimal("20"), Decimal("20.25"),
+        Decimal("20.50"), Decimal("20.75"),
+    )
+
+    def profile():
+        return SimpleNamespace(thresholds_bps=thresholds)
+
+    monkeypatch.setattr(
+        wti_replay, "build_wti_gradient_threshold_profiles",
+        lambda *_args, **_kwargs: {
+            "long_var_short_lighter": profile(),
+            "short_var_long_lighter": profile(),
+        },
+    )
+    rows = [
+        _row(i, variational_qty="100", lighter_qty="100", long_edge_bps="30")
+        for i in range(80)
+    ]
+    rows[-1].update({
+        "var_bid": "70.8", "var_ask": "70.9",
+        "lighter_bid": "70.2", "lighter_ask": "70.3",
+        "lighter_buy_price": "70.3", "lighter_sell_price": "70.2",
+        "long_edge_bps": "0", "short_edge_bps": "0",
+    })
+
+    report = replay_wti_gradient(
+        rows,
+        config=_config(
+            entry_threshold_bps=Decimal("10"), exit_target_bps=Decimal("10"),
+            max_hold_seconds=10000, max_order_notional_usd=Decimal("20"),
+        ),
+        second_tier_threshold_bps=Decimal("20"),
+        layer_notional_usd=Decimal("10"),
+        aggregate_max_notional_usd=Decimal("500"), max_layers=5,
+        equity_usd=Decimal("100"),
+    )
+    assert report.completed_trades == 1
+    assert report.config["tier_capacity_notional_usd"] == [
+        "100", "200", "300", "400", "500",
+    ]
+    assert report.trades[0].layer_count > 5
+    assert report.trades[0].layer_count <= 50
 
 
 def test_replay_waits_for_exit_quotes_covering_the_open_position_size():
@@ -341,6 +448,13 @@ def test_gradient_replay_uses_two_bounded_layers_and_closes_aggregate():
         ),
         _row(
             2,
+            var_bid="69.9", var_ask="70.0",
+            lighter_buy_price="70.3", lighter_sell_price="70.2",
+            long_edge_bps="21", short_edge_bps="0",
+            variational_qty="0.35", lighter_qty="0.35",
+        ),
+        _row(
+            3,
             var_bid="70.4", var_ask="70.5",
             lighter_buy_price="70.3", lighter_sell_price="70.2",
             long_edge_bps="0", short_edge_bps="0",
@@ -360,7 +474,7 @@ def test_gradient_replay_uses_two_bounded_layers_and_closes_aggregate():
     assert report.completed_trades == 1
     assert report.trades[0].layer_count == 2
     assert report.trades[0].layer_entry_edges_bps == (
-        "28.57142857142857142857142857", "21",
+        "21", "21",
     )
     assert report.unresolved_position is False
     assert report.config["max_layers"] == 2
@@ -369,9 +483,9 @@ def test_gradient_replay_uses_two_bounded_layers_and_closes_aggregate():
 def test_continuous_gradient_replay_runs_sequential_rounds_without_raising_per_round_caps():
     rows = []
     for round_index in range(2):
-        start = round_index * 3
+        start = round_index * 4
         rows.extend([
-            _row(start, variational_qty="0.35", lighter_qty="0.35"),
+            _row(start, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
             _row(
                 start + 1,
                 var_bid="69.9", var_ask="70.0",
@@ -381,6 +495,13 @@ def test_continuous_gradient_replay_runs_sequential_rounds_without_raising_per_r
             ),
             _row(
                 start + 2,
+                var_bid="69.9", var_ask="70.0",
+                lighter_buy_price="70.3", lighter_sell_price="70.2",
+                long_edge_bps="21", short_edge_bps="0",
+                variational_qty="0.35", lighter_qty="0.35",
+            ),
+            _row(
+                start + 3,
                 var_bid="70.4", var_ask="70.5",
                 lighter_buy_price="70.3", lighter_sell_price="70.2",
                 long_edge_bps="0", short_edge_bps="0",
@@ -411,13 +532,19 @@ def test_continuous_gradient_replay_runs_sequential_rounds_without_raising_per_r
 
 def test_gradient_replay_preserves_depth_gap_and_aggregate_caps():
     rows = [
-        _row(0),
+        _row(0, variational_qty="0.35", lighter_qty="0.35"),
         _row(
             1,
-            at=NOW + timedelta(seconds=140),
+            at=NOW + timedelta(seconds=10),
             var_bid="69.9", var_ask="70.0",
             lighter_buy_price="70.3", lighter_sell_price="70.2",
             long_edge_bps="21", short_edge_bps="0",
+            variational_qty="0.35", lighter_qty="0.35",
+        ),
+        _row(
+            2,
+            at=NOW + timedelta(seconds=140),
+            long_edge_bps="0", short_edge_bps="0",
             variational_qty="0.1", lighter_qty="0.1",
         ),
     ]
@@ -438,18 +565,22 @@ def test_continuous_gradient_gap_revocation_survives_verified_session_transition
     rows = [
         _row(0, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
         _row(
-            1, at=NOW + timedelta(seconds=40), long_edge_bps="0", short_edge_bps="0",
+            1, at=NOW + timedelta(seconds=10), long_edge_bps="21",
             variational_qty="0.35", lighter_qty="0.35",
         ),
         _row(
-            2, at=next_open, session_id="wti-session-2",
+            2, at=NOW + timedelta(seconds=50), long_edge_bps="0", short_edge_bps="0",
+            variational_qty="0.35", lighter_qty="0.35",
+        ),
+        _row(
+            3, at=next_open, session_id="wti-session-2",
             session_status_observed_at=next_open.isoformat(),
             session_status_feed_heartbeat_at=next_open.isoformat(),
             session_closing_at=(next_open + timedelta(hours=8)).isoformat(),
             long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35",
         ),
         _row(
-            3, at=next_open + timedelta(seconds=10), session_id="wti-session-2",
+            4, at=next_open + timedelta(seconds=10), session_id="wti-session-2",
             session_status_observed_at=(next_open + timedelta(seconds=10)).isoformat(),
             session_status_feed_heartbeat_at=(next_open + timedelta(seconds=10)).isoformat(),
             session_closing_at=(next_open + timedelta(hours=8)).isoformat(),
@@ -475,26 +606,30 @@ def test_gradient_replay_rearms_only_with_explicit_verified_flat_restart_assumpt
     rows = [
         _row(0, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
         _row(
-            1, at=NOW + timedelta(seconds=40), long_edge_bps="0", short_edge_bps="0",
+            1, at=NOW + timedelta(seconds=10), long_edge_bps="21",
             variational_qty="0.35", lighter_qty="0.35",
         ),
         _row(
-            2, at=next_open, session_id="wti-session-2",
+            2, at=NOW + timedelta(seconds=50), long_edge_bps="0", short_edge_bps="0",
+            variational_qty="0.35", lighter_qty="0.35",
+        ),
+        _row(
+            3, at=next_open, session_id="wti-session-2",
             session_status_observed_at=next_open.isoformat(),
             session_status_feed_heartbeat_at=next_open.isoformat(),
             session_closing_at=(next_open + timedelta(hours=8)).isoformat(),
             long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35",
         ),
         _row(
-            3, at=next_open + timedelta(seconds=10), session_id="wti-session-2",
+            4, at=next_open + timedelta(seconds=10), session_id="wti-session-2",
             session_status_observed_at=(next_open + timedelta(seconds=10)).isoformat(),
             session_status_feed_heartbeat_at=(next_open + timedelta(seconds=10)).isoformat(),
             session_closing_at=(next_open + timedelta(hours=8)).isoformat(),
-            long_edge_bps="0", short_edge_bps="0",
+            long_edge_bps="21", short_edge_bps="0",
             variational_qty="0.35", lighter_qty="0.35",
         ),
         _row(
-            4, at=next_open + timedelta(seconds=35), session_id="wti-session-2",
+            5, at=next_open + timedelta(seconds=35), session_id="wti-session-2",
             session_status_observed_at=(next_open + timedelta(seconds=35)).isoformat(),
             session_status_feed_heartbeat_at=(next_open + timedelta(seconds=35)).isoformat(),
             session_closing_at=(next_open + timedelta(hours=8)).isoformat(),
@@ -542,7 +677,12 @@ def test_gradient_replay_skips_second_minimum_order_that_exceeds_twenty_dollar_c
             variational_qty="0.35", lighter_qty="0.35",
         ),
         _row(
-            2, at=NOW + timedelta(seconds=70), long_edge_bps="0", short_edge_bps="0",
+            2, at=NOW + timedelta(seconds=20), long_edge_bps="21", short_edge_bps="0",
+            lighter_min_quote_amount="10", variational_qty="0.35", lighter_qty="0.35",
+        ),
+        _row(
+            3, at=NOW + timedelta(seconds=70), long_edge_bps="0", short_edge_bps="0",
+            var_bid="70.4", var_ask="70.5", lighter_buy_price="70.3",
             lighter_min_quote_amount="10", variational_qty="0.35", lighter_qty="0.35",
         ),
     ]
@@ -590,6 +730,7 @@ def test_replay_cli_can_emit_side_by_side_baseline_and_gradient(monkeypatch, cap
         "--gradient-layer-notional-usd", "10",
         "--gradient-aggregate-max-notional-usd", "100",
         "--gradient-equity-usd", "20",
+        "--gradient-elastic-capacity",
     ])
     assert result == 0
     output = json.loads(capsys.readouterr().out)
@@ -598,6 +739,7 @@ def test_replay_cli_can_emit_side_by_side_baseline_and_gradient(monkeypatch, cap
     assert output["baseline"]["replay_kind"] != output["gradient"]["replay_kind"]
     assert output["gradient"]["config"]["max_layers"] == 5
     assert output["gradient"]["config"]["equity_scenario_usd"] == "20"
+    assert output["gradient"]["config"]["elastic_capacity_enabled"] is True
 
 
 def test_replay_cli_continuous_gradient_is_explicit_and_never_authorizes_live(monkeypatch, capsys):
@@ -631,6 +773,7 @@ def test_replay_cli_continuous_gradient_is_explicit_and_never_authorizes_live(mo
     assert output["gradient"]["completed_trades"] == 2
     assert output["gradient"]["config"]["max_completed_roundtrips"] is None
     assert output["gradient"]["config"]["assume_verified_flat_session_restarts"] is True
+    assert output["gradient"]["config"]["elastic_capacity_enabled"] is False
 
 
 def test_five_tier_equity_scenario_replay_adds_within_tier_and_keeps_higher_tiers_maturity_gated():
@@ -642,6 +785,7 @@ def test_five_tier_equity_scenario_replay_adds_within_tier_and_keeps_higher_tier
         _row(4, long_edge_bps="25", short_edge_bps="0", variational_qty="1", lighter_qty="1"),
         _row(5, long_edge_bps="100", short_edge_bps="0", variational_qty="1", lighter_qty="1"),
         _row(6, long_edge_bps="100", short_edge_bps="0", variational_qty="1", lighter_qty="1"),
+        _row(7, long_edge_bps="0", short_edge_bps="0", variational_qty="1", lighter_qty="1"),
     ]
     report = replay_wti_gradient(
         rows,
@@ -665,6 +809,94 @@ def test_five_tier_equity_scenario_replay_adds_within_tier_and_keeps_higher_tier
     assert report.trades[0].layer_count == 3
     assert report.trades[0].layer_entry_edges_bps == ("25", "25", "25")
     assert report.trades[0].exit_reason == "max_hold"
+
+
+def test_gradient_replay_resets_confirmation_on_invalid_baseline_and_ignores_bursts(monkeypatch):
+    from types import SimpleNamespace
+    from tools.lib import wti_replay
+
+    profile = SimpleNamespace(thresholds_bps=(
+        Decimal("10"), Decimal("20"), Decimal("20.25"),
+        Decimal("20.50"), Decimal("20.75"),
+    ))
+    monkeypatch.setattr(
+        wti_replay,
+        "build_wti_gradient_threshold_profiles",
+        lambda *_args, **_kwargs: {
+            "long_var_short_lighter": profile,
+            "short_var_long_lighter": profile,
+        },
+    )
+    rows = [
+        _row(0, variational_qty="1", lighter_qty="1", long_edge_bps="15"),
+        _row(
+            1, variational_qty="1", lighter_qty="1", long_edge_bps="15",
+            sample_quality="invalid", sample_quality_reasons=["quote_stale"],
+        ),
+        _row(
+            2, variational_qty="1", lighter_qty="1", long_edge_bps="15",
+            sample_kind="burst", sample_id="execution-burst",
+        ),
+        _row(3, variational_qty="1", lighter_qty="1", long_edge_bps="15"),
+        _row(4, variational_qty="1", lighter_qty="1", long_edge_bps="15"),
+        _row(
+            5, variational_qty="1", lighter_qty="1", long_edge_bps="0",
+            var_bid="70.5", var_ask="70.6", lighter_buy_price="70.0",
+            lighter_bid="70.0", lighter_ask="70.1", lighter_sell_price="70.0",
+        ),
+    ]
+
+    report = replay_wti_gradient(
+        rows,
+        config=_config(max_hold_seconds=60),
+        second_tier_threshold_bps=Decimal("20"),
+        layer_notional_usd=Decimal("10"),
+        aggregate_max_notional_usd=Decimal("100"),
+        max_layers=5,
+        expected_market_id=145,
+        expected_multiplier=Decimal("1"),
+    )
+
+    assert report.completed_trades == 1
+    assert report.trades[0].entry_at == rows[4]["logged_at"]
+    assert report.rejected_sample_count == 1
+    assert report.config["invalid_baseline_confirmation_resets"] == 1
+    assert report.config["execution_refresh_replayed"] is False
+    assert report.config["execution_refresh_samples_available"] == 0
+    assert "queue delay cannot be reconstructed" in report.cost_caveat
+
+
+@pytest.mark.parametrize(("enabled", "expected_layers"), [(False, 1), (True, 2)])
+def test_replay_elastic_capacity_is_opt_in_and_allows_only_one_reserved_child(
+    enabled, expected_layers,
+):
+    rows = [
+        _row(i, variational_qty="0.5", lighter_qty="0.5",
+             long_edge_bps="15", short_edge_bps="0")
+        for i in range(5)
+    ]
+    rows.append(_row(
+        5, variational_qty="0.5", lighter_qty="0.5",
+        var_bid="70.4", var_ask="70.5",
+        lighter_buy_price="70.3", long_edge_bps="0", short_edge_bps="0",
+    ))
+
+    report = replay_wti_gradient(
+        rows,
+        config=_config(entry_threshold_bps=Decimal("10")),
+        second_tier_threshold_bps=Decimal("20"),
+        layer_notional_usd=Decimal("10"),
+        aggregate_max_notional_usd=Decimal("100"),
+        max_layers=5,
+        equity_usd=Decimal("20"),
+        elastic_capacity_enabled=enabled,
+    )
+
+    assert report.completed_trades == 1
+    assert report.trades[0].layer_count == expected_layers
+    assert report.config["elastic_capacity_enabled"] is enabled
+    if enabled:
+        assert report.trades[0].layer_entry_edges_bps == ("15", "15")
 
 
 def test_replay_cli_writes_hash_addressed_readiness_evidence(tmp_path: Path, monkeypatch, capsys):

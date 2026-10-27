@@ -32,7 +32,13 @@ from tools.basis_collector import (  # noqa: E402
     run_receiver_server,
 )
 from variational.listener import EventSink as ListenerEventSink  # noqa: E402
-from tools.lib.basis_store import read_basis_samples  # noqa: E402
+from tools.lib.basis_store import basis_sample_paths, read_basis_samples  # noqa: E402
+from tools.lib.gradient_entry_confirmation import (  # noqa: E402
+    confirm_gradient_entry_with_execution_refresh,
+    elastic_addon_confirmation_allowed,
+    strictest_entry_threshold,
+    update_gradient_entry_confirmation,
+)
 from tools.lib.market_sessions import (  # noqa: E402
     OilSession,
     classify_usoil_session,
@@ -433,6 +439,11 @@ class WTILiveRuntime:
         self.wti_gradient_threshold_profiles: dict[str, WTIGradientThresholdProfile] = {}
         self.wti_gradient_threshold_refreshed_monotonic = 0.0
         self.wti_gradient_threshold_source = "not_loaded"
+        self.gradient_entry_confirmation_history: dict[str, list[tuple[str, int]]] = {
+            "long_var_short_lighter": [],
+            "short_var_long_lighter": [],
+        }
+        self.last_processed_session_id: str | None = None
 
     def request_stop(self, *_args: Any) -> None:
         self.stop = True
@@ -710,7 +721,7 @@ class WTILiveRuntime:
             second + Decimal("0.25") * tier
             for tier in range(1, WTI_GRADIENT_MAX_LAYERS - 1)
         )
-        return {
+        config = {
             **self._pilot_config(),
             "tier_thresholds_bps": [str(value) for value in floors],
             "layer_notional_usd": str(layer_notional),
@@ -718,6 +729,9 @@ class WTILiveRuntime:
             "max_equity_multiple": str(WTI_MAX_EQUITY_MULTIPLE),
             "max_completed_roundtrips": 1,
         }
+        if getattr(self.args, "gradient_elastic_capacity", False):
+            config["elastic_capacity_enabled"] = True
+        return config
 
     def _sync_entry_authorization(
         self, state: dict[str, Any], row: dict[str, Any], *, now: datetime
@@ -1047,14 +1061,8 @@ class WTILiveRuntime:
                 if len(floors) != WTI_GRADIENT_MAX_LAYERS:
                     raise ValueError("gradient_pilot_tier_floors_invalid")
                 rows = await asyncio.to_thread(
-                    read_basis_samples,
-                    self.args.sample_root,
-                    limit=200000,
-                    asset_filter="WTI",
-                    sample_kind_filter="baseline",
-                    sample_quality_filter="valid",
-                    since_utc=sample_at - timedelta(seconds=WTI_THRESHOLD_WINDOW_SECONDS),
-                    until_utc=sample_at,
+                    self._read_gradient_history,
+                    sample_at,
                 )
                 profiles = build_wti_gradient_threshold_profiles(
                     rows,
@@ -1072,35 +1080,41 @@ class WTILiveRuntime:
                 self.wti_gradient_threshold_source = "directional_7d_percentiles"
             except Exception as exc:
                 self.logger.warning(
-                    "wti_gradient_threshold_refresh_failed reason=%s; retaining hard floor tiers",
+                    "wti_gradient_threshold_refresh_failed reason=%s; blocking new entries",
                     type(exc).__name__,
                 )
-                pilot_config = self.gradient_pilot.get("config") or {}
-                floors = [Decimal(str(value)) for value in pilot_config.get("tier_thresholds_bps", [])]
-                if len(floors) != WTI_GRADIENT_MAX_LAYERS:
-                    return None
-                self.wti_gradient_threshold_profiles = build_wti_gradient_threshold_profiles(
-                    [],
-                    as_of=datetime.fromisoformat(
-                        str(row["logged_at"]).replace("Z", "+00:00")
-                    ).astimezone(timezone.utc),
-                    market_id=int(self.market_metadata["market_id"]),
-                    multiplier=Decimal(str(self.market_metadata["multiplier"])),
-                    first_floor_bps=floors[0],
-                    second_floor_bps=floors[1],
-                    tier_floors_bps=tuple(floors),
-                    roundtrip_cost_bps=self.config.roundtrip_cost_bps,
-                    exit_target_bps=self.config.exit_target_bps,
-                    sample_interval_seconds=int(self.args.sample_interval_seconds),
-                )
-                self.wti_gradient_threshold_source = "history_error_floor_fallback"
+                self.wti_gradient_threshold_profiles = {}
+                self.wti_gradient_threshold_source = "history_error_block"
             self.wti_gradient_threshold_refreshed_monotonic = now_monotonic
+        if not getattr(self, "wti_gradient_threshold_profiles", {}):
+            return {
+                direction: (None,) * WTI_GRADIENT_MAX_LAYERS
+                for direction in ("long_var_short_lighter", "short_var_long_lighter")
+            }
         return {
             direction: profile.thresholds_bps
             for direction, profile in getattr(
                 self, "wti_gradient_threshold_profiles", {}
             ).items()
         }
+
+    def _read_gradient_history(self, sample_at: datetime) -> list[dict[str, Any]]:
+        root = Path(self.args.sample_root)
+        paths = basis_sample_paths(root, "WTI")
+        if not paths:
+            raise OSError("wti_gradient_history_source_missing")
+        for path in paths:
+            with path.open("rb"):
+                pass
+        return read_basis_samples(
+            root,
+            limit=200000,
+            asset_filter="WTI",
+            sample_kind_filter="baseline",
+            sample_quality_filter="valid",
+            since_utc=sample_at - timedelta(seconds=WTI_THRESHOLD_WINDOW_SECONDS),
+            until_utc=sample_at,
+        )
 
     def _gradient_equity_capacity_by_tier(self) -> tuple[Decimal, ...] | None:
         if (
@@ -1257,6 +1271,30 @@ class WTILiveRuntime:
 
         failed = [name for name, passed in checks.items() if not passed]
         result["failed_checks"] = failed
+        def diagnostic_decimal(value: Any) -> Decimal | None:
+            try:
+                parsed = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError):
+                return None
+            return parsed if parsed.is_finite() else None
+
+        freshness_limits = [
+            Decimal("2") - value
+            for value in (
+                diagnostic_decimal(result.get("capture_age_seconds")),
+                diagnostic_decimal(result.get("quote_age_effective_seconds")),
+                diagnostic_decimal(result.get("book_age_effective_seconds")),
+            )
+            if value is not None
+        ]
+        heartbeat_age = diagnostic_decimal(result.get("session_heartbeat_age_seconds"))
+        if heartbeat_age is not None:
+            freshness_limits.append(Decimal("30") - heartbeat_age)
+        result["authorization_freshness_limit_seconds"] = 2
+        result["authorization_remaining_seconds"] = (
+            None if len(freshness_limits) != 4
+            else round(float(min(freshness_limits)), 3)
+        )
         # Only cached age expiry is recoverable in-cycle. Feed, continuity,
         # instrument/session evidence and source-clock failures remain hard blocks.
         cache_age_checks = {"sample_age", "quote_age_effective", "book_age_effective"}
@@ -1279,6 +1317,27 @@ class WTILiveRuntime:
     def _sample_health_fresh(row: dict[str, Any] | None, now: datetime) -> bool:
         return bool(WTILiveRuntime._sample_freshness_diagnostics(row, now).get("fresh"))
 
+    @staticmethod
+    def _quote_age_refresh_candidate(row: dict[str, Any] | None) -> bool:
+        if not isinstance(row, dict):
+            return False
+        if (
+            row.get("sample_quality") != "invalid"
+            or row.get("sample_quality_reasons") != ["variational_quote_age_invalid"]
+            or row.get("lighter_continuity_ok") is not True
+            or session_observation_for_sample(row) is None
+        ):
+            return False
+        try:
+            quote_age = Decimal(str(row.get("var_quote_age_seconds")))
+            book_age = Decimal(str(row.get("lighter_book_age_seconds")))
+        except Exception:
+            return False
+        return bool(
+            quote_age.is_finite() and quote_age > Decimal("2")
+            and book_age.is_finite() and Decimal("0") <= book_age <= Decimal("2")
+        )
+
     def _revoke_entry_authorization(self, reason: str) -> None:
         self.entry_authorized = False
         self.entry_gate_block_reason = reason
@@ -1293,6 +1352,7 @@ class WTILiveRuntime:
             return None
         self.last_seen_sample_id = sample_id
         if row.get("sample_quality") != "valid" or session_observation_for_sample(row) is None:
+            self._reset_gradient_confirmation()
             self.last_sample_freshness_diagnostics = self._sample_freshness_diagnostics(
                 row, datetime.now(timezone.utc)
             )
@@ -1304,6 +1364,7 @@ class WTILiveRuntime:
         diagnostics = self._sample_freshness_diagnostics(row, datetime.now(timezone.utc))
         self.last_sample_freshness_diagnostics = diagnostics
         if not diagnostics["fresh"]:
+            self._reset_gradient_confirmation()
             reason = (
                 "wti_cached_sample_expired_execution_refresh_required"
                 if diagnostics["refreshable_cache_expiry"]
@@ -1330,16 +1391,29 @@ class WTILiveRuntime:
                     self.last_sample_gap_seconds < 0
                     or self.last_sample_gap_seconds > MAX_WTI_ENTRY_GAP_SECONDS
                 ):
+                    self._reset_gradient_confirmation()
                     self.pending_gap_exit = True
                     self._revoke_entry_authorization(
                         "wti_entry_authorization_revoked_after_sample_gap"
                     )
+            observation = session_observation_for_sample(row)
+            current_session_id = observation.session_id if observation else None
+            previous_session_id = getattr(self, "last_processed_session_id", None)
+            if previous_session_id and current_session_id != previous_session_id:
+                self._reset_gradient_confirmation()
+            self.last_processed_session_id = current_session_id
             self.last_processed_sample_at = sample_at
         except (TypeError, ValueError):
             self._revoke_entry_authorization("wti_sample_timestamp_unverified")
             return False
         self.last_processed_sample_id = sample_id
         return True
+
+    def _reset_gradient_confirmation(self) -> None:
+        self.gradient_entry_confirmation_history = {
+            "long_var_short_lighter": [],
+            "short_var_long_lighter": [],
+        }
 
     def _write_health(
         self,
@@ -1352,29 +1426,70 @@ class WTILiveRuntime:
         state = state or read_json(self.args.state_path)
         exposure = state.get("open_position") is not None
         pending = state.get("pending_action") is not None
+        collector_row = row
+        decision_row = getattr(self, "last_decision_sample", None) or row
         sample_at = None
         age = None
-        if row:
-            sample_at = row.get("logged_at")
+        if decision_row:
+            sample_at = decision_row.get("logged_at")
             with contextlib.suppress(TypeError, ValueError):
                 at = datetime.fromisoformat(str(sample_at).replace("Z", "+00:00"))
                 age = (now - at.astimezone(timezone.utc)).total_seconds()
-        stale = not self._sample_health_fresh(row, now)
-        freshness_diagnostics = self._sample_freshness_diagnostics(row, now)
+        stale = not self._sample_health_fresh(decision_row, now)
+        freshness_diagnostics = self._sample_freshness_diagnostics(decision_row, now)
+        collector_diagnostics = self._sample_freshness_diagnostics(collector_row, now)
         closed_window = self._confirmed_closed_session_window(now)
         risk = dict(self.last_risk)
-        if self.args.mode == "observe":
-            action, reason = "block_entry", "observe_only_mode"
+        account_risk_action = str(risk.get("risk_action") or "block_entry")
+        account_risk_reason = str(
+            risk.get("risk_reason") or "wti_account_risk_snapshot_unavailable"
+        )
+        account_entry_blocked = account_risk_action not in {"normal", "warning"}
+        entry_block_reason: str | None = None
+        if account_entry_blocked and account_risk_action not in {"emergency_exit", "force_reduce"}:
+            entry_block_reason = account_risk_reason
+        elif self.args.mode == "observe":
+            entry_block_reason = "observe_only_mode"
         elif stale:
-            action, reason = "block_entry", (
+            entry_block_reason = (
                 "wti_exchange_closed" if closed_window is not None
-                else "wti_market_sample_or_session_unavailable"
+                else "wti_current_sample_or_session_not_fresh"
             )
         elif self.entry_gate_block_reason:
-            action, reason = "block_entry", self.entry_gate_block_reason
+            entry_block_reason = self.entry_gate_block_reason
+        entry_currently_authorized = bool(
+            self.entry_authorized
+            and not stale
+            and self.startup_reconciled
+            and not self.entry_authorization_permanently_revoked
+            and not pending
+            and account_risk_action in {"normal", "warning"}
+        )
+        if entry_block_reason is None and not entry_currently_authorized:
+            if stale:
+                entry_block_reason = (
+                    "wti_exchange_closed" if closed_window is not None
+                    else "wti_current_sample_or_session_not_fresh"
+                )
+            elif self.entry_gate_block_reason:
+                entry_block_reason = self.entry_gate_block_reason
+            elif pending:
+                entry_block_reason = "wti_pending_action_reconciliation_required"
+            elif not self.startup_reconciled:
+                entry_block_reason = "wti_startup_reconciliation_required"
+            elif account_risk_action not in {"normal", "warning"}:
+                entry_block_reason = account_risk_reason
+            elif not self.entry_authorized:
+                entry_block_reason = "wti_entry_authorization_unavailable"
+        if account_risk_action in {"emergency_exit", "force_reduce"}:
+            action, reason = account_risk_action, account_risk_reason
+        elif account_entry_blocked:
+            action, reason = "block_entry", account_risk_reason
+        elif not entry_currently_authorized:
+            action = "block_entry"
+            reason = entry_block_reason or account_risk_reason
         else:
-            action = str(risk.get("risk_action") or "block_entry")
-            reason = str(risk.get("risk_reason") or "wti_account_risk_snapshot_unavailable")
+            action, reason = account_risk_action, account_risk_reason
         health = {
             "schema_version": 1,
             "asset": "WTI",
@@ -1408,7 +1523,7 @@ class WTILiveRuntime:
             ),
             "single_round_pilot": state.get("single_round_pilot"),
             "gradient_pilot": state.get("gradient_pilot"),
-            "wti_entry_authorized": self.entry_authorized,
+            "wti_entry_authorized": entry_currently_authorized,
             "startup_reconciled": self.startup_reconciled,
             "entry_authorization_permanently_revoked": self.entry_authorization_permanently_revoked,
             "runtime_error": getattr(self, "last_runtime_error", None),
@@ -1419,6 +1534,7 @@ class WTILiveRuntime:
             "readiness_elapsed_ms": getattr(self, "last_readiness_elapsed_ms", None),
             "reconcile_elapsed_ms": getattr(self, "last_reconcile_elapsed_ms", None),
             "entry_gate_block_reason": self.entry_gate_block_reason,
+            "entry_block_reason": entry_block_reason,
             "last_sample_gap_seconds": self.last_sample_gap_seconds,
             "manage_existing_only": self.manage_existing_only,
             "rotation_drain_status": (
@@ -1426,7 +1542,13 @@ class WTILiveRuntime:
                 if getattr(self, "rotation_drain_request", None) else None
             ),
             "risk_action": action,
-            "risk_reason": error or reason,
+            "risk_reason": (
+                account_risk_reason
+                if account_entry_blocked
+                else error or reason
+            ),
+            "account_risk_action": account_risk_action,
+            "account_risk_reason": account_risk_reason,
             "risk_data_complete": risk.get("risk_data_complete"),
             "variational_equity_usd": risk.get("variational_equity_usd"),
             "lighter_equity_usd": risk.get("lighter_equity_usd"),
@@ -1437,6 +1559,20 @@ class WTILiveRuntime:
             "market_sample_age_seconds": None if age is None else round(age, 3),
             "market_sample_fresh": not stale,
             "market_sample_freshness_diagnostics": freshness_diagnostics,
+            "entry_authorization_freshness_limit_seconds": 2,
+            "entry_authorization_remaining_seconds": freshness_diagnostics.get(
+                "authorization_remaining_seconds"
+            ),
+            "entry_authorization_valid_until": (
+                (now + timedelta(seconds=freshness_diagnostics["authorization_remaining_seconds"])).isoformat()
+                if freshness_diagnostics.get("authorization_remaining_seconds") is not None
+                else None
+            ),
+            "collector_sample_at": (
+                collector_row.get("logged_at") if isinstance(collector_row, dict) else None
+            ),
+            "collector_sample_fresh": bool(collector_diagnostics.get("fresh")),
+            "collector_sample_freshness_diagnostics": collector_diagnostics,
             "last_seen_sample_id": getattr(self, "last_seen_sample_id", None),
             "last_processed_sample_id": getattr(self, "last_processed_sample_id", None),
             "execution_refresh_status": getattr(
@@ -1453,7 +1589,7 @@ class WTILiveRuntime:
                 self, "last_sample_freshness_diagnostics", {}
             ),
             "market_session": (
-                row.get("session_status") if row else
+                decision_row.get("session_status") if decision_row else
                 OilSession.EXCHANGE_CLOSED.value if closed_window is not None else None
             ),
             "last_action": self.last_action,
@@ -1653,6 +1789,7 @@ class WTILiveRuntime:
             }
             return None
         self.last_sample_freshness_diagnostics = diagnostics
+        self.last_decision_sample = dict(candidate)
         if candidate.get("sample_kind") == "burst":
             self.last_execution_refresh_status = "fresh"
         return candidate
@@ -1715,6 +1852,11 @@ class WTILiveRuntime:
             }
             return state
         row = decision_sample
+        signal_sample = None
+        if row.get("sample_kind", "baseline") == "baseline" and self._sample_freshness_diagnostics(
+            row, datetime.now(timezone.utc)
+        ).get("fresh"):
+            signal_sample = dict(row)
         state = await self._read_reconcile(row)
         self.last_risk = dict(self.gateway.latest_risk)
         self._poll_rotation_drain()
@@ -1725,6 +1867,21 @@ class WTILiveRuntime:
             self.last_action = {"action": "reconcile", "reason": state.get("manual_review_reason") or state.get("status")}
             return state
         position = state.get("open_position")
+        gradient_entry_mode = bool(
+            getattr(self.args, "gradient_live", False)
+            and not self.manage_existing_only
+            and getattr(self, "gradient_pilot", None) is not None
+        )
+        thresholds_by_direction = None
+        if gradient_entry_mode:
+            thresholds_by_direction = await self._gradient_thresholds_for_sample(
+                signal_sample or row
+            )
+            if thresholds_by_direction is None:
+                thresholds_by_direction = {
+                    direction: (None,) * WTI_GRADIENT_MAX_LAYERS
+                    for direction in ("long_var_short_lighter", "short_var_long_lighter")
+                }
         decision_sample = await self._decision_sample(row)
         if decision_sample is None:
             self.entry_authorized = False
@@ -1740,6 +1897,13 @@ class WTILiveRuntime:
             }
             return state
         row = decision_sample
+        if (
+            gradient_entry_mode
+            and signal_sample is None
+            and row.get("sample_kind", "baseline") == "baseline"
+            and self._sample_freshness_diagnostics(row, datetime.now(timezone.utc)).get("fresh")
+        ):
+            signal_sample = dict(row)
         now = datetime.now(timezone.utc)
         if self._complete_rotation_drain_if_verified_flat(state):
             return state
@@ -1750,14 +1914,29 @@ class WTILiveRuntime:
         self.gateway.set_current_notional(self._position_notional(state, row))
         risk_action = str(self.last_risk.get("risk_action") or "block_entry")
         window = _session_window(row, now, self.config.entry_cutoff_seconds)
-        gradient_entry_mode = bool(
-            getattr(self.args, "gradient_live", False)
-            and not self.manage_existing_only
-            and getattr(self, "gradient_pilot", None) is not None
-        )
         if gradient_entry_mode:
             self.gradient_pilot = dict(state.get("gradient_pilot") or self.gradient_pilot)
-            thresholds_by_direction = await self._gradient_thresholds_for_sample(row)
+            confirmation_history = getattr(
+                self, "gradient_entry_confirmation_history", None
+            )
+            if not isinstance(confirmation_history, dict):
+                confirmation_history = {
+                    "long_var_short_lighter": [],
+                    "short_var_long_lighter": [],
+                }
+                self.gradient_entry_confirmation_history = confirmation_history
+            if risk_action in {"normal", "warning"}:
+                for signal in (signal_sample, row):
+                    if signal is not None and signal.get("sample_kind", "baseline") == "baseline":
+                        update_gradient_entry_confirmation(
+                            signal,
+                            thresholds_by_direction,
+                            confirmation_history,
+                            direction=None,
+                            candidate_tier=1,
+                        )
+            else:
+                self._reset_gradient_confirmation()
             equity_capacity = self._gradient_equity_capacity_by_tier()
             if equity_capacity is None:
                 decision = decide_wti_action(row, position, config=self.config, now=now)
@@ -1768,6 +1947,11 @@ class WTILiveRuntime:
                     row, position, self.gradient_pilot, config=self.config, now=now,
                     thresholds_by_direction=thresholds_by_direction,
                     aggregate_capacity_by_tier_usd=equity_capacity,
+                    elastic_capacity_enabled=bool(
+                        (self.gradient_pilot.get("config") or {}).get(
+                            "elastic_capacity_enabled", False
+                        )
+                    ),
                 )
         elif self.manage_existing_only and position is None:
             decision = {"action": "hold", "reason": "management_only_flat_no_new_entries"}
@@ -1779,6 +1963,129 @@ class WTILiveRuntime:
             decision = {"action": "close", "reason": "sample_gap_requires_position_drain"}
         elif risk_action in {"force_reduce", "emergency_exit"}:
             decision = {"action": "close", "reason": f"account_risk_{risk_action}"}
+        if gradient_entry_mode and decision.get("action") in {"open", "add"}:
+            if risk_action not in {"normal", "warning"}:
+                self._reset_gradient_confirmation()
+                decision = {
+                    "action": "hold",
+                    "reason": "account_risk_entry_blocked",
+                }
+            else:
+                pilot_layers = (self.gradient_pilot or {}).get("layers_opened") or []
+                strong_probe_used = any(
+                    isinstance(item, dict)
+                    and item.get("confirmation_mode") == "strong_single_probe"
+                    for item in pilot_layers
+                )
+                direction = str(decision["direction"])
+                candidate_tier = int(decision["gradient_tier"])
+                signal = signal_sample if isinstance(signal_sample, dict) else None
+                signal_confirmation = update_gradient_entry_confirmation(
+                    signal or row,
+                    thresholds_by_direction,
+                    self.gradient_entry_confirmation_history,
+                    direction=direction,
+                    candidate_tier=candidate_tier,
+                    allow_strong_single_probe=not strong_probe_used,
+                )
+                if signal_confirmation.get("confirmation_mode") == "strong_single_probe":
+                    if signal is None:
+                        confirmation = {
+                            "confirmed": False,
+                            "reason": "gradient_strong_signal_baseline_missing",
+                        }
+                    else:
+                        try:
+                            refreshed = await self.collector.collect_fresh_sample(
+                                sample_kind="burst",
+                                signal_sample_id=str(signal.get("sample_id") or ""),
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            refreshed = None
+                            self.last_execution_refresh_status = "unavailable"
+                            self.last_execution_refresh_error = (
+                                f"{type(exc).__name__}:{' '.join(str(exc).split())[:120]}"
+                            )
+                        if not isinstance(refreshed, dict):
+                            confirmation = {
+                                "confirmed": False,
+                                "reason": "gradient_strong_signal_execution_refresh_unavailable",
+                            }
+                        else:
+                            self.last_execution_refresh_status = "returned"
+                            self.last_execution_refresh_at = refreshed.get("logged_at")
+                            self.last_execution_refresh_error = None
+                            freshness = self._sample_freshness_diagnostics(
+                                refreshed, datetime.now(timezone.utc)
+                            )
+                            recorded = self._record_new_sample(dict(refreshed))
+                            if recorded is not True or not freshness.get("fresh"):
+                                self.last_execution_refresh_status = "invalid"
+                                confirmation = {
+                                    "confirmed": False,
+                                    "reason": "gradient_strong_signal_execution_refresh_stale_or_invalid",
+                                }
+                            else:
+                                row = dict(refreshed)
+                                self.last_execution_refresh_status = "fresh"
+                                self.last_decision_sample = dict(row)
+                                confirmation = confirm_gradient_entry_with_execution_refresh(
+                                    signal,
+                                    row,
+                                    thresholds_by_direction,
+                                    self.gradient_entry_confirmation_history,
+                                    direction=direction,
+                                    candidate_tier=candidate_tier,
+                                    allow_strong_single_probe=not strong_probe_used,
+                                )
+                else:
+                    confirmation = update_gradient_entry_confirmation(
+                        row,
+                        thresholds_by_direction,
+                        self.gradient_entry_confirmation_history,
+                        direction=direction,
+                        candidate_tier=candidate_tier,
+                    )
+                if not confirmation.get("confirmed"):
+                    decision = {
+                        "action": "hold",
+                        "reason": confirmation.get("reason", "gradient_entry_confirmation_pending"),
+                        "confirm_count": confirmation.get("confirm_count"),
+                        "required_confirm_samples": confirmation.get("required_confirm_samples"),
+                        "raw_tier": confirmation.get("raw_tier"),
+                    }
+                elif (
+                    not elastic_addon_confirmation_allowed(
+                        decision.get("elastic_capacity_addon") is True,
+                        confirmation.get("confirmation_mode"),
+                    )
+                ):
+                    decision = {
+                        "action": "hold",
+                        "reason": "elastic_capacity_requires_two_of_three_confirmation",
+                        "confirm_count": confirmation.get("confirm_count"),
+                        "required_confirm_samples": 2,
+                        "raw_tier": confirmation.get("raw_tier"),
+                    }
+                else:
+                    minimum_entry_edge = strictest_entry_threshold(
+                        decision.get("minimum_entry_edge_bps"),
+                        confirmation.get("required_edge_bps"),
+                    )
+                    if minimum_entry_edge is None:
+                        decision = {
+                            "action": "hold",
+                            "reason": "gradient_exact_entry_threshold_invalid",
+                        }
+                    else:
+                        decision = {
+                            **decision,
+                            "confirmation_mode": confirmation["confirmation_mode"],
+                            "confirmation_count": confirmation["confirm_count"],
+                            "minimum_entry_edge_bps": str(minimum_entry_edge),
+                        }
         if decision["action"] == "close":
             if not window.allow_position_management:
                 self.last_action = {
@@ -1871,6 +2178,17 @@ class WTILiveRuntime:
             finally:
                 self.gateway.set_proposed_notional(None)
             self.last_risk = dict(self.gateway.latest_risk)
+            entry_block = state.get("last_entry_block") or {}
+            if (
+                gradient_entry
+                and isinstance(entry_block, dict)
+                and entry_block.get("sample_id") == row.get("sample_id")
+            ):
+                self.last_action = {
+                    "action": "blocked_entry",
+                    **entry_block,
+                }
+                return state
             if state.get("status") == "open":
                 self.entry_authorized = gradient_entry
                 self.entry_gate_block_reason = (
@@ -1882,6 +2200,7 @@ class WTILiveRuntime:
             self.last_action = {
                 "action": decision["action"], "direction": decision["direction"],
                 "edge_bps": decision["edge_bps"], "tier": decision.get("gradient_tier"),
+                "confirmation_mode": decision.get("confirmation_mode"),
                 "status": state.get("status"),
             }
             return state
@@ -2008,7 +2327,35 @@ class WTILiveRuntime:
                                 self.last_action = {"action": "blocked", "reason": type(exc).__name__}
                                 self._write_health(state=state, row=row, error=type(exc).__name__)
                     elif new_valid_sample is False:
-                        self._write_health(state=state, row=row)
+                        if self._quote_age_refresh_candidate(row):
+                            try:
+                                state = await self._process_sample(dict(row))
+                                self._note_verified_cycle(state, kind="quote_age_refresh")
+                                self._finish_single_round_pilot_if_done(state)
+                                self._finish_gradient_pilot_if_done(state)
+                            except Exception as exc:
+                                self.last_cycle_error = f"{type(exc).__name__}:{str(exc)[:160]}"
+                                self.entry_authorized = False
+                                if _retryable_sample_validation_error(exc):
+                                    if not self.entry_authorization_permanently_revoked:
+                                        self.entry_gate_block_reason = "wti_current_sample_or_session_not_fresh"
+                                    self.last_runtime_error = str(exc)
+                                    self.last_action = {"action": "deferred", "reason": str(exc)}
+                                    self.logger.warning(
+                                        "wti_quote_age_refresh_deferred sample_id=%s reason=%s",
+                                        row.get("sample_id"), exc,
+                                    )
+                                else:
+                                    self._revoke_entry_authorization("wti_strategy_cycle_requires_review")
+                                    self.last_runtime_error = type(exc).__name__
+                                    self.last_action = {"action": "blocked", "reason": type(exc).__name__}
+                            self._write_health(
+                                state=state,
+                                row=getattr(self, "last_decision_sample", None) or row,
+                                error=self.last_runtime_error,
+                            )
+                        else:
+                            self._write_health(state=state, row=row)
                     elif time.monotonic() - self.last_health_write_monotonic >= 5:
                         self._write_health(state=state, row=row, error=self.last_runtime_error)
                 elif self.args.mode == "observe":
@@ -2087,6 +2434,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rotation-test-id")
     parser.add_argument("--gradient-second-tier-bps", type=Decimal)
     parser.add_argument("--gradient-layer-notional-usd", type=Decimal, default=Decimal("20"))
+    parser.add_argument(
+        "--gradient-elastic-capacity",
+        action="store_true",
+        help="Allow at most one guarded first-tier reserve child; disabled by default.",
+    )
     parser.add_argument("--new-pilot-after", help="authorize one new round after this exact terminal pilot ID")
     parser.add_argument("--keep-collecting-after-pilot", action="store_true")
     parser.add_argument(
@@ -2171,6 +2523,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         elif args.confirm_continuous_gradient_rotation:
             parser.error("continuous rotation confirmation requires --continuous-gradient-rotation")
     elif (args.confirm_bounded_gradient_pilot or args.gradient_second_tier_bps is not None
+          or args.gradient_elastic_capacity
           or args.continuous_gradient_rotation or args.confirm_continuous_gradient_rotation):
         parser.error("gradient options require --gradient-live")
     elif args.rotation_test_id:

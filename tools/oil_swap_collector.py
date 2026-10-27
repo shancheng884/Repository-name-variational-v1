@@ -230,10 +230,12 @@ class OilSwapCollector:
         var_qty: Decimal | None = None,
         lighter_qty: Decimal | None = None,
         sample_kind: str = "baseline",
+        signal_sample_id: str | None = None,
     ) -> dict[str, Any] | None:
         async with self.sample_lock:
             return await self._collect_once_unlocked(
-                var_qty=var_qty, lighter_qty=lighter_qty, sample_kind=sample_kind
+                var_qty=var_qty, lighter_qty=lighter_qty, sample_kind=sample_kind,
+                signal_sample_id=signal_sample_id,
             )
 
     async def _collect_once_unlocked(
@@ -242,9 +244,12 @@ class OilSwapCollector:
         var_qty: Decimal | None = None,
         lighter_qty: Decimal | None = None,
         sample_kind: str = "baseline",
+        signal_sample_id: str | None = None,
     ) -> dict[str, Any] | None:
         if sample_kind not in {"baseline", "burst"}:
             raise ValueError("unsupported_wti_sample_kind")
+        if signal_sample_id and sample_kind != "burst":
+            raise ValueError("signal_sample_link_requires_burst")
         metadata = self.books.market_metadata[ASSET]
         multiplier = Decimal(str(metadata.get("multiplier") or "1"))
         requested_pair = var_qty is not None or lighter_qty is not None
@@ -304,6 +309,7 @@ class OilSwapCollector:
             kind=INSTRUMENT_KIND,
             funding_interval_s=FUNDING_INTERVAL_S,
         )
+        quote_response_received_at = datetime.now(timezone.utc)
         if not message.get("ok"):
             self.last_quote_state = "unavailable"
             raise RuntimeError(str(message.get("error") or "variational_quote_failed"))
@@ -333,6 +339,10 @@ class OilSwapCollector:
         self.last_session_closing_at = session_observation["session_closing_at"]
         quote_text = quote.get("quoteTimestamp") or quote.get("timestamp")
         quote_dt = parse_timestamp(quote_text)
+        quote_age_at_response = (
+            None if quote_dt is None
+            else (quote_response_received_at - quote_dt).total_seconds()
+        )
         quote_age = None if quote_dt is None else (now - quote_dt).total_seconds()
         book_age = after.get("book_age_seconds")
         server_timestamp_ms = after.get("server_timestamp_ms")
@@ -393,6 +403,7 @@ class OilSwapCollector:
             "logged_at": now.isoformat(),
             "sample_id": uuid.uuid4().hex,
             "sample_kind": sample_kind,
+            "signal_sample_id": signal_sample_id,
             "sample_quality": sample_quality,
             "sample_quality_reasons": reasons,
             "record_kind": "basis_market_sample",
@@ -428,6 +439,11 @@ class OilSwapCollector:
             "variational_quote_cost_metadata": self._cost_metadata(quote),
             "quote_timestamp": quote_text,
             "quote_ms": f"{quote_ms:.3f}",
+            "quote_response_received_at": quote_response_received_at.isoformat(),
+            "quote_age_at_response_seconds": (
+                None if quote_age_at_response is None
+                else f"{quote_age_at_response:.6f}"
+            ),
             "var_quote_age_seconds": None if quote_age is None else f"{quote_age:.6f}",
             "lighter_book_age_seconds": None if book_age is None else f"{book_age:.6f}",
             "lighter_clock_drift_seconds": None if clock_drift is None else f"{clock_drift:.6f}",
@@ -479,14 +495,30 @@ class OilSwapCollector:
         var_qty: Decimal | None = None,
         lighter_qty: Decimal | None = None,
         sample_kind: str = "burst",
+        signal_sample_id: str | None = None,
     ) -> dict[str, Any]:
         """Serialize execution refreshes with the normal collector poll loop."""
-        row = await self._collect_once(
-            var_qty=var_qty, lighter_qty=lighter_qty, sample_kind=sample_kind
-        )
-        if not isinstance(row, dict):
-            raise RuntimeError("wti_fresh_sample_unavailable")
-        self._record_sample(row)
+        row: dict[str, Any] | None = None
+        for attempt in range(2 if sample_kind == "burst" else 1):
+            candidate = await self._collect_once(
+                var_qty=var_qty, lighter_qty=lighter_qty, sample_kind=sample_kind,
+                signal_sample_id=signal_sample_id,
+            )
+            if not isinstance(candidate, dict):
+                raise RuntimeError("wti_fresh_sample_unavailable")
+            candidate["execution_refresh_attempt"] = attempt + 1
+            self._record_sample(candidate)
+            row = candidate
+            if (
+                sample_kind != "burst"
+                or candidate.get("sample_quality") != "invalid"
+                or candidate.get("sample_quality_reasons") != ["variational_quote_age_invalid"]
+                or attempt == 1
+            ):
+                break
+            # Each independent response still has to satisfy the unchanged 2s gate.
+            await asyncio.sleep(0.25)
+        assert row is not None
         self._write_health(force=True)
         return dict(row)
 

@@ -688,7 +688,7 @@ def test_v4_real_gradient_slot_caps_follow_dynamic_smaller_equity() -> None:
         lighter_equity_usd=Decimal("98.64"),
         child_notional_usd=Decimal("20"),
         max_venue_leverage=Decimal("5"),
-    ) == [5, 10, 15, 20, 24]
+    ) == [4, 9, 14, 19, 24]
     assert v4_real_gradient_slot_caps(
         variational_equity_usd=Decimal("100"),
         lighter_equity_usd=Decimal("100"),
@@ -701,6 +701,16 @@ def test_v4_real_gradient_slot_caps_follow_dynamic_smaller_equity() -> None:
         child_notional_usd=Decimal("20"),
         max_venue_leverage=Decimal("5"),
     ) == [6, 12, 18, 24, 30]
+
+
+def test_v4_real_gradient_slot_caps_never_round_fractional_tiers_up() -> None:
+    caps = v4_real_gradient_slot_caps(
+        variational_equity_usd=Decimal("39.99"),
+        lighter_equity_usd=Decimal("39.99"),
+        child_notional_usd=Decimal("20"),
+        max_venue_leverage=Decimal("5"),
+    )
+    assert caps == [1, 3, 5, 7, 9]
 
 
 def test_v4_real_gradient_elastic_capacity_borrows_one_guarded_slot() -> None:

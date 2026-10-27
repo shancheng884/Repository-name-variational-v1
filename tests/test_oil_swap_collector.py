@@ -208,6 +208,8 @@ def test_oil_sample_quotes_same_qty_as_lighter_depth_and_uses_swap(tmp_path) -> 
             (status_at + timedelta(hours=6)).isoformat()
         )
         assert row["session_closing_at"] is not None
+        assert row["quote_response_received_at"]
+        assert Decimal(row["quote_age_at_response_seconds"]) <= Decimal("2")
         assert row["orders_attempted"] is False
         assert seen_qty == [None, Decimal("0.200"), Decimal("0.200")]
 
@@ -274,6 +276,70 @@ def test_execution_refresh_preserves_requested_pair_quantity(tmp_path) -> None:
             collector.sample_root, limit=10, asset_filter="WTI"
         )
         assert [item["sample_kind"] for item in persisted] == ["burst"]
+
+    asyncio.run(run())
+
+
+def test_execution_refresh_retries_stale_quote_once_and_keeps_both_samples(tmp_path) -> None:
+    async def run() -> None:
+        args = parse_args(["--reuse-forwarder", "--output-dir", str(tmp_path)])
+        collector = OilSwapCollector(args)
+        collector.books.market_metadata["WTI"] = market()
+        observed = datetime.now(timezone.utc)
+        snapshots = [
+            {
+                "bid": Decimal("101.99"), "ask": Decimal("102.01"),
+                "sell_price": Decimal("101.99"), "buy_price": Decimal("102.01"),
+                "nonce": n, "server_timestamp_ms": int(observed.timestamp() * 1000),
+                "book_age_seconds": 0.1, "continuity_ok": True,
+                "cold": False, "sequence_gaps": 0,
+            }
+            for n in range(30, 36)
+        ]
+        quote_calls = 0
+
+        async def fake_snapshot(_asset, _notional, *, base_qty=None):
+            return snapshots.pop(0)
+
+        async def fake_quote(_asset, _qty, **_kwargs):
+            nonlocal quote_calls
+            quote_calls += 1
+            quote_at = datetime.now(timezone.utc)
+            if quote_calls == 1:
+                quote_at -= timedelta(seconds=3)
+            return {
+                "ok": True,
+                "result": {
+                    "bid": "102.00", "ask": "102.02",
+                    "quoteId": f"q-{quote_calls}",
+                    "quoteTimestamp": quote_at.isoformat(),
+                },
+            }, 50.0
+
+        collector.market_status_feed.connected = True
+        collector.market_status_feed.status = "open"
+        collector.market_status_feed.status_observed_at = observed
+        collector.market_status_feed.heartbeat_at = observed
+        collector.trading_sessions = [{
+            "open": (observed - timedelta(minutes=1)).isoformat(),
+            "close": (observed + timedelta(hours=6)).isoformat(),
+        }]
+        collector.session_schedule_updated_at = observed.isoformat()
+        collector.books.snapshot = fake_snapshot
+        collector.quote_client.quote = fake_quote
+
+        row = await collector.collect_fresh_sample(
+            var_qty=Decimal("0.198"), lighter_qty=Decimal("0.198"),
+            sample_kind="burst",
+        )
+        assert quote_calls == 2
+        assert row["sample_quality"] == "valid"
+        assert row["execution_refresh_attempt"] == 2
+        assert Decimal(row["quote_age_at_response_seconds"]) <= Decimal("2")
+        assert collector.sample_quality_counts == {"invalid": 1, "valid": 1}
+        persisted = read_basis_samples(collector.sample_root, limit=10, asset_filter="WTI")
+        assert len(persisted) == 2
+        assert all(item["sample_kind"] == "burst" for item in persisted)
 
     asyncio.run(run())
 

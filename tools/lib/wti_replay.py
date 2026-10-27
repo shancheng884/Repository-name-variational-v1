@@ -17,6 +17,11 @@ from tools.lib.hedge_instruments import (
     paired_exposure_matches,
     paired_realized_pnl,
 )
+from tools.lib.gradient_entry_confirmation import (
+    confirm_gradient_entry_with_execution_refresh,
+    elastic_addon_confirmation_allowed,
+    update_gradient_entry_confirmation,
+)
 from tools.lib.market_sessions import session_observation_for_sample
 from tools.lib.wti_sizing import equity_gradient_slot_caps, size_paired_layer
 from tools.lib.wti_thresholds import (
@@ -209,6 +214,103 @@ def _canonical_rows(
         raise ValueError("historical_wti_market_profile_changed_split_replay_by_contract")
     ordered = sorted(candidates.values(), key=lambda row: _timestamp(row["logged_at"]))
     return ordered, rejected, duplicates, len(conflicting)
+
+
+def _linked_execution_refreshes(
+    rows: list[dict[str, Any]],
+    baseline_rows: list[dict[str, Any]],
+    *,
+    expected_market_id: int | None,
+    expected_multiplier: Decimal | None,
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """Index valid, unique burst quotes linked to a baseline signal within 2s."""
+    signals = {str(row.get("sample_id")): row for row in baseline_rows}
+    candidates: dict[str, dict[str, Any]] = {}
+    conflicted_signals: set[str] = set()
+    seen_refresh_ids: dict[str, dict[str, Any]] = {}
+    valid_count = 0
+    for row in rows:
+        if not isinstance(row, dict) or row.get("sample_kind") != "burst":
+            continue
+        refresh_id = str(row.get("sample_id") or "").strip()
+        signal_id = str(row.get("signal_sample_id") or "").strip()
+        signal = signals.get(signal_id)
+        if not refresh_id or not signal_id or signal is None:
+            continue
+        old = seen_refresh_ids.get(refresh_id)
+        if old is not None:
+            if old != row:
+                conflicted_signals.add(str(old.get("signal_sample_id") or ""))
+                conflicted_signals.add(signal_id)
+            continue
+        seen_refresh_ids[refresh_id] = row
+        valid_as_baseline = {**row, "sample_kind": "baseline"}
+        if not _valid_sample(
+            valid_as_baseline,
+            expected_market_id=expected_market_id,
+            expected_multiplier=expected_multiplier,
+        ):
+            continue
+        signal_at = _timestamp(signal.get("logged_at"))
+        refresh_at = _timestamp(row.get("logged_at"))
+        if (
+            signal_at is None or refresh_at is None
+            or row.get("session_id") != signal.get("session_id")
+            or refresh_at < signal_at
+            or (refresh_at - signal_at).total_seconds() > 2
+        ):
+            continue
+        valid_count += 1
+        if signal_id in candidates:
+            conflicted_signals.add(signal_id)
+        else:
+            candidates[signal_id] = row
+    for signal_id in conflicted_signals:
+        candidates.pop(signal_id, None)
+    return candidates, valid_count
+
+
+def _baseline_confirmation_invalidations(
+    rows: list[dict[str, Any]],
+    *,
+    expected_market_id: int | None,
+    expected_multiplier: Decimal | None,
+) -> tuple[list[tuple[datetime, str]], set[str]]:
+    """Mirror live confirmation resets for first-seen, same-contract bad baselines."""
+    first_seen: set[str] = set()
+    invalidations: list[tuple[datetime, str]] = []
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or str(row.get("asset") or "").upper() != "WTI"
+            or row.get("record_kind") != "basis_market_sample"
+            or row.get("sample_kind", "baseline") != "baseline"
+        ):
+            continue
+        sample_id = str(row.get("sample_id") or "").strip()
+        at = _timestamp(row.get("logged_at"))
+        if not sample_id or at is None or sample_id in first_seen:
+            continue
+        market_id = _decimal(row.get("lighter_market_id"))
+        multiplier = _decimal(row.get("lighter_multiplier"))
+        if (
+            (expected_market_id is not None and market_id is not None
+             and market_id != expected_market_id)
+            or (expected_multiplier is not None and multiplier is not None
+                and multiplier != expected_multiplier)
+            or (row.get("variational_underlying") not in (None, "USOILP"))
+            or (row.get("lighter_symbol") not in (None, "WTI"))
+        ):
+            continue
+        first_seen.add(sample_id)
+        if not _valid_sample(
+            row,
+            expected_market_id=expected_market_id,
+            expected_multiplier=expected_multiplier,
+        ):
+            invalidations.append((at, sample_id))
+    invalidations.sort(key=lambda event: event[0])
+    return invalidations, {sample_id for _, sample_id in invalidations}
 
 
 def _trade_pnl(
@@ -442,6 +544,7 @@ def replay_wti_gradient(
     max_completed_roundtrips: int | None = 1,
     assume_verified_flat_session_restarts: bool = False,
     adaptive_threshold_refresh_seconds: int = WTI_THRESHOLD_REFRESH_SECONDS,
+    elastic_capacity_enabled: bool = False,
 ) -> ReplayReport:
     """Replay conservative multi-tier WTI rounds; equity is an explicit scenario input."""
     if second_tier_threshold_bps <= config.entry_threshold_bps:
@@ -464,8 +567,32 @@ def replay_wti_gradient(
         or max_completed_roundtrips < 1
     ):
         raise ValueError("gradient_max_completed_roundtrips_must_be_positive_or_none")
+    baseline_inputs = [
+        row for row in rows
+        if not isinstance(row, dict) or row.get("sample_kind", "baseline") != "burst"
+    ]
     samples, rejected, duplicates, conflicts = _canonical_rows(
+        baseline_inputs,
+        expected_market_id=expected_market_id,
+        expected_multiplier=expected_multiplier,
+    )
+    confirmation_invalidations, suppressed_sample_ids = _baseline_confirmation_invalidations(
+        baseline_inputs,
+        expected_market_id=expected_market_id,
+        expected_multiplier=expected_multiplier,
+    )
+    suppressed_count = sum(
+        str(row.get("sample_id") or "") in suppressed_sample_ids for row in samples
+    )
+    if suppressed_sample_ids:
+        samples = [
+            row for row in samples
+            if str(row.get("sample_id") or "") not in suppressed_sample_ids
+        ]
+        rejected += suppressed_count
+    execution_refreshes, execution_refresh_count = _linked_execution_refreshes(
         rows,
+        samples,
         expected_market_id=expected_market_id,
         expected_multiplier=expected_multiplier,
     )
@@ -480,9 +607,16 @@ def replay_wti_gradient(
     position_gap_exit_pending = False
     rejected_depth = 0
     capped_additions = 0
+    execution_refreshes_used = 0
+    unmatched_strong_probe_signals = 0
+    strong_probe_refresh_rejections: Counter[str] = Counter()
     threshold_history: deque[dict[str, Any]] = deque()
     threshold_profiles: dict[str, WTIGradientThresholdProfile] = {}
     threshold_refreshed_at: datetime | None = None
+    confirmation_history: dict[str, list[tuple[str, int]]] = {
+        "long_var_short_lighter": [],
+        "short_var_long_lighter": [],
+    }
     hard_floors = (
         config.entry_threshold_bps,
         second_tier_threshold_bps,
@@ -623,9 +757,19 @@ def replay_wti_gradient(
         })
         return position
 
+    invalidation_index = 0
     for row in samples:
         at = _timestamp(row["logged_at"])
         assert at is not None
+        while (
+            invalidation_index < len(confirmation_invalidations)
+            and confirmation_invalidations[invalidation_index][0] <= at
+        ):
+            confirmation_history = {
+                "long_var_short_lighter": [],
+                "short_var_long_lighter": [],
+            }
+            invalidation_index += 1
         refresh_thresholds(at, row)
         threshold_cutoff = at - timedelta(days=7)
         while threshold_history:
@@ -647,9 +791,17 @@ def replay_wti_gradient(
             if gap > config.max_sample_gap_seconds:
                 gaps += 1
                 entry_authorization_revoked = True
+                confirmation_history = {
+                    "long_var_short_lighter": [],
+                    "short_var_long_lighter": [],
+                }
                 if current is not None:
                     position_gap_exit_pending = True
             if session_changed:
+                confirmation_history = {
+                    "long_var_short_lighter": [],
+                    "short_var_long_lighter": [],
+                }
                 previous_observation = session_observation_for_sample(previous_row)
                 if current is not None:
                     stopped_reason = "position_crossed_session_boundary"
@@ -668,6 +820,17 @@ def replay_wti_gradient(
         previous_at, previous_row = at, row
         cutoff = observation.closing_at - timedelta(seconds=config.entry_cutoff_seconds)
         in_cutoff = at >= cutoff
+        confirmation_thresholds = {
+            direction: threshold_profiles[direction].thresholds_bps
+            for direction in DIRECTIONS
+        }
+        update_gradient_entry_confirmation(
+            row,
+            confirmation_thresholds,
+            confirmation_history,
+            direction=None,
+            candidate_tier=1,
+        )
 
         if current is not None:
             if at <= current["at"]:
@@ -719,13 +882,19 @@ def replay_wti_gradient(
                 exit_reasons[reason] += 1
                 current = None
                 position_gap_exit_pending = False
+                confirmation_history = {
+                    "long_var_short_lighter": [],
+                    "short_var_long_lighter": [],
+                }
                 if (
                     max_completed_roundtrips is not None
                     and len(trades) >= max_completed_roundtrips
                 ):
                     break
                 continue
-            if not in_cutoff and len(current["layers"]) < max_layers:
+            # In the equity-capacity model max_layers counts risk tiers, not
+            # child orders. Preserve the one-child-per-tier legacy replay.
+            if not in_cutoff and (capacity_slots is not None or len(current["layers"]) < max_layers):
                 edge = _decimal(row.get(
                     "long_edge_bps" if current["direction"] == "long_var_short_lighter"
                     else "short_edge_bps"
@@ -733,6 +902,8 @@ def replay_wti_gradient(
                 direction_thresholds = threshold_profiles[current["direction"]].thresholds_bps
                 opened_tiers = [layer["tier"] for layer in current["layers"]]
                 active_tier = max(opened_tiers)
+                elastic_capacity_addon = False
+                current_notional: Decimal | None = None
                 if capacity_slots is None:
                     # Preserve the legacy one-child-per-tier replay mode.
                     tier = len(current["layers"]) + 1
@@ -748,23 +919,94 @@ def replay_wti_gradient(
                         * current["instrument"].lighter.exposure_multiplier,
                     )
                     if current_notional + layer_notional_usd >= tier_caps[tier - 1]:
-                        tier += 1
+                        elastic_used = any(
+                            layer.get("elastic_capacity_addon") is True
+                            for layer in current["layers"]
+                        )
+                        elastic_threshold = direction_thresholds[0]
+                        if (
+                            elastic_capacity_enabled
+                            and tier == 1
+                            and not elastic_used
+                            and len(tier_caps) > 1
+                            and tier_caps[1] > current_notional + layer_notional_usd
+                            and elastic_threshold is not None
+                            and edge is not None
+                            and edge >= elastic_threshold + Decimal("0.25")
+                        ):
+                            elastic_capacity_addon = True
+                        else:
+                            tier += 1
                 tier_threshold = (
                     direction_thresholds[tier - 1]
                     if 1 <= tier <= len(direction_thresholds) else None
                 )
+                if elastic_capacity_addon and tier_threshold is not None:
+                    tier_threshold += Decimal("0.25")
                 if (
                     tier <= max_layers
                     and tier_threshold is not None
                     and edge is not None and edge >= tier_threshold
                 ):
+                    strong_probe_used = any(
+                        layer.get("confirmation_mode") == "strong_single_probe"
+                        for layer in current["layers"]
+                    )
+                    confirmation = update_gradient_entry_confirmation(
+                        row,
+                        confirmation_thresholds,
+                        confirmation_history,
+                        direction=current["direction"],
+                        candidate_tier=tier,
+                        allow_strong_single_probe=not strong_probe_used,
+                    )
+                    layer_row = row
+                    if confirmation.get("confirmation_mode") == "strong_single_probe":
+                        refreshed = execution_refreshes.get(str(row.get("sample_id") or ""))
+                        if refreshed is None:
+                            unmatched_strong_probe_signals += 1
+                            strong_probe_refresh_rejections["linked_execution_refresh_missing"] += 1
+                            continue
+                        confirmation = confirm_gradient_entry_with_execution_refresh(
+                            row,
+                            refreshed,
+                            confirmation_thresholds,
+                            confirmation_history,
+                            direction=current["direction"],
+                            candidate_tier=tier,
+                            allow_strong_single_probe=not strong_probe_used,
+                        )
+                        if not confirmation.get("confirmed"):
+                            strong_probe_refresh_rejections[str(
+                                confirmation.get("reason") or "linked_execution_refresh_rejected"
+                            )] += 1
+                            continue
+                        layer_row = refreshed
+                        edge = _decimal(refreshed.get(
+                            "long_edge_bps" if current["direction"] == "long_var_short_lighter"
+                            else "short_edge_bps"
+                        ))
+                        if edge is None or edge < tier_threshold:
+                            strong_probe_refresh_rejections["execution_edge_below_tier_threshold"] += 1
+                            continue
+                        execution_refreshes_used += 1
+                    if not confirmation.get("confirmed"):
+                        continue
+                    if not elastic_addon_confirmation_allowed(
+                        elastic_capacity_addon,
+                        confirmation.get("confirmation_mode"),
+                    ):
+                        continue
                     layer = make_layer(
-                        row, current["direction"], edge, tier, current,
-                        aggregate_cap=tier_caps[tier - 1],
+                        layer_row, current["direction"], edge, tier, current,
+                        aggregate_cap=(tier_caps[tier] if elastic_capacity_addon else tier_caps[tier - 1]),
                     )
                     if layer is None:
                         capped_additions += 1
                     else:
+                        layer["confirmation_mode"] = confirmation["confirmation_mode"]
+                        if elastic_capacity_addon:
+                            layer["elastic_capacity_addon"] = True
                         current["layers"].append(layer)
                         refresh_aggregate(current)
             continue
@@ -785,10 +1027,52 @@ def replay_wti_gradient(
         if not qualified:
             continue
         direction, edge = max(qualified, key=lambda item: item[1])
+        confirmation = update_gradient_entry_confirmation(
+            row,
+            confirmation_thresholds,
+            confirmation_history,
+            direction=direction,
+            candidate_tier=1,
+            allow_strong_single_probe=True,
+        )
+        if not confirmation.get("confirmed"):
+            continue
+        entry_row = row
+        if confirmation.get("confirmation_mode") == "strong_single_probe":
+            refreshed = execution_refreshes.get(str(row.get("sample_id") or ""))
+            if refreshed is None:
+                unmatched_strong_probe_signals += 1
+                strong_probe_refresh_rejections["linked_execution_refresh_missing"] += 1
+                continue
+            confirmation = confirm_gradient_entry_with_execution_refresh(
+                row,
+                refreshed,
+                confirmation_thresholds,
+                confirmation_history,
+                direction=direction,
+                candidate_tier=1,
+                allow_strong_single_probe=True,
+            )
+            if not confirmation.get("confirmed"):
+                strong_probe_refresh_rejections[str(
+                    confirmation.get("reason") or "linked_execution_refresh_rejected"
+                )] += 1
+                continue
+            edge = _decimal(refreshed.get(
+                "long_edge_bps" if direction == "long_var_short_lighter" else "short_edge_bps"
+            ))
+            if edge is None:
+                strong_probe_refresh_rejections["execution_edge_unavailable"] += 1
+                continue
+            entry_row = refreshed
+            execution_refreshes_used += 1
+        minimum_edge = _decimal(confirmation.get("required_edge_bps"))
+        if minimum_edge is None or edge < minimum_edge:
+            continue
         multiplier = _decimal(row.get("lighter_multiplier"))
         current = {
             "direction": direction,
-            "at": at,
+            "at": _timestamp(entry_row.get("logged_at")) or at,
             "edge": edge,
             "instrument": replace(
                 WTI_HEDGE,
@@ -797,12 +1081,13 @@ def replay_wti_gradient(
             "layers": [],
         }
         layer = make_layer(
-            row, direction, edge, 1, aggregate_cap=tier_caps[0],
+            entry_row, direction, edge, 1, aggregate_cap=tier_caps[0],
         )
         if layer is None:
             current = None
             rejected_depth += 1
             continue
+        layer["confirmation_mode"] = confirmation["confirmation_mode"]
         current["layers"].append(layer)
         refresh_aggregate(current)
 
@@ -859,10 +1144,18 @@ def replay_wti_gradient(
             "gradient_threshold_refresh_seconds": adaptive_threshold_refresh_seconds,
             "gradient_threshold_sample_floor": 100,
             "gradient_threshold_effective_seconds_floor": 129600,
+            "entry_confirmation": "two_of_three_or_single_tier_three_probe_with_linked_2s_execution_refresh",
+            "invalid_baseline_confirmation_resets": len(confirmation_invalidations),
+            "execution_refresh_replayed": execution_refreshes_used > 0,
+            "execution_refresh_samples_available": execution_refresh_count,
+            "execution_refresh_samples_used": execution_refreshes_used,
+            "unmatched_strong_probe_signals": unmatched_strong_probe_signals,
+            "strong_probe_refresh_rejections": dict(strong_probe_refresh_rejections),
+            "elastic_capacity_enabled": elastic_capacity_enabled,
         },
         cost_caveat=(
             f"Sequential {max_layers}-tier rounds with the configured completed-round limit. Quote-path only; no historical fills, fees, funding, latency, or market impact are inferred. "
-            "Sample-size/depth, exchange-session, process-latched sample-gap, cutoff, hold, slippage, paired-notional, and per-leg caps remain active. Session re-entry is modeled only when the explicit supervisor-restart assumption is enabled; historical quotes do not prove the external flat-account reconciliation."
+            "Sample-size/depth, exchange-session, process-latched sample-gap, cutoff, hold, slippage, paired-notional, and per-leg caps remain active. Invalid same-contract baseline rows reset the confirmation window as in live processing. Execution-time refreshes and queue delay cannot be reconstructed from historical samples and are not counted as signal confirmations; the live two-second gate remains independently enforced. Session re-entry is modeled only when the explicit supervisor-restart assumption is enabled; historical quotes do not prove the external flat-account reconciliation."
         ),
         trades=tuple(trades),
     )

@@ -144,6 +144,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--gradient-equity-usd", type=_positive_decimal,
         help="Explicit symmetric equity scenario for the paired 1x-to-5x tier capacity; not inferred from historical data.",
     )
+    parser.add_argument(
+        "--gradient-elastic-capacity", action="store_true",
+        help="Replay the optional single first-tier reserve child; disabled by default.",
+    )
     parser.add_argument("--limit", type=int, default=200000)
     parser.add_argument("--evidence-output", type=Path, help="Write a hash-addressed replay/readiness evidence JSON file.")
     return parser
@@ -166,12 +170,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--compare-gradient requires all gradient tier and notional options")
     if args.continuous_gradient and not args.compare_gradient:
         parser.error("--continuous-gradient requires --compare-gradient")
-    if not args.compare_gradient and any(value is not None for value in (
-        args.gradient_second_tier_bps,
-        args.gradient_layer_notional_usd,
-        args.gradient_aggregate_max_notional_usd,
-        args.gradient_equity_usd,
-    )):
+    if (
+        not args.compare_gradient and any(value is not None for value in (
+            args.gradient_second_tier_bps,
+            args.gradient_layer_notional_usd,
+            args.gradient_aggregate_max_notional_usd,
+            args.gradient_equity_usd,
+        ))
+    ) or (args.gradient_elastic_capacity and not args.compare_gradient):
         parser.error("gradient options require --compare-gradient")
     try:
         rows: list[dict[str, Any]] = read_basis_samples(
@@ -208,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
                 expected_multiplier=args.lighter_multiplier,
                 max_completed_roundtrips=None if args.continuous_gradient else 1,
                 assume_verified_flat_session_restarts=args.assume_verified_flat_session_restarts,
+                elastic_capacity_enabled=args.gradient_elastic_capacity,
             )
     except ValueError as exc:
         print(json.dumps({"replay_error": str(exc), "live_authorization": False}, indent=2))

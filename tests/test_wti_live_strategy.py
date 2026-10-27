@@ -203,7 +203,7 @@ def test_gradient_add_requires_higher_same_direction_edge_and_pilot_ownership():
     assert reached == {
         "action": "add", "direction": "long_var_short_lighter", "edge_bps": "8",
         "reason": "gradient_tier_threshold_reached", "gradient_tier": 2,
-        "layer_notional_usd": "10",
+        "layer_notional_usd": "10", "minimum_entry_edge_bps": "8",
     }
 
 
@@ -226,6 +226,72 @@ def test_gradient_second_layer_remains_blocked_when_step_rounding_exceeds_cap():
     )
     assert result["action"] == "hold"
     assert result["reason"] == "gradient_aggregate_notional_cap_would_be_exceeded"
+
+
+def test_elastic_capacity_is_opt_in_one_child_and_still_uses_next_tier_cap():
+    now = datetime.now(timezone.utc)
+    position = _position(
+        now, gradient_pilot_id="pilot-1", var_qty="0.29", lighter_qty="0.29",
+    )
+    pilot = _gradient_pilot(
+        status="in_position", opened=[{"tier": 1, "layer_id": "layer-1"}],
+    )
+    profiles = {
+        "long_var_short_lighter": (Decimal("4"), Decimal("8")),
+        "short_var_long_lighter": (Decimal("4"), Decimal("8")),
+    }
+    caps = (Decimal("20"), Decimal("40"))
+    row = _row(
+        now, var_bid="70.0", var_ask="70.1", lighter_buy_price="70.2",
+        long_edge_bps="4.3",
+    )
+
+    disabled = decide_wti_gradient_action(
+        row, position, pilot, config=_config(), now=now,
+        thresholds_by_direction=profiles,
+        aggregate_capacity_by_tier_usd=caps,
+    )
+    enabled = decide_wti_gradient_action(
+        row, position, pilot, config=_config(), now=now,
+        thresholds_by_direction=profiles,
+        aggregate_capacity_by_tier_usd=caps,
+        elastic_capacity_enabled=True,
+    )
+
+    assert disabled["action"] == "hold"
+    assert enabled["action"] == "add"
+    assert enabled["gradient_tier"] == 1
+    assert enabled["elastic_capacity_addon"] is True
+    assert enabled["aggregate_max_notional_usd"] == "40"
+    assert enabled["minimum_entry_edge_bps"] == "4.25"
+
+
+def test_elastic_capacity_cannot_be_used_twice_in_one_gradient_round():
+    now = datetime.now(timezone.utc)
+    position = _position(
+        now, gradient_pilot_id="pilot-1", var_qty="0.29", lighter_qty="0.29",
+    )
+    pilot = _gradient_pilot(
+        status="in_position",
+        opened=[
+            {"tier": 1, "layer_id": "layer-1"},
+            {"tier": 1, "layer_id": "elastic-1", "elastic_capacity_addon": True},
+        ],
+    )
+    result = decide_wti_gradient_action(
+        _row(now, var_bid="70.0", var_ask="70.1", lighter_buy_price="70.2",
+             long_edge_bps="8"), position, pilot,
+        config=_config(), now=now,
+        thresholds_by_direction={
+            "long_var_short_lighter": (Decimal("4"), Decimal("8")),
+            "short_var_long_lighter": (Decimal("4"), Decimal("8")),
+        },
+        aggregate_capacity_by_tier_usd=(Decimal("20"), Decimal("40")),
+        elastic_capacity_enabled=True,
+    )
+    assert result["action"] == "add"
+    assert result["gradient_tier"] == 2
+    assert result.get("elastic_capacity_addon") is not True
 
 
 def test_gradient_second_layer_blocks_when_minimum_quote_and_basis_exceed_cap():

@@ -517,6 +517,13 @@ class WTIProductionGateway:
                 "native_client_order_id": str(self._var_order_value(row, "rfq_id") or ""),
                 "status": "filled", "filled_qty": str(qty), "average_price": str(price),
                 "trade_ids": [], "fee_usd": self._explicit_fee_usd(row),
+                "fee_evidence": self._fee_evidence(
+                    row,
+                    venue="variational",
+                    source="variational_exact_order_record",
+                    native_order_id=self._var_order_value(row, "order_id"),
+                    native_client_order_id=self._var_order_value(row, "rfq_id"),
+                ),
                 **clock_evidence,
             }
             return result
@@ -626,6 +633,57 @@ class WTIProductionGateway:
             if value is not None:
                 return str(value)
         return None
+
+    @staticmethod
+    def _raw_fee_fields(row: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "fee_usd", "actual_fee_usd", "commission_usd", "fee", "fees",
+            "commission", "commission_amount", "fee_amount", "maker_fee",
+            "taker_fee", "fee_currency", "fee_asset", "fee_token", "fee_unit",
+            "currency", "fee_type", "fee_rate", "maker_fee_rate", "taker_fee_rate",
+        )
+        values: dict[str, Any] = {}
+        for key in keys:
+            value = row.get(key)
+            if value is None or isinstance(value, (dict, list, tuple, set)):
+                continue
+            if isinstance(value, (str, int, bool)):
+                values[key] = value
+            elif isinstance(value, float):
+                values[key] = value if _decimal(value) is not None else str(value)
+            else:
+                values[key] = str(value)
+        return values
+
+    @classmethod
+    def _fee_evidence(
+        cls,
+        row: dict[str, Any],
+        *,
+        venue: str,
+        source: str,
+        native_order_id: Any = None,
+        native_client_order_id: Any = None,
+        trade_ids: list[str] | None = None,
+        fill_coverage_complete: bool | None = None,
+        lookup_error_type: str | None = None,
+    ) -> dict[str, Any]:
+        fee_usd = cls._explicit_fee_usd(row)
+        return {
+            "venue": venue,
+            "source": source,
+            "native_order_id": None if native_order_id is None else str(native_order_id),
+            "native_client_order_id": (
+                None if native_client_order_id is None else str(native_client_order_id)
+            ),
+            "trade_ids": list(trade_ids or []),
+            "fill_coverage_complete": fill_coverage_complete,
+            "fee_usd": fee_usd,
+            "status": "confirmed_usd" if fee_usd is not None else "unverified",
+            "raw_fee_unit": "USD" if fee_usd is not None else "unverified",
+            "raw_fields": cls._raw_fee_fields(row),
+            "lookup_error_type": lookup_error_type,
+        }
 
     async def _lookup_lighter(
         self, client_order_id: str, request: dict[str, Any]
@@ -765,7 +823,12 @@ class WTIProductionGateway:
                             "is_maker_ask": trade.get("is_maker_ask"),
                             "maker_fee_raw": trade.get("maker_fee"),
                             "taker_fee_raw": trade.get("taker_fee"),
+                            "raw_fee_fields": self._raw_fee_fields(trade),
                             "fee_usd": explicit_fee,
+                            "fee_evidence_status": (
+                                "confirmed_usd" if explicit_fee is not None and identity_ok
+                                else "unverified"
+                            ),
                             "trade_qty": None if trade_qty is None else str(trade_qty),
                             "identity_verified": identity_ok,
                             "raw_fee_unit": "unverified",
@@ -805,6 +868,21 @@ class WTIProductionGateway:
                     "trade_fill_coverage_complete": fill_coverage_complete,
                     "fee_usd": str(fee_total) if fee_confirmed else None,
                     "trade_fee_evidence": trade_fee_evidence if trade_rows is not None else None,
+                    "fee_evidence": {
+                        "venue": "lighter",
+                        "source": "lighter_exact_order_trades",
+                        "native_order_id": str(order_index),
+                        "native_client_order_id": str(client_index),
+                        "trade_ids": list(trade_ids),
+                        "fill_coverage_complete": fill_coverage_complete,
+                        "fee_usd": str(fee_total) if fee_confirmed else None,
+                        "status": "confirmed_usd" if fee_confirmed else "unverified",
+                        "raw_fee_unit": "USD" if fee_confirmed else "unverified",
+                        "raw_fields_by_trade": [
+                            item["raw_fee_fields"] for item in trade_fee_evidence
+                        ],
+                        "lookup_error_type": trade_error,
+                    },
                     **({
                         "lookup_stage": "trades",
                         "lookup_reason": (

@@ -922,6 +922,286 @@ def test_health_exposes_pending_lookup_reason_and_retains_original_submission_re
     assert health["startup_reconciled"] is False
 
 
+def test_invalid_quote_age_sample_triggers_only_strict_burst_refresh():
+    now = datetime.now(timezone.utc)
+    baseline = _live_sample(now, sample_id="quote-stale-at-source")
+    baseline.update({
+        "sample_quality": "invalid",
+        "sample_quality_reasons": ["variational_quote_age_invalid"],
+        "market_availability": "partial_or_unavailable",
+        "var_quote_age_seconds": "3.2",
+    })
+    assert wti_live.WTILiveRuntime._quote_age_refresh_candidate(baseline)
+    assert not wti_live.WTILiveRuntime._quote_age_refresh_candidate({
+        **baseline, "sample_quality_reasons": [
+            "variational_quote_age_invalid", "lighter_book_stale",
+        ],
+    })
+    assert not wti_live.WTILiveRuntime._quote_age_refresh_candidate({
+        **baseline, "lighter_continuity_ok": False,
+    })
+
+    class RefreshingCollector:
+        latest_sample = baseline
+        calls = 0
+
+        async def collect_fresh_sample(self, *, sample_kind):
+            self.calls += 1
+            assert sample_kind == "burst"
+            self.latest_sample = _live_sample(
+                datetime.now(timezone.utc), sample_id="strict-fresh-burst"
+            )
+            self.latest_sample["sample_kind"] = sample_kind
+            return dict(self.latest_sample)
+
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.last_seen_sample_id = None
+    runtime.last_processed_sample_id = None
+    runtime.last_processed_sample_at = None
+    runtime.last_sample_gap_seconds = None
+    runtime.pending_gap_exit = False
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.last_action = {}
+    runtime.last_sample_freshness_diagnostics = {}
+    runtime.last_execution_refresh_status = "not_attempted"
+    runtime.last_execution_refresh_at = None
+    runtime.last_execution_refresh_elapsed_ms = None
+    runtime.last_execution_refresh_error = None
+    runtime.logger = logging.getLogger("test_quote_age_refresh")
+    runtime.collector = RefreshingCollector()
+
+    assert runtime._record_new_sample(baseline) is False
+    refreshed = asyncio.run(runtime._decision_sample(baseline))
+    assert runtime.collector.calls == 1
+    assert refreshed["sample_id"] == "strict-fresh-burst"
+    assert runtime.last_execution_refresh_status == "fresh"
+
+
+def test_health_separates_collector_age_from_decision_age_and_expires_authorization(tmp_path):
+    runtime = _runtime_for_entry_gate(allow_unqualified=False)
+    runtime.args.health_path = tmp_path / "health.json"
+    runtime.args.state_path = tmp_path / "state.json"
+    runtime.args.entry_cutoff_seconds = 1800
+    runtime.run_id = "health-sample-freshness"
+    runtime.stop = False
+    runtime.startup_reconciled = True
+    runtime.last_sample_gap_seconds = None
+    runtime.last_risk = {"risk_action": "normal", "risk_reason": "account_risk_normal"}
+    runtime.last_action = {"action": "hold", "reason": "gradient_entry_below_adaptive_threshold"}
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.manage_existing_only = False
+    runtime.rotation_drain_request = None
+    state = {"status": "flat", "open_position": None, "pending_action": None}
+    decision = _live_sample(datetime.now(timezone.utc), sample_id="decision-fresh")
+    collector = {
+        **_live_sample(datetime.now(timezone.utc), sample_id="collector-invalid"),
+        "sample_quality": "invalid",
+        "sample_quality_reasons": ["variational_quote_age_invalid"],
+        "market_availability": "partial_or_unavailable",
+        "var_quote_age_seconds": "3.1",
+    }
+    runtime.last_decision_sample = decision
+
+    runtime._write_health(state=state, row=collector)
+    health = json.loads(runtime.args.health_path.read_text())
+    assert health["wti_entry_authorized"] is True
+    assert health["market_sample_fresh"] is True
+    assert health["collector_sample_fresh"] is False
+    assert health["collector_sample_at"] == collector["logged_at"]
+    assert health["entry_authorization_freshness_limit_seconds"] == 2
+    assert 0 <= health["entry_authorization_remaining_seconds"] <= 2
+    assert health["entry_authorization_valid_until"]
+
+    runtime.last_decision_sample = _live_sample(
+        datetime.now(timezone.utc) - timedelta(seconds=3), sample_id="decision-expired"
+    )
+    runtime._write_health(state=state, row=collector)
+    health = json.loads(runtime.args.health_path.read_text())
+    assert health["wti_entry_authorized"] is False
+    assert health["risk_action"] == "block_entry"
+    assert health["risk_reason"] == "wti_current_sample_or_session_not_fresh"
+    assert health["entry_authorization_remaining_seconds"] < 0
+
+
+def test_health_reports_account_entry_block_before_stale_quote_reason(tmp_path):
+    runtime = _runtime_for_entry_gate(allow_unqualified=False)
+    runtime.args.health_path = tmp_path / "health-account-block.json"
+    runtime.args.state_path = tmp_path / "state.json"
+    runtime.args.entry_cutoff_seconds = 1800
+    runtime.run_id = "health-account-block-priority"
+    runtime.stop = False
+    runtime.startup_reconciled = True
+    runtime.last_sample_gap_seconds = None
+    runtime.last_risk = {
+        "risk_action": "block_entry",
+        "risk_reason": "variational_account_recovery_confirmation_pending",
+    }
+    runtime.last_action = {"action": "hold", "reason": "stale_sample"}
+    runtime.entry_authorized = False
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.manage_existing_only = False
+    runtime.rotation_drain_request = None
+    state = {"status": "flat", "open_position": None, "pending_action": None}
+    stale = _live_sample(
+        datetime.now(timezone.utc) - timedelta(seconds=3), sample_id="account-block-stale"
+    )
+
+    runtime._write_health(state=state, row=stale)
+    health = json.loads(runtime.args.health_path.read_text())
+
+    assert health["account_risk_action"] == "block_entry"
+    assert health["entry_block_reason"] == "variational_account_recovery_confirmation_pending"
+    assert health["risk_action"] == "block_entry"
+    assert health["risk_reason"] == "variational_account_recovery_confirmation_pending"
+    assert health["wti_entry_authorized"] is False
+
+
+def test_health_preserves_emergency_account_risk_when_market_sample_is_stale(tmp_path):
+    runtime = _runtime_for_entry_gate(allow_unqualified=False)
+    runtime.args.health_path = tmp_path / "health.json"
+    runtime.args.state_path = tmp_path / "state.json"
+    runtime.args.entry_cutoff_seconds = 1800
+    runtime.run_id = "health-emergency-priority"
+    runtime.stop = False
+    runtime.startup_reconciled = True
+    runtime.last_sample_gap_seconds = None
+    runtime.last_risk = {
+        "risk_action": "emergency_exit",
+        "risk_reason": "critical_margin_usage",
+    }
+    runtime.last_action = {"action": "hold", "reason": "stale_sample"}
+    runtime.entry_authorized = False
+    runtime.entry_gate_block_reason = None
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.manage_existing_only = False
+    runtime.rotation_drain_request = None
+    state = {"status": "open", "open_position": {"var_qty": "0.1"}, "pending_action": None}
+    stale = _live_sample(
+        datetime.now(timezone.utc) - timedelta(seconds=3), sample_id="emergency-stale-market"
+    )
+
+    runtime._write_health(state=state, row=stale)
+    health = json.loads(runtime.args.health_path.read_text())
+
+    assert health["wti_entry_authorized"] is False
+    assert health["risk_action"] == "emergency_exit"
+    assert health["risk_reason"] == "critical_margin_usage"
+    assert health["account_risk_action"] == "emergency_exit"
+    assert health["account_risk_reason"] == "critical_margin_usage"
+    assert health["entry_block_reason"] == "wti_current_sample_or_session_not_fresh"
+
+
+@pytest.mark.parametrize(("refresh_edge", "expected_submits"), [("40", 0), ("55", 1)])
+def test_gradient_strong_signal_uses_linked_execution_refresh_before_open(
+    monkeypatch, tmp_path, refresh_edge, expected_submits,
+):
+    class Collector:
+        def __init__(self, baseline):
+            self.latest_sample = baseline
+            self.signal_links = []
+
+        async def collect_fresh_sample(self, *, sample_kind="burst", signal_sample_id=None, **_kwargs):
+            self.signal_links.append(signal_sample_id)
+            row = _live_sample(datetime.now(timezone.utc), sample_id="linked-refresh")
+            row.update({
+                "sample_kind": sample_kind,
+                "signal_sample_id": signal_sample_id,
+                "var_bid": "69.9", "var_ask": "70.0",
+                "lighter_bid": "70.4", "lighter_ask": "70.5",
+                "lighter_sell_price": "70.4", "lighter_buy_price": "70.5",
+                "long_edge_bps": refresh_edge,
+            })
+            self.latest_sample = row
+            return dict(row)
+
+    baseline = _live_sample(datetime.now(timezone.utc), sample_id="strong-signal")
+    baseline.update({
+        "var_bid": "69.9", "var_ask": "70.0",
+        "lighter_bid": "70.4", "lighter_ask": "70.5",
+        "lighter_sell_price": "70.4", "lighter_buy_price": "70.5",
+        "long_edge_bps": "55",
+    })
+    collector = Collector(baseline)
+    gateway = _FlatLoopGateway()
+    runtime = _runtime_with_real_executor(tmp_path, collector, gateway, gradient=True)
+    for path in Path(runtime.args.sample_root).rglob("*.jsonl"):
+        path.unlink()
+    state = runtime.pilot_store.load()
+    runtime.startup_reconciled = True
+    runtime.last_risk = {"risk_action": "normal", "risk_reason": "account_risk_normal"}
+    runtime.last_action = {"action": "hold"}
+    runtime.manage_existing_only = False
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.gradient_entry_confirmation_history = {
+        "long_var_short_lighter": [], "short_var_long_lighter": [],
+    }
+
+    async def reconcile(_row):
+        return state
+
+    async def unchanged(pilot_state, _row=None):
+        return pilot_state
+
+    async def decision_sample(row):
+        runtime.last_decision_sample = dict(row)
+        return row
+
+    async def thresholds(_row):
+        values = (Decimal("30"), Decimal("45"), Decimal("50"), Decimal("55"), Decimal("60"))
+        return {"long_var_short_lighter": values, "short_var_long_lighter": values}
+
+    submissions = []
+
+    def fake_open(**kwargs):
+        submissions.append(kwargs)
+        return {
+            **state,
+            "status": "open",
+            "pending_action": None,
+            "open_position": {
+                "direction": kwargs["direction"], "var_qty": "0.1",
+                "lighter_qty": "0.1", "gradient_pilot_id": kwargs["gradient_pilot_id"],
+            },
+        }
+
+    runtime._read_reconcile = reconcile
+    runtime._arm_manual_gradient_round = unchanged
+    runtime._advance_continuous_gradient_round = unchanged
+    runtime._decision_sample = decision_sample
+    runtime._gradient_thresholds_for_sample = thresholds
+    runtime._gradient_equity_capacity_by_tier = lambda: tuple(
+        Decimal(value) for value in ("20", "40", "60", "80", "100")
+    )
+    runtime.executor.open = fake_open
+    monkeypatch.setattr(
+        wti_live, "decide_wti_gradient_action",
+        lambda *_args, **_kwargs: {
+            "action": "open", "direction": "long_var_short_lighter",
+            "gradient_tier": 1, "layer_notional_usd": "9",
+            "aggregate_max_notional_usd": "20", "minimum_entry_edge_bps": "30",
+            "edge_bps": "55",
+        },
+    )
+    assert runtime._record_new_sample(baseline) is True
+
+    result = asyncio.run(runtime._process_sample(baseline))
+
+    assert result["status"] == ("open" if expected_submits else "flat")
+    assert len(submissions) == expected_submits
+    assert collector.signal_links == [baseline["sample_id"]]
+    if expected_submits:
+        assert submissions[0]["sample"]["sample_kind"] == "burst"
+        assert submissions[0]["sample"]["signal_sample_id"] == baseline["sample_id"]
+        assert submissions[0]["decision"]["confirmation_mode"] == "strong_single_probe"
+    else:
+        assert runtime.last_action["reason"] == "gradient_strong_signal_refresh_below_required_tier"
+
+
 def test_unqualified_data_pilot_bypasses_history_only_with_fresh_verified_sample():
     now = datetime.now(timezone.utc)
     state = {
@@ -1257,6 +1537,27 @@ def _runtime_with_real_executor(tmp_path, collector, gateway, *, gradient=False)
     runtime.pilot_store = wti_live.WTIExecutionStore(runtime.args.state_path)
     runtime.gradient_pilot = None
     if gradient:
+        latest_sample = getattr(collector, "latest_sample", None)
+        latest_at = (
+            datetime.fromisoformat(
+                str(latest_sample["logged_at"]).replace("Z", "+00:00")
+            )
+            if isinstance(latest_sample, dict) and latest_sample.get("logged_at")
+            else datetime.now(timezone.utc)
+        )
+        history_at = latest_at - timedelta(seconds=10)
+        history_dir = Path(runtime.args.sample_root) / "WTI"
+        history_dir.mkdir(parents=True, exist_ok=True)
+        history_row = _live_sample(history_at, sample_id="runtime-gradient-history")
+        history_row.update({
+            "record_kind": "basis_market_sample",
+            "sample_kind": "baseline",
+            "long_edge_bps": "50",
+            "short_edge_bps": "0",
+        })
+        (history_dir / f"{history_at.date().isoformat()}.jsonl").write_text(
+            json.dumps(history_row) + "\n", encoding="utf-8",
+        )
         runtime.single_round_pilot = None
         runtime.gradient_pilot = runtime.pilot_store.initialize_gradient_pilot(
             market_id=145, multiplier=Decimal("1"),
@@ -1302,6 +1603,58 @@ def test_gradient_equity_capacity_requires_fresh_complete_dual_equity_snapshot()
     runtime.last_risk["observed_at"] = datetime.now(timezone.utc).isoformat()
     runtime.last_risk["risk_data_complete"] = False
     assert runtime._gradient_equity_capacity_by_tier() is None
+
+
+def test_missing_gradient_history_source_blocks_instead_of_falling_back_to_floors(
+    tmp_path: Path,
+):
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.manage_existing_only = False
+    runtime.args = SimpleNamespace(
+        sample_root=tmp_path / "missing-history",
+        sample_interval_seconds=10,
+    )
+    runtime.config = wti_live.ReplayConfig(
+        entry_threshold_bps=Decimal("30"),
+        exit_target_bps=Decimal("1"),
+        roundtrip_cost_bps=Decimal("10"),
+        max_hold_seconds=21600,
+        max_sample_gap_seconds=120,
+    )
+    runtime.market_metadata = {"market_id": 145, "multiplier": "1"}
+    runtime.gradient_pilot = {
+        "config": {"tier_thresholds_bps": ["30", "45", "45.25", "45.50", "45.75"]}
+    }
+    runtime.wti_gradient_threshold_profiles = {}
+    runtime.wti_gradient_threshold_refreshed_monotonic = 0.0
+    runtime.wti_gradient_threshold_source = "not_loaded"
+    runtime.logger = logging.getLogger("test-wti-history-fail-closed")
+    row = _live_sample(datetime.now(timezone.utc), sample_id="history-missing")
+
+    thresholds = asyncio.run(runtime._gradient_thresholds_for_sample(row))
+
+    assert runtime.wti_gradient_threshold_source == "history_error_block"
+    assert thresholds == {
+        direction: (None, None, None, None, None)
+        for direction in ("long_var_short_lighter", "short_var_long_lighter")
+    }
+
+
+def test_gradient_elastic_capacity_flag_is_explicit_and_defaults_off():
+    base = [
+        "--mode", "live", "--confirm-eth-flat", "--i-understand-live-orders",
+        "--gradient-live", "--confirm-bounded-gradient-pilot",
+        "--expected-lighter-market-id", "145", "--entry-threshold-bps", "30",
+        "--gradient-second-tier-bps", "45", "--exit-target-bps", "1",
+        "--roundtrip-cost-bps", "10", "--max-notional-usd", "20",
+    ]
+    default = wti_live.parse_args(base)
+    enabled = wti_live.parse_args([*base, "--gradient-elastic-capacity"])
+
+    assert default.gradient_elastic_capacity is False
+    assert enabled.gradient_elastic_capacity is True
+    with pytest.raises(SystemExit):
+        wti_live.parse_args(["--mode", "observe", "--gradient-elastic-capacity"])
 
 
 @pytest.mark.parametrize("layer", [None, "NaN", "0", "21"])
@@ -1506,12 +1859,14 @@ def test_real_strategy_executor_roundtrip_after_slow_account_read_stops_one_pilo
             return row
 
         async def collect_fresh_sample(
-            self, *, var_qty=None, lighter_qty=None, sample_kind="burst"
+            self, *, var_qty=None, lighter_qty=None, sample_kind="baseline",
+            signal_sample_id=None, **_kwargs,
         ):
             if var_qty is not None or lighter_qty is not None:
                 self.requested_sizes.append((var_qty, lighter_qty))
             self.latest_sample = self.sample(var_qty=var_qty, lighter_qty=lighter_qty)
             self.latest_sample["sample_kind"] = sample_kind
+            self.latest_sample["signal_sample_id"] = signal_sample_id
             return dict(self.latest_sample)
 
         def request_stop(self):
@@ -1650,20 +2005,31 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
             row["session_closing_at"] = self.closing
             row["variational_qty"] = str(var_qty or "0.29")
             row["lighter_qty"] = str(lighter_qty or "0.29")
+            row["var_bid"] = "69.9"
+            row["var_ask"] = "70.0"
+            row["lighter_bid"] = "70.5"
+            row["lighter_ask"] = "70.6"
+            row["lighter_sell_price"] = "70.5"
+            row["lighter_buy_price"] = "70.6"
             row["long_edge_bps"] = "50" if self.phase != "exit" else "0"
             if self.phase == "add":
-                row["var_bid"] = "70.0"
-                row["lighter_buy_price"] = "70.1"
+                row["var_bid"] = "69.9"
+                row["lighter_buy_price"] = "70.6"
             elif self.phase == "exit":
                 row["var_bid"] = "70.3"
                 row["var_ask"] = "70.4"
                 row["lighter_buy_price"] = "69.8"
             return row
 
-        async def collect_fresh_sample(self, *, var_qty=None, lighter_qty=None):
+        async def collect_fresh_sample(
+            self, *, var_qty=None, lighter_qty=None, sample_kind="baseline",
+            signal_sample_id=None, **_kwargs,
+        ):
             if var_qty is not None and lighter_qty is not None:
                 self.requested_sizes.append((Decimal(str(var_qty)), Decimal(str(lighter_qty))))
             self.latest_sample = self.sample(var_qty=var_qty, lighter_qty=lighter_qty)
+            self.latest_sample["sample_kind"] = sample_kind
+            self.latest_sample["signal_sample_id"] = signal_sample_id
             return dict(self.latest_sample)
 
         def request_stop(self):
@@ -1672,6 +2038,8 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
     collector = GradientCollector()
     gateway = GradientGateway()
     runtime = _runtime_with_real_executor(tmp_path, collector, gateway, gradient=True)
+    gateway.delay = 2.1
+    collector.latest_sample = collector.sample()
 
     async def run_cycle():
         nonlocal runtime
@@ -1688,8 +2056,26 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
         connect_market_readers()
         row = dict(collector.latest_sample)
         assert runtime._record_new_sample(row) is True
+        unconfirmed = await runtime._process_sample(row)
+        assert unconfirmed["status"] == "flat"
+        assert gateway.requests == []
+
+        # The first baseline was fresh before the slow account preflight; the
+        # execution burst afterward is not a second independent confirmation.
+        gateway.delay = 0
+        burst = await collector.collect_fresh_sample(sample_kind="burst")
+        assert runtime._record_new_sample(burst) is True
+        burst_result = await runtime._process_sample(burst)
+        assert burst_result["status"] == "flat"
+        assert gateway.requests == []
+
+        row = await collector.collect_fresh_sample()
+        assert runtime._record_new_sample(row) is True
         first = await runtime._process_sample(row)
-        assert first["status"] == "open"
+        assert first["status"] == "open", (
+            runtime.last_action, runtime.wti_gradient_threshold_profiles,
+            runtime.gradient_entry_confirmation_history,
+        )
         assert len(first["open_position"]["layers"]) == 1
         collector.phase = "add"
         row = await collector.collect_fresh_sample()

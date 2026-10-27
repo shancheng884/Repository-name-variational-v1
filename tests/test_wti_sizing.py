@@ -7,6 +7,7 @@ from tools.lib.wti_sizing import (
     equity_position_cap_usd,
     size_paired_layer,
 )
+from main import v4_real_gradient_slot_caps
 
 
 def _size(*, var_price="99.8", lighter_price="100", existing="0"):
@@ -66,6 +67,27 @@ def test_five_tier_capacity_uses_the_lower_verified_equity_and_hard_five_x_cap()
         D("80"), D("160"), D("240"), D("320"), D("400"),
     ]
     assert equity_position_cap_usd(D("100"), D("80")) == D("400")
+
+
+def test_wti_five_tier_slots_match_eth_for_same_equity_child_size_and_leverage():
+    variational_equity = D("144.741342")
+    lighter_equity = D("129.06631")
+    child_notional = D("20")
+    wti_slots = equity_gradient_slot_caps(
+        variational_equity_usd=variational_equity,
+        lighter_equity_usd=lighter_equity,
+        child_notional_usd=child_notional,
+        tier_count=5,
+        max_equity_multiple=D("5"),
+    )
+    eth_slots = v4_real_gradient_slot_caps(
+        variational_equity_usd=variational_equity,
+        lighter_equity_usd=lighter_equity,
+        child_notional_usd=child_notional,
+        max_venue_leverage=D("5"),
+        tier_count=5,
+    )
+    assert wti_slots == tuple(eth_slots) == (6, 12, 19, 25, 32)
 
 
 def test_equity_capacity_rounding_never_exceeds_hard_cap_or_invents_missing_equity():

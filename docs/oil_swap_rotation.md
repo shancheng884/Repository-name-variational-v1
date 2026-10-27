@@ -31,15 +31,30 @@ state reconciliation are required before a position can be treated as flat or
 open.
 
 The ETH V4 live runner remains ETH-only. WTI never reads or reuses ETH market
-observations. Its five-tier gradient uses the same rolling, directional
-percentile method on WTI-only samples: a 7-day anchor, 97.5/98.25/99/99.5/99.8
-percentiles, and a 36-hour effective-history minimum. The existing 30/45 bps
-tiers remain hard floors; tiers three through five have strictly increasing
-floors and remain unavailable until history matures. Mature thresholds add the
-configured 10 bps roundtrip-cost and 1 bps exit-target reserve and cannot move
-below their floors. ETH and WTI must both be manually confirmed flat before the
-first supervised start; the WTI manager runtime independently reconciles its
-own venue positions and orders.
+observations. Both five-tier runners use the same directional percentile set
+(97.5/98.25/99/99.5/99.8), two-of-three unique baseline-sample confirmation,
+and one bounded tier-three-or-higher single-sample probe. WTI calibration is
+computed only from WTI data: a 7-day anchor, at least 100 samples and 36 hours
+of capped effective coverage for mature tiers, plus a 24-hour fast window that
+requires 100 samples and six hours of observed coverage before it can affect
+tier one. Gaps do not count as coverage. Tier spacing uses observed adjacent
+market noise; configured 30/45 bps floors and the existing roundtrip-cost and
+exit-target reserve remain hard lower bounds. Tiers three through five stay
+unavailable until the anchor history matures. Missing or unreadable threshold
+history blocks new WTI entries instead of silently substituting a lower profile;
+position management and risk exits remain active.
+
+After a WTI gradient candidate is confirmed, the executor obtains a fresh
+quantity-sized market context and independently rechecks the executable edge
+against the stricter of the tier threshold and confirmation threshold before it
+persists an order intent. If that check fails, it records a block and submits no
+leg. WTI's per-tier aggregate caps use the smaller fresh venue equity and round
+down to whole child slots, matching ETH's conservative capacity rounding. Each
+child remains capped at the configured notional. The optional single reserve
+child in tier one requires an additional 0.25 bps, a two-of-three confirmation,
+and the next tier's aggregate cap; it is disabled by default. ETH and WTI must
+both be manually confirmed flat before the first supervised start; the WTI
+manager runtime independently reconciles its own venue positions and orders.
 
 ## Read-Only Account Probe
 
@@ -146,15 +161,19 @@ layers in one exchange session and one completed paired roundtrip. Tier two
 retains its 45 bps hard floor; tiers three through five require mature rolling
 history and higher thresholds. Each child is capped at $20. Cumulative paired
 notional is capped at 1x through 5x the smaller fresh, verified venue equity;
-missing, stale, or inconsistent equity blocks additions. The persisted pilot
-config, attempt budget, exact-size fresh quotes, current session, account
-reconciliation, live account-risk checks, exit logic, and slippage limits remain
-enforced. An exit, risk block, session cutoff, sample gap, or execution
-uncertainty prevents adding a layer. A completed or exhausted pilot cannot be
-reset by restarting with altered settings. The history bypass flag, when used,
-skips only historical session/sample/coverage counts; instrument identity,
-verified-session and historical-gap evidence, real-time entry checks, live risk,
-and production-rotation approval are not bypassed.
+missing, stale, or inconsistent equity blocks additions. The optional
+`--gradient-elastic-capacity` switch is off by default and allows at most one
+additional tier-one child, never above tier two's aggregate equity cap. The
+persisted pilot config, attempt budget, exact-size fresh quotes, current session,
+account reconciliation, live account-risk checks, exit logic, and slippage
+limits remain enforced. An exit, risk block, session cutoff, sample gap, or
+execution uncertainty prevents adding a layer. A completed or exhausted pilot
+cannot be reset by restarting with altered settings. The history bypass flag,
+when used, skips only historical session/sample/coverage counts; instrument
+identity, verified-session and historical-gap evidence, real-time entry checks,
+live risk, and production-rotation approval are not bypassed. Offline
+`tools/wti_strategy_replay.py --compare-gradient` applies the same sample
+confirmation, tier gates, and caps; it never authorizes live orders.
 
 `tools/rotation_supervisor.py` coordinates the ETH/WTI handoff. Its default
 `--rehearse` mode is read-only. Live supervision requires both explicit

@@ -256,6 +256,9 @@ def test_full_open_close_uses_exact_contracts_reduce_only_and_confirmed_position
     assert closed["last_closed_position"]["actual_net_pnl_usd"] is None
     assert closed["last_closed_position"]["actual_net_pnl_status"] == "funding_unverified"
     assert closed["last_closed_position"]["funding_cashflow_confirmed"] is False
+    assert closed["last_closed_position"]["fee_evidence"]["all_leg_fees_confirmed_usd"] is True
+    assert closed["last_closed_position"]["fee_evidence"]["variational"]["entry"][0]["status"] == "confirmed_usd"
+    assert closed["last_closed_position"]["fee_evidence"]["lighter"]["exit"]["status"] == "confirmed_usd"
     assert closed["last_closed_position"]["entry_execution_id"]
     assert closed["last_closed_position"]["exit_execution_id"]
     assert len(gateway.requests) == 4
@@ -347,6 +350,34 @@ def test_gradient_aggregate_budget_never_overrides_executor_child_order_cap(tmp_
         qty = Decimal(request["qty"])
         assert qty == Decimal("0.28")
         assert qty * Decimal("70.1") * Decimal("1.0008") <= Decimal("20")
+
+
+def test_gradient_exact_refreshed_edge_below_threshold_blocks_before_any_submit(tmp_path):
+    row = _sample()
+    executor, gateway = _executor(tmp_path, sample=row)
+    pilot = executor.store.initialize_gradient_pilot(
+        market_id=145,
+        multiplier=Decimal("1"),
+        max_layers=2,
+        config={"tier_thresholds_bps": ["30", "45"], "layer_notional_usd": "10"},
+    )
+    state = executor.open(
+        sample=row,
+        direction=DIRECTION,
+        notional_usd=Decimal("10"),
+        session=_session_for_sample(row),
+        layer_id="exact-edge-check",
+        gradient_tier=1,
+        gradient_pilot_id=pilot["pilot_id"],
+        decision={"minimum_entry_edge_bps": "30", "confirmation_mode": "two_of_three"},
+    )
+
+    assert state["status"] == "flat"
+    assert state["pending_action"] is None
+    assert state["gradient_pilot"]["status"] == "available"
+    assert state["last_entry_block"]["reason"] == "gradient_exact_entry_edge_below_threshold"
+    assert Decimal(state["last_entry_block"]["exact_edge_bps"]) < Decimal("30")
+    assert gateway.requests == []
 
 
 def test_gradient_layer_adds_only_same_session_exposure_and_closes_as_aggregate(tmp_path):

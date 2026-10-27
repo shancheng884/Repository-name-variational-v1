@@ -1373,7 +1373,7 @@ def v4_real_gradient_slot_caps(
             int(
                 (
                     smaller_equity * Decimal(tier) / child_notional_usd
-                ).to_integral_value(rounding=ROUND_HALF_UP)
+                ).to_integral_value(rounding=ROUND_DOWN)
             ),
         )
         for tier in range(1, tier_count + 1)

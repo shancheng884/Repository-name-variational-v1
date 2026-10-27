@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 from tools.lib.hedge_instruments import WTI_HEDGE, paired_realized_pnl
+from tools.lib.gradient_entry_confirmation import update_gradient_entry_confirmation
 from tools.lib.market_sessions import session_observation_for_sample
 from tools.lib.wti_sizing import size_paired_layer
 from tools.lib.wti_replay import ReplayConfig, _decimal
@@ -159,6 +160,7 @@ def decide_wti_gradient_action(
     now: datetime | None = None,
     thresholds_by_direction: Mapping[str, Sequence[Decimal | None]] | None = None,
     aggregate_capacity_by_tier_usd: Sequence[Decimal] | None = None,
+    elastic_capacity_enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Apply strictly increasing, same-direction tiers within a durable pilot."""
     decision = decide_wti_action(row, position, config=config, now=now)
@@ -314,6 +316,12 @@ def decide_wti_gradient_action(
         return {"action": "hold", "reason": "gradient_threshold_profile_invalid"}
     if edge is None:
         return decision
+    elastic_enabled = (
+        bool(pilot.get("config", {}).get("elastic_capacity_enabled", False))
+        if elastic_capacity_enabled is None else bool(elastic_capacity_enabled)
+    )
+    elastic_capacity_addon = False
+    aggregate_cap_override: Decimal | None = None
     if tier_capacities is None:
         # Legacy pilots have one immutable child per tier; their restart
         # behavior is preserved while the live five-tier pilot uses equity slots.
@@ -341,15 +349,34 @@ def decide_wti_gradient_action(
         # current tier's remaining allowance. Waiting for an exact cap touch can
         # deadlock on exchange quantity steps and slippage padding.
         if current_notional + layer_notional >= current_cap:
-            tier += 1
+            elastic_already_used = any(
+                isinstance(item, dict) and item.get("elastic_capacity_addon") is True
+                for item in layers
+            )
+            elastic_threshold = active_thresholds[0]
+            can_use_elastic = (
+                elastic_enabled
+                and tier == 1
+                and not elastic_already_used
+                and len(tier_capacities) > 1
+                and tier_capacities[1] > current_notional + layer_notional
+                and elastic_threshold is not None
+                and edge >= elastic_threshold + Decimal("0.25")
+            )
+            if can_use_elastic:
+                elastic_capacity_addon = True
+                aggregate_cap_override = tier_capacities[1]
+            else:
+                tier += 1
             if tier > len(thresholds) or tier > pilot.get("max_layers", 0):
                 return {"action": "hold", "reason": "gradient_equity_position_cap_reached"}
-            tier_threshold = active_thresholds[tier - 1]
-            if tier_threshold is None:
-                return {"action": "hold", "reason": "gradient_threshold_history_not_mature"}
     if tier in pilot.get("exhausted_tiers", []):
         return decision
-    tier_threshold = active_thresholds[tier - 1]
+    tier_threshold = (
+        active_thresholds[0] + Decimal("0.25")
+        if elastic_capacity_addon and active_thresholds[0] is not None
+        else active_thresholds[tier - 1]
+    )
     if tier_threshold is None:
         return {"action": "hold", "reason": "gradient_threshold_history_not_mature"}
     if edge < tier_threshold:
@@ -366,8 +393,14 @@ def decide_wti_gradient_action(
             }
         return decision
     try:
-        cap = (tier_capacities[tier - 1] if tier_capacities is not None
-               else Decimal(str(pilot["config"]["max_notional_usd"])))
+        if tier_capacities is None:
+            cap = Decimal(str(pilot["config"]["max_notional_usd"]))
+        else:
+            cap = (
+                aggregate_cap_override
+                if aggregate_cap_override is not None
+                else tier_capacities[tier - 1]
+            )
         if cap <= 0:
             return {"action": "hold", "reason": "gradient_equity_capacity_unavailable"}
         multiplier = Decimal(str(position["multiplier"]))
@@ -423,6 +456,8 @@ def decide_wti_gradient_action(
         "reason": "gradient_tier_threshold_reached",
         "gradient_tier": tier,
         "layer_notional_usd": str(layer_notional),
+        **({"elastic_capacity_addon": True} if elastic_capacity_addon else {}),
+        "minimum_entry_edge_bps": str(tier_threshold),
         **({"aggregate_max_notional_usd": str(cap)} if tier_capacities is not None else {}),
         **({
             "effective_tier_thresholds_bps": {

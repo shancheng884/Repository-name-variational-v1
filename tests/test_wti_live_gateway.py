@@ -369,6 +369,32 @@ def test_variational_lookup_accepts_exact_native_match_and_explicit_fills():
     assert result["native_order_id"] == "ord-1"
     assert result["native_client_order_id"] == "rfq-123"
     assert result["fee_usd"] == "0.01"
+    assert result["fee_evidence"]["status"] == "confirmed_usd"
+    assert result["fee_evidence"]["native_order_id"] == "ord-1"
+    assert result["fee_evidence"]["raw_fields"]["fee_usd"] == "0.01"
+    gateway.loop.close()
+
+
+def test_variational_raw_fee_without_explicit_usd_unit_is_preserved_as_unverified():
+    submitted = datetime.now(timezone.utc).isoformat()
+    var = FakeVariational(orders=[{
+        "underlying": "USOILP", "side": "buy", "qty": "0.29",
+        "filled_qty": "0.29", "average_fill_price": "70.12",
+        "created_at": submitted, "rfq_id": "rfq-fee-raw", "order_id": "ord-fee-raw",
+        "status": "cleared", "fee": "0.00012", "fee_currency": "USDC",
+    }])
+    gateway = _gateway(var)
+
+    result = asyncio.run(gateway._lookup_variational("client-fee-raw", {
+        "venue": "variational", "side": "buy", "qty": "0.29",
+        "submitted_at": submitted, "rfq_id": "rfq-fee-raw",
+    }))
+
+    assert result["status"] == "filled"
+    assert result["fee_usd"] is None
+    assert result["fee_evidence"]["status"] == "unverified"
+    assert result["fee_evidence"]["raw_fields"]["fee"] == "0.00012"
+    assert result["fee_evidence"]["raw_fields"]["fee_currency"] == "USDC"
     gateway.loop.close()
 
 
@@ -753,6 +779,10 @@ def test_lighter_trade_fee_requires_exact_identity_and_explicit_usd(
         trade["ask_id"] == 123456 and trade["ask_account_id"] == 10
     )
     assert evidence["raw_fee_unit"] == "unverified"
+    assert evidence["raw_fee_fields"].get("maker_fee") == trade.get("maker_fee")
+    assert result["fee_evidence"]["status"] == (
+        "confirmed_usd" if expected_fee is not None else "unverified"
+    )
     assert result["trade_fill_coverage_complete"] is (
         trade["ask_id"] == 123456
         and trade["ask_account_id"] == 10
