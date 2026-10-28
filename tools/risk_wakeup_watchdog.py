@@ -1768,14 +1768,18 @@ class RiskWakeupWatchdog:
                     wti_health.get("entry_authorization_permanently_revoked") is True
                     and key.startswith("wti:account_risk:block_entry:")
                 )
-                recovered_lock_not_authorized = bool(
+                recovered_lock_not_ready = bool(
                     key == "wti:account_risk:block_entry:wti_entry_authorization_revoked"
-                    and wti_health.get("wti_entry_authorized") is not True
+                    and (
+                        wti_health.get("startup_reconciled") is not True
+                        or wti_health.get("account_read_recovery_required") is True
+                        or wti_health.get("risk_action") in {"force_reduce", "emergency_exit"}
+                    )
                 )
                 if not (
                     inactive_wti_flat
                     or fresh_runtime_health(wti_health, now, self.config.risk_heartbeat_max_age_seconds)
-                ) or unresolved_data or unresolved_lock or recovered_lock_not_authorized:
+                ) or unresolved_data or unresolved_lock or recovered_lock_not_ready:
                     record.pop("recovery_candidate_at", None)
                     continue
                 candidate = parse_time(record.get("recovery_candidate_at"))

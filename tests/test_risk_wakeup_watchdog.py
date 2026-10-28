@@ -151,7 +151,10 @@ def isolated_watchdog_paths(tmp_path):
     }
 
 
-def write_wti_notification_health(tmp_path, now, *, reason="account_risk_normal", revoked=False):
+def write_wti_notification_health(
+    tmp_path, now, *, reason="account_risk_normal", revoked=False,
+    startup_reconciled=True, account_recovery=False,
+):
     write_json(tmp_path / "state.json", {
         "asset": "ETH", "status": "flat", "open_lots": [], "pending_actions": [],
     })
@@ -171,6 +174,8 @@ def write_wti_notification_health(tmp_path, now, *, reason="account_risk_normal"
         "entry_authorization_permanently_revoked": revoked,
         "entry_gate_block_reason": "wti_strategy_cycle_requires_review" if revoked else None,
         "wti_entry_authorized": not revoked and reason == "account_risk_normal",
+        "startup_reconciled": startup_reconciled,
+        "account_read_recovery_required": account_recovery,
         "market_sample_fresh": reason == "account_risk_normal",
     })
 
@@ -241,30 +246,31 @@ def test_wti_permanent_lock_reason_change_never_sends_false_recovery(tmp_path):
     current[0] += timedelta(seconds=10)
     write_wti_notification_health(
         tmp_path, current[0], reason="account_risk_normal", revoked=False,
+        startup_reconciled=False, account_recovery=True,
     )
     watchdog.run_once()
-    # A cleared lock is not enough: entry authorization must also be healthy.
-    write_json(tmp_path / "wti-risk.json", {
-        **json.loads((tmp_path / "wti-risk.json").read_text()),
-        "wti_entry_authorized": False,
-    })
     current[0] += timedelta(seconds=35)
     write_wti_notification_health(
         tmp_path, current[0], reason="account_risk_normal", revoked=False,
+        startup_reconciled=False, account_recovery=True,
     )
-    write_json(tmp_path / "wti-risk.json", {
-        **json.loads((tmp_path / "wti-risk.json").read_text()),
-        "wti_entry_authorized": False,
-    })
     watchdog.run_once()
     assert key in watchdog.memory["active_incidents"]
     assert len(watchdog.telegram.sent) == 1
 
     current[0] += timedelta(seconds=5)
     write_wti_notification_health(tmp_path, current[0], reason="account_risk_normal")
+    write_json(tmp_path / "wti-risk.json", {
+        **json.loads((tmp_path / "wti-risk.json").read_text()),
+        "wti_entry_authorized": False,
+    })
     watchdog.run_once()
     current[0] += timedelta(seconds=31)
     write_wti_notification_health(tmp_path, current[0], reason="account_risk_normal")
+    write_json(tmp_path / "wti-risk.json", {
+        **json.loads((tmp_path / "wti-risk.json").read_text()),
+        "wti_entry_authorized": False,
+    })
     watchdog.run_once()
     assert key not in watchdog.memory["active_incidents"]
     assert len(watchdog.telegram.sent) == 2
