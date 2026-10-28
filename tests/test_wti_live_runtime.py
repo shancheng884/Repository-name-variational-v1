@@ -861,6 +861,92 @@ def test_runtime_revokes_entry_after_sample_gap_without_reprocessing_same_id():
     assert runtime._record_new_sample(_live_sample(now, sample_id="sample-2")) is None
 
 
+@pytest.mark.parametrize("reopen_delay_seconds, expected_gap_seconds, revoked", [
+    (20, 30, False),
+    (190, 200, True),
+])
+def test_runtime_counts_only_verified_scheduled_closure_out_of_sample_gap(
+    reopen_delay_seconds, expected_gap_seconds, revoked,
+):
+    now = datetime.now(timezone.utc)
+    current_open = now - timedelta(seconds=reopen_delay_seconds)
+    previous_close = current_open - timedelta(hours=1)
+    previous_open = previous_close - timedelta(hours=23)
+    current_close = now + timedelta(hours=8)
+    previous_id = f"{previous_open.isoformat()}|{previous_close.isoformat()}"
+    current_id = f"{current_open.isoformat()}|{current_close.isoformat()}"
+    schedule = [
+        {"open": previous_open.isoformat(), "close": previous_close.isoformat()},
+        {"open": current_open.isoformat(), "close": current_close.isoformat()},
+    ]
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.last_seen_sample_id = "previous"
+    runtime.last_processed_sample_id = "previous"
+    runtime.last_processed_sample_at = now - timedelta(hours=1, seconds=10 + reopen_delay_seconds)
+    runtime.last_baseline_sample_id = "previous"
+    runtime.last_baseline_sample_at = previous_close - timedelta(seconds=10)
+    runtime.last_baseline_session_id = previous_id
+    runtime.last_baseline_session_closing_at = previous_close
+    runtime.last_baseline_trading_sessions = schedule
+    runtime.last_validated_session_id = previous_id
+    runtime.collector = SimpleNamespace(trading_sessions=schedule)
+    runtime.last_sample_gap_seconds = None
+    runtime.entry_authorized = True
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.entry_gate_block_reason = None
+    runtime.pending_gap_exit = False
+    runtime.last_action = {}
+
+    sample = _live_sample(now, sample_id="after-reopen")
+    sample.update({
+        "session_id": current_id,
+        "session_closing_at": current_close.isoformat(),
+    })
+    assert runtime._record_new_sample(sample) is True
+    assert runtime.last_sample_gap_seconds == pytest.approx(expected_gap_seconds)
+    assert runtime.entry_authorization_permanently_revoked is revoked
+    assert runtime.pending_gap_exit is revoked
+
+
+def test_runtime_does_not_exempt_session_gap_without_adjacent_schedule_evidence():
+    now = datetime.now(timezone.utc)
+    current_open = now - timedelta(seconds=20)
+    previous_close = current_open - timedelta(hours=1)
+    previous_open = previous_close - timedelta(hours=23)
+    current_close = now + timedelta(hours=8)
+    previous_id = f"{previous_open.isoformat()}|{previous_close.isoformat()}"
+    current_id = f"{current_open.isoformat()}|{current_close.isoformat()}"
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.last_seen_sample_id = "previous"
+    runtime.last_processed_sample_id = "previous"
+    runtime.last_processed_sample_at = now - timedelta(hours=1, seconds=30)
+    runtime.last_baseline_sample_at = previous_close - timedelta(seconds=10)
+    runtime.last_baseline_session_id = previous_id
+    runtime.last_baseline_session_closing_at = previous_close
+    intermediate_open = previous_close + timedelta(minutes=10)
+    intermediate_close = previous_close + timedelta(minutes=30)
+    runtime.last_baseline_trading_sessions = [
+        {"open": previous_open.isoformat(), "close": previous_close.isoformat()},
+        {"open": intermediate_open.isoformat(), "close": intermediate_close.isoformat()},
+        {"open": current_open.isoformat(), "close": current_close.isoformat()},
+    ]
+    runtime.last_validated_session_id = previous_id
+    runtime.collector = SimpleNamespace(trading_sessions=runtime.last_baseline_trading_sessions)
+    runtime.last_sample_gap_seconds = None
+    runtime.entry_authorized = True
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.entry_gate_block_reason = None
+    runtime.pending_gap_exit = False
+    runtime.last_action = {}
+    sample = _live_sample(now, sample_id="after-reopen")
+    sample.update({"session_id": current_id, "session_closing_at": current_close.isoformat()})
+
+    assert runtime._record_new_sample(sample) is True
+    assert runtime.last_sample_gap_seconds > 120
+    assert runtime.entry_authorization_permanently_revoked is True
+    assert runtime.pending_gap_exit is True
+
+
 def test_execution_burst_does_not_reset_baseline_gap_clock():
     now = datetime.now(timezone.utc)
     runtime = object.__new__(wti_live.WTILiveRuntime)
@@ -1607,7 +1693,10 @@ def _runtime_with_real_executor(tmp_path, collector, gateway, *, gradient=False)
     return runtime
 
 
-def test_transient_account_read_recovers_only_after_two_verified_snapshots_without_orders(tmp_path):
+@pytest.mark.parametrize("permanent_lock", [False, True])
+def test_transient_account_read_recovers_only_after_two_verified_snapshots_without_orders(
+    tmp_path, permanent_lock,
+):
     class RecoveringGateway(_FlatLoopGateway):
         def __init__(self):
             super().__init__()
@@ -1635,6 +1724,10 @@ def test_transient_account_read_recovers_only_after_two_verified_snapshots_witho
 
     gateway = RecoveringGateway()
     runtime = _runtime_with_real_executor(tmp_path, Collector(), gateway)
+    runtime.entry_authorization_permanently_revoked = permanent_lock
+    runtime.entry_gate_block_reason = (
+        "wti_entry_authorization_revoked_after_sample_gap" if permanent_lock else None
+    )
     first = Collector.latest_sample
 
     first_state = asyncio.run(runtime._read_reconcile(first))
@@ -1642,7 +1735,9 @@ def test_transient_account_read_recovers_only_after_two_verified_snapshots_witho
     assert gateway.attempts == 2  # one bounded retry, read-only only
     assert runtime.account_read_recovery_required is True
     assert runtime.account_read_recovery_verified_snapshots == 1
-    assert runtime.entry_authorization_permanently_revoked is False
+    assert runtime.entry_authorization_permanently_revoked is permanent_lock
+    if permanent_lock:
+        assert runtime.entry_gate_block_reason == "wti_entry_authorization_revoked_after_sample_gap"
     assert runtime.entry_authorized is False
     assert first_state["account_read_recovery"]["required"] is True
     assert gateway.attempts == 2
@@ -1658,7 +1753,13 @@ def test_transient_account_read_recovers_only_after_two_verified_snapshots_witho
     assert runtime.account_read_recovery_cycle_blocked is True
     assert runtime.startup_reconciled is True
     assert runtime.entry_authorized is False
-    assert runtime.last_action["reason"] == "wti_account_read_recovery_confirmed_next_sample_required"
+    assert runtime.last_action["reason"] == (
+        "wti_account_read_recovery_confirmed_entry_remains_locked"
+        if permanent_lock else "wti_account_read_recovery_confirmed_next_sample_required"
+    )
+    assert runtime.entry_authorization_permanently_revoked is permanent_lock
+    if permanent_lock:
+        assert runtime.entry_gate_block_reason == "wti_entry_authorization_revoked_after_sample_gap"
     assert "account_read_recovery" not in second_state
     assert second_state["pending_action"] is None
     assert second_state["execution_history"] == []

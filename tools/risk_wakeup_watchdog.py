@@ -177,25 +177,29 @@ def wti_notification_health(health: dict[str, Any]) -> dict[str, Any]:
     if health.get("risk_action") in {"force_reduce", "emergency_exit"}:
         return result
     account_action = health.get("account_risk_action")
+    if account_action in {"force_reduce", "emergency_exit"}:
+        result["risk_notification_action"] = account_action
+        result["risk_notification_reason"] = health.get("account_risk_reason")
+        result["risk_action"] = account_action
+        result["risk_reason"] = health.get("account_risk_reason")
+        return result
+    if health.get("entry_authorization_permanently_revoked") is True:
+        result["risk_notification_action"] = "block_entry"
+        result["risk_notification_reason"] = "wti_entry_authorization_revoked"
+        return result
     if account_action in {"warning", "block_entry", "force_reduce", "emergency_exit"}:
         result["risk_notification_action"] = account_action
         result["risk_notification_reason"] = health.get("account_risk_reason")
-        if account_action in {"force_reduce", "emergency_exit"}:
-            result["risk_action"] = account_action
-            result["risk_reason"] = health.get("account_risk_reason")
-    elif health.get("entry_authorization_permanently_revoked") is True:
-        result["risk_notification_action"] = "block_entry"
-        result["risk_notification_reason"] = (
-            health.get("entry_gate_block_reason") or "wti_entry_authorization_revoked"
-        )
     elif health.get("risk_reason") in WTI_MARKET_DATA_NOTIFICATION_REASONS:
         result["risk_notification_action"] = "block_entry"
         result["risk_notification_reason"] = "wti_market_data_unavailable"
     return result
 
 
-def canonical_wti_incident_key(key: str) -> str:
+def canonical_wti_incident_key(key: str, *, permanent_entry_lock: bool = False) -> str:
     prefix = "wti:account_risk:block_entry:"
+    if permanent_entry_lock and key.startswith(prefix):
+        return prefix + "wti_entry_authorization_revoked"
     if key.startswith(prefix) and key[len(prefix):] in WTI_MARKET_DATA_NOTIFICATION_REASONS:
         return prefix + "wti_market_data_unavailable"
     return key
@@ -913,7 +917,9 @@ class RiskWakeupWatchdog:
         self._migrate_wti_notification_memory()
         self.stop_requested = False
 
-    def _migrate_wti_notification_memory(self) -> None:
+    def _migrate_wti_notification_memory(
+        self, *, permanent_entry_lock: bool = False,
+    ) -> None:
         active = self.memory["active_incidents"]
         for key in list(active):
             record = active[key]
@@ -921,7 +927,9 @@ class RiskWakeupWatchdog:
                 continue
             if record.get("severity") != "warning":
                 continue
-            canonical = canonical_wti_incident_key(key)
+            canonical = canonical_wti_incident_key(
+                key, permanent_entry_lock=permanent_entry_lock,
+            )
             signature = hashlib.sha256(
                 f"warning\nWTI:{canonical[4:]}".encode("utf-8")
             ).hexdigest()[:16]
@@ -939,7 +947,9 @@ class RiskWakeupWatchdog:
                     active[canonical] = record
         deadlines = self.memory["incident_rearm_until"]
         for key in list(deadlines):
-            canonical = canonical_wti_incident_key(key)
+            canonical = canonical_wti_incident_key(
+                key, permanent_entry_lock=permanent_entry_lock,
+            )
             if canonical != key:
                 deadline = parse_time(deadlines.pop(key))
                 existing = parse_time(deadlines.get(canonical))
@@ -1534,6 +1544,11 @@ class RiskWakeupWatchdog:
                     strategy_running=strategy_running, config=self.config, now=now,
                 )
             if wti_state_raw or wti_health:
+                self._migrate_wti_notification_memory(
+                    permanent_entry_lock=(
+                        wti_health.get("entry_authorization_permanently_revoked") is True
+                    ),
+                )
                 open_position = wti_state_raw.get("open_position")
                 pending_action = wti_state_raw.get("pending_action")
                 wti_pending: list[dict[str, Any]] = []
@@ -1751,12 +1766,16 @@ class RiskWakeupWatchdog:
                 } and wti_health.get("market_sample_fresh") is not True
                 unresolved_lock = bool(
                     wti_health.get("entry_authorization_permanently_revoked") is True
-                    and key.endswith(":" + str(wti_health.get("entry_gate_block_reason") or "wti_entry_authorization_revoked"))
+                    and key.startswith("wti:account_risk:block_entry:")
+                )
+                recovered_lock_not_authorized = bool(
+                    key == "wti:account_risk:block_entry:wti_entry_authorization_revoked"
+                    and wti_health.get("wti_entry_authorized") is not True
                 )
                 if not (
                     inactive_wti_flat
                     or fresh_runtime_health(wti_health, now, self.config.risk_heartbeat_max_age_seconds)
-                ) or unresolved_data or unresolved_lock:
+                ) or unresolved_data or unresolved_lock or recovered_lock_not_authorized:
                     record.pop("recovery_candidate_at", None)
                     continue
                 candidate = parse_time(record.get("recovery_candidate_at"))

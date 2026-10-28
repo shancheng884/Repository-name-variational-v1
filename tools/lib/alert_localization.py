@@ -19,7 +19,7 @@ ACTION_LABELS = {
 
 REASON_LABELS = {
     "wti_strategy_cycle_requires_review": "WTI 策略循环发生异常，开仓授权已锁定，需人工复核",
-    "wti_entry_authorization_revoked": "WTI 开仓授权已撤销，需人工复核",
+    "wti_entry_authorization_revoked": "WTI 开仓授权已锁定，需人工复核",
     "wti_entry_authorization_revoked_after_sample_gap": "WTI 样本断档，开仓授权已锁定",
     "wti_market_data_unavailable": "WTI 行情或交易时段证据未满足实时风控，等待刷新确认",
     "wti_current_sample_or_session_not_fresh": "WTI 当前行情或交易时段证据已过期",

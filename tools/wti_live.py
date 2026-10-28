@@ -442,6 +442,8 @@ class WTILiveRuntime:
         self.last_baseline_sample_id: str | None = None
         self.last_baseline_sample_at: datetime | None = None
         self.last_baseline_session_id: str | None = None
+        self.last_baseline_session_closing_at: datetime | None = None
+        self.last_baseline_trading_sessions: list[dict[str, Any]] = []
         self.last_validated_session_id: str | None = None
         self.last_execution_sample_id: str | None = None
         self.last_execution_sample_at: datetime | None = None
@@ -1384,6 +1386,89 @@ class WTILiveRuntime:
         self.entry_gate_block_reason = reason
         self.entry_authorization_permanently_revoked = True
 
+    @staticmethod
+    def _session_id_bounds(session_id: Any) -> tuple[datetime, datetime] | None:
+        try:
+            opened_text, closed_text = str(session_id).split("|", 1)
+            opened = datetime.fromisoformat(opened_text.replace("Z", "+00:00"))
+            closed = datetime.fromisoformat(closed_text.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if (
+            opened.tzinfo is None or opened.utcoffset() is None
+            or closed.tzinfo is None or closed.utcoffset() is None
+        ):
+            return None
+        opened = opened.astimezone(timezone.utc)
+        closed = closed.astimezone(timezone.utc)
+        return (opened, closed) if closed > opened else None
+
+    @classmethod
+    def _verified_scheduled_closure_seconds(
+        cls,
+        *,
+        previous_sample_at: datetime,
+        sample_at: datetime,
+        previous_session_id: str | None,
+        current_session_id: str | None,
+        previous_closing_at: datetime | None,
+        current_closing_at: datetime | None,
+        previous_schedule: list[dict[str, Any]],
+        current_schedule: list[dict[str, Any]],
+    ) -> float:
+        """Exclude a closed interval only when one API schedule proves adjacency."""
+        previous = cls._session_id_bounds(previous_session_id)
+        current = cls._session_id_bounds(current_session_id)
+        if (
+            previous is None or current is None or previous == current
+            or previous_closing_at is None or current_closing_at is None
+        ):
+            return 0.0
+        previous_open, previous_close = previous
+        current_open, current_close = current
+        previous_closing_at = previous_closing_at.astimezone(timezone.utc)
+        current_closing_at = current_closing_at.astimezone(timezone.utc)
+        if (
+            abs((previous_close - previous_closing_at).total_seconds()) > 1
+            or abs((current_close - current_closing_at).total_seconds()) > 1
+            or previous_sample_at > previous_close
+            or sample_at < current_open
+            or current_open < previous_close
+        ):
+            return 0.0
+
+        for schedule in (previous_schedule, current_schedule):
+            if not isinstance(schedule, list):
+                continue
+            intervals: set[tuple[datetime, datetime]] = set()
+            for item in schedule:
+                if not isinstance(item, dict):
+                    intervals.clear()
+                    break
+                try:
+                    opened = datetime.fromisoformat(
+                        str(item.get("open")).replace("Z", "+00:00")
+                    )
+                    closed = datetime.fromisoformat(
+                        str(item.get("close")).replace("Z", "+00:00")
+                    )
+                except (TypeError, ValueError):
+                    intervals.clear()
+                    break
+                if (
+                    opened.tzinfo is None or opened.utcoffset() is None
+                    or closed.tzinfo is None or closed.utcoffset() is None
+                    or closed <= opened
+                ):
+                    intervals.clear()
+                    break
+                intervals.add((opened.astimezone(timezone.utc), closed.astimezone(timezone.utc)))
+            ordered = sorted(intervals)
+            for index, interval in enumerate(ordered[:-1]):
+                if interval == previous and ordered[index + 1] == current:
+                    return max(0.0, (current_open - previous_close).total_seconds())
+        return 0.0
+
     def _record_new_sample(self, row: dict[str, Any]) -> bool | None:
         sample_id = str(row.get("sample_id") or "")
         if not sample_id or sample_id in {
@@ -1425,6 +1510,7 @@ class WTILiveRuntime:
             sample_at = sample_at.astimezone(timezone.utc)
             observation = session_observation_for_sample(row)
             current_session_id = observation.session_id if observation else None
+            previous_session_id = getattr(self, "last_baseline_session_id", None)
             is_execution_refresh = row.get("sample_kind", "baseline") == "burst"
             if is_execution_refresh:
                 self.last_execution_sample_id = sample_id
@@ -1432,9 +1518,27 @@ class WTILiveRuntime:
             else:
                 previous_baseline_at = getattr(self, "last_baseline_sample_at", None)
                 if previous_baseline_at is not None:
+                    current_schedule = list(
+                        getattr(getattr(self, "collector", None), "trading_sessions", []) or []
+                    )
+                    current_closing_at = observation.closing_at if observation else None
+                    closed_seconds = self._verified_scheduled_closure_seconds(
+                        previous_sample_at=previous_baseline_at,
+                        sample_at=sample_at,
+                        previous_session_id=previous_session_id,
+                        current_session_id=current_session_id,
+                        previous_closing_at=getattr(
+                            self, "last_baseline_session_closing_at", None
+                        ),
+                        current_closing_at=current_closing_at,
+                        previous_schedule=getattr(
+                            self, "last_baseline_trading_sessions", []
+                        ),
+                        current_schedule=current_schedule,
+                    )
                     self.last_sample_gap_seconds = (
                         sample_at - previous_baseline_at
-                    ).total_seconds()
+                    ).total_seconds() - closed_seconds
                     if (
                         self.last_sample_gap_seconds < 0
                         or self.last_sample_gap_seconds > MAX_WTI_ENTRY_GAP_SECONDS
@@ -1444,12 +1548,17 @@ class WTILiveRuntime:
                         self._revoke_entry_authorization(
                             "wti_entry_authorization_revoked_after_sample_gap"
                         )
-                previous_session_id = getattr(self, "last_baseline_session_id", None)
                 if previous_session_id and current_session_id != previous_session_id:
                     self._reset_gradient_confirmation()
                 self.last_baseline_sample_id = sample_id
                 self.last_baseline_sample_at = sample_at
                 self.last_baseline_session_id = current_session_id
+                self.last_baseline_session_closing_at = (
+                    observation.closing_at if observation else None
+                )
+                self.last_baseline_trading_sessions = list(
+                    getattr(getattr(self, "collector", None), "trading_sessions", []) or []
+                )
             previous_session_id = getattr(self, "last_validated_session_id", None)
             if previous_session_id and current_session_id != previous_session_id:
                 self._reset_gradient_confirmation()
@@ -1895,12 +2004,22 @@ class WTILiveRuntime:
                 if recovered and persisted:
                     state.pop("account_read_recovery", None)
                     self.account_read_recovery_required = False
-                    self.entry_gate_block_reason = None
+                    if self.entry_authorization_permanently_revoked:
+                        self.entry_authorized = False
+                        self.entry_gate_block_reason = (
+                            self.entry_gate_block_reason or "wti_entry_authorization_revoked"
+                        )
+                    else:
+                        self.entry_gate_block_reason = None
                     self.startup_reconciled = True
                     self.last_runtime_error = None
                     self.last_action = {
                         "action": "blocked_entry",
-                        "reason": "wti_account_read_recovery_confirmed_next_sample_required",
+                        "reason": (
+                            "wti_account_read_recovery_confirmed_entry_remains_locked"
+                            if self.entry_authorization_permanently_revoked
+                            else "wti_account_read_recovery_confirmed_next_sample_required"
+                        ),
                     }
                 else:
                     if recovered and not persisted:
@@ -1908,7 +2027,8 @@ class WTILiveRuntime:
                             ACCOUNT_READ_RECOVERY_REQUIRED_SNAPSHOTS - 1
                         )
                     self.entry_authorized = False
-                    self.entry_gate_block_reason = "wti_account_read_recovery_pending"
+                    if not self.entry_authorization_permanently_revoked:
+                        self.entry_gate_block_reason = "wti_account_read_recovery_pending"
                     self.startup_reconciled = False
                     self.last_action = {
                         "action": "blocked_entry",
@@ -1919,7 +2039,8 @@ class WTILiveRuntime:
                 self.account_read_recovery_verified_snapshots = 0
                 self.account_read_recovery_snapshot_verified = False
                 self.entry_authorized = False
-                self.entry_gate_block_reason = "wti_account_read_recovery_pending"
+                if not self.entry_authorization_permanently_revoked:
+                    self.entry_gate_block_reason = "wti_account_read_recovery_pending"
                 self.startup_reconciled = False
                 self.last_action = {
                     "action": "blocked_entry",
@@ -1941,7 +2062,6 @@ class WTILiveRuntime:
         if (
             not exc.retryable
             or exc.phase not in ACCOUNT_READ_RECOVERY_PHASES
-            or getattr(self, "entry_authorization_permanently_revoked", False)
             or not _safe_account_recovery_state(state)
         ):
             return False
@@ -1957,7 +2077,8 @@ class WTILiveRuntime:
         self.account_read_recovery_snapshot_verified = False
         self.account_read_recovery_cycle_blocked = True
         self.last_account_read_failure = diagnostic[:160]
-        self.entry_gate_block_reason = "wti_account_read_recovery_pending"
+        if not getattr(self, "entry_authorization_permanently_revoked", False):
+            self.entry_gate_block_reason = "wti_account_read_recovery_pending"
         self.last_action = {
             "action": "blocked_entry",
             "reason": "wti_account_read_recovery_pending",

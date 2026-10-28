@@ -170,6 +170,7 @@ def write_wti_notification_health(tmp_path, now, *, reason="account_risk_normal"
         "account_risk_action": "normal", "account_risk_reason": "account_risk_normal",
         "entry_authorization_permanently_revoked": revoked,
         "entry_gate_block_reason": "wti_strategy_cycle_requires_review" if revoked else None,
+        "wti_entry_authorized": not revoked and reason == "account_risk_normal",
         "market_sample_fresh": reason == "account_risk_normal",
     })
 
@@ -204,10 +205,10 @@ def test_wti_short_freshness_pulses_do_not_recover_or_realert(tmp_path):
 def test_wti_permanent_entry_lock_is_not_recovered_when_quote_freshness_changes(tmp_path):
     current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
     watchdog = wti_notification_watchdog(tmp_path, current)
-    key = "wti:account_risk:block_entry:wti_strategy_cycle_requires_review"
+    key = "wti:account_risk:block_entry:wti_entry_authorization_revoked"
     for reason in (
         "wti_strategy_cycle_requires_review", "wti_current_sample_or_session_not_fresh",
-        "wti_sample_or_session_unverified", "account_risk_normal",
+        "wti_sample_or_session_unverified", "wti_account_read_recovery_pending",
     ):
         write_wti_notification_health(tmp_path, current[0], reason=reason, revoked=True)
         watchdog.run_once()
@@ -217,6 +218,69 @@ def test_wti_permanent_entry_lock_is_not_recovered_when_quote_freshness_changes(
     assert "开仓授权已锁定" in watchdog.telegram.sent[0][0]
     assert "未分类" not in watchdog.telegram.sent[0][0]
     assert json.loads((tmp_path / "wti-risk.json").read_text())["entry_authorization_permanently_revoked"] is True
+
+
+def test_wti_permanent_lock_reason_change_never_sends_false_recovery(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    key = "wti:account_risk:block_entry:wti_entry_authorization_revoked"
+    write_wti_notification_health(
+        tmp_path, current[0], reason="wti_entry_authorization_revoked_after_sample_gap",
+        revoked=True,
+    )
+    watchdog.run_once()
+    current[0] += timedelta(seconds=10)
+    write_wti_notification_health(
+        tmp_path, current[0], reason="wti_strategy_cycle_requires_review", revoked=True,
+    )
+    watchdog.run_once()
+    assert list(watchdog.memory["active_incidents"]) == [key]
+    assert len(watchdog.telegram.sent) == 1
+    assert not any("风险监控已恢复" in text for text, _ in watchdog.telegram.sent)
+
+    current[0] += timedelta(seconds=10)
+    write_wti_notification_health(
+        tmp_path, current[0], reason="account_risk_normal", revoked=False,
+    )
+    watchdog.run_once()
+    # A cleared lock is not enough: entry authorization must also be healthy.
+    write_json(tmp_path / "wti-risk.json", {
+        **json.loads((tmp_path / "wti-risk.json").read_text()),
+        "wti_entry_authorized": False,
+    })
+    current[0] += timedelta(seconds=35)
+    write_wti_notification_health(
+        tmp_path, current[0], reason="account_risk_normal", revoked=False,
+    )
+    write_json(tmp_path / "wti-risk.json", {
+        **json.loads((tmp_path / "wti-risk.json").read_text()),
+        "wti_entry_authorized": False,
+    })
+    watchdog.run_once()
+    assert key in watchdog.memory["active_incidents"]
+    assert len(watchdog.telegram.sent) == 1
+
+    current[0] += timedelta(seconds=5)
+    write_wti_notification_health(tmp_path, current[0], reason="account_risk_normal")
+    watchdog.run_once()
+    current[0] += timedelta(seconds=31)
+    write_wti_notification_health(tmp_path, current[0], reason="account_risk_normal")
+    watchdog.run_once()
+    assert key not in watchdog.memory["active_incidents"]
+    assert len(watchdog.telegram.sent) == 2
+    assert "风险监控已恢复" in watchdog.telegram.sent[-1][0]
+
+
+def test_wti_permanent_lock_does_not_mask_account_emergency_action():
+    result = watchdog_module.wti_notification_health({
+        "risk_action": "normal",
+        "entry_authorization_permanently_revoked": True,
+        "account_risk_action": "emergency_exit",
+        "account_risk_reason": "maintenance_margin_usage_emergency",
+    })
+    assert result["risk_action"] == "emergency_exit"
+    assert result["risk_notification_action"] == "emergency_exit"
+    assert result["risk_notification_reason"] == "maintenance_margin_usage_emergency"
 
 
 def test_wti_confirmed_recovery_and_namespaced_cooldown_survive_restart(tmp_path):
@@ -280,7 +344,7 @@ def test_wti_acknowledged_lock_does_not_realert_after_watchdog_restart(tmp_path)
     watchdog = wti_notification_watchdog(tmp_path, current)
     write_wti_notification_health(tmp_path, current[0], revoked=True)
     watchdog.run_once()
-    key = "wti:account_risk:block_entry:wti_strategy_cycle_requires_review"
+    key = "wti:account_risk:block_entry:wti_entry_authorization_revoked"
     record = watchdog.memory["active_incidents"][key]
     record["acknowledged_at"] = current[0].isoformat()
     record["acknowledged_signature"] = record["incident_signature"]
@@ -292,6 +356,37 @@ def test_wti_acknowledged_lock_does_not_realert_after_watchdog_restart(tmp_path)
     write_wti_notification_health(tmp_path, current[0], reason="wti_sample_or_session_unverified", revoked=True)
     watchdog.run_once()
     assert watchdog.memory["active_incidents"][key]["acknowledged_at"]
+    assert len(telegram.sent) == 1
+
+
+def test_wti_permanent_lock_migrates_legacy_incident_without_duplicate_alert(tmp_path):
+    current = [datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    write_wti_notification_health(tmp_path, current[0], revoked=True)
+    watchdog.run_once()
+    stable_key = "wti:account_risk:block_entry:wti_entry_authorization_revoked"
+    legacy_key = "wti:account_risk:block_entry:wti_strategy_cycle_requires_review"
+    record = watchdog.memory["active_incidents"].pop(stable_key)
+    legacy_signature = "legacy-entry-lock-signature"
+    record["incident_signature"] = legacy_signature
+    record["acknowledged_at"] = current[0].isoformat()
+    record["acknowledged_signature"] = legacy_signature
+    watchdog.memory["active_incidents"][legacy_key] = record
+    watchdog._persist(now=current[0])
+    telegram = watchdog.telegram
+
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    watchdog.telegram = telegram
+    current[0] += timedelta(seconds=10)
+    write_wti_notification_health(
+        tmp_path, current[0], reason="wti_account_read_recovery_pending", revoked=True,
+    )
+    watchdog.run_once()
+
+    migrated = watchdog.memory["active_incidents"]
+    assert list(migrated) == [stable_key]
+    assert migrated[stable_key]["acknowledged_at"]
+    assert migrated[stable_key]["acknowledged_signature"] == migrated[stable_key]["incident_signature"]
     assert len(telegram.sent) == 1
 
 
@@ -333,7 +428,7 @@ def test_wti_lock_does_not_fake_market_recovery_or_inactive_eth_recovery(tmp_pat
         write_wti_notification_health(tmp_path, current[0], reason="wti_current_sample_or_session_not_fresh", revoked=True)
         watchdog.run_once()
     assert "strategy_stopped_flat" not in watchdog.memory["active_incidents"]
-    assert "wti:account_risk:block_entry:wti_market_data_unavailable" in watchdog.memory["active_incidents"]
+    assert "wti:account_risk:block_entry:wti_entry_authorization_revoked" in watchdog.memory["active_incidents"]
     assert not any("风险监控已恢复" in text for text, _ in watchdog.telegram.sent)
 
 
