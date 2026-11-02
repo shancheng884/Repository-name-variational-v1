@@ -50,6 +50,9 @@ class WatchState:
     closed: set[tuple[str, str]] = field(default_factory=set)
     qualified_total: int = 0
     closed_total: int = 0
+    # Byte offset already consumed, so a restart resumes instead of skipping
+    # whatever happened while the watcher was down.
+    offset: int = 0
 
     def observe(
         self, row: dict[str, Any], *, now: datetime | None = None
@@ -99,6 +102,7 @@ class WatchState:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "qualified_total": self.qualified_total,
             "closed_total": self.closed_total,
+            "offset": self.offset,
             "qualified": [
                 {
                     "run_id": run_id,
@@ -135,6 +139,7 @@ class WatchState:
         try:
             state.qualified_total = int(payload.get("qualified_total") or 0)
             state.closed_total = int(payload.get("closed_total") or 0)
+            state.offset = int(payload.get("offset") or 0)
         except (TypeError, ValueError):
             pass
         return state

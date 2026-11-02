@@ -68,9 +68,13 @@ def main(argv: list[str] | None = None) -> int:
 
     metrics = Path(args.metrics)
     state = load_state(args.state)
-    offset = 0 if args.replay_from_start else (
-        metrics.stat().st_size if metrics.exists() else 0
-    )
+    if args.replay_from_start:
+        offset = 0
+    else:
+        size = metrics.stat().st_size if metrics.exists() else 0
+        # Resume where the previous run stopped; a truncated file means the
+        # saved offset belongs to a rotation that already happened.
+        offset = state.offset if 0 < state.offset <= size else size
     started_at = datetime.now(timezone.utc).isoformat()
     _append(args.log, f"{started_at} WATCH_START offset={offset} pid={os.getpid()}")
 
@@ -112,7 +116,8 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             errors += 1
             _append(args.log, f"{datetime.now(timezone.utc).isoformat()} ERROR {type(exc).__name__}:{exc}")
-        if dirty:
+        if dirty or state.offset != offset:
+            state.offset = offset
             try:
                 save_state(args.state, state)
             except OSError:
@@ -142,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
             last_health = now
         time.sleep(args.interval_seconds)
     try:
+        state.offset = offset
         save_state(args.state, state)
         _write_json(
             args.health,

@@ -113,3 +113,13 @@ def test_qualified_format_matches_the_heartbeat_grep():
     line = format_event(event)
     assert line.startswith("QUALIFIED lot=1 pnl=4")
     assert "thr=3.5" in line
+
+def test_state_remembers_the_byte_offset_so_a_restart_resumes(tmp_path):
+    state = WatchState()
+    state.offset = 1234
+    path = tmp_path / "state.json"
+
+    save_state(path, state)
+    restored = load_state(path)
+
+    assert restored.offset == 1234
