@@ -96,3 +96,30 @@ def test_asset_filter_and_summary_lines():
                       now=datetime(2026, 11, 2, 5, 1, tzinfo=timezone.utc))
     assert summary["lots"] == 1
     assert summary_lines(summary)[0].startswith("批次=1")
+
+def test_a_passive_block_pnl_does_not_start_the_exit_clock():
+    rows = [
+        {"event": "live_inventory_exit_blocked", "run_id": "run-1", "asset": "ETH",
+         "lot_id": 9, "logged_at": "2026-11-02T05:00:00+00:00",
+         "reason": "v4_exit_confirmation_pending", "pnl_bps": "9.5",
+         "effective_min_exit_pnl_bps": "3.5"},
+        {"event": "live_inventory_exit_refresh", "run_id": "run-1", "asset": "ETH",
+         "lot_id": 9, "logged_at": "2026-11-02T05:10:00+00:00",
+         "executable_pnl_bps": "4.0", "effective_min_exit_pnl_bps": "3.5"},
+        {"event": "live_inventory_exited", "run_id": "run-1", "asset": "ETH",
+         "lot_id": 9, "logged_at": "2026-11-02T05:11:00+00:00"},
+    ]
+    summary = measure(rows)
+    assert summary["detail"][0]["latency_seconds"] == 60.0
+
+
+def test_a_lot_left_open_by_a_stopped_run_is_stale_not_open():
+    rows = [
+        _row("live_inventory_exit_refresh", lot=10,
+             at="2026-10-25T05:00:00+00:00", pnl=5, threshold=3.5),
+    ]
+    summary = measure(
+        rows, now=datetime(2026, 11, 2, 5, 0, tzinfo=timezone.utc)
+    )
+    assert summary["stale"] == 1
+    assert summary["open"] == 0

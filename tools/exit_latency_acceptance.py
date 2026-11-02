@@ -36,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-latency-seconds", type=float, default=DEFAULT_MAX_LATENCY_SECONDS
     )
+    parser.add_argument(
+        "--max-age-hours",
+        type=float,
+        default=72.0,
+        help="Qualified lots older than this are reported as stale, not open.",
+    )
     parser.add_argument("--no-archives", action="store_true")
     parser.add_argument("--json", action="store_true")
     return parser
@@ -50,7 +56,10 @@ def main(argv: list[str] | None = None) -> int:
         asset=args.asset,
     )
     summary = measure(
-        rows, asset=args.asset, max_latency_seconds=args.max_latency_seconds
+        rows,
+        asset=args.asset,
+        max_latency_seconds=args.max_latency_seconds,
+        max_age_seconds=args.max_age_hours * 3600.0,
     )
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))

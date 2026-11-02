@@ -21,6 +21,7 @@ QUALIFIED_EVENTS = {
 }
 
 DEFAULT_MAX_LATENCY_SECONDS = 180.0
+DEFAULT_MAX_AGE_SECONDS = 72 * 3600.0
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -47,7 +48,13 @@ def _time(value: Any) -> datetime | None:
 
 
 def _pnl_bps(row: dict[str, Any]) -> Decimal | None:
-    for field in ("refreshed_pnl_bps", "executable_pnl_bps", "pnl_bps"):
+    """Only a refreshed or executable price can start the exit clock.
+
+    ``pnl_bps`` on a blocked row is the passive reference price; it is not what
+    the exit gate compares, so using it would timestamp the clock far too early.
+    """
+
+    for field in ("refreshed_pnl_bps", "executable_pnl_bps"):
         value = _decimal(row.get(field))
         if value is not None:
             return value
@@ -81,6 +88,7 @@ def measure(
     *,
     asset: str | None = None,
     max_latency_seconds: float = DEFAULT_MAX_LATENCY_SECONDS,
+    max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     wanted_asset = str(asset).upper() if asset else ""
@@ -130,12 +138,22 @@ def measure(
         latency = None
         if qualified_at is not None and closed_at is not None and closed_at >= qualified_at:
             latency = (closed_at - qualified_at).total_seconds()
+        age = (
+            (observed - qualified_at).total_seconds()
+            if qualified_at is not None
+            else None
+        )
         if latency is not None:
             latencies.append(latency)
             status = "PASS" if latency <= max_latency_seconds else "SLOW"
+        elif age is not None and age > max_age_seconds:
+            # A lot left open by a run that already stopped is history, not a
+            # live latency failure; it would otherwise dominate the P95.
+            status = "STALE"
+            latency = age
         elif qualified_at is not None:
             status = "OPEN"
-            latency = (observed - qualified_at).total_seconds()
+            latency = age
         else:
             status = "NOT_QUALIFIED"
         records.append(
@@ -166,6 +184,7 @@ def measure(
         "slow": sum(1 for item in records if item["status"] == "SLOW"),
         "open": sum(1 for item in records if item["status"] == "OPEN"),
         "not_qualified": sum(1 for item in records if item["status"] == "NOT_QUALIFIED"),
+        "stale": sum(1 for item in records if item["status"] == "STALE"),
         "p50_latency_seconds": round(_percentile(latencies, 50), 1) if latencies else None,
         "p95_latency_seconds": round(_percentile(latencies, 95), 1) if latencies else None,
         "worst_latency_seconds": round(latencies[-1], 1) if latencies else None,
@@ -190,7 +209,8 @@ def summary_lines(summary: dict[str, Any]) -> list[str]:
     lines = [
         f"批次={summary.get('lots') or 0} 达标={summary.get('pass') or 0} "
         f"超时={summary.get('slow') or 0} 等待中={summary.get('open') or 0} "
-        f"未达标={summary.get('not_qualified') or 0}",
+        f"历史未命中={summary.get('not_qualified') or 0} "
+        f"陈旧={summary.get('stale') or 0}",
         f"平仓延迟中位={summary.get('p50_latency_seconds')} 秒 "
         f"P95={summary.get('p95_latency_seconds')} 秒 "
         f"最差={summary.get('worst_latency_seconds')} 秒 "
