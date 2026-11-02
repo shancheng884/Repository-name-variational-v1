@@ -3,6 +3,7 @@ Description=Retry Var/Lighter daily PnL report until delivered
 
 [Timer]
 OnBootSec=2min
+OnCalendar=*-*-* 16:01:00 UTC
 OnUnitActiveSec=5min
 AccuracySec=15s
 Persistent=true

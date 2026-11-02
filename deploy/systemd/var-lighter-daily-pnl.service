@@ -8,7 +8,7 @@ Type=oneshot
 User=ubuntu
 WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
 EnvironmentFile=-/home/ubuntu/Repository-name-variational-v1/.env
-ExecStart=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/daily_pnl_report.py --asset ETH
+ExecStart=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/daily_pnl_report.py --asset WTI
 
 [Install]
 WantedBy=multi-user.target

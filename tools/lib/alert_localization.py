@@ -22,6 +22,7 @@ REASON_LABELS = {
     "wti_entry_authorization_revoked": "WTI 开仓授权已锁定，需人工复核",
     "wti_entry_authorization_revoked_after_sample_gap": "WTI 样本断档，开仓授权已锁定",
     "wti_market_data_unavailable": "WTI 行情或交易时段证据未满足实时风控，等待刷新确认",
+    "wti_account_read_unavailable": "WTI 账户读取暂不可用，正在等待账户核对恢复",
     "wti_current_sample_or_session_not_fresh": "WTI 当前行情或交易时段证据已过期",
     "wti_sample_or_session_unverified": "WTI 样本质量或交易时段证据未通过校验",
     "wti_market_sample_or_session_unavailable": "WTI 行情或交易时段证据不可用",
