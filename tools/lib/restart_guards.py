@@ -12,7 +12,9 @@ RECONCILED_STATUSES = {
     "both_exchanges_flat",
     "both_exchanges_matched",
     "positions_matched",
+    "open_state_matches_both_exchanges",
 }
+RECONCILED_STATUS_SUFFIX = "matches_both_exchanges"
 STARTUP_RECONCILE_EVENT = "live_inventory_startup_reconcile_ok"
 
 
@@ -211,7 +213,10 @@ def classify_reconcile(event: dict[str, Any] | None, *, expected: Any) -> dict[s
     if not event:
         return {"ok": False, "reasons": ["startup_reconcile_event_missing"]}
     status = str(event.get("status") or "")
-    if status not in RECONCILED_STATUSES:
+    recognised = status in RECONCILED_STATUSES or status.endswith(
+        RECONCILED_STATUS_SUFFIX
+    )
+    if not recognised:
         return {"ok": False, "reasons": [f"startup_reconcile_status:{status or 'missing'}"], "status": status}
     return {
         "ok": True,

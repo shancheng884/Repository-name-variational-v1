@@ -234,3 +234,22 @@ def test_launch_command_includes_resume_only_when_open(tmp_path: Path):
     assert "--asset ETH" in resume_cmd
     assert "tools/live.py" in flat_cmd
     assert str(tmp_path / "log" / "s1.log") in resume_cmd
+
+
+def test_classify_reconcile_accepts_open_state_matched_status():
+    event = {
+        "status": "open_state_matches_both_exchanges",
+        "variational_position_qty": "-0.1144",
+        "lighter_position_qty": "0.1144",
+    }
+
+    result = classify_reconcile(event, expected="0.1144")
+
+    assert result["ok"] is True
+    assert result["positions"]["ok"] is True
+
+
+def test_classify_reconcile_accepts_any_matched_suffix_status():
+    event = {"status": "positions_matches_both_exchanges", "variational_position_qty": "1", "lighter_qty": "1", "lighter_position_qty": "-1"}
+
+    assert classify_reconcile(event, expected="1")["ok"] is True
