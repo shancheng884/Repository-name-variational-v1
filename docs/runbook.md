@@ -479,3 +479,20 @@ down until someone looked.
 Do not start either service by hand while the unit is active: the runtime
 refuses with `python_main_already_running` and the collector would write the
 same sample files twice. Stop the unit first.
+# Batch exit and exit-lock expiry
+
+With a dozen lots open the profit exit competes for one RFQ slot per minute, so
+per-lot thresholds only ever closed a few lots before the spread reverted. The
+hybrid portfolio exit now closes every open lot in one action and is judged on
+the aggregate executable PnL across all lots (`--live-inventory-basis-v4-portfolio-exit-target-bps`,
+default 3 bps, depth-priced on the Lighter leg). It still needs the usual
+2-of-3 confirmation and fresh quotes.
+
+A locked exit that cannot fill is now released after
+`--live-inventory-v4-exit-lock-ttl-seconds` (default 600) and logged as
+`live_inventory_v4_exit_lock_expired`. Operator-requested and account-risk exits
+are exempt: those must keep trying until they fill.
+
+Reason: a tier exit locked at 2026-11-02 03:24 on a six-second spread spike kept
+re-validating against the live quote for nine hours, and because only one lot is
+evaluated per cycle the other twelve never got a turn.

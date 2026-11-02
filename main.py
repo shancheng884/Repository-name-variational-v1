@@ -51,6 +51,10 @@ from tools.lib.quote_throttle import (
     RfqAttemptLog,
     should_probe_exit_rfq,
 )
+from tools.lib.exit_targets import (
+    DEFAULT_PORTFOLIO_EXIT_TARGET_BPS,
+    portfolio_exit_target_bps,
+)
 from tools.lib.quote_allocation import (
     DEFAULT_ALLOCATION_COOLDOWN_SECONDS,
     exit_candidate_priority,
@@ -226,6 +230,12 @@ LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE = "passive_browser_stream"
 LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_MAX_AGE_SECONDS = 5.0
 LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION = 2
 LIVE_INVENTORY_BASIS_V4_PORTFOLIO_EXIT_EXTRA_BPS = Decimal("1.00")
+# A batch exit closes every open lot in one action, so it is judged on the
+# aggregate executable PnL instead of one lot per RFQ slot.
+LIVE_INVENTORY_BASIS_V4_PORTFOLIO_EXIT_TARGET_BPS = DEFAULT_PORTFOLIO_EXIT_TARGET_BPS
+# A lock that cannot fill inside this window is released and re-decided; an
+# untouched lock otherwise waits for hours while the quote has already moved.
+LIVE_INVENTORY_BASIS_V4_EXIT_LOCK_TTL_SECONDS = 600.0
 LIVE_INVENTORY_ENTRY_BLOCKED_LOG_THROTTLE_SECONDS = 30.0
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_MAX_AGE_SECONDS = 60.0
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_USABLE_MAX_AGE_SECONDS = 300.0
@@ -2427,6 +2437,16 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_long_min_abs_entry_bps = Decimal(str(args.live_inventory_basis_long_min_abs_entry_bps))
         self.live_inventory_basis_short_min_abs_entry_bps = Decimal(str(args.live_inventory_basis_short_min_abs_entry_bps))
         self.live_inventory_basis_min_exit_pnl_bps = Decimal(str(args.live_inventory_basis_min_exit_pnl_bps))
+        self.live_inventory_v4_portfolio_exit_target_bps = portfolio_exit_target_bps(
+            getattr(args, "live_inventory_basis_v4_portfolio_exit_target_bps", None)
+        )
+        self.live_inventory_v4_exit_lock_ttl_seconds = float(
+            getattr(
+                args,
+                "live_inventory_v4_exit_lock_ttl_seconds",
+                LIVE_INVENTORY_BASIS_V4_EXIT_LOCK_TTL_SECONDS,
+            )
+        )
         self.live_inventory_basis_min_signal_reverted_exit_pnl_bps = Decimal(str(args.live_inventory_basis_min_signal_reverted_exit_pnl_bps))
         self.live_inventory_basis_reversion_signal_exit_min_pnl_bps = Decimal(
             str(args.live_inventory_basis_reversion_signal_exit_min_pnl_bps)
@@ -10771,6 +10791,64 @@ class VariationalToLighterRuntime:
             stamps = {}
             self.live_inventory_exit_refresh_at_monotonic = stamps
         stamps[str(lot_id)] = time.monotonic()
+
+    async def live_inventory_expire_exit_lock(
+        self,
+        portfolio_exit_lot_ids: set[str],
+        *,
+        state_payload: dict[str, Any],
+    ) -> set[str]:
+        """Release a locked exit that never filled, so it is re-decided.
+
+        Without this an exit authorised on a short spike keeps waiting for the
+        same price to come back, and because only one lot is evaluated per
+        cycle the whole cohort is blocked behind it.
+        """
+
+        if not portfolio_exit_lot_ids:
+            return portfolio_exit_lot_ids
+        context = dict(getattr(self, "live_inventory_v4_portfolio_exit_context", {}) or {})
+        if context.get("operator_requested_exit") or context.get("account_risk_exit"):
+            return portfolio_exit_lot_ids
+        locked_at_text = str(context.get("locked_at") or "").strip()
+        if not locked_at_text:
+            return portfolio_exit_lot_ids
+        try:
+            locked_at = datetime.fromisoformat(locked_at_text.replace("Z", "+00:00"))
+        except ValueError:
+            return portfolio_exit_lot_ids
+        if locked_at.tzinfo is None:
+            locked_at = locked_at.replace(tzinfo=timezone.utc)
+        ttl = float(
+            getattr(
+                self,
+                "live_inventory_v4_exit_lock_ttl_seconds",
+                LIVE_INVENTORY_BASIS_V4_EXIT_LOCK_TTL_SECONDS,
+            )
+        )
+        if ttl <= 0:
+            return portfolio_exit_lot_ids
+        age = (datetime.now(timezone.utc) - locked_at).total_seconds()
+        if age < ttl:
+            return portfolio_exit_lot_ids
+        released = sorted(portfolio_exit_lot_ids)
+        self.live_inventory_v4_portfolio_exit_lot_ids = set()
+        self.live_inventory_v4_portfolio_exit_context = {}
+        confirmations = getattr(self, "live_inventory_v4_portfolio_exit_confirmations", None)
+        if confirmations is not None and hasattr(confirmations, "clear"):
+            confirmations.clear()
+        await self.persist_live_inventory_memory(reason="v4_exit_lock_ttl_expired")
+        await self.append_live_inventory_log(
+            "live_inventory_v4_exit_lock_expired",
+            {
+                **state_payload,
+                "reason": "exit_lock_ttl_expired",
+                "lot_ids": released,
+                "age_seconds": round(age, 1),
+                "ttl_seconds": ttl,
+            },
+        )
+        return set()
 
     async def live_inventory_basis_refreshed_exit_context(
         self,
@@ -22853,6 +22931,10 @@ class VariationalToLighterRuntime:
             or self.live_inventory_v4_exit_reconciliation_lot_ids
         ):
             return
+        portfolio_exit_lot_ids = await self.live_inventory_expire_exit_lock(
+            portfolio_exit_lot_ids,
+            state_payload=state_payload,
+        )
         if (
             getattr(self, "live_inventory_force_close_open_state", False)
             and len(self.live_inventory_open_lots) > 1
@@ -23015,11 +23097,13 @@ class VariationalToLighterRuntime:
                         )
                     )
                     portfolio_context["exit_lighter_depth"] = portfolio_depth
-            portfolio_target_bps = (
-                v4_exit_shortfall_reserve_bps
-                + LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS
-                + LIVE_INVENTORY_BASIS_V4_PORTFOLIO_EXIT_EXTRA_BPS
-            )
+            portfolio_target_bps = to_decimal(
+                getattr(
+                    self,
+                    "live_inventory_v4_portfolio_exit_target_bps",
+                    LIVE_INVENTORY_BASIS_V4_PORTFOLIO_EXIT_TARGET_BPS,
+                )
+            ) or LIVE_INVENTORY_BASIS_V4_PORTFOLIO_EXIT_TARGET_BPS
             portfolio_pnl_bps = to_decimal(
                 portfolio_context.get("aggregate_executable_pnl_bps")
             )
@@ -28072,6 +28156,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-basis-long-min-abs-entry-bps", type=float, default=0.0)
     parser.add_argument("--live-inventory-basis-short-min-abs-entry-bps", type=float, default=0.0)
     parser.add_argument("--live-inventory-basis-min-exit-pnl-bps", type=float, default=1.0)
+    parser.add_argument(
+        "--live-inventory-basis-v4-portfolio-exit-target-bps",
+        type=float,
+        default=float(LIVE_INVENTORY_BASIS_V4_PORTFOLIO_EXIT_TARGET_BPS),
+        help="Aggregate executable PnL bps that closes every open lot in one action. Default: 3",
+    )
+    parser.add_argument(
+        "--live-inventory-v4-exit-lock-ttl-seconds",
+        type=float,
+        default=LIVE_INVENTORY_BASIS_V4_EXIT_LOCK_TTL_SECONDS,
+        help="Release an exit lock that has not filled within this window. Default: 600",
+    )
     parser.add_argument(
         "--live-inventory-basis-min-signal-reverted-exit-pnl-bps",
         type=float,
