@@ -13,6 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from tools.lib.metrics_store import (  # noqa: E402
+    ACTIVE_NAME,
+    iter_rows as iter_metric_rows,
+)
 from tools.lib.pnl_baseline import (  # noqa: E402
     PNL_BASELINE_FILE_NAME,
     load_pnl_baseline,
@@ -78,6 +82,18 @@ def actual_pnl_four_leg_volume(row: dict[str, Any]) -> Decimal | None:
     )
 
 
+def _read_single_file(path: Path):
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            if '"event": "live_inventory_actual_pnl"' not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            yield row
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="One-time migration of four-leg volume into the small PnL ledger."
@@ -95,43 +111,43 @@ def main() -> int:
     matched = 0
     migrated = 0
     missing_fields = 0
-    with args.path.open("r", encoding="utf-8", errors="ignore") as handle:
-        for line in handle:
-            if '"event": "live_inventory_actual_pnl"' not in line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if row.get("actual_pnl_status") != "lighter_final_fill_confirmed":
-                continue
-            run_id = str(row.get("run_id") or "")
-            asset = str(row.get("asset") or "").upper()
-            lot_id = row.get("lot_id")
-            key = f"{run_id}:{asset}:{lot_id}"
-            if key not in counted:
-                continue
-            matched += 1
-            volume = actual_pnl_four_leg_volume(row)
-            if volume is None:
-                missing_fields += 1
-                continue
-            record_pnl_cycle(
-                args.baseline_path,
-                run_id=run_id,
-                asset=asset,
-                lot_id=lot_id,
-                actual_pnl_usd=row.get("actual_pnl_usd"),
-                observed_at=row.get("confirmed_at") or row.get("logged_at"),
-                four_leg_volume_usd=volume,
-                closed_child_lots=(
-                    row.get("closed_child_lots")
-                    or row.get("portfolio_component_lot_count")
-                    or 1
-                ),
-            )
-            if key not in volume_counted_before:
-                migrated += 1
+    if args.path.name == ACTIVE_NAME and args.path.parent.exists():
+        row_iter = iter_metric_rows(
+            args.path.parent,
+            events={"live_inventory_actual_pnl"},
+        )
+    else:
+        row_iter = _read_single_file(args.path)
+    for row in row_iter:
+        if row.get("actual_pnl_status") != "lighter_final_fill_confirmed":
+            continue
+        run_id = str(row.get("run_id") or "")
+        asset = str(row.get("asset") or "").upper()
+        lot_id = row.get("lot_id")
+        key = f"{run_id}:{asset}:{lot_id}"
+        if key not in counted:
+            continue
+        matched += 1
+        volume = actual_pnl_four_leg_volume(row)
+        if volume is None:
+            missing_fields += 1
+            continue
+        record_pnl_cycle(
+            args.baseline_path,
+            run_id=run_id,
+            asset=asset,
+            lot_id=lot_id,
+            actual_pnl_usd=row.get("actual_pnl_usd"),
+            observed_at=row.get("confirmed_at") or row.get("logged_at"),
+            four_leg_volume_usd=volume,
+            closed_child_lots=(
+                row.get("closed_child_lots")
+                or row.get("portfolio_component_lot_count")
+                or 1
+            ),
+        )
+        if key not in volume_counted_before:
+            migrated += 1
     updated = load_pnl_baseline(args.baseline_path) or {}
     print("backfill=PASS")
     print(f"matched_confirmed_closes={matched}")

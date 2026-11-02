@@ -282,7 +282,7 @@ def format_telegram_trade_message(
                     f"统计本金：{_localized_money(payload, 'capital_usd')}",
                     "最新双边权益："
                     f"{_localized_money(payload, 'combined_equity_usd')}",
-                    "口径：双边最终成交价；手续费和资金费未单独计入",
+                    "口径：双边最终成交价＋资金费收益；手续费不计",
                     "说明：单日及短周期年化仅供观察",
                 ]
             )

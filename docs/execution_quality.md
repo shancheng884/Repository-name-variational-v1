@@ -64,3 +64,35 @@ candidates are not treated as profitable alternative fills. Fees, funding, new
 exit times, and hypothetical realized PnL are not inferred. Sparse baseline
 samples cannot establish fills during Lighter's taker-delay interval. Actual
 delay-aware fill replay needs event-level book data covering that interval.
+
+## Archive-aware reporting, per-signal audit, and exit latency
+
+`log/order_metrics.jsonl` is rotated into `order_metrics.jsonl.full-<UTC>.gz`
+and then truncated. Every reader must therefore use
+`tools/lib/metrics_store.py`, which walks the archives oldest-first and the
+live file last, and drops a cycle that a crash left in both places.
+
+Read-only checks on the VPS (none of them touch the live process):
+
+```bash
+.venv/bin/python tools/pnl_report.py --asset ETH
+.venv/bin/python tools/signal_audit.py --asset ETH --limit 20
+.venv/bin/python tools/exit_latency_acceptance.py --asset ETH --max-latency-seconds 180
+```
+
+PnL rule: `确认成交盈亏` stays the confirmed final-fill gross. Funding is added as
+income (`funding_income_usd`, `net_income_usd`), fees are not deducted, and the
+report says so on its 口径 line. A cycle without funding evidence contributes
+zero funding, not an "unverified" net.
+
+`signal_audit` folds rows into one record per (run, signal) so a signal that was
+blocked five hundred times counts as one opportunity; the duplicate count stays
+visible as log pressure. `exit_latency_acceptance` measures qualification to
+fill per lot and returns a non-zero exit code when any filled lot exceeded the
+latency budget.
+
+The profit-exit RFQ budget is one request per minute shared by every open lot.
+`tools/lib/quote_allocation.py` ranks the candidates: forced exits first, then
+lots that have not spent the slot inside the 45 s cooldown, with a 120 s
+starvation promotion, then the highest executable PnL. `main.py` records each
+attempt (successful or not) so the slot rotates instead of retrying one lot.

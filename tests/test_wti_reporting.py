@@ -107,7 +107,7 @@ def test_daily_uses_beijing_day_separates_assets_and_does_not_reuse_old_equity()
     assert 'WTI：当日平仓=1组' in message
     assert 'ETH：平仓批次=0' in message
     assert '273.749043' not in message
-    assert '净收益=未确认' in message
+    assert '手续费不计' in message
     previous = build_platform_daily_message(None, state, day=date(2026, 10, 28))
     assert 'WTI：当日平仓=0组' in previous
     assert 'WTI：累计平仓=0组' in previous
@@ -119,7 +119,7 @@ def test_daily_missing_ledger_does_not_claim_zero_profit():
     assert '不能按0收益统计' in message
 
 
-def test_partial_fees_and_funding_remain_unverified():
+def test_partial_fee_evidence_does_not_block_net_income():
     a, b = execution('a', 'open'), execution('b', 'close')
     a['legs']['lighter']['result']['fee_confirmed'] = False
     state = {'asset': 'WTI', 'status': 'flat', 'execution_history': [a, b]}
@@ -127,7 +127,7 @@ def test_partial_fees_and_funding_remain_unverified():
     assert row['actual_fees_usd'] is None
     msg = build_platform_daily_message(None, state, day=date(2026, 10, 29))
     assert '手续费=未确认' in msg
-    assert '净收益=未确认' in msg
+    assert '手续费不计' in msg
 
 
 def test_rejected_open_is_not_counted_as_a_filled_layer():

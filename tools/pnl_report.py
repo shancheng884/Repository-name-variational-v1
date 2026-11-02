@@ -23,6 +23,11 @@ from tools.lib.telegram_notifier import (  # noqa: E402
     TelegramNotifier,
     format_telegram_trade_message,
 )
+from tools.lib.metrics_store import (  # noqa: E402
+    ACTIVE_NAME,
+    dedupe,
+    iter_rows as iter_metric_rows,
+)
 from tools.lib.pnl_baseline import (  # noqa: E402
     BEIJING_TIMEZONE,
     PNL_BASELINE_FILE_NAME,
@@ -55,6 +60,26 @@ def to_decimal(value: Any) -> Decimal | None:
         return Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
         return None
+
+
+FUNDING_FIELDS = ("funding_cashflow_usd", "funding_usdc", "funding_usd")
+
+
+def funding_income(row: dict[str, Any]) -> Decimal | None:
+    """Funding actually booked for one cycle, when the ledger recorded it."""
+
+    for field in FUNDING_FIELDS:
+        value = to_decimal(row.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def total_funding_income(rows: list[dict[str, Any]]) -> Decimal:
+    return sum(
+        (funding_income(row) or Decimal("0") for row in rows),
+        Decimal("0"),
+    )
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -106,11 +131,37 @@ def reporting_period_since(
     ).astimezone(timezone.utc)
 
 
-def load_rows(path: Path, *, asset: str) -> list[dict[str, Any]]:
+def load_rows(
+    path: Path,
+    *,
+    asset: str,
+    include_archives: bool = True,
+) -> list[dict[str, Any]]:
+    """Read the metrics stream, rotated archives included.
+
+    Rotation moves the live file into ``order_metrics.jsonl.full-<UTC>.gz``
+    before truncating it, so opening only the live file silently drops every
+    earlier cycle and makes the daily report under-count history.
+    """
+
+    path = Path(path)
+    archive_stream = (
+        include_archives
+        and path.name == ACTIVE_NAME
+        and path.parent.exists()
+    )
+    if not path.exists() and not archive_stream:
+        return []
     rows: list[dict[str, Any]] = []
-    if not path.exists():
-        return rows
     needles = tuple(f'"event": "{event}"' for event in RELEVANT_EVENTS)
+    if archive_stream:
+        for row in iter_metric_rows(
+            path.parent,
+            events=RELEVANT_EVENTS,
+            asset=asset,
+        ):
+            rows.append(row)
+        return dedupe(rows)
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
         for line in handle:
             if not any(needle in line for needle in needles):
@@ -320,6 +371,10 @@ def latest_pnl_telegram_payload(
         ),
         Decimal("0"),
     )
+    run_funding_income = total_funding_income(run_cycles)
+    day_funding_income = total_funding_income(day_cycles)
+    run_net_income = run_actual_pnl + run_funding_income
+    day_net_income = day_actual_pnl + day_funding_income
     cycle_actual_pnl = to_decimal(cycle.get("actual_pnl_usd"))
     exit_snapshot = snapshot_for_cycle(
         report.snapshots,
@@ -388,7 +443,7 @@ def latest_pnl_telegram_payload(
     pnl_for_return = (
         account_net_change
         if account_net_change is not None
-        else run_actual_pnl
+        else run_net_income
     )
     return_pct = (
         pnl_for_return / capital_usd * Decimal("100")
@@ -396,7 +451,7 @@ def latest_pnl_telegram_payload(
         else None
     )
     day_return_pct = (
-        day_actual_pnl / capital_usd * Decimal("100")
+        day_net_income / capital_usd * Decimal("100")
         if capital_usd is not None and capital_usd > 0
         else None
     )
@@ -444,6 +499,13 @@ def latest_pnl_telegram_payload(
         "beijing_day": reporting_day,
         "reporting_timezone": PNL_REPORTING_TIMEZONE,
         "beijing_day_actual_pnl_usd": decimal_text(day_actual_pnl),
+        "beijing_day_funding_income_usd": decimal_text(day_funding_income),
+        "beijing_day_net_income_usd": decimal_text(day_net_income),
+        "funding_income_usd": decimal_text(run_funding_income),
+        "net_income_usd": decimal_text(run_net_income),
+        "fees_included": False,
+        "funding_included": True,
+        "pnl_rule": "final_fills_plus_funding_fees_ignored",
         "beijing_day_return_pct": decimal_text(day_return_pct),
         "beijing_day_completed_cycles": len(day_cycles),
         "account_raw_change_usd": decimal_text(account_raw_change),
@@ -684,7 +746,8 @@ def print_report(
         else "无法计算"
     )
     print(f"年化可信度={reliability}")
-    print("成交盈亏口径=双方确认成交价计算_不单独扣手续费和资金费")
+    print("成交盈亏口径=双方确认成交价+资金费收益_手续费不计入")
+    print(f"资金费收益={money(total_funding_income(report.cycles))}")
 
     print("\n== 双边账户权益 ==")
     print(f"完整快照数={len(report.snapshots)}")

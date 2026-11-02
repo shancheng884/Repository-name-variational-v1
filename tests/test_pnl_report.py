@@ -920,3 +920,118 @@ def test_live_pnl_summary_persists_tracking_across_runs(
     assert first["completed_cycles"] == 1
     assert second["run_actual_pnl_usd"] == "0.006"
     assert second["completed_cycles"] == 2
+
+
+def test_load_rows_reads_rotated_archives(tmp_path) -> None:
+    import gzip
+
+    from tools.pnl_report import load_rows
+
+    archive = tmp_path / "order_metrics.jsonl.full-20260926T043730Z.gz"
+    with gzip.open(archive, "wt", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "event": "live_inventory_actual_pnl",
+                    "run_id": "run-old",
+                    "asset": "ETH",
+                    "lot_id": 1,
+                    "actual_pnl_status": "lighter_final_fill_confirmed",
+                    "actual_pnl_usd": "0.05",
+                    "logged_at": "2026-09-26T04:00:00+00:00",
+                }
+            )
+            + "\n"
+        )
+    live = tmp_path / "order_metrics.jsonl"
+    live.write_text(
+        json.dumps(
+            {
+                "event": "live_inventory_actual_pnl",
+                "run_id": "run-new",
+                "asset": "ETH",
+                "lot_id": 2,
+                "actual_pnl_status": "lighter_final_fill_confirmed",
+                "actual_pnl_usd": "0.07",
+                "logged_at": "2026-11-02T05:00:00+00:00",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rows = load_rows(live, asset="ETH")
+
+    assert [row["lot_id"] for row in rows] == [1, 2]
+
+
+def test_load_rows_does_not_double_count_a_row_in_archive_and_live(tmp_path) -> None:
+    import gzip
+
+    from tools.pnl_report import load_rows
+
+    row = {
+        "event": "live_inventory_actual_pnl",
+        "run_id": "run-1",
+        "asset": "ETH",
+        "lot_id": 3,
+        "actual_pnl_status": "lighter_final_fill_confirmed",
+        "actual_pnl_usd": "0.02",
+        "logged_at": "2026-11-02T05:00:00+00:00",
+    }
+    with gzip.open(
+        tmp_path / "order_metrics.jsonl.full-20261102T031917Z.gz",
+        "wt",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(json.dumps(row) + "\n")
+    live = tmp_path / "order_metrics.jsonl"
+    live.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    rows = load_rows(live, asset="ETH")
+
+    assert len(rows) == 1
+
+
+def test_payload_counts_funding_as_income_and_ignores_fees() -> None:
+    rows = [
+        {
+            "event": "live_inventory_run_config",
+            "run_id": "run-1",
+            "asset": "ETH",
+            "logged_at": "2026-08-25T00:00:00+00:00",
+        },
+        {
+            "event": "live_inventory_actual_pnl",
+            "run_id": "run-1",
+            "asset": "ETH",
+            "lot_id": 1,
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "actual_pnl_usd": "0.04",
+            "funding_cashflow_usd": "-0.01",
+            "actual_fees_usd": "0.001",
+            "logged_at": "2026-08-25T01:00:00+00:00",
+        },
+        {
+            "event": "live_inventory_actual_pnl",
+            "run_id": "run-1",
+            "asset": "ETH",
+            "lot_id": 2,
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "actual_pnl_usd": "0.06",
+            "funding_cashflow_usd": "0.005",
+            "logged_at": "2026-08-25T02:00:00+00:00",
+        },
+    ]
+    report = build_report(rows, since=None, capital_usd=Decimal("100"))
+
+    payload = latest_pnl_telegram_payload(rows, report, asset="ETH")
+
+    assert payload is not None
+    assert payload["run_actual_pnl_usd"] == "0.10"
+    assert payload["funding_income_usd"] == "-0.005"
+    assert payload["net_income_usd"] == "0.095"
+    assert payload["beijing_day_funding_income_usd"] == "-0.005"
+    assert payload["beijing_day_net_income_usd"] == "0.095"
+    assert payload["fees_included"] is False
+    assert payload["funding_included"] is True

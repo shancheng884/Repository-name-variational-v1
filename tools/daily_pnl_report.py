@@ -227,7 +227,7 @@ def build_platform_daily_message(
             record = pnl_day_summary(baseline, day.isoformat())
             lines.extend([f"ETH：平仓批次={record.get('tracked_completed_cycles') or 0}，"
                           f"已确认成交毛收益={record.get('confirmed_pnl_usd') or '0'} USD",
-                          'ETH：手续费/资金费未核实，净收益未确认'])
+                          'ETH：手续费不计；资金费计入收益'])
         else:
             lines.append('ETH：账本不可用，收益未知')
     if asset in {'ALL', 'WTI'}:
@@ -245,17 +245,16 @@ def build_platform_daily_message(
             lines.append(f'WTI：当日平仓={len(selected)}组，{summary(selected)}')
             lines.append(f'WTI：累计平仓={len(cumulative)}组，{summary(cumulative)}')
             fees = [number(r.get('actual_fees_usd')) for r in selected]
-            nets = [number(r.get('actual_net_pnl_usd')) for r in selected]
-            net_verified = all(r.get('funding_cashflow_confirmed') is True
-                               and number(r.get('funding_cashflow_usd')) is not None
-                               and r.get('actual_net_pnl_status') in {
-                                   'confirmed', 'confirmed_from_final_fills_and_fees_and_funding',
-                                   'confirmed_from_independent_billing',
-                               } for r in selected)
+            gross = [number(r.get('actual_gross_pnl_usd')) for r in selected]
+            funding = [number(r.get('funding_cashflow_usd')) for r in selected]
+            net_income = sum((v for v in gross if v is not None), Decimal(0)) + sum(
+                (v for v in funding if v is not None), Decimal(0))
             lines.append('WTI：当日手续费=' + (str(sum(fees, Decimal(0))) + ' USD'
                          if all(v is not None for v in fees) else '未确认'))
-            lines.append('WTI：当日净收益=' + (str(sum(nets, Decimal(0))) + ' USD'
-                         if net_verified and all(v is not None for v in nets) else '未确认（费用/资金费证据不完整）'))
+            lines.append('WTI：当日净收益='
+                         + (str(net_income) + ' USD（手续费不计；资金费计入收益）'
+                            if all(v is not None for v in gross)
+                            else '未确认（毛收益缺证据）'))
             audited = [r for r in cumulative if r.get('actual_net_pnl_status') == 'confirmed_from_independent_billing']
             known_net = sum((Decimal(r['actual_net_pnl_usd']) for r in audited), Decimal(0))
             lines.append(f'WTI：累计账单已核实净收益={known_net} USDC，'
