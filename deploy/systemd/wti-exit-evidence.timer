@@ -1,0 +1,11 @@
+[Unit]
+Description=Renew WTI exit cost evidence every five minutes
+
+[Timer]
+OnBootSec=20
+OnUnitInactiveSec=300
+AccuracySec=5
+Unit=wti-exit-evidence.service
+
+[Install]
+WantedBy=timers.target

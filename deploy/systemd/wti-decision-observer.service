@@ -1,0 +1,26 @@
+[Unit]
+Description=Read-only WTI decision evidence observer
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
+ExecStart=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/wti_decision_audit.py --follow --poll-seconds 2
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
+Nice=19
+CPUQuota=10%
+IOSchedulingClass=idle
+MemoryMax=128M
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/Repository-name-variational-v1/log/wti_decision_audit
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

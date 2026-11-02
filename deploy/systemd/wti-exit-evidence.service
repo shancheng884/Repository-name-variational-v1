@@ -1,0 +1,21 @@
+[Unit]
+Description=WTI read-only exit fee evidence renewal (no alerts or orders)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
+EnvironmentFile=/home/ubuntu/Repository-name-variational-v1/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/wti_exit_cost_renew.py
+ExecStopPost=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/wti_exit_cost_renew.py --check-service-result
+TimeoutStartSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/Repository-name-variational-v1/log/wti-exit-cost-20261030
+
