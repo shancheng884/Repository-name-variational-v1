@@ -46,6 +46,11 @@ from tools.lib.pnl_baseline import (
     set_pnl_account_baseline,
     set_pnl_latest_account_snapshot,
 )
+from tools.lib.quote_throttle import (
+    ExitQuoteThrottle,
+    RfqAttemptLog,
+    should_probe_exit_rfq,
+)
 from tools.lib.rolling_rate_limiter import RollingWindowRateLimiter
 from tools.lib.runtime_files import read_json, write_json_atomic
 from tools.lib.telegram_notifier import TelegramNotifier
@@ -2787,6 +2792,9 @@ class VariationalToLighterRuntime:
             hard_limit=LIVE_INVENTORY_LIGHTER_ORDER_RATE_HARD_PER_MINUTE,
             state_path=self.output_dir / "lighter_rate_limiter.json",
         )
+        # Profit-exit RFQ shares the Variational order budget, so it gets its own
+        # pacing: one request per minute after a hit, with backoff on failures.
+        self.live_inventory_profit_exit_rfq_throttle = ExitQuoteThrottle()
         self.live_inventory_v4_last_entry_submit_monotonic = 0.0
         self.live_inventory_basis_entry_rfq_cooldown_until_monotonic: dict[
             str, float
@@ -10671,6 +10679,74 @@ class VariationalToLighterRuntime:
                 slippage_bps = Decimal("0")
         return {**depth, "slippage_bps": decimal_to_str(slippage_bps)}
 
+    async def live_inventory_profit_exit_passive_pnl(
+        self,
+        *,
+        asset: str,
+        direction: str,
+        qty: Decimal,
+        entry_var_price: Decimal,
+        entry_lighter_price: Decimal,
+    ) -> Decimal | None:
+        """Reference-price PnL, used only to decide whether an RFQ is worth spending."""
+
+        quote = await self.get_variational_reference_quote(str(asset).upper())
+        quote = quote if isinstance(quote, dict) else {}
+        var_bid = to_decimal(quote.get("bid"))
+        var_ask = to_decimal(quote.get("ask"))
+        fallback = to_decimal(quote.get("reference_price")) or to_decimal(
+            quote.get("mark_price")
+        )
+        lighter_best_bid, lighter_best_ask = await self.get_lighter_best_bid_ask()
+        if lighter_best_bid is None or lighter_best_ask is None:
+            return None
+        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+            exit_var_price = var_bid or fallback
+            exit_lighter_price = lighter_best_ask
+        else:
+            exit_var_price = var_ask or fallback
+            exit_lighter_price = lighter_best_bid
+        if exit_var_price is None:
+            return None
+        _, _, pnl = self.live_inventory_pair_pnl(
+            direction=direction,
+            qty=qty,
+            entry_var_price=entry_var_price,
+            entry_lighter_price=entry_lighter_price,
+            exit_var_price=exit_var_price,
+            exit_lighter_price=exit_lighter_price,
+        )
+        notional = qty * entry_var_price
+        if not notional:
+            return None
+        return pnl / notional * Decimal("10000")
+
+    def record_profit_exit_rfq_evidence(
+        self,
+        *,
+        asset: str,
+        outcome: str,
+        waited_ms: float | None = None,
+    ) -> dict[str, Any]:
+        """Track request outcomes so the real server-side quota becomes visible."""
+
+        log = getattr(self, "profit_exit_rfq_attempt_log", None)
+        if log is None:
+            log = RfqAttemptLog()
+            self.profit_exit_rfq_attempt_log = log
+        log.record(outcome=outcome, waited_ms=waited_ms)
+        summary = log.summary()
+        output_dir = getattr(self, "output_dir", None)
+        if output_dir is not None:
+            try:
+                write_json_atomic(
+                    Path(output_dir) / "profit_exit_rfq_evidence.json",
+                    {"asset": str(asset).upper(), "updated_at": utc_now(), **summary},
+                )
+            except Exception:
+                pass
+        return summary
+
     async def live_inventory_basis_refreshed_exit_context(
         self,
         *,
@@ -10680,7 +10756,50 @@ class VariationalToLighterRuntime:
         entry_var_price: Decimal,
         entry_lighter_price: Decimal,
         exit_lighter_side: str,
+        effective_min_exit_pnl_bps: Decimal | None = None,
     ) -> dict[str, Any]:
+        throttle_key = str(asset).upper()
+        throttle = getattr(self, "live_inventory_profit_exit_rfq_throttle", None)
+        if throttle is None:
+            throttle = ExitQuoteThrottle()
+            self.live_inventory_profit_exit_rfq_throttle = throttle
+        if not throttle.allow(throttle_key):
+            self.record_profit_exit_rfq_evidence(asset=asset, outcome="throttled")
+            return {
+                "reason": "basis_exit_refresh_quote_throttled",
+                "refresh_quote_ms": None,
+                "throttle_remaining_seconds": throttle.remaining(throttle_key),
+            }
+        if effective_min_exit_pnl_bps is not None:
+            passive_pnl = await self.live_inventory_profit_exit_passive_pnl(
+                asset=asset,
+                direction=direction,
+                qty=qty,
+                entry_var_price=entry_var_price,
+                entry_lighter_price=entry_lighter_price,
+            )
+            probes = dict(
+                getattr(self, "profit_exit_rfq_last_probe_monotonic", {}) or {}
+            )
+            last_probe = probes.get(throttle_key)
+            gate = should_probe_exit_rfq(
+                passive_pnl_bps=None if passive_pnl is None else float(passive_pnl),
+                threshold_bps=float(effective_min_exit_pnl_bps),
+                seconds_since_last_probe=(
+                    None if last_probe is None else max(0.0, time.monotonic() - last_probe)
+                ),
+            )
+            if not gate["probe"]:
+                self.record_profit_exit_rfq_evidence(
+                    asset=asset, outcome="passive_gate_skip"
+                )
+                return {
+                    "reason": gate["reason"],
+                    "refresh_quote_ms": None,
+                    "passive_pnl_bps": decimal_to_str(passive_pnl),
+                }
+            probes[throttle_key] = time.monotonic()
+            self.profit_exit_rfq_last_probe_monotonic = probes
         refreshed_quote, refresh_quote_ms = await self.fetch_live_inventory_basis_quote(
             asset=asset,
             qty=qty,
@@ -10700,10 +10819,19 @@ class VariationalToLighterRuntime:
             or lighter_best_bid is None
             or lighter_best_ask is None
         ):
+            throttle_wait = throttle.record_failure(throttle_key)
+            self.record_profit_exit_rfq_evidence(
+                asset=asset, outcome="unavailable", waited_ms=refresh_quote_ms
+            )
             return {
                 "reason": "basis_exit_refresh_quote_unavailable",
                 "refresh_quote_ms": refresh_quote_ms,
+                "throttle_backoff_seconds": throttle_wait,
             }
+        throttle.record_success(throttle_key)
+        self.record_profit_exit_rfq_evidence(
+            asset=asset, outcome="success", waited_ms=refresh_quote_ms
+        )
 
         if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
             refreshed_var_exit_price = refreshed_var_bid
@@ -10841,6 +10969,7 @@ class VariationalToLighterRuntime:
                 entry_var_price=entry_var_price,
                 entry_lighter_price=entry_lighter_price,
                 exit_lighter_side=exit_lighter_side,
+                effective_min_exit_pnl_bps=effective_min_exit_pnl_bps,
             )
             refreshed_pnl_bps = to_decimal(context.get("refreshed_pnl_bps"))
             executable_pnl_bps = to_decimal(context.get("executable_pnl_bps"))
@@ -24122,6 +24251,7 @@ class VariationalToLighterRuntime:
                             entry_var_price=entry_var_price,
                             entry_lighter_price=entry_lighter_price,
                             exit_lighter_side=exit_lighter_side,
+                            effective_min_exit_pnl_bps=effective_min_exit_pnl_bps,
                         )
                     )
                     refresh_reason = refresh_context.get("reason")
