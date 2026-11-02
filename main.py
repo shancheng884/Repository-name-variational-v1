@@ -52,7 +52,10 @@ from tools.lib.quote_throttle import (
     should_probe_exit_rfq,
 )
 from tools.lib.exit_targets import (
+    DEFAULT_LOT_EXIT_TARGET_BPS,
     DEFAULT_PORTFOLIO_EXIT_TARGET_BPS,
+    cap_exit_threshold,
+    lot_exit_target_bps,
     portfolio_exit_target_bps,
 )
 from tools.lib.quote_allocation import (
@@ -236,6 +239,9 @@ LIVE_INVENTORY_BASIS_V4_PORTFOLIO_EXIT_TARGET_BPS = DEFAULT_PORTFOLIO_EXIT_TARGE
 # A lock that cannot fill inside this window is released and re-decided; an
 # untouched lock otherwise waits for hours while the quote has already moved.
 LIVE_INVENTORY_BASIS_V4_EXIT_LOCK_TTL_SECONDS = 600.0
+# The per-lot gate adds a dynamic execution reserve on top of the profit
+# target; cap it so one lot and the whole batch aim at the same 3 bps.
+LIVE_INVENTORY_BASIS_LOT_EXIT_TARGET_BPS = DEFAULT_LOT_EXIT_TARGET_BPS
 LIVE_INVENTORY_ENTRY_BLOCKED_LOG_THROTTLE_SECONDS = 30.0
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_MAX_AGE_SECONDS = 60.0
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_USABLE_MAX_AGE_SECONDS = 300.0
@@ -2439,6 +2445,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_min_exit_pnl_bps = Decimal(str(args.live_inventory_basis_min_exit_pnl_bps))
         self.live_inventory_v4_portfolio_exit_target_bps = portfolio_exit_target_bps(
             getattr(args, "live_inventory_basis_v4_portfolio_exit_target_bps", None)
+        )
+        self.live_inventory_v4_lot_exit_target_bps = lot_exit_target_bps(
+            getattr(args, "live_inventory_basis_lot_exit_target_bps", None)
         )
         self.live_inventory_v4_exit_lock_ttl_seconds = float(
             getattr(
@@ -23798,7 +23807,16 @@ class VariationalToLighterRuntime:
             signal_reverted_min_exit_pnl_bps = self.live_inventory_signal_reverted_exit_min_pnl_bps(
                 time_decayed_min_exit_pnl_bps=time_decayed_min_exit_pnl_bps,
             )
-            effective_min_exit_pnl_bps = signal_reverted_min_exit_pnl_bps + self.live_inventory_basis_exit_safety_buffer_bps + dynamic_exit_buffer_bps
+            effective_min_exit_pnl_bps = cap_exit_threshold(
+                signal_reverted_min_exit_pnl_bps
+                + self.live_inventory_basis_exit_safety_buffer_bps
+                + dynamic_exit_buffer_bps,
+                getattr(
+                    self,
+                    "live_inventory_v4_lot_exit_target_bps",
+                    LIVE_INVENTORY_BASIS_LOT_EXIT_TARGET_BPS,
+                ),
+            )
             signal_reverted = can_exit_on_reversion and (
                 direction_signal <= self.live_inventory_basis_reversion_exit_deviation_bps
                 if self.live_inventory_basis_reversion_mode
@@ -28156,6 +28174,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live-inventory-basis-long-min-abs-entry-bps", type=float, default=0.0)
     parser.add_argument("--live-inventory-basis-short-min-abs-entry-bps", type=float, default=0.0)
     parser.add_argument("--live-inventory-basis-min-exit-pnl-bps", type=float, default=1.0)
+    parser.add_argument(
+        "--live-inventory-basis-lot-exit-target-bps",
+        type=float,
+        default=float(LIVE_INVENTORY_BASIS_LOT_EXIT_TARGET_BPS),
+        help="Cap for the adaptive per-lot exit gate, aligned with the batch target. Default: 3",
+    )
     parser.add_argument(
         "--live-inventory-basis-v4-portfolio-exit-target-bps",
         type=float,

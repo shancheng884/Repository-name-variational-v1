@@ -115,3 +115,30 @@ def test_no_lock_is_a_no_op():
 
     assert _expire(runtime, []) == set()
     assert runtime.events == []
+
+def test_lot_target_defaults_to_the_batch_target():
+    from tools.lib.exit_targets import DEFAULT_LOT_EXIT_TARGET_BPS, lot_exit_target_bps
+
+    assert DEFAULT_LOT_EXIT_TARGET_BPS == Decimal("3.00")
+    assert lot_exit_target_bps(None) == DEFAULT_PORTFOLIO_EXIT_TARGET_BPS
+    assert lot_exit_target_bps("2.4") == Decimal("2.4")
+    assert lot_exit_target_bps(-1) == DEFAULT_LOT_EXIT_TARGET_BPS
+
+
+def test_the_adaptive_gate_is_capped_at_the_target():
+    from tools.lib.exit_targets import cap_exit_threshold
+
+    assert cap_exit_threshold(Decimal("4.50"), Decimal("3.00")) == Decimal("3.00")
+
+
+def test_time_decay_below_the_target_is_preserved():
+    from tools.lib.exit_targets import cap_exit_threshold
+
+    assert cap_exit_threshold(Decimal("1.80"), Decimal("3.00")) == Decimal("1.80")
+
+
+def test_a_missing_target_leaves_the_gate_untouched():
+    from tools.lib.exit_targets import cap_exit_threshold
+
+    assert cap_exit_threshold(Decimal("4.50"), None) == Decimal("4.50")
+    assert cap_exit_threshold(Decimal("4.50"), Decimal("0")) == Decimal("4.50")
