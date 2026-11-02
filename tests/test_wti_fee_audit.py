@@ -200,3 +200,34 @@ def test_fee_audit_keeps_multilayer_position_unverified_when_one_fee_is_missing(
     assert report["status"] == "unverified"
     assert report["fees_usd"] is None
     assert report["audited_order_leg_count"] == 6
+
+
+def test_fee_audit_uses_stored_native_identity_and_rejects_different_order():
+    state = _state()
+    for e in state['execution_history']:
+        for venue, leg in e['legs'].items():
+            leg['result']['native_order_id'] = f"order-{e['action_id']}-{venue}"
+    seen = []
+    async def lookup(client_id, request):
+        seen.append(request['native_order_id'])
+        return {'status': 'filled', 'final': True, 'client_order_id': client_id,
+                'native_order_id': 'different-order', 'filled_qty': '0.2',
+                'average_price': '100' if 'entry' in client_id else '101', 'fee_usd': '0',
+                'fee_evidence': {'status': 'confirmed_usd', 'raw_fee_unit': 'USD', 'fee_usd': '0'}}
+    report = asyncio.run(audit_latest_closed_position_fees(state, lookup))
+    assert len(seen) == 4
+    assert report['status'] == 'unverified' and report['fees_usd'] is None
+
+
+def test_fee_audit_conflicting_execution_history_is_not_silently_overwritten():
+    state = _state()
+    conflict = deepcopy(state['execution_history'][0])
+    conflict['legs']['lighter']['result']['average_price'] = '999'
+    state['execution_history'].append(conflict)
+    seen = []
+    async def lookup(client_id, request):
+        seen.append(client_id)
+        return {}
+    report = asyncio.run(audit_latest_closed_position_fees(state, lookup))
+    assert all('entry' not in x for x in seen)
+    assert report['status'] == 'unverified'

@@ -33,10 +33,14 @@ async def audit_latest_closed_position_fees(
             "legs": [],
         }
     executions = state.get("execution_history")
-    by_id = {
-        str(item.get("action_id")): item
-        for item in executions if isinstance(item, dict) and item.get("action_id")
-    } if isinstance(executions, list) else {}
+    by_id, conflicts = {}, set()
+    for item in executions if isinstance(executions, list) else []:
+        if not isinstance(item, dict) or not item.get('action_id'):
+            continue
+        key = str(item['action_id'])
+        if key in by_id and by_id[key] != item:
+            conflicts.add(key)
+        by_id[key] = item
     layers = position.get("layers")
     entry_ids = [
         str(layer.get("entry_execution_id"))
@@ -59,7 +63,7 @@ async def audit_latest_closed_position_fees(
     all_confirmed = True
     for phase, action_id, expected_kind in leg_specs:
         execution = by_id.get(str(action_id or ""))
-        if not isinstance(execution, dict) or execution.get("kind") != expected_kind:
+        if not isinstance(execution, dict) or str(action_id) in conflicts or execution.get("kind") != expected_kind:
             all_confirmed = False
             legs.append({
                 "phase": phase,
@@ -84,7 +88,11 @@ async def audit_latest_closed_position_fees(
                 })
                 continue
             try:
-                result = await lookup_order(str(client_order_id), dict(request))
+                lookup_request = dict(request)
+                for key in ('native_order_id', 'native_client_order_id', 'transaction_hash'):
+                    if stored.get(key):
+                        lookup_request[key] = stored[key]
+                result = await lookup_order(str(client_order_id), lookup_request)
             except Exception as exc:
                 result = {
                     "status": "unknown",
@@ -99,6 +107,9 @@ async def audit_latest_closed_position_fees(
             identity_matches = (
                 str(result.get("client_order_id") or "") == str(client_order_id)
                 and result.get("status") == "filled"
+                and (result.get('terminal_confirmed') is True or result.get('final') is True)
+                and (not stored.get('native_order_id')
+                     or str(result.get('native_order_id')) == str(stored['native_order_id']))
                 and expected_qty is not None and observed_qty == expected_qty
                 and expected_price is not None and observed_price == expected_price
             )
@@ -128,6 +139,7 @@ async def audit_latest_closed_position_fees(
                 "fee_usd": str(fee) if confirmed else None,
                 "fee_evidence": fee_evidence if isinstance(fee_evidence, dict) else None,
                 "lookup_reason": result.get("lookup_reason"),
+                "lookup_stage": result.get('lookup_stage'),
                 "error_type": result.get("error_type"),
             })
     return {
