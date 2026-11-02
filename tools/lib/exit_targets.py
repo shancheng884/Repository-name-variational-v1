@@ -26,6 +26,16 @@ def lot_exit_target_bps(configured: object | None = None) -> Decimal:
     return _bounded_target(configured, DEFAULT_LOT_EXIT_TARGET_BPS)
 
 
+def batch_exit_exceeds_risk_limit(
+    base_units: int | None, limit: int | None
+) -> bool:
+    """True when one merged order would breach the per-order Lighter cap."""
+
+    if base_units is None or not limit or limit <= 0:
+        return False
+    return base_units > limit
+
+
 def cap_exit_threshold(raw: Decimal, target: Decimal | None) -> Decimal:
     """The adaptive per-lot gate may tighten, but never exceed the target.
 

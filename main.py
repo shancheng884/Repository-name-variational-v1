@@ -54,6 +54,7 @@ from tools.lib.quote_throttle import (
 from tools.lib.exit_targets import (
     DEFAULT_LOT_EXIT_TARGET_BPS,
     DEFAULT_PORTFOLIO_EXIT_TARGET_BPS,
+    batch_exit_exceeds_risk_limit,
     cap_exit_threshold,
     lot_exit_target_bps,
     portfolio_exit_target_bps,
@@ -15838,6 +15839,152 @@ class VariationalToLighterRuntime:
             "price_boundary_policy": "bounded_hedge_completion_not_guaranteed_pair_pnl",
         }
 
+    def live_inventory_lighter_size_multiplier(self, asset: str) -> Decimal | None:
+        cache = getattr(self, "_lighter_size_multiplier_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._lighter_size_multiplier_cache = cache
+        key = str(asset or "").strip().upper()
+        if key in cache:
+            return cache[key]
+        try:
+            _, multiplier, _, _, _ = self.get_lighter_market_config(key)
+        except Exception:
+            return None
+        value = Decimal(multiplier)
+        cache[key] = value
+        return value
+
+    def live_inventory_lighter_base_units(
+        self, asset: str, qty: Any
+    ) -> int | None:
+        """Base units Lighter will see for this quantity, or None if unknown."""
+
+        multiplier = self.live_inventory_lighter_size_multiplier(asset)
+        value = to_decimal(qty)
+        if multiplier is None or value is None or value <= 0:
+            return None
+        return int((value * multiplier).to_integral_value())
+
+    async def recover_live_inventory_exit_hedge(
+        self,
+        *,
+        asset: str,
+        lot: dict[str, Any],
+        direction: str,
+        qty: Decimal,
+        var_exit_price: Decimal,
+        exit_side: str,
+        var_amount: str,
+        failure_reason: str,
+        attempts: int = 2,
+    ) -> dict[str, Any]:
+        """Finish the hedge leg, or undo the Var leg we already filled.
+
+        A filled Var exit without its Lighter hedge leaves a naked position, so a
+        failed hedge is retried a couple of times and then reversed rather than
+        parked in manual review.
+        """
+
+        context: dict[str, Any] = {
+            "failure_reason": failure_reason,
+            "attempts": [],
+        }
+        for attempt in range(1, max(1, attempts) + 1):
+            if attempt > 1:
+                await asyncio.sleep(1.5 * (attempt - 1))
+            try:
+                (record, payload), submit_ms = await self._timed_submit(
+                    self.place_lighter_order_from_plan(
+                        asset=asset,
+                        side=exit_side,
+                        qty=qty,
+                        var_fill_price=var_exit_price,
+                        cycle_id=int(lot.get("lot_id") or 0),
+                        role="live_inventory_exit",
+                        reduce_only=True,
+                    )
+                )
+            except Exception as exc:
+                context["attempts"].append(
+                    {"attempt": attempt, "error": f"{type(exc).__name__}:{exc}"}
+                )
+                continue
+            known = self.lighter_exit_submission_known(record)
+            context["attempts"].append(
+                {
+                    "attempt": attempt,
+                    "known": bool(known),
+                    "failure": getattr(record, "failure_reason", None),
+                }
+            )
+            if known:
+                await self.append_live_inventory_log(
+                    "live_inventory_exit_hedge_retry_ok",
+                    {
+                        "asset": asset,
+                        "lot_id": lot.get("lot_id"),
+                        "direction": direction,
+                        "qty": decimal_to_str(qty),
+                        "attempt": attempt,
+                        "lighter_submit_ms": submit_ms,
+                        "failure_reason": failure_reason,
+                    },
+                )
+                return {
+                    "status": "hedged",
+                    "lighter_record": record,
+                    "lighter_payload": payload,
+                    "lighter_submit_ms": submit_ms,
+                    "context": context,
+                }
+
+        unwind_side = "SELL" if str(exit_side).strip().upper() == "BUY" else "BUY"
+        unwind_error = None
+        try:
+            unwind_result = await self.send_variational_place_order(
+                asset=asset,
+                side=unwind_side,
+                amount=var_amount,
+                expected_min_btc_qty=None,
+                confirm=True,
+                reduce_only=False,
+            )
+        except Exception as exc:
+            unwind_result = None
+            unwind_error = f"{type(exc).__name__}:{exc}"
+        unwind_ok = bool(
+            isinstance(unwind_result, dict)
+            and unwind_result.get("ok")
+            and not unwind_result.get("error")
+        )
+        context["unwind"] = {
+            "side": unwind_side,
+            "ok": unwind_ok,
+            "error": unwind_error
+            or (unwind_result or {}).get("error")
+            if isinstance(unwind_result, dict)
+            else unwind_error,
+        }
+        if not unwind_ok:
+            return {"status": "failed", "context": context}
+        self.remove_pending_live_inventory_var_fill_match(
+            asset=asset, lot_id=lot.get("lot_id"), role="live_inventory_exit"
+        )
+        await self.append_live_inventory_log(
+            "live_inventory_exit_leg_unwound",
+            {
+                "asset": asset,
+                "lot_id": lot.get("lot_id"),
+                "direction": direction,
+                "qty": decimal_to_str(qty),
+                "unwind_side": unwind_side,
+                "failure_reason": failure_reason,
+                "action": "position_restored_and_left_open",
+            },
+        )
+        return {"status": "unwound", "context": context}
+
     async def submit_live_inventory_exit_pair(
         self,
         *,
@@ -23713,13 +23860,46 @@ class VariationalToLighterRuntime:
                     },
                 )
                 return
-            atomic_portfolio_lot_index = next(
-                index_value
-                for index_value, lot in enumerate(self.live_inventory_open_lots)
-                if self.live_inventory_normalized_lot_id(lot.get("lot_id"))
-                == self.live_inventory_normalized_lot_id(
-                    atomic_portfolio_lot.get("lot_id")
+            if atomic_portfolio_lot is not None:
+                merged_base_units = self.live_inventory_lighter_base_units(
+                    str(asset), atomic_portfolio_lot.get("qty")
                 )
+                base_limit = int(
+                    getattr(self, "risk_guard_max_base_amount", 0) or 0
+                )
+                if batch_exit_exceeds_risk_limit(
+                    merged_base_units, base_limit
+                ):
+                    released_lot_ids = sorted(portfolio_exit_lot_ids)
+                    self.live_inventory_v4_portfolio_exit_lot_ids = set()
+                    self.live_inventory_v4_portfolio_exit_context = {}
+                    portfolio_exit_lot_ids = set()
+                    atomic_portfolio_lot = None
+                    await self.persist_live_inventory_memory(
+                        reason="v4_batch_exit_blocked_size_limit"
+                    )
+                    await self.append_live_inventory_log(
+                        "live_inventory_v4_batch_exit_blocked",
+                        {
+                            **state_payload,
+                            "reason": "batch_exit_exceeds_lighter_risk_limit",
+                            "lot_ids": released_lot_ids,
+                            "merged_base_units": merged_base_units,
+                            "risk_limit_base_units": base_limit,
+                            "action": "fall_back_to_single_lot_exits",
+                        },
+                    )
+            atomic_portfolio_lot_index = (
+                next(
+                    index_value
+                    for index_value, lot in enumerate(self.live_inventory_open_lots)
+                    if self.live_inventory_normalized_lot_id(lot.get("lot_id"))
+                    == self.live_inventory_normalized_lot_id(
+                        atomic_portfolio_lot.get("lot_id")
+                    )
+                )
+                if atomic_portfolio_lot is not None
+                else None
             )
         selected_exit: dict[str, Any] | None = None
         for lot_index, candidate_lot in enumerate(self.live_inventory_open_lots):
@@ -24980,34 +25160,54 @@ class VariationalToLighterRuntime:
                         context={"action": "exit", "lot_id": lot.get("lot_id"), "direction": direction, "qty": decimal_to_str(qty), "var_amount": var_amount},
                     )
                     return
-            if lighter_exception is not None:
-                await self.require_live_inventory_manual_review(
-                    asset=asset,
-                    reason=f"basis_exit_concurrent_lighter_submit_exception:{lighter_exception}",
-                    context={
-                        "action": "reconcile_both_exit_legs",
-                        "lot_id": lot.get("lot_id"),
-                        "direction": direction,
-                        "qty": decimal_to_str(qty),
-                        "var_amount": var_amount,
-                        "exit_pair_context": exit_pair_context,
-                    },
+            if (
+                lighter_exception is not None
+                or not self.lighter_exit_submission_known(lighter_record)
+            ):
+                failure_reason = (
+                    f"basis_exit_concurrent_lighter_submit_exception:{lighter_exception}"
+                    if lighter_exception is not None
+                    else "basis_exit_lighter_submit_failed"
                 )
-                return
-            if not self.lighter_exit_submission_known(lighter_record):
-                await self.require_live_inventory_manual_review(
+                recovery = await self.recover_live_inventory_exit_hedge(
                     asset=asset,
-                    reason="basis_exit_lighter_submit_failed",
-                    context={
-                        "action": "reconcile_both_exit_legs" if v4_mode else "exit",
-                        "lot_id": lot.get("lot_id"),
-                        "direction": direction,
-                        "qty": decimal_to_str(qty),
-                        "lighter_payload": lighter_payload,
-                        "exit_pair_context": exit_pair_context,
-                    },
+                    lot=lot,
+                    direction=direction,
+                    qty=qty,
+                    var_exit_price=var_exit_price,
+                    exit_side=exit_side,
+                    var_amount=var_amount,
+                    failure_reason=failure_reason,
                 )
-                return
+                if recovery.get("status") == "hedged":
+                    lighter_record = recovery.get("lighter_record")
+                    lighter_payload = recovery.get("lighter_payload")
+                    lighter_submit_ms = recovery.get("lighter_submit_ms")
+                    lighter_exception = None
+                    exit_pair_context = {
+                        **exit_pair_context,
+                        "lighter_recovery": recovery.get("context") or {},
+                    }
+                else:
+                    if recovery.get("status") == "unwound":
+                        return
+                    await self.require_live_inventory_manual_review(
+                        asset=asset,
+                        reason=failure_reason,
+                        context={
+                            "action": "reconcile_both_exit_legs"
+                            if v4_mode
+                            else "exit",
+                            "lot_id": lot.get("lot_id"),
+                            "direction": direction,
+                            "qty": decimal_to_str(qty),
+                            "var_amount": var_amount,
+                            "lighter_payload": lighter_payload,
+                            "exit_pair_context": exit_pair_context,
+                            "recovery": recovery.get("context") or {},
+                        },
+                    )
+                    return
             if not await self.wait_for_lighter_final_fill(lighter_record):
                 retry_result = await self.retry_lighter_exit_after_cancel(
                     asset=asset,
