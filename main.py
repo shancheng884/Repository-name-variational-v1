@@ -23046,6 +23046,32 @@ class VariationalToLighterRuntime:
                             **self.live_inventory_v4_portfolio_exit_context,
                         },
                     )
+        if self.should_log_live_inventory_exit_blocked(
+            lot_id="portfolio_gate",
+            reason="v4_portfolio_exit_gate",
+        ):
+            await self.append_live_inventory_log(
+                "live_inventory_v4_portfolio_exit_gate",
+                {
+                    **state_payload,
+                    "reason": "v4_portfolio_exit_gate",
+                    "v4_mode": bool(v4_mode),
+                    "real_gradient": bool(self.live_inventory_basis_v4_real_gradient),
+                    "open_lots": len(self.live_inventory_open_lots),
+                    "lock_count": len(portfolio_exit_lot_ids),
+                    "pending_fills": len(self.pending_live_inventory_var_fill_matches),
+                    "reconcile_ids": len(
+                        self.live_inventory_v4_exit_reconciliation_lot_ids
+                    ),
+                    "account_risk_exit_reason": getattr(
+                        self, "live_inventory_account_risk_exit_reason", None
+                    ),
+                    "cost_confirmed": all(
+                        self.live_inventory_entry_cost_confirmed(open_lot)
+                        for open_lot in self.live_inventory_open_lots
+                    ),
+                },
+            )
         if (
             v4_mode
             and self.live_inventory_basis_v4_real_gradient
