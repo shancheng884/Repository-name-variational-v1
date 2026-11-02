@@ -1,0 +1,30 @@
+[Unit]
+Description=Read-only exit latency watcher (order metrics follower)
+After=var-lighter-eth-live.service
+Wants=var-lighter-eth-live.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/exit_latency_watch.py --interval-seconds 2
+Restart=always
+RestartSec=10
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Nice=10
+MemoryMax=128M
+CPUQuota=20%
+IOSchedulingClass=idle
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/home/ubuntu/Repository-name-variational-v1/log
+
+[Install]
+WantedBy=multi-user.target

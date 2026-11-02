@@ -83,6 +83,20 @@ def _qualified(row: dict[str, Any]) -> bool:
     return edge >= threshold
 
 
+def is_qualified(row: dict[str, Any]) -> bool:
+    """True when this row shows the exit gate was met at an executable price."""
+
+    return _qualified(row)
+
+
+def row_pnl_bps(row: dict[str, Any]) -> Decimal | None:
+    return _pnl_bps(row)
+
+
+def row_threshold_bps(row: dict[str, Any]) -> Decimal | None:
+    return _threshold_bps(row)
+
+
 def measure(
     rows: Iterable[dict[str, Any]],
     *,
