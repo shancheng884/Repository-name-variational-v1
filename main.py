@@ -51,6 +51,10 @@ from tools.lib.quote_throttle import (
     RfqAttemptLog,
     should_probe_exit_rfq,
 )
+from tools.lib.quote_allocation import (
+    DEFAULT_ALLOCATION_COOLDOWN_SECONDS,
+    exit_candidate_priority,
+)
 from tools.lib.rolling_rate_limiter import RollingWindowRateLimiter
 from tools.lib.runtime_files import read_json, write_json_atomic
 from tools.lib.telegram_notifier import TelegramNotifier
@@ -2795,6 +2799,9 @@ class VariationalToLighterRuntime:
         # Profit-exit RFQ shares the Variational order budget, so it gets its own
         # pacing: one request per minute after a hit, with backoff on failures.
         self.live_inventory_profit_exit_rfq_throttle = ExitQuoteThrottle()
+        # One profit-exit RFQ slot per minute is shared by every open lot, so
+        # remember when each lot last spent it and hand the slot elsewhere next.
+        self.live_inventory_exit_refresh_at_monotonic: dict[str, float] = {}
         self.live_inventory_v4_last_entry_submit_monotonic = 0.0
         self.live_inventory_basis_entry_rfq_cooldown_until_monotonic: dict[
             str, float
@@ -10746,6 +10753,24 @@ class VariationalToLighterRuntime:
             except Exception:
                 pass
         return summary
+
+    def live_inventory_exit_lot_recently_refreshed(self, lot_id: Any) -> bool:
+        stamps = getattr(self, "live_inventory_exit_refresh_at_monotonic", None) or {}
+        last = stamps.get(str(lot_id))
+        if last is None:
+            return False
+        return (
+            time.monotonic() - last
+        ) < DEFAULT_ALLOCATION_COOLDOWN_SECONDS
+
+    def note_live_inventory_exit_refresh(self, lot_id: Any) -> None:
+        if lot_id is None:
+            return
+        stamps = getattr(self, "live_inventory_exit_refresh_at_monotonic", None)
+        if stamps is None:
+            stamps = {}
+            self.live_inventory_exit_refresh_at_monotonic = stamps
+        stamps[str(lot_id)] = time.monotonic()
 
     async def live_inventory_basis_refreshed_exit_context(
         self,
@@ -23962,6 +23987,9 @@ class VariationalToLighterRuntime:
                     "direction": direction,
                     "holding_samples": holding_samples,
                     "holding_seconds": holding_seconds,
+                    "recently_refreshed": self.live_inventory_exit_lot_recently_refreshed(
+                        candidate_lot.get("lot_id")
+                    ),
                     "var_exit_price": var_exit_price,
                     "lighter_exit_price": lighter_exit_price,
                     "entry_var_price": entry_var_price,
@@ -24009,8 +24037,19 @@ class VariationalToLighterRuntime:
                 if should_stop or should_account_risk_exit:
                     selected_exit = candidate_exit
                     break
-                selected_pnl_bps = selected_exit.get("pnl_bps") if selected_exit is not None else None
-                if selected_exit is None or (pnl_bps is not None and (selected_pnl_bps is None or pnl_bps > selected_pnl_bps)):
+                if selected_exit is None or exit_candidate_priority(
+                    pnl_bps=candidate_exit.get("pnl_bps"),
+                    waited_seconds=candidate_exit.get("holding_seconds"),
+                    recently_refreshed=bool(
+                        candidate_exit.get("recently_refreshed")
+                    ),
+                ) > exit_candidate_priority(
+                    pnl_bps=selected_exit.get("pnl_bps"),
+                    waited_seconds=selected_exit.get("holding_seconds"),
+                    recently_refreshed=bool(
+                        selected_exit.get("recently_refreshed")
+                    ),
+                ):
                     selected_exit = candidate_exit
         if selected_exit is None:
             return
@@ -24258,6 +24297,9 @@ class VariationalToLighterRuntime:
                     refreshed_pnl_bps = to_decimal(
                         refresh_context.get("refreshed_pnl_bps")
                     )
+                    # A failed attempt still spends the shared minute, so the
+                    # allocation counts it as used and moves to another lot.
+                    self.note_live_inventory_exit_refresh(lot.get("lot_id"))
                     if refresh_reason is not None:
                         self.live_inventory_basis_v4_reset_exit_confirmation(lot)
                         await self.append_live_inventory_log(
