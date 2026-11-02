@@ -566,3 +566,44 @@ Var order, verifies both accounts and zero active orders, and only then submits
 the provably missing Lighter hedge. It does not re-submit the Var order or
 authorize further gradient entries. A lost hedge acknowledgement is looked up
 on the next restart, never blindly repeated. No state/history file is cleared.
+
+## Fresh Quote Retries and Realized Cost Evidence
+
+Execution refresh retries only a sample rejected solely for an expired
+Variational quote timestamp. It makes at most three independent quote attempts,
+records whether the source timestamp advanced, and accepts a sample only when
+the original 2-second quote/book checks pass. Session, continuity, depth,
+120-second active-market gap, threshold, account-risk and order-idempotency
+guards are unchanged. A repeated timestamp is diagnostic evidence, not a reason
+to substitute local receipt time or reuse an old quote.
+
+Replay applies the configured round-trip reserve once to quote-path gross PnL.
+It does not infer actual fills, fees, funding or realized slippage from market
+samples. Closed-position state separately records final-fill slippage against
+the dispatch reference and explicit USD fee evidence; slippage is already
+reflected in final-fill gross PnL and must not be subtracted again. Missing fee
+or funding evidence remains unknown rather than being treated as zero.
+Run `.venv/bin/python tools/wti_cost_audit.py` for a read-only audit of the
+latest closed position.
+
+## Manual WTI Recovery And Reporting
+
+- Baseline continuity is independent of the two-second execution freshness gate.
+  An expired cached quote can prove capture continuity but cannot authorize orders.
+  Execution bursts cannot overwrite the latest baseline or reset its gap clock.
+- A real unexplained gap above 120 seconds still revokes entries and drains exposure.
+  Gap-only locks can recover after three continuous baseline observations and two
+  distinct, fresh, current-runtime account reconciliations proving flat positions,
+  no pending actions or orders, complete normal account risk, and fresh execution
+  quotes. Other manual-review locks cannot use this recovery path. Restart retains
+  lock metadata and requires new recovery evidence; it never resets a pilot budget.
+- WTI execution notifications use a separate durable outbox keyed by action ID.
+  Existing history is imported without replaying old alerts. Confirmed rate-limit
+  failures retry; ambiguous transport failures and interrupted sends are retained
+  as `delivery_unknown` instead of risking duplicate messages. This is not a claim
+  of exactly-once Telegram delivery: Telegram provides no idempotency key.
+- The daily service uses `--asset ALL`, separates ETH and WTI, groups final closes
+  by Beijing date, and distinguishes gross PnL from verified fees and net PnL.
+  Missing evidence remains unknown. Old account equity and annualized estimates
+  are not presented as current. Execution state and market collection are never
+  modified by the report or notification worker. Automatic rotation stays off.
