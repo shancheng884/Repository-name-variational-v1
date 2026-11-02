@@ -43,6 +43,14 @@ from tools.lib.market_sessions import (  # noqa: E402
 
 
 ASSET = "WTI"
+EXECUTION_REFRESH_MAX_ATTEMPTS = 3
+EXECUTION_REFRESH_RETRY_DELAY_SECONDS = 0.4
+EXECUTION_REFRESH_MAX_ELAPSED_SECONDS = 2.0
+EXECUTION_REFRESH_RETRYABLE_REASONS = frozenset({
+    "variational_quote_age_invalid",
+    "lighter_book_stale",
+    "lighter_moved_during_var_quote",
+})
 VAR_MARKET = "USOILP"
 INSTRUMENT_TYPE = "swap"
 INSTRUMENT_KIND = "commodity"
@@ -140,6 +148,7 @@ class OilSwapCollector:
         self.last_session_id: str | None = None
         self.last_session_closing_at: str | None = None
         self.latest_sample: dict[str, Any] | None = None
+        self.latest_baseline_sample: dict[str, Any] | None = None
         self.sample_lock = asyncio.Lock()
         self.last_health_write = 0.0
         self.last_maintenance = 0.0
@@ -484,6 +493,8 @@ class OilSwapCollector:
     def _record_sample(self, row: dict[str, Any]) -> None:
         self.store.append(row)
         self.latest_sample = dict(row)
+        if row.get('sample_kind', 'baseline') == 'baseline':
+            self.latest_baseline_sample = dict(row)
         self.samples += 1
         self.sample_quality_counts[str(row.get("sample_quality") or "unknown")] += 1
         self.last_sample_at = row["logged_at"]
@@ -499,25 +510,60 @@ class OilSwapCollector:
     ) -> dict[str, Any]:
         """Serialize execution refreshes with the normal collector poll loop."""
         row: dict[str, Any] | None = None
-        for attempt in range(2 if sample_kind == "burst" else 1):
-            candidate = await self._collect_once(
-                var_qty=var_qty, lighter_qty=lighter_qty, sample_kind=sample_kind,
-                signal_sample_id=signal_sample_id,
-            )
+        max_attempts = EXECUTION_REFRESH_MAX_ATTEMPTS if sample_kind == "burst" else 1
+        deadline = time.monotonic() + EXECUTION_REFRESH_MAX_ELAPSED_SECONDS
+        previous_quote_timestamp = None
+        for attempt in range(max_attempts):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                candidate = await asyncio.wait_for(
+                    self._collect_once(
+                        var_qty=var_qty, lighter_qty=lighter_qty, sample_kind=sample_kind,
+                        signal_sample_id=signal_sample_id,
+                    ),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                if row is None:
+                    raise RuntimeError("wti_execution_refresh_deadline_exceeded")
+                row["execution_refresh_deadline_exceeded"] = True
+                break
             if not isinstance(candidate, dict):
                 raise RuntimeError("wti_fresh_sample_unavailable")
             candidate["execution_refresh_attempt"] = attempt + 1
+            quote_timestamp = parse_timestamp(candidate.get("quote_timestamp"))
+            if attempt:
+                candidate["execution_refresh_quote_timestamp_advanced"] = bool(
+                    previous_quote_timestamp is not None
+                    and quote_timestamp is not None
+                    and quote_timestamp > previous_quote_timestamp
+                )
+            else:
+                candidate["execution_refresh_quote_timestamp_advanced"] = None
             self._record_sample(candidate)
             row = candidate
+            reasons = candidate.get("sample_quality_reasons") or []
+            retryable = (
+                bool(reasons)
+                and set(reasons).issubset(EXECUTION_REFRESH_RETRYABLE_REASONS)
+                and candidate.get("sample_quality") in {"invalid", "degraded"}
+            )
             if (
                 sample_kind != "burst"
-                or candidate.get("sample_quality") != "invalid"
-                or candidate.get("sample_quality_reasons") != ["variational_quote_age_invalid"]
-                or attempt == 1
+                or not retryable
+                or attempt + 1 >= max_attempts
             ):
                 break
-            # Each independent response still has to satisfy the unchanged 2s gate.
-            await asyncio.sleep(0.25)
+            # Recover only timestamp/book-pair failures inside one hard 2s budget.
+            # Session, continuity, resync, clock and slow-quote failures stay blocked.
+            previous_quote_timestamp = quote_timestamp
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                row["execution_refresh_deadline_exceeded"] = True
+                break
+            await asyncio.sleep(min(EXECUTION_REFRESH_RETRY_DELAY_SECONDS, remaining))
         assert row is not None
         self._write_health(force=True)
         return dict(row)

@@ -795,6 +795,12 @@ class VariationalMonitor:
             f"ask={quote.get('ask')}{spread_part} mark={quote.get('mark_price')}"
         )
 
+    async def get_quote_snapshot(self, asset: str) -> dict[str, Any] | None:
+        """Return a detached copy of an already observed complete bid/ask quote."""
+        async with self._lock:
+            quote = self.quotes.get(asset.upper())
+            return dict(quote) if isinstance(quote, dict) else None
+
     def _format_portfolio_line(self) -> str | None:
         if not self.current_quote_asset:
             return None

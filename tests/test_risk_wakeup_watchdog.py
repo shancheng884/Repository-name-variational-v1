@@ -176,6 +176,9 @@ def write_wti_notification_health(
         "wti_entry_authorized": not revoked and reason == "account_risk_normal",
         "startup_reconciled": startup_reconciled,
         "account_read_recovery_required": account_recovery,
+        "risk_data_complete": not account_recovery,
+        "account_snapshot_observed_at": now.isoformat() if not account_recovery else None,
+        "last_account_read_failure": "positions:http_503" if account_recovery else None,
         "market_sample_fresh": reason == "account_risk_normal",
     })
 
@@ -323,6 +326,67 @@ def test_wti_confirmed_recovery_and_namespaced_cooldown_survive_restart(tmp_path
     write_wti_notification_health(tmp_path, current[0], reason="wti_current_sample_or_session_not_fresh")
     assert watchdog.run_once()[0].key == key
     assert len(telegram.sent) == 3
+
+
+def test_wti_account_read_failures_share_one_incident_and_recover_only_after_confirmation(tmp_path):
+    current = [datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    key = watchdog_module.WTI_ACCOUNT_READ_INCIDENT_KEY
+    for reason in (
+        "account_snapshot_unavailable:positions:http_503",
+        "wti_account_read_recovery_pending",
+        "wti_entry_authorization_unavailable",
+    ):
+        write_wti_notification_health(tmp_path, current[0], reason=reason, account_recovery=True)
+        watchdog.run_once()
+        current[0] += timedelta(seconds=5)
+    assert list(watchdog.memory["active_incidents"]) == [key]
+    assert len(watchdog.telegram.sent) == 1
+    assert not any("风险监控已恢复" in text for text, _ in watchdog.telegram.sent)
+
+    write_wti_notification_health(tmp_path, current[0], reason="account_risk_normal", account_recovery=True)
+    watchdog.run_once()
+    current[0] += timedelta(seconds=35)
+    write_wti_notification_health(tmp_path, current[0], reason="account_risk_normal", account_recovery=True)
+    watchdog.run_once()
+    assert key in watchdog.memory["active_incidents"]
+    assert len(watchdog.telegram.sent) == 1
+
+    current[0] += timedelta(seconds=5)
+    write_wti_notification_health(tmp_path, current[0], reason="account_risk_normal")
+    watchdog.run_once()
+    current[0] += timedelta(seconds=31)
+    write_wti_notification_health(tmp_path, current[0], reason="account_risk_normal")
+    watchdog.run_once()
+    assert key not in watchdog.memory["active_incidents"]
+    assert len(watchdog.telegram.sent) == 2
+    assert "风险监控已恢复" in watchdog.telegram.sent[-1][0]
+
+
+def test_wti_account_recovery_never_notifies_without_delivered_alarm(tmp_path):
+    current = [datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)]
+    watchdog = wti_notification_watchdog(tmp_path, current)
+    key = watchdog_module.WTI_ACCOUNT_READ_INCIDENT_KEY
+    write_wti_notification_health(
+        tmp_path, current[0], reason="account_snapshot_unavailable:positions:http_503",
+        account_recovery=True,
+    )
+    watchdog.alert_control_path.write_text(json.dumps({
+        "notifications_enabled": False,
+        "reason": "test_silence",
+    }), encoding="utf-8")
+    watchdog.run_once()
+    assert watchdog.memory["active_incidents"][key]["telegram_status"] == "suppressed"
+
+    watchdog.alert_control_path.write_text(json.dumps({"notifications_enabled": True}), encoding="utf-8")
+    current[0] += timedelta(seconds=5)
+    write_wti_notification_health(tmp_path, current[0], reason="account_risk_normal")
+    watchdog.run_once()
+    current[0] += timedelta(seconds=31)
+    write_wti_notification_health(tmp_path, current[0], reason="account_risk_normal")
+    watchdog.run_once()
+    assert key not in watchdog.memory["active_incidents"]
+    assert watchdog.telegram.sent == []
 
 
 def test_wti_missing_health_resets_recovery_confirmation(tmp_path):

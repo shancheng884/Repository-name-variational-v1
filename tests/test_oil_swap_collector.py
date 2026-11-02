@@ -280,8 +280,14 @@ def test_execution_refresh_preserves_requested_pair_quantity(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_execution_refresh_retries_stale_quote_once_and_keeps_both_samples(tmp_path) -> None:
+def test_execution_refresh_waits_for_timestamp_advance_and_keeps_attempt_evidence(
+    tmp_path, monkeypatch,
+) -> None:
     async def run() -> None:
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("tools.oil_swap_collector.asyncio.sleep", no_sleep)
         args = parse_args(["--reuse-forwarder", "--output-dir", str(tmp_path)])
         collector = OilSwapCollector(args)
         collector.books.market_metadata["WTI"] = market()
@@ -297,6 +303,7 @@ def test_execution_refresh_retries_stale_quote_once_and_keeps_both_samples(tmp_p
             for n in range(30, 36)
         ]
         quote_calls = 0
+        stale_quote_at = observed - timedelta(seconds=3)
 
         async def fake_snapshot(_asset, _notional, *, base_qty=None):
             return snapshots.pop(0)
@@ -304,9 +311,9 @@ def test_execution_refresh_retries_stale_quote_once_and_keeps_both_samples(tmp_p
         async def fake_quote(_asset, _qty, **_kwargs):
             nonlocal quote_calls
             quote_calls += 1
-            quote_at = datetime.now(timezone.utc)
-            if quote_calls == 1:
-                quote_at -= timedelta(seconds=3)
+            quote_at = (
+                stale_quote_at if quote_calls <= 2 else datetime.now(timezone.utc)
+            )
             return {
                 "ok": True,
                 "result": {
@@ -332,14 +339,156 @@ def test_execution_refresh_retries_stale_quote_once_and_keeps_both_samples(tmp_p
             var_qty=Decimal("0.198"), lighter_qty=Decimal("0.198"),
             sample_kind="burst",
         )
-        assert quote_calls == 2
+        assert quote_calls == 3
+        assert row["sample_quality"] == "valid"
+        assert row["execution_refresh_attempt"] == 3
+        assert row["execution_refresh_quote_timestamp_advanced"] is True
+        assert Decimal(row["quote_age_at_response_seconds"]) <= Decimal("2")
+        assert collector.sample_quality_counts == {"invalid": 2, "valid": 1}
+        persisted = read_basis_samples(collector.sample_root, limit=10, asset_filter="WTI")
+        assert len(persisted) == 3
+        assert all(item["sample_kind"] == "burst" for item in persisted)
+
+    asyncio.run(run())
+
+
+def test_execution_refresh_keeps_blocking_when_timestamp_never_advances(
+    tmp_path, monkeypatch,
+) -> None:
+    async def run() -> None:
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("tools.oil_swap_collector.asyncio.sleep", no_sleep)
+        args = parse_args(["--reuse-forwarder", "--output-dir", str(tmp_path)])
+        collector = OilSwapCollector(args)
+        collector.books.market_metadata["WTI"] = market()
+        observed = datetime.now(timezone.utc)
+        snapshots = [
+            {
+                "bid": Decimal("101.99"), "ask": Decimal("102.01"),
+                "sell_price": Decimal("101.99"), "buy_price": Decimal("102.01"),
+                "nonce": n, "server_timestamp_ms": int(observed.timestamp() * 1000),
+                "book_age_seconds": 0.1, "continuity_ok": True,
+                "cold": False, "sequence_gaps": 0,
+            }
+            for n in range(40, 46)
+        ]
+        stale_quote_at = observed - timedelta(seconds=3)
+        quote_calls = 0
+
+        async def fake_snapshot(_asset, _notional, *, base_qty=None):
+            return snapshots.pop(0)
+
+        async def fake_quote(_asset, _qty, **_kwargs):
+            nonlocal quote_calls
+            quote_calls += 1
+            return {
+                "ok": True,
+                "result": {
+                    "bid": "102.00", "ask": "102.02",
+                    "quoteId": f"q-{quote_calls}",
+                    "quoteTimestamp": stale_quote_at.isoformat(),
+                },
+            }, 50.0
+
+        collector.market_status_feed.connected = True
+        collector.market_status_feed.status = "open"
+        collector.market_status_feed.status_observed_at = observed
+        collector.market_status_feed.heartbeat_at = observed
+        collector.trading_sessions = [{
+            "open": (observed - timedelta(minutes=1)).isoformat(),
+            "close": (observed + timedelta(hours=6)).isoformat(),
+        }]
+        collector.session_schedule_updated_at = observed.isoformat()
+        collector.books.snapshot = fake_snapshot
+        collector.quote_client.quote = fake_quote
+
+        row = await collector.collect_fresh_sample(
+            sample_kind="burst", var_qty=Decimal("0.198"), lighter_qty=Decimal("0.198")
+        )
+        assert quote_calls == 3
+        assert row["sample_quality"] == "invalid"
+        assert row["sample_quality_reasons"] == ["variational_quote_age_invalid"]
+        assert row["execution_refresh_attempt"] == 3
+        assert row["execution_refresh_quote_timestamp_advanced"] is False
+        assert collector.sample_quality_counts == {"invalid": 3}
+
+    asyncio.run(run())
+
+
+def test_execution_refresh_retries_only_within_two_second_budget(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        args = parse_args(["--reuse-forwarder", "--output-dir", str(tmp_path)])
+        collector = OilSwapCollector(args)
+        monkeypatch.setattr(
+            "tools.oil_swap_collector.EXECUTION_REFRESH_MAX_ELAPSED_SECONDS", 0.05
+        )
+        monkeypatch.setattr(
+            "tools.oil_swap_collector.EXECUTION_REFRESH_RETRY_DELAY_SECONDS", 0
+        )
+        calls = 0
+
+        async def slow_refresh(**_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {
+                    "sample_id": "stale-1", "sample_kind": "burst",
+                    "logged_at": datetime.now(timezone.utc).isoformat(),
+                    "quote_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "sample_quality": "invalid",
+                    "sample_quality_reasons": ["variational_quote_age_invalid"],
+                }
+            await asyncio.sleep(0.2)
+            raise AssertionError("refresh must be canceled at its elapsed-time deadline")
+
+        collector._collect_once = slow_refresh
+        started = asyncio.get_running_loop().time()
+        row = await collector.collect_fresh_sample(sample_kind="burst")
+        elapsed = asyncio.get_running_loop().time() - started
+        assert calls == 2
+        assert elapsed < 0.2
+        assert row["sample_quality"] == "invalid"
+        assert row["execution_refresh_deadline_exceeded"] is True
+        assert collector.sample_quality_counts == {"invalid": 1}
+
+    asyncio.run(run())
+
+
+def test_execution_refresh_can_retry_pair_drift_without_relaxing_15bps_gate(
+    tmp_path, monkeypatch,
+) -> None:
+    async def run() -> None:
+        args = parse_args(["--reuse-forwarder", "--output-dir", str(tmp_path)])
+        collector = OilSwapCollector(args)
+        monkeypatch.setattr(
+            "tools.oil_swap_collector.EXECUTION_REFRESH_RETRY_DELAY_SECONDS", 0
+        )
+        now = datetime.now(timezone.utc)
+        calls = 0
+
+        async def refresh(**_kwargs):
+            nonlocal calls
+            calls += 1
+            quote_at = now + timedelta(milliseconds=calls)
+            return {
+                "sample_id": f"refresh-{calls}", "sample_kind": "burst",
+                "logged_at": quote_at.isoformat(),
+                "quote_timestamp": quote_at.isoformat(),
+                "sample_quality": "degraded" if calls == 1 else "valid",
+                "sample_quality_reasons": (
+                    ["lighter_moved_during_var_quote"] if calls == 1 else []
+                ),
+            }
+
+        collector._collect_once = refresh
+        row = await collector.collect_fresh_sample(sample_kind="burst")
+        assert calls == 2
         assert row["sample_quality"] == "valid"
         assert row["execution_refresh_attempt"] == 2
-        assert Decimal(row["quote_age_at_response_seconds"]) <= Decimal("2")
-        assert collector.sample_quality_counts == {"invalid": 1, "valid": 1}
-        persisted = read_basis_samples(collector.sample_root, limit=10, asset_filter="WTI")
-        assert len(persisted) == 2
-        assert all(item["sample_kind"] == "burst" for item in persisted)
+        assert row["execution_refresh_quote_timestamp_advanced"] is True
+        assert collector.sample_quality_counts == {"degraded": 1, "valid": 1}
 
     asyncio.run(run())
 

@@ -66,6 +66,11 @@ WTI_MARKET_DATA_NOTIFICATION_REASONS = frozenset({
     "wti_execution_refresh_sample_invalid",
     "variational_quote_stale_or_invalid",
 })
+WTI_ACCOUNT_READ_NOTIFICATION_REASONS = frozenset({
+    "wti_account_read_recovery_pending",
+    "wti_entry_authorization_unavailable",
+})
+WTI_ACCOUNT_READ_INCIDENT_KEY = "wti:account_risk:block_entry:wti_account_read_unavailable"
 
 
 CRITICAL_MANUAL_REVIEW_MARKERS = (
@@ -187,6 +192,20 @@ def wti_notification_health(health: dict[str, Any]) -> dict[str, Any]:
         result["risk_notification_action"] = "block_entry"
         result["risk_notification_reason"] = "wti_entry_authorization_revoked"
         return result
+    risk_reason = str(health.get("risk_reason") or "")
+    entry_reason = str(health.get("entry_gate_block_reason") or "")
+    if (
+        health.get("entry_authorization_permanently_revoked") is not True
+        and (
+            health.get("account_read_recovery_required") is True
+            or risk_reason.startswith("account_snapshot_unavailable")
+            or risk_reason in WTI_ACCOUNT_READ_NOTIFICATION_REASONS
+            or entry_reason in WTI_ACCOUNT_READ_NOTIFICATION_REASONS
+        )
+    ):
+        result["risk_notification_action"] = "block_entry"
+        result["risk_notification_reason"] = "wti_account_read_unavailable"
+        return result
     if account_action in {"warning", "block_entry", "force_reduce", "emergency_exit"}:
         result["risk_notification_action"] = account_action
         result["risk_notification_reason"] = health.get("account_risk_reason")
@@ -200,6 +219,13 @@ def canonical_wti_incident_key(key: str, *, permanent_entry_lock: bool = False) 
     prefix = "wti:account_risk:block_entry:"
     if permanent_entry_lock and key.startswith(prefix):
         return prefix + "wti_entry_authorization_revoked"
+    if key.startswith(prefix):
+        reason = key[len(prefix):]
+        if (
+            reason in WTI_ACCOUNT_READ_NOTIFICATION_REASONS
+            or reason.startswith("account_snapshot_unavailable")
+        ):
+            return WTI_ACCOUNT_READ_INCIDENT_KEY
     if key.startswith(prefix) and key[len(prefix):] in WTI_MARKET_DATA_NOTIFICATION_REASONS:
         return prefix + "wti_market_data_unavailable"
     return key
@@ -1476,6 +1502,8 @@ class RiskWakeupWatchdog:
     ) -> None:
         if not bool(record.get("notify_recovery", True)):
             return
+        if not record.get("telegram_sent_at"):
+            return
         if not self.alerts_allowed(now=now):
             return
         message = "\n".join(
@@ -1591,6 +1619,12 @@ class RiskWakeupWatchdog:
                     config=self.config,
                     now=now,
                 )
+                entry_lock_key = "wti:account_risk:block_entry:wti_entry_authorization_revoked"
+                if entry_lock_key in self.memory["active_incidents"]:
+                    wti_events = [
+                        item for item in wti_events
+                        if item.key != "account_risk:block_entry:wti_account_read_unavailable"
+                    ]
                 if not inactive_wti_flat:
                     self.monitored_assets.append("WTI")
                 if inactive_base_flat:
@@ -1612,7 +1646,8 @@ class RiskWakeupWatchdog:
                         message=item.message,
                         alert_params=("WTI", *(item.alert_params[1:] or ("WTI 风险监控",))),
                         fingerprint=(
-                            f"WTI:{item.key}"
+                            "WTI:"
+                            + canonical_wti_incident_key(f"wti:{item.key}")[4:]
                             if item.severity == "warning" and item.key.startswith("account_risk:")
                             else item.fingerprint
                         ),
@@ -1760,6 +1795,13 @@ class RiskWakeupWatchdog:
                 active.pop(key)
                 continue
             if key.startswith("wti:") and isinstance(record, dict):
+                unresolved_account_read = key == WTI_ACCOUNT_READ_INCIDENT_KEY and (
+                    wti_health.get("account_read_recovery_required") is True
+                    or wti_health.get("startup_reconciled") is not True
+                    or wti_health.get("last_account_read_failure") is not None
+                    or wti_health.get("risk_data_complete") is not True
+                    or wti_health.get("account_risk_action") not in {None, "normal"}
+                )
                 unresolved_data = key in {
                     "wti:account_risk:block_entry:wti_market_data_unavailable",
                     "wti:wti_market_data_unavailable_with_exposure",
@@ -1773,13 +1815,16 @@ class RiskWakeupWatchdog:
                     and (
                         wti_health.get("startup_reconciled") is not True
                         or wti_health.get("account_read_recovery_required") is True
+                        or wti_health.get("last_account_read_failure") is not None
+                        or wti_health.get("risk_data_complete") is not True
+                        or wti_health.get("account_risk_action") not in {None, "normal"}
                         or wti_health.get("risk_action") in {"force_reduce", "emergency_exit"}
                     )
                 )
                 if not (
                     inactive_wti_flat
                     or fresh_runtime_health(wti_health, now, self.config.risk_heartbeat_max_age_seconds)
-                ) or unresolved_data or unresolved_lock or recovered_lock_not_ready:
+                ) or unresolved_data or unresolved_lock or recovered_lock_not_ready or unresolved_account_read:
                     record.pop("recovery_candidate_at", None)
                     continue
                 candidate = parse_time(record.get("recovery_candidate_at"))
