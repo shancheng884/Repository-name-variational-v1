@@ -35,3 +35,6 @@ log/
 
 # all csv files
 *.csv
+
+# patch backups
+*.orig
