@@ -11,7 +11,7 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
 EnvironmentFile=/home/ubuntu/Repository-name-variational-v1/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/live.py --asset ETH --v4-live --v4-real-gradient --v4-elastic-capacity --v4-bidirectional --v4-continuous --resume-open-position
+ExecStart=/home/ubuntu/Repository-name-variational-v1/deploy/systemd/run-live-eth.sh
 Restart=always
 RestartSec=10
 KillMode=control-group
