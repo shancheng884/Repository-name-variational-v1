@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep the live order metrics log bounded
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
