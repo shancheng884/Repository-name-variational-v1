@@ -1,0 +1,22 @@
+[Unit]
+Description=WTI oil swap basis collector (read only, auto restart)
+After=network-online.target var-lighter-eth-live.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
+EnvironmentFile=/home/ubuntu/Repository-name-variational-v1/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/oil_swap_collector.py --reuse-forwarder --forwarder-command-port 8768 --output-dir log/oil_swap --notional-usd 20 --interval-seconds 10
+Restart=always
+RestartSec=15
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

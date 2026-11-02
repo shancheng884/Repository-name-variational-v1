@@ -449,3 +449,30 @@ The independent Pushover Emergency and Tencent Cloud voice escalation service
 is documented in `docs/risk_wakeup_watchdog.md`. It reads local state and the
 main runtime's small risk heartbeat only; it never enters the quote or order
 path.
+
+# Live process supervision (no tmux)
+
+The ETH strategy and the WTI collector are systemd units, not tmux panes:
+
+```bash
+sudo systemctl status  var-lighter-eth-live.service var-lighter-wti-collector.service
+sudo journalctl -u var-lighter-eth-live.service -f
+sudo systemctl restart var-lighter-eth-live.service      # restarts with --resume-open-position
+```
+
+Both use `Restart=always`, so a crash, an OOM kill, or a missed extension
+connection brings them back within 10–15 s. `StartLimitIntervalSec=0` removes
+systemd's five-starts-per-10 s cap, which otherwise leaves a crash-looping unit
+dead until someone notices. The live unit carries `OOMScoreAdjust=-500` so the
+kernel prefers other victims when this 4 GB box runs out of memory.
+
+Why: on 2026-11-02 the whole tmux server exited together with its last pane at
+08:03, the earlier collector stop at 05:48 left no crash trace at all (log ends
+mid-sample, so it took SIGHUP/SIGTERM from a session teardown), and a 3.27 GB
+python in an SSH session triggered a global OOM at 06:04. tmux has no restart
+policy and no notion of which process matters, so both services silently stayed
+down until someone looked.
+
+Do not start either service by hand while the unit is active: the runtime
+refuses with `python_main_already_running` and the collector would write the
+same sample files twice. Stop the unit first.

@@ -1,0 +1,24 @@
+[Unit]
+Description=Var/Lighter ETH live basis strategy (auto restart)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
+EnvironmentFile=/home/ubuntu/Repository-name-variational-v1/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/live.py --asset ETH --v4-live --v4-real-gradient --v4-elastic-capacity --v4-bidirectional --v4-continuous --resume-open-position
+Restart=always
+RestartSec=10
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=90
+# The live desk must survive a memory spike elsewhere on this 4 GB box.
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
