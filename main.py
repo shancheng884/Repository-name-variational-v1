@@ -6082,7 +6082,7 @@ class VariationalToLighterRuntime:
                         "variational_portfolio_refresh_snapshot_age_seconds": (
                             variational_freshness["age_seconds"]
                         ),
-                        "variational_portfolio_refresh_equity_usd": (
+                        "variational_portfolio_refresh_equity_usd": decimal_to_str(
                             variational_metrics.get("equity_usd")
                         ),
                     }
@@ -6281,8 +6281,10 @@ class VariationalToLighterRuntime:
                     await self.write_live_inventory_risk_health(context)
                 except Exception as exc:
                     self.logger.warning(
-                        "live_inventory_risk_health_write_failed error=%s",
+                        "live_inventory_risk_health_write_failed error=%s detail=%s",
                         type(exc).__name__,
+                        exc,
+                        exc_info=True,
                     )
                 action = str(context.get("risk_action") or "normal")
                 reason = str(context.get("risk_reason") or "account_risk_normal")

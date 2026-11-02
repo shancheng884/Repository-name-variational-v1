@@ -4,7 +4,7 @@ import json
 import gzip
 import os
 from collections import deque
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
@@ -20,11 +20,42 @@ LIVE_STATE = LOG_DIR / "live_inventory_state.json"
 LIVE_CONTROL = LOG_DIR / "live_inventory_control.json"
 
 
+def json_default(value: Any) -> Any:
+    """Return a JSON-safe form for values the runtime stores but json rejects.
+
+    Decimals keep their full precision by rendering as a plain decimal string,
+    matching the format the health payloads already publish for money fields.
+    """
+
+    if isinstance(value, Decimal):
+        if value.is_finite():
+            return format(value, "f")
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, (set, frozenset)):
+        return sorted(str(item) for item in value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
-        json.dumps(value, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            indent=2,
+            default=json_default,
+        )
+        + "\n",
         encoding="utf-8",
     )
     os.replace(temporary, path)
