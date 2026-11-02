@@ -348,6 +348,16 @@ def test_full_open_close_uses_exact_contracts_reduce_only_and_confirmed_position
     assert closed["last_closed_position"]["fee_evidence"]["all_leg_fees_confirmed_usd"] is True
     assert closed["last_closed_position"]["fee_evidence"]["variational"]["entry"][0]["status"] == "confirmed_usd"
     assert closed["last_closed_position"]["fee_evidence"]["lighter"]["exit"]["status"] == "confirmed_usd"
+    costs = closed["last_closed_position"]["execution_cost_evidence"]
+    assert costs["method"] == "final_fill_vs_dispatch_reference_v1"
+    assert costs["all_fills_verified"] is True
+    assert costs["all_fees_verified_usd"] is True
+    assert costs["actual_fees_usd"] == "0.04"
+    assert costs["slippage_is_already_in_final_fill_gross_pnl"] is True
+    assert costs["do_not_subtract_slippage_again"] is True
+    assert Decimal(
+        closed["last_closed_position"]["pnl_after_confirmed_trading_fees_before_funding_usd"]
+    ) == Decimal(closed["last_closed_position"]["actual_gross_pnl_usd"]) - Decimal("0.04")
     assert closed["last_closed_position"]["entry_execution_id"]
     assert closed["last_closed_position"]["exit_execution_id"]
     assert len(gateway.requests) == 4
@@ -2454,6 +2464,151 @@ def _completed_manual_gradient(executor):
     assert state["gradient_pilot"]["status"] == "completed"
     executor.reconcile_account_only(runtime_pid=777, runtime_run_id="manual-runtime")
     return state["gradient_pilot"]
+
+
+def _manual_continuous_gradient_config():
+    return {
+        "tier_thresholds_bps": ["30", "45"],
+        "layer_notional_usd": "10",
+        "max_notional_usd": "20",
+        "max_slippage_bps": "8",
+        "manual_continuous_equity": True,
+    }
+
+
+def test_legacy_tier_reactivation_migration_preserves_open_layers_and_never_submits(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    config = _manual_continuous_gradient_config()
+    pilot = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+    )
+    opened = _open(
+        executor, notional_usd="10", layer_id="existing-layer-t2",
+        gradient_tier=2, gradient_pilot_id=pilot["pilot_id"],
+    )
+    original_layers = deepcopy(opened["open_position"]["layers"])
+    state = executor.store.load()
+    state["gradient_pilot"].pop("tier_reactivation_by_direction", None)
+    state["gradient_pilot"]["layers_closed"] = [
+        {"layer_id": "already-closed-layer-t1", "tier": 1}
+    ]
+    executor.store.save(state)
+    executor.reconcile_account_only(runtime_pid=777, runtime_run_id="lifecycle-runtime")
+
+    updated = executor.store.update_gradient_reactivation(
+        pilot_id=pilot["pilot_id"],
+        row=_sample(sample_id="migration-only", logged_at=datetime.now(timezone.utc).isoformat()),
+        thresholds_by_direction={
+            "long_var_short_lighter": (Decimal("30"), Decimal("45")),
+            "short_var_long_lighter": (Decimal("30"), Decimal("45")),
+        },
+        activated_tiers={"long_var_short_lighter": 0, "short_var_long_lighter": 0},
+        runtime_pid=777,
+        runtime_run_id="lifecycle-runtime",
+    )
+
+    assert updated["status"] == "open"
+    assert updated["open_position"]["layers"] == original_layers
+    assert [item["layer_id"] for item in updated["gradient_pilot"]["layers_opened"]] == [
+        "existing-layer-t2"
+    ]
+    lifecycle = updated["gradient_pilot"]["tier_reactivation_by_direction"][DIRECTION]
+    assert lifecycle["1"]["armed"] is False
+    assert lifecycle["2"]["armed"] is True
+    assert len(gateway.requests) == 2
+
+
+def test_high_signal_first_tier_and_restart_preserve_layer_identity_without_resubmit(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    config = _manual_continuous_gradient_config()
+    pilot = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, max_layers=5,
+    )
+    sample = _sample(variational_qty="2", lighter_qty="2")
+    now = datetime.now(timezone.utc)
+    opened = executor.open(
+        sample=sample,
+        direction=DIRECTION,
+        notional_usd=Decimal("20"),
+        session=_session_for_sample(sample),
+        layer_id="existing-signal-tier-5",
+        gradient_tier=5,
+        gradient_pilot_id=pilot["pilot_id"],
+        aggregate_max_notional_usd=Decimal("100"),
+        decision={"action": "open", "confirmed_gradient_tier": 5},
+        now=now,
+    )
+    before = deepcopy(opened["open_position"]["layers"])
+    assert before[0]["tier"] == 5
+    assert before[0]["layer_id"] == "existing-signal-tier-5"
+    assert len(gateway.requests) == 2
+
+    restarted, _ = _executor(tmp_path, gateway, sample=sample)
+    recovered = restarted.reconcile(
+        sample=sample, session=_session_for_sample(sample), now=datetime.now(timezone.utc),
+    )
+    assert recovered["status"] == "open"
+    assert recovered["open_position"]["layers"] == before
+    assert len(gateway.requests) == 2
+
+
+def test_completed_manual_gradient_waits_for_three_fresh_resets_before_successor(tmp_path):
+    executor, gateway = _executor(tmp_path)
+    config = _manual_continuous_gradient_config()
+    pilot = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+    )
+    _open(executor, notional_usd="10", layer_id="round-one-tier-1",
+          gradient_tier=1, gradient_pilot_id=pilot["pilot_id"])
+    closed = executor.close(
+        sample=_sample(), session=_session(),
+        decision={"reason": "manual_test_flat"},
+    )
+    assert closed["status"] == "flat"
+    assert closed["gradient_pilot"]["round_reactivation"]["armed"] is False
+    state = executor.store.load()
+    state["gradient_pilot"].pop("round_reactivation")
+    executor.store.save(state)
+
+    proof_kwargs = {"runtime_pid": 777, "runtime_run_id": "lifecycle-runtime"}
+    executor.reconcile_account_only(**proof_kwargs)
+    with pytest.raises(WTIExecutionError, match="terminal_flat_unchanged_predecessor"):
+        executor.store.initialize_gradient_pilot(
+            market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+            manual_new_pilot_after=pilot["pilot_id"], **proof_kwargs,
+        )
+    thresholds = {
+        "long_var_short_lighter": (Decimal("30"), Decimal("45")),
+        "short_var_long_lighter": (Decimal("30"), Decimal("45")),
+    }
+    for index in range(3):
+        now = datetime.now(timezone.utc)
+        executor.reconcile_account_only(now=now, **proof_kwargs)
+        updated = executor.store.update_gradient_reactivation(
+            pilot_id=pilot["pilot_id"],
+            row=_sample(now=now, sample_id=f"round-reset-{index}", long_edge_bps="29.49"),
+            thresholds_by_direction=thresholds,
+            activated_tiers={"long_var_short_lighter": 0, "short_var_long_lighter": 0},
+            **proof_kwargs,
+        )
+        assert updated["status"] == "flat"
+        if index < 2:
+            assert updated["gradient_pilot"]["round_reactivation"]["armed"] is False
+            with pytest.raises(WTIExecutionError, match="terminal_flat_unchanged_predecessor"):
+                executor.store.initialize_gradient_pilot(
+                    market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+                    manual_new_pilot_after=pilot["pilot_id"], **proof_kwargs,
+                )
+
+    assert updated["gradient_pilot"]["round_reactivation"]["armed"] is True
+    successor = executor.store.initialize_gradient_pilot(
+        market_id=145, multiplier=Decimal("1"), config=config, max_layers=2,
+        manual_new_pilot_after=pilot["pilot_id"], **proof_kwargs,
+    )
+    assert successor["authorization_kind"] == "manual_new_round"
+    assert successor["previous_pilot_id"] == pilot["pilot_id"]
+    assert successor["layers_opened"] == []
+    assert gateway.requests and len(gateway.requests) == 4
 
 
 def test_manual_gradient_archives_once_and_retry_never_renews_budget(tmp_path):

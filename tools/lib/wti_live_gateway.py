@@ -330,6 +330,8 @@ class WTIProductionGateway:
 
     async def _read_account(self) -> dict[str, Any]:
         snapshot = await self.account_reader.read_account()
+        from tools.lib.wti_equity_reporting import snapshot as reporting_snapshot
+        self.latest_reporting_snapshot = reporting_snapshot(snapshot)
         from main import (
             account_risk_context,
             extract_lighter_account_metrics,

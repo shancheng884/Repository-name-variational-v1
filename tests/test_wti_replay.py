@@ -100,6 +100,12 @@ def test_replay_is_no_lookahead_and_exits_on_net_target():
     assert report.trades[0].exit_at == rows[1]["logged_at"]
     assert report.trades[0].exit_reason == "target_reached"
     assert Decimal(report.trades[0].net_pnl_usd) > 0
+    assert Decimal(report.trades[0].gross_pnl_usd) - Decimal(
+        report.trades[0].assumed_cost_usd
+    ) == Decimal(report.trades[0].net_pnl_usd)
+    assert report.config["cost_model_id"] == "fixed_roundtrip_reserve_applied_once_v1"
+    assert report.config["assumed_cost_application"] == "quote_path_gross_to_net_once"
+    assert report.config["actual_fees_slippage_funding_inferred"] is False
     assert report.unresolved_position is False
 
 
@@ -480,34 +486,70 @@ def test_gradient_replay_uses_two_bounded_layers_and_closes_aggregate():
     assert report.config["max_layers"] == 2
 
 
+def test_equity_replay_opens_and_adds_at_confirmed_signal_tier_without_capacity_promotion():
+    thresholds = (
+        Decimal("30"), Decimal("45"), Decimal("45.25"),
+        Decimal("45.50"), Decimal("45.75"),
+    )
+    rows = [
+        _row(index, long_edge_bps="50", variational_qty="2", lighter_qty="2")
+        for index in range(6)
+    ]
+    rows.append(_row(
+        6, var_bid="70.5", var_ask="70.6", lighter_buy_price="70.3",
+        lighter_sell_price="70.2", long_edge_bps="0", short_edge_bps="0",
+        variational_qty="2", lighter_qty="2",
+    ))
+    thresholds_by_sample = {
+        row["sample_id"]: {
+            "long_var_short_lighter": thresholds,
+            "short_var_long_lighter": thresholds,
+        }
+        for row in rows
+    }
+
+    report = replay_wti_gradient(
+        rows,
+        config=_config(
+            entry_threshold_bps=Decimal("30"),
+            max_order_notional_usd=Decimal("20"),
+        ),
+        second_tier_threshold_bps=Decimal("45"),
+        layer_notional_usd=Decimal("20"),
+        aggregate_max_notional_usd=Decimal("100"),
+        max_layers=5,
+        equity_usd=Decimal("20"),
+        expected_market_id=145,
+        expected_multiplier=Decimal("1"),
+        research_thresholds_by_sample=thresholds_by_sample,
+    )
+
+    assert report.live_authorization is False
+    assert report.completed_trades == 1
+    assert report.trades[0].layer_count == 5
+    assert report.trades[0].layer_entry_tiers == (5, 5, 5, 5, 5)
+    assert report.config["tier_capacity_notional_usd"] == ["20", "40", "60", "80", "100"]
+    assert report.config["capacity_does_not_promote_tier"] is True
+
+
 def test_continuous_gradient_replay_runs_sequential_rounds_without_raising_per_round_caps():
-    rows = []
-    for round_index in range(2):
-        start = round_index * 4
-        rows.extend([
-            _row(start, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
-            _row(
-                start + 1,
-                var_bid="69.9", var_ask="70.0",
-                lighter_buy_price="70.3", lighter_sell_price="70.2",
-                long_edge_bps="21", short_edge_bps="0",
-                variational_qty="0.35", lighter_qty="0.35",
-            ),
-            _row(
-                start + 2,
-                var_bid="69.9", var_ask="70.0",
-                lighter_buy_price="70.3", lighter_sell_price="70.2",
-                long_edge_bps="21", short_edge_bps="0",
-                variational_qty="0.35", lighter_qty="0.35",
-            ),
-            _row(
-                start + 3,
-                var_bid="70.4", var_ask="70.5",
-                lighter_buy_price="70.3", lighter_sell_price="70.2",
-                long_edge_bps="0", short_edge_bps="0",
-                variational_qty="0.35", lighter_qty="0.35",
-            ),
-        ])
+    rows = [
+        _row(0, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
+        _row(1, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
+        _row(2, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
+        _row(3, var_bid="70.4", var_ask="70.5", lighter_buy_price="70.3",
+             lighter_sell_price="70.2", long_edge_bps="0", short_edge_bps="0",
+             variational_qty="0.35", lighter_qty="0.35"),
+        _row(4, long_edge_bps="0", short_edge_bps="0", variational_qty="0.35", lighter_qty="0.35"),
+        _row(5, long_edge_bps="0", short_edge_bps="0", variational_qty="0.35", lighter_qty="0.35"),
+        _row(6, long_edge_bps="0", short_edge_bps="0", variational_qty="0.35", lighter_qty="0.35"),
+        _row(7, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
+        _row(8, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
+        _row(9, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
+        _row(10, var_bid="70.4", var_ask="70.5", lighter_buy_price="70.3",
+             lighter_sell_price="70.2", long_edge_bps="0", short_edge_bps="0",
+             variational_qty="0.35", lighter_qty="0.35"),
+    ]
     report = replay_wti_gradient(
         rows,
         config=_config(entry_threshold_bps=Decimal("10"), exit_target_bps=Decimal("10")),
@@ -527,6 +569,8 @@ def test_continuous_gradient_replay_runs_sequential_rounds_without_raising_per_r
     assert report.config["max_layers"] == 2
     assert report.config["max_completed_roundtrips"] is None
     assert report.config["aggregate_max_notional_usd"] == "20"
+    assert report.trades[0].layer_entry_tiers == (2, 2)
+    assert report.trades[1].layer_entry_tiers == (2, 2)
     assert report.unresolved_position is False
 
 
@@ -613,29 +657,21 @@ def test_gradient_replay_rearms_only_with_explicit_verified_flat_restart_assumpt
             2, at=NOW + timedelta(seconds=50), long_edge_bps="0", short_edge_bps="0",
             variational_qty="0.35", lighter_qty="0.35",
         ),
-        _row(
-            3, at=next_open, session_id="wti-session-2",
-            session_status_observed_at=next_open.isoformat(),
-            session_status_feed_heartbeat_at=next_open.isoformat(),
-            session_closing_at=(next_open + timedelta(hours=8)).isoformat(),
-            long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35",
-        ),
-        _row(
-            4, at=next_open + timedelta(seconds=10), session_id="wti-session-2",
-            session_status_observed_at=(next_open + timedelta(seconds=10)).isoformat(),
-            session_status_feed_heartbeat_at=(next_open + timedelta(seconds=10)).isoformat(),
-            session_closing_at=(next_open + timedelta(hours=8)).isoformat(),
-            long_edge_bps="21", short_edge_bps="0",
-            variational_qty="0.35", lighter_qty="0.35",
-        ),
-        _row(
-            5, at=next_open + timedelta(seconds=35), session_id="wti-session-2",
-            session_status_observed_at=(next_open + timedelta(seconds=35)).isoformat(),
-            session_status_feed_heartbeat_at=(next_open + timedelta(seconds=35)).isoformat(),
-            session_closing_at=(next_open + timedelta(hours=8)).isoformat(),
-            long_edge_bps="0", short_edge_bps="0",
-            variational_qty="0.35", lighter_qty="0.35",
-        ),
+        *[
+            _row(
+                index, at=next_open + timedelta(seconds=10 * (index - 2)),
+                session_id="wti-session-2",
+                session_status_observed_at=(next_open + timedelta(seconds=10 * (index - 2))).isoformat(),
+                session_status_feed_heartbeat_at=(next_open + timedelta(seconds=10 * (index - 2))).isoformat(),
+                session_closing_at=(next_open + timedelta(hours=8)).isoformat(),
+                long_edge_bps=("0" if index <= 5 or index == 9 else "21"),
+                short_edge_bps="0", var_bid=("70.4" if index == 9 else "69.9"),
+                var_ask=("70.5" if index == 9 else "70.0"),
+                lighter_buy_price="70.3", lighter_sell_price="70.2",
+                variational_qty="0.35", lighter_qty="0.35",
+            )
+            for index in range(3, 10)
+        ],
     ]
     report = replay_wti_gradient(
         rows,
@@ -652,7 +688,7 @@ def test_gradient_replay_rearms_only_with_explicit_verified_flat_restart_assumpt
     assert report.sample_gap_count == 2
     assert report.completed_trades == 2
     assert report.trades[0].exit_reason == "sample_gap_requires_position_drain"
-    assert report.trades[1].exit_reason == "max_hold"
+    assert report.trades[1].exit_reason == "target_reached"
     assert report.unresolved_position is False
     assert report.config["assume_verified_flat_session_restarts"] is True
 
@@ -744,17 +780,23 @@ def test_replay_cli_can_emit_side_by_side_baseline_and_gradient(monkeypatch, cap
 
 def test_replay_cli_continuous_gradient_is_explicit_and_never_authorizes_live(monkeypatch, capsys):
     rows = []
-    for i in range(2):
-        start = i * 3
-        rows.extend([
-            _row(start),
-            _row(start + 1, var_bid="69.9", var_ask="70.0",
-                 lighter_buy_price="70.3", lighter_sell_price="70.2",
-                 long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
-            _row(start + 2, var_bid="70.4", var_ask="70.5",
-                 long_edge_bps="0", short_edge_bps="0",
-                 variational_qty="0.35", lighter_qty="0.35"),
-        ])
+    rows = [
+        _row(0, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
+        _row(1, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
+        _row(2, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
+        _row(3, var_bid="70.4", var_ask="70.5", lighter_buy_price="70.3",
+             lighter_sell_price="70.2", long_edge_bps="0", short_edge_bps="0",
+             variational_qty="0.35", lighter_qty="0.35"),
+        _row(4, long_edge_bps="0", short_edge_bps="0", variational_qty="0.35", lighter_qty="0.35"),
+        _row(5, long_edge_bps="0", short_edge_bps="0", variational_qty="0.35", lighter_qty="0.35"),
+        _row(6, long_edge_bps="0", short_edge_bps="0", variational_qty="0.35", lighter_qty="0.35"),
+        _row(7, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
+        _row(8, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
+        _row(9, long_edge_bps="21", variational_qty="0.35", lighter_qty="0.35"),
+        _row(10, var_bid="70.4", var_ask="70.5", lighter_buy_price="70.3",
+             lighter_sell_price="70.2", long_edge_bps="0", short_edge_bps="0",
+             variational_qty="0.35", lighter_qty="0.35"),
+    ]
     monkeypatch.setattr(wti_strategy_replay, "read_basis_samples", lambda *args, **kwargs: rows)
     result = wti_strategy_replay.main([
         "--sample-root", "unused", "--entry-threshold-bps", "10",

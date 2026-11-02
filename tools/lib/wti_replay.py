@@ -22,6 +22,11 @@ from tools.lib.gradient_entry_confirmation import (
     elastic_addon_confirmation_allowed,
     update_gradient_entry_confirmation,
 )
+from tools.lib.gradient_lifecycle import (
+    REARM_BUFFER_BPS,
+    REARM_CONFIRM_SAMPLES,
+    confirmed_gradient_tiers,
+)
 from tools.lib.market_sessions import session_observation_for_sample
 from tools.lib.wti_sizing import equity_gradient_slot_caps, size_paired_layer
 from tools.lib.wti_thresholds import (
@@ -60,6 +65,7 @@ class ReplayTrade:
     exit_reason: str
     layer_count: int = 1
     layer_entry_edges_bps: tuple[str, ...] = ()
+    layer_entry_tiers: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,6 +522,9 @@ def replay_wti(
             "entry_threshold_bps": str(config.entry_threshold_bps),
             "exit_target_bps": str(config.exit_target_bps),
             "roundtrip_cost_bps": str(config.roundtrip_cost_bps),
+            "cost_model_id": "fixed_roundtrip_reserve_applied_once_v1",
+            "assumed_cost_application": "quote_path_gross_to_net_once",
+            "actual_fees_slippage_funding_inferred": False,
             "max_hold_seconds": config.max_hold_seconds,
             "max_sample_gap_seconds": config.max_sample_gap_seconds,
             "entry_cutoff_seconds": config.entry_cutoff_seconds,
@@ -545,6 +554,8 @@ def replay_wti_gradient(
     assume_verified_flat_session_restarts: bool = False,
     adaptive_threshold_refresh_seconds: int = WTI_THRESHOLD_REFRESH_SECONDS,
     elastic_capacity_enabled: bool = False,
+    initial_threshold_history: list[dict[str, Any]] | None = None,
+    research_thresholds_by_sample: dict[str, dict[str, tuple[Decimal | None, ...]]] | None = None,
 ) -> ReplayReport:
     """Replay conservative multi-tier WTI rounds; equity is an explicit scenario input."""
     if second_tier_threshold_bps <= config.entry_threshold_bps:
@@ -605,12 +616,24 @@ def replay_wti_gradient(
     previous_row: dict[str, Any] | None = None
     entry_authorization_revoked = False
     position_gap_exit_pending = False
+    round_reactivation: dict[str, Any] | None = None
     rejected_depth = 0
     capped_additions = 0
     execution_refreshes_used = 0
     unmatched_strong_probe_signals = 0
     strong_probe_refresh_rejections: Counter[str] = Counter()
-    threshold_history: deque[dict[str, Any]] = deque()
+    warm_history = list(initial_threshold_history or [])
+    first_at = min((_timestamp(r.get("logged_at")) for r in samples), default=None)
+    if warm_history and (first_at is None or any(
+        not isinstance(r, dict) or _timestamp(r.get("logged_at")) is None
+        or _timestamp(r.get("logged_at")) >= first_at
+        or r.get("sample_kind", "baseline") != "baseline"
+        for r in warm_history
+    )):
+        raise ValueError("gradient_warm_history_must_precede_replay")
+    threshold_history: deque[dict[str, Any]] = deque(
+        sorted(warm_history, key=lambda r: _timestamp(r["logged_at"]))
+    )
     threshold_profiles: dict[str, WTIGradientThresholdProfile] = {}
     threshold_refreshed_at: datetime | None = None
     confirmation_history: dict[str, list[tuple[str, int]]] = {
@@ -770,7 +793,8 @@ def replay_wti_gradient(
                 "short_var_long_lighter": [],
             }
             invalidation_index += 1
-        refresh_thresholds(at, row)
+        if research_thresholds_by_sample is None:
+            refresh_thresholds(at, row)
         threshold_cutoff = at - timedelta(days=7)
         while threshold_history:
             oldest_at = _timestamp(threshold_history[0].get("logged_at"))
@@ -795,6 +819,8 @@ def replay_wti_gradient(
                     "long_var_short_lighter": [],
                     "short_var_long_lighter": [],
                 }
+                if round_reactivation is not None:
+                    round_reactivation["reset_confirmation_count"] = 0
                 if current is not None:
                     position_gap_exit_pending = True
             if session_changed:
@@ -802,6 +828,8 @@ def replay_wti_gradient(
                     "long_var_short_lighter": [],
                     "short_var_long_lighter": [],
                 }
+                if round_reactivation is not None:
+                    round_reactivation["reset_confirmation_count"] = 0
                 previous_observation = session_observation_for_sample(previous_row)
                 if current is not None:
                     stopped_reason = "position_crossed_session_boundary"
@@ -820,16 +848,43 @@ def replay_wti_gradient(
         previous_at, previous_row = at, row
         cutoff = observation.closing_at - timedelta(seconds=config.entry_cutoff_seconds)
         in_cutoff = at >= cutoff
-        confirmation_thresholds = {
-            direction: threshold_profiles[direction].thresholds_bps
-            for direction in DIRECTIONS
-        }
+        if research_thresholds_by_sample is None:
+            confirmation_thresholds = {
+                direction: threshold_profiles[direction].thresholds_bps
+                for direction in DIRECTIONS
+            }
+        else:
+            # Offline research only. Missing evidence blocks, never falls back
+            # to an easier entry. All execution and position gates below remain.
+            supplied = research_thresholds_by_sample.get(str(row.get("sample_id")), {})
+            confirmation_thresholds = {}
+            for direction in DIRECTIONS:
+                values = tuple(supplied.get(direction, (None,) * 5))
+                if len(values) != 5 or any(
+                    value is not None and (not isinstance(value, Decimal)
+                        or not value.is_finite() or value < hard_floors[i])
+                    for i, value in enumerate(values)
+                ) or any(a is None and b is not None or a is not None and b is not None and a >= b
+                         for a, b in zip(values, values[1:])):
+                    raise ValueError("research_thresholds_violate_configured_floors")
+                confirmation_thresholds[direction] = values
         update_gradient_entry_confirmation(
             row,
             confirmation_thresholds,
             confirmation_history,
             direction=None,
             candidate_tier=1,
+        )
+        strong_probe_used = bool(
+            current is not None
+            and any(layer.get("confirmation_mode") == "strong_single_probe"
+                    for layer in current["layers"])
+        )
+        activated_tiers = confirmed_gradient_tiers(
+            row,
+            confirmation_thresholds,
+            confirmation_history,
+            allow_strong_single_probe=not strong_probe_used,
         )
 
         if current is not None:
@@ -878,10 +933,23 @@ def replay_wti_gradient(
                     exit_reason=reason,
                     layer_count=len(current["layers"]),
                     layer_entry_edges_bps=tuple(str(layer["edge"]) for layer in current["layers"]),
+                    layer_entry_tiers=tuple(int(layer["tier"]) for layer in current["layers"]),
                 ))
                 exit_reasons[reason] += 1
+                closed_direction = current["direction"]
                 current = None
                 position_gap_exit_pending = False
+                threshold = confirmation_thresholds[closed_direction][0]
+                round_reactivation = {
+                    "direction": closed_direction,
+                    "closed_at": at,
+                    "reset_threshold_bps": (
+                        threshold - REARM_BUFFER_BPS if threshold is not None else None
+                    ),
+                    "reset_confirmation_count": 0,
+                    "last_sample_id": str(row.get("sample_id") or ""),
+                    "armed": False,
+                }
                 confirmation_history = {
                     "long_var_short_lighter": [],
                     "short_var_long_lighter": [],
@@ -899,16 +967,16 @@ def replay_wti_gradient(
                     "long_edge_bps" if current["direction"] == "long_var_short_lighter"
                     else "short_edge_bps"
                 ))
-                direction_thresholds = threshold_profiles[current["direction"]].thresholds_bps
-                opened_tiers = [layer["tier"] for layer in current["layers"]]
-                active_tier = max(opened_tiers)
+                direction_thresholds = confirmation_thresholds[current["direction"]]
                 elastic_capacity_addon = False
                 current_notional: Decimal | None = None
                 if capacity_slots is None:
                     # Preserve the legacy one-child-per-tier replay mode.
                     tier = len(current["layers"]) + 1
                 else:
-                    tier = active_tier
+                    tier = int(activated_tiers.get(current["direction"], 0))
+                    if tier <= 0:
+                        continue
                     mark_var = max(_decimal(row.get("var_bid")) or Decimal("0"),
                                    _decimal(row.get("var_ask")) or Decimal("0"))
                     mark_lighter = max(_decimal(row.get("lighter_bid")) or Decimal("0"),
@@ -918,7 +986,7 @@ def replay_wti_gradient(
                         current["lighter_qty"] * mark_lighter
                         * current["instrument"].lighter.exposure_multiplier,
                     )
-                    if current_notional + layer_notional_usd >= tier_caps[tier - 1]:
+                    if current_notional + layer_notional_usd > tier_caps[tier - 1]:
                         elastic_used = any(
                             layer.get("elastic_capacity_addon") is True
                             for layer in current["layers"]
@@ -936,7 +1004,8 @@ def replay_wti_gradient(
                         ):
                             elastic_capacity_addon = True
                         else:
-                            tier += 1
+                            capped_additions += 1
+                            continue
                 tier_threshold = (
                     direction_thresholds[tier - 1]
                     if 1 <= tier <= len(direction_thresholds) else None
@@ -1017,22 +1086,63 @@ def replay_wti_gradient(
             "long_var_short_lighter": _decimal(row.get("long_edge_bps")),
             "short_var_long_lighter": _decimal(row.get("short_edge_bps")),
         }
+        if round_reactivation is not None and not round_reactivation.get("armed"):
+            sample_id = str(row.get("sample_id") or "")
+            sample_at = _timestamp(row.get("logged_at"))
+            closed_at = round_reactivation.get("closed_at")
+            if (
+                sample_id and sample_id != round_reactivation.get("last_sample_id")
+                and sample_at is not None
+                and (closed_at is None or sample_at > closed_at)
+            ):
+                round_reactivation["last_sample_id"] = sample_id
+                previous_direction = round_reactivation["direction"]
+                opposite = (
+                    DIRECTIONS[1] if previous_direction == DIRECTIONS[0]
+                    else DIRECTIONS[0]
+                )
+                if activated_tiers.get(opposite, 0) >= 1:
+                    round_reactivation.update({
+                        "armed": True,
+                        "armed_by": "confirmed_opposite_signal",
+                    })
+                else:
+                    reset_threshold = round_reactivation.get("reset_threshold_bps")
+                    reset_edge = edges.get(previous_direction)
+                    if (
+                        reset_threshold is not None and reset_edge is not None
+                        and reset_edge <= reset_threshold
+                    ):
+                        round_reactivation["reset_confirmation_count"] += 1
+                    else:
+                        round_reactivation["reset_confirmation_count"] = 0
+                    if round_reactivation["reset_confirmation_count"] >= REARM_CONFIRM_SAMPLES:
+                        round_reactivation.update({
+                            "armed": True,
+                            "armed_by": "three_sample_reset",
+                        })
+            if not round_reactivation.get("armed"):
+                exit_reasons["gradient_round_rearm_waiting_for_reset"] += 1
+                continue
         qualified = [
-            (direction, edge)
+            (direction, edge, int(activated_tiers.get(direction, 0)))
             for direction, edge in edges.items()
-            if edge is not None
-            and threshold_profiles[direction].thresholds_bps[0] is not None
-            and edge >= threshold_profiles[direction].thresholds_bps[0]
+            if edge is not None and activated_tiers.get(direction, 0) > 0
         ]
         if not qualified:
             continue
-        direction, edge = max(qualified, key=lambda item: item[1])
+        direction, edge, signal_tier = max(
+            qualified,
+            key=lambda item: item[1] - (
+                confirmation_thresholds[item[0]][item[2] - 1] or Decimal("0")
+            ),
+        )
         confirmation = update_gradient_entry_confirmation(
             row,
             confirmation_thresholds,
             confirmation_history,
             direction=direction,
-            candidate_tier=1,
+            candidate_tier=signal_tier,
             allow_strong_single_probe=True,
         )
         if not confirmation.get("confirmed"):
@@ -1050,7 +1160,7 @@ def replay_wti_gradient(
                 confirmation_thresholds,
                 confirmation_history,
                 direction=direction,
-                candidate_tier=1,
+                candidate_tier=signal_tier,
                 allow_strong_single_probe=True,
             )
             if not confirmation.get("confirmed"):
@@ -1081,7 +1191,8 @@ def replay_wti_gradient(
             "layers": [],
         }
         layer = make_layer(
-            entry_row, direction, edge, 1, aggregate_cap=tier_caps[0],
+            entry_row, direction, edge, signal_tier,
+            aggregate_cap=tier_caps[signal_tier - 1],
         )
         if layer is None:
             current = None
@@ -1123,6 +1234,9 @@ def replay_wti_gradient(
             "second_tier_threshold_bps": str(second_tier_threshold_bps),
             "exit_target_bps": str(config.exit_target_bps),
             "roundtrip_cost_bps": str(config.roundtrip_cost_bps),
+            "cost_model_id": "fixed_roundtrip_reserve_applied_once_v1",
+            "assumed_cost_application": "quote_path_gross_to_net_once",
+            "actual_fees_slippage_funding_inferred": False,
             "layer_notional_usd": str(layer_notional_usd),
             "max_order_notional_usd": str(config.max_order_notional_usd),
             "aggregate_max_notional_usd": str(aggregate_max_notional_usd),
@@ -1142,6 +1256,14 @@ def replay_wti_gradient(
             "gradient_threshold_mode": "eth_style_directional_7d_percentiles_with_wti_floors",
             "gradient_threshold_percentiles": ["97.5", "98.25", "99", "99.5", "99.8"][:max_layers],
             "gradient_threshold_refresh_seconds": adaptive_threshold_refresh_seconds,
+            "initial_threshold_history_rows": len(warm_history),
+            "gradient_tier_assignment": "highest_currently_confirmed_directional_threshold",
+            "capacity_does_not_promote_tier": True,
+            "round_reactivation": "three_unique_reset_samples_or_confirmed_opposite_direction_after_flat",
+            "round_reactivation_buffer_bps": str(REARM_BUFFER_BPS),
+            "round_reactivation_samples": REARM_CONFIRM_SAMPLES,
+            "partial_tier_close_modeled": False,
+            "entry_policy_source": "offline_research_schedule" if research_thresholds_by_sample is not None else "unchanged_adaptive_thresholds",
             "gradient_threshold_sample_floor": 100,
             "gradient_threshold_effective_seconds_floor": 129600,
             "entry_confirmation": "two_of_three_or_single_tier_three_probe_with_linked_2s_execution_refresh",

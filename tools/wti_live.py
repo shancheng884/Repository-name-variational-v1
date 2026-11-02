@@ -16,6 +16,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,37 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+
+def _gap_drain_identity(position: dict[str, Any] | None) -> dict[str, str] | None:
+    if not isinstance(position, dict):
+        return None
+    keys = ("gradient_pilot_id", "opened_at", "entry_execution_id", "var_qty", "lighter_qty")
+    identity = {key: str(position.get(key) or "") for key in keys}
+    return identity if all(identity.values()) else None
+
+
+def _sample_guard_requires_position_drain(guard: dict[str, Any], state: dict[str, Any]) -> bool:
+    """A generic entry lock is never a flatten instruction; bind real gaps to exposure."""
+    if guard.get("locked") is not True or not guard.get("position_drain_required"):
+        return False
+    event = guard.get("gap_event") or {}
+    try:
+        gap = Decimal(str(event["effective_gap_seconds"]))
+        limit = Decimal(str(MAX_WTI_ENTRY_GAP_SECONDS))
+    except (KeyError, InvalidOperation, TypeError, ValueError):
+        return False
+    if not gap.is_finite() or not (gap < 0 or gap > limit):
+        return False
+    reason = guard.get("reason")
+    if reason not in {
+        "wti_entry_authorization_revoked_after_sample_gap",
+        "wti_sample_timestamp_unverified",
+    }:
+        return False
+    expected = guard.get("drain_position_identity")
+    current = _gap_drain_identity(state.get("open_position"))
+    return isinstance(expected, dict) and current == expected and not state.get("pending_action")
+
 from dotenv import load_dotenv  # noqa: E402
 
 from tools.basis_collector import (  # noqa: E402
@@ -31,7 +63,12 @@ from tools.basis_collector import (  # noqa: E402
     run_command_server,
     run_receiver_server,
 )
-from variational.listener import EventSink as ListenerEventSink  # noqa: E402
+from variational.listener import (  # noqa: E402
+    EventSink as ListenerEventSink,
+    VariationalMonitor,
+    classify_rest_endpoint,
+    QUOTES_INDICATIVE_PATH,
+)
 from tools.lib.basis_store import basis_sample_paths, read_basis_samples  # noqa: E402
 from tools.lib.hedge_instruments import integer_value  # noqa: E402
 from tools.lib.gradient_entry_confirmation import (  # noqa: E402
@@ -47,6 +84,17 @@ from tools.lib.market_sessions import (  # noqa: E402
 )
 from tools.lib.oil_swap_readiness import assess_oil_readiness  # noqa: E402
 from tools.lib.runtime_files import read_json, write_json_atomic  # noqa: E402
+from tools.lib.wti_reporting import TradeReporter  # noqa: E402
+from tools.lib.wti_decision_audit import (  # noqa: E402
+    AuditWriter, audited_cycle, emit as audit_event, sample_evidence,
+    state_evidence, gate_evidence, execution_marker, execution_evidence, safe_error, crossing_evidence,
+)
+from tools.lib.wti_shadow_audit import (  # noqa: E402
+    ShadowWindow,
+    observe_shadow_book,
+    passive_wti_quote_sample,
+)
+from tools.lib.telegram_notifier import TelegramNotifier  # noqa: E402
 from tools.lib.wti_execution import (  # noqa: E402
     WTIPairExecutor,
     WTIAccountSnapshotUnavailable,
@@ -56,6 +104,13 @@ from tools.lib.wti_execution import (  # noqa: E402
 from tools.lib.wti_live_gateway import WTIProductionGateway  # noqa: E402
 from tools.lib.wti_live_strategy import decide_wti_action, decide_wti_gradient_action  # noqa: E402
 from tools.lib.wti_sizing import equity_gradient_slot_caps  # noqa: E402
+from tools.lib.wti_convergence import (  # noqa: E402
+    MODEL_KIND, PILOT_CAP_USD, clean_feature_history, convergence_thresholds,
+    features_for_row, load_model,
+)
+from tools.lib.wti_manual_trial import ensure_trial, advance_trial  # noqa: E402
+from tools.lib.wti_continuous import ensure_continuous, position_subset  # noqa: E402
+from tools.lib.wti_exit_cost import cost_policy, scoped_cost_policy  # noqa: E402
 from tools.lib.wti_replay import ReplayConfig  # noqa: E402
 from tools.lib.wti_thresholds import (  # noqa: E402
     ANCHOR_WINDOW_SECONDS as WTI_THRESHOLD_WINDOW_SECONDS,
@@ -68,6 +123,21 @@ from tools.oil_swap_collector import OilSwapCollector, parse_args as parse_colle
 
 DEFAULT_LIGHTER_URL = "https://mainnet.zklighter.elliot.ai"
 DEFAULT_PORTS = (8766, 8767, 8768)
+
+
+class WTIPassiveQuoteMonitor(VariationalMonitor):
+    """Consume only already-forwarded indicative REST quotes; no requests or WS parsing."""
+
+    async def process_ws_event(self, _payload: dict[str, Any]) -> list[str]:
+        return []
+
+    async def process_rest_event(self, payload: dict[str, Any]) -> list[str]:
+        if (
+            payload.get("kind") != "rest_response"
+            or classify_rest_endpoint(str(payload.get("url") or "")) != QUOTES_INDICATIVE_PATH
+        ):
+            return []
+        return await super().process_rest_event(payload)
 ETH_STATE_PATH = ROOT / "log" / "live_inventory_state.json"
 WTI_STATE_PATH = ROOT / "log" / "wti_live_state.json"
 WTI_HEALTH_PATH = ROOT / "log" / "wti_live_risk_health.json"
@@ -473,23 +543,66 @@ class WTILiveRuntime:
         self.entry_authorization_permanently_revoked = False
         self.last_readiness_elapsed_ms: float | None = None
         self.last_reconcile_elapsed_ms: float | None = None
+        self.decision_audit: AuditWriter | None = None
         self.rotation_drain_request: dict[str, Any] | None = None
         self.last_account_only_reconcile_monotonic = 0.0
         self.wti_gradient_threshold_profiles: dict[str, WTIGradientThresholdProfile] = {}
         self.wti_gradient_threshold_refreshed_monotonic = 0.0
         self.wti_gradient_threshold_source = "not_loaded"
+        self.decision_shadow_thresholds: dict[str, Any] | None = None
+        self.decision_shadow_window_sequence = 0
+        self.passive_quote_monitor: WTIPassiveQuoteMonitor | None = None
+        self.experimental_exit_model = None
+        self.experimental_exit_history: list[dict[str, Any]] = []
+        self.experimental_exit_diagnostic: dict[str, Any] = {}
+        self.manual_wti_trial: dict[str, Any] | None = None
+        if getattr(args, "experimental_exit_model", None) is not None:
+            self.experimental_exit_model = load_model(
+                args.experimental_exit_model, args.experimental_exit_model_sha256,
+                config=self._gradient_pilot_config(),
+            )
         self.gradient_entry_confirmation_history: dict[str, list[tuple[str, int]]] = {
             "long_var_short_lighter": [],
             "short_var_long_lighter": [],
         }
         self.last_processed_session_id: str | None = None
+        self.sample_guard_path = args.state_path.with_suffix('.sample_guard.json')
+        guard = read_json(self.sample_guard_path)
+        if not guard and args.mode == 'live':
+            previous_health = read_json(args.health_path)
+            if previous_health.get('entry_authorization_permanently_revoked') is True:
+                guard = {
+                    'locked': True,
+                    'reason': previous_health.get('entry_gate_block_reason') or 'wti_strategy_cycle_requires_review',
+                }
+        self.gap_recovery_samples = 0
+        self.gap_recovery_proofs: set[str] = set()
+        if guard.get('locked') is True:
+            self._revoke_entry_authorization(guard.get('reason') or 'wti_sample_timestamp_unverified')
+            current_state = read_json(args.state_path)
+            self.pending_gap_exit = _sample_guard_requires_position_drain(guard, current_state)
+        self.sample_gap_event = guard.get('gap_event')
+        self.sample_gap_drain_identity = guard.get('drain_position_identity')
+        if guard.get('baseline_at'):
+            try:
+                at = datetime.fromisoformat(guard['baseline_at'])
+                if at.tzinfo is not None:
+                    self.last_baseline_sample_at = at
+                    self.last_baseline_session_id = guard.get('session_id')
+                    self.last_baseline_session_closing_at = datetime.fromisoformat(guard['closing_at'])
+                    self.last_baseline_trading_sessions = guard.get('schedule') or []
+            except (ValueError, TypeError, KeyError):
+                self._revoke_entry_authorization('wti_sample_timestamp_unverified')
 
     def request_stop(self, *_args: Any) -> None:
         self.stop = True
         self.collector.request_stop()
 
     async def _start_forwarder(self) -> None:
-        sink = ListenerEventSink(output_dir=None, quiet=True, monitor=None)
+        self.passive_quote_monitor = WTIPassiveQuoteMonitor()
+        sink = ListenerEventSink(
+            output_dir=None, quiet=True, monitor=self.passive_quote_monitor,
+        )
         broker = CommandBroker(quiet=True)
         self.servers = [
             await run_receiver_server("ws", self.args.forwarder_host, self.args.forwarder_ws_port, sink),
@@ -565,7 +678,18 @@ class WTILiveRuntime:
                 )
                 existing_gradient = existing.get("gradient_pilot") or {}
                 manual_after = getattr(self.args, "new_gradient_pilot_after", None)
-                if manual_after:
+                if getattr(self.args, "continuous_manual_gradient", False):
+                    if local_exposure and not gradient_pilot_owns_exposure(existing):
+                        raise RuntimeError("continuous_gradient_exposure_identity_mismatch")
+                    self.gradient_pilot = dict(existing_gradient)
+                elif getattr(self.args, "manual_wti_trial_id", None):
+                    if local_exposure and not gradient_pilot_owns_exposure(existing):
+                        raise RuntimeError("manual_wti_trial_exposure_identity_mismatch")
+                    self.manual_wti_trial = await asyncio.to_thread(
+                        ensure_trial, store, **self._manual_trial_options(),
+                    )
+                    self.gradient_pilot = dict(store.load()["gradient_pilot"])
+                elif manual_after:
                     if existing_gradient.get("pilot_id") == manual_after:
                         if (
                             local_exposure or existing_gradient.get("status") not in {"completed", "exhausted"}
@@ -733,6 +857,8 @@ class WTILiveRuntime:
             expected_lighter_price_decimals=market["supported_price_decimals"],
             max_notional_usd=self.args._validated_notional,
         )
+        from tools.lib.wti_equity_reporting import EquityJournal
+        self.executor.reporting_observer = EquityJournal(self.args.state_path.parent/'wti_equity_events')
         return market, {"account_index": account_index, "api_key_index": api_key_index}
 
     def _pilot_config(self) -> dict[str, Any]:
@@ -773,6 +899,8 @@ class WTILiveRuntime:
         }
         if getattr(self.args, "gradient_elastic_capacity", False):
             config["elastic_capacity_enabled"] = True
+        if getattr(self.args, "continuous_manual_gradient", False):
+            config["manual_continuous_equity"] = True
         return config
 
     def _sync_entry_authorization(
@@ -797,6 +925,37 @@ class WTILiveRuntime:
             self.entry_authorized = False
             return False
         if gradient_mode:
+            gradient_state = state.get("gradient_pilot") or {}
+            round_reactivation = gradient_state.get("round_reactivation") or {}
+            if (
+                state.get("status") == "flat"
+                and gradient_state.get("status") == "completed"
+                and (gradient_state.get("config") or {}).get("manual_continuous_equity")
+                and (
+                    not isinstance(gradient_state.get("round_reactivation"), dict)
+                    or round_reactivation.get("required") is True
+                    and round_reactivation.get("armed") is not True
+                )
+            ):
+                self.entry_authorized = False
+                self.entry_gate_block_reason = "gradient_round_rearm_waiting_for_reset"
+                return False
+            model = getattr(self, "experimental_exit_model", None)
+            if model is not None and not (
+                datetime.fromisoformat(model["created_at"]) <= now
+                < datetime.fromisoformat(model["expires_at"])
+            ):
+                self.entry_authorized = False
+                self.entry_gate_block_reason = "experimental_exit_model_expired_or_not_yet_valid"
+                return False
+            if getattr(self.args, "manual_wti_trial_id", None):
+                trial = state.get("manual_wti_trial") or {}
+                if (trial.get("trial_id") != self.args.manual_wti_trial_id
+                        or trial.get("status") != "active"
+                        or len(trial.get("completed_pilot_ids") or []) >= self.args.manual_wti_max_rounds):
+                    self.entry_authorized = False
+                    self.entry_gate_block_reason = "manual_wti_trial_round_budget_unavailable"
+                    return False
             pilot = state.get("gradient_pilot") or {}
             opened = pilot.get("layers_opened") or []
             if (
@@ -948,6 +1107,43 @@ class WTILiveRuntime:
     async def _advance_continuous_gradient_round(
         self, state: dict[str, Any]
     ) -> dict[str, Any]:
+        if getattr(self.args, "continuous_manual_gradient", False):
+            if self.manage_existing_only or self.entry_authorization_permanently_revoked or self._poll_rotation_drain():
+                return state
+            if state.get('status') not in {'flat','open'} or state.get('pending_action'):
+                return state
+            state = await asyncio.to_thread(
+                ensure_continuous, self.pilot_store,
+                root_pilot_id=self.args.adopt_gradient_pilot,
+                config=self._gradient_pilot_config(), runtime_pid=os.getpid(), runtime_run_id=self.run_id,
+            )
+            pilot = state['gradient_pilot']
+            if state['status'] == 'flat' and pilot.get('status') in {'completed', 'exhausted'}:
+                reactivation = pilot.get("round_reactivation") or {}
+                if (pilot.get("status") == "completed"
+                        and (not isinstance(pilot.get("round_reactivation"), dict)
+                             or reactivation.get("required") is True
+                             and reactivation.get("armed") is not True)):
+                    self.entry_authorized = False
+                    self.entry_gate_block_reason = "gradient_round_rearm_waiting_for_reset"
+                    self.gradient_pilot = dict(pilot)
+                    return state
+                await asyncio.to_thread(
+                    self.pilot_store.initialize_gradient_pilot,
+                    market_id=145, multiplier=Decimal(str(self.market_metadata['multiplier'])),
+                    config=self._gradient_pilot_config(), max_layers=WTI_GRADIENT_MAX_LAYERS,
+                    manual_new_pilot_after=pilot['pilot_id'], runtime_pid=os.getpid(), runtime_run_id=self.run_id,
+                )
+                state = await asyncio.to_thread(
+                    ensure_continuous, self.pilot_store,
+                    root_pilot_id=self.args.adopt_gradient_pilot, config=self._gradient_pilot_config(),
+                    runtime_pid=os.getpid(), runtime_run_id=self.run_id,
+                )
+                self._reset_gradient_confirmation()
+            self.gradient_pilot = dict(state['gradient_pilot'])
+            return state
+        if getattr(self.args, "manual_wti_trial_id", None):
+            return await self._advance_manual_wti_trial(state)
         if (
             getattr(self, "manage_existing_only", False)
             or not getattr(self.args, "gradient_live", False)
@@ -1007,6 +1203,67 @@ class WTILiveRuntime:
             next_pilot.get("rotation_test_id"), next_pilot.get("round_number"),
             next_pilot.get("pilot_id"),
         )
+        return state
+
+    def _manual_trial_options(self) -> dict[str, Any]:
+        return {
+            "trial_id": self.args.manual_wti_trial_id,
+            "root_pilot_id": self.args.manual_wti_root_pilot,
+            "max_rounds": self.args.manual_wti_max_rounds,
+            "model_sha256": self.args.experimental_exit_model_sha256,
+            "config": self._gradient_pilot_config(),
+        }
+
+    def _profit_exit_cost(self, state: dict[str, Any], layer_ids=None) -> Decimal:
+        path = getattr(self.args, "exit_cost_evidence", None)
+        evidence = None
+        if path is not None:
+            try:
+                evidence = read_json(path)
+            except (OSError, ValueError, TypeError):
+                pass
+        if layer_ids is not None:
+            return scoped_cost_policy(state, evidence, layer_ids, fallback_bps=self.config.roundtrip_cost_bps)
+        applied, self.exit_cost_diagnostic = cost_policy(
+            state, evidence, fallback_bps=self.config.roundtrip_cost_bps,
+        )
+        return applied
+
+    async def _advance_manual_wti_trial(self, state: dict[str, Any]) -> dict[str, Any]:
+        if (state.get("manual_wti_trial") or {}).get("status") == "completed":
+            return state
+        self._poll_rotation_drain()
+        pilot = state.get("gradient_pilot") or {}
+        model = getattr(self, "experimental_exit_model", None)
+        now = datetime.now(timezone.utc)
+        if (self.manage_existing_only or self.entry_authorization_permanently_revoked
+                or getattr(self, "rotation_drain_request", None) is not None
+                or model is None or now >= datetime.fromisoformat(model["expires_at"])
+                or pilot.get("status") != "completed"
+                or state.get("status") != "flat" or state.get("open_position")
+                or state.get("pending_action")):
+            return state
+        state = await self._read_account_only_reconcile()
+        if self._poll_rotation_drain():
+            self.entry_authorized = False
+            return state
+        if state.get("status") != "flat" or state.get("pending_action") or state.get("open_position"):
+            self.entry_authorized = False
+            return state
+        state = await asyncio.to_thread(
+            advance_trial, self.pilot_store, **self._manual_trial_options(),
+            runtime_pid=os.getpid(), runtime_run_id=self.run_id,
+        )
+        self.manual_wti_trial = dict(state["manual_wti_trial"])
+        self.gradient_pilot = dict(state["gradient_pilot"])
+        self.entry_authorized = False
+        if self.gradient_pilot["pilot_id"] != pilot["pilot_id"]:
+            self._reset_gradient_confirmation()
+            self.entry_gate_block_reason = "manual_wti_next_round_waiting_fresh_sample"
+            self.last_action = {"action": "manual_wti_round_armed",
+                                "round": len(self.manual_wti_trial["round_pilot_ids"])}
+        else:
+            self.entry_gate_block_reason = "manual_wti_trial_round_budget_completed"
         return state
 
     async def _arm_manual_gradient_round(
@@ -1121,6 +1378,10 @@ class WTILiveRuntime:
                 )
                 self.wti_gradient_threshold_profiles = profiles
                 self.wti_gradient_threshold_source = "directional_7d_percentiles"
+                if getattr(self, "experimental_exit_model", None) is not None:
+                    self.experimental_exit_history = await asyncio.to_thread(
+                        clean_feature_history, rows, as_of=sample_at,
+                    )
             except Exception as exc:
                 self.logger.warning(
                     "wti_gradient_threshold_refresh_failed reason=%s; blocking new entries",
@@ -1134,12 +1395,139 @@ class WTILiveRuntime:
                 direction: (None,) * WTI_GRADIENT_MAX_LAYERS
                 for direction in ("long_var_short_lighter", "short_var_long_lighter")
             }
-        return {
+        control = {
             direction: profile.thresholds_bps
             for direction, profile in getattr(
                 self, "wti_gradient_threshold_profiles", {}
             ).items()
         }
+        model = getattr(self, "experimental_exit_model", None)
+        if model is None:
+            return control
+        history = getattr(self, "experimental_exit_history", [])
+        thresholds, diagnostic = convergence_thresholds(
+            model, row, features_for_row(history, row), control,
+            now=datetime.now(timezone.utc),
+            exploratory=getattr(self.args, "confirm_exploratory_entry", False),
+        )
+        self.experimental_exit_diagnostic = diagnostic
+        self.wti_gradient_threshold_source = (
+            "exploratory_floor_pilot_v1"
+            if getattr(self.args, "confirm_exploratory_entry", False) else MODEL_KIND
+        )
+        at = datetime.fromisoformat(str(row["logged_at"]).replace("Z", "+00:00"))
+        accepted = clean_feature_history([row], as_of=at + timedelta(microseconds=1))
+        if accepted and not any(r.get("sample_id") == row.get("sample_id") for r in history):
+            history = [r for r in history if datetime.fromisoformat(
+                str(r["logged_at"]).replace("Z", "+00:00")
+            ) >= at - timedelta(minutes=31)]
+            history.append(dict(row))
+            self.experimental_exit_history = history
+        return thresholds
+
+    async def _capture_decision_shadow_tick(self) -> dict[str, Any]:
+        row = getattr(self.collector, "latest_sample", None)
+        if not isinstance(row, dict):
+            row = getattr(self.collector, "latest_baseline_sample", None)
+        now = datetime.now(timezone.utc)
+        baseline = row
+        if not isinstance(baseline, dict):
+            baseline = getattr(self.collector, "latest_baseline_sample", None)
+        monitor = getattr(self, "passive_quote_monitor", None)
+        book = None
+        if isinstance(baseline, dict) and monitor is not None:
+            for asset in ("USOILP", "WTI"):
+                quote = await monitor.get_quote_snapshot(asset)
+                passive_row, _reason = passive_wti_quote_sample(
+                    quote, baseline, now=now,
+                )
+                if passive_row is None:
+                    continue
+                try:
+                    quantity = Decimal(str(passive_row.get("lighter_qty")))
+                    if quantity <= 0:
+                        continue
+                    passive_book = await self.collector.books.snapshot(
+                        "WTI", Decimal("0"), base_qty=quantity,
+                    )
+                except Exception:
+                    continue
+                if not isinstance(passive_book, dict):
+                    continue
+                book = passive_book
+                passive_row["lighter_book_age_seconds"] = str(
+                    passive_book.get("book_age_seconds")
+                )
+                passive_row["lighter_continuity_ok"] = (
+                    passive_book.get("continuity_ok") is True
+                )
+                row = passive_row
+                break
+        freshness = self._sample_freshness_diagnostics(row, now)
+        if book is None and isinstance(row, dict) and freshness.get("checks", {}).get("quote_age_effective") is True:
+            try:
+                quantity = Decimal(str(row.get("lighter_qty")))
+                if quantity > 0:
+                    book = await self.collector.books.snapshot(
+                        "WTI", Decimal("0"), base_qty=quantity,
+                    )
+            except Exception as exc:
+                return {
+                    "observed_at": now.isoformat(),
+                    "sample_id": row.get("sample_id"),
+                    "shadow_only": True,
+                    "orders_attempted": False,
+                    "affects_strategy": False,
+                    "status": "unavailable",
+                    "reason": f"lighter_snapshot_error:{type(exc).__name__}",
+                }
+        return observe_shadow_book(
+            row, book, self.decision_shadow_thresholds, freshness, now=now,
+        )
+
+    async def _run_decision_shadow(self) -> None:
+        window = ShadowWindow()
+        last_flush = time.monotonic()
+        try:
+            while not self.stop:
+                try:
+                    window.add(await self._capture_decision_shadow_tick())
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    window.add({
+                        "observed_at": datetime.now(timezone.utc).isoformat(),
+                        "status": "unavailable",
+                        "reason": f"shadow_observation_error:{type(exc).__name__}",
+                        "shadow_only": True,
+                        "orders_attempted": False,
+                        "affects_strategy": False,
+                    })
+                now = time.monotonic()
+                if now - last_flush >= 1.0:
+                    self._emit_decision_shadow_window(window)
+                    window = ShadowWindow()
+                    last_flush = now
+                await asyncio.sleep(0.2)
+        finally:
+            if window.count:
+                self._emit_decision_shadow_window(window)
+
+    def _emit_decision_shadow_window(self, window: ShadowWindow) -> None:
+        writer = getattr(self, "decision_audit", None)
+        if writer is None:
+            return
+        self.decision_shadow_window_sequence += 1
+        try:
+            writer.emit(
+                "high_frequency_shadow_window",
+                window.close(),
+                trace=f"{self.run_id}:shadow:{self.decision_shadow_window_sequence}",
+                evidence="runtime_exact",
+            )
+        except Exception:
+            # Shadow evidence is best-effort and must not affect trading flow.
+            return
 
     def _read_gradient_history(self, sample_at: datetime) -> list[dict[str, Any]]:
         root = Path(self.args.sample_root)
@@ -1195,7 +1583,13 @@ class WTILiveRuntime:
             tier_count=WTI_GRADIENT_MAX_LAYERS,
             max_equity_multiple=WTI_MAX_EQUITY_MULTIPLE,
         )
-        return None if slots is None else tuple(Decimal(count) * layer for count in slots)
+        if slots is None:
+            return None
+        capacities = tuple(Decimal(count) * layer for count in slots)
+        if (getattr(self, "experimental_exit_model", None) is not None
+                and not getattr(self.args, "continuous_manual_gradient", False)):
+            capacities = tuple(min(value, PILOT_CAP_USD) for value in capacities)
+        return capacities
 
     async def _load_startup_readiness(self) -> None:
         started = time.monotonic()
@@ -1385,6 +1779,60 @@ class WTILiveRuntime:
         self.entry_authorized = False
         self.entry_gate_block_reason = reason
         self.entry_authorization_permanently_revoked = True
+        self.entry_revocation_reason = reason
+
+    def _persist_sample_guard(self) -> None:
+        path = getattr(self, 'sample_guard_path', None)
+        if path is None:
+            return
+        at = getattr(self, 'last_baseline_sample_at', None)
+        close = getattr(self, 'last_baseline_session_closing_at', None)
+        write_json_atomic(path, {
+            'locked': self.entry_authorization_permanently_revoked,
+            'reason': getattr(self, 'entry_revocation_reason', None),
+            'gap_event': getattr(self, 'sample_gap_event', None),
+            'position_drain_required': bool(
+                self.pending_gap_exit and getattr(self, 'sample_gap_drain_identity', None)
+            ),
+            'drain_position_identity': getattr(self, 'sample_gap_drain_identity', None),
+            'baseline_at': at.isoformat() if at else None,
+            'session_id': getattr(self, 'last_baseline_session_id', None),
+            'closing_at': close.isoformat() if close else None,
+            'schedule': getattr(self, 'last_baseline_trading_sessions', []),
+        })
+
+    def _recover_sample_gap(self, state: dict[str, Any], row: dict[str, Any]) -> bool:
+        if not getattr(self, 'entry_authorization_permanently_revoked', False):
+            return False
+        if getattr(self, 'entry_revocation_reason', None) != 'wti_entry_authorization_revoked_after_sample_gap':
+            return False
+        proof = state.get('last_account_reconciliation') or {}
+        safe = (
+            state.get('status') == 'flat' and not state.get('open_position')
+            and not state.get('pending_action') and not state.get('manual_review_reason')
+            and not getattr(self, 'account_read_recovery_required', False)
+            and self._account_recovery_snapshot_verified(state, self.last_risk)
+            and proof.get('runtime_pid') == os.getpid()
+            and proof.get('runtime_run_id') == self.run_id
+            and self._sample_freshness_diagnostics(row, datetime.now(timezone.utc))['fresh']
+        )
+        proofs = getattr(self, 'gap_recovery_proofs', set())
+        if not safe:
+            self.gap_recovery_proofs = set()
+            return False
+        proofs.add(str(proof.get('observed_at')))
+        self.gap_recovery_proofs = proofs
+        if getattr(self, 'gap_recovery_samples', 0) < 3 or len(proofs) < 2:
+            return False
+        self.entry_authorization_permanently_revoked = False
+        self.entry_revocation_reason = None
+        self.entry_gate_block_reason = None
+        self.pending_gap_exit = False
+        self._reset_gradient_confirmation()
+        self._persist_sample_guard()
+        self.logger.info('wti_sample_gap_recovered verified_flat=true samples=%s proofs=%s',
+                         self.gap_recovery_samples, len(proofs))
+        return True
 
     @staticmethod
     def _session_id_bounds(session_id: Any) -> tuple[datetime, datetime] | None:
@@ -1471,6 +1919,9 @@ class WTILiveRuntime:
 
     def _record_new_sample(self, row: dict[str, Any]) -> bool | None:
         sample_id = str(row.get("sample_id") or "")
+        if (row.get('sample_kind', 'baseline') == 'baseline'
+                and sample_id == getattr(self, 'last_baseline_sample_id', None)):
+            return None
         if not sample_id or sample_id in {
             getattr(self, "last_seen_sample_id", None),
             getattr(self, "last_processed_sample_id", None),
@@ -1478,6 +1929,8 @@ class WTILiveRuntime:
             return None
         self.last_seen_sample_id = sample_id
         if row.get("sample_quality") != "valid" or session_observation_for_sample(row) is None:
+            self.gap_recovery_samples = 0
+            self.gap_recovery_proofs = set()
             self._reset_gradient_confirmation()
             self.last_sample_freshness_diagnostics = self._sample_freshness_diagnostics(
                 row, datetime.now(timezone.utc)
@@ -1486,10 +1939,14 @@ class WTILiveRuntime:
             self.entry_authorized = False
             if not self.entry_authorization_permanently_revoked:
                 self.entry_gate_block_reason = "wti_sample_or_session_unverified"
+            audit_event(self, "sample_admission_rejected", sample=sample_evidence(row),
+                        reason=self.last_action["reason"], diagnostics=self.last_sample_freshness_diagnostics)
             return False
         diagnostics = self._sample_freshness_diagnostics(row, datetime.now(timezone.utc))
         self.last_sample_freshness_diagnostics = diagnostics
-        if not diagnostics["fresh"]:
+        if not diagnostics["fresh"] and not diagnostics["refreshable_cache_expiry"]:
+            self.gap_recovery_samples = 0
+            self.gap_recovery_proofs = set()
             self._reset_gradient_confirmation()
             reason = (
                 "wti_cached_sample_expired_execution_refresh_required"
@@ -1500,6 +1957,8 @@ class WTILiveRuntime:
             self.entry_authorized = False
             if not self.entry_authorization_permanently_revoked:
                 self.entry_gate_block_reason = reason
+            audit_event(self, "sample_admission_rejected", sample=sample_evidence(row), reason=reason,
+                        diagnostics=diagnostics)
             return bool(diagnostics["refreshable_cache_expiry"])
         try:
             sample_at = datetime.fromisoformat(
@@ -1543,11 +2002,34 @@ class WTILiveRuntime:
                         self.last_sample_gap_seconds < 0
                         or self.last_sample_gap_seconds > MAX_WTI_ENTRY_GAP_SECONDS
                     ):
+                        self.sample_gap_event = {
+                            'previous_at': previous_baseline_at.isoformat(),
+                            'sample_at': sample_at.isoformat(),
+                            'scheduled_closed_seconds': closed_seconds,
+                            'effective_gap_seconds': self.last_sample_gap_seconds,
+                        }
+                        runtime_args = getattr(self, "args", None)
+                        current_state = (
+                            read_json(runtime_args.state_path) if runtime_args is not None else {}
+                        )
+                        self.sample_gap_drain_identity = _gap_drain_identity(
+                            current_state.get("open_position")
+                        )
                         self._reset_gradient_confirmation()
                         self.pending_gap_exit = True
                         self._revoke_entry_authorization(
-                            "wti_entry_authorization_revoked_after_sample_gap"
+                            "wti_sample_timestamp_unverified" if self.last_sample_gap_seconds < 0
+                            else "wti_entry_authorization_revoked_after_sample_gap"
                         )
+                        audit_event(self, "sample_gap_gate_latched", sample=sample_evidence(row),
+                                    gap_event=self.sample_gap_event, gate=gate_evidence(self))
+                        self.gap_recovery_samples = 0
+                        self.gap_recovery_proofs = set()
+                    elif 0 < self.last_sample_gap_seconds <= 30 and current_session_id == previous_session_id:
+                        self.gap_recovery_samples = getattr(self, 'gap_recovery_samples', 0) + 1
+                    else:
+                        self.gap_recovery_samples = 0
+                        self.gap_recovery_proofs = set()
                 if previous_session_id and current_session_id != previous_session_id:
                     self._reset_gradient_confirmation()
                 self.last_baseline_sample_id = sample_id
@@ -1559,6 +2041,7 @@ class WTILiveRuntime:
                 self.last_baseline_trading_sessions = list(
                     getattr(getattr(self, "collector", None), "trading_sessions", []) or []
                 )
+                self._persist_sample_guard()
             previous_session_id = getattr(self, "last_validated_session_id", None)
             if previous_session_id and current_session_id != previous_session_id:
                 self._reset_gradient_confirmation()
@@ -1566,7 +2049,15 @@ class WTILiveRuntime:
             self.last_processed_sample_at = sample_at
         except (TypeError, ValueError):
             self._revoke_entry_authorization("wti_sample_timestamp_unverified")
+            audit_event(self, "sample_admission_rejected", sample=sample_evidence(row),
+                        reason="wti_sample_timestamp_unverified")
             return False
+        if not diagnostics['fresh']:
+            self.entry_authorized = False
+            self.last_action = {'action': 'blocked', 'reason': 'wti_cached_sample_expired_execution_refresh_required'}
+            if not self.entry_authorization_permanently_revoked:
+                self.entry_gate_block_reason = self.last_action['reason']
+            return True
         self.last_processed_sample_id = sample_id
         return True
 
@@ -1584,6 +2075,7 @@ class WTILiveRuntime:
         error: str | None = None,
     ) -> None:
         now = datetime.now(timezone.utc)
+        self._persist_sample_guard()
         state = state or read_json(self.args.state_path)
         exposure = state.get("open_position") is not None
         pending = state.get("pending_action") is not None
@@ -1681,6 +2173,7 @@ class WTILiveRuntime:
             "updated_at": now.isoformat(),
             "status": "running" if not self.stop else "stopped",
             "execution_mode": (
+                "live_continuous_manual_gradient" if getattr(self.args,'continuous_manual_gradient',False) else
                 "live_bounded_gradient_pilot"
                 if self.args.mode == "live" and getattr(self, "gradient_pilot", None)
                 else "live_single_round_pilot"
@@ -1743,6 +2236,10 @@ class WTILiveRuntime:
             "risk_data_complete": risk.get("risk_data_complete"),
             "variational_equity_usd": risk.get("variational_equity_usd"),
             "lighter_equity_usd": risk.get("lighter_equity_usd"),
+            "variational_maintenance_margin_usage_pct": (str(risk['variational_maintenance_margin_usage_pct'])
+                if risk.get('variational_maintenance_margin_usage_pct') is not None else None),
+            "lighter_maintenance_margin_usage_pct": (str(risk['lighter_maintenance_margin_usage_pct'])
+                if risk.get('lighter_maintenance_margin_usage_pct') is not None else None),
             "max_maintenance_margin_usage_pct": risk.get("max_maintenance_margin_usage_pct"),
             "max_projected_venue_leverage": risk.get("max_projected_venue_leverage"),
             "account_snapshot_observed_at": risk.get("observed_at"),
@@ -1796,6 +2293,9 @@ class WTILiveRuntime:
                 OilSession.EXCHANGE_CLOSED.value if closed_window is not None else None
             ),
             "last_action": self.last_action,
+            "sample_gap_recovery_samples": getattr(self, 'gap_recovery_samples', 0),
+            "sample_gap_event": getattr(self, 'sample_gap_event', None),
+            "sample_gap_recovery_proofs": len(getattr(self, 'gap_recovery_proofs', set())),
             "gradient_threshold_source": getattr(
                 self, "wti_gradient_threshold_source", "not_loaded"
             ),
@@ -1805,6 +2305,23 @@ class WTILiveRuntime:
                     self, "wti_gradient_threshold_profiles", {}
                 ).items()
             },
+            "experimental_entry_policy": {
+                "enabled": getattr(self, "experimental_exit_model", None) is not None,
+                "model_sha256": getattr(self.args, "experimental_exit_model_sha256", None),
+                "exploratory_entry": getattr(self.args, "confirm_exploratory_entry", False),
+                "aggregate_cap_usd": (
+                    str(PILOT_CAP_USD) if getattr(self, "experimental_exit_model", None)
+                    and not getattr(self.args,'continuous_manual_gradient',False) else None
+                ),
+                "diagnostic": getattr(self, "experimental_exit_diagnostic", {}),
+            },
+            "manual_wti_trial": state.get("manual_wti_trial"),
+            "manual_continuous_gradient": state.get('manual_continuous_gradient'),
+            "gradient_capacity_by_tier_usd": (
+                [str(x) for x in (self._gradient_equity_capacity_by_tier() or [])]
+                if getattr(self.args,'continuous_manual_gradient',False) else None),
+            "exit_cost_policy": getattr(self, "exit_cost_diagnostic", {}),
+            "exit_cost_shadow": getattr(self, "exit_cost_shadow", {}),
             "open_lots_total": int(exposure),
             "pending_actions_total": int(pending),
             "manual_review_reason": state.get("manual_review_reason"),
@@ -1824,6 +2341,11 @@ class WTILiveRuntime:
             "readiness": self.readiness,
             "errors": [] if error is None else [error],
         }
+        try:
+            writer = getattr(self, "decision_audit", None)
+            health["decision_audit"] = writer.stats() if writer else {"enabled": False}
+        except Exception:
+            health["decision_audit"] = {"capture_health_unavailable": True}
         write_json_atomic(self.args.health_path, health)
         self.last_health_write_monotonic = time.monotonic()
 
@@ -1926,6 +2448,7 @@ class WTILiveRuntime:
         return True
 
     async def _read_reconcile(self, row: dict[str, Any]) -> dict[str, Any]:
+        audit_event(self, "account_check_started", sample=sample_evidence(row))
         assert self.executor is not None
         self.account_read_recovery_required = getattr(
             self, "account_read_recovery_required", False
@@ -1940,7 +2463,11 @@ class WTILiveRuntime:
         session = _session_window(row, now, self.args.entry_cutoff_seconds)
         try:
             state = await self._reconcile_with_account_read_retries(row, now, session)
+            audit_event(self, "account_check_result", state=state_evidence(state), gate=gate_evidence(self))
             return state
+        except BaseException as exc:
+            audit_event(self, "account_check_failed", error=safe_error(exc))
+            raise
         finally:
             self.last_reconcile_elapsed_ms = round((time.monotonic() - started) * 1000, 3)
 
@@ -2210,11 +2737,13 @@ class WTILiveRuntime:
                 self.last_execution_refresh_at = now.isoformat()
                 self.last_execution_refresh_error = None
                 started = time.monotonic()
+                audit_event(self, "quote_refresh_requested", trigger=refresh_trigger, sample=sample_evidence(row))
                 try:
                     candidate = await self.collector.collect_fresh_sample(sample_kind="burst")
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    audit_event(self, "quote_refresh_failed", error=safe_error(exc), trigger=refresh_trigger)
                     detail = " ".join(str(exc).split())[:160] or type(exc).__name__
                     self.last_execution_refresh_status = "unavailable"
                     self.last_execution_refresh_error = f"{type(exc).__name__}:{detail}"
@@ -2237,6 +2766,8 @@ class WTILiveRuntime:
                 )
                 self.last_execution_refresh_status = "returned"
                 self.last_execution_refresh_error = None
+                audit_event(self, "quote_refresh_returned", sample=sample_evidence(candidate),
+                            result_type=type(candidate).__name__)
                 if not isinstance(candidate, dict):
                     self.last_execution_refresh_status = "invalid"
                     self.last_sample_freshness_diagnostics = {
@@ -2248,6 +2779,8 @@ class WTILiveRuntime:
                 candidate = dict(candidate)
 
         if self._record_new_sample(candidate) is False:
+            audit_event(self, "quote_rejected", sample=sample_evidence(candidate),
+                        reason="record_new_sample_rejected", diagnostics=getattr(self, "last_sample_freshness_diagnostics", None))
             self.last_execution_refresh_status = (
                 "invalid" if candidate.get("sample_kind") == "burst"
                 else self.last_execution_refresh_status
@@ -2260,6 +2793,7 @@ class WTILiveRuntime:
             candidate, datetime.now(timezone.utc)
         )
         if not diagnostics["fresh"]:
+            audit_event(self, "quote_rejected", sample=sample_evidence(candidate), diagnostics=diagnostics)
             self.last_execution_refresh_status = (
                 "stale" if candidate.get("sample_kind") == "burst"
                 else self.last_execution_refresh_status
@@ -2270,12 +2804,14 @@ class WTILiveRuntime:
             }
             return None
         self.last_sample_freshness_diagnostics = diagnostics
+        audit_event(self, "quote_accepted", sample=sample_evidence(candidate), diagnostics=diagnostics)
         self.last_decision_sample = dict(candidate)
         if candidate.get("sample_kind") == "burst":
             self.last_execution_refresh_status = "fresh"
             self.last_execution_refresh_at = str(candidate.get("logged_at") or "") or None
         return candidate
 
+    @audited_cycle("startup_reconcile")
     async def _startup_reconcile_sample(self, row: dict[str, Any]) -> dict[str, Any]:
         candidate = await self._decision_sample(row)
         if candidate is None:
@@ -2309,6 +2845,7 @@ class WTILiveRuntime:
             self.entry_authorized = False
             return state
         self.startup_reconciled = state.get("status") in {"flat", "open"}
+        self._recover_sample_gap(state, candidate)
         state = await self._arm_manual_gradient_round(state, candidate)
         state = await self._advance_continuous_gradient_round(state)
         self._sync_entry_authorization(
@@ -2318,6 +2855,7 @@ class WTILiveRuntime:
         self.last_runtime_error = None
         return state
 
+    @audited_cycle("strategy")
     async def _process_sample(self, row: dict[str, Any]) -> dict[str, Any]:
         assert self.executor is not None and self.gateway is not None and self.config is not None
         decision_sample = await self._decision_sample(row)
@@ -2344,6 +2882,7 @@ class WTILiveRuntime:
             signal_sample = dict(row)
         state = await self._read_reconcile(row)
         self.last_risk = dict(self.gateway.latest_risk)
+        self._recover_sample_gap(state, row)
         if getattr(self, "account_read_recovery_cycle_blocked", False):
             self.entry_authorized = False
             recovery_management = bool(
@@ -2368,7 +2907,17 @@ class WTILiveRuntime:
             and not self.manage_existing_only
             and getattr(self, "gradient_pilot", None) is not None
         )
+        confirmation_history = getattr(
+            self, "gradient_entry_confirmation_history", None
+        )
+        if not isinstance(confirmation_history, dict):
+            confirmation_history = {
+                "long_var_short_lighter": [],
+                "short_var_long_lighter": [],
+            }
+            self.gradient_entry_confirmation_history = confirmation_history
         thresholds_by_direction = None
+        self.decision_shadow_thresholds = None
         if gradient_entry_mode:
             thresholds_by_direction = await self._gradient_thresholds_for_sample(
                 signal_sample or row
@@ -2378,6 +2927,18 @@ class WTILiveRuntime:
                     direction: (None,) * WTI_GRADIENT_MAX_LAYERS
                     for direction in ("long_var_short_lighter", "short_var_long_lighter")
                 }
+            self.decision_shadow_thresholds = {
+                "sample_id": (signal_sample or row).get("sample_id"),
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "by_direction": {
+                    direction: [None if value is None else str(value) for value in values]
+                    for direction, values in thresholds_by_direction.items()
+                },
+            }
+            audit_event(self, "thresholds_evaluated", sample=sample_evidence(signal_sample or row),
+                        thresholds=thresholds_by_direction,
+                        crossings=crossing_evidence(signal_sample or row, thresholds_by_direction),
+                        source=getattr(self, "wti_gradient_threshold_source", None))
         decision_sample = await self._decision_sample(row)
         if decision_sample is None:
             self.entry_authorized = False
@@ -2403,6 +2964,15 @@ class WTILiveRuntime:
         now = datetime.now(timezone.utc)
         if self._complete_rotation_drain_if_verified_flat(state):
             return state
+        exit_config = self.config
+        if getattr(self.args, "exit_cost_evidence", None) is not None:
+            exit_config = replace(self.config, roundtrip_cost_bps=self._profit_exit_cost(state))
+            self.exit_cost_shadow = {
+                "sample_id": row.get("sample_id"),
+                "legacy": decide_wti_action(row, position, config=self.config, now=now),
+                "candidate": decide_wti_action(row, position, config=exit_config, now=now),
+                "entry_policy_unchanged": True,
+            }
         if position is None or getattr(self, "gradient_pilot", None) is not None:
             self._sync_entry_authorization(state, row, now=now)
         else:
@@ -2412,37 +2982,69 @@ class WTILiveRuntime:
         window = _session_window(row, now, self.config.entry_cutoff_seconds)
         if gradient_entry_mode:
             self.gradient_pilot = dict(state.get("gradient_pilot") or self.gradient_pilot)
-            confirmation_history = getattr(
-                self, "gradient_entry_confirmation_history", None
-            )
-            if not isinstance(confirmation_history, dict):
-                confirmation_history = {
-                    "long_var_short_lighter": [],
-                    "short_var_long_lighter": [],
-                }
-                self.gradient_entry_confirmation_history = confirmation_history
             if risk_action in {"normal", "warning"}:
-                for signal in (signal_sample, row):
-                    if signal is not None and signal.get("sample_kind", "baseline") == "baseline":
-                        update_gradient_entry_confirmation(
-                            signal,
-                            thresholds_by_direction,
-                            confirmation_history,
-                            direction=None,
-                            candidate_tier=1,
-                        )
+                confirmation_sample = (
+                    signal_sample if isinstance(signal_sample, dict) else row
+                )
+                if confirmation_sample.get("sample_kind", "baseline") == "baseline":
+                    update_gradient_entry_confirmation(
+                        confirmation_sample,
+                        thresholds_by_direction,
+                        confirmation_history,
+                        direction=None,
+                        candidate_tier=1,
+                    )
             else:
                 self._reset_gradient_confirmation()
+            lifecycle_signal = signal_sample if isinstance(signal_sample, dict) else None
+            activated_tiers_by_direction = {direction: 0 for direction in (
+                "long_var_short_lighter", "short_var_long_lighter"
+            )}
+            if lifecycle_signal is not None and risk_action in {"normal", "warning"}:
+                from tools.lib.gradient_lifecycle import confirmed_gradient_tiers
+                pilot_layers = (self.gradient_pilot or {}).get("layers_opened") or []
+                strong_probe_used = any(
+                    isinstance(item, dict)
+                    and item.get("confirmation_mode") == "strong_single_probe"
+                    for item in pilot_layers
+                )
+                activated_tiers_by_direction = confirmed_gradient_tiers(
+                    lifecycle_signal,
+                    thresholds_by_direction,
+                    confirmation_history,
+                    allow_strong_single_probe=not strong_probe_used,
+                )
+                if getattr(self.args, "continuous_manual_gradient", False):
+                    state = await asyncio.to_thread(
+                        self.pilot_store.update_gradient_reactivation,
+                        pilot_id=str((self.gradient_pilot or {}).get("pilot_id") or ""),
+                        row=lifecycle_signal,
+                        thresholds_by_direction=thresholds_by_direction,
+                        activated_tiers=activated_tiers_by_direction,
+                        runtime_pid=os.getpid(), runtime_run_id=self.run_id,
+                    )
+                    state = await self._advance_continuous_gradient_round(state)
+                    self.gradient_pilot = dict(state.get("gradient_pilot") or self.gradient_pilot)
+                    if state.get("gradient_pilot", {}).get("authorization_kind") == "manual_new_round":
+                        # A newly armed round starts with a clean confirmation window.
+                        activated_tiers_by_direction = {direction: 0 for direction in activated_tiers_by_direction}
+                        self._sync_entry_authorization(state, row, now=datetime.now(timezone.utc))
+                    position = state.get("open_position")
             equity_capacity = self._gradient_equity_capacity_by_tier()
             if equity_capacity is None:
-                decision = decide_wti_action(row, position, config=self.config, now=now)
+                decision = decide_wti_action(row, position, config=exit_config, now=now)
                 if decision.get("action") != "close":
                     decision = {"action": "hold", "reason": "gradient_equity_capacity_unavailable"}
             else:
                 decision = decide_wti_gradient_action(
-                    row, position, self.gradient_pilot, config=self.config, now=now,
+                    row, position, self.gradient_pilot, config=exit_config, now=now,
                     thresholds_by_direction=thresholds_by_direction,
                     aggregate_capacity_by_tier_usd=equity_capacity,
+                    confirmed_tiers_by_direction=activated_tiers_by_direction,
+                    **({'exit_cost_by_tier': {
+                        tier: self._profit_exit_cost(state, [x['layer_id'] for x in position['layers'] if x['tier'] == tier])
+                        for tier in {x['tier'] for x in position['layers']}
+                    }} if position and getattr(self.args,'continuous_manual_gradient',False) else {}),
                     elastic_capacity_enabled=bool(
                         (self.gradient_pilot.get("config") or {}).get(
                             "elastic_capacity_enabled", False
@@ -2452,13 +3054,27 @@ class WTILiveRuntime:
         elif self.manage_existing_only and position is None:
             decision = {"action": "hold", "reason": "management_only_flat_no_new_entries"}
         else:
-            decision = decide_wti_action(row, position, config=self.config, now=now)
+            decision = decide_wti_action(row, position, config=exit_config, now=now)
         if position is None:
             self.pending_gap_exit = False
         elif self.pending_gap_exit:
             decision = {"action": "close", "reason": "sample_gap_requires_position_drain"}
         elif risk_action in {"force_reduce", "emergency_exit"}:
             decision = {"action": "close", "reason": f"account_risk_{risk_action}"}
+        if (decision.get("action") == "close"
+                and getattr(self.args, "continuous_manual_gradient", False)
+                and position is not None):
+            direction = str(position.get("direction"))
+            active = (thresholds_by_direction or {}).get(direction) or ()
+            fallback = ((self.gradient_pilot or {}).get("config") or {}).get(
+                "tier_thresholds_bps", [self.config.entry_threshold_bps]
+            )
+            threshold = active[0] if active and active[0] is not None else fallback[0]
+            decision = {
+                **decision,
+                "reactivation_entry_threshold_bps": str(threshold),
+            }
+        audit_event(self, "strategy_decision", decision=decision, sample=sample_evidence(row), gate=gate_evidence(self))
         if gradient_entry_mode and decision.get("action") in {"open", "add"}:
             if risk_action not in {"normal", "warning"}:
                 self._reset_gradient_confirmation()
@@ -2479,11 +3095,13 @@ class WTILiveRuntime:
                 signal_confirmation = update_gradient_entry_confirmation(
                     signal or row,
                     thresholds_by_direction,
-                    self.gradient_entry_confirmation_history,
+                    confirmation_history,
                     direction=direction,
                     candidate_tier=candidate_tier,
                     allow_strong_single_probe=not strong_probe_used,
                 )
+                audit_event(self, "signal_confirmation", result=signal_confirmation,
+                            signal=sample_evidence(signal or row))
                 if signal_confirmation.get("confirmation_mode") == "strong_single_probe":
                     if signal is None:
                         confirmation = {
@@ -2491,6 +3109,7 @@ class WTILiveRuntime:
                             "reason": "gradient_strong_signal_baseline_missing",
                         }
                     else:
+                        audit_event(self, "strong_refresh_requested", signal=sample_evidence(signal))
                         try:
                             refreshed = await self.collector.collect_fresh_sample(
                                 sample_kind="burst",
@@ -2499,17 +3118,20 @@ class WTILiveRuntime:
                         except asyncio.CancelledError:
                             raise
                         except Exception as exc:
+                            audit_event(self, "strong_refresh_failed", error=safe_error(exc))
                             refreshed = None
                             self.last_execution_refresh_status = "unavailable"
                             self.last_execution_refresh_error = (
                                 f"{type(exc).__name__}:{' '.join(str(exc).split())[:120]}"
                             )
                         if not isinstance(refreshed, dict):
+                            audit_event(self, "strong_refresh_unavailable", result_type=type(refreshed).__name__)
                             confirmation = {
                                 "confirmed": False,
                                 "reason": "gradient_strong_signal_execution_refresh_unavailable",
                             }
                         else:
+                            audit_event(self, "strong_refresh_returned", sample=sample_evidence(refreshed))
                             self.last_execution_refresh_status = "returned"
                             self.last_execution_refresh_at = refreshed.get("logged_at")
                             self.last_execution_refresh_error = None
@@ -2531,7 +3153,7 @@ class WTILiveRuntime:
                                     signal,
                                     row,
                                     thresholds_by_direction,
-                                    self.gradient_entry_confirmation_history,
+                                    confirmation_history,
                                     direction=direction,
                                     candidate_tier=candidate_tier,
                                     allow_strong_single_probe=not strong_probe_used,
@@ -2540,10 +3162,11 @@ class WTILiveRuntime:
                     confirmation = update_gradient_entry_confirmation(
                         row,
                         thresholds_by_direction,
-                        self.gradient_entry_confirmation_history,
+                        confirmation_history,
                         direction=direction,
                         candidate_tier=candidate_tier,
                     )
+                audit_event(self, "execution_confirmation", result=confirmation, sample=sample_evidence(row))
                 if not confirmation.get("confirmed"):
                     decision = {
                         "action": "hold",
@@ -2582,6 +3205,14 @@ class WTILiveRuntime:
                             "confirmation_count": confirmation["confirm_count"],
                             "minimum_entry_edge_bps": str(minimum_entry_edge),
                         }
+        audit_event(self, "pre_submission_gate", decision=decision, sample=sample_evidence(row),
+                    gate=gate_evidence(self), allow_new_entries=window.allow_new_entries,
+                    allow_position_management=window.allow_position_management)
+        observer = getattr(self.executor, 'reporting_observer', None)
+        if observer is not None:
+            from tools.lib.wti_equity_reporting import market_tier
+            observer.market_tier = market_tier(row, thresholds_by_direction,
+                (position or {}).get('direction') or decision.get('direction'))
         if decision["action"] == "close":
             if not window.allow_position_management:
                 self.last_action = {
@@ -2589,14 +3220,20 @@ class WTILiveRuntime:
                     "trigger": decision.get("reason"),
                 }
                 return state
+            previous_execution = execution_marker(state)
+            audit_event(self, "executor_close_requested", state=state_evidence(state), decision=decision)
             state = await asyncio.to_thread(
                 lambda: self.executor.close(
                     sample=row, session=window, decision=decision,
                     exit_target_bps=self.config.exit_target_bps,
                     roundtrip_cost_bps=self.config.roundtrip_cost_bps,
+                    **({"exit_cost_reader": lambda current: self._profit_exit_cost(current, decision.get('close_layer_ids'))}
+                       if getattr(self.args, "exit_cost_evidence", None) is not None else {}),
                     now=datetime.now(timezone.utc),
                 )
             )
+            audit_event(self, "executor_close_returned", state=state_evidence(state),
+                        executions=execution_evidence(state, previous_execution))
             if state.get("status") == "flat":
                 self.pending_gap_exit = False
             close_check = state.get("last_close_check") or {}
@@ -2611,6 +3248,12 @@ class WTILiveRuntime:
                     "action": "close", "reason": decision["reason"],
                     "status": state.get("status"),
                 }
+            if (risk_action in {"normal", "warning"}
+                    and row.get("sample_kind", "baseline") == "baseline"):
+                update_gradient_entry_confirmation(
+                    row, thresholds_by_direction, self.gradient_entry_confirmation_history,
+                    direction=None, candidate_tier=1,
+                )
             self._finish_single_round_pilot_if_done(state)
             self._finish_gradient_pilot_if_done(state)
             return state
@@ -2640,8 +3283,12 @@ class WTILiveRuntime:
                 )
             self.gateway.set_proposed_notional(
                 notional,
-                equity_multiple=Decimal(tier) if gradient_entry else None,
+                equity_multiple=Decimal(2 if decision.get('elastic_capacity_addon') else tier) if gradient_entry else None,
             )
+            previous_execution = execution_marker(state)
+            audit_event(self, "executor_open_requested", sample=sample_evidence(row),
+                        direction=decision["direction"], tier=tier, layer_id=layer_id,
+                        notional_usd=notional, gate=gate_evidence(self))
             try:
                 state = await asyncio.to_thread(
                     lambda: self.executor.open(
@@ -2663,7 +3310,11 @@ class WTILiveRuntime:
                         now=datetime.now(timezone.utc),
                     )
                 )
+                audit_event(self, "executor_open_returned", state=state_evidence(state),
+                            executions=execution_evidence(state, previous_execution),
+                            entry_block=state.get("last_entry_block"))
             except Exception:
+                audit_event(self, "executor_open_exception", submission_status="unknown_consult_persisted_intent_do_not_retry")
                 if not gradient_entry and reservation_id is not None:
                     state = await asyncio.to_thread(
                         self.pilot_store.release_unsubmitted_single_round_pilot_entry,
@@ -2706,6 +3357,12 @@ class WTILiveRuntime:
             "risk_action": risk_action,
             "edge_bps": decision.get("edge_bps"),
         }
+        if (risk_action in {"normal", "warning"}
+                and row.get("sample_kind", "baseline") == "baseline"):
+            update_gradient_entry_confirmation(
+                row, thresholds_by_direction, confirmation_history,
+                direction=None, candidate_tier=1,
+            )
         return state
 
     def _note_verified_cycle(self, state: dict[str, Any], *, kind: str) -> bool:
@@ -2728,9 +3385,33 @@ class WTILiveRuntime:
 
     async def run(self) -> None:
         validate_startup_preconditions(self.args)
+        notification_task = None
+        shadow_task: asyncio.Task[Any] | None = None
         await self._start_forwarder()
+        if self.args.mode == 'live':
+            load_dotenv(ROOT / '.env', override=False)
+            reporter = TradeReporter(
+                self.args.state_path.with_suffix('.telegram.json'),
+                read_json(self.args.state_path),
+                TelegramNotifier.from_env(logger=self.logger),
+                health_path=getattr(self.args, 'health_path', None),
+                equity_directory=self.args.state_path.parent/'wti_equity_events',
+                snapshot_reader=lambda: getattr(self.gateway, 'latest_reporting_snapshot', None),
+                snapshot_refresher=lambda: self.gateway.read_account(),
+            )
+            notification_task = asyncio.create_task(reporter.run(self.args.state_path))
         self.collector_task = asyncio.create_task(self.collector.run(), name="wti-collector")
         try:
+            if getattr(self.args, "decision_audit_enabled", False):
+                try:
+                    self.decision_audit = AuditWriter(self.args.health_path.parent / "wti_decision_audit",
+                                                      name="runtime", run_id=self.run_id)
+                except Exception as exc:
+                    self.logger.warning("decision_audit_unavailable error_type=%s", type(exc).__name__)
+            if self.args.mode == "live" and getattr(self, "decision_audit", None) is not None:
+                shadow_task = asyncio.create_task(
+                    self._run_decision_shadow(), name="wti-decision-shadow",
+                )
             if self.args.mode == "live":
                 await self._initialize_execution()
                 sample = await self._wait_for_first_sample()
@@ -2783,7 +3464,7 @@ class WTILiveRuntime:
 
             while not self.stop and not self.collector_task.done():
                 self._poll_rotation_drain()
-                row = self.collector.latest_sample
+                row = getattr(self.collector, 'latest_baseline_sample', None) or self.collector.latest_sample
                 state = read_json(self.args.state_path) if self.args.mode == "live" else {}
                 if self.args.mode == "live" and row is not None:
                     new_valid_sample = self._record_new_sample(dict(row))
@@ -2914,7 +3595,13 @@ class WTILiveRuntime:
             if self.collector_task.done():
                 await self.collector_task
         finally:
+            if notification_task is not None:
+                notification_task.cancel()
+                await asyncio.gather(notification_task, return_exceptions=True)
             self.stop = True
+            if shadow_task is not None:
+                shadow_task.cancel()
+                await asyncio.gather(shadow_task, return_exceptions=True)
             self.collector.request_stop()
             if self.collector_task is not None and not self.collector_task.done():
                 self.collector_task.cancel()
@@ -2928,15 +3615,30 @@ class WTILiveRuntime:
                 from tools.wti_account_probe import _close_client
                 await _close_client(self.signer_client)
             self._write_health(state=None, row=self.collector.latest_sample)
+            if getattr(self, "decision_audit", None) is not None:
+                await asyncio.to_thread(self.decision_audit.close)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Standalone WTI pair live runtime; ETH runtime is not imported or stopped.")
     parser.add_argument("--mode", choices=("observe", "live"), default="observe")
+    parser.add_argument("--disable-decision-audit", dest="decision_audit_enabled", action="store_false", default=True)
     parser.add_argument("--confirm-eth-flat", action="store_true")
     parser.add_argument("--i-understand-live-orders", action="store_true")
     parser.add_argument("--confirm-bounded-live-pilot", action="store_true")
     parser.add_argument("--gradient-live", action="store_true")
+    parser.add_argument("--experimental-exit-model", type=Path)
+    parser.add_argument("--experimental-exit-model-sha256")
+    parser.add_argument("--confirm-experimental-exit-model", action="store_true")
+    parser.add_argument("--confirm-exploratory-entry", action="store_true")
+    parser.add_argument("--manual-wti-trial-id")
+    parser.add_argument("--manual-wti-root-pilot")
+    parser.add_argument("--manual-wti-max-rounds", type=int, default=1)
+    parser.add_argument("--continuous-manual-gradient", action="store_true")
+    parser.add_argument("--confirm-continuous-manual-gradient", action="store_true")
+    parser.add_argument("--adopt-gradient-pilot")
+    parser.add_argument("--exit-cost-evidence", type=Path)
+    parser.add_argument("--confirm-evidence-exit-costs", action="store_true")
     parser.add_argument("--new-gradient-pilot-after", help="explicit manual new round after this exact terminal gradient pilot; never enables rotation")
     parser.add_argument("--confirm-bounded-gradient-pilot", action="store_true")
     parser.add_argument("--continuous-gradient-rotation", action="store_true")
@@ -2980,6 +3682,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lighter-base-url", default=DEFAULT_LIGHTER_URL)
     parser.add_argument("--expected-lighter-market-id", type=int)
     args = parser.parse_args(argv)
+    if args.continuous_manual_gradient:
+        if (not args.confirm_continuous_manual_gradient or not args.gradient_live or args.mode != 'live'
+                or args.manual_wti_trial_id or args.manual_wti_root_pilot or args.manual_wti_max_rounds != 1
+                or args.continuous_gradient_rotation or args.rotation_test_id or args.new_gradient_pilot_after
+                or not re.fullmatch(r'[0-9a-f]{32}', args.adopt_gradient_pilot or '')
+                or args.gradient_layer_notional_usd != Decimal('20') or args.max_notional_usd != Decimal('20')
+                or not args.keep_collecting_after_pilot):
+            parser.error('manual continuous gradient requires exact adoption, 20 USD children, explicit confirmation and no rotation/trial')
+    elif args.confirm_continuous_manual_gradient or args.adopt_gradient_pilot:
+        parser.error('continuous gradient confirmation/adoption requires continuous-manual-gradient')
     bounded_history_mode = bool(
         args.mode == "live"
         and (
@@ -3063,6 +3775,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("choose either bounded entry pilot or existing-position management")
     elif args.gradient_live or args.confirm_bounded_gradient_pilot:
         parser.error("gradient live options require --mode live")
+    if args.experimental_exit_model is not None:
+        if (args.mode != "live" or not args.gradient_live
+                or not args.confirm_experimental_exit_model
+                or args.continuous_gradient_rotation or args.rotation_test_id
+                or args.manage_existing_wti_position
+                or not re.fullmatch(r"[0-9a-f]{64}", args.experimental_exit_model_sha256 or "")
+                or args.roundtrip_cost_bps != Decimal("10")
+                or args.exit_target_bps != Decimal("1")
+                or args._validated_notional > PILOT_CAP_USD):
+            parser.error("experimental exit model requires explicit hash-pinned manual gradient pilot, 10bps cost, 1bps target and order cap <=20; no rotation")
+    elif args.confirm_experimental_exit_model or args.experimental_exit_model_sha256 or args.confirm_exploratory_entry:
+        parser.error("experimental model confirmation/hash requires a model file")
+    if args.manual_wti_trial_id:
+        if (not args.confirm_exploratory_entry or not args.experimental_exit_model
+                or not args.keep_collecting_after_pilot
+                or not re.fullmatch(r"[0-9a-f]{32}", args.manual_wti_trial_id)
+                or not re.fullmatch(r"[0-9a-f]{32}", args.manual_wti_root_pilot or "")
+                or not 1 <= args.manual_wti_max_rounds <= 3):
+            parser.error("manual WTI trial requires explicit exploratory mode, fixed IDs, collection retention and at most 3 rounds")
+    elif args.manual_wti_root_pilot or args.manual_wti_max_rounds != 1:
+        parser.error("manual WTI round budget requires a persistent trial ID")
+    if bool(args.exit_cost_evidence) != args.confirm_evidence_exit_costs:
+        parser.error("evidence-based exits require a proof file and explicit confirmation")
     return args
 
 

@@ -16,6 +16,12 @@ from tools import wti_live
 from tools.lib.wti_readonly_adapter import WTIReadOnlyError
 
 
+@pytest.fixture(autouse=True)
+def disable_real_trade_notifications(monkeypatch):
+    monkeypatch.setattr(wti_live.TelegramNotifier, 'from_env', lambda **kwargs: SimpleNamespace(
+        send_now=lambda message: (False, 'missing_TELEGRAM_BOT_TOKEN_or_TELEGRAM_CHAT_ID')))
+
+
 @pytest.mark.parametrize("mode", ["observe", "live"])
 def test_cli_main_reaches_runtime_with_parsed_arguments(monkeypatch, mode):
     argv = ["tools/wti_live.py", "--mode", mode]
@@ -988,6 +994,158 @@ def test_runtime_keeps_entry_gate_when_sample_gap_is_within_existing_limit():
     assert runtime.entry_gate_block_reason is None
 
 
+def test_cached_but_valid_captures_do_not_create_false_120_second_gap(monkeypatch):
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.last_action = {}
+    now = datetime.now(timezone.utc)
+    runtime.last_baseline_sample_at = now - timedelta(seconds=10)
+    runtime.last_baseline_session_id = 'wti-session-1'
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+    Clock.current = now
+    monkeypatch.setattr(wti_live, 'datetime', Clock)
+    for index in range(14):
+        captured = now + timedelta(seconds=index * 10)
+        Clock.current = captured + timedelta(seconds=3)
+        row = _live_sample(captured, sample_id=f'cached-{index}')
+        assert runtime._record_new_sample(row) is True
+        assert not runtime.entry_authorization_permanently_revoked
+        assert runtime.last_sample_gap_seconds == 10
+        assert not runtime._sample_health_fresh(row, Clock.current)
+
+
+@pytest.mark.parametrize('block', ['pending', 'position', 'risk', 'stale', 'wrong_runtime', 'other_lock', 'account_recovery'])
+def test_sample_gap_cannot_recover_without_all_safety_evidence(tmp_path, block):
+    runtime, state, row = _gap_recovery_runtime(tmp_path)
+    if block == 'pending': state['pending_action'] = {'kind': 'open'}
+    if block == 'position': state['status'] = 'open'
+    if block == 'risk': runtime.last_risk['risk_action'] = 'warning'
+    if block == 'stale': row['logged_at'] = (datetime.now(timezone.utc) - timedelta(seconds=3)).isoformat()
+    if block == 'wrong_runtime': state['last_account_reconciliation']['runtime_run_id'] = 'old'
+    if block == 'other_lock': runtime.entry_revocation_reason = 'wti_strategy_cycle_requires_review'
+    if block == 'account_recovery': runtime.account_read_recovery_required = True
+    assert not runtime._recover_sample_gap(state, row)
+    assert runtime.entry_authorization_permanently_revoked
+
+
+def _gap_recovery_runtime(tmp_path):
+    import os
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.args = SimpleNamespace(expected_lighter_market_id=145)
+    runtime.market_metadata = {'supported_size_decimals': 3}
+    runtime.run_id = 'gap-recovery'
+    runtime.logger = logging.getLogger('gap-recovery-test')
+    runtime.sample_guard_path = tmp_path / 'guard.json'
+    runtime.last_baseline_sample_at = datetime.now(timezone.utc)
+    runtime.last_baseline_session_closing_at = runtime.last_baseline_sample_at + timedelta(hours=8)
+    runtime.gap_recovery_samples = 3
+    runtime.gap_recovery_proofs = set()
+    runtime._revoke_entry_authorization('wti_entry_authorization_revoked_after_sample_gap')
+    now = datetime.now(timezone.utc).isoformat()
+    runtime.last_risk = {'observed_at': now, 'risk_action': 'normal', 'risk_data_complete': True}
+    state = {'status': 'flat', 'pending_action': None, 'open_position': None,
+             'last_account_reconciliation': {'verified': True, 'market_id': 145,
+                 'observed_at': now, 'variational_qty': '0', 'lighter_qty': '0',
+                 'active_order_count': 0, 'runtime_pid': os.getpid(), 'runtime_run_id': runtime.run_id}}
+    return runtime, state, _live_sample(datetime.now(timezone.utc))
+
+
+def test_sample_gap_recovery_requires_distinct_account_proofs_and_persists(tmp_path):
+    runtime, state, row = _gap_recovery_runtime(tmp_path)
+    assert not runtime._recover_sample_gap(state, row)
+    assert not runtime._recover_sample_gap(state, row)
+    state['last_account_reconciliation']['observed_at'] = datetime.now(timezone.utc).isoformat()
+    assert runtime._recover_sample_gap(state, row)
+    assert not runtime.entry_authorization_permanently_revoked
+    assert not json.loads(runtime.sample_guard_path.read_text())['locked']
+
+
+@pytest.mark.parametrize('reason', ['wti_entry_authorization_revoked_after_sample_gap', 'wti_strategy_cycle_requires_review'])
+def test_restart_preserves_old_runtime_lock_and_resets_recovery_evidence(tmp_path, monkeypatch, reason):
+    monkeypatch.setattr(wti_live, 'ROOT', tmp_path)
+    monkeypatch.setattr(wti_live, 'OilSwapCollector', lambda args: SimpleNamespace())
+    args = wti_live.parse_args([
+        '--mode', 'live', '--confirm-eth-flat', '--i-understand-live-orders',
+        '--manage-existing-wti-position', '--entry-threshold-bps', '30',
+        '--exit-target-bps', '1', '--roundtrip-cost-bps', '10',
+        '--state-path', str(tmp_path / 'state.json'), '--health-path', str(tmp_path / 'health.json')])
+    args.health_path.write_text(json.dumps({'entry_authorization_permanently_revoked': True,
+                                          'entry_gate_block_reason': reason}))
+    runtime = wti_live.WTILiveRuntime(args)
+    assert runtime.entry_authorization_permanently_revoked
+    assert runtime.entry_revocation_reason == reason
+    assert runtime.gap_recovery_samples == 0 and not runtime.gap_recovery_proofs
+    runtime._persist_sample_guard()
+    args.health_path.unlink()
+    restarted = wti_live.WTILiveRuntime(args)
+    assert restarted.entry_authorization_permanently_revoked
+    assert restarted.entry_revocation_reason == reason
+    assert restarted.pending_gap_exit is False
+
+
+def test_only_matching_exposure_bound_gap_guard_restores_position_drain():
+    from tools.wti_live import _sample_guard_requires_position_drain
+
+    position = {
+        "gradient_pilot_id": "pilot-1", "opened_at": "2026-10-30T15:56:18+00:00",
+        "entry_execution_id": "entry-1", "var_qty": "6.141", "lighter_qty": "6.141",
+    }
+    identity = {key: str(position[key]) for key in (
+        "gradient_pilot_id", "opened_at", "entry_execution_id", "var_qty", "lighter_qty",
+    )}
+    guard = {
+        "locked": True,
+        "reason": "wti_entry_authorization_revoked_after_sample_gap",
+        "gap_event": {"effective_gap_seconds": 121},
+        "position_drain_required": True,
+        "drain_position_identity": identity,
+    }
+    assert _sample_guard_requires_position_drain(guard, {"open_position": position})
+    assert not _sample_guard_requires_position_drain(
+        {**guard, "reason": "wti_strategy_cycle_requires_review"},
+        {"open_position": position},
+    )
+    assert not _sample_guard_requires_position_drain(guard, {"open_position": None})
+    assert not _sample_guard_requires_position_drain(
+        guard, {"open_position": {**position, "var_qty": "6.140"}}
+    )
+    assert not _sample_guard_requires_position_drain(
+        {**guard, "position_drain_required": False}, {"open_position": position}
+    )
+
+
+def test_real_reconcile_cycles_recover_gap_without_opening_or_renewing_pilot(tmp_path):
+    class Collector:
+        latest_sample = _live_sample(datetime.now(timezone.utc))
+    gateway = _FlatLoopGateway()
+    def fresh_risk(_count):
+        gateway.latest_risk = {'observed_at': datetime.now(timezone.utc).isoformat(),
+                               'risk_action': 'normal', 'risk_data_complete': True}
+    gateway.after_read = fresh_risk
+    runtime = _runtime_with_real_executor(tmp_path, Collector(), gateway, gradient=True)
+    runtime.startup_reconciled = True
+    pilot_id = runtime.gradient_pilot['pilot_id']
+    runtime.last_baseline_sample_at = datetime.now(timezone.utc) - timedelta(seconds=121)
+    runtime.last_baseline_session_id = 'wti-session-1'
+    async def cycles():
+        for index in range(4):
+            row = _live_sample(datetime.now(timezone.utc), sample_id=f'gap-cycle-{index}')
+            runtime.collector.latest_sample = row
+            assert runtime._record_new_sample(row) is True
+            await runtime._process_sample(row)
+            if index < 3:
+                assert runtime.entry_authorization_permanently_revoked
+        return runtime.pilot_store.load()
+    state = asyncio.run(cycles())
+    assert not runtime.entry_authorization_permanently_revoked
+    assert state['status'] == 'flat' and not state['pending_action']
+    assert state['execution_history'] == []
+    assert state['gradient_pilot']['pilot_id'] == pilot_id
+
+
 def _runtime_for_entry_gate(*, allow_unqualified: bool):
     runtime = object.__new__(wti_live.WTILiveRuntime)
     runtime.args = SimpleNamespace(
@@ -1355,6 +1513,38 @@ def test_history_volume_bypass_does_not_authorize_without_clean_historical_evide
     }
     assert not runtime._sync_entry_authorization(state, _live_sample(now), now=now)
     assert runtime.entry_gate_block_reason == "wti_historical_volume_bypass_evidence_not_met"
+
+
+@pytest.mark.parametrize("round_state", [None, {"required": True, "armed": False}])
+def test_completed_manual_gradient_cannot_authorize_without_round_reactivation(round_state):
+    runtime = object.__new__(wti_live.WTILiveRuntime)
+    runtime.args = SimpleNamespace(
+        mode="live", gradient_live=True, manage_existing_wti_position=False,
+        manual_wti_trial_id=None,
+    )
+    runtime.manage_existing_only = False
+    runtime.entry_authorization_permanently_revoked = False
+    runtime.account_read_recovery_required = False
+    runtime.gradient_pilot = {"pilot_id": "completed-pilot"}
+    runtime.entry_authorized = True
+    runtime.entry_gate_block_reason = None
+    pilot = {
+        "pilot_id": "completed-pilot", "status": "completed",
+        "completed_roundtrips": 1,
+        "config": {"manual_continuous_equity": True},
+    }
+    if round_state is not None:
+        pilot["round_reactivation"] = round_state
+    state = {
+        "status": "flat", "open_position": None, "pending_action": None,
+        "gradient_pilot": pilot,
+    }
+
+    assert not runtime._sync_entry_authorization(
+        state, {}, now=datetime.now(timezone.utc),
+    )
+    assert runtime.entry_authorized is False
+    assert runtime.entry_gate_block_reason == "gradient_round_rearm_waiting_for_reset"
 
 
 def test_degraded_startup_sample_blocks_entry_then_recovers_on_valid_sample():
@@ -2360,7 +2550,11 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
             row["lighter_ask"] = "70.6"
             row["lighter_sell_price"] = "70.5"
             row["lighter_buy_price"] = "70.6"
-            row["long_edge_bps"] = "50" if self.phase != "exit" else "0"
+            row["long_edge_bps"] = (
+                "0" if self.phase == "exit"
+                else "50" if self.phase == "add"
+                else "30"
+            )
             if self.phase == "add":
                 row["var_bid"] = "69.9"
                 row["lighter_buy_price"] = "70.6"
@@ -2427,6 +2621,11 @@ def test_real_strategy_executor_runs_two_layer_gradient_once_and_completes_durab
         )
         assert len(first["open_position"]["layers"]) == 1
         collector.phase = "add"
+        row = await collector.collect_fresh_sample()
+        assert runtime._record_new_sample(row) is True
+        first_add = await runtime._process_sample(row)
+        assert first_add["status"] == "open"
+        assert len(first_add["open_position"]["layers"]) == 1
         row = await collector.collect_fresh_sample()
         assert runtime._record_new_sample(row) is True
         second = await runtime._process_sample(row)

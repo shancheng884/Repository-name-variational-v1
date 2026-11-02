@@ -5,6 +5,7 @@ provide an adapter that confirms final fills and exact WTI account snapshots.
 """
 
 from __future__ import annotations
+from tools.lib.wti_continuous import split_close
 
 import json
 import os
@@ -38,6 +39,12 @@ from tools.lib.lighter_order_identity import (
     LEGACY_INDEX_REJECTION,
     legacy_lighter_index_was_unsendable,
     lighter_order_identity,
+)
+from tools.lib.gradient_lifecycle import (
+    DIRECTIONS as GRADIENT_DIRECTIONS,
+    REARM_BUFFER_BPS,
+    REARM_CONFIRM_SAMPLES,
+    advance_pilot_reactivation,
 )
 from tools.lib.wti_sizing import size_paired_layer
 
@@ -605,6 +612,9 @@ class WTIExecutionStore:
         return state
 
     def save(self, state: dict[str, Any]) -> None:
+        closed = state.get('last_closed_position')
+        if isinstance(closed, dict) and closed.get('exit_execution_id'):
+            state.setdefault('closed_positions', {})[closed['exit_execution_id']] = dict(closed)
         state["updated_at"] = _utc_now()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary_name = tempfile.mkstemp(
@@ -840,6 +850,14 @@ class WTIExecutionStore:
                     "previous_pilot_id": previous_pilot_id,
                     "layers_opened": [],
                     "exhausted_tiers": [],
+                    "tier_reactivation_by_direction": {
+                        direction: {
+                            str(tier): {"armed": True, "reset_seen": False}
+                            for tier in range(1, max_layers + 1)
+                        }
+                        for direction in GRADIENT_DIRECTIONS
+                    },
+                    "round_reactivation": {"required": False, "armed": True},
                     "completed_roundtrips": 0,
                     "started_at": _utc_now(),
                 }
@@ -849,6 +867,7 @@ class WTIExecutionStore:
                 if not isinstance(pilot, dict) or not manual_new_pilot_after:
                     raise WTIExecutionError("manual_gradient_predecessor_missing")
                 if pilot.get("pilot_id") == manual_new_pilot_after:
+                    reactivation = pilot.get("round_reactivation") or {}
                     terminal = (
                         pilot.get("status") == "completed"
                         and pilot.get("completed_roundtrips") == 1
@@ -859,6 +878,12 @@ class WTIExecutionStore:
                     )
                     if (
                         not flat or not terminal or pilot.get("schema_version") != 1
+                        or ((pilot.get("config") or {}).get("manual_continuous_equity")
+                            and (not isinstance(pilot.get("round_reactivation"), dict)
+                                 or reactivation.get("required") is True
+                                 and reactivation.get("armed") is not True))
+                        or (reactivation.get("required") is True
+                            and reactivation.get("armed") is not True)
                         or pilot.get("market_id") != market_id
                         or decimal_value(pilot.get("multiplier")) != multiplier
                         or pilot.get("config") != config or pilot.get("max_layers") != max_layers
@@ -1090,6 +1115,124 @@ class WTIExecutionStore:
             ):
                 raise WTIExecutionError("gradient_pilot_available_state_inconsistent")
             return deepcopy(pilot)
+
+    def update_gradient_reactivation(
+        self,
+        *,
+        pilot_id: str,
+        row: dict[str, Any],
+        thresholds_by_direction: dict[str, list[Any] | tuple[Any, ...]],
+        activated_tiers: dict[str, int],
+        runtime_pid: int,
+        runtime_run_id: str,
+    ) -> dict[str, Any]:
+        """Persist lifecycle state only after a current exact account proof."""
+        with self.exclusive():
+            state = self.load()
+            pilot = state.get("gradient_pilot")
+            if (
+                not isinstance(pilot, dict) or pilot.get("pilot_id") != pilot_id
+                or state.get("status") not in {"flat", "open"}
+                or state.get("pending_action") is not None
+            ):
+                return state
+            migrated = False
+            if not isinstance(pilot.get("tier_reactivation_by_direction"), dict):
+                try:
+                    max_layers = int(pilot.get("max_layers", 0))
+                except (TypeError, ValueError):
+                    return state
+                if not 1 <= max_layers <= 5:
+                    return state
+                tier_states = {
+                    direction: {
+                        str(tier): {"armed": True, "reset_seen": False}
+                        for tier in range(1, max_layers + 1)
+                    }
+                    for direction in GRADIENT_DIRECTIONS
+                }
+                position = state.get("open_position") or {}
+                closed_position = state.get("last_closed_position") or {}
+                closed_direction = str(
+                    position.get("direction") or closed_position.get("direction") or ""
+                )
+                legacy_closed = pilot.get("layers_closed") or []
+                if closed_direction in tier_states:
+                    for layer in legacy_closed:
+                        if not isinstance(layer, dict):
+                            continue
+                        try:
+                            tier = int(layer.get("tier"))
+                        except (TypeError, ValueError):
+                            continue
+                        if str(tier) not in tier_states[closed_direction]:
+                            continue
+                        tier_states[closed_direction][str(tier)] = {
+                            "armed": False,
+                            "reset_seen": False,
+                            "closed_at": layer.get("closed_at")
+                            or pilot.get("last_tier_closed_at")
+                            or _utc_now(),
+                            "migrated_from_legacy_state": True,
+                        }
+                pilot["tier_reactivation_by_direction"] = tier_states
+                migrated = True
+            if ((pilot.get("config") or {}).get("manual_continuous_equity")
+                    and state.get("status") == "flat"
+                    and pilot.get("status") == "completed"
+                    and not isinstance(pilot.get("round_reactivation"), dict)):
+                closed = state.get("last_closed_position") or {}
+                direction = str(closed.get("direction") or "")
+                active = thresholds_by_direction.get(direction) or ()
+                try:
+                    threshold = Decimal(str(active[0]))
+                    reset_threshold = threshold - REARM_BUFFER_BPS
+                except Exception:
+                    return state
+                if direction not in GRADIENT_DIRECTIONS or not reset_threshold.is_finite():
+                    return state
+                pilot["round_reactivation"] = {
+                    "required": True,
+                    "armed": False,
+                    "direction": direction,
+                    "reset_threshold_bps": str(reset_threshold),
+                    "reset_confirmation_count": 0,
+                    "required_reset_samples": REARM_CONFIRM_SAMPLES,
+                    "closed_at": pilot.get("completed_at") or closed.get("closed_at"),
+                    "last_sample_id": None,
+                    "migrated_from_legacy_state": True,
+                }
+                migrated = True
+            proof = state.get("last_account_reconciliation") or {}
+            position = state.get("open_position") or {}
+            try:
+                observed = datetime.fromisoformat(str(proof["observed_at"]).replace("Z", "+00:00"))
+                proof_age = (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds()
+                expected_var = Decimal(str(position.get("expected_var_qty", "0")))
+                expected_lighter = Decimal(str(position.get("expected_lighter_qty", "0")))
+                actual_var = Decimal(str(proof.get("variational_qty", "NaN")))
+                actual_lighter = Decimal(str(proof.get("lighter_qty", "NaN")))
+            except (KeyError, TypeError, ValueError, ArithmeticError):
+                return state
+            if (
+                observed.tzinfo is None or observed.utcoffset() is None
+                or proof.get("verified") is not True
+                or proof.get("runtime_pid") != runtime_pid
+                or proof.get("runtime_run_id") != runtime_run_id
+                or proof.get("market_id") != 145
+                or proof.get("active_order_count") != 0
+                or not -5 <= proof_age <= 15
+                or not actual_var.is_finite() or not actual_lighter.is_finite()
+                or actual_var != expected_var or actual_lighter != expected_lighter
+            ):
+                return state
+            changed = advance_pilot_reactivation(
+                pilot, row, thresholds_by_direction, activated_tiers,
+                verified_flat=(state.get("status") == "flat" and expected_var == 0 and expected_lighter == 0),
+            )
+            if changed or migrated:
+                self.save(state)
+            return state
 
 
 def _utc_now() -> str:
@@ -1720,6 +1863,15 @@ class WTIPairExecutor:
             result["last_layer_recovered_at"] = _utc_now()
         return result
 
+    def _capture_reporting(self, phase, state, pending):
+        observer = getattr(self, 'reporting_observer', None)
+        if observer is not None:
+            try:
+                observer.capture(phase, state, pending, self.gateway)
+            except Exception:
+                import logging
+                logging.getLogger('wti_live').exception('wti_reporting_capture_failed phase=%s', phase)
+
     def _archive_execution(
         self,
         state: dict[str, Any],
@@ -1728,6 +1880,8 @@ class WTIPairExecutor:
         *,
         recovered: bool = False,
     ) -> dict[str, Any]:
+        if outcome in {'filled', 'positions_flat_confirmed'}:
+            self._capture_reporting('after', state, pending)
         record = self._execution_record(pending, outcome, recovered=recovered)
         state.setdefault("execution_history", []).append(record)
         if pending.get("kind") == "open" and pending.get("gradient_pilot_id"):
@@ -1738,7 +1892,24 @@ class WTIPairExecutor:
                 item.get("tier") for item in opened if isinstance(item, dict)
             ]
             previous_position = pending.get("previous_position")
-            valid_tier = (
+            decision = pending.get("decision")
+            confirmed_signal_tier = bool(
+                isinstance(decision, dict)
+                and decision.get("action") in {"open", "add"}
+                and decision.get("confirmed_gradient_tier") == tier
+            )
+            manual_equity_gradient = bool(
+                isinstance(pilot, dict)
+                and (pilot.get("config") or {}).get("manual_continuous_equity")
+            )
+            valid_tier = (manual_equity_gradient or confirmed_signal_tier) and (
+                isinstance(tier, int) and not isinstance(tier, bool)
+                and 1 <= tier <= int(pilot.get("max_layers", 0))
+                and (
+                    previous_position is None and not prior_tiers
+                    or previous_position is not None and bool(prior_tiers)
+                )
+            ) or (
                 tier == 1 and not prior_tiers and previous_position is None
             ) or (
                 previous_position is not None
@@ -1752,6 +1923,11 @@ class WTIPairExecutor:
                 or pilot.get("status") != "entry_pending"
                 or not valid_tier
                 or tier > pilot.get("max_layers", 0)
+                or manual_equity_gradient and (
+                    pilot.get("pending_tier") != tier
+                    or pilot.get("pending_layer_id") != pending.get("layer_id")
+                    or pilot.get("pending_action_id") != pending.get("action_id")
+                )
             ):
                 raise CorruptExecutionState("gradient pilot layer does not match pending entry")
             if outcome == "filled":
@@ -1809,6 +1985,31 @@ class WTIPairExecutor:
         if not pilot_id:
             return
         pilot = state.get("gradient_pilot")
+        if not isinstance(pilot, dict) or pilot.get("pilot_id") != pilot_id:
+            raise CorruptExecutionState("gradient pilot identity mismatch on close")
+        remaining = state.get('open_position')
+        if isinstance(remaining, dict) and (pilot.get('config') or {}).get('manual_continuous_equity'):
+            closed_ids = {x['layer_id'] for x in position['layers']}
+            active_ids = {x['layer_id'] for x in pilot['layers_opened']}
+            retained_ids = {x['layer_id'] for x in remaining['layers']}
+            if (pilot.get('pilot_id') != pilot_id or closed_ids & retained_ids
+                    or closed_ids | retained_ids != active_ids):
+                raise CorruptExecutionState('partial gradient close identity mismatch')
+            pilot.setdefault('layers_closed', []).extend(deepcopy(position['layers']))
+            pilot['layers_opened'] = [x for x in pilot['layers_opened'] if x['layer_id'] in retained_ids]
+            tier_states = pilot.setdefault("tier_reactivation_by_direction", {}).setdefault(
+                str(position.get("direction")), {}
+            )
+            for tier in {item.get("tier") for item in position.get("layers", [])}:
+                if not isinstance(tier, int) or isinstance(tier, bool) or tier < 1:
+                    raise CorruptExecutionState("closed gradient layer tier is invalid")
+                tier_states[str(tier)] = {
+                    "armed": False,
+                    "reset_seen": False,
+                    "closed_at": execution["completed_at"],
+                }
+            pilot['status'] = 'in_position'
+            return
         layers = position.get("layers")
         opened_tiers = [item.get("tier") for item in layers or [] if isinstance(item, dict)]
         if (
@@ -1825,6 +2026,38 @@ class WTIPairExecutor:
         pilot["completed_roundtrips"] = 1
         pilot["exit_action_id"] = execution["action_id"]
         pilot["completed_at"] = execution["completed_at"]
+        if (pilot.get("config") or {}).get("manual_continuous_equity"):
+            direction = str(position.get("direction"))
+            tier_states = pilot.setdefault("tier_reactivation_by_direction", {}).setdefault(
+                direction, {}
+            )
+            for tier in set(opened_tiers):
+                tier_states[str(tier)] = {
+                    "armed": False,
+                    "reset_seen": False,
+                    "closed_at": execution["completed_at"],
+                }
+            decision = execution.get("decision") or {}
+            threshold = decision.get("reactivation_entry_threshold_bps")
+            if threshold is None:
+                values = (pilot.get("config") or {}).get("tier_thresholds_bps") or []
+                threshold = values[0] if values else None
+            try:
+                reset_threshold = Decimal(str(threshold)) - REARM_BUFFER_BPS
+            except Exception as exc:
+                raise CorruptExecutionState("gradient round reactivation threshold is missing") from exc
+            if not reset_threshold.is_finite():
+                raise CorruptExecutionState("gradient round reactivation threshold is invalid")
+            pilot["round_reactivation"] = {
+                "required": True,
+                "armed": False,
+                "direction": direction,
+                "reset_threshold_bps": str(reset_threshold),
+                "reset_confirmation_count": 0,
+                "required_reset_samples": REARM_CONFIRM_SAMPLES,
+                "closed_at": execution["completed_at"],
+                "last_sample_id": None,
+            }
         if pilot.get("continuous_rotation"):
             session = state.get("gradient_rotation_session")
             if (
@@ -1864,11 +2097,169 @@ class WTIPairExecutor:
         pilot["completed_at"] = execution["completed_at"]
 
     @staticmethod
+    def _execution_cost_evidence(
+        position: dict[str, Any],
+        *,
+        execution_history: Any,
+        exit_execution_id: Any,
+    ) -> dict[str, Any]:
+        """Attribute final-fill slippage and explicit USD fees without rebooking PnL."""
+        layers = position.get("layers")
+        entry_ids = [
+            str(layer.get("entry_execution_id"))
+            for layer in layers or []
+            if isinstance(layer, dict) and layer.get("entry_execution_id")
+        ]
+        if not entry_ids and position.get("entry_execution_id"):
+            entry_ids = [str(position["entry_execution_id"])]
+        action_ids = list(dict.fromkeys([*entry_ids, str(exit_execution_id or "")]))
+        action_ids = [value for value in action_ids if value]
+        actions: dict[str, dict[str, Any]] = {}
+        conflicting_action_ids: set[str] = set()
+        if isinstance(execution_history, list):
+            for item in execution_history:
+                if not isinstance(item, dict) or not item.get("action_id"):
+                    continue
+                action_id = str(item["action_id"])
+                existing = actions.get(action_id)
+                if existing is not None and existing != item:
+                    conflicting_action_ids.add(action_id)
+                else:
+                    actions[action_id] = item
+
+        multiplier = decimal_value(position.get("multiplier"))
+        if multiplier is None or multiplier <= 0:
+            multiplier = Decimal("1")
+        evidence: list[dict[str, Any]] = []
+        confirmed_fees: list[Decimal] = []
+        signed_slippages: list[Decimal] = []
+        expected_leg_count = len(action_ids) * 2
+        verified_fill_count = 0
+        verified_fee_count = 0
+        action_missing_count = 0
+
+        for action_id in action_ids:
+            action = actions.get(action_id)
+            if action is None or action_id in conflicting_action_ids:
+                action_missing_count += 1
+                continue
+            legs = action.get("legs")
+            legs = legs if isinstance(legs, dict) else {}
+            for venue in ("variational", "lighter"):
+                leg = legs.get(venue)
+                leg = leg if isinstance(leg, dict) else {}
+                request = leg.get("request")
+                result = leg.get("result")
+                request = request if isinstance(request, dict) else {}
+                result = result if isinstance(result, dict) else {}
+                side = str(request.get("side") or "").lower()
+                reference = decimal_value(request.get("reference_price"))
+                fill_price = decimal_value(result.get("average_price"))
+                requested_qty = decimal_value(request.get("qty"))
+                filled_qty = decimal_value(result.get("filled_qty"))
+                full_fill_verified = bool(
+                    result.get("classification") == "filled"
+                    and result.get("terminal_confirmed") is True
+                    and side in {"buy", "sell"}
+                    and reference is not None and reference > 0
+                    and fill_price is not None and fill_price > 0
+                    and requested_qty is not None and requested_qty > 0
+                    and filled_qty == requested_qty
+                )
+                row: dict[str, Any] = {
+                    "action_id": action_id,
+                    "kind": action.get("kind"),
+                    "venue": venue,
+                    "side": side or None,
+                    "reference_price": None if reference is None else str(reference),
+                    "fill_price": None if fill_price is None else str(fill_price),
+                    "requested_qty": None if requested_qty is None else str(requested_qty),
+                    "filled_qty": None if filled_qty is None else str(filled_qty),
+                    "fill_verified": full_fill_verified,
+                }
+                if full_fill_verified:
+                    adverse_price = (
+                        fill_price - reference if side == "buy"
+                        else reference - fill_price
+                    )
+                    venue_multiplier = multiplier if venue == "lighter" else Decimal("1")
+                    signed_slippage = adverse_price * filled_qty * venue_multiplier
+                    row["signed_slippage_bps"] = str(
+                        adverse_price / reference * Decimal("10000")
+                    )
+                    row["signed_slippage_usd"] = str(signed_slippage)
+                    signed_slippages.append(signed_slippage)
+                    verified_fill_count += 1
+                else:
+                    row["signed_slippage_bps"] = None
+                    row["signed_slippage_usd"] = None
+
+                fee = decimal_value(result.get("fee_usd"))
+                fee_verified = result.get("fee_confirmed") is True and fee is not None
+                row["fee_usd"] = str(fee) if fee_verified else None
+                row["fee_verified"] = fee_verified
+                if fee_verified:
+                    confirmed_fees.append(fee)
+                    verified_fee_count += 1
+                evidence.append(row)
+
+        all_fills_verified = (
+            expected_leg_count > 0
+            and verified_fill_count == expected_leg_count
+            and action_missing_count == 0
+            and not conflicting_action_ids.intersection(action_ids)
+        )
+        all_fees_verified = (
+            expected_leg_count > 0
+            and verified_fee_count == expected_leg_count
+            and verified_fill_count == expected_leg_count
+            and action_missing_count == 0
+            and not conflicting_action_ids.intersection(action_ids)
+        )
+        var_entry = decimal_value(position.get("var_entry_price"))
+        lighter_entry = decimal_value(position.get("lighter_entry_price"))
+        var_qty = decimal_value(position.get("var_qty"))
+        lighter_qty = decimal_value(position.get("lighter_qty"))
+        paired_notional = None
+        if None not in (var_entry, lighter_entry, var_qty, lighter_qty):
+            paired_notional = (
+                var_entry * var_qty + lighter_entry * lighter_qty * multiplier
+            ) / Decimal("2")
+            if paired_notional <= 0:
+                paired_notional = None
+        slippage_total = sum(signed_slippages, Decimal("0"))
+        fees_partial = sum(confirmed_fees, Decimal("0"))
+        return {
+            "method": "final_fill_vs_dispatch_reference_v1",
+            "slippage_is_already_in_final_fill_gross_pnl": True,
+            "do_not_subtract_slippage_again": True,
+            "expected_filled_leg_count": expected_leg_count,
+            "verified_filled_leg_count": verified_fill_count,
+            "all_fills_verified": all_fills_verified,
+            "action_record_missing_count": action_missing_count,
+            "conflicting_action_ids": sorted(conflicting_action_ids.intersection(action_ids)),
+            "legs": evidence,
+            "signed_slippage_usd": str(slippage_total) if all_fills_verified else None,
+            "signed_slippage_bps_of_entry_paired_notional": (
+                str(slippage_total / paired_notional * Decimal("10000"))
+                if all_fills_verified and paired_notional is not None else None
+            ),
+            "verified_fee_leg_count": verified_fee_count,
+            "all_fees_verified_usd": all_fees_verified,
+            "confirmed_fee_usd_partial": format(fees_partial.normalize(), "f"),
+            "actual_fees_usd": (
+                format(fees_partial.normalize(), "f") if all_fees_verified else None
+            ),
+        }
+
+    @staticmethod
     def _closed_pnl_evidence(
         position: dict[str, Any],
         *,
         var_exit: dict[str, Any],
         lighter_exit: dict[str, Any],
+        execution_history: Any = None,
+        exit_execution_id: Any = None,
     ) -> dict[str, Any]:
         var_entry = decimal_value(position.get("var_entry_price"))
         lighter_entry = decimal_value(position.get("lighter_entry_price"))
@@ -1977,6 +2368,19 @@ class WTIPairExecutor:
             "funding_unverified"
             if output["actual_gross_pnl_usd"] is not None and all_fees_confirmed
             else "fees_unverified"
+        )
+        output["pnl_after_confirmed_trading_fees_before_funding_usd"] = (
+            format(
+                (decimal_value(output["actual_gross_pnl_usd"]) - decimal_value(output["actual_fees_usd"])).normalize(),
+                "f",
+            )
+            if output["actual_gross_pnl_usd"] is not None
+            and output["actual_fees_usd"] is not None else None
+        )
+        output["execution_cost_evidence"] = WTIPairExecutor._execution_cost_evidence(
+            position,
+            execution_history=execution_history,
+            exit_execution_id=exit_execution_id,
         )
         return output
 
@@ -2188,11 +2592,23 @@ class WTIPairExecutor:
                     item.get("tier") for item in opened_layers if isinstance(item, dict)
                 ]
                 valid_tier = (
-                    gradient_tier == 1 and not opened_layers and previous_position is None
+                    previous_position is None
+                    and not opened_layers
+                    and state.get("status") == "flat"
+                    and 1 <= gradient_tier <= (gradient_pilot.get("max_layers", 0) if isinstance(gradient_pilot, dict) else 0)
                 ) or (
                     previous_position is not None
                     and opened_tiers
-                    and gradient_tier in {max(opened_tiers), max(opened_tiers) + 1}
+                    and 1 <= gradient_tier <= (gradient_pilot.get("max_layers", 0) if isinstance(gradient_pilot, dict) else 0)
+                )
+                direction_tiers = (
+                    ((gradient_pilot or {}).get("tier_reactivation_by_direction") or {})
+                    .get(str(direction), {})
+                ) if isinstance(gradient_pilot, dict) else {}
+                tier_state = direction_tiers.get(str(gradient_tier), {})
+                round_reactivation = (
+                    gradient_pilot.get("round_reactivation") or {}
+                    if isinstance(gradient_pilot, dict) else {}
                 )
                 if (
                     not isinstance(gradient_pilot, dict)
@@ -2203,10 +2619,13 @@ class WTIPairExecutor:
                     or gradient_pilot.get("completed_roundtrips") != 0
                     or gradient_pilot.get("max_layers", 0) < gradient_tier
                     or not valid_tier
+                    or tier_state.get("armed", True) is not True
+                    or (round_reactivation.get("required") is True
+                        and round_reactivation.get("armed") is not True)
                     or gradient_tier in gradient_pilot.get("exhausted_tiers", [])
                     or (
                         previous_position is None
-                        and (gradient_tier != 1 or opened_layers or state.get("status") != "flat")
+                        and (opened_layers or state.get("status") != "flat")
                     )
                     or (
                         previous_position is not None
@@ -2390,6 +2809,7 @@ class WTIPairExecutor:
                     )
                 except WTIExecutionError as exc:
                     return self._manual_review(state, str(exc))
+            self._capture_reporting('before', state, state['pending_action'])
             var_result = self._submit_leg(
                 state, context=first_context, venue="variational", side=var_side,
                 qty=var_qty, reduce_only=False, session=session, opening=True,
@@ -2559,6 +2979,7 @@ class WTIPairExecutor:
         decision: dict[str, Any] | None = None,
         exit_target_bps: Decimal | None = None,
         roundtrip_cost_bps: Decimal | None = None,
+        exit_cost_reader: Callable[[dict[str, Any]], Decimal] | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         operation_now = now or self._now()
@@ -2575,6 +2996,12 @@ class WTIPairExecutor:
             position = state.get("open_position")
             if state["status"] != "open" or not isinstance(position, dict) or state.get("pending_action"):
                 raise WTIExecutionError("no_reconciled_open_wti_position")
+            full_position = position
+            remaining_position = None
+            if isinstance(decision, dict) and decision.get('close_layer_ids'):
+                if not ((state.get('gradient_pilot') or {}).get('config') or {}).get('manual_continuous_equity'):
+                    raise WTIExecutionError('partial_close_requires_continuous_gradient')
+                position, remaining_position = split_close(position, decision['close_layer_ids'])
             if (
                 int(position.get("market_id", -1)) != context.market_id
                 or decimal_value(position.get("multiplier")) != context.multiplier
@@ -2608,6 +3035,10 @@ class WTIPairExecutor:
                 and exit_target_bps is not None
                 and roundtrip_cost_bps is not None
             ):
+                if exit_cost_reader is not None:
+                    roundtrip_cost_bps = exit_cost_reader(state)
+                    if not roundtrip_cost_bps.is_finite() or roundtrip_cost_bps < 0:
+                        raise WTIExecutionError("profit_exit_cost_unverified")
                 refreshed_net_bps = self._estimated_close_net_bps(
                     position, context, roundtrip_cost_bps
                 )
@@ -2618,6 +3049,7 @@ class WTIPairExecutor:
                         None if refreshed_net_bps is None else str(refreshed_net_bps)
                     ),
                     "exit_target_bps": str(exit_target_bps),
+                    "applied_exit_cost_bps": str(roundtrip_cost_bps),
                     "decision": close_decision,
                 }
                 if refreshed_net_bps is None or refreshed_net_bps < exit_target_bps:
@@ -2629,8 +3061,8 @@ class WTIPairExecutor:
             self.store.save(state)
             before = self._read(context, phase="exit_preflight")
             expected_open = (
-                Decimal(str(position["expected_var_qty"])),
-                Decimal(str(position["expected_lighter_qty"])),
+                Decimal(str(full_position["expected_var_qty"])),
+                Decimal(str(full_position["expected_lighter_qty"])),
             )
             if not _matches(before, expected_open, context):
                 return self._manual_review(state, "pre_close_exchange_position_mismatch")
@@ -2645,14 +3077,16 @@ class WTIPairExecutor:
                 "action_id": action_id,
                 "kind": "close",
                 "direction": direction,
-                "expected_var_qty": "0",
-                "expected_lighter_qty": "0",
+                "expected_var_qty": (remaining_position or {}).get('expected_var_qty', '0'),
+                "expected_lighter_qty": (remaining_position or {}).get('expected_lighter_qty', '0'),
                 "var_qty": str(position["var_qty"]),
                 "lighter_qty": str(position["lighter_qty"]),
                 "multiplier": str(context.multiplier),
                 "market_id": context.market_id,
                 "session_id": session_id,
-                "previous_position": position,
+                "previous_position": full_position,
+                "close_position": position,
+                "remaining_position": remaining_position,
                 "gradient_pilot_id": position.get("gradient_pilot_id"),
                 "intent_at": self._now().isoformat(),
                 "decision": close_decision,
@@ -2662,6 +3096,7 @@ class WTIPairExecutor:
             self.store.save(state)
 
             first_context = context
+            self._capture_reporting('before', state, state['pending_action'])
             var_result = self._submit_leg(
                 state, context=first_context, venue="variational", side=var_close_side,
                 qty=Decimal(str(position["var_qty"])), reduce_only=True,
@@ -2691,28 +3126,10 @@ class WTIPairExecutor:
                 )
             except WTIExecutionError:
                 return self._manual_review(state, "post_close_account_snapshot_unavailable")
-            if not _matches(actual, (Decimal("0"), Decimal("0")), context):
+            expected_after = tuple(Decimal(state['pending_action'][k]) for k in ('expected_var_qty', 'expected_lighter_qty'))
+            if not _matches(actual, expected_after, context):
                 return self._manual_review(state, "post_close_exchange_position_mismatch")
-            execution = self._archive_execution(state, state["pending_action"], "filled")
-            state["status"] = "flat"
-            state["open_position"] = None
-            state["pending_action"] = None
-            state["manual_review_reason"] = None
-            state["last_closed_position"] = {
-                **position,
-                "exit_reason": execution.get("exit_reason"),
-                "exit_decision": execution.get("decision"),
-                "exit_check": execution.get("close_check"),
-                **self._closed_pnl_evidence(
-                    position, var_exit=var_result, lighter_exit=lighter_result
-                ),
-                "closed_at": _utc_now(),
-                "exit_execution_id": execution["action_id"],
-            }
-            self._complete_single_round_pilot(state, position, execution)
-            self._complete_gradient_pilot(state, position, execution)
-            self.store.save(state)
-            return state
+            return self._finalize_reconciled_close(state, state['pending_action'], recovered=False)
 
     def _resume_pending_open_missing_lighter(
         self,
@@ -2881,37 +3298,102 @@ class WTIPairExecutor:
         self,
         state: dict[str, Any],
         pending: dict[str, Any],
+        *, recovered: bool = True,
     ) -> dict[str, Any]:
-        position = pending.get("previous_position") or {}
+        position = pending.get("close_position") or pending.get("previous_position") or {}
         legs = pending.get("legs") or {}
         var_result = (legs.get("variational") or {}).get("result") or {}
         lighter_result = (legs.get("lighter") or {}).get("result") or {}
         var_exit = var_result if var_result.get("classification") == "filled" else {}
         lighter_exit = lighter_result if lighter_result.get("classification") == "filled" else {}
         execution = self._archive_execution(
-            state, pending, "positions_flat_confirmed", recovered=True
+            state, pending, "positions_flat_confirmed" if recovered and not pending.get('remaining_position') else "filled", recovered=recovered
         )
-        state["status"] = "flat"
-        state["open_position"] = None
+        remaining = pending.get('remaining_position')
+        state["status"] = "open" if remaining else "flat"
+        state["open_position"] = deepcopy(remaining)
         state["pending_action"] = None
         state["manual_review_reason"] = None
         state["last_action_resolution"] = "close_confirmed_flat_by_account_snapshot"
+        if remaining:
+            state['last_action_resolution'] = 'partial_close_confirmed_remaining_by_account_snapshot'
         state["last_closed_position"] = {
             **position,
             "exit_reason": (pending.get("decision") or {}).get("reason"),
             "exit_decision": deepcopy(pending.get("decision")),
             "exit_check": deepcopy(pending.get("close_check")),
             **self._closed_pnl_evidence(
-                position, var_exit=var_exit, lighter_exit=lighter_exit
+                position, var_exit=var_exit, lighter_exit=lighter_exit,
+                execution_history=state.get("execution_history"),
+                exit_execution_id=execution["action_id"],
             ),
             "closed_at": _utc_now(),
-            "recovered_from_pending": True,
+            **({'recovered_from_pending': True} if recovered else {}),
             "exit_execution_id": execution["action_id"],
         }
         self._complete_single_round_pilot(state, position, execution)
         self._complete_gradient_pilot(state, position, execution)
         self.store.save(state)
         return state
+
+    def _resume_partial_close(self, state, pending, *, context, actual, sample, session):
+        if pending.get('kind') != 'close' or not pending.get('remaining_position'):
+            return None
+        previous = pending['previous_position']
+        selected, remaining = split_close(previous, [x['layer_id'] for x in pending['close_position']['layers']])
+        if selected != pending['close_position'] or remaining != pending['remaining_position']:
+            return self._manual_review(state, 'partial_close_identity_mismatch')
+        expected = tuple(Decimal(remaining[k]) for k in ('expected_var_qty', 'expected_lighter_qty'))
+        if expected != tuple(Decimal(pending[k]) for k in ('expected_var_qty','expected_lighter_qty')):
+            return self._manual_review(state, 'partial_close_target_mismatch')
+        legs = pending.get('legs') or {}
+        for venue,leg in legs.items():
+            if venue not in {'variational','lighter'}:
+                return self._manual_review(state,'partial_close_leg_identity_mismatch')
+            request=leg.get('request') or {}; fill=leg.get('result') or {}
+            qty=Decimal(selected['var_qty' if venue=='variational' else 'lighter_qty'])
+            expected_side=('sell' if previous['direction']=='long_var_short_lighter' else 'buy')
+            if venue=='lighter': expected_side='buy' if expected_side=='sell' else 'sell'
+            if (request.get('venue')!=venue or request.get('side')!=expected_side
+                    or request.get('reduce_only') is not True or decimal_value(request.get('qty'))!=qty
+                    or request.get('client_order_id')!=pending['action_id']+'-'+venue
+                    or (fill.get('classification')=='filled' and decimal_value(fill.get('filled_qty'))!=qty)):
+                return self._manual_review(state,'partial_close_leg_identity_mismatch')
+        if _matches(actual, expected, context) and self._all_expected_fills(pending):
+            return self._finalize_reconciled_close(state, pending)
+        if self._all_known_no_fill(pending):
+            return None
+        var_fill = (legs.get('variational') or {}).get('result') or {}
+        if (actual.active_order_count != 0 or var_fill.get('classification') != 'filled'
+                or var_fill.get('terminal_confirmed') is not True
+                or decimal_value(var_fill.get('filled_qty')) != Decimal(selected['var_qty'])):
+            return self._manual_review(state, 'partial_close_terminal_status_unconfirmed')
+        lighter = legs.get('lighter') or {}
+        if lighter.get('submission_started') is True:
+            return self._manual_review(state, 'partial_close_submitted_lighter_status_unconfirmed')
+        # A persisted but unsent leg may be resumed; any submitted identity is never retried.
+        if lighter and (lighter.get('submission_started') is not False or lighter.get('result', {}).get('source') != 'local_pre_submit_guard'):
+            return self._manual_review(state, 'partial_close_missing_leg_identity_unconfirmed')
+        half = (expected[0], Decimal(previous['expected_lighter_qty']))
+        if (not _matches(actual, half, context) or _session_matches_sample(sample,session) != pending['session_id']
+                or not _session_allows(session, opening=False, now=self._now())):
+            return self._manual_review(state, 'partial_close_missing_leg_account_or_session_mismatch')
+        try:
+            fresh = self._fresh_context(context, var_qty=Decimal(selected['var_qty']), lighter_qty=Decimal(selected['lighter_qty']))
+        except WTIExecutionError as exc:
+            return self._manual_review(state,'pending_partial_close_missing_lighter_'+str(exc))
+        result = self._submit_leg(state, context=fresh, venue='lighter',
+                                  side='buy' if Decimal(previous['expected_lighter_qty']) < 0 else 'sell',
+                                  qty=Decimal(selected['lighter_qty']), reduce_only=True, session=session, opening=False)
+        if result.get('classification') != 'filled':
+            return self._manual_review(state, 'partial_close_lighter_terminal_status_unconfirmed')
+        try:
+            after = self._read(context, minimum_observed_at=self._latest_order_time(pending))
+        except WTIExecutionError:
+            return self._manual_review(state,'partial_close_post_account_snapshot_unavailable')
+        if not _matches(after, expected, context):
+            return self._manual_review(state, 'partial_close_post_account_mismatch')
+        return self._finalize_reconciled_close(state,pending)
 
     def _resume_pending_close_missing_lighter(
         self,
@@ -3155,6 +3637,10 @@ class WTIPairExecutor:
             if actual.active_order_count != 0:
                 return self._manual_review(state, "active_wti_orders_require_reconciliation")
             if isinstance(pending, dict):
+                partial = self._resume_partial_close(state, pending, context=context, actual=actual,
+                                                     sample=sample, session=session)
+                if partial is not None:
+                    return partial
                 resumed_close = self._resume_pending_close_missing_lighter(
                     state,
                     pending,
@@ -3230,6 +3716,8 @@ class WTIPairExecutor:
                             pending.get("previous_position") or {},
                             var_exit=(legs.get("variational") or {}).get("result") or {},
                             lighter_exit=(legs.get("lighter") or {}).get("result") or {},
+                            execution_history=state.get("execution_history"),
+                            exit_execution_id=execution["action_id"],
                         ),
                         "closed_at": _utc_now(),
                         "recovered_from_pending": True,

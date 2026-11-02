@@ -9,8 +9,10 @@ from typing import Any, Mapping, Sequence
 
 from tools.lib.hedge_instruments import WTI_HEDGE, paired_realized_pnl
 from tools.lib.gradient_entry_confirmation import update_gradient_entry_confirmation
+from tools.lib.gradient_lifecycle import DIRECTIONS, raw_gradient_tier, tier_is_armed
 from tools.lib.market_sessions import session_observation_for_sample
 from tools.lib.wti_sizing import size_paired_layer
+from tools.lib.wti_continuous import position_subset
 from tools.lib.wti_replay import ReplayConfig, _decimal
 
 
@@ -161,8 +163,10 @@ def decide_wti_gradient_action(
     thresholds_by_direction: Mapping[str, Sequence[Decimal | None]] | None = None,
     aggregate_capacity_by_tier_usd: Sequence[Decimal] | None = None,
     elastic_capacity_enabled: bool | None = None,
+    exit_cost_by_tier: Mapping[int, Decimal] | None = None,
+    confirmed_tiers_by_direction: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
-    """Apply strictly increasing, same-direction tiers within a durable pilot."""
+    """Apply ETH-aligned signal tiers with WTI's existing equity and execution guards."""
     decision = decide_wti_action(row, position, config=config, now=now)
     pilot_id = pilot.get("pilot_id")
     tiers = pilot.get("config", {}).get("tier_thresholds_bps")
@@ -184,6 +188,29 @@ def decide_wti_gradient_action(
         or not layer_notional.is_finite() or layer_notional <= 0
     ):
         return {"action": "hold", "reason": "gradient_pilot_configuration_invalid"}
+    if position and pilot.get('config', {}).get('manual_continuous_equity'):
+        # Risk/session/time exits always drain everything; profit exits are tier-local.
+        if decision.get('reason') in {'wti_market_sample_or_session_unverified','wti_open_position_metadata_invalid','wti_exit_quote_unavailable'}:
+            return decision
+        sample_at = datetime.fromisoformat(row['logged_at'].replace('Z','+00:00'))
+        session = session_observation_for_sample(row)
+        if (sample_at-datetime.fromisoformat(position['opened_at'])).total_seconds() >= config.max_hold_seconds:
+            return {'action':'close','reason':'max_hold'}
+        if session and (session.closing_at-sample_at).total_seconds() <= config.entry_cutoff_seconds:
+            return {'action':'close','reason':'session_entry_cutoff'}
+        if decision.get('reason') in {'max_hold','session_entry_cutoff','session_boundary','entry_session_unverified'}:
+            return decision
+        groups = {}
+        for layer in position.get('layers') or []:
+            groups.setdefault(layer['tier'], []).append(layer['layer_id'])
+        for tier in sorted(groups, reverse=True):
+            group = position_subset(position, groups[tier])
+            group_config = replace(config, roundtrip_cost_bps=exit_cost_by_tier[tier]) if exit_cost_by_tier else config
+            group_decision = decide_wti_action(row, group, config=group_config, now=now)
+            if group_decision.get('action') == 'close':
+                return {**group_decision, 'close_layer_ids':groups[tier], 'exit_gradient_tier':tier}
+        if decision.get('action') == 'close':
+            decision = {'action':'hold','reason':'exit_target_not_reached'}
     if decision.get("action") == "close":
         return decision
 
@@ -233,45 +260,87 @@ def decide_wti_gradient_action(
         except (TypeError, ValueError, ArithmeticError):
             return {"action": "hold", "reason": "gradient_equity_capacity_unavailable"}
 
+    def signal_tier(direction: str, edge: Decimal | None) -> tuple[int, int, int]:
+        direction_thresholds = (
+            effective_thresholds.get(direction)
+            if effective_thresholds is not None else thresholds
+        )
+        if direction_thresholds is None:
+            return 0, 0, 0
+        raw_tier = raw_gradient_tier(edge, direction_thresholds)
+        activation_tier = (
+            raw_tier if confirmed_tiers_by_direction is None
+            else min(raw_tier, int(confirmed_tiers_by_direction.get(direction, 0)))
+        )
+        for candidate in range(activation_tier, 0, -1):
+            if tier_is_armed(pilot, direction, candidate):
+                return candidate, raw_tier, activation_tier
+        return 0, raw_tier, activation_tier
+
     if position is None:
         if pilot.get("status") != "available":
-            return decision
+            reactivation = pilot.get("round_reactivation") or {}
+            if (
+                pilot.get("status") == "completed"
+                and pilot.get("config", {}).get("manual_continuous_equity")
+                and reactivation.get("required") is True
+                and reactivation.get("armed") is not True
+            ):
+                return {
+                    "action": "hold",
+                    "reason": "gradient_round_rearm_waiting_for_reset",
+                }
+            return {"action": "hold", "reason": "gradient_pilot_entry_budget_unavailable"}
         if pilot.get("layers_opened") or pilot.get("completed_roundtrips") != 0:
             return {"action": "hold", "reason": "gradient_pilot_entry_budget_unavailable"}
+        edges = {
+            direction: _decimal(row.get(
+                "long_edge_bps" if direction == DIRECTIONS[0] else "short_edge_bps"
+            ))
+            for direction in DIRECTIONS
+        }
+        qualified = []
+        saw_floor_crossing = False
+        saw_unconfirmed = False
+        saw_disarmed = False
+        for direction, edge in edges.items():
+            active = effective_thresholds.get(direction) if effective_thresholds is not None else thresholds
+            if edge is None or active is None or not active or active[0] is None or edge < active[0]:
+                continue
+            saw_floor_crossing = True
+            tier, raw_tier, activation_tier = signal_tier(direction, edge)
+            if tier:
+                qualified.append((direction, edge, tier, raw_tier, activation_tier))
+            elif activation_tier <= 0:
+                saw_unconfirmed = True
+            else:
+                saw_disarmed = True
+        if not qualified:
+            reason = (
+                "gradient_tier_rearm_required" if saw_disarmed
+                else "gradient_entry_confirmation_pending" if saw_floor_crossing and saw_unconfirmed
+                else "gradient_entry_below_adaptive_threshold" if effective_thresholds is not None
+                else decision.get("reason", "entry_edge_below_threshold")
+            )
+            return {
+                "action": "hold", "reason": reason,
+                **({"effective_tier_thresholds_bps": {
+                    direction: [None if value is None else str(value) for value in values]
+                    for direction, values in effective_thresholds.items()
+                }} if effective_thresholds is not None else {}),
+            }
+        direction, edge, tier, raw_tier, activation_tier = max(qualified, key=lambda item: item[1])
         first_capacity = (
-            tier_capacities[0] if tier_capacities is not None
+            tier_capacities[tier - 1] if tier_capacities is not None
             else Decimal(str(pilot.get("config", {}).get("max_notional_usd", "0")))
         )
         if first_capacity <= 0:
             return {"action": "hold", "reason": "gradient_equity_capacity_unavailable"}
-        if effective_thresholds is not None:
-            edges = {
-                "long_var_short_lighter": _decimal(row.get("long_edge_bps")),
-                "short_var_long_lighter": _decimal(row.get("short_edge_bps")),
-            }
-            qualified = [
-                (direction, edge)
-                for direction, edge in edges.items()
-                if edge is not None and edge >= effective_thresholds[direction][0]
-            ]
-            if not qualified:
-                return {
-                    "action": "hold",
-                    "reason": "gradient_entry_below_adaptive_threshold",
-                    "effective_tier_thresholds_bps": {
-                        direction: [None if value is None else str(value) for value in values]
-                        for direction, values in effective_thresholds.items()
-                    },
-                }
-            direction, edge = max(qualified, key=lambda item: item[1])
-            decision = {
-                "action": "open", "direction": direction, "edge_bps": str(edge),
-            }
-        elif decision.get("action") != "open":
-            return decision
         return {
-            **decision,
-            "gradient_tier": 1,
+            "action": "open", "direction": direction, "edge_bps": str(edge),
+            "gradient_tier": tier,
+            "raw_gradient_tier": raw_tier,
+            "confirmed_gradient_tier": activation_tier,
             "layer_notional_usd": str(layer_notional),
             **({"aggregate_max_notional_usd": str(first_capacity)} if tier_capacities is not None else {}),
             **({
@@ -298,10 +367,8 @@ def decide_wti_gradient_action(
         len(opened_tiers) != len(layers)
         or any(not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= len(thresholds)
                for value in opened_tiers)
-        or any(left > right for left, right in zip(opened_tiers, opened_tiers[1:]))
     ):
         return {"action": "hold", "reason": "gradient_pilot_state_invalid"}
-    active_tier = max(opened_tiers)
     direction = position.get("direction")
     edge_field = (
         "long_edge_bps" if direction == "long_var_short_lighter"
@@ -316,6 +383,11 @@ def decide_wti_gradient_action(
         return {"action": "hold", "reason": "gradient_threshold_profile_invalid"}
     if edge is None:
         return decision
+    tier, raw_tier, activation_tier = signal_tier(str(direction), edge)
+    if tier <= 0:
+        if activation_tier > 0:
+            return {"action": "hold", "reason": "gradient_tier_rearm_required"}
+        return {"action": "hold", "reason": "gradient_entry_confirmation_pending"}
     elastic_enabled = (
         bool(pilot.get("config", {}).get("elastic_capacity_enabled", False))
         if elastic_capacity_enabled is None else bool(elastic_capacity_enabled)
@@ -323,13 +395,14 @@ def decide_wti_gradient_action(
     elastic_capacity_addon = False
     aggregate_cap_override: Decimal | None = None
     if tier_capacities is None:
-        # Legacy pilots have one immutable child per tier; their restart
-        # behavior is preserved while the live five-tier pilot uses equity slots.
-        tier = len(layers) + 1
+        if len(layers) >= pilot.get("max_layers", 0):
+            return {"action": "hold", "reason": "gradient_pilot_layer_budget_unavailable"}
+        # Legacy bounded pilots preserve their one-child-per-tier contract;
+        # live equity-capacity gradients use the signal tier directly below.
+        tier = max(tier, max(opened_tiers) + 1)
         if tier > len(thresholds) or tier > pilot.get("max_layers", 0):
             return decision
     else:
-        tier = active_tier
         current_cap = tier_capacities[tier - 1]
         multiplier_for_mark = _decimal(position.get("multiplier"))
         var_qty_for_mark = _decimal(position.get("var_qty"))
@@ -345,10 +418,8 @@ def decide_wti_gradient_action(
             var_qty_for_mark * var_mark_for_cap,
             lighter_qty_for_mark * lighter_mark_for_cap * multiplier_for_mark,
         )
-        # Graduate when another standard child would consume or exceed the
-        # current tier's remaining allowance. Waiting for an exact cap touch can
-        # deadlock on exchange quantity steps and slippage padding.
-        if current_notional + layer_notional >= current_cap:
+        # Tier follows the confirmed signal; capacity can never promote it.
+        if current_notional + layer_notional > current_cap:
             elastic_already_used = any(
                 isinstance(item, dict) and item.get("elastic_capacity_addon") is True
                 for item in layers
@@ -367,8 +438,6 @@ def decide_wti_gradient_action(
                 elastic_capacity_addon = True
                 aggregate_cap_override = tier_capacities[1]
             else:
-                tier += 1
-            if tier > len(thresholds) or tier > pilot.get("max_layers", 0):
                 return {"action": "hold", "reason": "gradient_equity_position_cap_reached"}
     if tier in pilot.get("exhausted_tiers", []):
         return decision
@@ -455,6 +524,8 @@ def decide_wti_gradient_action(
         "edge_bps": str(edge),
         "reason": "gradient_tier_threshold_reached",
         "gradient_tier": tier,
+        "raw_gradient_tier": raw_tier,
+        "confirmed_gradient_tier": activation_tier,
         "layer_notional_usd": str(layer_notional),
         **({"elastic_capacity_addon": True} if elastic_capacity_addon else {}),
         "minimum_entry_edge_bps": str(tier_threshold),
