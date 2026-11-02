@@ -23140,6 +23140,31 @@ class VariationalToLighterRuntime:
                 and sum(1 for value in confirmations if value)
                 >= LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES
             )
+            if self.should_log_live_inventory_exit_blocked(
+                lot_id="portfolio",
+                reason="v4_portfolio_exit_probe",
+            ):
+                await self.append_live_inventory_log(
+                    "live_inventory_v4_portfolio_exit_probe",
+                    {
+                        **state_payload,
+                        "reason": "v4_portfolio_exit_probe",
+                        "aggregate_executable_pnl_bps": decimal_to_str(
+                            portfolio_pnl_bps
+                        ),
+                        "portfolio_target_bps": decimal_to_str(portfolio_target_bps),
+                        "portfolio_ready": bool(portfolio_context.get("ready")),
+                        "portfolio_ready_reason": portfolio_context.get("reason"),
+                        "portfolio_eligible": portfolio_eligible,
+                        "confirmation_count": sum(1 for value in confirmations if value),
+                        "portfolio_qty": decimal_to_str(portfolio_qty),
+                        "portfolio_lot_count": len(self.live_inventory_open_lots),
+                        "portfolio_exit_lighter_price": (
+                            (portfolio_context.get("exit_lighter_depth") or {})
+                            .get("estimated_fill_price")
+                        ),
+                    },
+                )
             if portfolio_confirmed:
                 self.live_inventory_v4_portfolio_exit_lot_ids = set(
                     portfolio_context.get("lot_ids") or []
