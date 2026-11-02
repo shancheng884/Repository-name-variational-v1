@@ -452,10 +452,13 @@ path.
 
 # Live process supervision (no tmux)
 
-The ETH strategy and the WTI collector are systemd units, not tmux panes:
+The ETH strategy, the WTI collector and the two read-only observers
+(`wti-decision-observer`, `var-lighter-exit-latency-watch`) are systemd
+units, not tmux panes:
 
 ```bash
-sudo systemctl status  var-lighter-eth-live.service var-lighter-wti-collector.service
+sudo systemctl status var-lighter-eth-live.service var-lighter-wti-collector.service \
+    wti-decision-observer.service var-lighter-exit-latency-watch.service
 sudo journalctl -u var-lighter-eth-live.service -f
 sudo systemctl restart var-lighter-eth-live.service      # restarts with --resume-open-position
 ```
