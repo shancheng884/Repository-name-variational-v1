@@ -24434,6 +24434,12 @@ class VariationalToLighterRuntime:
                     and not should_account_risk_exit
                     and self.live_inventory_basis_refresh_exit_quote_before_submit
                     and not reuse_current_quote
+                    # A locked batch exit was already authorised on the
+                    # aggregate quote. Asking for another refresh would spend
+                    # the shared 1/min request budget once per lot, so a
+                    # thirteen-lot cohort could never drain. The order's own
+                    # preflight still enforces the threshold.
+                    and not portfolio_exit_selected
                 ):
                     refresh_context = (
                         await self.live_inventory_basis_refreshed_exit_context(
