@@ -1,0 +1,15 @@
+[Unit]
+Description=Lighter funding ledger snapshot (read only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
+EnvironmentFile=-/home/ubuntu/Repository-name-variational-v1/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/funding_ledger.py --lookback-hours 48
+Nice=10
+NoNewPrivileges=true

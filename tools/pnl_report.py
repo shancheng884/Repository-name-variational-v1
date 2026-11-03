@@ -23,6 +23,7 @@ from tools.lib.telegram_notifier import (  # noqa: E402
     TelegramNotifier,
     format_telegram_trade_message,
 )
+from tools.lib.funding_ledger import daily_funding_usd  # noqa: E402
 from tools.lib.metrics_store import (  # noqa: E402
     ACTIVE_NAME,
     dedupe,
@@ -44,6 +45,7 @@ ORDER_METRICS = ROOT / "log" / "order_metrics.jsonl"
 LIVE_INVENTORY_STATE = ROOT / "log" / "live_inventory_state.json"
 PNL_BASELINE = ROOT / "log" / PNL_BASELINE_FILE_NAME
 DAILY_PNL_SEND_STATE = ROOT / "log" / "pnl_daily_telegram_state.json"
+FUNDING_LEDGER = ROOT / "log" / "funding_ledger.jsonl"
 RELEVANT_EVENTS = {
     "live_inventory_run_config",
     "live_inventory_actual_pnl",
@@ -373,6 +375,13 @@ def latest_pnl_telegram_payload(
     )
     run_funding_income = total_funding_income(run_cycles)
     day_funding_income = total_funding_income(day_cycles)
+    ledger_day_funding = Decimal("0")
+    if day_funding_income == 0 and reporting_day:
+        # Lighter publishes per-position funding payments; Variational has no
+        # funding endpoint through the browser bridge, so only that side is
+        # counted here and the payload says so.
+        ledger_day_funding = daily_funding_usd(FUNDING_LEDGER, reporting_day)
+        day_funding_income = ledger_day_funding
     run_net_income = run_actual_pnl + run_funding_income
     day_net_income = day_actual_pnl + day_funding_income
     cycle_actual_pnl = to_decimal(cycle.get("actual_pnl_usd"))
@@ -502,6 +511,10 @@ def latest_pnl_telegram_payload(
         "beijing_day_funding_income_usd": decimal_text(day_funding_income),
         "beijing_day_net_income_usd": decimal_text(day_net_income),
         "funding_income_usd": decimal_text(run_funding_income),
+        "funding_ledger_day_usd": decimal_text(ledger_day_funding),
+        "funding_source": (
+            "lighter_ledger" if ledger_day_funding else "none_recorded"
+        ),
         "net_income_usd": decimal_text(run_net_income),
         "fees_included": False,
         "funding_included": True,

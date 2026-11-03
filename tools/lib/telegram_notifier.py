@@ -356,6 +356,46 @@ def format_telegram_trade_message(
                 f"已合并重复提醒：{_value(payload, 'telegram_suppressed_repeats')}",
             ]
         )
+    if event_type == "live_inventory_exit_leg_unwound":
+        return "\n".join(
+            [
+                "[Var/Lighter] 对冲腿失败已回滚",
+                f"资产：{asset}｜批次：{lot_id}",
+                f"方向：{_direction_cn(direction)}｜数量：{_value(payload, 'qty')}",
+                f"失败原因：{_value(payload, 'failure_reason')}",
+                "动作：已在 Var 反向恢复原仓位，本档继续持有",
+            ]
+        )
+    if event_type == "live_inventory_exit_hedge_retry_ok":
+        return "\n".join(
+            [
+                "[Var/Lighter] 对冲腿重试成功",
+                f"资产：{asset}｜批次：{lot_id}",
+                f"重试次数：{_value(payload, 'attempt')}",
+                f"首次失败：{_value(payload, 'failure_reason')}",
+            ]
+        )
+    if event_type == "live_inventory_v4_batch_exit_chunked":
+        return "\n".join(
+            [
+                "[Var/Lighter] 批量平仓已拆分",
+                f"资产：{asset}",
+                "本次平仓："
+                f"{_value(payload, 'selected_lots')} 档｜"
+                f"剩余：{_value(payload, 'remaining_lots')} 档",
+                "原因：单笔超过 Lighter 风控上限 "
+                f"{_value(payload, 'risk_limit_base_units')}",
+            ]
+        )
+    if event_type == "live_inventory_v4_batch_exit_blocked":
+        return "\n".join(
+            [
+                "[Var/Lighter] 批量平仓被拒，回退逐档",
+                f"资产：{asset}",
+                f"数量：{_value(payload, 'merged_base_units')}｜上限：{_value(payload, 'risk_limit_base_units')}",
+                f"涉及批次：{_value(payload, 'lot_ids')}",
+            ]
+        )
     if event_type == "live_inventory_basis_quote_failed":
         return "\n".join(
             [

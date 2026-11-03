@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly Lighter funding ledger snapshot
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

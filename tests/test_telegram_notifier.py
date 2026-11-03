@@ -600,3 +600,44 @@ def test_request_failure_is_contained(monkeypatch) -> None:
 
     assert ok is False
     assert detail == "request_failed:TimeoutError"
+
+
+def test_exit_leg_unwound_message_states_the_rollback():
+    from tools.lib.telegram_notifier import format_telegram_trade_message
+
+    text = format_telegram_trade_message(
+        "live_inventory_exit_leg_unwound",
+        {
+            "asset": "ETH",
+            "lot_id": 72,
+            "direction": "short_var_long_lighter",
+            "qty": "0.0088",
+            "failure_reason": "basis_exit_lighter_submit_failed",
+        },
+    )
+    assert "对冲腿失败已回滚" in text
+    assert "继续持有" in text
+
+
+def test_batch_chunked_message_reports_the_split():
+    from tools.lib.telegram_notifier import format_telegram_trade_message
+
+    text = format_telegram_trade_message(
+        "live_inventory_v4_batch_exit_chunked",
+        {"asset": "ETH", "selected_lots": 11, "remaining_lots": 2,
+         "risk_limit_base_units": 1000},
+    )
+    assert "批量平仓已拆分" in text
+    assert "11" in text and "2" in text
+
+
+def test_batch_blocked_message_says_it_falls_back():
+    from tools.lib.telegram_notifier import format_telegram_trade_message
+
+    text = format_telegram_trade_message(
+        "live_inventory_v4_batch_exit_blocked",
+        {"asset": "ETH", "merged_base_units": 1144, "risk_limit_base_units": 1000,
+         "lot_ids": ["72", "73"]},
+    )
+    assert "批量平仓被拒" in text
+    assert "回退逐档" in text
