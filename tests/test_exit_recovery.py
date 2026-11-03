@@ -138,3 +138,25 @@ def test_a_sell_exit_unwinds_with_a_buy():
     rt = _runtime(hedge_known=[False, False])
     _recover(rt, exit_side="SELL", direction="long_var_short_lighter")
     assert [p["side"] for n, p in rt.events if n == "var_order"] == ["BUY"]
+
+def test_a_thirteen_lot_batch_splits_into_eleven_plus_two():
+    from tools.lib.exit_targets import lots_fitting_in_base_limit
+
+    sizes = [88] * 13
+    assert lots_fitting_in_base_limit(sizes, 1000) == 11
+    assert lots_fitting_in_base_limit(sizes, 200) == 2
+    assert lots_fitting_in_base_limit(sizes, 88) == 1
+    assert lots_fitting_in_base_limit(sizes, 50) == 0
+
+
+def test_no_limit_means_every_lot_fits():
+    from tools.lib.exit_targets import lots_fitting_in_base_limit
+
+    assert lots_fitting_in_base_limit([88] * 13, 0) == 13
+
+
+def test_an_unknown_size_stops_the_chunk_instead_of_guessing():
+    from tools.lib.exit_targets import lots_fitting_in_base_limit
+
+    assert lots_fitting_in_base_limit([88, None, 88], 1000) == 1
+    assert lots_fitting_in_base_limit([], 1000) == 0

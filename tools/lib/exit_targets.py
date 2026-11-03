@@ -26,6 +26,28 @@ def lot_exit_target_bps(configured: object | None = None) -> Decimal:
     return _bounded_target(configured, DEFAULT_LOT_EXIT_TARGET_BPS)
 
 
+def lots_fitting_in_base_limit(sizes: list[int], limit: int) -> int:
+    """How many leading lots fit under one Lighter order limit.
+
+    Lots are taken in the order they are held (oldest first) until the next one
+    would breach the cap, so a thirteen-lot batch becomes e.g. 11 + 2 instead of
+    one order the venue guard refuses.
+    """
+
+    if not limit or limit <= 0:
+        return len(sizes)
+    used = 0
+    count = 0
+    for size in sizes:
+        if size is None or size <= 0:
+            break
+        if used + size > limit:
+            break
+        used += size
+        count += 1
+    return count
+
+
 def batch_exit_exceeds_risk_limit(
     base_units: int | None, limit: int | None
 ) -> bool:

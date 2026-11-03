@@ -56,6 +56,7 @@ from tools.lib.exit_targets import (
     DEFAULT_PORTFOLIO_EXIT_TARGET_BPS,
     batch_exit_exceeds_risk_limit,
     cap_exit_threshold,
+    lots_fitting_in_base_limit,
     lot_exit_target_bps,
     portfolio_exit_target_bps,
 )
@@ -23861,15 +23862,73 @@ class VariationalToLighterRuntime:
                 )
                 return
             if atomic_portfolio_lot is not None:
-                merged_base_units = self.live_inventory_lighter_base_units(
-                    str(asset), atomic_portfolio_lot.get("qty")
-                )
                 base_limit = int(
                     getattr(self, "risk_guard_max_base_amount", 0) or 0
                 )
-                if batch_exit_exceeds_risk_limit(
-                    merged_base_units, base_limit
+                sizes = [
+                    self.live_inventory_lighter_base_units(
+                        str(asset), open_lot.get("qty")
+                    )
+                    for open_lot in locked_lots
+                ]
+                fitting = lots_fitting_in_base_limit(sizes, base_limit)
+                merged_base_units = self.live_inventory_lighter_base_units(
+                    str(asset), atomic_portfolio_lot.get("qty")
+                )
+                if (
+                    base_limit > 0
+                    and fitting < len(locked_lots)
+                    and fitting > 0
                 ):
+                    # Split the cohort: exit the largest prefix that fits under
+                    # one order, leave the rest unlocked for the next cycle.
+                    total_locked = len(portfolio_exit_lot_ids)
+                    locked_lots = locked_lots[:fitting]
+                    selected_ids = {
+                        self.live_inventory_normalized_lot_id(open_lot.get("lot_id"))
+                        for open_lot in locked_lots
+                    }
+                    self.live_inventory_v4_portfolio_exit_lot_ids = set(
+                        selected_ids
+                    )
+                    portfolio_exit_lot_ids = set(selected_ids)
+                    atomic_portfolio_lot = (
+                        self.live_inventory_v4_merge_lots_for_atomic_exit(
+                            locked_lots
+                        )
+                    )
+                    atomic_portfolio_lot["portfolio_partial_detier"] = bool(
+                        self.live_inventory_v4_portfolio_exit_context.get(
+                            "partial_detier"
+                        )
+                    )
+                    atomic_portfolio_lot["portfolio_tier_independent_exit"] = bool(
+                        self.live_inventory_v4_portfolio_exit_context.get(
+                            "tier_independent_exit"
+                        )
+                    )
+                    atomic_portfolio_lot["entry_gradient_tier"] = (
+                        self.live_inventory_v4_portfolio_exit_context.get(
+                            "selected_gradient_tier"
+                        )
+                        or atomic_portfolio_lot.get("entry_gradient_tier")
+                    )
+                    await self.persist_live_inventory_memory(
+                        reason="v4_batch_exit_chunked_for_risk_limit"
+                    )
+                    await self.append_live_inventory_log(
+                        "live_inventory_v4_batch_exit_chunked",
+                        {
+                            **state_payload,
+                            "reason": "batch_exit_chunked_for_lighter_risk_limit",
+                            "selected_lot_ids": sorted(selected_ids),
+                            "selected_lots": len(selected_ids),
+                            "remaining_lots": max(0, total_locked - len(selected_ids)),
+                            "risk_limit_base_units": base_limit,
+                            "merged_base_units": merged_base_units,
+                        },
+                    )
+                elif batch_exit_exceeds_risk_limit(merged_base_units, base_limit):
                     released_lot_ids = sorted(portfolio_exit_lot_ids)
                     self.live_inventory_v4_portfolio_exit_lot_ids = set()
                     self.live_inventory_v4_portfolio_exit_context = {}
