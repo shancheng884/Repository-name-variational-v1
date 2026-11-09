@@ -34,6 +34,8 @@ const state = {
   lastExplicitReloadAt: 0
 };
 
+const COMMAND_KEEPALIVE_MS = 20000;
+
 let restorePromise = null;
 
 class ForwardSocket {
@@ -47,6 +49,34 @@ class ForwardSocket {
     this.status = "disconnected";
     this.queue = [];
     this.retryTimer = null;
+    this.keepAliveMs = Number(options.keepAliveMs) || 0;
+    this.keepAliveTimer = null;
+  }
+
+  startKeepAlive() {
+    this.stopKeepAlive();
+    if (!this.keepAliveMs) {
+      return;
+    }
+    // Chrome 会在 30 秒空闲后回收 MV3 后台进程。定期发一条应用层心跳，
+    // 让 service worker 的计时器持续被重置，WebSocket 才不会被连坐断开。
+    this.keepAliveTimer = setInterval(() => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      try {
+        this.ws.send(JSON.stringify({ type: "PING", timestamp: nowIso() }));
+      } catch (_error) {
+        // 发送失败交给 onclose 的重连逻辑处理
+      }
+    }, this.keepAliveMs);
+  }
+
+  stopKeepAlive() {
+    if (this.keepAliveTimer) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+    }
   }
 
   get endpoint() {
@@ -85,6 +115,7 @@ class ForwardSocket {
         if (this.onOpen) {
           this.onOpen(this);
         }
+        this.startKeepAlive();
         notifyStatus();
       };
 
@@ -101,6 +132,7 @@ class ForwardSocket {
         }
         this.ws = null;
         this.status = "disconnected";
+        this.stopKeepAlive();
         notifyStatus();
         this.scheduleReconnect();
       };
@@ -162,6 +194,7 @@ class ForwardSocket {
   }
 
   close() {
+    this.stopKeepAlive();
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
@@ -183,7 +216,8 @@ const restForwarder = new ForwardSocket("rest", "restEndpoint", {
 });
 const commandForwarder = new ForwardSocket("command", "commandEndpoint", {
   onOpen: (socket) => socket.send({ type: "REGISTER", role: "extension", timestamp: nowIso() }),
-  onMessage: (data) => handleCommandSocketMessage(data)
+  onMessage: (data) => handleCommandSocketMessage(data),
+  keepAliveMs: COMMAND_KEEPALIVE_MS
 });
 
 async function ensureConfigLoaded() {

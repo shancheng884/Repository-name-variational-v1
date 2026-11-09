@@ -14,7 +14,7 @@ def test_extension_has_persistent_keepalive_and_recovery() -> None:
     )
 
     assert "alarms" in manifest["permissions"]
-    assert manifest["version"] == "1.1.2"
+    assert manifest["version"] == "1.1.3"
     assert "variationalForwarderKeepalive" in background
     assert "saveForwarderSession(true" in background
     assert "restoreForwarding" in background
@@ -28,6 +28,10 @@ def test_extension_has_persistent_keepalive_and_recovery() -> None:
     assert "/prices" in background
     assert "queueWhenDisconnected: false" in background
     assert "autoReloadAttachedTab" not in background
+    assert "COMMAND_KEEPALIVE_MS" in background
+    assert "startKeepAlive" in background
+    assert "keepAliveMs: COMMAND_KEEPALIVE_MS" in background
+    assert 'type: "PING"' in background
 
 
 def test_extension_can_fetch_portfolio_through_authenticated_page() -> None:
