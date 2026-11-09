@@ -16164,7 +16164,7 @@ class VariationalToLighterRuntime:
         self,
         asset: str,
         *,
-        extension_wait_seconds: float = 10.0,
+        extension_wait_seconds: float = 180.0,
         retry_interval_seconds: float = 0.5,
     ) -> None:
         deadline = time.monotonic() + max(0.0, extension_wait_seconds)
@@ -16197,7 +16197,11 @@ class VariationalToLighterRuntime:
                 return
 
             error = result.get("error") or result
-            is_extension_disconnected = "No extension command client connected" in str(error)
+            error_text = str(error)
+            is_extension_disconnected = (
+                "No extension command client connected" in error_text
+                or "Extension disconnected before order result" in error_text
+            )
             remaining_seconds = deadline - time.monotonic()
             if not is_extension_disconnected or remaining_seconds <= 0:
                 raise RuntimeError(f"Variational API command preflight failed: {error}")
@@ -16211,6 +16215,116 @@ class VariationalToLighterRuntime:
                     remaining_seconds,
                 )
             await asyncio.sleep(min(max(0.0, retry_interval_seconds), remaining_seconds))
+
+    async def prime_variational_page_streams(
+        self,
+        *,
+        asset: str,
+        timeout_seconds: float = 90.0,
+        poll_seconds: float = 5.0,
+    ) -> None:
+        """Force the browser bridge to capture price frames before trading starts.
+
+        A freshly loaded Variational tab opens its WebSocket before the extension
+        attaches its CDP debugger, so no frames are captured and the runtime
+        starves for quotes even though the page itself keeps ticking. Reloading
+        the page through the bridge re-creates the socket while the debugger is
+        already attached, which is what the extension needs to forward frames.
+        """
+        def _log(level: str, message: str, *args: Any) -> None:
+            logger = getattr(self, "logger", None)
+            handler = getattr(logger, level, None) if logger is not None else None
+            if handler is None:
+                return
+            handler(message, *args)
+
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        attempt = 0
+        while True:
+            attempt += 1
+            frames = await self.variational_captured_price_frames()
+            if frames > 0:
+                _log(
+                    "info",
+                    "variational_page_stream_primed asset=%s attempt=%s frames=%s",
+                    asset,
+                    attempt,
+                    frames,
+                )
+                return
+            request_id = uuid.uuid4().hex
+            try:
+                reload_result = await asyncio.wait_for(
+                    self.send_variational_command(
+                        payload={
+                            "type": "VAR_API_RELOAD_PAGE",
+                            "requestId": request_id,
+                        },
+                        request_id=request_id,
+                        lane="read",
+                    ),
+                    timeout=6.0,
+                )
+                if isinstance(reload_result, dict):
+                    reload_ok = bool(reload_result.get("ok"))
+                    reload_error = reload_result.get("error")
+                else:
+                    reload_ok = False
+                    reload_error = "invalid_result"
+                _log(
+                    "info",
+                    "variational_page_stream_reload asset=%s attempt=%s ok=%s error=%s",
+                    asset,
+                    attempt,
+                    reload_ok,
+                    reload_error,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _log(
+                    "warning",
+                    "variational_page_stream_reload_failed asset=%s attempt=%s error=%s",
+                    asset,
+                    attempt,
+                    f"{type(exc).__name__}:{exc}",
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _log(
+                    "warning",
+                    "variational_page_stream_prime_timeout asset=%s attempts=%s",
+                    asset,
+                    attempt,
+                )
+                return
+            await asyncio.sleep(min(max(0.0, poll_seconds), remaining))
+
+    async def variational_captured_price_frames(self) -> int:
+        """Return how many price frames the browser extension has captured."""
+        try:
+            result = await asyncio.wait_for(
+                self.fetch_variational_stream_health(),
+                timeout=LIVE_INVENTORY_VARIATIONAL_STREAM_HEALTH_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return 0
+        payload = result.get("result") if isinstance(result, dict) else None
+        if not isinstance(payload, dict):
+            return 0
+        streams = payload.get("streams")
+        if not isinstance(streams, list):
+            return 0
+        frames = 0
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            label = f"{stream.get('url') or ''} {stream.get('matchedPattern') or ''}".lower()
+            if "price" in label:
+                frames += int(stream.get("frameCount") or 0)
+        return frames
 
     @staticmethod
     def _is_lighter_ws_sendtx_response(message: dict[str, Any]) -> bool:
@@ -27773,6 +27887,16 @@ class VariationalToLighterRuntime:
             try:
                 await self.preflight_variational_api_command_client(initial_asset)
                 self.logger.info("variational_api_command_client_preflight_passed asset=%s", initial_asset)
+                try:
+                    await self.prime_variational_page_streams(asset=initial_asset)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.logger.warning(
+                        "variational_page_stream_prime_failed asset=%s",
+                        initial_asset,
+                        exc_info=True,
+                    )
             except RuntimeError as exc:
                 message = str(exc)
                 self.logger.exception("variational_api_command_client_preflight_failed asset=%s", initial_asset)
