@@ -9671,8 +9671,8 @@ class VariationalToLighterRuntime:
             or 2.0
         )
         exact_age_limit = float(
-            getattr(self, "live_inventory_basis_max_var_quote_age_ms", 1500.0)
-            or 1500.0
+            getattr(self, "live_inventory_basis_max_var_quote_age_ms", 2500.0)
+            or 2500.0
         ) / 1000.0
 
         def reject(reason: str) -> None:
@@ -30490,8 +30490,8 @@ def parse_args() -> argparse.Namespace:
                 parser.error("basis V4 profile requires one entry confirmation sample")
             if args.live_inventory_basis_max_sample_move_bps != 3:
                 parser.error("basis V4 profile requires max sample move=3 bps")
-            if args.live_inventory_basis_max_var_quote_age_ms != 1500:
-                parser.error("basis V4 profile requires max Variational quote age=1500ms")
+            if args.live_inventory_basis_max_var_quote_age_ms != 2500:
+                parser.error("basis V4 profile requires max Variational quote age=2500ms")
             if args.live_inventory_max_lighter_book_age_seconds != 2:
                 parser.error("basis V4 profile requires max Lighter book age=2s")
         elif args.live_inventory_basis_v4_test_skip_recent_health:

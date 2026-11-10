@@ -108,7 +108,7 @@ def test_live_tool_reversion_forces_one_small_lot_and_omits_normalized_primary()
     assert "--live-inventory-basis-use-normalized-edge-for-entry" not in command
     assert "--live-inventory-i-accept-basis-addon-diagnostic" not in command
     assert "--live-inventory-basis-refresh-exit-quote-before-submit" in command
-    assert command[command.index("--live-inventory-basis-max-var-quote-age-ms") + 1] == "1500"
+    assert command[command.index("--live-inventory-basis-max-var-quote-age-ms") + 1] == "2500"
     assert command[command.index("--live-inventory-max-lighter-book-age-seconds") + 1] == "2"
     assert command[command.index("--live-inventory-basis-reversion-min-deviation-bps") + 1] == "1.2"
     assert command[command.index("--live-inventory-basis-reversion-long-execution-reserve-bps") + 1] == "4.5"
