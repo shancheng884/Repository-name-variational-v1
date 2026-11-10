@@ -367,3 +367,30 @@ def test_downtime_marker_older_than_a_day_is_ignored() -> None:
     ]
 
     assert runtime.live_inventory_planned_downtime_intervals(now) == []
+
+
+def test_health_seeding_keeps_every_sample_in_its_wall_clock_slot() -> None:
+    """Rows a few hundred ms early must not be dropped into a fake 60s gap."""
+
+    from main import v4_sample_slot
+
+    interval = 30.0
+    start = 1_000_000.0
+    rows = [start + index * 29.3 for index in range(120)]
+    slots = [v4_sample_slot(value, interval) for value in rows]
+
+    kept = len(dict.fromkeys(slots))
+    assert kept >= 115  # the old "previous + 30" chain kept about 80
+
+
+def test_downtime_marker_pulls_back_to_the_last_sample() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_last_sample_at = 1_000_000.0
+
+    # A shutdown 8s after the last sample starts the downtime at that sample.
+    assert runtime.live_inventory_downtime_start_ts(1_000_008.0) == 1_000_000.0
+    # A stall that began long before the shutdown is not excused.
+    assert runtime.live_inventory_downtime_start_ts(1_000_600.0) == 1_000_600.0
+    # Without any sample the marker keeps the shutdown time.
+    runtime.live_inventory_basis_v4_last_sample_at = None
+    assert runtime.live_inventory_downtime_start_ts(1_000_008.0) == 1_000_008.0

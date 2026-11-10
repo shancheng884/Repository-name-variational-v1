@@ -462,6 +462,11 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def v4_sample_slot(timestamp: float, interval: float) -> int:
+    """Wall-clock slot that keeps one observation per sampling cadence."""
+    return int(float(timestamp) // float(interval))
+
+
 def parse_iso_timestamp(value: Any) -> float | None:
     if not value:
         return None
@@ -9878,6 +9883,7 @@ class VariationalToLighterRuntime:
             *,
             direction: str,
             history: deque[tuple[float, Decimal]],
+            bucket_align: bool = False,
         ) -> dict[str, int]:
             edge_key = (
                 "long_edge_bps"
@@ -9886,6 +9892,7 @@ class VariationalToLighterRuntime:
             )
             counts = {"compatible": 0, "legacy": 0}
             next_sample_at = cutoff
+            last_bucket: int | None = None
             ordered_rows = sorted(
                 rows,
                 key=lambda row: (
@@ -9907,6 +9914,18 @@ class VariationalToLighterRuntime:
                     or timestamp < next_sample_at
                 ):
                     continue
+                if bucket_align:
+                    # One observation per 30s slot, keyed by the wall clock.
+                    # Chaining "last sample + 30" instead dropped every row
+                    # that landed a few milliseconds early, which then showed
+                    # up as a 60s health gap that never happened.
+                    slot = v4_sample_slot(
+                        timestamp,
+                        LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
+                    )
+                    if slot == last_bucket:
+                        continue
+                    last_bucket = slot
                 history.append((timestamp, edge_bps))
                 mode_key = (
                     "compatible"
@@ -9989,6 +10008,7 @@ class VariationalToLighterRuntime:
                 compatible_source_rows,
                 direction=direction,
                 history=health_history,
+                bucket_align=True,
             )
             self.live_inventory_basis_v4_anchor_legacy_count_by_direction[
                 direction
@@ -10192,6 +10212,32 @@ class VariationalToLighterRuntime:
             if end >= cutoff and end > start
         ]
 
+    def live_inventory_downtime_start_ts(
+        self,
+        stopped_at: float | None = None,
+    ) -> float:
+        """Datestamp the moment observation actually stopped.
+
+        Shutdown takes a few seconds after the last recorded sample, so the
+        marker is pulled back to that sample. A feed
+        that stalled long before the shutdown is left untouched, so its hole
+        is still counted as a market gap.
+        """
+        resolved = float(stopped_at if stopped_at is not None else time.time())
+        last_sample = getattr(
+            self,
+            "live_inventory_basis_v4_last_sample_at",
+            None,
+        )
+        if last_sample is None:
+            return resolved
+        lag = resolved - float(last_sample)
+        if 0.0 <= lag <= float(LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS):
+            # Observation really stopped at the last sample: anchoring there
+            # leaves no dangling fragment for the health gap check.
+            resolved = min(resolved, float(last_sample))
+        return resolved
+
     def record_live_inventory_planned_downtime(
         self,
         *,
@@ -10215,7 +10261,7 @@ class VariationalToLighterRuntime:
         payload["closed"] = closed[-49:]
         payload["open"] = {
             "stopped_at": datetime.fromtimestamp(
-                stopped_at if stopped_at is not None else time.time(),
+                self.live_inventory_downtime_start_ts(stopped_at),
                 tz=timezone.utc,
             ).isoformat(),
             "reason": reason,
