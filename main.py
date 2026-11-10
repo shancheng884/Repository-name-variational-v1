@@ -124,15 +124,10 @@ LIVE_INVENTORY_BASIS_V4_PROFILE_ETH_SHORT_20260724 = "eth_short_execution_calibr
 LIVE_INVENTORY_BASIS_V4_PROFILE_CHOICES = (
     LIVE_INVENTORY_BASIS_V4_PROFILE_ETH_SHORT_20260724,
 )
-# Rolling anchor window. Defaults to 7 days; widen it (e.g. 14) when the
-# sample history has collection gaps that would otherwise keep the effective
-# coverage below the minimum forever.
-LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_DAYS = float(
-    os.environ.get("V4_ANCHOR_WINDOW_DAYS", "7")
-)
-LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS = int(
-    LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_DAYS * 86400
-)
+# Rolling anchor window. 14 days: with a 7-day window the effective coverage
+# stayed pinned near 64% because old samples expired as fast as new ones
+# arrived, so the adaptive threshold could never become ready.
+LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS = 1209600
 LIVE_INVENTORY_BASIS_V4_FAST_WINDOW_SECONDS = 86400
 LIVE_INVENTORY_BASIS_V4_MID_WINDOW_SECONDS = 15 * 86400
 LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS = 30 * 86400

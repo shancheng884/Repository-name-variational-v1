@@ -2250,7 +2250,7 @@ def test_v4_entry_threshold_uses_rolling_7d_anchor_with_recent_health() -> None:
     assert threshold == Decimal("98.50")
     assert context["v4_anchor_ready"] is True
     assert context["v4_health_ready"] is True
-    assert context["v4_baseline_window_seconds"] == 604800
+    assert context["v4_baseline_window_seconds"] == 1209600
     assert context["v4_baseline_count"] == 5760
     assert context["v4_anchor_effective_seconds"] == 172800
     assert Decimal("98") <= threshold < Decimal("99")
@@ -2698,10 +2698,10 @@ def test_v4_entry_threshold_keeps_7d_anchor_across_historical_gap() -> None:
     threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
 
     assert threshold is not None
-    assert context["v4_mature_windows"] == [604800]
+    assert context["v4_mature_windows"] == [1209600]
     assert context["v4_anchor_ready"] is True
     assert context["v4_health_ready"] is True
-    assert context["v4_baseline_window_seconds"] == 604800
+    assert context["v4_baseline_window_seconds"] == 1209600
     assert Decimal(context["v4_anchor_max_sample_gap_seconds"]) > Decimal("60")
     assert context["v4_health_max_sample_gap_seconds"] == "30.000"
     assert threshold < Decimal("9999")
@@ -3100,7 +3100,7 @@ def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> Non
     assert context["reason"] == "ready"
     assert context["v4_anchor_ready"] is True
     assert context["v4_health_ready"] is True
-    assert context["v4_baseline_window_seconds"] == 604800
+    assert context["v4_baseline_window_seconds"] == 1209600
     assert context["v4_anchor_effective_seconds"] == 172800
     assert context["v4_entry_threshold_bps"] == "98.50"
     assert context["compatible_source_rows"] == 5760
