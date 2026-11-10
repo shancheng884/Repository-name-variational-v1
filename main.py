@@ -402,6 +402,11 @@ AUTO_LIVE_STATE_FILE = LOG_DIR / "auto_live_state.json"
 LIVE_INVENTORY_STATE_FILE = LOG_DIR / "live_inventory_state.json"
 LIVE_INVENTORY_CONTROL_FILE = LOG_DIR / "live_inventory_control.json"
 LIVE_INVENTORY_RISK_HEALTH_FILE = LOG_DIR / "live_inventory_risk_health.json"
+# Only a clean shutdown writes this marker and only the next start closes it.
+# A killed/crashed process leaves no marker, so its gap still counts.
+LIVE_INVENTORY_PLANNED_DOWNTIME_FILE = LOG_DIR / "live_inventory_planned_downtime.json"
+LIVE_INVENTORY_PLANNED_DOWNTIME_MAX_AGE_SECONDS = 86400.0
+PROCESS_STARTED_WALL_CLOCK = time.time()
 READY_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
@@ -455,6 +460,15 @@ TRADE_EVENT_STARTUP_GRACE_SECONDS = 5.0
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso_timestamp(value: Any) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 def to_decimal(value: Any) -> Decimal | None:
@@ -10100,6 +10114,117 @@ class VariationalToLighterRuntime:
             **primary,
         }
 
+    def live_inventory_planned_downtime_path(self) -> Path:
+        return Path(
+            getattr(
+                self,
+                "live_inventory_planned_downtime_file",
+                LIVE_INVENTORY_PLANNED_DOWNTIME_FILE,
+            )
+        )
+
+    def load_live_inventory_planned_downtime(
+        self,
+    ) -> list[tuple[float, float]]:
+        """Read closed process-downtime intervals, closing any open marker.
+
+        The open marker is closed at this process' start time and persisted,
+        so a restart loop cannot keep widening the same exempt interval.
+        """
+        path = self.live_inventory_planned_downtime_path()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(payload, dict):
+            return []
+        closed = [
+            item
+            for item in (payload.get("closed") or [])
+            if isinstance(item, dict)
+        ]
+        intervals: list[tuple[float, float]] = []
+        for item in closed:
+            start = parse_iso_timestamp(item.get("stopped_at"))
+            end = parse_iso_timestamp(item.get("started_at"))
+            if start is not None and end is not None and end > start:
+                intervals.append((start, end))
+        open_item = payload.get("open")
+        if isinstance(open_item, dict):
+            start = parse_iso_timestamp(open_item.get("stopped_at"))
+            end = PROCESS_STARTED_WALL_CLOCK
+            if start is not None and end > start:
+                intervals.append((start, end))
+                closed.append(
+                    {
+                        "stopped_at": open_item.get("stopped_at"),
+                        "started_at": datetime.fromtimestamp(
+                            end,
+                            tz=timezone.utc,
+                        ).isoformat(),
+                        "reason": open_item.get("reason"),
+                    }
+                )
+            payload["closed"] = closed[-49:]
+            payload["open"] = None
+            try:
+                write_json_atomic(path, payload)
+            except Exception:
+                pass
+        intervals.sort()
+        return intervals[-50:]
+
+    def live_inventory_planned_downtime_intervals(
+        self,
+        now: float | None = None,
+    ) -> list[tuple[float, float]]:
+        cached = getattr(self, "live_inventory_planned_downtime_cache", None)
+        if isinstance(cached, list):
+            intervals = cached
+        else:
+            intervals = self.load_live_inventory_planned_downtime()
+            self.live_inventory_planned_downtime_cache = intervals
+        reference = now if now is not None else time.time()
+        cutoff = reference - LIVE_INVENTORY_PLANNED_DOWNTIME_MAX_AGE_SECONDS
+        return [
+            (start, end)
+            for start, end in intervals
+            if end >= cutoff and end > start
+        ]
+
+    def record_live_inventory_planned_downtime(
+        self,
+        *,
+        reason: str | None = None,
+        stopped_at: float | None = None,
+    ) -> None:
+        """Mark a clean stop so the next start can exclude the downtime."""
+        path = self.live_inventory_planned_downtime_path()
+        payload: dict[str, Any] = {"schema_version": 1}
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                payload.update(existing)
+        except (OSError, ValueError):
+            pass
+        closed = [
+            item
+            for item in (payload.get("closed") or [])
+            if isinstance(item, dict)
+        ]
+        payload["closed"] = closed[-49:]
+        payload["open"] = {
+            "stopped_at": datetime.fromtimestamp(
+                stopped_at if stopped_at is not None else time.time(),
+                tz=timezone.utc,
+            ).isoformat(),
+            "reason": reason,
+            "pid": os.getpid(),
+        }
+        payload["updated_at"] = utc_now()
+        write_json_atomic(path, payload)
+        self.live_inventory_planned_downtime_cache = None
+
     def live_inventory_basis_v4_remember_threshold_context(
         self,
         direction: str | None,
@@ -10142,7 +10267,11 @@ class VariationalToLighterRuntime:
                 reasons.append("recent_1h_health_samples_below_minimum")
             try:
                 coverage = Decimal(
-                    str(context.get("v4_health_coverage_seconds") or "0")
+                    str(
+                        context.get("v4_health_observed_coverage_seconds")
+                        or context.get("v4_health_coverage_seconds")
+                        or "0"
+                    )
                 )
             except Exception:
                 coverage = Decimal("0")
@@ -10199,6 +10328,12 @@ class VariationalToLighterRuntime:
                 "threshold_bps": decimal_to_str(threshold),
                 "health_count": context.get("v4_health_count"),
                 "health_coverage_seconds": context.get("v4_health_coverage_seconds"),
+                "health_observed_coverage_seconds": context.get(
+                    "v4_health_observed_coverage_seconds"
+                ),
+                "health_excluded_downtime_seconds": context.get(
+                    "v4_health_excluded_downtime_seconds"
+                ),
                 "health_max_sample_gap_seconds": context.get(
                     "v4_health_max_sample_gap_seconds"
                 ),
@@ -10225,6 +10360,12 @@ class VariationalToLighterRuntime:
             "v4_entry_threshold_bps": primary.get("threshold_bps"),
             "v4_health_count": primary.get("health_count"),
             "v4_health_coverage_seconds": primary.get("health_coverage_seconds"),
+            "v4_health_observed_coverage_seconds": primary.get(
+                "health_observed_coverage_seconds"
+            ),
+            "v4_health_excluded_downtime_seconds": primary.get(
+                "health_excluded_downtime_seconds"
+            ),
             "v4_health_max_sample_gap_seconds": primary.get(
                 "health_max_sample_gap_seconds"
             ),
@@ -10270,6 +10411,7 @@ class VariationalToLighterRuntime:
                 "max_sample_gap_seconds": LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS,
                 "health_window_seconds": LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS,
                 "history_sample_seconds": LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
+                "planned_downtime_excluded": True,
             },
             **self.live_inventory_entry_block_payload(),
         }
@@ -10478,16 +10620,34 @@ class VariationalToLighterRuntime:
         health_coverage_seconds = (
             max(0.0, now - health_rows[0][0]) if health_rows else 0.0
         )
-        health_max_gap_seconds = max(
-            (
-                current[0] - previous[0]
-                for previous, current in zip(health_rows, health_rows[1:])
-            ),
-            default=0.0,
+        # A clean shutdown is not a market-data gap: the feed was never
+        # observed, so that interval is removed from the coverage budget and
+        # never allowed to look like a feed hole. Anything the process did
+        # not mark (crash, kill, OOM) still counts as a real gap.
+        downtime_intervals = self.live_inventory_planned_downtime_intervals(now)
+        health_excluded_downtime_seconds = 0.0
+        for downtime_start, downtime_end in downtime_intervals:
+            overlap_start = max(downtime_start, health_cutoff)
+            overlap_end = min(downtime_end, now)
+            if overlap_end > overlap_start:
+                health_excluded_downtime_seconds += overlap_end - overlap_start
+        health_observed_coverage_seconds = max(
+            0.0,
+            health_coverage_seconds - health_excluded_downtime_seconds,
         )
+        health_gaps = [
+            current[0] - previous[0]
+            for previous, current in zip(health_rows, health_rows[1:])
+            if not any(
+                previous[0] >= downtime_start - 1.0
+                and current[0] <= downtime_end + 1.0
+                for downtime_start, downtime_end in downtime_intervals
+            )
+        ]
+        health_max_gap_seconds = max(health_gaps, default=0.0)
         health_ready_observed = (
             len(health_rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
-            and Decimal(str(health_coverage_seconds))
+            and Decimal(str(health_observed_coverage_seconds))
             >= Decimal(LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS)
             * LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
             and health_max_gap_seconds
@@ -10621,6 +10781,12 @@ class VariationalToLighterRuntime:
                 else "history_compatibility_fallback"
             ),
             "v4_health_coverage_seconds": f"{health_coverage_seconds:.3f}",
+            "v4_health_excluded_downtime_seconds": (
+                f"{health_excluded_downtime_seconds:.3f}"
+            ),
+            "v4_health_observed_coverage_seconds": (
+                f"{health_observed_coverage_seconds:.3f}"
+            ),
             "v4_health_max_sample_gap_seconds": f"{health_max_gap_seconds:.3f}",
             "v4_health_ready": health_ready,
             "v4_health_ready_observed": health_ready_observed,
@@ -28562,6 +28728,8 @@ class VariationalToLighterRuntime:
                 len(self.live_inventory_open_lots),
                 self.live_inventory_completed_cycles,
             )
+            with contextlib.suppress(Exception):
+                self.record_live_inventory_planned_downtime(reason=stop_reason)
         self.stop_flag = True
 
         account_snapshot_tasks = list(

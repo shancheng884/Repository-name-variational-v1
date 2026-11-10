@@ -241,6 +241,7 @@ def test_v4_health_payload_publishes_gates_and_block() -> None:
         "max_sample_gap_seconds": 60,
         "health_window_seconds": LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS,
         "history_sample_seconds": 30,
+        "planned_downtime_excluded": True,
     }
     assert payload["entry_gate_block_reason"] == "basis_entry_edge_below_threshold"
     # The payload must stay JSON serialisable: it is written to health.json.
@@ -255,3 +256,114 @@ def test_v4_health_payload_reports_missing_context() -> None:
 
     assert payload["v4_health_ready"] is False
     assert payload["v4_health_reasons"] == ["v4_gate_context_not_initialised"]
+
+
+def _downtime_runtime(now, hole_seconds, downtime=True):
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    first_len = 50
+    start = now - 3300
+    part_one = [
+        (start + index * 30, Decimal(index)) for index in range(first_len)
+    ]
+    resume = start + first_len * 30 + hole_seconds
+    part_two = [
+        (resume + index * 30, Decimal(first_len + index))
+        for index in range(int((now - resume) // 30) + 1)
+    ]
+    runtime.live_inventory_basis_v4_history = _anchor_rows(
+        now,
+        part_one + part_two,
+    )
+    last_row_before_stop = part_one[-1][0]
+    runtime.live_inventory_planned_downtime_cache = (
+        [(last_row_before_stop, resume)] if downtime else []
+    )
+    return runtime
+
+
+def test_planned_downtime_is_not_a_market_gap() -> None:
+    now = 1_000_000.0
+    runtime = _downtime_runtime(now, 240.0, downtime=True)
+
+    threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
+
+    assert threshold is not None
+    assert context["v4_health_ready"] is True
+    assert Decimal(context["v4_health_excluded_downtime_seconds"]) >= Decimal("240")
+    assert Decimal(context["v4_health_observed_coverage_seconds"]) >= Decimal(
+        "2880"
+    )
+    assert runtime.live_inventory_basis_v4_health_reasons(context, threshold) == []
+
+
+def test_unmarked_gap_still_blocks_trading() -> None:
+    now = 1_000_000.0
+    runtime = _downtime_runtime(now, 240.0, downtime=False)
+
+    threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
+
+    assert threshold is None
+    assert context["v4_health_excluded_downtime_seconds"] == "0.000"
+    reasons = runtime.live_inventory_basis_v4_health_reasons(context, threshold)
+    assert "recent_1h_health_sample_gap_too_large" in reasons
+
+
+def test_long_planned_downtime_does_not_satisfy_the_48_minute_budget() -> None:
+    now = 1_000_000.0
+    runtime = _downtime_runtime(now, 2400.0, downtime=True)
+
+    threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
+
+    assert threshold is None
+    assert Decimal(context["v4_health_observed_coverage_seconds"]) < Decimal("2880")
+    reasons = runtime.live_inventory_basis_v4_health_reasons(context, threshold)
+    assert "recent_1h_health_coverage_below_minimum" in reasons
+
+
+def test_partial_downtime_overlap_keeps_the_gap(tmp_path) -> None:
+    now = 1_000_000.0
+    runtime = _downtime_runtime(now, 240.0, downtime=True)
+    # The marker only covers the first half of the hole, so the rest is a gap.
+    hole_start = runtime.live_inventory_planned_downtime_cache[0][0]
+    runtime.live_inventory_planned_downtime_cache = [
+        (hole_start, hole_start + 120.0)
+    ]
+
+    threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
+
+    assert threshold is None
+    assert Decimal(context["v4_health_max_sample_gap_seconds"]) > Decimal("60")
+
+
+def test_shutdown_marker_is_closed_at_the_next_start(tmp_path) -> None:
+    path = tmp_path / "planned_downtime.json"
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_planned_downtime_file = path
+
+    runtime.record_live_inventory_planned_downtime(
+        reason="signal_15",
+        stopped_at=time.time() - 120.0,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["open"]["reason"] == "signal_15"
+
+    restarted = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    restarted.live_inventory_planned_downtime_file = path
+    intervals = restarted.load_live_inventory_planned_downtime()
+
+    assert len(intervals) == 1
+    start, end = intervals[0]
+    assert end > start
+    assert 0.0 < end - start <= 125.0
+    # The marker is consumed, so a later start cannot widen the same interval.
+    assert json.loads(path.read_text(encoding="utf-8"))["open"] is None
+
+
+def test_downtime_marker_older_than_a_day_is_ignored() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    now = time.time()
+    runtime.live_inventory_planned_downtime_cache = [
+        (now - 200_000.0, now - 199_000.0),
+    ]
+
+    assert runtime.live_inventory_planned_downtime_intervals(now) == []
