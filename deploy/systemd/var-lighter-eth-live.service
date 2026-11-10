@@ -11,6 +11,9 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
 EnvironmentFile=/home/ubuntu/Repository-name-variational-v1/.env
 Environment=PYTHONUNBUFFERED=1
+# 14-day anchor window: the 7-day window kept the effective coverage
+# pinned near 64% because old samples expired as fast as new ones landed.
+Environment=V4_ANCHOR_WINDOW_DAYS=14
 ExecStart=/home/ubuntu/Repository-name-variational-v1/deploy/systemd/run-live-eth.sh
 Restart=always
 RestartSec=10
