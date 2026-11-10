@@ -10135,13 +10135,15 @@ class VariationalToLighterRuntime:
         }
 
     def live_inventory_planned_downtime_path(self) -> Path:
-        return Path(
-            getattr(
-                self,
-                "live_inventory_planned_downtime_file",
-                LIVE_INVENTORY_PLANNED_DOWNTIME_FILE,
-            )
-        )
+        explicit = getattr(self, "live_inventory_planned_downtime_file", None)
+        if explicit is not None:
+            return Path(explicit)
+        # Stay inside this runtime's own output directory: a test run or a
+        # second instance must never inherit the live process' downtime.
+        output_dir = getattr(self, "output_dir", None)
+        if output_dir is not None:
+            return Path(output_dir) / LIVE_INVENTORY_PLANNED_DOWNTIME_FILE.name
+        return LIVE_INVENTORY_PLANNED_DOWNTIME_FILE
 
     def load_live_inventory_planned_downtime(
         self,
