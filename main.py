@@ -235,6 +235,9 @@ LIVE_INVENTORY_LIGHTER_ORDER_RATE_NORMAL_PER_MINUTE = 30
 LIVE_INVENTORY_LIGHTER_ORDER_RATE_HARD_PER_MINUTE = 36
 LIVE_INVENTORY_BASIS_QUOTE_SIZE_MODE = "exact_base_qty_v1"
 LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE = "passive_browser_stream"
+# 同一份报价在 5 秒内重复出现仍算有效样本：Var 的 WS 大约 1 秒一条，
+# 采样更密时会把同一条消息读多次，直接判重复会把健康窗口饿死。
+LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_DUPLICATE_GRACE_SECONDS = 5.0
 LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_MAX_AGE_SECONDS = 5.0
 LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION = 2
 LIVE_INVENTORY_BASIS_V4_PORTFOLIO_EXIT_EXTRA_BPS = Decimal("1.00")
@@ -16982,6 +16985,23 @@ class VariationalToLighterRuntime:
             )
         )
 
+    def live_inventory_passive_reference_age_seconds(
+        self,
+        quote: dict[str, Any],
+    ) -> float | None:
+        """Age of a passive reference quote, in seconds."""
+        received_monotonic = quote.get("received_monotonic")
+        if received_monotonic is not None:
+            try:
+                return max(0.0, time.monotonic() - float(received_monotonic))
+            except (TypeError, ValueError):
+                pass
+        received_at = quote.get("received_at")
+        parsed = parse_utc_iso(received_at) if received_at else None
+        if parsed is None:
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+
     def live_inventory_var_quote_age_ok(self, quote: dict[str, Any]) -> tuple[bool, float | None]:
         age_ok, age_seconds, _ = self.live_inventory_var_quote_freshness(quote)
         return age_ok, age_seconds
@@ -19763,12 +19783,19 @@ class VariationalToLighterRuntime:
                 and passive_reference_key is None
             ):
                 sample_skip_reason = "passive_reference_identity_missing"
-            elif passive_reference_key is not None and passive_reference_key == (
-                getattr(
+            elif (
+                passive_reference_key is not None
+                and passive_reference_key
+                == getattr(
                     self,
                     "live_inventory_last_passive_reference_key_by_asset",
                     {},
                 ).get(asset.upper())
+                and (
+                    self.live_inventory_passive_reference_age_seconds(quote)
+                    or 0.0
+                )
+                > LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_DUPLICATE_GRACE_SECONDS
             ):
                 sample_skip_reason = "duplicate_passive_reference"
         if v4_mode:
