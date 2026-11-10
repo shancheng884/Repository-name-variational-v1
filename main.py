@@ -9654,6 +9654,10 @@ class VariationalToLighterRuntime:
         under an attached debugger, which is the only way to resume the feed.
         """
         last_reload = 0.0
+        # 从未记录过"新鲜报价"时也要能报警：否则报价一条都进不来、
+        # 属性永远为 None，看门狗会一直空转（今晚就是这种情况）。
+        if getattr(self, "live_inventory_last_fresh_quote_monotonic", None) is None:
+            self.live_inventory_last_fresh_quote_monotonic = time.monotonic()
         while True:
             await asyncio.sleep(max(5.0, float(poll_seconds)))
             last_fresh = getattr(
