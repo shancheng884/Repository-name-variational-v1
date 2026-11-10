@@ -1,0 +1,16 @@
+[Unit]
+Description=Persistent Variational Chrome on Xvfb (quote bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+ExecStart=/home/ubuntu/Repository-name-variational-v1/deploy/systemd/run-var-chrome-xvfb.sh
+Restart=always
+RestartSec=5
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
