@@ -27965,7 +27965,8 @@ class VariationalToLighterRuntime:
                     asset=v4_asset,
                 )
             )
-            asyncio.create_task(
+            # Keep a reference: an unreferenced task can be garbage collected.
+            self.live_inventory_v4_history_refresh_task = asyncio.create_task(
                 self.refresh_live_inventory_basis_v4_history_loop(asset=v4_asset)
             )
         self.print_startup_next_steps()
