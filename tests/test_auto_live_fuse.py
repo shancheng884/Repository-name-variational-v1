@@ -2247,13 +2247,13 @@ def test_v4_entry_threshold_uses_rolling_7d_anchor_with_recent_health() -> None:
 
     threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
 
-    assert threshold == Decimal("98.50")
+    assert threshold == Decimal("96.00")
     assert context["v4_anchor_ready"] is True
     assert context["v4_health_ready"] is True
     assert context["v4_baseline_window_seconds"] == 1209600
     assert context["v4_baseline_count"] == 5760
     assert context["v4_anchor_effective_seconds"] == 172800
-    assert Decimal("98") <= threshold < Decimal("99")
+    assert Decimal("94") <= threshold <= Decimal("96")
 
 
 def test_v4_entry_threshold_adds_recent_entry_capture_loss_reserve() -> None:
@@ -2274,15 +2274,15 @@ def test_v4_entry_threshold_adds_recent_entry_capture_loss_reserve() -> None:
 
     threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
 
-    assert context["v4_raw_entry_threshold_bps"] == "97"
+    assert context["v4_raw_entry_threshold_bps"] == "94"
     assert context["v4_entry_capture_sample_count"] == 10
     assert context["v4_entry_capture_calibration_ready"] is True
     assert context["v4_entry_capture_raw_p80_bps"] == "3.19"
     assert context["v4_entry_capture_calibration_weight"] == "0"
-    assert context["v4_entry_execution_reserve_bps"] == "1.50"
-    assert context["v4_raw_threshold_driver"] == "anchor_7d_p97_5"
-    assert threshold == Decimal("98.50")
-    assert context["v4_entry_threshold_bps"] == "98.50"
+    assert context["v4_entry_execution_reserve_bps"] == "2.00"
+    assert context["v4_raw_threshold_driver"] == "anchor_7d_p95"
+    assert threshold == Decimal("96.00")
+    assert context["v4_entry_threshold_bps"] == "96.00"
 
 
 def test_v4_entry_threshold_uses_prior_for_immature_entry_capture_reserve() -> None:
@@ -2306,9 +2306,9 @@ def test_v4_entry_threshold_uses_prior_for_immature_entry_capture_reserve() -> N
     assert context["v4_entry_capture_sample_count"] == 2
     assert context["v4_entry_capture_calibration_ready"] is False
     assert context["v4_entry_capture_raw_p80_bps"] == "3.19"
-    assert context["v4_entry_capture_prior_bps"] == "1.50"
-    assert context["v4_entry_execution_reserve_bps"] == "1.50"
-    assert threshold == Decimal("98.50")
+    assert context["v4_entry_capture_prior_bps"] == "2.00"
+    assert context["v4_entry_execution_reserve_bps"] == "2.00"
+    assert threshold == Decimal("96.00")
 
 
 def test_v4_entry_capture_reserve_blends_prior_until_twenty_samples() -> None:
@@ -2323,7 +2323,7 @@ def test_v4_entry_capture_reserve_blends_prior_until_twenty_samples() -> None:
     assert context["ready"] is True
     assert context["fully_mature"] is False
     assert context["calibration_weight"] == Decimal("0.5")
-    assert context["applied_bps"] == Decimal("2.250")
+    assert context["applied_bps"] == Decimal("2.500")
 
 
 def test_v4_fast_1d_threshold_can_raise_rolling_7d_entry_gate() -> None:
@@ -2354,7 +2354,7 @@ def test_v4_fast_1d_threshold_can_raise_rolling_7d_entry_gate() -> None:
         context["v4_7d_entry_threshold_bps"]
     )
     assert threshold == Decimal(context["v4_fast_threshold_bps"]) + Decimal(
-        "1.50"
+        "2.00"
     )
 
 
@@ -2411,7 +2411,7 @@ def test_v4_exit_target_uses_observed_tail_even_before_calibration_is_ready() ->
     assert context["ready"] is False
     assert context["fully_mature"] is False
     assert context["raw_p80_bps"] == Decimal("6.65")
-    assert context["prior_bps"] == Decimal("3.50")
+    assert context["prior_bps"] == Decimal("2.00")
     assert context["calibration_weight"] == Decimal("0")
     assert runtime.live_inventory_basis_v4_confirm_exit_candidate(
         lot,
@@ -2543,7 +2543,7 @@ def test_bidirectional_long_exit_keeps_prior_before_calibration_ready() -> None:
     )
 
     assert payload["v4_exit_shortfall_calibration_ready"] is False
-    assert payload["v4_exit_shortfall_reserve_bps"] == "3.50"
+    assert payload["v4_exit_shortfall_reserve_bps"] == "2.00"
 
 
 def test_v4_execution_reserve_loaders_ignore_other_strategies_and_assets(
@@ -2797,11 +2797,11 @@ def test_v4_reverse_test_selects_long_direction_and_conservative_reserves() -> N
     )
     assert (
         runtime.live_inventory_basis_v4_entry_execution_reserve_bps()
-        == Decimal("1.50")
+        == Decimal("2.00")
     )
     assert (
         runtime.live_inventory_basis_v4_exit_shortfall_reserve_bps()
-        == Decimal("3.50")
+        == Decimal("2.00")
     )
 
 
@@ -2925,7 +2925,7 @@ def test_v4_bidirectional_uses_observed_long_exit_reserve_when_ready() -> None:
 
     assert runtime.live_inventory_basis_v4_entry_execution_reserve_bps(
         direction="long_var_short_lighter"
-    ) == Decimal("1.50")
+    ) == Decimal("2.00")
     assert runtime.live_inventory_basis_v4_entry_execution_reserve_bps(
         direction="short_var_long_lighter"
     ) == Decimal("0.25")
@@ -3102,7 +3102,7 @@ def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> Non
     assert context["v4_health_ready"] is True
     assert context["v4_baseline_window_seconds"] == 1209600
     assert context["v4_anchor_effective_seconds"] == 172800
-    assert context["v4_entry_threshold_bps"] == "98.50"
+    assert context["v4_entry_threshold_bps"] == "96.00"
     assert context["compatible_source_rows"] == 5760
     assert context["incompatible_quote_size_rows"] == 0
     assert context["quote_size_mode"] == "exact_base_qty_v1"

@@ -236,7 +236,7 @@ def test_single_new_tail_loss_raises_reserve_immediately_then_decays_slowly():
     runtime.observe_live_inventory_exit_shortfall(direction, Decimal("0"))
     assert runtime.live_inventory_basis_v4_exit_calibration_context(direction=direction)["reserve_bps"] == Decimal("6.40")
     assert runtime.live_inventory_basis_v4_threshold_cache_by_direction == {}
-    assert runtime.live_inventory_basis_v4_exit_calibration_context(direction="long_var_short_lighter")["reserve_bps"] == Decimal("3.50")
+    assert runtime.live_inventory_basis_v4_exit_calibration_context(direction="long_var_short_lighter")["reserve_bps"] == Decimal("2.00")
 
 
 def test_reserve_envelope_survives_state_reload():
@@ -247,7 +247,7 @@ def test_reserve_envelope_survives_state_reload():
         },
     }
     runtime.sync_live_inventory_memory_from_state()
-    assert runtime.live_inventory_basis_v4_exit_calibration_context(direction="short_var_long_lighter")["reserve_bps"] == Decimal("3.50")
+    assert runtime.live_inventory_basis_v4_exit_calibration_context(direction="short_var_long_lighter")["reserve_bps"] == Decimal("2.00")
     assert runtime.live_inventory_exit_shortfall_legacy_reserve_floor_by_direction[
         "short_var_long_lighter"
     ] == Decimal("5.75")
@@ -314,5 +314,5 @@ def test_observed_exit_cost_increases_new_entry_threshold_without_waiting_for_ca
     before, _ = runtime.live_inventory_basis_v4_entry_threshold(now=now)
     runtime.observe_live_inventory_exit_shortfall("short_var_long_lighter", Decimal("6.65"))
     after, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
-    assert after - before == Decimal("3.15")
-    assert context["v4_entry_exit_cost_increment_bps"] == "3.15"
+    assert after - before == Decimal("4.65")
+    assert context["v4_entry_exit_cost_increment_bps"] == "4.65"

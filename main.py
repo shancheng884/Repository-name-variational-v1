@@ -257,6 +257,13 @@ LIVE_INVENTORY_ACCOUNT_RECOVERY_CONFIRM_SAMPLES = 3
 LIVE_INVENTORY_ACCOUNT_RISK_NOTIFICATION_CONFIRM_SAMPLES = 2
 LIVE_INVENTORY_ACCOUNT_RISK_NOTIFICATION_RECOVERY_SAMPLES = 3
 LIVE_INVENTORY_ACCOUNT_RISK_IMBALANCE_CLEAR_BUFFER = Decimal("0.02")
+LIVE_INVENTORY_ENTRY_BLOCK_EVENTS = frozenset(
+    {
+        "live_inventory_entry_blocked",
+        "live_inventory_v4_entry_blocked",
+    }
+)
+LIVE_INVENTORY_ENTRY_BLOCK_HEALTH_TTL_SECONDS = 300.0
 LIVE_INVENTORY_WATCHDOG_OWNED_NOTIFICATION_EVENTS = frozenset(
     {
         "live_inventory_account_risk_alert",
@@ -6501,6 +6508,7 @@ class VariationalToLighterRuntime:
             "expected_open_qty": decimal_to_str(expected_open_qty),
             **context,
             **reference_feed,
+            **self.live_inventory_v4_health_payload(),
         }
         await asyncio.to_thread(write_json_atomic, path, payload)
 
@@ -10092,6 +10100,231 @@ class VariationalToLighterRuntime:
             **primary,
         }
 
+    def live_inventory_basis_v4_remember_threshold_context(
+        self,
+        direction: str | None,
+        threshold_bps: Decimal | None,
+        context: dict[str, Any] | None,
+    ) -> None:
+        """Cache the freshest gate context so health output can explain it."""
+        store = getattr(
+            self,
+            "live_inventory_basis_v4_last_threshold_by_direction",
+            None,
+        )
+        if not isinstance(store, dict):
+            store = {}
+            self.live_inventory_basis_v4_last_threshold_by_direction = store
+        key = str(direction or "default")
+        store[key] = (threshold_bps, dict(context or {}), time.monotonic())
+
+    def live_inventory_basis_v4_health_reasons(
+        self,
+        context: dict[str, Any],
+        threshold_bps: Decimal | None,
+    ) -> list[str]:
+        """Name the exact gate that is blocking, instead of a generic flag."""
+        reasons: list[str] = []
+        if context.get("v4_quote_size_migration") == "legacy_frozen":
+            reasons.append("legacy_quote_size_migration")
+        if context.get("v4_anchor_ready") is False:
+            reasons.append("rolling_7d_anchor_not_ready")
+        observed_ready = context.get(
+            "v4_health_ready_observed",
+            context.get("v4_health_ready"),
+        )
+        if observed_ready is False:
+            try:
+                health_count = int(context.get("v4_health_count") or 0)
+            except (TypeError, ValueError):
+                health_count = 0
+            if health_count < LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES:
+                reasons.append("recent_1h_health_samples_below_minimum")
+            try:
+                coverage = Decimal(
+                    str(context.get("v4_health_coverage_seconds") or "0")
+                )
+            except Exception:
+                coverage = Decimal("0")
+            if coverage < Decimal(
+                LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS
+            ) * LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE:
+                reasons.append("recent_1h_health_coverage_below_minimum")
+            try:
+                max_gap = Decimal(
+                    str(context.get("v4_health_max_sample_gap_seconds") or "0")
+                )
+            except Exception:
+                max_gap = Decimal("0")
+            if max_gap > Decimal(LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS):
+                reasons.append("recent_1h_health_sample_gap_too_large")
+            if not reasons:
+                reasons.append("recent_1h_health_not_ready")
+        if threshold_bps is None and not reasons:
+            reasons.append("v4_entry_threshold_unavailable")
+        return reasons
+
+    def live_inventory_v4_health_payload(self) -> dict[str, Any]:
+        """Publish the v4 entry gates so the health file can be audited."""
+        if not getattr(self, "live_inventory_basis_v4_mode", False):
+            return {}
+        store = getattr(
+            self,
+            "live_inventory_basis_v4_last_threshold_by_direction",
+            {},
+        )
+        if not isinstance(store, dict) or not store:
+            return {
+                "v4_health_ready": False,
+                "v4_health_reasons": ["v4_gate_context_not_initialised"],
+                "v4_gate_limits": {
+                    "min_window_coverage": str(
+                        LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
+                    ),
+                    "min_history_samples": LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES,
+                    "max_sample_gap_seconds": LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS,
+                    "health_window_seconds": LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS,
+                    "history_sample_seconds": LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
+                },
+            }
+        directions: dict[str, Any] = {}
+        for key, (threshold, context, captured_at) in store.items():
+            reasons = self.live_inventory_basis_v4_health_reasons(
+                context,
+                threshold,
+            )
+            directions[key] = {
+                "ready": threshold is not None,
+                "reasons": reasons,
+                "threshold_bps": decimal_to_str(threshold),
+                "health_count": context.get("v4_health_count"),
+                "health_coverage_seconds": context.get("v4_health_coverage_seconds"),
+                "health_max_sample_gap_seconds": context.get(
+                    "v4_health_max_sample_gap_seconds"
+                ),
+                "anchor_count": context.get("v4_anchor_count"),
+                "anchor_progress_pct": context.get("v4_anchor_progress_pct"),
+                "percentile": context.get("v4_fast_percentile"),
+                "context_age_seconds": round(
+                    max(0.0, time.monotonic() - captured_at),
+                    3,
+                ),
+            }
+        entry_key = "default"
+        try:
+            if getattr(self, "live_inventory_basis_v4_bidirectional", False):
+                entry_key = str(self.live_inventory_basis_v4_entry_direction())
+        except Exception:
+            entry_key = "default"
+        primary = directions.get(entry_key) or next(iter(directions.values()))
+        last_sample_at = getattr(self, "live_inventory_basis_v4_last_sample_at", None)
+        return {
+            "v4_health_ready": bool(primary.get("ready")),
+            "v4_health_reasons": list(primary.get("reasons") or []),
+            "v4_entry_direction": entry_key,
+            "v4_entry_threshold_bps": primary.get("threshold_bps"),
+            "v4_health_count": primary.get("health_count"),
+            "v4_health_coverage_seconds": primary.get("health_coverage_seconds"),
+            "v4_health_max_sample_gap_seconds": primary.get(
+                "health_max_sample_gap_seconds"
+            ),
+            "v4_anchor_count": primary.get("anchor_count"),
+            "v4_anchor_progress_pct": primary.get("anchor_progress_pct"),
+            "v4_entry_percentile": primary.get("percentile"),
+            "v4_direction_gates": directions,
+            "v4_run_sample_count": int(
+                getattr(self, "live_inventory_basis_v4_run_sample_count", 0) or 0
+            ),
+            "v4_last_sample_at": (
+                datetime.fromtimestamp(
+                    float(last_sample_at),
+                    tz=timezone.utc,
+                ).isoformat()
+                if last_sample_at is not None
+                else None
+            ),
+            "v4_last_sample_age_seconds": (
+                round(
+                    max(
+                        0.0,
+                        time.monotonic()
+                        - float(
+                            getattr(
+                                self,
+                                "live_inventory_basis_v4_last_sample_monotonic",
+                                0.0,
+                            )
+                            or 0.0
+                        ),
+                    ),
+                    3,
+                )
+                if last_sample_at is not None
+                else None
+            ),
+            "v4_gate_limits": {
+                "min_window_coverage": str(
+                    LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
+                ),
+                "min_history_samples": LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES,
+                "max_sample_gap_seconds": LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS,
+                "health_window_seconds": LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS,
+                "history_sample_seconds": LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
+            },
+            **self.live_inventory_entry_block_payload(),
+        }
+
+    def note_live_inventory_entry_block(
+        self,
+        reason: Any,
+        *,
+        direction: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Remember why the newest entry attempt was rejected."""
+        reason_text = str(reason or "unknown")
+        fields = context if isinstance(context, dict) else {}
+        self.live_inventory_last_entry_block = {
+            "reason": reason_text,
+            "at": utc_now(),
+            "monotonic": time.monotonic(),
+            "direction": direction or fields.get("direction"),
+            "edge_bps": fields.get("edge_bps"),
+            "min_entry_edge_bps": fields.get("min_entry_edge_bps"),
+            "v4_health_ready": fields.get("v4_health_ready"),
+        }
+
+    def live_inventory_entry_block_payload(self) -> dict[str, Any]:
+        block = getattr(self, "live_inventory_last_entry_block", None)
+        if not isinstance(block, dict):
+            return {
+                "entry_gate_block_reason": "no_entry_attempt_recorded",
+                "entry_gate_block_at": None,
+                "entry_gate_block_age_seconds": None,
+                "entry_gate_block": None,
+            }
+        age_seconds = round(
+            max(
+                0.0,
+                time.monotonic()
+                - float(block.get("monotonic") or 0.0),
+            ),
+            3,
+        )
+        active = age_seconds <= LIVE_INVENTORY_ENTRY_BLOCK_HEALTH_TTL_SECONDS
+        return {
+            "entry_gate_block_reason": (
+                block.get("reason") if active else "stale_entry_block_cleared"
+            ),
+            "entry_gate_block_at": block.get("at"),
+            "entry_gate_block_age_seconds": age_seconds,
+            "entry_gate_block": {
+                key: value
+                for key, value in block.items()
+                if key != "monotonic"
+            },
+        }
+
     def live_inventory_basis_v4_entry_threshold(
         self,
         *,
@@ -10159,13 +10392,28 @@ class VariationalToLighterRuntime:
             and now - cached_at < LIVE_INVENTORY_BASIS_V4_THRESHOLD_CACHE_SECONDS
         ):
             if cached[0] is not None or history_override is not None:
+                self.live_inventory_basis_v4_remember_threshold_context(
+                    context_direction,
+                    cached[0],
+                    cached[1],
+                )
                 return cached[0], dict(cached[1])
+            self.live_inventory_basis_v4_remember_threshold_context(
+                context_direction,
+                cached[0],
+                cached[1],
+            )
             return cached[0], dict(cached[1])
 
         def finish(
             threshold_bps: Decimal | None,
             threshold_context: dict[str, Any],
         ) -> tuple[Decimal | None, dict[str, Any]]:
+            self.live_inventory_basis_v4_remember_threshold_context(
+                context_direction,
+                threshold_bps,
+                threshold_context,
+            )
             if not cache_result:
                 return threshold_bps, threshold_context
             if bidirectional:
@@ -10439,13 +10687,20 @@ class VariationalToLighterRuntime:
             return finish(None, context)
         fast_threshold = to_decimal(fast_context.get("threshold_bps"))
         weekend_context = v4_weekend_regime_context(now)
-        raw_threshold_candidates = [(anchor_threshold, "anchor_7d_p97_5")]
+        # Keep the audit label honest: it must name the percentile actually
+        # applied, otherwise a re-tune leaves a p97.5 label on a p95 gate.
+        percentile_label = str(
+            LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE
+        ).replace(".", "_")
+        raw_threshold_candidates = [
+            (anchor_threshold, f"anchor_7d_p{percentile_label}")
+        ]
         if fast_context["ready"] and fast_threshold is not None:
             raw_threshold_candidates.append((fast_threshold, "fast_1d_p95"))
         if weekend_context["v4_weekend_transition_active"]:
             for name, window_context in (
-                ("mid_15d_p97_5", mid_context),
-                ("long_30d_p97_5", long_context),
+                (f"mid_15d_p{percentile_label}", mid_context),
+                (f"long_30d_p{percentile_label}", long_context),
             ):
                 window_threshold = to_decimal(window_context.get("threshold_bps"))
                 if window_context.get("ready") and window_threshold is not None:
@@ -10601,7 +10856,16 @@ class VariationalToLighterRuntime:
         )
         if health_history is not history:
             health_history.append((now, selected_edge_bps))
-        next_sample_at = now + LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS
+        # The 30s cadence must be anchored to the wall clock. Adding the
+        # interval to `now` let every loop latency (quote arrival, decision
+        # work) accumulate, until a single 30s slot measured 61s and the
+        # one-hour health gate flapped on/off. Aligning to the next bucket
+        # keeps the spacing deterministic without inventing sample
+        # timestamps: the recorded time stays the real quote time.
+        sample_interval = float(LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS)
+        next_sample_at = (
+            math.floor(now / sample_interval) + 1.0
+        ) * sample_interval
         if bidirectional:
             self.live_inventory_basis_v4_next_history_sample_at_by_direction[
                 selected_direction
@@ -10619,6 +10883,11 @@ class VariationalToLighterRuntime:
             and health_history[0][0] <= cutoff
         ):
             health_history.popleft()
+        self.live_inventory_basis_v4_last_sample_at = now
+        self.live_inventory_basis_v4_last_sample_monotonic = time.monotonic()
+        self.live_inventory_basis_v4_run_sample_count = int(
+            getattr(self, "live_inventory_basis_v4_run_sample_count", 0) or 0
+        ) + 1
         return True
 
     def live_inventory_basis_v4_update_rearm(
@@ -14109,6 +14378,21 @@ class VariationalToLighterRuntime:
                     )
             if self.live_inventory:
                 passed.append("live_inventory_enabled")
+                passed.append(
+                    "v4_entry_gates="
+                    + json.dumps(
+                        {
+                            "min_window_coverage": str(
+                                LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
+                            ),
+                            "min_history_samples": LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES,
+                            "max_sample_gap_seconds": LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS,
+                            "health_window_seconds": LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS,
+                            "history_sample_seconds": LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
+                        },
+                        sort_keys=True,
+                    )
+                )
                 if getattr(
                     self,
                     "live_inventory_basis_v4_test_skip_recent_health",
@@ -17366,6 +17650,12 @@ class VariationalToLighterRuntime:
             await asyncio.to_thread(self._append_line, self.market_samples_file, line)
 
     async def append_live_inventory_log(self, event_type: str, payload: dict[str, Any]) -> None:
+        if event_type in LIVE_INVENTORY_ENTRY_BLOCK_EVENTS:
+            self.note_live_inventory_entry_block(
+                payload.get("reason"),
+                direction=payload.get("direction"),
+                context=payload,
+            )
         enriched_payload = {
             "record_kind": "live_inventory",
             "mode": self.mode,
@@ -20913,6 +21203,17 @@ class VariationalToLighterRuntime:
                         or v4_entry_threshold_bps is None
                     ):
                         self.live_inventory_basis_entry_confirm_counts[direction] = 0
+                        self.note_live_inventory_entry_block(
+                            (
+                                self.live_inventory_basis_v4_history_reason
+                                or "v4_entry_gate_not_ready"
+                            ),
+                            direction=direction,
+                            context={
+                                "edge_bps": decimal_to_str(edge_bps),
+                                **v4_entry_context,
+                            },
+                        )
                         if index == 1 or index % 30 == 0:
                             await self.append_live_inventory_log(
                                 "live_inventory_v4_entry_blocked",
@@ -21370,6 +21671,15 @@ class VariationalToLighterRuntime:
                         **entry_rfq_bias_context,
                     }
                 if edge_bps < min_entry_edge_bps and not entry_rfq_probe_candidate:
+                    self.note_live_inventory_entry_block(
+                        "basis_entry_edge_below_threshold",
+                        direction=direction,
+                        context={
+                            "edge_bps": decimal_to_str(edge_bps),
+                            "min_entry_edge_bps": decimal_to_str(min_entry_edge_bps),
+                            **v4_entry_context,
+                        },
+                    )
                     promoted, watch_context = self.live_inventory_update_watch_candidate(
                         direction=direction,
                         edge_bps=edge_bps,
