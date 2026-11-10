@@ -2686,6 +2686,7 @@ class VariationalToLighterRuntime:
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
         self.auto_live_state_file = output_dir / AUTO_LIVE_STATE_FILE.name if output_dir else None
         self.live_inventory_state_file = output_dir / LIVE_INVENTORY_STATE_FILE.name if output_dir else None
+        self.execution_measurements_file = output_dir / "execution_measurements.jsonl" if output_dir else None
         self.live_inventory_entry_rfq_bias_state_file = (
             output_dir / LIVE_INVENTORY_ENTRY_RFQ_BIAS_STATE_FILE_NAME
             if output_dir
@@ -3578,6 +3579,92 @@ class VariationalToLighterRuntime:
 
     def live_inventory_recent_execution_loss_buffer_bps(self) -> Decimal:
         return self.percentile_decimal(getattr(self, "live_inventory_execution_loss_bps_samples", []), 80) or Decimal("0")
+
+    def record_entry_execution_measurement(
+        self,
+        *,
+        lot: dict[str, Any],
+        context: dict[str, Any],
+        var_fill_price: Any,
+        lighter_fill_price: Any,
+    ) -> None:
+        """Append one row describing what the entry actually cost.
+
+        Nothing in the strategy used to compare the planned price with the
+        realised fill per leg, so every discussion about execution cost was
+        guesswork.  This writes a compact record per filled lot:
+
+        * planned vs realised price for both legs (bps, adverse-positive)
+        * quote age at submit and submit-to-fill latency per leg
+        * the basis the signal was computed from
+
+        It never raises: measurement must never break a live entry.
+        """
+
+        def _d(value: Any) -> Decimal | None:
+            if value is None:
+                return None
+            try:
+                parsed = Decimal(str(value))
+            except Exception:
+                return None
+            if parsed.is_nan():
+                return None
+            return parsed
+
+        def _slip_bps(planned: Decimal | None, actual: Decimal | None, side: str) -> str | None:
+            if not planned or not actual or planned <= 0:
+                return None
+            raw = (actual - planned) / planned * Decimal("10000")
+            if str(side).lower() in {"sell", "short"}:
+                raw = -raw
+            return decimal_to_str(raw)
+
+        try:
+            var_planned = _d(context.get("var_price")) or _d(context.get("var_ask"))
+            lighter_planned = _d(context.get("lighter_price"))
+            var_actual = _d(var_fill_price)
+            lighter_actual = _d(lighter_fill_price)
+            var_side = str(context.get("var_side") or "buy")
+            lighter_side = "sell" if var_side == "buy" else "buy"
+            quote_ts = parse_utc_iso(context.get("quote_timestamp"))
+            now = datetime.now(timezone.utc)
+            quote_age_ms = (
+                int((now - quote_ts).total_seconds() * 1000)
+                if quote_ts is not None
+                else None
+            )
+            row = {
+                "logged_at": utc_now(),
+                "lot_id": lot.get("lot_id"),
+                "asset": str(lot.get("asset") or getattr(self, "live_inventory_asset", "") or ""),
+                "direction": lot.get("direction"),
+                "tier": lot.get("entry_gradient_tier"),
+                "qty": lot.get("qty"),
+                "signal_basis_bps": lot.get("entry_basis_bps"),
+                "entry_threshold_bps": lot.get("entry_v4_threshold_bps"),
+                "var_side": var_side,
+                "var_planned_price": decimal_to_str(var_planned) if var_planned else None,
+                "var_fill_price": decimal_to_str(var_actual) if var_actual else None,
+                "var_slippage_bps": _slip_bps(var_planned, var_actual, var_side),
+                "lighter_planned_price": decimal_to_str(lighter_planned) if lighter_planned else None,
+                "lighter_fill_price": decimal_to_str(lighter_actual) if lighter_actual else None,
+                "lighter_slippage_bps": _slip_bps(lighter_planned, lighter_actual, lighter_side),
+                "quote_age_ms": quote_age_ms,
+                "var_submit_ms": lot.get("entry_var_submit_ms"),
+                "lighter_submit_ms": lot.get("entry_lighter_submit_ms"),
+                "record_kind": "entry_execution_measurement",
+            }
+            path = getattr(self, "execution_measurements_file", None)
+            if path is None:
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+        except Exception:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.warning("entry_execution_measurement_failed", exc_info=True)
 
     def live_inventory_basis_v4_entry_calibration_context(
         self,
@@ -12301,6 +12388,12 @@ class VariationalToLighterRuntime:
             "status": "open",
         }
         self.live_inventory_open_lots.append(lot)
+        self.record_entry_execution_measurement(
+            lot=lot,
+            context=context,
+            var_fill_price=var_fill_price,
+            lighter_fill_price=lighter_fill_price,
+        )
         if getattr(self, "live_inventory_basis_v4_mode", False):
             self.live_inventory_v4_episode_id = lot.get("episode_id") or (
                 getattr(self, "live_inventory_v4_episode_id", None)

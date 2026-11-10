@@ -1,0 +1,4 @@
+{
+  "_comment": "ETH macro event blackout. Fill at_utc with the official announcement time (UTC). before/after default to 30 minutes.",
+  "events": []
+}
