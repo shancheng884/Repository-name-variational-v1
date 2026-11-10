@@ -9635,6 +9635,59 @@ class VariationalToLighterRuntime:
         counts["rejected"] = len(rows) - len(accepted)
         return accepted, counts
 
+    async def watch_variational_quote_freshness(
+        self,
+        *,
+        stale_seconds: float = 60.0,
+        poll_seconds: float = 20.0,
+        reload_cooldown_seconds: float = 300.0,
+    ) -> None:
+        """Reload the Var page when no fresh quote arrives for a while.
+
+        When Chrome freezes the tab (RDP detached, page backgrounded) the bridge
+        keeps replaying the same quote, every sample is rejected as
+        ``duplicate_passive_reference`` and the health window starves, which
+        silently disables entries. Reloading the page re-creates the WebSocket
+        under an attached debugger, which is the only way to resume the feed.
+        """
+        last_reload = 0.0
+        while True:
+            await asyncio.sleep(max(5.0, float(poll_seconds)))
+            last_fresh = getattr(
+                self, "live_inventory_last_fresh_quote_monotonic", None
+            )
+            if last_fresh is None:
+                continue
+            age = time.monotonic() - float(last_fresh)
+            if age < stale_seconds:
+                continue
+            now = time.monotonic()
+            if now - last_reload < reload_cooldown_seconds:
+                continue
+            last_reload = now
+            self.logger.warning(
+                "variational_quote_stale_reload age_seconds=%.1f", age
+            )
+            request_id = uuid.uuid4().hex
+            try:
+                await asyncio.wait_for(
+                    self.send_variational_command(
+                        payload={
+                            "type": "VAR_API_RELOAD_PAGE",
+                            "requestId": request_id,
+                        },
+                        request_id=request_id,
+                        lane="read",
+                    ),
+                    timeout=8.0,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.warning(
+                    "variational_quote_stale_reload_failed", exc_info=True
+                )
+
     async def refresh_live_inventory_basis_v4_history_loop(
         self,
         *,
@@ -19726,6 +19779,8 @@ class VariationalToLighterRuntime:
         duplicate_passive_reference = (
             sample_skip_reason == "duplicate_passive_reference"
         )
+        if sample_skip_reason is None:
+            self.live_inventory_last_fresh_quote_monotonic = time.monotonic()
         if sample_skip_reason is not None:
             now_monotonic = time.monotonic()
             last_log = float(
@@ -27971,6 +28026,9 @@ class VariationalToLighterRuntime:
             # Keep a reference: an unreferenced task can be garbage collected.
             self.live_inventory_v4_history_refresh_task = asyncio.create_task(
                 self.refresh_live_inventory_basis_v4_history_loop(asset=v4_asset)
+            )
+            self.live_inventory_quote_watchdog_task = asyncio.create_task(
+                self.watch_variational_quote_freshness()
             )
         self.print_startup_next_steps()
         self.logger.info(
