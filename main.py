@@ -467,6 +467,28 @@ def v4_sample_slot(timestamp: float, interval: float) -> int:
     return int(float(timestamp) // float(interval))
 
 
+def v4_accept_history_sample(
+    *,
+    timestamp: float,
+    last_bucket: int | None,
+    next_sample_at: float,
+    interval: float,
+    bucket_align: bool,
+) -> tuple[bool, int | None]:
+    """Decide whether a persisted sample belongs in a rebuilt window.
+
+    Bucket mode keeps the first observation of each wall-clock slot, so
+    jitter cannot delete an observation. The legacy mode keeps the original
+    "one full interval since the last kept row" rule.
+    """
+    if bucket_align:
+        slot = v4_sample_slot(timestamp, interval)
+        if slot == last_bucket:
+            return False, last_bucket
+        return True, slot
+    return float(timestamp) >= float(next_sample_at), last_bucket
+
+
 def parse_iso_timestamp(value: Any) -> float | None:
     if not value:
         return None
@@ -9908,24 +9930,17 @@ class VariationalToLighterRuntime:
                 if logged_at is None or edge_bps is None:
                     continue
                 timestamp = logged_at.timestamp()
-                if (
-                    timestamp < cutoff
-                    or timestamp >= now
-                    or timestamp < next_sample_at
-                ):
+                if timestamp < cutoff or timestamp >= now:
                     continue
-                if bucket_align:
-                    # One observation per 30s slot, keyed by the wall clock.
-                    # Chaining "last sample + 30" instead dropped every row
-                    # that landed a few milliseconds early, which then showed
-                    # up as a 60s health gap that never happened.
-                    slot = v4_sample_slot(
-                        timestamp,
-                        LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
-                    )
-                    if slot == last_bucket:
-                        continue
-                    last_bucket = slot
+                accepted, last_bucket = v4_accept_history_sample(
+                    timestamp=timestamp,
+                    last_bucket=last_bucket,
+                    next_sample_at=next_sample_at,
+                    interval=LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
+                    bucket_align=bucket_align,
+                )
+                if not accepted:
+                    continue
                 history.append((timestamp, edge_bps))
                 mode_key = (
                     "compatible"

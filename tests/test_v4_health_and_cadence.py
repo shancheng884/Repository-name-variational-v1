@@ -394,3 +394,41 @@ def test_downtime_marker_pulls_back_to_the_last_sample() -> None:
     # Without any sample the marker keeps the shutdown time.
     runtime.live_inventory_basis_v4_last_sample_at = None
     assert runtime.live_inventory_downtime_start_ts(1_000_008.0) == 1_000_008.0
+
+
+def test_bucket_mode_keeps_rows_the_interval_chain_would_drop() -> None:
+    """Regression: the 30s chain must not also gate the bucket-mode window."""
+
+    from main import v4_accept_history_sample
+
+    interval = 30.0
+    start = 1_000_000.0
+    kept: list[float] = []
+    last_bucket = None
+    next_sample_at = 0.0
+    for step, offset in enumerate([0.0, 20.0, 50.0, 80.0, 110.0]):
+        timestamp = start + offset
+        accepted, last_bucket = v4_accept_history_sample(
+            timestamp=timestamp,
+            last_bucket=last_bucket,
+            next_sample_at=next_sample_at,
+            interval=interval,
+            bucket_align=True,
+        )
+        if accepted:
+            kept.append(timestamp)
+            next_sample_at = timestamp + interval
+
+    # Every row sits in its own 30s slot, so none of them may be dropped even
+    # though the plain interval chain would have skipped the 20s/80s rows.
+    assert len(kept) == 5
+
+    # The legacy rule is still available and still skips early rows.
+    accepted, _ = v4_accept_history_sample(
+        timestamp=start + 20.0,
+        last_bucket=None,
+        next_sample_at=start + 30.0,
+        interval=interval,
+        bucket_align=False,
+    )
+    assert accepted is False
