@@ -9632,6 +9632,38 @@ class VariationalToLighterRuntime:
         counts["rejected"] = len(rows) - len(accepted)
         return accepted, counts
 
+    async def refresh_live_inventory_basis_v4_history_loop(
+        self,
+        *,
+        asset: str,
+        interval_seconds: float = 600.0,
+    ) -> None:
+        """Rebuild the rolling anchor from disk while the process keeps running.
+
+        The history deque used to be filled once at startup and never again, so
+        the 7-day anchor only advanced when the service was restarted.  On a
+        quiet restart-free night the coverage number would sit frozen and the
+        adaptive threshold could never become ready.  Reloading periodically
+        keeps the same (already tested) loader authoritative and lets coverage
+        grow continuously.
+        """
+        while True:
+            await asyncio.sleep(max(30.0, float(interval_seconds)))
+            try:
+                info = await asyncio.to_thread(
+                    self.load_live_inventory_basis_v4_history,
+                    asset=asset,
+                )
+                self.logger.info(
+                    "v4_history_refreshed samples=%s effective_seconds=%s",
+                    (info or {}).get("samples"),
+                    (info or {}).get("effective_seconds"),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.warning("v4_history_refresh_failed", exc_info=True)
+
     def load_live_inventory_basis_v4_history(self, *, asset: str) -> dict[str, Any]:
         directions = (
             DIRECTION_LONG_VAR_SHORT_LIGHTER,
@@ -27926,11 +27958,15 @@ class VariationalToLighterRuntime:
         if self.live_inventory_basis_v4_mode and not reset_state_only:
             # Load the rolling anchor while exchange clients initialize. Recent
             # continuity is checked separately and cannot replace the 7d anchor.
+            v4_asset = next(iter(self.live_allowed_assets))
             v4_history_task = asyncio.create_task(
                 asyncio.to_thread(
                     self.load_live_inventory_basis_v4_history,
-                    asset=next(iter(self.live_allowed_assets)),
+                    asset=v4_asset,
                 )
+            )
+            asyncio.create_task(
+                self.refresh_live_inventory_basis_v4_history_loop(asset=v4_asset)
             )
         self.print_startup_next_steps()
         self.logger.info(
