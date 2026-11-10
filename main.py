@@ -406,6 +406,8 @@ LIVE_INVENTORY_RISK_HEALTH_FILE = LOG_DIR / "live_inventory_risk_health.json"
 # A killed/crashed process leaves no marker, so its gap still counts.
 LIVE_INVENTORY_PLANNED_DOWNTIME_FILE = LOG_DIR / "live_inventory_planned_downtime.json"
 LIVE_INVENTORY_PLANNED_DOWNTIME_MAX_AGE_SECONDS = 86400.0
+# Process start to first observed sample is warm-up, never market data.
+LIVE_INVENTORY_PLANNED_DOWNTIME_WARMUP_MAX_SECONDS = 300.0
 PROCESS_STARTED_WALL_CLOCK = time.time()
 READY_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.05
@@ -10229,6 +10231,48 @@ class VariationalToLighterRuntime:
             if end >= cutoff and end > start
         ]
 
+    def extend_live_inventory_planned_downtime_to_first_sample(
+        self,
+        now: float,
+    ) -> None:
+        """Stretch this restart's downtime up to the first observed sample.
+
+        Loading history and warming the quote stream takes tens of seconds
+        after the process is up. That window carries no market observation
+        either, so it belongs to the same exempt interval. The stretch is
+        capped, so a feed that stays silent after boot is still counted.
+        """
+        path = self.live_inventory_planned_downtime_path()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        closed = payload.get("closed")
+        if not isinstance(closed, list) or not closed:
+            return
+        last = closed[-1]
+        if not isinstance(last, dict):
+            return
+        start = parse_iso_timestamp(last.get("stopped_at"))
+        end = parse_iso_timestamp(last.get("started_at"))
+        if start is None or end is None:
+            return
+        if abs(end - PROCESS_STARTED_WALL_CLOCK) > 1.0:
+            return
+        if now <= end:
+            return
+        if now - end > LIVE_INVENTORY_PLANNED_DOWNTIME_WARMUP_MAX_SECONDS:
+            return
+        last["started_at"] = datetime.fromtimestamp(
+            now,
+            tz=timezone.utc,
+        ).isoformat()
+        payload["updated_at"] = utc_now()
+        write_json_atomic(path, payload)
+        self.live_inventory_planned_downtime_cache = None
+
     def live_inventory_downtime_start_ts(
         self,
         stopped_at: float | None = None,
@@ -11112,6 +11156,9 @@ class VariationalToLighterRuntime:
             and health_history[0][0] <= cutoff
         ):
             health_history.popleft()
+        if not int(getattr(self, "live_inventory_basis_v4_run_sample_count", 0) or 0):
+            with contextlib.suppress(Exception):
+                self.extend_live_inventory_planned_downtime_to_first_sample(now)
         self.live_inventory_basis_v4_last_sample_at = now
         self.live_inventory_basis_v4_last_sample_monotonic = time.monotonic()
         self.live_inventory_basis_v4_run_sample_count = int(

@@ -432,3 +432,49 @@ def test_bucket_mode_keeps_rows_the_interval_chain_would_drop() -> None:
         bucket_align=False,
     )
     assert accepted is False
+
+
+def test_warmup_extends_the_restart_downtime_to_the_first_sample(
+    tmp_path, monkeypatch
+) -> None:
+    import main as main_module
+
+    path = tmp_path / "planned_downtime.json"
+    payload = {
+        "closed": [
+            {
+                "stopped_at": "2026-11-10T14:00:00+00:00",
+                "started_at": "2026-11-10T14:00:02+00:00",
+                "reason": "signal_15",
+            }
+        ],
+        "open": None,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        main_module,
+        "PROCESS_STARTED_WALL_CLOCK",
+        parse_iso("2026-11-10T14:00:02+00:00"),
+    )
+
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_planned_downtime_file = path
+    runtime.extend_live_inventory_planned_downtime_to_first_sample(
+        parse_iso("2026-11-10T14:00:52+00:00")
+    )
+
+    intervals = runtime.load_live_inventory_planned_downtime()
+    assert intervals and abs(intervals[-1][1] - parse_iso("2026-11-10T14:00:52+00:00")) < 1.0
+
+    # A silent feed after boot is not warm-up: past the cap nothing extends.
+    runtime.extend_live_inventory_planned_downtime_to_first_sample(
+        parse_iso("2026-11-10T14:30:00+00:00")
+    )
+    intervals = runtime.load_live_inventory_planned_downtime()
+    assert abs(intervals[-1][1] - parse_iso("2026-11-10T14:00:52+00:00")) < 1.0
+
+
+def parse_iso(value: str) -> float:
+    from datetime import datetime
+
+    return datetime.fromisoformat(value).timestamp()
