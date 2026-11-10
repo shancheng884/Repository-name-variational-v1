@@ -9,6 +9,7 @@ import math
 import os
 import shutil
 import signal
+import threading
 import time
 import uuid
 from collections import deque
@@ -9779,6 +9780,16 @@ class VariationalToLighterRuntime:
                 self.logger.warning("v4_history_refresh_failed", exc_info=True)
 
     def load_live_inventory_basis_v4_history(self, *, asset: str) -> dict[str, Any]:
+        # Runs from a worker thread; hold the same lock the live sampler uses
+        # so the clear-and-refill cannot interleave with a recorded sample.
+        with self.live_inventory_basis_history_lock():
+            return self._load_live_inventory_basis_v4_history_unlocked(asset=asset)
+
+    def _load_live_inventory_basis_v4_history_unlocked(
+        self,
+        *,
+        asset: str,
+    ) -> dict[str, Any]:
         directions = (
             DIRECTION_LONG_VAR_SHORT_LIGHTER,
             DIRECTION_SHORT_VAR_LONG_LIGHTER,
@@ -10724,6 +10735,13 @@ class VariationalToLighterRuntime:
             for row in health_history
             if health_cutoff < row[0] <= now
         ]
+        # Defensive: coverage and gap maths assume chronological order, and a
+        # worker-thread rebuild must never be able to make them lie.
+        if any(
+            earlier[0] > later[0]
+            for earlier, later in zip(health_rows, health_rows[1:])
+        ):
+            health_rows.sort(key=lambda row: row[0])
         health_coverage_seconds = (
             max(0.0, now - health_rows[0][0]) if health_rows else 0.0
         )
@@ -11094,6 +11112,14 @@ class VariationalToLighterRuntime:
             ),
         })
 
+    def live_inventory_basis_history_lock(self) -> "threading.RLock":
+        """Serialize the periodic disk rebuild against live sampling."""
+        lock = getattr(self, "live_inventory_basis_history_rlock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self.live_inventory_basis_history_rlock = lock
+        return lock
+
     def record_live_inventory_basis_v4_edge(
         self,
         *,
@@ -11120,15 +11146,39 @@ class VariationalToLighterRuntime:
         )
         if now < next_sample_at:
             return False
-        history = self.live_inventory_basis_v4_history_for_direction(
-            selected_direction if bidirectional else None
-        )
-        history.append((now, selected_edge_bps))
-        health_history = self.live_inventory_basis_v4_health_history_for_direction(
-            selected_direction if bidirectional else None
-        )
-        if health_history is not history:
-            health_history.append((now, selected_edge_bps))
+        # The rolling rebuild runs in a worker thread and clears the deques
+        # before refilling them. Without this lock a live sample could land in
+        # that gap and leave the series out of order.
+        with self.live_inventory_basis_history_lock():
+            history = self.live_inventory_basis_v4_history_for_direction(
+                selected_direction if bidirectional else None
+            )
+            health_history = (
+                self.live_inventory_basis_v4_health_history_for_direction(
+                    selected_direction if bidirectional else None
+                )
+            )
+            history.append((now, selected_edge_bps))
+            if health_history is not history:
+                health_history.append((now, selected_edge_bps))
+            self._finish_live_inventory_basis_v4_sample(
+                now=now,
+                bidirectional=bidirectional,
+                selected_direction=selected_direction,
+                history=history,
+                health_history=health_history,
+            )
+        return True
+
+    def _finish_live_inventory_basis_v4_sample(
+        self,
+        *,
+        now: float,
+        bidirectional: bool,
+        selected_direction: str,
+        history: deque[tuple[float, Decimal]],
+        health_history: deque[tuple[float, Decimal]],
+    ) -> None:
         # The 30s cadence must be anchored to the wall clock. Adding the
         # interval to `now` let every loop latency (quote arrival, decision
         # work) accumulate, until a single 30s slot measured 61s and the
