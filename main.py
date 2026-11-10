@@ -335,6 +335,9 @@ LIVE_INVENTORY_VARIATIONAL_MAX_FUTURE_SKEW_SECONDS = 5.0
 # the post-rollback position. The bounded retry covers exchange settlement
 # lag without turning a transient mismatch into a permanent manual stop.
 LIVE_INVENTORY_AUTO_CLOSE_POSITION_VERIFY_TIMEOUT_SECONDS = 10.0
+# A reduce-only close is safe to repeat: it can never flip the position.
+LIVE_INVENTORY_AUTO_CLOSE_LEG_ATTEMPTS = 2
+LIVE_INVENTORY_AUTO_CLOSE_LEG_RETRY_SLEEP_SECONDS = 1.0
 LIVE_INVENTORY_AUTO_CLOSE_POSITION_VERIFY_INTERVAL_SECONDS = 0.5
 # The 15d/30d windows are diagnostic context only. Refreshing them daily keeps
 # their full-history sort out of the order-decision path.
@@ -12716,30 +12719,81 @@ class VariationalToLighterRuntime:
             except Exception as exc:
                 result["var_close"] = {"ok": False, "error": str(exc)}
         if close_lighter:
-            try:
-                (record, payload), close_ms = await self._timed_submit(
-                    self.place_lighter_order_from_plan(
-                        asset=asset,
-                        side=opposite_side,
-                        qty=qty,
-                        var_fill_price=var_price,
-                        cycle_id=lot_id,
-                        role="live_inventory_auto_close_unhedged_lighter",
-                        reduce_only=True,
+            attempts: list[dict[str, Any]] = []
+            for attempt in range(1, LIVE_INVENTORY_AUTO_CLOSE_LEG_ATTEMPTS + 1):
+                try:
+                    (record, payload), close_ms = await self._timed_submit(
+                        self.place_lighter_order_from_plan(
+                            asset=asset,
+                            side=opposite_side,
+                            qty=qty,
+                            var_fill_price=var_price,
+                            cycle_id=lot_id,
+                            role="live_inventory_auto_close_unhedged_lighter",
+                            reduce_only=True,
+                        )
                     )
-                )
-                result["lighter_close"] = {
-                    "ok": self.auto_live_eager_hedge_started(record),
-                    "submit_ms": close_ms,
-                    "payload": payload,
-                }
-            except Exception as exc:
-                result["lighter_close"] = {"ok": False, "error": str(exc)}
+                    attempt_result = {
+                        "ok": self.auto_live_eager_hedge_started(record),
+                        "submit_ms": close_ms,
+                        "payload": payload,
+                    }
+                except Exception as exc:
+                    attempt_result = {"ok": False, "error": str(exc)}
+                attempts.append(attempt_result)
+                if attempt_result["ok"]:
+                    break
+                if attempt < LIVE_INVENTORY_AUTO_CLOSE_LEG_ATTEMPTS:
+                    # The hedge fill may still be settling; reduce-only means a
+                    # second attempt can only shrink the position, never flip it.
+                    await asyncio.sleep(
+                        LIVE_INVENTORY_AUTO_CLOSE_LEG_RETRY_SLEEP_SECONDS
+                    )
+            result["lighter_close"] = attempts[-1]
+            result["lighter_close_attempts"] = attempts
         await self.append_live_inventory_log(
             "live_inventory_auto_close_unhedged_attempted",
             {"asset": asset, "lot_id": lot_id, "var_side": var_side, "qty": decimal_to_str(qty), **result},
         )
         return result
+
+    async def rollback_unhedged_entry_leg(
+        self,
+        *,
+        asset: str,
+        reason: str,
+        var_side: str,
+        qty: Decimal,
+        var_price: Decimal,
+        lot_id: int,
+        close_lighter: bool,
+        close_var: bool = False,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Reduce-only close of an unpaired leg, then verify no exposure.
+
+        A reduce-only order cannot open the opposite position, so this is safe
+        to run even when the paired leg never filled. The caller must still
+        treat an unverified result as manual review.
+        """
+        context = await self.try_auto_close_unhedged_live_inventory_leg(
+            asset=asset,
+            reason=reason,
+            var_side=var_side,
+            qty=qty,
+            var_price=var_price,
+            lot_id=lot_id,
+            close_var=close_var,
+            close_lighter=close_lighter,
+        )
+        verified, verify_reason, verify_context = (
+            await self.verify_live_inventory_auto_close_positions(asset=asset)
+        )
+        context["position_reconcile"] = {
+            "ok": verified,
+            "reason": verify_reason,
+            "context": verify_context,
+        }
+        return verified, context
 
     async def verify_live_inventory_auto_close_positions(
         self,
@@ -23831,16 +23885,45 @@ class VariationalToLighterRuntime:
                             return
                         self.remove_pending_live_inventory_var_fill_match(asset=asset, lot_id=lot_id, role="live_inventory_entry_pending_var_fill")
                         auto_close_context = None
+                        rollback_verified = False
                         if lighter_started:
-                            auto_close_context = await self.try_auto_close_unhedged_live_inventory_leg(
-                                asset=asset,
-                                reason="basis_entry_var_submit_failed_after_lighter_started",
-                                var_side=var_side,
-                                qty=submitted_qty,
-                                var_price=var_price,
-                                lot_id=lot_id,
-                                close_lighter=True,
+                            rollback_verified, auto_close_context = (
+                                await self.rollback_unhedged_entry_leg(
+                                    asset=asset,
+                                    reason=(
+                                        "basis_entry_var_submit_failed_after_"
+                                        "lighter_started"
+                                    ),
+                                    var_side=var_side,
+                                    qty=submitted_qty,
+                                    var_price=var_price,
+                                    lot_id=lot_id,
+                                    close_lighter=True,
+                                )
                             )
+                        if rollback_verified:
+                            self.live_inventory_basis_entry_confirm_counts.clear()
+                            self.mark_live_inventory_state_dirty(
+                                reason="live_inventory_entry_rolled_back_after_leg_failure"
+                            )
+                            await self.persist_live_inventory_memory(
+                                reason="basis_entry_leg_failure_auto_closed"
+                            )
+                            await self.append_live_inventory_log(
+                                "live_inventory_entry_auto_closed_after_leg_failure",
+                                {
+                                    **state_payload,
+                                    "lot_id": lot_id,
+                                    "direction": direction,
+                                    "qty": decimal_to_str(submitted_qty),
+                                    "var_result": var_result,
+                                    "auto_close_unhedged": auto_close_context,
+                                    "action": (
+                                        "continue_after_verified_flat_hedge"
+                                    ),
+                                },
+                            )
+                            return
                         await self.require_live_inventory_manual_review(
                             asset=asset,
                             reason=f"basis_entry_var_submit_failed:{var_result.get('error') or 'unknown'}",
@@ -29801,8 +29884,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--live-inventory-basis-auto-close-unhedged",
-        action="store_true",
-        help="Experimental: if one entry leg clearly fails after the other started, try a reduce-only close before manual review.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If one entry leg clearly fails after the other started, close the "
+            "filled leg with a reduce-only order and verify before falling back "
+            "to manual review. Default: enabled"
+        ),
     )
     parser.add_argument(
         "--live-inventory-entry-lighter-fill-timeout-seconds",
