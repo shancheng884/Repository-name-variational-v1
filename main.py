@@ -10661,6 +10661,20 @@ class VariationalToLighterRuntime:
             else self.live_inventory_basis_v4_health_history_for_direction(direction)
         )
         context_direction = direction or self.live_inventory_basis_v4_entry_direction()
+        # The periodic rebuild clears and refills the window in a worker
+        # thread. An empty window is a transient of that rebuild, not a market
+        # condition, so hold the previous decision instead of flipping health
+        # to "not ready" once every ten minutes.
+        if not health_history and health_history_override is None:
+            cached_entry = getattr(
+                self,
+                "live_inventory_basis_v4_last_threshold_by_direction",
+                {},
+            ).get(str(context_direction))
+            if cached_entry is not None:
+                cached_threshold, cached_context, cached_at = cached_entry
+                if time.monotonic() - cached_at <= 120.0:
+                    return cached_threshold, dict(cached_context)
         anchor_legacy_counts = getattr(
             self,
             "live_inventory_basis_v4_anchor_legacy_count_by_direction",
