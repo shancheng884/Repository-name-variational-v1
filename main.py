@@ -409,6 +409,11 @@ LIVE_INVENTORY_PLANNED_DOWNTIME_FILE = LOG_DIR / "live_inventory_planned_downtim
 LIVE_INVENTORY_PLANNED_DOWNTIME_MAX_AGE_SECONDS = 86400.0
 # Process start to first observed sample is warm-up, never market data.
 LIVE_INVENTORY_PLANNED_DOWNTIME_WARMUP_MAX_SECONDS = 300.0
+# Entry jump guard: p95 of the one-hour 30s basis moves, scaled and capped.
+LIVE_INVENTORY_BASIS_SAMPLE_MOVE_WINDOW_SECONDS = 3600.0
+LIVE_INVENTORY_BASIS_SAMPLE_MOVE_P95_MULTIPLIER = Decimal("1.5")
+LIVE_INVENTORY_BASIS_SAMPLE_MOVE_DYNAMIC_CAP_BPS = Decimal("8.0")
+LIVE_INVENTORY_BASIS_SAMPLE_MOVE_MIN_SAMPLES = 60
 PROCESS_STARTED_WALL_CLOCK = time.time()
 READY_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.05
@@ -4494,6 +4499,32 @@ class VariationalToLighterRuntime:
             "dynamic_entry_lighter_spread_regime": lighter_regime,
         }
 
+    def live_inventory_basis_sample_move_p95_bps(
+        self,
+    ) -> tuple[Decimal | None, dict[str, Any]]:
+        """p95 of the absolute basis move between neighbouring observations.
+
+        The window is the last hour of live observations, so the guard tracks
+        the current volatility regime instead of a fixed number.
+        """
+        history = getattr(self, "live_inventory_basis_bps_history", None)
+        if not isinstance(history, deque) or len(history) < 2:
+            return None, {"basis_sample_move_window_samples": 0}
+        cutoff = time.time() - LIVE_INVENTORY_BASIS_SAMPLE_MOVE_WINDOW_SECONDS
+        rows = [(ts, value) for ts, value in history if ts >= cutoff]
+        moves = [
+            abs(current[1] - previous[1])
+            for previous, current in zip(rows, rows[1:])
+        ]
+        if len(moves) < LIVE_INVENTORY_BASIS_SAMPLE_MOVE_MIN_SAMPLES:
+            return None, {"basis_sample_move_window_samples": len(moves)}
+        return self.percentile_decimal(deque(moves), 95), {
+            "basis_sample_move_window_samples": len(moves),
+            "basis_sample_move_window_seconds": (
+                LIVE_INVENTORY_BASIS_SAMPLE_MOVE_WINDOW_SECONDS
+            ),
+        }
+
     def live_inventory_basis_dynamic_sample_move_threshold_bps(self) -> tuple[Decimal, dict[str, Any]]:
         static_floor = self.live_inventory_basis_max_sample_move_bps
         if static_floor <= 0:
@@ -4501,21 +4532,39 @@ class VariationalToLighterRuntime:
                 "basis_dynamic_sample_move_enabled": False,
                 "basis_static_max_sample_move_bps": decimal_to_str(static_floor),
                 "basis_dynamic_max_sample_move_bps": decimal_to_str(static_floor),
-                "basis_sample_move_p80_bps": None,
-                "basis_sample_move_p90_bps": None,
+                "basis_sample_move_p95_bps": None,
             }
-        sample_p80 = self.percentile_decimal(self.live_inventory_basis_sample_move_bps_samples, 80)
-        sample_p90 = self.percentile_decimal(self.live_inventory_basis_sample_move_bps_samples, 90)
-        dynamic_threshold = max(static_floor, sample_p80 or Decimal("0"))
-        dynamic_cap = max(static_floor, Decimal("6"))
+        sample_p95, window_context = self.live_inventory_basis_sample_move_p95_bps()
+        source = "one_hour_window"
+        if sample_p95 is None:
+            # Cold start: fall back to the short live window so the guard is
+            # never silently disabled while the hour is still filling up.
+            sample_p95 = self.percentile_decimal(
+                self.live_inventory_basis_sample_move_bps_samples,
+                95,
+            )
+            source = "short_live_window"
+        dynamic_cap = max(
+            static_floor,
+            LIVE_INVENTORY_BASIS_SAMPLE_MOVE_DYNAMIC_CAP_BPS,
+        )
+        dynamic_threshold = max(
+            static_floor,
+            (sample_p95 or Decimal("0"))
+            * LIVE_INVENTORY_BASIS_SAMPLE_MOVE_P95_MULTIPLIER,
+        )
         dynamic_threshold = min(dynamic_threshold, dynamic_cap)
         return dynamic_threshold, {
             "basis_dynamic_sample_move_enabled": True,
             "basis_static_max_sample_move_bps": decimal_to_str(static_floor),
             "basis_dynamic_max_sample_move_bps": decimal_to_str(dynamic_threshold),
-            "basis_sample_move_p80_bps": decimal_to_str(sample_p80),
-            "basis_sample_move_p90_bps": decimal_to_str(sample_p90),
+            "basis_sample_move_p95_bps": decimal_to_str(sample_p95),
+            "basis_sample_move_p95_multiplier": decimal_to_str(
+                LIVE_INVENTORY_BASIS_SAMPLE_MOVE_P95_MULTIPLIER
+            ),
             "basis_sample_move_dynamic_cap_bps": decimal_to_str(dynamic_cap),
+            "basis_sample_move_source": source,
+            **window_context,
         }
 
     def live_inventory_open_notional_usd(self) -> Decimal:
@@ -20516,6 +20565,17 @@ class VariationalToLighterRuntime:
         )
         if not duplicate_passive_reference:
             self.live_inventory_basis_last_basis_bps = basis_bps
+            basis_history = getattr(self, "live_inventory_basis_bps_history", None)
+            if not isinstance(basis_history, deque):
+                basis_history = deque()
+                self.live_inventory_basis_bps_history = basis_history
+            observed_at = time.time()
+            basis_history.append((observed_at, basis_bps))
+            basis_cutoff = (
+                observed_at - LIVE_INVENTORY_BASIS_SAMPLE_MOVE_WINDOW_SECONDS
+            )
+            while basis_history and basis_history[0][0] < basis_cutoff:
+                basis_history.popleft()
         var_spread_bps = self.spread_bps_from_bid_ask(var_bid, var_ask)
         lighter_spread_bps = self.spread_bps_from_bid_ask(snapshot.lighter_bid, snapshot.lighter_ask)
         if var_spread_bps is not None and not duplicate_passive_reference:

@@ -478,3 +478,59 @@ def parse_iso(value: str) -> float:
     from datetime import datetime
 
     return datetime.fromisoformat(value).timestamp()
+
+
+def _move_runtime(moves, static=Decimal("3")):
+    from collections import deque as _deque
+
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_max_sample_move_bps = static
+    runtime.live_inventory_basis_sample_move_bps_samples = _deque(maxlen=200)
+    now = time.time()
+    rows = [(now - 3600 + index * 30, Decimal("0")) for index in range(len(moves) + 1)]
+    values = [Decimal("0")]
+    for move in moves:
+        values.append(values[-1] + Decimal(str(move)))
+    runtime.live_inventory_basis_bps_history = _deque(
+        (rows[index][0], values[index]) for index in range(len(values))
+    )
+    return runtime
+
+
+def test_jump_guard_tracks_the_one_hour_p95() -> None:
+    # A calm hour: p95 of the moves is small, so the static 3bps floor holds.
+    runtime = _move_runtime([1.0] * 120)
+    threshold, context = runtime.live_inventory_basis_dynamic_sample_move_threshold_bps()
+    assert threshold == Decimal("3")
+    assert context["basis_sample_move_source"] == "one_hour_window"
+    assert Decimal(context["basis_sample_move_p95_bps"]) == Decimal("1.0")
+
+    # A violent hour: p95 = 4bps, so the guard opens to 4 * 1.5 = 6bps.
+    runtime = _move_runtime([1.0] * 100 + [4.0] * 20)
+    threshold, context = runtime.live_inventory_basis_dynamic_sample_move_threshold_bps()
+    assert threshold == Decimal("6.0")
+    assert context["basis_sample_move_source"] == "one_hour_window"
+
+
+def test_jump_guard_is_capped() -> None:
+    runtime = _move_runtime([9.0] * 120)
+    threshold, context = runtime.live_inventory_basis_dynamic_sample_move_threshold_bps()
+    assert threshold == Decimal("8.0")
+    assert context["basis_sample_move_dynamic_cap_bps"] == "8.0"
+
+
+def test_jump_guard_falls_back_while_the_hour_fills() -> None:
+    from collections import deque as _deque
+
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_max_sample_move_bps = Decimal("3")
+    runtime.live_inventory_basis_sample_move_bps_samples = _deque(
+        [Decimal("2.0")] * 40,
+        maxlen=200,
+    )
+    runtime.live_inventory_basis_bps_history = _deque()
+
+    threshold, context = runtime.live_inventory_basis_dynamic_sample_move_threshold_bps()
+
+    assert context["basis_sample_move_source"] == "short_live_window"
+    assert threshold == Decimal("3")
