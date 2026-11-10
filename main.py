@@ -10646,6 +10646,27 @@ class VariationalToLighterRuntime:
         health_history_override: deque[tuple[float, Decimal]] | None = None,
         cache_result: bool = True,
     ) -> tuple[Decimal | None, dict[str, Any]]:
+        # The rolling rebuild clears and refills these deques in a worker
+        # thread. Reading them unlocked showed an empty window once per
+        # refresh, which made health flap and blocked every entry.
+        with self.live_inventory_basis_history_lock():
+            return self._live_inventory_basis_v4_entry_threshold_unlocked(
+                now=now,
+                direction=direction,
+                history_override=history_override,
+                health_history_override=health_history_override,
+                cache_result=cache_result,
+            )
+
+    def _live_inventory_basis_v4_entry_threshold_unlocked(
+        self,
+        *,
+        now: float,
+        direction: str | None = None,
+        history_override: deque[tuple[float, Decimal]] | None = None,
+        health_history_override: deque[tuple[float, Decimal]] | None = None,
+        cache_result: bool = True,
+    ) -> tuple[Decimal | None, dict[str, Any]]:
         bidirectional = bool(
             direction is not None
             and getattr(self, "live_inventory_basis_v4_bidirectional", False)
