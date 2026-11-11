@@ -192,6 +192,20 @@ def test_real_startup_does_not_start_legacy_history_before_model_restore(tmp_pat
     asyncio.run(run())
 
 
+def test_health_uses_current_median_gates_not_uninitialised_legacy_store(tmp_path,monkeypatch):
+    rt,_=loop_runtime(tmp_path,monkeypatch,D(22))
+    health=rt.live_inventory_v4_health_payload()
+    assert health['median_strategy']=='frozen_median_D6_v1'
+    assert health['v4_health_ready'] and health['median_ready']
+    assert health['v4_gate_limits']['history_sample_seconds']==1
+    assert health['v4_direction_gates'][LONG]['gradient_thresholds_bps']==['16','19.0','22','28','34']
+    assert 'frozen_median' not in health
+    rt.frozen_median_model.history.clear()
+    health=rt.live_inventory_v4_health_payload()
+    assert not health['v4_health_ready']
+    assert health['v4_health_reasons']==['median_1s_60m_warmup']
+
+
 def test_invalid_source_clears_current_signal_and_cannot_use_previous_quote(tmp_path):
     rt=fake_runtime(tmp_path);r=rt.frozen_median_last_row
     live.observe(rt,asset='ETH',quote={'quote_semantics':'reference_price_only'},

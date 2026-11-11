@@ -10585,6 +10585,28 @@ class VariationalToLighterRuntime:
         """Publish the v4 entry gates so the health file can be audited."""
         if not getattr(self, "live_inventory_basis_v4_mode", False):
             return {}
+        if median_live.enabled(self):
+            public = {k: v for k, v in median_live.checkpoint(self).items()
+                      if k.startswith("median_")}
+            gates = {}
+            for direction in self.live_inventory_basis_v4_entry_directions():
+                threshold, detail = median_live.thresholds(self, now=time.time(), direction=direction)
+                gates[direction] = {
+                    "ready": threshold is not None,
+                    "threshold_bps": decimal_to_str(threshold),
+                    "gradient_thresholds_bps": detail["v4_real_gradient_tier_thresholds_bps"],
+                }
+            ready = any(g["ready"] for g in gates.values())
+            reason = self.frozen_median_model.review_reason or "median_1s_60m_warmup"
+            return {
+                **public, "v4_health_ready": ready,
+                "v4_health_reasons": [] if ready else [reason],
+                "v4_direction_gates": gates,
+                "v4_gate_limits": {"history_sample_seconds": 1,
+                    "health_window_seconds": 3600, "min_window_coverage": "0.8",
+                    "max_sample_gap_seconds": 60},
+                **self.live_inventory_entry_block_payload(),
+            }
         store = getattr(
             self,
             "live_inventory_basis_v4_last_threshold_by_direction",
