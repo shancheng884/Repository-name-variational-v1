@@ -137,6 +137,14 @@ LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE = Decimal("95")
 LIVE_INVENTORY_BASIS_V4_FAST_ENTRY_PERCENTILE = Decimal("95")
 LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS = 30
 LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE = Decimal("0.80")
+# Liveness gate. The old rule demanded 80% coverage of a full hour, which
+# meant 48 minutes of warm-up after every restart or bridge hiccup even though
+# the entry threshold itself comes from the 14-day anchor. Continuity is what
+# actually protects the signal, so the gate now looks at a short recent window:
+# enough samples, and no hole longer than one sampling gap inside it.
+LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_WINDOW_SECONDS = 660
+LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MIN_SAMPLES = 20
+LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MAX_GAP_SECONDS = 60
 LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES = 100
 LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS = 129600
 LIVE_INVENTORY_BASIS_V4_FAST_MIN_EFFECTIVE_SECONDS = 21600
@@ -10430,35 +10438,26 @@ class VariationalToLighterRuntime:
         )
         if observed_ready is False:
             try:
-                health_count = int(context.get("v4_health_count") or 0)
+                recent_count = int(context.get("v4_health_recent_count") or 0)
             except (TypeError, ValueError):
-                health_count = 0
-            if health_count < LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES:
-                reasons.append("recent_1h_health_samples_below_minimum")
+                recent_count = 0
+            if recent_count < LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MIN_SAMPLES:
+                reasons.append("recent_10m_health_samples_below_minimum")
             try:
-                coverage = Decimal(
+                recent_max_gap = Decimal(
                     str(
-                        context.get("v4_health_observed_coverage_seconds")
-                        or context.get("v4_health_coverage_seconds")
+                        context.get("v4_health_recent_max_sample_gap_seconds")
                         or "0"
                     )
                 )
             except Exception:
-                coverage = Decimal("0")
-            if coverage < Decimal(
-                LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS
-            ) * LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE:
-                reasons.append("recent_1h_health_coverage_below_minimum")
-            try:
-                max_gap = Decimal(
-                    str(context.get("v4_health_max_sample_gap_seconds") or "0")
-                )
-            except Exception:
-                max_gap = Decimal("0")
-            if max_gap > Decimal(LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS):
-                reasons.append("recent_1h_health_sample_gap_too_large")
+                recent_max_gap = Decimal("0")
+            if recent_max_gap > Decimal(
+                LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MAX_GAP_SECONDS
+            ):
+                reasons.append("recent_10m_health_sample_gap_too_large")
             if not reasons:
-                reasons.append("recent_1h_health_not_ready")
+                reasons.append("recent_10m_health_not_ready")
         if threshold_bps is None and not reasons:
             reasons.append("v4_entry_threshold_unavailable")
         return reasons
@@ -10483,6 +10482,15 @@ class VariationalToLighterRuntime:
                     "min_history_samples": LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES,
                     "max_sample_gap_seconds": LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS,
                     "health_window_seconds": LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS,
+                    "health_recent_window_seconds": (
+                        LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_WINDOW_SECONDS
+                    ),
+                    "health_recent_min_samples": (
+                        LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MIN_SAMPLES
+                    ),
+                    "health_recent_max_sample_gap_seconds": (
+                        LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MAX_GAP_SECONDS
+                    ),
                     "history_sample_seconds": LIVE_INVENTORY_BASIS_V4_HISTORY_SAMPLE_SECONDS,
                 },
             }
@@ -10506,6 +10514,13 @@ class VariationalToLighterRuntime:
                 ),
                 "health_max_sample_gap_seconds": context.get(
                     "v4_health_max_sample_gap_seconds"
+                ),
+                "health_recent_window_seconds": context.get(
+                    "v4_health_recent_window_seconds"
+                ),
+                "health_recent_count": context.get("v4_health_recent_count"),
+                "health_recent_max_sample_gap_seconds": context.get(
+                    "v4_health_recent_max_sample_gap_seconds"
                 ),
                 "anchor_count": context.get("v4_anchor_count"),
                 "anchor_progress_pct": context.get("v4_anchor_progress_pct"),
@@ -10538,6 +10553,10 @@ class VariationalToLighterRuntime:
             ),
             "v4_health_max_sample_gap_seconds": primary.get(
                 "health_max_sample_gap_seconds"
+            ),
+            "v4_health_recent_count": primary.get("health_recent_count"),
+            "v4_health_recent_max_sample_gap_seconds": primary.get(
+                "health_recent_max_sample_gap_seconds"
             ),
             "v4_anchor_count": primary.get("anchor_count"),
             "v4_anchor_progress_pct": primary.get("anchor_progress_pct"),
@@ -10636,6 +10655,24 @@ class VariationalToLighterRuntime:
                 if key != "monotonic"
             },
         }
+
+    @staticmethod
+    def live_inventory_gap_seconds_excluding_downtime(
+        previous: float,
+        current: float,
+        downtime_intervals: list[tuple[float, float]],
+    ) -> float:
+        """A clean shutdown explains part of a hole, not the whole feed."""
+
+        gap = float(current) - float(previous)
+        for downtime_start, downtime_end in downtime_intervals:
+            overlap = min(float(current), float(downtime_end)) - max(
+                float(previous),
+                float(downtime_start),
+            )
+            if overlap > 0:
+                gap -= overlap
+        return max(0.0, gap)
 
     def live_inventory_basis_v4_entry_threshold(
         self,
@@ -10836,13 +10873,37 @@ class VariationalToLighterRuntime:
             )
         ]
         health_max_gap_seconds = max(health_gaps, default=0.0)
+        recent_cutoff = (
+            now - LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_WINDOW_SECONDS
+        )
+        recent_health_rows = [
+            row for row in health_rows if row[0] > recent_cutoff
+        ]
+        # A hole that starts before the window and ends inside it would be
+        # invisible to a window-local diff, so anchor the chain on the last
+        # observation at or before the cutoff. This can only tighten the gate.
+        prior_health_rows = [
+            row for row in health_rows if row[0] <= recent_cutoff
+        ]
+        recent_chain = (
+            [prior_health_rows[-1], *recent_health_rows]
+            if prior_health_rows
+            else list(recent_health_rows)
+        )
+        recent_health_gaps = [
+            self.live_inventory_gap_seconds_excluding_downtime(
+                previous[0],
+                current[0],
+                downtime_intervals,
+            )
+            for previous, current in zip(recent_chain, recent_chain[1:])
+        ]
+        recent_health_max_gap_seconds = max(recent_health_gaps, default=0.0)
         health_ready_observed = (
-            len(health_rows) >= LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES
-            and Decimal(str(health_observed_coverage_seconds))
-            >= Decimal(LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS)
-            * LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE
-            and health_max_gap_seconds
-            <= LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS
+            len(recent_health_rows)
+            >= LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MIN_SAMPLES
+            and recent_health_max_gap_seconds
+            <= LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MAX_GAP_SECONDS
         )
         health_gate_bypassed = bool(
             getattr(
@@ -10979,6 +11040,13 @@ class VariationalToLighterRuntime:
                 f"{health_observed_coverage_seconds:.3f}"
             ),
             "v4_health_max_sample_gap_seconds": f"{health_max_gap_seconds:.3f}",
+            "v4_health_recent_window_seconds": (
+                LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_WINDOW_SECONDS
+            ),
+            "v4_health_recent_count": len(recent_health_rows),
+            "v4_health_recent_max_sample_gap_seconds": (
+                f"{recent_health_max_gap_seconds:.3f}"
+            ),
             "v4_health_ready": health_ready,
             "v4_health_ready_observed": health_ready_observed,
             "v4_health_gate_bypassed": health_gate_bypassed,

@@ -8,6 +8,9 @@ from collections import deque
 from decimal import Decimal
 
 from main import (
+    LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MAX_GAP_SECONDS,
+    LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MIN_SAMPLES,
+    LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_WINDOW_SECONDS,
     LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS,
     LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS,
     LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES,
@@ -39,6 +42,10 @@ def test_v4_gate_limits_match_the_reviewed_source_values() -> None:
     assert LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE == Decimal("0.80")
     assert LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES == 100
     assert LIVE_INVENTORY_BASIS_V4_MAX_SAMPLE_GAP_SECONDS == 60
+    # Liveness gate: eleven minutes of window, twenty samples, no 60s hole.
+    assert LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_WINDOW_SECONDS == 660
+    assert LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MIN_SAMPLES == 20
+    assert LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MAX_GAP_SECONDS == 60
 
 
 def test_v4_sample_cadence_is_anchored_to_wall_clock() -> None:
@@ -110,7 +117,7 @@ def test_v4_health_reasons_name_the_failing_gate() -> None:
     health_rows = [
         (now - 3000 + index * 30, Decimal(index)) for index in range(50)
     ] + [
-        (now - 1400 + index * 30, Decimal(index + 50)) for index in range(50)
+        (now - 540 + index * 30, Decimal(index + 50)) for index in range(19)
     ]
     runtime.live_inventory_basis_v4_history = _anchor_rows(now, health_rows)
 
@@ -118,7 +125,7 @@ def test_v4_health_reasons_name_the_failing_gate() -> None:
     reasons = runtime.live_inventory_basis_v4_health_reasons(context, threshold)
 
     assert threshold is None
-    assert "recent_1h_health_sample_gap_too_large" in reasons
+    assert "recent_10m_health_sample_gap_too_large" in reasons
 
 
 def test_v4_health_reasons_are_empty_when_ready() -> None:
@@ -258,45 +265,48 @@ def test_v4_health_payload_reports_missing_context() -> None:
     assert payload["v4_health_reasons"] == ["v4_gate_context_not_initialised"]
 
 
-def _downtime_runtime(now, hole_seconds, downtime=True):
+def _rows_with_hole(now, hole_start, hole_end):
+    """A clean 30s grid over the last 55 minutes with one observation hole."""
+
+    rows = []
+    timestamp = now - 3300
+    index = 0
+    while timestamp <= now:
+        if not (hole_start <= timestamp < hole_end):
+            rows.append((timestamp, Decimal(index)))
+        index += 1
+        timestamp += 30
+    return rows
+
+
+def _downtime_runtime(now, hole_seconds, downtime=True, hole_end_offset=560.0):
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
-    first_len = 50
-    start = now - 3300
-    part_one = [
-        (start + index * 30, Decimal(index)) for index in range(first_len)
-    ]
-    resume = start + first_len * 30 + hole_seconds
-    part_two = [
-        (resume + index * 30, Decimal(first_len + index))
-        for index in range(int((now - resume) // 30) + 1)
-    ]
+    hole_end = now - hole_end_offset
+    hole_start = hole_end - hole_seconds
     runtime.live_inventory_basis_v4_history = _anchor_rows(
         now,
-        part_one + part_two,
+        _rows_with_hole(now, hole_start, hole_end),
     )
-    last_row_before_stop = part_one[-1][0]
     runtime.live_inventory_planned_downtime_cache = (
-        [(last_row_before_stop, resume)] if downtime else []
+        [(hole_start, hole_end)] if downtime else []
     )
     return runtime
 
 
 def test_planned_downtime_is_not_a_market_gap() -> None:
     now = 1_000_000.0
-    runtime = _downtime_runtime(now, 240.0, downtime=True)
+    # The hole is far outside the recent liveness window: continuous data
+    # before and after it is enough.
+    runtime = _downtime_runtime(now, 600.0, downtime=True, hole_end_offset=1800.0)
 
     threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
 
     assert threshold is not None
     assert context["v4_health_ready"] is True
-    assert Decimal(context["v4_health_excluded_downtime_seconds"]) >= Decimal("240")
-    assert Decimal(context["v4_health_observed_coverage_seconds"]) >= Decimal(
-        "2880"
-    )
     assert runtime.live_inventory_basis_v4_health_reasons(context, threshold) == []
 
 
-def test_unmarked_gap_still_blocks_trading() -> None:
+def test_unmarked_gap_inside_the_window_still_blocks_trading() -> None:
     now = 1_000_000.0
     runtime = _downtime_runtime(now, 240.0, downtime=False)
 
@@ -305,34 +315,42 @@ def test_unmarked_gap_still_blocks_trading() -> None:
     assert threshold is None
     assert context["v4_health_excluded_downtime_seconds"] == "0.000"
     reasons = runtime.live_inventory_basis_v4_health_reasons(context, threshold)
-    assert "recent_1h_health_sample_gap_too_large" in reasons
+    assert "recent_10m_health_sample_gap_too_large" in reasons
 
 
-def test_long_planned_downtime_does_not_satisfy_the_48_minute_budget() -> None:
+def test_marked_downtime_removes_the_gap_but_not_the_sample_count() -> None:
+    """A shutdown is not a market hole, yet it cannot invent samples either."""
+
     now = 1_000_000.0
-    runtime = _downtime_runtime(now, 2400.0, downtime=True)
+    runtime = _downtime_runtime(now, 240.0, downtime=True)
 
     threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
 
     assert threshold is None
-    assert Decimal(context["v4_health_observed_coverage_seconds"]) < Decimal("2880")
+    assert Decimal(context["v4_health_excluded_downtime_seconds"]) > 0
     reasons = runtime.live_inventory_basis_v4_health_reasons(context, threshold)
-    assert "recent_1h_health_coverage_below_minimum" in reasons
+    assert "recent_10m_health_sample_gap_too_large" not in reasons
+    assert "recent_10m_health_samples_below_minimum" in reasons
 
 
-def test_partial_downtime_overlap_keeps_the_gap(tmp_path) -> None:
+def test_recovery_needs_only_the_short_recent_window() -> None:
+    """Twenty fresh samples are enough again; the old rule wanted 48 minutes."""
+
     now = 1_000_000.0
-    runtime = _downtime_runtime(now, 240.0, downtime=True)
-    # The marker only covers the first half of the hole, so the rest is a gap.
-    hole_start = runtime.live_inventory_planned_downtime_cache[0][0]
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_basis_v4_history = _anchor_rows(
+        now,
+        _rows_with_hole(now, now - 3000.0, now - 900.0),
+    )
     runtime.live_inventory_planned_downtime_cache = [
-        (hole_start, hole_start + 120.0)
+        (now - 3000.0, now - 900.0)
     ]
 
     threshold, context = runtime.live_inventory_basis_v4_entry_threshold(now=now)
 
-    assert threshold is None
-    assert Decimal(context["v4_health_max_sample_gap_seconds"]) > Decimal("60")
+    assert threshold is not None
+    assert context["v4_health_ready"] is True
+    assert int(context["v4_health_recent_count"]) >= 20
 
 
 def test_shutdown_marker_is_closed_at_the_next_start(tmp_path) -> None:
