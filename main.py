@@ -1095,6 +1095,50 @@ def account_snapshot_freshness(
     }
 
 
+def v4_direction_is_short(direction: str | None) -> bool:
+    """The short leg quotes a negative edge: "better" means more negative."""
+
+    return str(direction or "") == DIRECTION_SHORT_VAR_LONG_LIGHTER
+
+
+def v4_mirrored_percentile(percentile: Decimal, direction: str | None) -> Decimal:
+    """A p95 opportunity on the short side is the p5 of the signed values."""
+
+    if v4_direction_is_short(direction):
+        return Decimal("100") - percentile
+    return percentile
+
+
+def v4_edge_meets_threshold(
+    edge_bps: Decimal | None,
+    threshold_bps: Decimal | None,
+    *,
+    direction: str | None = None,
+) -> bool:
+    """Compare an edge against its threshold in the direction it belongs to."""
+
+    if edge_bps is None or threshold_bps is None:
+        return False
+    if v4_direction_is_short(direction):
+        return edge_bps <= threshold_bps
+    return edge_bps >= threshold_bps
+
+
+def v4_edge_margin_bps(
+    edge_bps: Decimal | None,
+    threshold_bps: Decimal | None,
+    *,
+    direction: str | None = None,
+) -> Decimal | None:
+    """Positive margin means the edge is on the profitable side of the bar."""
+
+    if edge_bps is None or threshold_bps is None:
+        return None
+    if v4_direction_is_short(direction):
+        return threshold_bps - edge_bps
+    return edge_bps - threshold_bps
+
+
 def v4_real_gradient_thresholds(
     *,
     history_values: list[Decimal],
@@ -1103,6 +1147,7 @@ def v4_real_gradient_thresholds(
     actual_market_noise_bps: Decimal | None = None,
     incremental_depth_cost_bps: Decimal | None = None,
     recent_pair_execution_error_bps: Decimal | None = None,
+    direction: str | None = None,
 ) -> list[Decimal]:
     # The absolute pair-execution error is already represented in the base
     # execution reserve. Reusing it as every tier's spacing double-counts the
@@ -1112,12 +1157,26 @@ def v4_real_gradient_thresholds(
         abs(actual_market_noise_bps or Decimal("0")),
         abs(incremental_depth_cost_bps or Decimal("0")),
     )
+    short_side = v4_direction_is_short(direction)
     thresholds = [base_threshold_bps]
     for percentile in LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_PERCENTILES[1:]:
         historical = VariationalToLighterRuntime.live_inventory_basis_v4_percentile(
             history_values,
-            percentile,
+            v4_mirrored_percentile(percentile, direction),
         )
+        if short_side:
+            candidate = (
+                historical - entry_execution_reserve_bps
+                if historical is not None
+                else thresholds[-1] - spacing_bps
+            )
+            thresholds.append(
+                min(
+                    candidate,
+                    thresholds[-1] - spacing_bps,
+                )
+            )
+            continue
         candidate = (
             historical + entry_execution_reserve_bps
             if historical is not None
@@ -1135,8 +1194,13 @@ def v4_real_gradient_thresholds(
 def v4_real_gradient_eligible_tier(
     edge_bps: Decimal,
     thresholds_bps: list[Decimal],
+    direction: str | None = None,
 ) -> int:
-    return sum(1 for threshold in thresholds_bps if edge_bps >= threshold)
+    return sum(
+        1
+        for threshold in thresholds_bps
+        if v4_edge_meets_threshold(edge_bps, threshold, direction=direction)
+    )
 
 
 def v4_exact_rfq_entry_threshold(
@@ -1204,7 +1268,11 @@ def v4_opposite_direction_rearm_allowed(
         and candidate_direction != rearm_direction
         and candidate_edge_bps is not None
         and candidate_threshold_bps is not None
-        and candidate_edge_bps >= candidate_threshold_bps
+        and v4_edge_meets_threshold(
+            candidate_edge_bps,
+            candidate_threshold_bps,
+            direction=candidate_direction,
+        )
     )
 
 
@@ -1283,6 +1351,7 @@ def v4_entry_rfq_probe_candidate_kind(
     exact_entry_threshold_bps: Decimal | None,
     bias_ready: bool,
     exploration_due: bool,
+    direction: str | None = None,
 ) -> str | None:
     """Classify executable and bounded first-lot RFQ probes."""
     if (
@@ -1292,15 +1361,27 @@ def v4_entry_rfq_probe_candidate_kind(
         or exact_entry_threshold_bps is None
     ):
         return None
-    if predicted_exact_edge_bps >= exact_entry_threshold_bps:
+    if v4_edge_meets_threshold(
+        predicted_exact_edge_bps,
+        exact_entry_threshold_bps,
+        direction=direction,
+    ):
         return "predicted_exact_threshold"
+    band = LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_BAND_BPS
+    exploration_band_edge = (
+        exact_entry_threshold_bps + band
+        if v4_direction_is_short(direction)
+        else exact_entry_threshold_bps - band
+    )
     if (
         account_flat
         and bias_ready
         and exploration_due
-        and predicted_exact_edge_bps
-        >= exact_entry_threshold_bps
-        - LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_BAND_BPS
+        and v4_edge_meets_threshold(
+            predicted_exact_edge_bps,
+            exploration_band_edge,
+            direction=direction,
+        )
     ):
         return "near_threshold_exploration"
     return None
@@ -1344,6 +1425,7 @@ def v4_single_lot_rfq_probe_allowed(
     passive_edge_bps: Decimal,
     passive_threshold_bps: Decimal | None,
     candidate_kind: str | None,
+    direction: str | None = None,
 ) -> bool:
     return bool(
         v4_enabled
@@ -1352,16 +1434,27 @@ def v4_single_lot_rfq_probe_allowed(
         and refresh_enabled
         and passive_threshold_bps is not None
         and (
-            passive_edge_bps >= passive_threshold_bps
+            v4_edge_meets_threshold(
+                passive_edge_bps,
+                passive_threshold_bps,
+                direction=direction,
+            )
             or candidate_kind is not None
         )
     )
 
 
 def v4_entry_rfq_exact_edge_passes(
-    *, exact_edge_bps: Decimal, required_edge_bps: Decimal
+    *,
+    exact_edge_bps: Decimal,
+    required_edge_bps: Decimal,
+    direction: str | None = None,
 ) -> bool:
-    return exact_edge_bps >= required_edge_bps
+    return v4_edge_meets_threshold(
+        exact_edge_bps,
+        required_edge_bps,
+        direction=direction,
+    )
 
 
 def v4_entry_rfq_exact_quality_passes(
@@ -3564,6 +3657,7 @@ class VariationalToLighterRuntime:
         predicted_exact_edge_bps: Decimal | None,
         exact_entry_threshold_bps: Decimal | None,
         bias_ready: bool,
+        direction: str | None = None,
     ) -> bool:
         """Allow calibration RFQs only inside a bounded near-threshold band."""
         if (
@@ -3572,11 +3666,15 @@ class VariationalToLighterRuntime:
             or exact_entry_threshold_bps is None
         ):
             return False
+        band = LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_BAND_BPS
+        if v4_direction_is_short(direction):
+            return (
+                predicted_exact_edge_bps > exact_entry_threshold_bps
+                and predicted_exact_edge_bps <= exact_entry_threshold_bps + band
+            )
         return (
             predicted_exact_edge_bps < exact_entry_threshold_bps
-            and predicted_exact_edge_bps
-            >= exact_entry_threshold_bps
-            - LIVE_INVENTORY_BASIS_V4_ENTRY_RFQ_EXPLORATION_BAND_BPS
+            and predicted_exact_edge_bps >= exact_entry_threshold_bps - band
         )
 
     def record_live_inventory_entry_rfq_bias_sample(
@@ -10916,7 +11014,10 @@ class VariationalToLighterRuntime:
         fast_context = self.live_inventory_basis_v4_window_stats(
             now=now,
             window_seconds=LIVE_INVENTORY_BASIS_V4_FAST_WINDOW_SECONDS,
-            percentile=LIVE_INVENTORY_BASIS_V4_FAST_ENTRY_PERCENTILE,
+            percentile=v4_mirrored_percentile(
+                LIVE_INVENTORY_BASIS_V4_FAST_ENTRY_PERCENTILE,
+                direction,
+            ),
             min_effective_seconds=LIVE_INVENTORY_BASIS_V4_FAST_MIN_EFFECTIVE_SECONDS,
             min_coverage_seconds=LIVE_INVENTORY_BASIS_V4_FAST_MIN_EFFECTIVE_SECONDS,
             require_contiguous=True,
@@ -10957,7 +11058,10 @@ class VariationalToLighterRuntime:
             mid_context = self.live_inventory_basis_v4_window_stats(
                 now=now,
                 window_seconds=LIVE_INVENTORY_BASIS_V4_MID_WINDOW_SECONDS,
-                percentile=LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE,
+                percentile=v4_mirrored_percentile(
+                    LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE,
+                    direction,
+                ),
                 min_effective_seconds=5 * 86400,
                 min_coverage_seconds=int(
                     LIVE_INVENTORY_BASIS_V4_MID_WINDOW_SECONDS
@@ -10969,7 +11073,10 @@ class VariationalToLighterRuntime:
             long_context = self.live_inventory_basis_v4_window_stats(
                 now=now,
                 window_seconds=LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS,
-                percentile=LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE,
+                percentile=v4_mirrored_percentile(
+                    LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE,
+                    direction,
+                ),
                 min_effective_seconds=10 * 86400,
                 min_coverage_seconds=int(
                     LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS
@@ -11107,7 +11214,13 @@ class VariationalToLighterRuntime:
             return finish(None, context)
 
         values = [edge_bps for _, edge_bps in anchor_rows]
-        anchor_threshold = self.live_inventory_basis_v4_percentile(values)
+        anchor_threshold = self.live_inventory_basis_v4_percentile(
+            values,
+            v4_mirrored_percentile(
+                LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE,
+                direction,
+            ),
+        )
         if anchor_threshold is None:
             return finish(None, context)
         fast_threshold = to_decimal(fast_context.get("threshold_bps"))
@@ -11130,9 +11243,12 @@ class VariationalToLighterRuntime:
                 window_threshold = to_decimal(window_context.get("threshold_bps"))
                 if window_context.get("ready") and window_threshold is not None:
                     raw_threshold_candidates.append((window_threshold, name))
-        raw_threshold, raw_threshold_driver = max(
-            raw_threshold_candidates,
-            key=lambda item: item[0],
+        # Every candidate has to be passed, so the strictest one wins. On the
+        # short side "stricter" means the more negative value.
+        raw_threshold, raw_threshold_driver = (
+            min(raw_threshold_candidates, key=lambda item: item[0])
+            if v4_direction_is_short(direction)
+            else max(raw_threshold_candidates, key=lambda item: item[0])
         )
         entry_execution_reserve_bps = (
             self.live_inventory_basis_v4_entry_execution_reserve_bps(
@@ -11145,7 +11261,11 @@ class VariationalToLighterRuntime:
             Decimal("0"),
         )
         entry_execution_reserve_bps += exit_cost_increment_bps
-        threshold = raw_threshold + entry_execution_reserve_bps
+        threshold = (
+            raw_threshold - entry_execution_reserve_bps
+            if v4_direction_is_short(direction)
+            else raw_threshold + entry_execution_reserve_bps
+        )
         market_noise_bps = self.percentile_decimal(
             [
                 abs(value)
@@ -11205,6 +11325,7 @@ class VariationalToLighterRuntime:
             actual_market_noise_bps=market_noise_bps,
             incremental_depth_cost_bps=incremental_depth_cost_bps,
             recent_pair_execution_error_bps=recent_pair_execution_error_bps,
+            direction=direction,
         )
         return finish(threshold, {
             **context,
@@ -21244,6 +21365,7 @@ class VariationalToLighterRuntime:
                         bias_ready=(
                             bias_context.get("v4_entry_rfq_bias_ready") is True
                         ),
+                        direction=direction,
                         exploration_due=(
                             self.live_inventory_basis_v4_entry_rfq_exploration_due(
                                 direction,
@@ -21278,6 +21400,7 @@ class VariationalToLighterRuntime:
                 v4_real_gradient_eligible_tier(
                     v4_signal_edges[direction],
                     thresholds,
+                    direction=direction,
                 )
                 if self.live_inventory_basis_v4_real_gradient
                 else 0
@@ -21355,6 +21478,7 @@ class VariationalToLighterRuntime:
             candidate_kind=v4_entry_rfq_candidate_kinds.get(
                 v4_entry_direction
             ),
+            direction=v4_entry_direction,
         )
         real_gradient_tier_before_probe = real_gradient_tier
         real_gradient_tier, real_gradient_confirmation_mode = (
@@ -21946,11 +22070,16 @@ class VariationalToLighterRuntime:
                                     },
                                 )
                             continue
-                    direction_signal = edge_bps - v4_entry_threshold_bps
+                    direction_signal = v4_edge_margin_bps(
+                        edge_bps,
+                        v4_entry_threshold_bps,
+                        direction=direction,
+                    )
                     if self.live_inventory_basis_v4_real_gradient:
                         raw_real_gradient_tier = v4_real_gradient_eligible_tier(
                             edge_bps,
                             real_gradient_thresholds,
+                            direction=direction,
                         )
                         if (
                             real_gradient_tier <= 0
@@ -22205,7 +22334,11 @@ class VariationalToLighterRuntime:
                         "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
                     }
                 elif v4_mode:
-                    entry_quality_score_bps = edge_bps - min_entry_edge_bps
+                    entry_quality_score_bps = v4_edge_margin_bps(
+                        edge_bps,
+                        min_entry_edge_bps,
+                        direction=direction,
+                    )
                     entry_quality_context = {
                         "entry_quality_mode": "v4_strict_prior_p97_5",
                         "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
@@ -22305,7 +22438,14 @@ class VariationalToLighterRuntime:
                         ),
                         **entry_rfq_bias_context,
                     }
-                if edge_bps < min_entry_edge_bps and not entry_rfq_probe_candidate:
+                if (
+                    not v4_edge_meets_threshold(
+                        edge_bps,
+                        min_entry_edge_bps,
+                        direction=direction,
+                    )
+                    and not entry_rfq_probe_candidate
+                ):
                     self.note_live_inventory_entry_block(
                         "basis_entry_edge_below_threshold",
                         direction=direction,
@@ -23031,6 +23171,7 @@ class VariationalToLighterRuntime:
                                 v4_real_gradient_eligible_tier(
                                     edge_bps,
                                     exact_real_gradient_thresholds,
+                                    direction=direction,
                                 )
                             )
                             required_refreshed_raw_gradient_tier = (
@@ -23084,7 +23225,11 @@ class VariationalToLighterRuntime:
                                 real_gradient_tier,
                                 refreshed_raw_gradient_tier,
                             )
-                        entry_quality_score_bps = edge_bps - min_entry_edge_bps
+                        entry_quality_score_bps = v4_edge_margin_bps(
+                            edge_bps,
+                            min_entry_edge_bps,
+                            direction=direction,
+                        )
                         entry_quality_context = {
                             "entry_quality_mode": "v4_strict_prior_p97_5",
                             "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
@@ -23112,6 +23257,7 @@ class VariationalToLighterRuntime:
                         and not v4_entry_rfq_exact_edge_passes(
                             exact_edge_bps=edge_bps,
                             required_edge_bps=min_entry_edge_bps,
+                            direction=direction,
                         )
                     ):
                         self.live_inventory_basis_entry_rfq_cooldown_until_monotonic[
@@ -23206,6 +23352,7 @@ class VariationalToLighterRuntime:
                             quantized_raw_gradient_tier = v4_real_gradient_eligible_tier(
                                 edge_bps,
                                 exact_real_gradient_thresholds,
+                                direction=direction,
                             )
                             required_quantized_raw_gradient_tier = (
                                 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_STRONG_SINGLE_MIN_TIER
@@ -23572,7 +23719,11 @@ class VariationalToLighterRuntime:
                             "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
                         }
                     elif v4_mode:
-                        entry_quality_score_bps = edge_bps - min_entry_edge_bps
+                        entry_quality_score_bps = v4_edge_margin_bps(
+                            edge_bps,
+                            min_entry_edge_bps,
+                            direction=direction,
+                        )
                         entry_quality_context = {
                             "entry_quality_mode": "v4_strict_prior_p97_5",
                             "entry_quality_roundtrip_pnl_bps": decimal_to_str(roundtrip_bps),
@@ -23595,7 +23746,11 @@ class VariationalToLighterRuntime:
                             basis_sample_move_bps=basis_sample_move_bps,
                             roundtrip_bps=roundtrip_bps,
                         )
-                    if not calibration_mode and edge_bps < min_entry_edge_bps:
+                    if not calibration_mode and not v4_edge_meets_threshold(
+                        edge_bps,
+                        min_entry_edge_bps,
+                        direction=direction,
+                    ):
                         await self.append_live_inventory_log(
                             "live_inventory_entry_blocked",
                             {

@@ -2842,8 +2842,8 @@ def test_v4_rearm_selects_only_a_fully_qualified_opposite_direction() -> None:
     runtime.live_inventory_v4_rearm_direction = "long_var_short_lighter"
 
     edges = {
-        "long_var_short_lighter": Decimal("10"),
-        "short_var_long_lighter": Decimal("-6"),
+        "long_var_short_lighter": Decimal("4"),
+        "short_var_long_lighter": Decimal("-8"),
     }
     thresholds = {
         "long_var_short_lighter": Decimal("5"),
@@ -2859,7 +2859,7 @@ def test_v4_rearm_selects_only_a_fully_qualified_opposite_direction() -> None:
         rearm_required=True,
         rearm_direction="long_var_short_lighter",
         candidate_direction="short_var_long_lighter",
-        candidate_edge_bps=Decimal("-7.1"),
+        candidate_edge_bps=Decimal("-6.9"),
         candidate_threshold_bps=Decimal("-7"),
         is_flat=True,
         has_pending_actions=False,
@@ -2893,7 +2893,7 @@ def test_v4_opposite_rearm_allows_flat_confirmed_edge_only() -> None:
         rearm_required=True,
         rearm_direction="long_var_short_lighter",
         candidate_direction="short_var_long_lighter",
-        candidate_edge_bps=Decimal("-6"),
+        candidate_edge_bps=Decimal("-7.5"),
         candidate_threshold_bps=Decimal("-7"),
         is_flat=True,
         has_pending_actions=False,
@@ -3024,15 +3024,19 @@ def test_v4_bidirectional_thresholds_use_separate_direction_histories() -> None:
     runtime.live_inventory_basis_sample_move_bps_samples = deque(maxlen=200)
     runtime.live_inventory_latest_basis_size_ladder = []
     now = 1_000_000.0
-    short_rows = _v4_rolling_anchor_rows(
-        now,
-        [
-            (now - 3000 + index * 30, Decimal(index))
-            for index in range(100)
-        ],
+    # Real short-side history is negative end to end, including the rolling
+    # anchor filler, so build it from the helper's rows with the sign flipped.
+    foundational = _v4_rolling_anchor_rows(now, [])
+    short_rows = deque(
+        (timestamp, -abs(edge))
+        for timestamp, edge in foundational
+    )
+    short_rows.extend(
+        (now - 3000 + index * 30, -(Decimal(index) + Decimal("10")))
+        for index in range(100)
     )
     long_rows = deque(
-        (timestamp, edge + Decimal("10"))
+        (timestamp, -edge)
         for timestamp, edge in short_rows
     )
     runtime.live_inventory_basis_v4_histories = {
@@ -3051,7 +3055,8 @@ def test_v4_bidirectional_thresholds_use_separate_direction_histories() -> None:
 
     assert long_threshold is not None
     assert short_threshold is not None
-    assert long_threshold - short_threshold == Decimal("10")
+    assert long_threshold > 0 > short_threshold
+    assert abs(abs(long_threshold) - abs(short_threshold)) <= Decimal("2")
     assert long_context["v4_history_direction"] == "long_var_short_lighter"
     assert short_context["v4_history_direction"] == "short_var_long_lighter"
 
@@ -3085,7 +3090,7 @@ def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> Non
             "sample_kind": "baseline",
             "sample_quality": "valid",
             "quote_size_mode": "exact_base_qty_v1",
-            "short_edge_bps": str(edge_bps),
+            "short_edge_bps": str(-edge_bps),
         }
         for timestamp, edge_bps in sample_rows
     ]
@@ -3102,7 +3107,8 @@ def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> Non
     assert context["v4_health_ready"] is True
     assert context["v4_baseline_window_seconds"] == 1209600
     assert context["v4_anchor_effective_seconds"] == 172800
-    assert context["v4_entry_threshold_bps"] == "96.00"
+    # The profile trades the short leg, so its bar is the mirrored percentile.
+    assert context["v4_entry_threshold_bps"] == "-96.00"
     assert context["compatible_source_rows"] == 5760
     assert context["incompatible_quote_size_rows"] == 0
     assert context["quote_size_mode"] == "exact_base_qty_v1"
@@ -3148,7 +3154,7 @@ def test_v4_history_loader_joins_samples_across_long_gap(tmp_path) -> None:
             "sample_kind": "baseline",
             "sample_quality": "valid",
             "quote_size_mode": "exact_base_qty_v1",
-            "short_edge_bps": str(edge_bps),
+            "short_edge_bps": str(-edge_bps),
         }
         for timestamp, edge_bps in [*pre_gap, *post_gap]
     ]
@@ -3216,7 +3222,7 @@ def test_v4_history_loader_uses_legacy_quote_size_rows_for_anchor(tmp_path) -> N
                 "sample_kind": "baseline",
                 "sample_quality": "valid",
                 "quote_size_mode": "exact_base_qty_v1",
-                "short_edge_bps": str(edge_bps),
+                "short_edge_bps": str(-edge_bps),
             }
         )
     (asset_dir / "2026-07-24.jsonl").write_text(
@@ -3304,7 +3310,7 @@ def test_v4_history_loader_does_not_use_legacy_health_during_size_migration(
             ).isoformat(),
             "sample_kind": "baseline",
             "sample_quality": "valid",
-            "short_edge_bps": str(edge_bps),
+            "short_edge_bps": str(-edge_bps),
         }
         for timestamp, edge_bps in _v4_rolling_anchor_rows(
             now,
