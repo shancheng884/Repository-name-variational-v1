@@ -9956,6 +9956,9 @@ class VariationalToLighterRuntime:
                 self.logger.warning("v4_history_refresh_failed", exc_info=True)
 
     def load_live_inventory_basis_v4_history(self, *, asset: str) -> dict[str, Any]:
+        if median_live.enabled(self):
+            return {"asset": asset, "strategy": "frozen_median_D6_v1",
+                    "legacy_history_ignored": True}
         # Runs from a worker thread; hold the same lock the live sampler uses
         # so the clear-and-refill cannot interleave with a recorded sample.
         with self.live_inventory_basis_history_lock():
@@ -25880,6 +25883,12 @@ class VariationalToLighterRuntime:
             normalized_candidate_lot_id = self.live_inventory_normalized_lot_id(
                 candidate_lot.get("lot_id")
             )
+            if median_live.enabled(self) and any(
+                str(order.get("lot_id")) == str(candidate_lot.get("lot_id"))
+                and order["state"] == "closing"
+                for order in self.frozen_median_model.orders.values()
+            ):
+                continue
             portfolio_exit_selected = (
                 atomic_portfolio_lot is not None
                 and normalized_candidate_lot_id in portfolio_exit_lot_ids
@@ -29644,6 +29653,11 @@ class VariationalToLighterRuntime:
         self.log_startup_diagnostics(diagnostics)
         if diagnostics.blocking_errors:
             raise RuntimeError("Startup diagnostics failed")
+        if median_live.enabled(self):
+            # Restore durable order identities before any background task can
+            # request health or thresholds. Exchange reconciliation still runs
+            # below before the trading loop starts.
+            self.sync_live_inventory_memory_from_state()
         notifier = getattr(self, "telegram_notifier", None)
         if notifier is not None:
             try:
@@ -29661,16 +29675,16 @@ class VariationalToLighterRuntime:
             # Load the rolling anchor while exchange clients initialize. Recent
             # continuity is checked separately and cannot replace the 7d anchor.
             v4_asset = next(iter(self.live_allowed_assets))
-            v4_history_task = asyncio.create_task(
-                asyncio.to_thread(
-                    self.load_live_inventory_basis_v4_history,
-                    asset=v4_asset,
+            if not median_live.enabled(self):
+                v4_history_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self.load_live_inventory_basis_v4_history,
+                        asset=v4_asset,
+                    )
                 )
-            )
-            # Keep a reference: an unreferenced task can be garbage collected.
-            self.live_inventory_v4_history_refresh_task = asyncio.create_task(
-                self.refresh_live_inventory_basis_v4_history_loop(asset=v4_asset)
-            )
+                self.live_inventory_v4_history_refresh_task = asyncio.create_task(
+                    self.refresh_live_inventory_basis_v4_history_loop(asset=v4_asset)
+                )
             self.live_inventory_quote_watchdog_task = asyncio.create_task(
                 self.watch_variational_quote_freshness()
             )
@@ -29749,7 +29763,7 @@ class VariationalToLighterRuntime:
                 asset=initial_asset
             )
             return
-        if self.live_inventory_basis_v4_mode:
+        if self.live_inventory_basis_v4_mode and not median_live.enabled(self):
             if v4_history_task is None:
                 raise RuntimeError("V4 history task was not initialized")
             v4_history_context = await v4_history_task
@@ -29762,7 +29776,8 @@ class VariationalToLighterRuntime:
                 v4_history_context,
             )
         if self.is_live_inventory_enabled():
-            self.sync_live_inventory_memory_from_state()
+            if not median_live.enabled(self):
+                self.sync_live_inventory_memory_from_state()
             self.sync_live_inventory_pnl_tracking_baseline()
             if self.live_inventory_force_close_open_state:
                 self.live_inventory_max_cycles = (

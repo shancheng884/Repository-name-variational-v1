@@ -156,6 +156,42 @@ def test_cold_runtime_reports_1s_warmup_not_old_7d_anchor(tmp_path,monkeypatch):
     asyncio.run(run())
 
 
+def test_real_startup_does_not_start_legacy_history_before_model_restore(tmp_path,monkeypatch):
+    async def run():
+        rt,_=loop_runtime(tmp_path,monkeypatch,D(22))
+        del rt.frozen_median_model
+        rt.setup_signal_handlers=lambda:None
+        rt.run_startup_diagnostics=lambda:SimpleNamespace(blocking_errors=[])
+        rt.print_startup_diagnostics=lambda d:None
+        rt.log_startup_diagnostics=lambda d:None
+        rt.print_startup_next_steps=lambda:None
+        rt.telegram_notifier=None
+        rt.append_live_inventory_run_config=AsyncMock()
+        async def start_forwarder():
+            assert rt.frozen_median_model.deviation==6
+        rt.runtime.start=AsyncMock(side_effect=start_forwarder)
+        rt.wait_for_variational_ready=AsyncMock(return_value=True)
+        rt.requires_lighter_trading_credentials=lambda:False
+        rt.requires_lighter_market_data=lambda:True
+        rt.wait_for_ticker_resolution=AsyncMock(return_value='ETH')
+        rt.activate_asset=AsyncMock()
+        rt.lighter_prewarm_submit_ws=False
+        rt.preflight_variational_api_command_client=AsyncMock()
+        rt.prime_variational_page_streams=AsyncMock()
+        rt.load_live_inventory_basis_v4_history=lambda **kw:pytest.fail('legacy history must not run')
+        rt.refresh_live_inventory_basis_v4_history_loop=AsyncMock()
+        rt.watch_variational_quote_freshness=AsyncMock()
+        rt.reconcile_live_inventory_startup_state=AsyncMock(side_effect=IntentCaptured())
+        with pytest.raises(IntentCaptured):
+            await rt.run()
+        assert rt.frozen_median_model.deviation==6
+        assert len(rt.frozen_median_model.history)==0
+        rt.refresh_live_inventory_basis_v4_history_loop.assert_not_called()
+        rt.send_variational_place_order.assert_not_called()
+        await rt.live_inventory_quote_watchdog_task
+    asyncio.run(run())
+
+
 def test_invalid_source_clears_current_signal_and_cannot_use_previous_quote(tmp_path):
     rt=fake_runtime(tmp_path);r=rt.frozen_median_last_row
     live.observe(rt,asset='ETH',quote={'quote_semantics':'reference_price_only'},
@@ -338,6 +374,13 @@ def test_real_loop_closes_only_selected_high_tier_with_a_fresh_rfq(tmp_path,monk
         assert state['frozen_median']['orders']['2']['state']=='closing'
         assert len(state['pending_actions'])==1
         assert state['pending_actions'][0]['lot_id']==2
+        assert rt.fetch_live_inventory_basis_quote.await_count==1
+        rt.send_variational_place_order.assert_not_called()
+        # An unresolved close restored from disk must not spend another RFQ
+        # or submit a second close for the same component.
+        rt.sync_live_inventory_memory_from_state()
+        rt.frozen_median_model.orders['1']['state']='closing'
+        await rt.maybe_run_live_inventory_basis(snapshot)
         assert rt.fetch_live_inventory_basis_quote.await_count==1
         rt.send_variational_place_order.assert_not_called()
     asyncio.run(run())
