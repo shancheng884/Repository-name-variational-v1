@@ -12525,14 +12525,26 @@ class VariationalToLighterRuntime:
             or quote.get("timestamp")
         )
         received_at = quote.get("received_at")
+        quote_bid = to_decimal(quote.get("bid"))
+        quote_ask = to_decimal(quote.get("ask"))
+        has_passive_spread = (
+            quote_bid is not None
+            and quote_ask is not None
+            and quote_ask > quote_bid
+        )
+        passive_bid = quote_bid if has_passive_spread else reference_price
+        passive_ask = quote_ask if has_passive_spread else reference_price
         return (
             {
                 **quote,
                 # The snapshot fields below are neutral internal bounds for
                 # signal math only; they are never reused for an order.
-                "bid": decimal_to_str(reference_price),
-                "ask": decimal_to_str(reference_price),
+                # A real passive bid/ask from the page's indicative quote is
+                # kept as-is; only a reference-only stream is flattened to mid.
+                "bid": decimal_to_str(passive_bid),
+                "ask": decimal_to_str(passive_ask),
                 "mark_price": decimal_to_str(reference_price),
+                "reference_price": decimal_to_str(reference_price),
                 # Passive stream freshness is measured from arrival on this
                 # process. The source timestamp may describe a slower upstream
                 # snapshot and is retained only for diagnostics.
@@ -12545,7 +12557,11 @@ class VariationalToLighterRuntime:
                 ),
                 "quote_size_mode": LIVE_INVENTORY_BASIS_QUOTE_SIZE_MODE,
                 "quote_source": LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE,
-                "quote_semantics": "reference_price_only",
+                "quote_semantics": (
+                    "passive_indicative_bid_ask"
+                    if has_passive_spread
+                    else "reference_price_only"
+                ),
                 "quote_freshness_source": (
                     "local_monotonic_receive_time"
                     if quote.get("received_monotonic") is not None
@@ -12695,8 +12711,92 @@ class VariationalToLighterRuntime:
         if not asset:
             return None
         async with runtime.monitor._lock:
-            quote = runtime.monitor.reference_quotes.get(asset)
-            return dict(quote) if isinstance(quote, dict) else None
+            reference = runtime.monitor.reference_quotes.get(asset)
+            if not isinstance(reference, dict):
+                return None
+            quote = dict(reference)
+            indicative = runtime.monitor.quotes.get(asset)
+            indicative = dict(indicative) if isinstance(indicative, dict) else None
+        return self.merge_passive_indicative_into_reference(
+            quote,
+            indicative,
+            asset=asset,
+        )
+
+    def merge_passive_indicative_into_reference(
+        self,
+        quote: dict[str, Any],
+        indicative: dict[str, Any] | None,
+        *,
+        asset: str,
+    ) -> dict[str, Any]:
+        """Give the reference quote the page's passive indicative bid/ask.
+
+        The /prices stream only publishes a mid, so a reference-only quote has
+        bid == ask and can never describe a tradeable spread. The browser page
+        already polls /api/quotes/indicative roughly once a second, so reusing
+        that passive quote costs no extra request. Freshness stays honest: the
+        merged quote keeps the older receive time of the two sources, so a
+        stale indicative quote can never look fresher than it is.
+        """
+        if not isinstance(indicative, dict):
+            quote["passive_indicative_state"] = "missing"
+            return quote
+        bid = to_decimal(indicative.get("bid"))
+        ask = to_decimal(indicative.get("ask"))
+        if bid is None or ask is None or ask <= bid:
+            quote["passive_indicative_state"] = "unusable"
+            return quote
+        indicative_monotonic = None
+        try:
+            indicative_monotonic = float(indicative.get("received_monotonic"))
+        except (TypeError, ValueError):
+            indicative_monotonic = None
+        age_seconds: float | None = None
+        if indicative_monotonic is not None:
+            age_seconds = time.monotonic() - indicative_monotonic
+        else:
+            indicative_received_at = self._parse_iso_ts(
+                str(indicative.get("received_at") or "")
+            )
+            if indicative_received_at is not None:
+                age_seconds = (
+                    datetime.now(timezone.utc) - indicative_received_at
+                ).total_seconds()
+        if age_seconds is None or age_seconds < 0:
+            quote["passive_indicative_state"] = "unusable"
+            return quote
+        if age_seconds > LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_MAX_AGE_SECONDS:
+            quote["passive_indicative_state"] = "stale"
+            quote["passive_indicative_age_seconds"] = f"{age_seconds:.6f}"
+            return quote
+        reference_monotonic = None
+        try:
+            reference_monotonic = float(quote.get("received_monotonic"))
+        except (TypeError, ValueError):
+            reference_monotonic = None
+        merged_monotonic = (
+            min(reference_monotonic, indicative_monotonic)
+            if reference_monotonic is not None and indicative_monotonic is not None
+            else indicative_monotonic or reference_monotonic
+        )
+        quote["bid"] = decimal_to_str(bid)
+        quote["ask"] = decimal_to_str(ask)
+        quote["passive_indicative_bid"] = decimal_to_str(bid)
+        quote["passive_indicative_ask"] = decimal_to_str(ask)
+        quote["passive_indicative_age_seconds"] = f"{age_seconds:.6f}"
+        quote["passive_indicative_state"] = "fresh"
+        quote["passive_indicative_received_at"] = indicative.get("received_at")
+        quote["reference_quote_received_at"] = quote.get("received_at")
+        quote["reference_quote_received_monotonic"] = quote.get("received_monotonic")
+        if merged_monotonic is not None:
+            quote["received_monotonic"] = merged_monotonic
+            quote["received_at"] = (
+                indicative.get("received_at") or quote.get("received_at")
+            )
+            if quote.get("quoteTimestamp") in (None, ""):
+                quote["quoteTimestamp"] = quote["received_at"]
+        return quote
 
     async def try_auto_close_unhedged_live_inventory_leg(
         self,
@@ -19772,11 +19872,14 @@ class VariationalToLighterRuntime:
         nested_summary = nested_summary[:20]
 
         self.logger.warning(
-            "var_quote_diagnostic reason=%s asset=%s source=%s source_url=%s source_stream=%s "
+            "var_quote_diagnostic reason=%s asset=%s source=%s indicative=%s "
+            "indicative_age_s=%s source_url=%s source_stream=%s "
             "var_bid=%s var_ask=%s var_buy=%s var_sell=%s quote_keys=%s raw_keys=%s nested=%s",
             reason,
             quote.get("asset"),
             var_spread_source,
+            quote.get("passive_indicative_state"),
+            quote.get("passive_indicative_age_seconds"),
             raw.get("__source_url"),
             raw.get("__source_stream") or raw.get("__source_endpoint"),
             decimal_to_str(var_bid),
@@ -19814,8 +19917,15 @@ class VariationalToLighterRuntime:
             if reference_quote is not None
             else None
         )
-        var_bid = reference_price or to_decimal(quote.get("bid"))
-        var_ask = reference_price or to_decimal(quote.get("ask"))
+        quote_bid = to_decimal(quote.get("bid"))
+        quote_ask = to_decimal(quote.get("ask"))
+        has_quote_spread = (
+            quote_bid is not None
+            and quote_ask is not None
+            and quote_ask > quote_bid
+        )
+        var_bid = quote_bid if has_quote_spread else reference_price or quote_bid
+        var_ask = quote_ask if has_quote_spread else reference_price or quote_ask
         quote_asset = str(quote.get("asset", ""))
         lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
         if var_bid is None or var_ask is None or lighter_bid is None or lighter_ask is None:
@@ -19830,14 +19940,17 @@ class VariationalToLighterRuntime:
             return None
 
         var_buy_price, var_sell_price, var_spread_source = (
-            (reference_price, reference_price, "reference_price_only")
-            if reference_price is not None
-            else self.extract_variational_button_prices(quote)
+            self.extract_variational_button_prices(quote)
         )
         if var_buy_price is None or var_sell_price is None:
-            var_buy_price = max(var_bid, var_ask)
-            var_sell_price = min(var_bid, var_ask)
-            var_spread_source = "bid_ask_fallback"
+            if has_quote_spread:
+                var_buy_price = quote_ask
+                var_sell_price = quote_bid
+                var_spread_source = "passive_indicative_bid_ask"
+            else:
+                var_buy_price = max(var_bid, var_ask)
+                var_sell_price = min(var_bid, var_ask)
+                var_spread_source = "reference_price_only"
 
         asset = (quote_asset or self.variational_ticker or self.ticker or "UNKNOWN").upper()
         var_mid = (var_buy_price + var_sell_price) / Decimal("2")
