@@ -10772,6 +10772,114 @@ class VariationalToLighterRuntime:
                 gap -= overlap
         return max(0.0, gap)
 
+    def audit_live_inventory_v4_threshold_crossing(
+        self,
+        *,
+        direction: str,
+        edge_bps: Decimal | None,
+        threshold_bps: Decimal | None,
+        sample_index: int | None = None,
+        asset: str | None = None,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Record how long the live edge stays past its bar.
+
+        This is an observation sidecar: it never changes a decision. One
+        "open" event fires the moment the edge crosses the bar and one
+        "close" event when it falls back, so the audit costs two log lines
+        per episode instead of one per second.
+        """
+
+        events: list[tuple[str, dict[str, Any]]] = []
+        store = getattr(self, "live_inventory_v4_crossing_state", None)
+        if not isinstance(store, dict):
+            store = {}
+            self.live_inventory_v4_crossing_state = store
+        if edge_bps is None or threshold_bps is None:
+            return events
+        qualified = v4_edge_meets_threshold(
+            edge_bps,
+            threshold_bps,
+            direction=direction,
+        )
+        now_monotonic = time.monotonic()
+        state = store.get(direction)
+        margin_bps = v4_edge_margin_bps(
+            edge_bps,
+            threshold_bps,
+            direction=direction,
+        )
+        if qualified:
+            if not isinstance(state, dict):
+                state = {
+                    "started_monotonic": now_monotonic,
+                    "started_at": utc_now(),
+                    "peak_edge_bps": edge_bps,
+                    "peak_margin_bps": margin_bps,
+                    "ticks": 1,
+                }
+                store[direction] = state
+                events.append(
+                    (
+                        "live_inventory_v4_crossing_opened",
+                        {
+                            "asset": asset,
+                            "sample_index": sample_index,
+                            "direction": direction,
+                            "edge_bps": decimal_to_str(edge_bps),
+                            "threshold_bps": decimal_to_str(threshold_bps),
+                            "margin_bps": decimal_to_str(margin_bps),
+                        },
+                    )
+                )
+            else:
+                peak = to_decimal(state.get("peak_edge_bps"))
+                if peak is None or v4_edge_meets_threshold(
+                    edge_bps,
+                    peak,
+                    direction=direction,
+                ):
+                    state["peak_edge_bps"] = edge_bps
+                    state["peak_margin_bps"] = margin_bps
+            state["ticks"] = int(state.get("ticks") or 0) + 1
+            state["last_edge_bps"] = edge_bps
+            return events
+        if isinstance(state, dict):
+            duration_seconds = max(
+                0.0,
+                now_monotonic - float(state.get("started_monotonic") or now_monotonic),
+            )
+            peak = to_decimal(state.get("peak_edge_bps"))
+            reverted_bps = (
+                v4_edge_margin_bps(peak, edge_bps, direction=direction)
+                if peak is not None
+                else None
+            )
+            block = getattr(self, "live_inventory_last_entry_block", None)
+            events.append(
+                (
+                    "live_inventory_v4_crossing_closed",
+                    {
+                        "asset": asset,
+                        "sample_index": sample_index,
+                        "direction": direction,
+                        "edge_bps": decimal_to_str(edge_bps),
+                        "threshold_bps": decimal_to_str(threshold_bps),
+                        "peak_edge_bps": decimal_to_str(peak),
+                        "peak_margin_bps": decimal_to_str(
+                            to_decimal(state.get("peak_margin_bps"))
+                        ),
+                        "seconds_past_bar": round(duration_seconds, 3),
+                        "ticks_past_bar": int(state.get("ticks") or 0),
+                        "reverted_bps": decimal_to_str(reverted_bps),
+                        "last_entry_block_reason": (
+                            block.get("reason") if isinstance(block, dict) else None
+                        ),
+                    },
+                )
+            )
+            store.pop(direction, None)
+        return events
+
     def live_inventory_basis_v4_entry_threshold(
         self,
         *,
@@ -21083,6 +21191,20 @@ class VariationalToLighterRuntime:
                 if not v4_entry_context.get("v4_anchor_ready")
                 else "recent_1h_health_not_ready"
             )
+            for crossing_direction in v4_entry_directions:
+                for crossing_event, crossing_payload in (
+                    self.audit_live_inventory_v4_threshold_crossing(
+                        direction=crossing_direction,
+                        edge_bps=v4_signal_edges.get(crossing_direction),
+                        threshold_bps=v4_entry_thresholds.get(crossing_direction),
+                        sample_index=index,
+                        asset=asset,
+                    )
+                ):
+                    await self.append_live_inventory_log(
+                        crossing_event,
+                        crossing_payload,
+                    )
             rearm_direction = (
                 self.live_inventory_v4_rearm_direction
                 if self.live_inventory_v4_rearm_direction in v4_entry_directions
