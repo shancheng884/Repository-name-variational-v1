@@ -147,6 +147,8 @@ LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MIN_SAMPLES = 20
 LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MAX_GAP_SECONDS = 60
 # How close to the entry bar counts as "approaching" in the read-only audit.
 LIVE_INVENTORY_BASIS_V4_NEAR_BAR_BAND_BPS = Decimal("1.0")
+# 1s decision-tick archive used for exact replay; roughly 15MB per day.
+LIVE_INVENTORY_V4_EDGE_TICK_KEEP_DAYS = 7
 LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES = 100
 LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS = 129600
 LIVE_INVENTORY_BASIS_V4_FAST_MIN_EFFECTIVE_SECONDS = 21600
@@ -10774,6 +10776,94 @@ class VariationalToLighterRuntime:
                 gap -= overlap
         return max(0.0, gap)
 
+    def live_inventory_v4_edge_tick_path(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> Path | None:
+        """One file per UTC day keeps rotation and pruning trivial."""
+
+        output_dir = getattr(self, "output_dir", None)
+        if output_dir is None:
+            return None
+        stamp = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+        return Path(output_dir) / "edge_ticks" / f"{stamp}.jsonl"
+
+    def prune_live_inventory_v4_edge_ticks(
+        self,
+        *,
+        keep_days: int = LIVE_INVENTORY_V4_EDGE_TICK_KEEP_DAYS,
+    ) -> None:
+        output_dir = getattr(self, "output_dir", None)
+        if output_dir is None:
+            return
+        directory = Path(output_dir) / "edge_ticks"
+        if not directory.is_dir():
+            return
+        cutoff = time.time() - keep_days * 86400
+        for path in directory.glob("*.jsonl"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+
+    def record_live_inventory_v4_edge_tick(
+        self,
+        *,
+        asset: str,
+        long_edge_bps: Decimal | None,
+        short_edge_bps: Decimal | None,
+        var_bid: Decimal | None,
+        var_ask: Decimal | None,
+        lighter_bid: Decimal | None,
+        lighter_ask: Decimal | None,
+        thresholds: dict[str, Decimal | None],
+    ) -> bool:
+        """Append one line per decision tick for later 1s-fidelity replay.
+
+        Observation only: nothing reads this file back inside the runtime, and
+        a write failure must never disturb trading.
+        """
+
+        if not getattr(self, "live_inventory_v4_edge_tick_log_enabled", True):
+            return False
+        now = datetime.now(timezone.utc)
+        payload = {
+            "t": now.isoformat(),
+            "a": str(asset or "").upper(),
+            "L": decimal_to_str(long_edge_bps),
+            "S": decimal_to_str(short_edge_bps),
+            "vb": decimal_to_str(var_bid),
+            "va": decimal_to_str(var_ask),
+            "lb": decimal_to_str(lighter_bid),
+            "la": decimal_to_str(lighter_ask),
+            "tL": decimal_to_str(thresholds.get(DIRECTION_LONG_VAR_SHORT_LIGHTER)),
+            "tS": decimal_to_str(thresholds.get(DIRECTION_SHORT_VAR_LONG_LIGHTER)),
+        }
+        path = self.live_inventory_v4_edge_tick_path(now=now)
+        if path is None:
+            return False
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            day = now.strftime("%Y-%m-%d")
+            if getattr(self, "live_inventory_v4_edge_tick_last_day", None) != day:
+                self.live_inventory_v4_edge_tick_last_day = day
+                self.prune_live_inventory_v4_edge_ticks()
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                    + "\n"
+                )
+            return True
+        except OSError as exc:
+            if not getattr(self, "live_inventory_v4_edge_tick_warned", False):
+                self.live_inventory_v4_edge_tick_warned = True
+                logger = getattr(self, "logger", None)
+                if logger is not None:
+                    logger.warning("edge_tick_write_failed error=%s", exc)
+            return False
+
     def audit_live_inventory_v4_threshold_crossing(
         self,
         *,
@@ -21283,6 +21373,16 @@ class VariationalToLighterRuntime:
                 else "insufficient_rolling_7d_anchor"
                 if not v4_entry_context.get("v4_anchor_ready")
                 else "recent_1h_health_not_ready"
+            )
+            self.record_live_inventory_v4_edge_tick(
+                asset=asset,
+                long_edge_bps=long_edge_bps,
+                short_edge_bps=short_edge_bps,
+                var_bid=var_bid,
+                var_ask=var_ask,
+                lighter_bid=snapshot.lighter_bid,
+                lighter_ask=snapshot.lighter_ask,
+                thresholds=v4_entry_thresholds,
             )
             for crossing_direction in v4_entry_directions:
                 for crossing_event, crossing_payload in (
