@@ -7,7 +7,12 @@ set -euo pipefail
 R=/home/ubuntu/Repository-name-variational-v1
 cd "$R"
 
-FLAGS=(--asset ETH --v4-live --v4-real-gradient --v4-elastic-capacity --v4-bidirectional --v4-continuous)
+FLAGS=(--asset ETH --v4-live --v4-real-gradient --v4-bidirectional --v4-continuous)
+if [ "${VAR_ETH_FROZEN_MEDIAN:-0}" = "1" ]; then
+  FLAGS+=(--frozen-median)
+else
+  FLAGS+=(--v4-elastic-capacity)
+fi
 STATE=$("$R/.venv/bin/python" - <<'PY' 2>/dev/null || echo "unknown 0"
 import json
 s = json.load(open("log/live_inventory_state.json"))

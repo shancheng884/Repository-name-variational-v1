@@ -790,6 +790,8 @@ def main() -> int:
     asset_group.add_argument("--assets", help="Comma-separated assets for the hard-isolated multi-asset collect-only process.")
     parser.add_argument("--config", default=str(LIVE_CONFIG), help="Startup config JSON. Default: live_config.json.")
     parser.add_argument("--reversion", action="store_true", help="Explicitly enable the one-lot basis reversion live test.")
+    parser.add_argument("--frozen-median", action="store_true",
+                        help="Use D=6 frozen 1-second median with concurrent V4 real gradient.")
     parser.add_argument(
         "--v4-live",
         action="store_true",
@@ -916,6 +918,12 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Print checks without starting live.")
     parser.add_argument("--verbose", action="store_true", help="Print the full main.py command.")
     args = parser.parse_args()
+    if args.frozen_median and not (
+        args.v4_live and args.v4_real_gradient and args.v4_bidirectional
+        and args.v4_continuous and not args.reversion and not args.calibration
+        and not args.v4_reverse_test and not args.collect_only
+    ):
+        parser.error("--frozen-median requires continuous bidirectional V4 real gradient")
 
     asset = args.asset.upper() if args.asset else None
     assets = tuple(dict.fromkeys(token.strip().upper() for token in str(args.assets or "").split(",") if token.strip()))
@@ -1168,6 +1176,8 @@ def main() -> int:
             flat_reset_confirmation=f"FLAT:{asset}" if asset else None,
         )
     )
+    if args.frozen_median:
+        command.append("--live-inventory-frozen-median")
     effective_max_cycles = (
         config.calibration_max_cycles
         if config.calibration_mode

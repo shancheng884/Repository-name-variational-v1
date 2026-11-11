@@ -31,6 +31,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from tools.lib.auto_rebalance import build_rebalance_plan
+from tools.lib import frozen_median_live as median_live
 from tools.lib.execution_quality import (
     advance_shortfall_reserve,
     lighter_book_clock,
@@ -2644,6 +2645,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_max_var_quote_age_ms = float(args.live_inventory_basis_max_var_quote_age_ms)
         self.live_inventory_basis_max_hold_action = args.live_inventory_basis_max_hold_action
         self.live_inventory_basis_entry_confirm_samples = int(args.live_inventory_basis_entry_confirm_samples)
+        self.live_inventory_frozen_median = bool(getattr(args, "live_inventory_frozen_median", False))
         self.live_inventory_basis_max_sample_move_bps = Decimal(str(args.live_inventory_basis_max_sample_move_bps))
         self.live_inventory_basis_profit_take_pnl_bps = Decimal(str(args.live_inventory_basis_profit_take_pnl_bps))
         self.live_inventory_basis_time_decay_exit_samples = int(args.live_inventory_basis_time_decay_exit_samples)
@@ -4443,6 +4445,16 @@ class VariationalToLighterRuntime:
         thresholds: dict[str, Decimal | None],
     ) -> str:
         allowed = self.live_inventory_basis_v4_entry_directions()
+        if median_live.enabled(self):
+            model = self.frozen_median_model
+            if model.direction in allowed:
+                return model.direction
+            eligible = [d for d in allowed if thresholds.get(d) is not None]
+            if eligible:
+                return max(eligible, key=lambda d: v4_edge_margin_bps(
+                    signal_edges[d], thresholds[d], direction=d,
+                ))
+            return self.live_inventory_basis_v4_entry_direction()
         open_directions = {
             str(lot.get("direction") or "")
             for lot in getattr(self, "live_inventory_open_lots", [])
@@ -5112,6 +5124,7 @@ class VariationalToLighterRuntime:
 
     def sync_live_inventory_memory_from_state(self) -> None:
         state = self.load_live_inventory_state()
+        median_live.initialize(self, state)
         self.live_inventory_state_revision = int(
             state.get("state_revision") or 0
         )
@@ -5534,6 +5547,7 @@ class VariationalToLighterRuntime:
                     value, compatibility_floors.get(direction, Decimal("0"))
                 )
         return {
+            **median_live.checkpoint(self),
             "v4_episode_state": episode_state,
             "v4_exit_shortfall_calibration_profile": current_profile,
             "v4_exit_shortfall_reserve_floors_by_profile": {
@@ -11072,6 +11086,8 @@ class VariationalToLighterRuntime:
         health_history_override: deque[tuple[float, Decimal]] | None = None,
         cache_result: bool = True,
     ) -> tuple[Decimal | None, dict[str, Any]]:
+        if median_live.enabled(self):
+            return median_live.thresholds(self, now=now, direction=direction)
         bidirectional = bool(
             direction is not None
             and getattr(self, "live_inventory_basis_v4_bidirectional", False)
@@ -11769,6 +11785,8 @@ class VariationalToLighterRuntime:
         entry_threshold_bps: Decimal | None,
         direction: str | None = None,
     ) -> tuple[bool, dict[str, Any]]:
+        if median_live.enabled(self):
+            return False, {"median_rearm_managed_by_persisted_order_state": True}
         required = bool(
             getattr(self, "live_inventory_v4_rearm_required", False)
         )
@@ -11866,6 +11884,8 @@ class VariationalToLighterRuntime:
         direction: str | None = None,
         advance_confirmation: bool = True,
     ) -> int:
+        if median_live.enabled(self):
+            return median_live.active_tier(self, direction=direction, now=time.time())
         bidirectional = bool(
             direction is not None
             and getattr(self, "live_inventory_basis_v4_bidirectional", False)
@@ -11989,6 +12009,8 @@ class VariationalToLighterRuntime:
         entry_threshold_bps: Decimal | None,
         direction: str | None = None,
     ) -> None:
+        if median_live.enabled(self):
+            return
         self.live_inventory_v4_rearm_required = True
         self.live_inventory_v4_rearm_confirmation_count = 0
         self.live_inventory_v4_rearm_reason = exit_reason
@@ -12078,6 +12100,8 @@ class VariationalToLighterRuntime:
             exit_lighter_price=exit_lighter_price,
         )
         notional = qty * entry_var_price
+        if median_live.enabled(self):
+            notional = qty * ((entry_var_price + entry_lighter_price) / 2)
         if not notional:
             return None
         return pnl / notional * Decimal("10000")
@@ -12285,6 +12309,8 @@ class VariationalToLighterRuntime:
             exit_lighter_price=refreshed_lighter_top_price,
         )
         notional = qty * entry_var_price
+        if median_live.enabled(self):
+            notional = qty * ((entry_var_price + entry_lighter_price) / 2)
         refreshed_pnl_bps = (
             refreshed_pnl / notional * Decimal("10000") if notional else None
         )
@@ -13387,6 +13413,11 @@ class VariationalToLighterRuntime:
             "reason": verify_reason,
             "context": verify_context,
         }
+        if verified and median_live.enabled(self):
+            verified = await median_live.entry_rollback_verified(
+                self, asset=asset, lot_id=lot_id,
+            )
+            context["median_rollback_no_active_orders"] = verified
         return verified, context
 
     async def verify_live_inventory_auto_close_positions(
@@ -13668,6 +13699,10 @@ class VariationalToLighterRuntime:
                 "reason": position_check_reason,
                 "context": position_check_context,
             }
+            if positions_verified and median_live.enabled(self):
+                positions_verified = await median_live.entry_rollback_verified(
+                    self, asset=asset, lot_id=lot_id,
+                )
             if positions_verified:
                 # The entry is rejected, but no exposure remains. Keep the
                 # current episode/counters and continue without an alert.
@@ -13775,6 +13810,8 @@ class VariationalToLighterRuntime:
             "status": "open",
         }
         self.live_inventory_open_lots.append(lot)
+        if median_live.enabled(self):
+            lot.update({k: v for k, v in context.items() if k.startswith("median_")})
         self.record_entry_execution_measurement(
             lot=lot,
             context=context,
@@ -14728,6 +14765,13 @@ class VariationalToLighterRuntime:
             "live_inventory_final_pnl",
             final_pnl_payload,
         )
+        if median_live.enabled(self):
+            median_live.final_closed(
+                self, lot_id=pending.get("lot_id"),
+                quantities_match=(var_roundtrip_qty_match and lighter_roundtrip_qty_match
+                                  and var_qty == lighter_qty == qty),
+            )
+            await self.persist_live_inventory_memory(reason="median_final_fills_checkpointed")
         await self.append_live_inventory_log(
             "live_inventory_execution_ledger",
             {
@@ -14857,7 +14901,12 @@ class VariationalToLighterRuntime:
             None if edge_bps is None else edge_bps - required_entry_bps
         )
         context["live_inventory_entry_edge_enforced"] = enforce_entry_edge
-        if enforce_entry_edge and (edge_bps is None or edge_bps < required_entry_bps):
+        edge_passes = (
+            v4_edge_meets_threshold(edge_bps, required_entry_bps, direction=direction)
+            if median_live.enabled(self)
+            else edge_bps is not None and edge_bps >= required_entry_bps
+        )
+        if enforce_entry_edge and not edge_passes:
             return False, "edge_bps_below_dynamic_live_inventory_entry", context
         return True, "ok", context
 
@@ -17310,6 +17359,9 @@ class VariationalToLighterRuntime:
         )
         pnl_bps = pnl / (qty * context["entry_var_price"]) * Decimal("10000")
         reserve = self.live_inventory_basis_v4_exit_calibration_context(direction=direction)["reserve_bps"]
+        if median_live.enabled(self):
+            pnl_bps = pnl / (qty * ((context["entry_var_price"] + context["entry_lighter_price"]) / 2)) * Decimal("10000")
+            reserve = Decimal(2)
         net_target = max(context["effective_min_exit_pnl_bps"] - context["exit_reserve_bps"], Decimal("0"))
         target = max(context["effective_min_exit_pnl_bps"], reserve + net_target)
         completion_bps = getattr(
@@ -17463,6 +17515,12 @@ class VariationalToLighterRuntime:
             else unwind_error,
         }
         if not unwind_ok:
+            return {"status": "failed", "context": context}
+        if median_live.enabled(self):
+            # An HTTP success is not final-fill or restored-cost evidence.
+            # Keep the durable intent and stop rather than retrying a close.
+            self.frozen_median_model.review_reason = "median_exit_unwind_final_cost_unverified"
+            await self.persist_live_inventory_memory(reason="median_exit_unwind_requires_reconciliation")
             return {"status": "failed", "context": context}
         self.remove_pending_live_inventory_var_fill_match(
             asset=asset, lot_id=lot.get("lot_id"), role="live_inventory_exit"
@@ -21293,6 +21351,16 @@ class VariationalToLighterRuntime:
                 v4_entry_direction = open_direction
         v4_signal_edge_bps = v4_signal_edges[v4_entry_direction]
         v4_now = datetime.now(timezone.utc).timestamp()
+        if median_live.enabled(self):
+            median_live.observe(self, asset=asset, quote=quote, snapshot=snapshot,
+                                var_bid=var_bid, var_ask=var_ask,
+                                lighter_age=lighter_book_age_seconds, now=v4_now)
+            await median_live.maybe_finish(self, asset=asset, now=v4_now)
+            median_basis = median_live.pair_edge(basis_mid, lighter_mid)
+            long_edge_bps = short_edge_bps = median_basis
+            v4_signal_edges = {direction: median_basis for direction in v4_entry_directions}
+            if self.frozen_median_model.direction in v4_entry_directions:
+                v4_entry_direction = self.frozen_median_model.direction
         v4_entry_threshold_bps = None
         v4_entry_context: dict[str, Any] = {}
         v4_entry_thresholds: dict[str, Decimal | None] = {}
@@ -21328,6 +21396,8 @@ class VariationalToLighterRuntime:
                     if not context.get("v4_anchor_ready")
                     else "recent_1h_health_not_ready"
                 )
+                if median_live.enabled(self) and not ready:
+                    reason = context.get("median_review_reason") or "median_1s_60m_warmup"
                 if self.live_inventory_basis_v4_bidirectional:
                     self.live_inventory_basis_v4_history_ready_by_direction[
                         direction
@@ -21335,7 +21405,7 @@ class VariationalToLighterRuntime:
                     self.live_inventory_basis_v4_history_reason_by_direction[
                         direction
                     ] = reason
-                if not duplicate_passive_reference and self.record_live_inventory_basis_v4_edge(
+                if not median_live.enabled(self) and not duplicate_passive_reference and self.record_live_inventory_basis_v4_edge(
                     now=v4_now,
                     direction=(
                         direction
@@ -21617,6 +21687,9 @@ class VariationalToLighterRuntime:
                 bias_context = self.live_inventory_basis_v4_entry_rfq_bias_context(
                     direction
                 )
+                if median_live.enabled(self):
+                    bias_context = {"v4_entry_rfq_bias_applied_bps": "0",
+                                    "v4_entry_rfq_bias_ready": True}
                 v4_entry_rfq_bias_contexts[direction] = bias_context
                 applied_bias_bps = to_decimal(
                     bias_context.get("v4_entry_rfq_bias_applied_bps")
@@ -21773,6 +21846,8 @@ class VariationalToLighterRuntime:
                 if self.live_inventory_basis_v4_real_gradient
                 else (0, "disabled")
             )
+            if median_live.enabled(self):
+                real_gradient_confirmation_modes[direction] = "median_latest_and_two_unique_quotes"
         real_gradient_thresholds = real_gradient_thresholds_by_direction.get(
             v4_entry_direction,
             [],
@@ -21809,6 +21884,8 @@ class VariationalToLighterRuntime:
             direction=v4_entry_direction,
         )
         real_gradient_tier_before_probe = real_gradient_tier
+        if median_live.enabled(self):
+            v4_single_lot_exact_rfq_probe = False
         real_gradient_tier, real_gradient_confirmation_mode = (
             v4_single_lot_rfq_gradient_state(
                 active_tier=real_gradient_tier,
@@ -22041,7 +22118,7 @@ class VariationalToLighterRuntime:
             )
         if basis_state_log_due:
             await self.append_live_inventory_log("live_inventory_basis_state", state_payload)
-        if v4_mode and v4_baseline_sample_due and self.live_inventory_basis_v4_store is not None:
+        if v4_mode and not median_live.enabled(self) and v4_baseline_sample_due and self.live_inventory_basis_v4_store is not None:
             await asyncio.to_thread(
                 self.live_inventory_basis_v4_store.append,
                 {
@@ -23299,7 +23376,7 @@ class VariationalToLighterRuntime:
                         return
                     lighter_price = depth_entry_price
                     raw_refreshed_edge_bps = self.live_inventory_pair_edge_bps(direction=direction, var_price=var_price, lighter_price=lighter_price) or Decimal("0")
-                    if v4_mode:
+                    if v4_mode and not median_live.enabled(self):
                         exact_calibration_edge_bps = self.live_inventory_pair_edge_bps(
                             direction=direction,
                             var_price=var_price,
@@ -23336,6 +23413,24 @@ class VariationalToLighterRuntime:
                                 },
                             )
                     edge_bps = raw_refreshed_edge_bps
+                    if median_live.enabled(self):
+                        try:
+                            edge_bps, median_required, exact_real_gradient_thresholds, median_proof = (
+                                median_live.rfq_confirmation(
+                                    self, direction=direction, var_bid=refreshed_var_bid,
+                                    var_ask=refreshed_var_ask, lighter_entry=lighter_price,
+                                    lighter_exit=depth_exit_price, now=time.time(),
+                                )
+                            )
+                        except ValueError as exc:
+                            await self.block_live_inventory_entry(asset=asset, reason=str(exc), context=state_payload)
+                            return
+                        raw_refreshed_edge_bps = edge_bps
+                        v4_exact_entry_thresholds[direction] = median_required
+                        await self.append_live_inventory_log("median_rfq_confirmation", {
+                            "asset": asset, "direction": direction, **median_proof,
+                            "sample_index": index,
+                        })
                     raw_refreshed_roundtrip_bps = self.live_inventory_roundtrip_pnl_bps(
                         direction=direction,
                         var_entry_price=var_price,
@@ -23491,12 +23586,15 @@ class VariationalToLighterRuntime:
                         # The passive threshold decides when to spend an RFQ;
                         # the translated threshold decides whether that exact
                         # RFQ is executable after the quote refresh.
-                        min_entry_edge_bps = (
-                            exact_entry_threshold_bps + Decimal("0.000000001")
+                        min_entry_edge_bps = exact_entry_threshold_bps + (
+                            -Decimal("0.000000001")
+                            if median_live.enabled(self) and direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
+                            else Decimal("0.000000001")
                         )
                         if self.live_inventory_basis_v4_real_gradient:
                             refreshed_raw_gradient_tier = (
-                                v4_real_gradient_eligible_tier(
+                                median_live.active_tier(self, direction=direction, now=time.time())
+                                if median_live.enabled(self) else v4_real_gradient_eligible_tier(
                                     edge_bps,
                                     exact_real_gradient_thresholds,
                                     direction=direction,
@@ -23963,6 +24061,15 @@ class VariationalToLighterRuntime:
                     lighter_price = submitted_lighter_price
                     raw_edge_bps = self.live_inventory_pair_edge_bps(direction=direction, var_price=var_price, lighter_price=lighter_price) or Decimal("0")
                     edge_bps = raw_edge_bps
+                    if median_live.enabled(self):
+                        edge_bps, min_entry_edge_bps, exact_real_gradient_thresholds, _ = (
+                            median_live.rfq_confirmation(
+                                self, direction=direction, var_bid=var_bid, var_ask=var_ask,
+                                lighter_entry=lighter_price, lighter_exit=submitted_exit_lighter_price,
+                                now=time.time(),
+                            )
+                        )
+                        raw_edge_bps = edge_bps
                     raw_roundtrip_bps = self.live_inventory_roundtrip_pnl_bps(
                         direction=direction,
                         var_entry_price=var_price,
@@ -24355,6 +24462,16 @@ class VariationalToLighterRuntime:
                         created_at_monotonic=time.monotonic(),
                         context=pending_context,
                     )
+                    if median_live.enabled(self):
+                        try:
+                            pending_context.update(median_live.reserve(
+                                self, order_id=basis_trace_id, lot_id=lot_id,
+                                direction=direction, tier=real_gradient_tier,
+                                capacity=gradient_capacity_child_lots, now=time.time(),
+                            ))
+                        except ValueError as exc:
+                            await self.block_live_inventory_entry(asset=asset, reason=str(exc), context=state_payload)
+                            return
                     self.add_pending_live_inventory_var_fill_match(pending_match)
                     # Persist intent before either real leg is submitted. A crash
                     # from this point onward must never restart from local-flat.
@@ -24789,6 +24906,8 @@ class VariationalToLighterRuntime:
                         tranche_index + 1,
                     )
                 self.live_inventory_basis_entry_confirm_counts.clear()
+                if median_live.enabled(self) and not self.live_inventory_dry_decisions:
+                    lot.update({k: v for k, v in pending_context.items() if k.startswith("median_")})
                 self.live_inventory_open_lots.append(lot)
                 if v4_mode:
                     self.live_inventory_v4_last_entry_submit_monotonic = (
@@ -25007,6 +25126,7 @@ class VariationalToLighterRuntime:
             )
         if (
             v4_mode
+            and not median_live.enabled(self)
             and self.live_inventory_basis_v4_real_gradient
             and len(self.live_inventory_open_lots) > 1
             and not portfolio_exit_lot_ids
@@ -25159,6 +25279,7 @@ class VariationalToLighterRuntime:
             and len(self.live_inventory_open_lots) > 1
             and not portfolio_exit_lot_ids
             and not portfolio_eligible
+            and not median_live.enabled(self)
             and not maintenance_drain_uses_individual_legacy_exits(
                 requested=bool(
                     getattr(
@@ -25319,6 +25440,7 @@ class VariationalToLighterRuntime:
         if (
             v4_mode
             and self.live_inventory_basis_v4_real_gradient
+            and not median_live.enabled(self)
             and not getattr(
                 self,
                 "live_inventory_basis_v4_tier_independent_exit",
@@ -25427,6 +25549,7 @@ class VariationalToLighterRuntime:
         if (
             v4_mode
             and self.live_inventory_basis_v4_real_gradient
+            and not median_live.enabled(self)
             and not getattr(
                 self,
                 "live_inventory_basis_v4_tier_independent_exit",
@@ -25746,7 +25869,10 @@ class VariationalToLighterRuntime:
                 else None
             )
         selected_exit: dict[str, Any] | None = None
-        for lot_index, candidate_lot in enumerate(self.live_inventory_open_lots):
+        exit_candidates = list(enumerate(self.live_inventory_open_lots))
+        if median_live.enabled(self):
+            exit_candidates.sort(key=lambda pair: int(pair[1].get("entry_gradient_tier") or 0), reverse=True)
+        for lot_index, candidate_lot in exit_candidates:
             if atomic_portfolio_lot is not None:
                 if lot_index != atomic_portfolio_lot_index:
                     continue
@@ -25804,6 +25930,7 @@ class VariationalToLighterRuntime:
             )
             current_quote_matches_lot = bool(
                 not portfolio_exit_selected
+                and (not median_live.enabled(self) or quote.get("quote_semantics") == "executable_rfq")
                 and current_quote_reuse_ok
                 and var_quote_age_ok
                 and lighter_book_age_ok
@@ -25927,6 +26054,17 @@ class VariationalToLighterRuntime:
                 and pnl_bps >= self.live_inventory_basis_profit_take_pnl_bps
             )
             raw_should_exit = raw_should_exit or should_profit_take
+            if median_live.enabled(self):
+                effective_min_exit_pnl_bps = max(Decimal(3), self.live_inventory_basis_min_exit_pnl_bps) + Decimal(2)
+                v4_exit_shortfall_reserve_bps = Decimal(2)
+                pnl_bps = pnl / (qty * ((entry_var_price + entry_lighter_price) / 2)) * Decimal("10000") if qty > 0 else None
+                raw_should_exit = bool(
+                    pnl_bps is not None and pnl_bps >= effective_min_exit_pnl_bps
+                    and median_live.reversion_ready(self, candidate_lot, median_basis)
+                )
+                raw_should_exit = median_live.confirm_exit_signal(
+                    self, candidate_lot, raw_should_exit, time.time()
+                )
             should_exit = raw_should_exit and var_quote_age_ok and lighter_book_age_ok
             loss_review_required = (
                 v4_mode
@@ -25948,10 +26086,13 @@ class VariationalToLighterRuntime:
             )
             forced_exit_reason = operator_exit_reason or account_risk_exit_reason
             should_account_risk_exit = bool(forced_exit_reason)
-            should_timeout = holding_samples >= self.live_inventory_max_hold_samples
+            should_timeout = (
+                not median_live.enabled(self)
+                and holding_samples >= self.live_inventory_max_hold_samples
+            )
             should_timeout_exit = should_timeout and self.live_inventory_basis_max_hold_action == "exit"
             v4_tail_release_active = False
-            if v4_mode and candidate_lot.get("entry_kind") == "basis_v4_eth_short_p97_5":
+            if v4_mode and not median_live.enabled(self) and candidate_lot.get("entry_kind") == "basis_v4_eth_short_p97_5":
                 effective_min_exit_pnl_bps, v4_tail_release_active = (
                     v4_single_tail_exit_target_bps(
                         open_lot_count=len(self.live_inventory_open_lots),
@@ -26214,7 +26355,11 @@ class VariationalToLighterRuntime:
                 if should_stop or should_account_risk_exit:
                     selected_exit = candidate_exit
                     break
-                if selected_exit is None or exit_candidate_priority(
+                if selected_exit is None or (
+                    median_live.enabled(self)
+                    and int(candidate_lot.get("entry_gradient_tier") or 0)
+                    > int(selected_exit["lot"].get("entry_gradient_tier") or 0)
+                ) or (not median_live.enabled(self) and exit_candidate_priority(
                     pnl_bps=candidate_exit.get("pnl_bps"),
                     waited_seconds=candidate_exit.get("holding_seconds"),
                     recently_refreshed=bool(
@@ -26226,7 +26371,7 @@ class VariationalToLighterRuntime:
                     recently_refreshed=bool(
                         selected_exit.get("recently_refreshed")
                     ),
-                ):
+                )):
                     selected_exit = candidate_exit
         if selected_exit is None:
             return
@@ -26332,6 +26477,7 @@ class VariationalToLighterRuntime:
             exit_lighter_side = "BUY" if exit_side.strip().upper() == "SELL" else "SELL"
             use_fast_refresh_window = bool(
                 v4_mode
+                and not median_live.enabled(self)
                 and should_exit
                 and not portfolio_exit_selected
                 and not should_stop
@@ -26625,6 +26771,8 @@ class VariationalToLighterRuntime:
                         exit_lighter_price=lighter_exit_price,
                     )
                     notional = qty * entry_var_price
+                    if median_live.enabled(self):
+                        notional = qty * ((entry_var_price + entry_lighter_price) / 2)
                     pnl_bps = (
                         pnl / notional * Decimal("10000") if notional else None
                     )
@@ -26662,6 +26810,7 @@ class VariationalToLighterRuntime:
                     and not should_timeout_exit
                     and not should_account_risk_exit
                     and not reuse_current_quote
+                    and not median_live.enabled(self)
                 ):
                     exit_confirmed, confirmation_count = (
                         self.live_inventory_basis_v4_confirm_exit_candidate(
@@ -26766,6 +26915,12 @@ class VariationalToLighterRuntime:
                 role="live_inventory_exit",
                 created_at_monotonic=time.monotonic(),
             )
+            if not median_live.close_started(self, lot):
+                await self.append_live_inventory_log("live_inventory_exit_blocked", {
+                    "asset": asset, "lot_id": lot.get("lot_id"),
+                    "reason": "median_close_already_pending_or_identity_unverified",
+                })
+                return
             self.add_pending_live_inventory_var_fill_match(pending_exit_match)
             # Persist the reduce-only intent before either venue is touched.
             await self.persist_live_inventory_memory(
@@ -26808,6 +26963,7 @@ class VariationalToLighterRuntime:
                 )
                 preflight = exit_pair_context.get("profit_preflight") or {}
                 if exit_pair_context.get("preflight_blocked"):
+                    median_live.close_not_submitted(self, lot)
                     self.remove_pending_live_inventory_var_fill_match(
                         asset=asset, lot_id=lot.get("lot_id"), role="live_inventory_exit"
                     )
@@ -30670,7 +30826,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paper-inventory-exit-bps", type=float, default=10.0)
     parser.add_argument("--paper-inventory-min-hold-samples", type=int, default=3)
     parser.add_argument("--paper-inventory-latency-samples", type=int, default=0)
+    parser.add_argument("--live-inventory-frozen-median", action="store_true",
+                        help="Use 1s/60m median, frozen anchor and D=6 gradient with existing live execution guards.")
     args = parser.parse_args()
+    if args.live_inventory_frozen_median and not (
+        args.mode == MODE_LIVE and args.live_inventory_basis_v4_real_gradient
+        and args.live_inventory_basis_v4_bidirectional
+        and args.live_inventory_basis_v4_continuous
+        and args.live_inventory_basis_refresh_entry_quote_before_submit
+        and args.live_inventory_basis_refresh_exit_quote_before_submit
+        and args.live_inventory_basis_entry_mode == LIVE_INVENTORY_ENTRY_MODE_CONCURRENT
+        and not args.live_inventory_basis_reversion and not args.live_inventory_execution_calibration
+        and 0 < args.live_inventory_max_venue_leverage <= 5
+        and args.live_inventory_lot_notional_usd == 20
+    ):
+        parser.error("Frozen median requires bidirectional V4 real gradient and concurrent live execution")
     if args.mode == MODE_LIVE and not args.confirm_live:
         parser.error("--mode live requires --confirm-live")
     if args.forwarder_ws_port <= 0 or args.forwarder_ws_port > 65535:
