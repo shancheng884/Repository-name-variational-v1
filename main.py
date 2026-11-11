@@ -145,6 +145,8 @@ LIVE_INVENTORY_BASIS_V4_MIN_WINDOW_COVERAGE = Decimal("0.80")
 LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_WINDOW_SECONDS = 660
 LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MIN_SAMPLES = 20
 LIVE_INVENTORY_BASIS_V4_HEALTH_RECENT_MAX_GAP_SECONDS = 60
+# How close to the entry bar counts as "approaching" in the read-only audit.
+LIVE_INVENTORY_BASIS_V4_NEAR_BAR_BAND_BPS = Decimal("1.0")
 LIVE_INVENTORY_BASIS_V4_MIN_HISTORY_SAMPLES = 100
 LIVE_INVENTORY_BASIS_V4_MIN_ANCHOR_EFFECTIVE_SECONDS = 129600
 LIVE_INVENTORY_BASIS_V4_FAST_MIN_EFFECTIVE_SECONDS = 21600
@@ -10880,6 +10882,97 @@ class VariationalToLighterRuntime:
             store.pop(direction, None)
         return events
 
+    def audit_live_inventory_v4_near_bar(
+        self,
+        *,
+        direction: str,
+        edge_bps: Decimal | None,
+        threshold_bps: Decimal | None,
+        sample_index: int | None = None,
+        asset: str | None = None,
+        band_bps: Decimal = LIVE_INVENTORY_BASIS_V4_NEAR_BAR_BAND_BPS,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Log the run-up to the bar, one event per approach instead of per tick.
+
+        Two events per episode ("entered" and "left") give a leading indicator
+        that costs nothing: no request, no decision, no change to any gate.
+        """
+
+        events: list[tuple[str, dict[str, Any]]] = []
+        store = getattr(self, "live_inventory_v4_near_bar_state", None)
+        if not isinstance(store, dict):
+            store = {}
+            self.live_inventory_v4_near_bar_state = store
+        if edge_bps is None or threshold_bps is None:
+            return events
+        margin_bps = v4_edge_margin_bps(
+            edge_bps,
+            threshold_bps,
+            direction=direction,
+        )
+        if margin_bps is None:
+            return events
+        distance_bps = -margin_bps
+        near = (
+            margin_bps < 0
+            and band_bps > 0
+            and distance_bps <= band_bps
+        )
+        now_monotonic = time.monotonic()
+        state = store.get(direction)
+        if near:
+            if not isinstance(state, dict):
+                store[direction] = {
+                    "started_monotonic": now_monotonic,
+                    "started_at": utc_now(),
+                    "closest_distance_bps": distance_bps,
+                    "ticks": 1,
+                }
+                events.append(
+                    (
+                        "live_inventory_v4_near_bar_entered",
+                        {
+                            "asset": asset,
+                            "sample_index": sample_index,
+                            "direction": direction,
+                            "edge_bps": decimal_to_str(edge_bps),
+                            "threshold_bps": decimal_to_str(threshold_bps),
+                            "distance_to_bar_bps": decimal_to_str(distance_bps),
+                            "band_bps": decimal_to_str(band_bps),
+                        },
+                    )
+                )
+                return events
+            closest = to_decimal(state.get("closest_distance_bps"))
+            if closest is None or distance_bps < closest:
+                state["closest_distance_bps"] = distance_bps
+            state["ticks"] = int(state.get("ticks") or 0) + 1
+            return events
+        if isinstance(state, dict):
+            duration_seconds = max(
+                0.0,
+                now_monotonic - float(state.get("started_monotonic") or now_monotonic),
+            )
+            events.append(
+                (
+                    "live_inventory_v4_near_bar_left",
+                    {
+                        "asset": asset,
+                        "sample_index": sample_index,
+                        "direction": direction,
+                        "edge_bps": decimal_to_str(edge_bps),
+                        "threshold_bps": decimal_to_str(threshold_bps),
+                        "closest_distance_bps": decimal_to_str(
+                            to_decimal(state.get("closest_distance_bps"))
+                        ),
+                        "seconds_in_band": round(duration_seconds, 3),
+                        "ticks_in_band": int(state.get("ticks") or 0),
+                    },
+                )
+            )
+            store.pop(direction, None)
+        return events
+
     def live_inventory_basis_v4_entry_threshold(
         self,
         *,
@@ -21204,6 +21297,19 @@ class VariationalToLighterRuntime:
                     await self.append_live_inventory_log(
                         crossing_event,
                         crossing_payload,
+                    )
+                for near_event, near_payload in (
+                    self.audit_live_inventory_v4_near_bar(
+                        direction=crossing_direction,
+                        edge_bps=v4_signal_edges.get(crossing_direction),
+                        threshold_bps=v4_entry_thresholds.get(crossing_direction),
+                        sample_index=index,
+                        asset=asset,
+                    )
+                ):
+                    await self.append_live_inventory_log(
+                        near_event,
+                        near_payload,
                     )
             rearm_direction = (
                 self.live_inventory_v4_rearm_direction
