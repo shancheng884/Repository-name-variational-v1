@@ -13,6 +13,36 @@ from tools.lib.frozen_median import (
     executable_profit_bps,
 )
 
+LEVELS = tuple(map(D, ("5.6", "6.6", "7.6", "8.6", "9.6")))
+ROUNDTRIP_BUDGET = D("4.6")
+NET_TARGET = D(1)
+STRATEGY = "frozen_median_56_96_cost46_net1_v2"
+
+
+def cost_residual(*, direction, var_entry, lighter_entry, var_entry_mid,
+                  lighter_entry_mid, var_exit, lighter_exit, var_exit_mid,
+                  lighter_exit_mid):
+    prices = tuple(map(D, (var_entry, lighter_entry, var_entry_mid, lighter_entry_mid,
+                          var_exit, lighter_exit, var_exit_mid, lighter_exit_mid)))
+    if not all(x.is_finite() and x > 0 for x in prices):
+        raise ValueError("median_cost_reference_invalid")
+    ve,le,vm,lm,vx,lx,vxm,lxm = prices
+    sign = D(1) if direction == LONG else D(-1)
+    embedded = sign*((ve-vm)+(lm-le)+(vxm-vx)+(lx-lxm))/((ve+le)/2)*10000
+    return max(D(0), ROUNDTRIP_BUDGET-max(D(0),embedded))
+
+
+def exit_reserve(lot, *, var_exit, lighter_exit, var_mid=None, lighter_mid=None):
+    # Missing evidence receives no cost credit, never a guessed zero budget.
+    if not all(lot.get(k) is not None for k in ("median_var_entry_mid", "median_lighter_entry_mid")):
+        return ROUNDTRIP_BUDGET
+    return cost_residual(direction=lot["direction"],
+        var_entry=D(lot["entry_var_fill_price"]), lighter_entry=D(lot["entry_lighter_fill_price"]),
+        var_entry_mid=D(lot["median_var_entry_mid"]), lighter_entry_mid=D(lot["median_lighter_entry_mid"]),
+        var_exit=var_exit,lighter_exit=lighter_exit,
+        var_exit_mid=var_mid if var_mid is not None else var_exit,
+        lighter_exit_mid=lighter_mid if lighter_mid is not None else lighter_exit)
+
 
 def enabled(runtime) -> bool:
     return bool(getattr(runtime, "live_inventory_frozen_median", False))
@@ -31,13 +61,17 @@ def initialize(runtime, state: dict) -> None:
     if not saved and (state.get("open_lots") or state.get("pending_actions")):
         raise ValueError("cannot_adopt_legacy_inventory_into_median_strategy")
     runtime.frozen_median_model = (
-        FrozenMedianGradient.restore(saved) if saved else FrozenMedianGradient()
+        FrozenMedianGradient.restore(saved) if saved else FrozenMedianGradient(deviation_bps=LEVELS[0], distances=LEVELS)
     )
     runtime.frozen_median_last_row = None
     runtime.frozen_median_rfq_context = {}
     model = runtime.frozen_median_model
-    if model.deviation != 6 or model.window != 3600:
-        raise ValueError("persisted_median_parameters_do_not_match_D6_60m")
+    if model.distances != LEVELS:
+        if model.anchor is not None or state.get("open_lots") or state.get("pending_actions") or any(o["state"] != "closed" for o in model.orders.values()):
+            raise ValueError("median_policy_upgrade_requires_verified_flat_state")
+        model.deviation, model.distances = LEVELS[0], LEVELS
+    if model.window != 3600:
+        raise ValueError("persisted_median_window_mismatch")
     # Only the qualified journal is eligible for restart warm-up, not old ticks.
     root = Path(runtime.output_dir) / "median_samples"
     cutoff = time.time() - model.window
@@ -110,14 +144,16 @@ def checkpoint(runtime) -> dict:
                 m.confirm_open(key, matched_qty=True)
     rolling = m.rolling_median(now=time.time())
     return {"frozen_median": m.dump(),
-            "median_strategy": "frozen_median_D6_v1",
+            "median_strategy": STRATEGY,
+            "median_roundtrip_cost_budget_bps": str(ROUNDTRIP_BUDGET),
+            "median_net_target_bps": str(NET_TARGET),
             "median_rolling_bps": str(rolling) if rolling is not None else None,
             "median_anchor_bps": str(m.anchor) if m.anchor is not None else None,
             "median_current_basis_bps": str(m.last_basis) if m.last_basis is not None else None,
             "median_history_count": len(m.history),
             "median_review_reason": m.review_reason,
             "median_ready": rolling is not None and not m.review_reason,
-            "median_levels_bps": [str(m.deviation * k) for k in MULTIPLIERS]}
+            "median_levels_bps": [str(k) for k in m.distances]}
 
 
 def thresholds(runtime, *, now, direction):
@@ -126,12 +162,12 @@ def thresholds(runtime, *, now, direction):
     anchor = m.anchor if m.anchor is not None else rolling
     ready = anchor is not None and not m.review_reason
     sign = D(1) if direction == LONG else D(-1)
-    levels = [anchor + sign * m.deviation * k for k in MULTIPLIERS] if ready else []
+    levels = [anchor + sign * k for k in m.distances] if ready else []
     context = {
-        "median_strategy": "frozen_median_D6_v1",
+        "median_strategy": STRATEGY,
         "median_anchor_bps": str(m.anchor) if m.anchor is not None else None,
         "median_rolling_bps": str(rolling) if rolling is not None else None,
-        "median_deviation_bps": "6", "median_window_seconds": m.window,
+        "median_deviation_bps": str(m.deviation), "median_window_seconds": m.window,
         "median_history_count": len(m.history),
         "median_review_reason": m.review_reason,
         "v4_anchor_ready": ready, "v4_health_ready": ready,
@@ -157,9 +193,8 @@ def rfq_confirmation(runtime, *, direction, var_bid, var_ask,
                      lighter_entry, lighter_exit, now):
     """Map the frozen reference midpoint to executable exit prices once.
 
-    The contemporaneous reference-to-RFQ midpoint offset is a forecast mapping,
-    not an extra charge. The existing 2bps entry and 2bps exit priors are kept
-    as unpriced-execution reserves, in addition to prices already containing spread.
+    The midpoint offset maps the forecast, not an extra fee. Quoted spread and
+    depth replace part of the 4.6bps total budget; only its residual is charged.
     """
     m = runtime.frozen_median_model
     row = runtime.frozen_median_last_row
@@ -181,24 +216,27 @@ def rfq_confirmation(runtime, *, direction, var_bid, var_ask,
     projected_l_exit = target_l + (lighter_exit - reference_l)
     # Do not reuse legacy signal-to-fill calibration here: it includes RFQ
     # repricing, which the executable prices have already incorporated.
-    entry_reserve = D(2)
-    exit_reserve = D(2)
-    remaining = entry_reserve + exit_reserve
+    remaining = cost_residual(direction=direction,var_entry=var_entry,lighter_entry=lighter_entry,
+        var_entry_mid=(var_bid+var_ask)/2,lighter_entry_mid=reference_l,
+        var_exit=var_exit,lighter_exit=projected_l_exit,
+        var_exit_mid=target_v+midpoint_offset,lighter_exit_mid=target_l)
     profit = executable_profit_bps(
         direction=direction, var_entry=var_entry, lighter_entry=lighter_entry,
         var_exit=var_exit, lighter_exit=projected_l_exit,
         remaining_reserve_bps=remaining,
     )
-    target = max(D(3), runtime.live_inventory_basis_min_exit_pnl_bps)
+    target = NET_TARGET
     edge = pair_edge(var_entry, lighter_entry)
     # Express the profit test in the same signed-edge units as the executor.
     sign = D(1) if direction == LONG else D(-1)
     required = edge + sign * (target - profit)
-    levels = [required + sign * m.deviation * (k - 1) for k in MULTIPLIERS]
+    levels = [required + sign * (k-m.distances[0]) for k in m.distances]
     result = {
         "median_anchor_bps": str(anchor), "median_expected_net_bps": str(profit),
-        "median_entry_execution_reserve_bps": str(entry_reserve),
-        "median_exit_execution_reserve_bps": str(exit_reserve),
+        "median_remaining_unpriced_cost_bps": str(remaining),
+        "median_roundtrip_cost_budget_bps": str(ROUNDTRIP_BUDGET),
+        "median_var_entry_mid": str((var_bid+var_ask)/2),
+        "median_lighter_entry_mid": str(reference_l),
         "median_rfq_midpoint_offset": str(midpoint_offset),
         "median_projected_var_exit": str(var_exit),
         "median_projected_lighter_exit": str(projected_l_exit),
@@ -220,7 +258,7 @@ def reserve(runtime, *, order_id, lot_id, direction, tier, capacity, now):
         raise ValueError("median_duplicate_intent")
     m.orders[order_id]["lot_id"] = lot_id
     return {"median_order_id": order_id, "median_anchor_bps": str(m.anchor),
-            "median_entry_strategy": "frozen_median_D6_v1",
+        "median_entry_strategy": STRATEGY,
             **runtime.frozen_median_rfq_context}
 
 
@@ -306,7 +344,7 @@ def reversion_ready(runtime, lot, basis):
     m = runtime.frozen_median_model
     anchor = D(lot["median_anchor_bps"])
     tier = int(lot["entry_gradient_tier"])
-    target_distance = D(0) if tier == 1 else m.deviation * MULTIPLIERS[tier - 2]
+    target_distance = D(0) if tier == 1 else m.distances[tier - 2]
     return m.signed_distance(basis, anchor, lot["direction"]) <= target_distance
 
 

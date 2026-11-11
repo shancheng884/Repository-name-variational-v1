@@ -9957,7 +9957,7 @@ class VariationalToLighterRuntime:
 
     def load_live_inventory_basis_v4_history(self, *, asset: str) -> dict[str, Any]:
         if median_live.enabled(self):
-            return {"asset": asset, "strategy": "frozen_median_D6_v1",
+            return {"asset": asset, "strategy": median_live.STRATEGY,
                     "legacy_history_ignored": True}
         # Runs from a worker thread; hold the same lock the live sampler uses
         # so the clear-and-refill cannot interleave with a recorded sample.
@@ -12243,6 +12243,7 @@ class VariationalToLighterRuntime:
         entry_lighter_price: Decimal,
         exit_lighter_side: str,
         effective_min_exit_pnl_bps: Decimal | None = None,
+        median_lot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         throttle_key = str(asset).upper()
         throttle = getattr(self, "live_inventory_profit_exit_rfq_throttle", None)
@@ -12363,7 +12364,15 @@ class VariationalToLighterRuntime:
         executable_pnl_bps = (
             executable_pnl / notional * Decimal("10000") if notional else None
         )
+        median_reserve = None
+        if median_live.enabled(self) and median_lot is not None:
+            median_reserve = median_live.exit_reserve(median_lot,
+                var_exit=refreshed_var_exit_price,lighter_exit=depth_exit_price,
+                var_mid=(refreshed_var_bid+refreshed_var_ask)/2,
+                lighter_mid=(lighter_best_bid+lighter_best_ask)/2)
         return {
+            "median_exit_reserve_bps": median_reserve,
+            "median_var_exit_mid": (refreshed_var_bid+refreshed_var_ask)/2,
             "reason": None,
             "refresh_quote_ms": refresh_quote_ms,
             "refreshed_var_exit_price": refreshed_var_exit_price,
@@ -17386,9 +17395,15 @@ class VariationalToLighterRuntime:
         reserve = self.live_inventory_basis_v4_exit_calibration_context(direction=direction)["reserve_bps"]
         if median_live.enabled(self):
             pnl_bps = pnl / (qty * ((context["entry_var_price"] + context["entry_lighter_price"]) / 2)) * Decimal("10000")
-            reserve = Decimal(2)
+            bid, ask = await self.get_lighter_best_bid_ask()
+            reserve = median_live.exit_reserve(context.get("median_lot") or {},
+                var_exit=var_exit_price,lighter_exit=price,
+                var_mid=to_decimal(context.get("median_var_exit_mid")),
+                lighter_mid=(bid+ask)/2 if bid is not None and ask is not None else None)
         net_target = max(context["effective_min_exit_pnl_bps"] - context["exit_reserve_bps"], Decimal("0"))
         target = max(context["effective_min_exit_pnl_bps"], reserve + net_target)
+        if median_live.enabled(self):
+            target = median_live.NET_TARGET + reserve
         completion_bps = getattr(
             self, "live_inventory_lighter_exit_submit_slippage_bps", self.live_inventory_max_lighter_slippage_bps
         )
@@ -26086,8 +26101,10 @@ class VariationalToLighterRuntime:
             )
             raw_should_exit = raw_should_exit or should_profit_take
             if median_live.enabled(self):
-                effective_min_exit_pnl_bps = max(Decimal(3), self.live_inventory_basis_min_exit_pnl_bps) + Decimal(2)
-                v4_exit_shortfall_reserve_bps = Decimal(2)
+                v4_exit_shortfall_reserve_bps = median_live.exit_reserve(candidate_lot,
+                    var_exit=var_exit_price,lighter_exit=lighter_exit_price,
+                    var_mid=basis_mid,lighter_mid=lighter_mid)
+                effective_min_exit_pnl_bps = median_live.NET_TARGET + v4_exit_shortfall_reserve_bps
                 pnl_bps = pnl / (qty * ((entry_var_price + entry_lighter_price) / 2)) * Decimal("10000") if qty > 0 else None
                 raw_should_exit = bool(
                     pnl_bps is not None and pnl_bps >= effective_min_exit_pnl_bps
@@ -26645,8 +26662,14 @@ class VariationalToLighterRuntime:
                             entry_lighter_price=entry_lighter_price,
                             exit_lighter_side=exit_lighter_side,
                             effective_min_exit_pnl_bps=effective_min_exit_pnl_bps,
+                            median_lot=lot if median_live.enabled(self) else None,
                         )
                     )
+                    if median_live.enabled(self):
+                        v4_exit_shortfall_reserve_bps = to_decimal(refresh_context.get("median_exit_reserve_bps"))
+                        if v4_exit_shortfall_reserve_bps is None:
+                            v4_exit_shortfall_reserve_bps = median_live.ROUNDTRIP_BUDGET
+                        effective_min_exit_pnl_bps = median_live.NET_TARGET + v4_exit_shortfall_reserve_bps
                     refresh_reason = refresh_context.get("reason")
                     refreshed_pnl_bps = to_decimal(
                         refresh_context.get("refreshed_pnl_bps")
@@ -26985,6 +27008,7 @@ class VariationalToLighterRuntime:
                             **(refresh_context or {}),
                             "entry_var_price": entry_var_price,
                             "entry_lighter_price": entry_lighter_price,
+                            "median_lot": lot,
                             "effective_min_exit_pnl_bps": effective_min_exit_pnl_bps,
                             "exit_reserve_bps": v4_exit_shortfall_reserve_bps,
                         }
@@ -30864,7 +30888,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paper-inventory-min-hold-samples", type=int, default=3)
     parser.add_argument("--paper-inventory-latency-samples", type=int, default=0)
     parser.add_argument("--live-inventory-frozen-median", action="store_true",
-                        help="Use 1s/60m median, frozen anchor and D=6 gradient with existing live execution guards.")
+                        help="Use frozen 1s/60m median, 5.6-9.6bps tiers, 4.6bps roundtrip budget and 1bps net target.")
     args = parser.parse_args()
     if args.live_inventory_frozen_median and not (
         args.mode == MODE_LIVE and args.live_inventory_basis_v4_real_gradient
@@ -30878,6 +30902,9 @@ def parse_args() -> argparse.Namespace:
         and args.live_inventory_lot_notional_usd == 20
     ):
         parser.error("Frozen median requires bidirectional V4 real gradient and concurrent live execution")
+    if args.live_inventory_frozen_median:
+        args.live_inventory_basis_min_exit_pnl_bps = 1.0
+        args.live_inventory_basis_min_signal_reverted_exit_pnl_bps = 1.0
     if args.mode == MODE_LIVE and not args.confirm_live:
         parser.error("--mode live requires --confirm-live")
     if args.forwarder_ws_port <= 0 or args.forwarder_ws_port > 65535:

@@ -27,7 +27,7 @@ def row(t, b=D(10), event=None):
 
 def fake_runtime(tmp_path, *, basis=D(22)):
     now = time.time()
-    m = FrozenMedianGradient()
+    m = FrozenMedianGradient(deviation_bps=live.LEVELS[0],distances=live.LEVELS)
     m.signature = ("ETH:USDC:passive_indicative_bid_ask", "base")
     m.history = deque((int(now)-3600+i, D(10)) for i in range(3600))
     r = row(now, basis)
@@ -56,8 +56,9 @@ def test_rfq_confirmation_uses_same_signed_edge_in_both_directions(tmp_path,dire
     assert D(proof['median_expected_net_bps']) > 3
     assert app.v4_edge_meets_threshold(edge,threshold,direction=direction)
     assert len(levels)==5
-    assert proof['median_entry_execution_reserve_bps']=='2'
-    assert proof['median_exit_execution_reserve_bps']=='2'
+    assert proof['median_roundtrip_cost_budget_bps']=='4.6'
+    assert proof['median_profit_target_bps']=='1'
+    assert D(proof['median_remaining_unpriced_cost_bps'])<D('4.6')
     # A source-to-RFQ shift affects executable prices, not an extra fee.
     moved = live.rfq_confirmation(rt,direction=direction,
         var_bid=r.var_bid+D('.4'),var_ask=r.var_ask+D('.4'),
@@ -71,7 +72,10 @@ def test_wider_executable_spread_reduces_profit_once(tmp_path):
         return D(live.rfq_confirmation(rt,direction=LONG,
             var_bid=r.var_bid-width,var_ask=r.var_ask+width,
             lighter_entry=r.lighter_bid,lighter_exit=r.lighter_ask,now=r.at)[3]['median_expected_net_bps'])
-    assert D('.99') < profit(D(0))-profit(D('.1')) < D('1.01')
+    # Spread below the total budget replaces part of its residual, not an
+    # additional charge. A spread exceeding the budget really reduces profit.
+    assert abs(profit(D(0))-profit(D('.1'))) < D('.01')
+    assert profit(D(1)) < profit(D('.1'))
 
 
 def test_partial_source_or_old_reference_is_not_qualified_journal(tmp_path):
@@ -168,7 +172,7 @@ def test_real_startup_does_not_start_legacy_history_before_model_restore(tmp_pat
         rt.telegram_notifier=None
         rt.append_live_inventory_run_config=AsyncMock()
         async def start_forwarder():
-            assert rt.frozen_median_model.deviation==6
+            assert rt.frozen_median_model.deviation==D('5.6')
         rt.runtime.start=AsyncMock(side_effect=start_forwarder)
         rt.wait_for_variational_ready=AsyncMock(return_value=True)
         rt.requires_lighter_trading_credentials=lambda:False
@@ -184,7 +188,7 @@ def test_real_startup_does_not_start_legacy_history_before_model_restore(tmp_pat
         rt.reconcile_live_inventory_startup_state=AsyncMock(side_effect=IntentCaptured())
         with pytest.raises(IntentCaptured):
             await rt.run()
-        assert rt.frozen_median_model.deviation==6
+        assert rt.frozen_median_model.deviation==D('5.6')
         assert len(rt.frozen_median_model.history)==0
         rt.refresh_live_inventory_basis_v4_history_loop.assert_not_called()
         rt.send_variational_place_order.assert_not_called()
@@ -195,10 +199,10 @@ def test_real_startup_does_not_start_legacy_history_before_model_restore(tmp_pat
 def test_health_uses_current_median_gates_not_uninitialised_legacy_store(tmp_path,monkeypatch):
     rt,_=loop_runtime(tmp_path,monkeypatch,D(22))
     health=rt.live_inventory_v4_health_payload()
-    assert health['median_strategy']=='frozen_median_D6_v1'
+    assert health['median_strategy']==live.STRATEGY
     assert health['v4_health_ready'] and health['median_ready']
     assert health['v4_gate_limits']['history_sample_seconds']==1
-    assert health['v4_direction_gates'][LONG]['gradient_thresholds_bps']==['16','19.0','22','28','34']
+    assert health['v4_direction_gates'][LONG]['gradient_thresholds_bps']==['15.6','16.6','17.6','18.6','19.6']
     assert 'frozen_median' not in health
     rt.frozen_median_model.history.clear()
     health=rt.live_inventory_v4_health_payload()
@@ -227,9 +231,78 @@ def test_constructor_and_cli_keep_all_original_execution_guards(tmp_path,monkeyp
     runtime=app.VariationalToLighterRuntime(args)
     runtime.sync_live_inventory_memory_from_state()
     assert runtime.live_inventory_frozen_median
-    assert runtime.frozen_median_model.deviation==6
+    assert runtime.frozen_median_model.deviation==D('5.6')
     assert runtime.live_inventory_lot_notional_usd==20
     assert runtime.live_inventory_max_venue_leverage==5
+    assert runtime.live_inventory_basis_min_exit_pnl_bps==1
+    assert runtime.live_inventory_basis_min_signal_reverted_exit_pnl_bps==1
+
+
+@pytest.mark.parametrize('direction,basis',[(LONG,D('15.5')),(LONG,D('15.7')),(SHORT,D('4.5')),(SHORT,D('4.3'))])
+def test_exact_profit_boundary_is_one_after_total_budget_not_three(tmp_path,direction,basis):
+    rt=fake_runtime(tmp_path,basis=basis);r=rt.frozen_median_last_row
+    edge,bar,_,proof=live.rfq_confirmation(rt,direction=direction,var_bid=r.var_bid,var_ask=r.var_ask,
+        lighter_entry=r.lighter_bid if direction==LONG else r.lighter_ask,
+        lighter_exit=r.lighter_ask if direction==LONG else r.lighter_bid,now=r.at)
+    passes=abs(basis-10)>D('5.6')
+    assert app.v4_edge_meets_threshold(edge,bar,direction=direction)==passes
+    if passes:assert 1<D(proof['median_expected_net_bps'])<3
+
+
+def test_total_budget_is_not_added_again_to_price_embedded_cost():
+    args=dict(direction=LONG,var_entry=D(10000),lighter_entry=D(10010),
+        var_entry_mid=D(9999),lighter_entry_mid=D(10011),
+        var_exit=D(10005),lighter_exit=D(10005),var_exit_mid=D(10006),lighter_exit_mid=D(10004))
+    residual=live.cost_residual(**args)
+    embedded=D(4)/D(10005)*10000
+    assert embedded+residual==D('4.6')
+    assert residual<D(1)
+    args['var_exit_mid']=D(10010)
+    assert live.cost_residual(**args)==0
+
+
+def test_exit_preflight_accepts_net_between_one_and_three_without_legacy_floor(tmp_path,monkeypatch):
+    async def run():
+        rt,_=loop_runtime(tmp_path,monkeypatch,D(10))
+        rt.live_inventory_basis_quote_reuse_validation=lambda **kw:(True,None,{})
+        rt.get_lighter_best_bid_ask=AsyncMock(return_value=(D('9997.6'),D('10000.4')))
+        rt.live_inventory_lighter_depth_context=AsyncMock(return_value={
+            'estimated_fill_price':'10000.4','reference_price':'10000.4',
+            'book_age_seconds':0,'book_exchange_timestamp_valid':True})
+        lot={'direction':LONG,'entry_var_fill_price':'9999','entry_lighter_fill_price':'10001',
+             'median_var_entry_mid':'9998','median_lighter_entry_mid':'10002'}
+        result=await rt.live_inventory_profit_exit_preflight(asset='ETH',direction=LONG,
+            qty=D('.002'),var_exit_price=D('10000.6'),reuse_quote_id='rfq',context={
+                'entry_var_price':D(9999),'entry_lighter_price':D(10001),
+                'median_lot':lot,'median_var_exit_mid':D(10002),
+                'effective_min_exit_pnl_bps':D(3),'exit_reserve_bps':D(2)})
+        assert result['ok']
+        assert D(result['effective_min_exit_pnl_bps'])==1
+        assert D(result['exit_execution_reserve_bps'])==0
+        assert 1<D(result['executable_pnl_bps'])<3
+    asyncio.run(run())
+
+
+def test_flat_upgrade_preserves_tombstones_and_live_upgrade_refuses(tmp_path):
+    rt=fake_runtime(tmp_path)
+    old=FrozenMedianGradient().dump()
+    old['orders']={'old':{'lot_id':7,'tier':1,'state':'closed','generation':0}}
+    live.initialize(rt,{'status':'flat','frozen_median':old})
+    assert rt.frozen_median_model.distances==live.LEVELS
+    assert rt.frozen_median_model.orders==old['orders']
+    old['orders']['old']['state']='pending'
+    old['anchor']='10';old['direction']=LONG;old['episode_id']='old'
+    with pytest.raises(ValueError,match='upgrade_requires_verified_flat'):
+        live.initialize(rt,{'frozen_median':old,'pending_actions':[{}]})
+
+
+def test_new_level_roundtrip_and_exact_tiers(tmp_path):
+    rt=fake_runtime(tmp_path,basis=D('19.7'));m=rt.frozen_median_model;t=m.last_at
+    m.observe(row(t+1,D('19.7')),var_max_age=5,lighter_max_age=2)
+    assert m.candidate_tier(direction=LONG,now=t+1)==5
+    m.freeze(episode_id='ep',direction=LONG,now=t+1)
+    restored=FrozenMedianGradient.restore(json.loads(json.dumps(m.dump())))
+    assert restored.distances==tuple(map(D,('5.6','6.6','7.6','8.6','9.6')))
 
 
 def test_state_restore_blocks_accidental_legacy_mode_restart(tmp_path):
@@ -416,6 +489,6 @@ def test_profit_preflight_retains_book_age_and_uses_only_remaining_cost(tmp_path
         assert result['reason']==reason
         assert result['ok'] is (reason is None)
         if result['ok']:
-            assert D(result['effective_min_exit_pnl_bps'])==5
-            assert D(result['exit_execution_reserve_bps'])==2
+            assert D(result['effective_min_exit_pnl_bps'])==D('5.6')
+            assert D(result['exit_execution_reserve_bps'])==D('4.6')
     asyncio.run(run())

@@ -791,7 +791,7 @@ def main() -> int:
     parser.add_argument("--config", default=str(LIVE_CONFIG), help="Startup config JSON. Default: live_config.json.")
     parser.add_argument("--reversion", action="store_true", help="Explicitly enable the one-lot basis reversion live test.")
     parser.add_argument("--frozen-median", action="store_true",
-                        help="Use D=6 frozen 1-second median with concurrent V4 real gradient.")
+                        help="Use 5.6-9.6bps frozen median tiers, 4.6bps roundtrip budget and 1bps net target.")
     parser.add_argument(
         "--v4-live",
         action="store_true",
@@ -1178,6 +1178,9 @@ def main() -> int:
     )
     if args.frozen_median:
         command.append("--live-inventory-frozen-median")
+        for flag in ("--live-inventory-basis-min-exit-pnl-bps",
+                     "--live-inventory-basis-min-signal-reverted-exit-pnl-bps"):
+            command[command.index(flag)+1] = "1"
     effective_max_cycles = (
         config.calibration_max_cycles
         if config.calibration_mode

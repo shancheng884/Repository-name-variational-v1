@@ -82,7 +82,7 @@ class FrozenMedianGradient:
 
     def __init__(self, *, deviation_bps: D = D(6), window_seconds: int = 3600,
                  coverage: D = D("0.8"), max_gap: float = 60,
-                 reset_buffer_bps: D = D("0.5")) -> None:
+                 reset_buffer_bps: D = D("0.5"), distances=None) -> None:
         if not deviation_bps.is_finite() or deviation_bps <= 0:
             raise ValueError("invalid_deviation")
         if window_seconds < 3 or not 0 < coverage <= 1 or max_gap <= 0:
@@ -90,6 +90,9 @@ class FrozenMedianGradient:
         if not reset_buffer_bps.is_finite() or not 0 <= reset_buffer_bps < deviation_bps:
             raise ValueError("invalid_reset_buffer")
         self.deviation = deviation_bps
+        self.distances = tuple(D(x) for x in distances) if distances is not None else tuple(deviation_bps*k for k in MULTIPLIERS)
+        if len(self.distances) != 5 or self.distances[0] != deviation_bps or any(not x.is_finite() or x <= 0 for x in self.distances) or any(b <= a for a,b in zip(self.distances,self.distances[1:])):
+            raise ValueError("invalid_gradient_distances")
         self.window = window_seconds
         self.coverage = coverage
         self.max_gap = max_gap
@@ -137,9 +140,9 @@ class FrozenMedianGradient:
                 t = self.tiers[str(i)]
                 if t["armed"] or t["last_event"] == row.event_id:
                     continue
-                if distance <= self.deviation * multiplier - self.reset_buffer:
+                if distance <= self.distances[i-1] - self.reset_buffer:
                     t["reset_seen"] = True
-                if (t["reset_seen"] and distance >= self.deviation * multiplier
+                if (t["reset_seen"] and distance >= self.distances[i-1]
                         and not self.tier_unresolved(i)):
                     t["armed"] = True
                     t["reset_seen"] = False
@@ -150,7 +153,7 @@ class FrozenMedianGradient:
             self.confirmations.append((row.event_id, second, row.basis))
         rolling = self.rolling_median(now=row.at)
         if self.anchor is not None and rolling is not None:
-            if abs(rolling - self.anchor) > self.deviation * 2:
+            if abs(rolling - self.anchor) > D(12):
                 if self.suspect_since is None:
                     self.suspect_since = row.at
                 elif row.at - self.suspect_since >= 1800:
@@ -178,7 +181,7 @@ class FrozenMedianGradient:
     def levels(self, *, now: float) -> tuple[D, ...] | None:
         if self.anchor is None and self.rolling_median(now=now) is None:
             return None
-        return tuple(self.deviation * k for k in MULTIPLIERS)
+        return self.distances
 
     def freeze(self, *, episode_id: str, direction: str, now: float) -> None:
         if self.episode_id is not None:
@@ -205,7 +208,7 @@ class FrozenMedianGradient:
             return 0
         tier = 0
         for i, multiplier in enumerate(MULTIPLIERS, 1):
-            threshold = self.deviation * multiplier
+            threshold = self.distances[i-1]
             if (self.tiers[str(i)]["armed"]
                     and self.signed_distance(self.last_basis, anchor, direction) >= threshold
                     and sum(self.signed_distance(c[2], anchor, direction) >= threshold
@@ -284,6 +287,7 @@ class FrozenMedianGradient:
     def dump(self) -> dict[str, Any]:
         return deepcopy({"schema": self.SCHEMA, "deviation": str(self.deviation),
                 "window": self.window, "coverage": str(self.coverage),
+                "distances": [str(x) for x in self.distances],
                 "max_gap": self.max_gap, "reset_buffer": str(self.reset_buffer),
                 "anchor": str(self.anchor) if self.anchor is not None else None,
                 "direction": self.direction, "episode_id": self.episode_id,
@@ -297,7 +301,7 @@ class FrozenMedianGradient:
             raise ValueError("unsupported_median_state_schema")
         model = cls(deviation_bps=D(state["deviation"]),
                     window_seconds=state["window"], coverage=D(state["coverage"]),
-                    max_gap=state["max_gap"], reset_buffer_bps=D(state["reset_buffer"]))
+                    max_gap=state["max_gap"], reset_buffer_bps=D(state["reset_buffer"]), distances=state.get("distances"))
         model.anchor = D(state["anchor"]) if state["anchor"] is not None else None
         model.direction, model.episode_id = state["direction"], state["episode_id"]
         model.signature = tuple(state["signature"]) if state["signature"] else None
