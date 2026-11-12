@@ -118,3 +118,20 @@ def test_old_fills_are_ignored_after_restart(tmp_path, monkeypatch):
     new = {**old, "trade_id": 2, "timestamp": int(datetime(2026, 11, 12, 15, 1, tzinfo=timezone.utc).timestamp() * 1000)}
     assert fills._normalize(new) is not None
     writer.close()
+
+
+def test_trade_channel_records_market_trades_once(tmp_path, monkeypatch):
+    feed, hub, writer = make_feed(tmp_path, monkeypatch)
+    import asyncio, json
+    asyncio.run(feed.load_markets())
+    msg = {"channel": "trade:15", "timestamp": 1700000000000,
+           "trades": [{"trade_id": 99, "price": "100.5", "size": "2", "usd_amount": "201",
+                       "type": "trade"}]}
+    assert feed._handle(msg) is False
+    feed._handle(msg)
+    writer.close()
+    files = list((tmp_path / "market_trades" / "lighter_mainnet" / "NVDA").glob("*.jsonl"))
+    assert len(files) == 1
+    rows = [json.loads(line) for line in files[0].read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["trade_id"] == "99" and rows[0]["price"] == "100.5"

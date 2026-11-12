@@ -19,7 +19,7 @@ from .probes import LatencyProbe, entropy_probe, lighter_probe, variational_prob
 from .storage import TapeWriter, disk_free_gb, gzip_cold_files, prune_old
 from .sysmon import LoopLagMonitor, SystemSampler
 from .venues.entropy import EntropyBookFeed, EntropyFillFeed
-from .venues.lighter import LighterBookFeed, LighterFillFeed, LighterTradePoller
+from .venues.lighter import LighterBookFeed, LighterFillFeed
 from .venues.variational import VariationalFillFeed, VariationalPriceFeed
 
 
@@ -144,7 +144,6 @@ class CaptureRunner:
                 )
                 await feed.load_markets()
                 self.venues["lighter_mainnet"] = feed
-                self.venues["lighter_mainnet_trades"] = LighterTradePoller(feed=feed, writer=self.writer)
                 self.venues["lighter_mainnet_fills"] = LighterFillFeed(
                     name="lighter_mainnet", rest_url=config.lighter_mainnet_rest,
                     asset_symbols={a.name: a.symbol("lighter_mainnet") for a in assets},
@@ -167,7 +166,6 @@ class CaptureRunner:
                 )
                 await feed.load_markets()
                 self.venues["lighter_rh"] = feed
-                self.venues["lighter_rh_trades"] = LighterTradePoller(feed=feed, writer=self.writer)
                 self.venues["lighter_rh_fills"] = LighterFillFeed(
                     name="lighter_rh", rest_url=config.lighter_rh_rest,
                     asset_symbols={a.name: a.symbol("lighter_rh") for a in assets},

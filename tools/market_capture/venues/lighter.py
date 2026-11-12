@@ -43,6 +43,7 @@ class LighterBookFeed:
         self.markets: dict[str, dict[str, Any]] = {}
         self.market_to_asset: dict[int, str] = {}
         self.books: dict[int, dict[str, Any]] = {}
+        self.seen_trades: set[str] = set()
 
     async def load_markets(self) -> None:
         response = await asyncio.to_thread(
@@ -89,6 +90,9 @@ class LighterBookFeed:
 
     def _handle(self, message: dict[str, Any]) -> bool:
         channel = str(message.get("channel") or "")
+        if channel.startswith("trade:"):
+            self._handle_trades(channel, message)
+            return False
         market_id = None
         for separator in (":", "/"):
             if channel.startswith(f"order_book{separator}"):
@@ -139,6 +143,41 @@ class LighterBookFeed:
         self.health.last_quote_at = book.recv_at
         return False
 
+    def _handle_trades(self, channel: str, message: dict[str, Any]) -> None:
+        try:
+            market_id = int(channel.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return
+        asset = self.market_to_asset.get(market_id)
+        if asset is None:
+            return
+        rows = list(message.get("trades") or []) + list(message.get("liquidation_trades") or [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            trade_id = str(row.get("trade_id") or row.get("trade_id_str") or "")
+            if not trade_id or trade_id in self.seen_trades:
+                continue
+            self.seen_trades.add(trade_id)
+            at = parse_epoch(row.get("timestamp") or message.get("timestamp"))
+            self.writer.append(
+                "market_trades", self.name, asset,
+                {
+                    "schema": 1, "event": "market_trade",
+                    "venue": self.name, "symbol": asset,
+                    "trade_id": trade_id,
+                    "price": decimal_text(to_decimal(row.get("price"))),
+                    "size": decimal_text(to_decimal(row.get("size"))),
+                    "usd_amount": decimal_text(to_decimal(row.get("usd_amount"))),
+                    "trade_type": row.get("type"),
+                    "source_at": at.isoformat() if at else None,
+                    "recv_at": datetime.now(timezone.utc).isoformat(),
+                },
+                at=at,
+            )
+        if len(self.seen_trades) > 100000:
+            self.seen_trades = set(list(self.seen_trades)[-40000:])
+
     async def run(self) -> None:
         backoff = 1.0
         while True:
@@ -148,6 +187,7 @@ class LighterBookFeed:
                     self.health.connected = True
                     for market_id in self.books:
                         await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{market_id}"}))
+                        await ws.send(json.dumps({"type": "subscribe", "channel": f"trade/{market_id}"}))
                     backoff = 1.0
                     async for raw in ws:
                         self.health.message()
