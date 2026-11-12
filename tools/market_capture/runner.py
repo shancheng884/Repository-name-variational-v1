@@ -82,7 +82,6 @@ class CaptureRunner:
         )
         try:
             await self._start_venues()
-            self.loop_lag.start()
             self.tasks.append(asyncio.create_task(self._edge_loop(), name="edge-loop"))
             self.tasks.append(asyncio.create_task(self._health_loop(), name="health-loop"))
             self.tasks.append(asyncio.create_task(self._system_loop(), name="system-loop"))
@@ -93,6 +92,10 @@ class CaptureRunner:
                     created = asyncio.create_task(task(), name=f"venue:{getattr(venue, 'name', '?')}")
                     created.add_done_callback(self._task_done)
                     self.tasks.append(created)
+            # Let lazy SDK imports and first connections finish before measuring
+            # steady-state event-loop lag; the system row still records startup CPU.
+            await asyncio.sleep(2.0)
+            self.loop_lag.start()
             self.logger.info(
                 "market_capture_started run_id=%s output=%s venues=%s assets=%s",
                 self.run_id, self.root, list(self.config.venue_enabled), [a.name for a in self.config.assets],
