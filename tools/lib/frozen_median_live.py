@@ -66,6 +66,9 @@ def initialize(runtime, state: dict) -> None:
     runtime.frozen_median_last_row = None
     runtime.frozen_median_rfq_context = {}
     model = runtime.frozen_median_model
+    wti = getattr(runtime, "live_allowed_assets", set()) == {"WTI"}
+    if wti and model.signature and not model.signature[0].startswith("WTI:USDC:"):
+        raise ValueError("wti_median_saved_instrument_mismatch")
     if model.distances != LEVELS:
         if model.anchor is not None or state.get("open_lots") or state.get("pending_actions") or any(o["state"] != "closed" for o in model.orders.values()):
             raise ValueError("median_policy_upgrade_requires_verified_flat_state")
@@ -81,6 +84,8 @@ def initialize(runtime, state: dict) -> None:
                 try:
                     item = json.loads(line)
                     if item.get("schema") != 1 or item["at"] < cutoff:
+                        continue
+                    if wti and not str(item.get("instrument", "")).startswith("WTI:USDC:"):
                         continue
                     row = Observation(**{
                         k: D(v) if k in ("var_bid", "var_ask", "lighter_bid", "lighter_ask") else v

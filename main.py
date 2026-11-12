@@ -33,6 +33,7 @@ from rich.table import Table
 from tools.lib.auto_rebalance import build_rebalance_plan
 from tools.lib import frozen_median_live as median_live
 from tools.lib import passive_signal
+from tools.lib import median_wti
 from tools.lib.execution_quality import (
     advance_shortfall_reserve,
     lighter_book_clock,
@@ -111,7 +112,7 @@ VARIATIONAL_SUBMIT_TRANSPORT_CHOICES = (VARIATIONAL_SUBMIT_TRANSPORT_DOM, VARIAT
 LIVE_INVENTORY_SIGNAL_SNAPSHOT = "snapshot"
 LIVE_INVENTORY_SIGNAL_BASIS = "basis"
 LIVE_INVENTORY_SIGNAL_CHOICES = (LIVE_INVENTORY_SIGNAL_SNAPSHOT, LIVE_INVENTORY_SIGNAL_BASIS)
-LIVE_INVENTORY_BASIS_ALLOWED_ASSETS = {"BNB", "BTC", "ETH", "HYPE", "SOL", "XRP"}
+LIVE_INVENTORY_BASIS_ALLOWED_ASSETS = {"BNB", "BTC", "ETH", "HYPE", "SOL", "WTI", "XRP"}
 LIVE_INVENTORY_ENTRY_MODE_CONCURRENT = "concurrent"
 LIVE_INVENTORY_ENTRY_MODE_VAR_FIRST = "var-first"
 LIVE_INVENTORY_ENTRY_MODE_CHOICES = (LIVE_INVENTORY_ENTRY_MODE_CONCURRENT, LIVE_INVENTORY_ENTRY_MODE_VAR_FIRST)
@@ -2852,6 +2853,8 @@ class VariationalToLighterRuntime:
             quiet=True,
             raw_event_policy="trading",
         )
+        if median_wti.enabled(self):
+            self.runtime.monitor.asset_aliases = {"USOILP": "WTI"}
 
         self.orders_file = output_dir / "order_metrics.jsonl" if output_dir else None
         self.opportunities_file = output_dir / "opportunities.jsonl" if output_dir else None
@@ -4539,6 +4542,8 @@ class VariationalToLighterRuntime:
         self,
         now_utc: datetime | None = None,
     ) -> bool:
+        if median_wti.enabled(self):
+            return median_wti.session(self, now_utc)["entry_allowed"]
         # V4 trades continuously. Weekend boundary risk is handled by the
         # multi-window threshold transition rather than a calendar shutdown.
         return True
@@ -5904,6 +5909,9 @@ class VariationalToLighterRuntime:
     def extract_all_variational_position_qtys(
         positions_result: dict[str, Any] | None, *, asset: str
     ) -> list[Decimal] | None:
+        if asset.upper() == "WTI":
+            qty = median_wti.position_qty(positions_result)
+            return [qty] if qty is not None else None
         if not isinstance(positions_result, dict):
             return None
         payload = (
@@ -8031,6 +8039,9 @@ class VariationalToLighterRuntime:
 
     @staticmethod
     def extract_lighter_position_qty(account_result: dict[str, Any] | None, *, asset: str) -> Decimal | None:
+        if asset.upper() == "WTI":
+            from tools.lib.hedge_instruments import lighter_position_qty
+            return lighter_position_qty(account_result, market_id=145, symbol="WTI")
         if not isinstance(account_result, dict):
             return None
         accounts = account_result.get("accounts")
@@ -8079,6 +8090,10 @@ class VariationalToLighterRuntime:
         lighter_account_result = None
         lighter_position_qty = None
         reconciliation_errors: dict[str, str] = {}
+        if median_wti.enabled(self):
+            if (await self.fetch_all_variational_pending_orders(asset=asset)
+                    or await self.fetch_lighter_active_orders()):
+                raise RuntimeError("WTI startup has active orders; preserve state for reconciliation")
         try:
             variational_positions_result = await self.fetch_variational_positions()
             if (
@@ -8100,6 +8115,13 @@ class VariationalToLighterRuntime:
             )
         except Exception as exc:
             reconciliation_errors["lighter"] = str(exc)
+
+        if median_wti.enabled(self) and not reconciliation_errors:
+            eth_var = self.extract_all_variational_position_qtys(variational_positions_result, asset="ETH")
+            eth_lighter = self.extract_all_lighter_position_qtys(lighter_account_result, asset="ETH")
+            if (eth_var is None or eth_lighter is None
+                    or any(abs(q) > Decimal("0.00000001") for q in eth_var+eth_lighter)):
+                raise RuntimeError("ETH positions not verified flat; WTI startup refused")
 
         if reconciliation_errors or variational_position_qty is None or lighter_position_qty is None:
             await self.require_live_inventory_manual_review(
@@ -8187,6 +8209,9 @@ class VariationalToLighterRuntime:
             or abs(var_abs - expected_qty) > tolerance
             or abs(lighter_abs - expected_qty) > tolerance
             or not lighter_direction_matches
+            or (median_wti.enabled(self) and (
+                variational_position_qty <= 0 if expected_direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                else variational_position_qty >= 0))
         ):
             await self.require_live_inventory_manual_review(
                 asset=asset,
@@ -9890,6 +9915,8 @@ class VariationalToLighterRuntime:
             self.live_inventory_last_fresh_quote_monotonic = time.monotonic()
         while True:
             await asyncio.sleep(max(5.0, float(poll_seconds)))
+            if median_wti.enabled(self) and median_wti.session(self)["reason"] == "wti_exchange_closed":
+                continue
             last_fresh = getattr(
                 self, "live_inventory_last_fresh_quote_monotonic", None
             )
@@ -10600,9 +10627,15 @@ class VariationalToLighterRuntime:
                 }
             ready = any(g["ready"] for g in gates.values())
             reason = self.frozen_median_model.review_reason or "median_1s_60m_warmup"
+            session = median_wti.session(self)
+            reasons = [] if ready else [reason]
+            if not session["entry_allowed"]:
+                ready = False
+                reasons.append(session["reason"])
             return {
                 **public, "v4_health_ready": ready,
-                "v4_health_reasons": [] if ready else [reason],
+                "v4_health_reasons": reasons,
+                "wti_session": session if median_wti.enabled(self) else None,
                 "v4_direction_gates": gates,
                 "v4_gate_limits": {"history_sample_seconds": 1,
                     "health_window_seconds": 3600, "min_window_coverage": "0.8",
@@ -13208,6 +13241,10 @@ class VariationalToLighterRuntime:
             )
             return None, None
         payload = result.get("result") if isinstance(result.get("result"), dict) else result
+        if asset.upper() == "WTI" and payload.get("instrumentType") != "swap":
+            await self.record_live_inventory_basis_quote_failure(
+                asset=asset, error="wti_rfq_instrument_type_unverified", failure_kind="invalid_quote_metadata")
+            return None, None
         payload = {
             **payload,
             "quote_asset": asset.upper(),
@@ -13261,13 +13298,17 @@ class VariationalToLighterRuntime:
             return None
         async with runtime.monitor._lock:
             reference = runtime.monitor.reference_quotes.get(asset)
-            if not isinstance(reference, dict):
-                return None
-            quote = dict(reference)
             indicative_cache = (getattr(runtime.monitor, "signal_quotes", runtime.monitor.quotes)
                                 if median_live.enabled(self) else runtime.monitor.quotes)
             indicative = indicative_cache.get(asset)
             indicative = dict(indicative) if isinstance(indicative, dict) else None
+            if median_wti.enabled(self) and isinstance(indicative, dict):
+                bid, ask = to_decimal(indicative.get("bid")), to_decimal(indicative.get("ask"))
+                if bid is not None and ask is not None and 0 < bid < ask:
+                    reference = {**indicative, "reference_price": decimal_to_str((bid+ask)/2)}
+            if not isinstance(reference, dict):
+                return None
+            quote = dict(reference)
         return self.merge_passive_indicative_into_reference(
             quote,
             indicative,
@@ -15787,6 +15828,11 @@ class VariationalToLighterRuntime:
         response.raise_for_status()
         data = response.json()
 
+        if market_ticker == "WTI":
+            from tools.lib.wti_readonly_adapter import validate_lighter_market_metadata
+            metadata = validate_lighter_market_metadata(data, expected_market_id=145)
+            if metadata["multiplier"] != Decimal(1):
+                raise ValueError("wti_contract_multiplier_changed")
         for market in data.get("order_books", []):
             if market.get("symbol") == market_ticker:
                 price_decimals = int(market["supported_price_decimals"])
@@ -15851,6 +15897,8 @@ class VariationalToLighterRuntime:
         return None
 
     async def wait_for_ticker_resolution(self) -> str:
+        if median_wti.enabled(self):
+            return "WTI"  # Quote/session gates remain independent of configured identity.
         deadline = time.time() + READY_TIMEOUT_SECONDS
         while not self.stop_flag and time.time() < deadline:
             asset = await self.detect_current_variational_asset()
@@ -16774,6 +16822,7 @@ class VariationalToLighterRuntime:
                 else LIVE_INVENTORY_VARIATIONAL_TRADE_OPERATION_TIMEOUT_MS
             ),
         }
+        payload.update(median_wti.request_instrument(asset))
         command = self.send_variational_command(
             payload=payload,
             request_id=request_id,
@@ -16979,6 +17028,8 @@ class VariationalToLighterRuntime:
             "order": "desc",
             "requestTimeoutMs": LIVE_INVENTORY_VARIATIONAL_READ_HTTP_TIMEOUT_MS,
         }
+        if asset == "WTI":
+            payload.pop("instrument")  # Commodity orders are not P-WTI perpetuals.
         return await self.send_variational_command(
             payload=payload,
             request_id=request_id,
@@ -17015,6 +17066,8 @@ class VariationalToLighterRuntime:
 
     @staticmethod
     def extract_variational_position_qty(positions_result: dict[str, Any] | None, *, asset: str) -> Decimal | None:
+        if asset.upper() == "WTI":
+            return median_wti.position_qty(positions_result)
         if not isinstance(positions_result, dict):
             return None
         payload = positions_result.get("result") if isinstance(positions_result.get("result"), dict) else positions_result
@@ -20984,6 +21037,14 @@ class VariationalToLighterRuntime:
             await self.poll_live_inventory_maintenance_control()
             if getattr(self, "stop_flag", False):
                 return
+        if median_wti.enabled(self):
+            session = median_wti.session(self)
+            if not session["management_allowed"]:
+                self.frozen_median_model.confirmations.clear()
+                if index == 1 or index % 30 == 0:
+                    await self.append_live_inventory_log("live_inventory_entry_blocked",
+                        {"asset":asset, "reason":session["reason"], "wti_session":session})
+                return
         pending_entry_roles = {
             "live_inventory_entry_pending_lighter",
             "live_inventory_entry_pending_var_fill",
@@ -22318,6 +22379,7 @@ class VariationalToLighterRuntime:
                 "live_inventory_maintenance_drain_requested",
                 False,
             )
+            and self.live_inventory_basis_v4_entry_time_allowed()
             and (
                 not self.live_inventory_open_lots
                 or addon_direction is not None
@@ -31044,6 +31106,8 @@ def parse_args() -> argparse.Namespace:
                 "--live-inventory-i-accept-open-state-resume"
             )
         allowed_assets = {asset.strip().upper() for asset in str(args.live_allowed_assets).split(",") if asset.strip()}
+        if "WTI" in allowed_assets and not (args.live_inventory_frozen_median and allowed_assets == {"WTI"}):
+            parser.error("WTI is supported only by the isolated frozen-median live entry")
         if args.live_inventory_reset_state_only_after_manual_flat:
             if len(allowed_assets) != 1:
                 parser.error(
@@ -31315,7 +31379,7 @@ def parse_args() -> argparse.Namespace:
                 "a V4 real-gradient profile"
             )
         if args.live_inventory_basis_v4_profile:
-            if allowed_assets != {"ETH"}:
+            if allowed_assets != {"ETH"} and not (args.live_inventory_frozen_median and allowed_assets == {"WTI"}):
                 parser.error("basis V4 profile requires --live-allowed-assets ETH")
             if args.live_inventory_execution_calibration or args.live_inventory_basis_reversion:
                 parser.error(

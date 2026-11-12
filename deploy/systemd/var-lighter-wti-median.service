@@ -1,0 +1,23 @@
+[Unit]
+Description=Var/Lighter WTI frozen-median live strategy
+After=network-online.target var-chrome.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
+EnvironmentFile=/home/ubuntu/Repository-name-variational-v1/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/wti_median_live.py --execute --confirm-eth-flat --i-understand-live-orders
+Restart=always
+RestartSec=10
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=90
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

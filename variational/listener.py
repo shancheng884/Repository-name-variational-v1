@@ -78,6 +78,7 @@ class VariationalMonitor:
     _quote_versions: dict[str, int] = field(default_factory=dict, repr=False)
     _quote_changed: dict[str, asyncio.Event] = field(default_factory=dict, repr=False)
     signal_quotes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    asset_aliases: dict[str, str] = field(default_factory=dict)
     _execution_quote_depth: dict[str, int] = field(default_factory=dict, repr=False)
     _execution_quote_ids: dict[str, float] = field(default_factory=dict, repr=False)
     _unresolved_quote_requests: dict[str, str] = field(default_factory=dict, repr=False)
@@ -457,6 +458,15 @@ class VariationalMonitor:
             return False
 
         asset = str(asset).upper()
+        if asset in self.asset_aliases:
+            if isinstance(instrument, dict) and (
+                instrument.get("instrument_type", "swap") != "swap"
+                or instrument.get("kind", "commodity") != "commodity"
+                or instrument.get("settlement_asset", "USDC") != "USDC"
+                or str(instrument.get("funding_interval_s", 0)) != "0"
+            ):
+                return False
+            asset = self.asset_aliases[asset]
 
         # The /prices stream publishes a reference price, not executable
         # bid/ask. Keep it separate so it cannot be mistaken for an RFQ.
@@ -565,6 +575,21 @@ class VariationalMonitor:
         summary = self._extract_trade_summary(payload)
         if summary is None:
             return None
+        if str(summary.get("asset", "")).upper() in self.asset_aliases:
+            data = payload
+            for key in ("data", "payload"):
+                candidate = payload.get(key)
+                if isinstance(candidate, dict) and self._looks_like_trade_event(candidate):
+                    data = candidate
+                    break
+            instrument = data.get("instrument")
+            if isinstance(instrument, dict) and (
+                instrument.get("instrument_type", "swap") != "swap"
+                or instrument.get("kind", "commodity") != "commodity"
+                or instrument.get("settlement_asset", "USDC") != "USDC"
+                or str(instrument.get("funding_interval_s", 0)) != "0"
+            ):
+                return None
 
         trade_id = str(summary.get("trade_id", ""))
         dedupe_key = self._trade_event_dedupe_key(summary)
@@ -575,7 +600,7 @@ class VariationalMonitor:
             "timestamp": summary.get("timestamp") or "-",
             "trade_id": trade_id,
             "side": summary.get("side", "-"),
-            "asset": summary.get("asset", "UNKNOWN"),
+            "asset": self.asset_aliases.get(str(summary.get("asset", "UNKNOWN")).upper(), summary.get("asset", "UNKNOWN")),
             "price": summary.get("price", "-"),
             "qty": summary.get("qty", "-"),
             "status": summary.get("status", "-"),

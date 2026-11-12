@@ -197,6 +197,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Send a deduplicated Beijing-day Telegram PnL report."
     )
     parser.add_argument("--asset", choices=('ETH', 'WTI', 'ALL'), default="ALL")
+    parser.add_argument("--native-inventory", action="store_true",
+                        help="Use the shared inventory engine's unchanged daily template and baseline.")
     parser.add_argument("--wti-state-path", type=Path, default=ROOT / 'log/wti_live_state.json')
     parser.add_argument('--wti-billing-dir', type=Path, default=ROOT / 'log/wti_billing_records')
     parser.add_argument('--billing-delivery-state', type=Path, default=ROOT / 'log/wti_billing_telegram_state.json')
@@ -354,7 +356,7 @@ def main() -> int:
     args = build_parser().parse_args()
     load_dotenv(ROOT / ".env")
     baseline = load_pnl_baseline(args.baseline_path)
-    if args.asset in {'ALL', 'WTI'}:
+    if args.asset in {'ALL', 'WTI'} and not args.native_inventory:
         return send_platform_daily(args, baseline)
     if baseline is None:
         print("daily_pnl=SKIP baseline_missing")

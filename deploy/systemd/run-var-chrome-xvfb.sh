@@ -20,4 +20,4 @@ exec google-chrome \
   --disable-gpu \
   --remote-debugging-port=9222 \
   --remote-allow-origins=* \
-  "https://omni.variational.io/perpetual/ETH"
+  "${VAR_CHROME_MARKET_URL:-https://omni.variational.io/perpetual/ETH}"
