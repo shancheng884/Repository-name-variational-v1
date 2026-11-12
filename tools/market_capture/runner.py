@@ -80,10 +80,9 @@ class CaptureRunner:
             self.hub, self.writer,
             stall_snapshot=lambda start, end: self.loop_lag.max_in_window(start, end) or {},
         )
-        self.loop_lag.start()
-
         try:
             await self._start_venues()
+            self.loop_lag.start()
             self.tasks.append(asyncio.create_task(self._edge_loop(), name="edge-loop"))
             self.tasks.append(asyncio.create_task(self._health_loop(), name="health-loop"))
             self.tasks.append(asyncio.create_task(self._system_loop(), name="system-loop"))

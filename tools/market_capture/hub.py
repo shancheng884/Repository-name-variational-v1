@@ -163,7 +163,7 @@ class MarketHub:
         out = []
         for venue in ("variational",) + BOOK_VENUES:
             for asset in self.config.assets:
-                symbol = asset.symbol(venue)
+                symbol = asset.name
                 key = (venue, symbol)
                 last = self.books.get(key)
                 ref = self.references.get(key)
