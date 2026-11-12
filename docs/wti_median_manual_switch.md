@@ -31,3 +31,17 @@ rotation remain off.
 For the unchanged ETH-format daily template, invoke `tools/daily_pnl_report.py`
 with `--asset WTI --native-inventory` and the isolated WTI baseline/send-state
 paths. Never substitute the legacy WTI execution ledger.
+
+## Keep ETH history warm
+
+`var-lighter-eth-passive.service` records qualified ETH pairs every second into
+the original `log/median_samples/` journal. It observes an independent ETH tab
+through loopback Chrome debugging and Lighter public books, without order or
+RFQ commands. Only the ETH observation tab can be reloaded; WTI stays attached.
+A missing ETH tab can be recreated in the background after a browser restart.
+
+Real source times, the existing five-second Var signal limit and two-second
+Lighter limit are preserved. Missing/stale evidence produces a health reason,
+not interpolated records. ETH live ownership pauses this writer automatically.
+The normal ETH startup loader reads the same journal, clears old confirmations,
+and still requires current valid quotes and sufficient real window coverage.

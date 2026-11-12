@@ -1,0 +1,18 @@
+[Unit]
+Description=ETH passive second-level median history (no orders)
+After=network-online.target var-chrome.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
+ExecStart=/usr/bin/flock --nonblock log/eth-passive.lock .venv/bin/python tools/eth_passive_collector.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+TimeoutStopSec=15
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
