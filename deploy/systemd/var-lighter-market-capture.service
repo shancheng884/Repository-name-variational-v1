@@ -1,0 +1,29 @@
+[Unit]
+Description=Read-only multi-venue RWA market capture (no orders)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
+EnvironmentFile=/home/ubuntu/Repository-name-variational-v1/.env
+EnvironmentFile=-/home/ubuntu/.config/market-capture/lighter-rh.env
+EnvironmentFile=-/home/ubuntu/.config/market-capture/entropy.env
+Environment=MARKET_CAPTURE_ENABLED=true
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/flock --nonblock log/market-capture.lock /home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/market_capture.py --enable-capture --output-dir log/market_capture
+Restart=always
+RestartSec=20
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUQuota=60%
+MemoryMax=700M
+NoNewPrivileges=true
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
