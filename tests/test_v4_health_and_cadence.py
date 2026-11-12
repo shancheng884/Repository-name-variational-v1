@@ -353,7 +353,7 @@ def test_recovery_needs_only_the_short_recent_window() -> None:
     assert int(context["v4_health_recent_count"]) >= 20
 
 
-def test_shutdown_marker_is_closed_at_the_next_start(tmp_path) -> None:
+def test_shutdown_marker_is_closed_at_the_next_start(tmp_path, monkeypatch) -> None:
     path = tmp_path / "planned_downtime.json"
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_planned_downtime_file = path
@@ -367,6 +367,8 @@ def test_shutdown_marker_is_closed_at_the_next_start(tmp_path) -> None:
 
     restarted = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     restarted.live_inventory_planned_downtime_file = path
+    # Simulate the new process, not the long-running pytest process' import time.
+    monkeypatch.setattr("main.PROCESS_STARTED_WALL_CLOCK", time.time())
     intervals = restarted.load_live_inventory_planned_downtime()
 
     assert len(intervals) == 1

@@ -64,3 +64,34 @@ bounded-size aggregate exits with component identities preserved.
   not automatic liquidation. All original realtime execution protections remain.
 
 No watchdog, automatic pair rotation, or TG template changes are part of this mode.
+
+## Passive quote wakeups and audit
+
+- A newly accepted, finite, positive Var bid/ask wakes the existing serial
+  paper/live loop. Reference-mid WS updates, other assets, invalid pairs, and
+  rejected duplicate timestamps do not wake it. The usual timer remains a
+  fallback for risk, reconciliation, and exit management during feed silence.
+- An update arriving during a cycle is coalesced to the newest version for the
+  next cycle. It never starts another execution task or replays an old quote.
+  No RFQ or market-data request is added by this scheduling path.
+- Execution-command responses are excluded from the passive signal cache:
+  suppress admission during that command and remember its quote IDs to reject
+  delayed CDP feedback. The ordinary quote cache remains available to legacy
+  consumers; it is not the frozen-median strategy's passive signal cache.
+  A timed-out command remains quarantined until its late broker result supplies
+  the identity; failure is not interpreted as a new independent passive quote.
+  Health reports the unresolved count, and no extra request is made to resolve it.
+- Confirmation still requires the latest observation plus two independent
+  source quotes in the existing 3-second window. Existing one-per-second
+  confirmation/history admission, entry/exit gates, cost, and capacity remain.
+- Snapshot Lighter prices, version, offset, local receipt, and exchange clocks
+  together under the book lock. Check the age of that captured book as well
+  as the current book; a later frame cannot make an earlier snapshot fresh.
+- `log/median_quote_audit/YYYY-MM-DD.jsonl` records one row per processed Var
+  version, with the run/sample pair ID, both bid/ask versions and timestamps,
+  receive skew, wakeup reason, coalesced count, rejections, and the model's
+  current confirmation window/counts. Timer repeats do not inflate this file.
+  Upstream Var timestamps can be absent; local receipt is explicitly separate.
+- Health exposes `median_signal_mode=passive_var_event_serial`, the latest
+  processed/audited version, and audit time. Audit is not evidence that an RFQ
+  or order was accepted. An RFQ still needs all existing signal/execution gates.

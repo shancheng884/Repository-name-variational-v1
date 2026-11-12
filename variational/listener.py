@@ -10,6 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -74,6 +75,80 @@ class VariationalMonitor:
     _next_trade_event_seq: int = 1
     _seen_trade_event_keys: set[str] = field(default_factory=set)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _quote_versions: dict[str, int] = field(default_factory=dict, repr=False)
+    _quote_changed: dict[str, asyncio.Event] = field(default_factory=dict, repr=False)
+    signal_quotes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _execution_quote_depth: dict[str, int] = field(default_factory=dict, repr=False)
+    _execution_quote_ids: dict[str, float] = field(default_factory=dict, repr=False)
+    _unresolved_quote_requests: dict[str, str] = field(default_factory=dict, repr=False)
+    _resolved_quote_requests: dict[str, float] = field(default_factory=dict, repr=False)
+
+    def begin_execution_quote(self, asset: str) -> None:
+        asset = asset.upper()
+        self._execution_quote_depth[asset] = self._execution_quote_depth.get(asset, 0) + 1
+
+    def end_execution_quote(self, asset: str, result: Any = None, request_id: str = "") -> None:
+        asset = asset.upper()
+        self._execution_quote_depth[asset] = max(0, self._execution_quote_depth.get(asset, 1) - 1)
+        resolved = self.remember_execution_quote_result(result)
+        if not resolved and request_id and request_id not in self._resolved_quote_requests:
+            # An uncorrelated delayed CDP body is not an independent quote.
+            self._unresolved_quote_requests[request_id] = asset
+
+    def resolve_execution_quote(self, request_id: str, result: Any) -> None:
+        if not self.remember_execution_quote_result(result):
+            return
+        self._unresolved_quote_requests.pop(request_id, None)
+        self._resolved_quote_requests[request_id] = time.monotonic()
+        while len(self._resolved_quote_requests) > 512:
+            self._resolved_quote_requests.pop(next(iter(self._resolved_quote_requests)))
+
+    def remember_execution_quote_result(self, result: Any) -> bool:
+        identified = False
+        def remember(value, depth=0):
+            nonlocal identified
+            if not isinstance(value, dict) or depth > 3:
+                return
+            for key in ("quoteId", "quote_id"):
+                if value.get(key):
+                    identified = True
+                    self._execution_quote_ids[str(value[key])] = time.monotonic()
+            for key in ("result", "raw"):
+                remember(value.get(key), depth+1)
+        remember(result)
+        while len(self._execution_quote_ids) > 512:
+            self._execution_quote_ids.pop(next(iter(self._execution_quote_ids)))
+        payload = result.get("result", result) if isinstance(result, dict) else None
+        definitive_rejection = (
+            isinstance(payload, dict) and payload.get("step") == "quotes/indicative"
+            and payload.get("ok") is False and not payload.get("timedOut")
+            and isinstance(payload.get("httpStatus"), int)
+            and 400 <= payload["httpStatus"] < 600
+        )
+        return identified or definitive_rejection
+
+    def indicative_quote_version(self, asset: str) -> int:
+        return self._quote_versions.get(asset.upper(), 0)
+
+    async def wait_for_indicative_quote(
+        self, asset: str, *, after_version: int, timeout: float,
+    ) -> int:
+        asset = asset.upper()
+        deadline = time.monotonic() + timeout
+        while True:
+            async with self._lock:
+                version = self.indicative_quote_version(asset)
+                if version > after_version:
+                    return version
+                event = self._quote_changed.setdefault(asset, asyncio.Event())
+                event.clear()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return version
+            try:
+                await asyncio.wait_for(event.wait(), remaining)
+            except asyncio.TimeoutError:
+                return self.indicative_quote_version(asset)
 
     async def process_rest_event(self, payload: dict[str, Any]) -> list[str]:
         if payload.get("kind") != "rest_response":
@@ -467,6 +542,22 @@ class VariationalMonitor:
             "quote_kind": "indicative_bid_ask",
             "raw": payload,
         }
+        try:
+            bid_value, ask_value = Decimal(str(bid)), Decimal(str(ask))
+            valid_pair = (bid_value.is_finite() and ask_value.is_finite()
+                          and 0 < bid_value < ask_value)
+        except (InvalidOperation, ValueError):
+            valid_pair = False
+        quote_id = str(payload.get("quote_id") or payload.get("quoteId") or "")
+        execution_feedback = (self._execution_quote_depth.get(asset, 0) > 0
+                              or asset in self._unresolved_quote_requests.values()
+                              or bool(quote_id and quote_id in self._execution_quote_ids))
+        if valid_pair and not execution_feedback:
+            version = self.indicative_quote_version(asset) + 1
+            self._quote_versions[asset] = version
+            self.quotes[asset]["quote_version"] = version
+            self.signal_quotes[asset] = dict(self.quotes[asset])
+            self._quote_changed.setdefault(asset, asyncio.Event()).set()
         self.current_quote_asset = asset
         return True
 
@@ -945,7 +1036,8 @@ class EventSink:
 
 
 class CommandBroker:
-    def __init__(self, quiet: bool = False) -> None:
+    def __init__(self, quiet: bool = False, monitor: VariationalMonitor | None = None) -> None:
+        self.monitor = monitor
         self.quiet = quiet
         self._lock = asyncio.Lock()
         self._roles: dict[websockets.ServerConnection, str] = {}
@@ -1264,6 +1356,8 @@ class CommandBroker:
         request_id = str(payload.get("requestId", "")).strip()
         if not request_id:
             return
+        if self.monitor is not None:
+            self.monitor.resolve_execution_quote(request_id, payload)
         async with self._lock:
             requester = self._pending_requests.pop(request_id, None)
             self._pending_request_results.pop(request_id, None)

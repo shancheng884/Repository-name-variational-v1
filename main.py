@@ -32,6 +32,7 @@ from rich.table import Table
 
 from tools.lib.auto_rebalance import build_rebalance_plan
 from tools.lib import frozen_median_live as median_live
+from tools.lib import passive_signal
 from tools.lib.execution_quality import (
     advance_shortfall_reserve,
     lighter_book_clock,
@@ -2407,6 +2408,7 @@ class CrossSpreadSnapshot:
     short_median_5m_pct: Decimal | None
     long_sample_count_5m: int
     short_sample_count_5m: int
+    lighter_quote_audit: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -2487,7 +2489,7 @@ class VariationalRuntime:
             monitor=self.monitor,
             raw_event_policy=raw_event_policy,
         )
-        self.command_broker = CommandBroker(quiet=quiet)
+        self.command_broker = CommandBroker(quiet=quiet, monitor=self.monitor)
         self.host = host
         self.ws_port = ws_port
         self.rest_port = rest_port
@@ -10605,6 +10607,13 @@ class VariationalToLighterRuntime:
                 "v4_gate_limits": {"history_sample_seconds": 1,
                     "health_window_seconds": 3600, "min_window_coverage": "0.8",
                     "max_sample_gap_seconds": 60},
+                "median_signal_mode": "passive_var_event_serial",
+                "median_signal_trigger": getattr(self, "median_signal_trigger", "startup"),
+                "median_signal_quote_version": getattr(self, "median_signal_used_version", None),
+                "median_signal_audit_version": getattr(self, "median_signal_last_audited_version", None),
+                "median_signal_audit_at": getattr(self, "median_signal_last_audit_at", None),
+                "median_signal_unresolved_execution_quotes": len(
+                    getattr(self.runtime.monitor, "_unresolved_quote_requests", {})),
                 **self.live_inventory_entry_block_payload(),
             }
         store = getattr(
@@ -13255,7 +13264,9 @@ class VariationalToLighterRuntime:
             if not isinstance(reference, dict):
                 return None
             quote = dict(reference)
-            indicative = runtime.monitor.quotes.get(asset)
+            indicative_cache = (getattr(runtime.monitor, "signal_quotes", runtime.monitor.quotes)
+                                if median_live.enabled(self) else runtime.monitor.quotes)
+            indicative = indicative_cache.get(asset)
             indicative = dict(indicative) if isinstance(indicative, dict) else None
         return self.merge_passive_indicative_into_reference(
             quote,
@@ -13327,6 +13338,10 @@ class VariationalToLighterRuntime:
         quote["passive_indicative_age_seconds"] = f"{age_seconds:.6f}"
         quote["passive_indicative_state"] = "fresh"
         quote["passive_indicative_received_at"] = indicative.get("received_at")
+        quote["passive_indicative_received_monotonic"] = indicative_monotonic
+        quote["passive_indicative_version"] = indicative.get("quote_version")
+        quote["passive_indicative_source_timestamp"] = indicative.get("timestamp")
+        quote["reference_source_timestamp"] = quote.get("timestamp")
         quote["reference_quote_received_at"] = quote.get("received_at")
         quote["reference_quote_received_monotonic"] = quote.get("received_monotonic")
         if merged_monotonic is not None:
@@ -15967,6 +15982,7 @@ class VariationalToLighterRuntime:
             self.last_lighter_order_book_clock = {}
 
     def record_lighter_order_book_clock(self, message: dict[str, Any]) -> None:
+        self.lighter_signal_book_version = getattr(self, "lighter_signal_book_version", 0) + 1
         self.last_lighter_order_book_update_at = utc_now()
         self.last_lighter_order_book_received_monotonic = time.monotonic()
         self.last_lighter_order_book_clock = lighter_book_clock(message, received_epoch=time.time())
@@ -16763,6 +16779,8 @@ class VariationalToLighterRuntime:
             request_id=request_id,
             lane="background" if priority == "background" and not urgent else "trade",
         )
+        if use_api and rfq_cost:
+            command = passive_signal.execution_command(self, asset, command, request_id=request_id)
         if priority == "background" and not urgent:
             try:
                 result = await asyncio.wait_for(
@@ -20505,7 +20523,20 @@ class VariationalToLighterRuntime:
         var_bid = quote_bid if has_quote_spread else reference_price or quote_bid
         var_ask = quote_ask if has_quote_spread else reference_price or quote_ask
         quote_asset = str(quote.get("asset", ""))
-        lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
+        lighter_quote_audit = None
+        if median_live.enabled(self):
+            async with self.lighter_order_book_lock:
+                lighter_bid, lighter_ask = self.lighter_best_bid, self.lighter_best_ask
+                lighter_quote_audit = {
+                    "version": getattr(self, "lighter_signal_book_version", 0),
+                    "offset": self.lighter_order_book_offset,
+                    "received_at": self.last_lighter_order_book_update_at,
+                    "received_monotonic": self.last_lighter_order_book_received_monotonic,
+                    **self.lighter_order_book_freshness_context(),
+                    "captured_monotonic": time.monotonic(),
+                }
+        else:
+            lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
         if var_bid is None or var_ask is None or lighter_bid is None or lighter_ask is None:
             await self.log_live_inventory_snapshot_unavailable(
                 "missing_quote_price",
@@ -20602,6 +20633,7 @@ class VariationalToLighterRuntime:
             short_median_5m_pct=short_median_pct,
             long_sample_count_5m=long_count,
             short_sample_count_5m=short_count,
+            lighter_quote_audit=lighter_quote_audit,
         )
 
     async def log_live_inventory_snapshot_unavailable(self, reason: str, **context: Any) -> None:
@@ -21195,6 +21227,23 @@ class VariationalToLighterRuntime:
         lighter_book_age_ok, lighter_book_age_seconds = (
             self.live_inventory_lighter_book_age_ok()
         )
+        quote_pair_context = {}
+        if median_live.enabled(self):
+            quote_pair_context = passive_signal.pair_audit(self, quote, snapshot)
+            captured = getattr(snapshot, "lighter_quote_audit", None) or {}
+            if captured and (captured.get("book_exchange_timestamp_valid") is not True
+                             or captured.get("book_timestamp_error")):
+                lighter_book_age_ok = False
+            captured_age = captured.get("book_age_seconds")
+            received = captured.get("received_monotonic")
+            captured_at = captured.get("captured_monotonic")
+            if captured_age is not None and captured_at is not None:
+                captured_age += max(0.0, time.monotonic() - captured_at)
+            if received is not None:
+                captured_age = max(captured_age or 0.0, time.monotonic() - received)
+            if captured_age is not None:
+                lighter_book_age_seconds = max(lighter_book_age_seconds or 0.0, captured_age)
+                lighter_book_age_ok = lighter_book_age_ok and captured_age <= self.live_inventory_max_lighter_book_age_seconds
         passive_reference_key = self.live_inventory_passive_reference_key(
             asset=asset,
             quote=quote,
@@ -21280,6 +21329,8 @@ class VariationalToLighterRuntime:
             # returning before the execution gates. Other skip reasons remain
             # hard skips because they indicate stale or invalid data.
             if not duplicate_passive_reference:
+                if quote_pair_context:
+                    passive_signal.record_decision(self, quote_pair_context, rejection=sample_skip_reason)
                 return
         if passive_reference_key is not None and not duplicate_passive_reference:
             reference_keys = getattr(
@@ -21395,6 +21446,7 @@ class VariationalToLighterRuntime:
             median_live.observe(self, asset=asset, quote=quote, snapshot=snapshot,
                                 var_bid=var_bid, var_ask=var_ask,
                                 lighter_age=lighter_book_age_seconds, now=v4_now)
+            passive_signal.record_decision(self, quote_pair_context)
             await median_live.maybe_finish(self, asset=asset, now=v4_now)
             median_basis = median_live.pair_edge(basis_mid, lighter_mid)
             long_edge_bps = short_edge_bps = median_basis
@@ -21978,6 +22030,7 @@ class VariationalToLighterRuntime:
         ).snapshot()
         lighter_rate = self.live_inventory_order_limiter("lighter").snapshot()
         state_payload = {
+            **quote_pair_context,
             "asset": asset,
             "sample_index": index,
             "quote_id": quote.get("quoteId") or quote.get("quote_id"),
@@ -29200,6 +29253,7 @@ class VariationalToLighterRuntime:
         )
         try:
             while not self.stop_flag:
+                passive_signal.begin_cycle(self)
                 if self.is_live_inventory_enabled():
                     disk_asset = (
                         self.variational_ticker
@@ -29247,7 +29301,7 @@ class VariationalToLighterRuntime:
                                     "timeout_seconds": snapshot_timeout_seconds,
                                 },
                             )
-                    await asyncio.sleep(self.paper_interval_seconds)
+                    await passive_signal.wait_next(self)
                     continue
                 if snapshot is not None:
                     if not getattr(self, "live_inventory_basis_v4_mode", False):
@@ -29267,7 +29321,7 @@ class VariationalToLighterRuntime:
                     await self.maybe_run_auto_live(snapshot)
                 elif self.is_live_inventory_enabled():
                     self.logger.warning("live_inventory_snapshot_none")
-                await asyncio.sleep(self.paper_interval_seconds)
+                await passive_signal.wait_next(self)
         except asyncio.CancelledError:
             raise
         except Exception:
