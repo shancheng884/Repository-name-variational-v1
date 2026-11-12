@@ -13,10 +13,10 @@
 | Lighter RH | `api.rh.lighter.xyz` | 同上，独立账户/API key |
 | Entropy | Hyperliquid HIP-3 `io` DEX | L2 订单簿 + 公共成交 + `userFills` |
 
-默认三个标的：`OPENAI`、`ANTHROPIC`、`NVDA`。它们同时存在于四个平台，按 Entropy 深度和跨平台可比较性挑选：
+默认六个标的：`OPENAI`、`ANTHROPIC`、`NVDA`、`SNDK`、`CRCL`、`AAPL`。它们同时存在于四个平台，按 Entropy 深度和跨平台可比较性挑选：
 
-- Variational / Lighter 主网 / Lighter RH：同名 `OPENAI`、`ANTHROPIC`、`NVDA`
-- Entropy：`io:OAI`、`io:ANTH`、`io:NVDA`
+- Variational / Lighter 主网 / Lighter RH：同名 `OPENAI`、`ANTHROPIC`、`NVDA`、`SNDK`、`CRCL`、`AAPL`
+- Entropy：`io:OAI`、`io:ANTH`、`io:NVDA`、`io:SNDK`、`io:CRCL`、`io:AAPL`
 
 ## 安全边界
 

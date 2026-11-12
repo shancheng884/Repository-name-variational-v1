@@ -26,7 +26,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Read-only RWA market capture (no order submission).")
     parser.add_argument("--enable-capture", action="store_true", help="required unless MARKET_CAPTURE_ENABLED=true")
     parser.add_argument("--output-dir", default=str(ROOT / "log" / "market_capture"))
-    parser.add_argument("--assets", default="OPENAI,ANTHROPIC,NVDA")
+    parser.add_argument("--assets", default="OPENAI,ANTHROPIC,NVDA,SNDK,CRCL,AAPL")
     parser.add_argument("--notional-usd", type=float, default=20.0)
     parser.add_argument("--book-snapshot-seconds", type=float, default=5.0)
     parser.add_argument("--health-seconds", type=float, default=5.0)

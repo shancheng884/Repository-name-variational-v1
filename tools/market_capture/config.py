@@ -36,6 +36,18 @@ DEFAULT_ASSETS: tuple[Asset, ...] = (
         "variational": "NVDA", "lighter_mainnet": "NVDA",
         "lighter_rh": "NVDA", "entropy": "io:NVDA",
     }),
+    Asset("SNDK", {
+        "variational": "SNDK", "lighter_mainnet": "SNDK",
+        "lighter_rh": "SNDK", "entropy": "io:SNDK",
+    }),
+    Asset("CRCL", {
+        "variational": "CRCL", "lighter_mainnet": "CRCL",
+        "lighter_rh": "CRCL", "entropy": "io:CRCL",
+    }),
+    Asset("AAPL", {
+        "variational": "AAPL", "lighter_mainnet": "AAPL",
+        "lighter_rh": "AAPL", "entropy": "io:AAPL",
+    }),
 )
 
 
