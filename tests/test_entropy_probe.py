@@ -96,6 +96,20 @@ def test_entropy_market_order_uses_cloid_and_aggregates_fills():
 def test_entropy_without_private_key_is_not_available():
     ex = EntropyProbeExecutor(info_url="https://x", account_address="0x" + "2" * 40, private_key="", info=FakeInfo(), exchange=FakeExchange())
     assert ex.available is False
+    assert ex.reason == "entropy_private_key_missing"
+
+
+def test_entropy_address_pasted_as_private_key_is_rejected_before_start():
+    ex = EntropyProbeExecutor(
+        info_url="https://x",
+        account_address="0x" + "2" * 40,
+        private_key="0x" + "3" * 40,
+        info=FakeInfo(),
+        exchange=FakeExchange(),
+    )
+    assert ex.available is False
+    assert ex.reason == "entropy_private_key_must_be_32_bytes"
+    assert asyncio.run(ex.preflight(NVDA))["error"] == "entropy_private_key_must_be_32_bytes"
 
 
 def test_entropy_info_url_accepts_full_info_endpoint_form():

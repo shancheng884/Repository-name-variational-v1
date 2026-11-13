@@ -262,13 +262,31 @@ class EntropyProbeExecutor:
         if base.endswith("/info"):
             base=base[:-5].rstrip("/")
         self.info_url=base
-        self.account_address=account_address
-        self.private_key=private_key
+        self.account_address=(account_address or "").strip()
+        self.private_key=(private_key or "").strip()
         self.dex=dex
         self.timeout_seconds=timeout_seconds
         self.info=info
         self.exchange=exchange
-        self.available=bool(account_address and private_key)
+        address_ok=bool(self.account_address.startswith("0x") and len(self.account_address)==42)
+        key_hex=self.private_key[2:] if self.private_key.startswith("0x") else self.private_key
+        key_ok=bool(self.private_key.startswith("0x") and len(self.private_key)==66)
+        try:
+            if key_ok: bytes.fromhex(key_hex)
+            else: key_ok=False
+        except ValueError:
+            key_ok=False
+        if not self.account_address:
+            self.reason="entropy_account_address_missing"
+        elif not address_ok:
+            self.reason="entropy_account_address_invalid"
+        elif not self.private_key:
+            self.reason="entropy_private_key_missing"
+        elif not key_ok:
+            self.reason="entropy_private_key_must_be_32_bytes"
+        else:
+            self.reason=None
+        self.available=bool(address_ok and key_ok)
         self.meta=None
         self.universe={}
     async def start(self):
@@ -291,7 +309,7 @@ class EntropyProbeExecutor:
         if row is None: raise ProbeError("entropy_market_missing")
         return row
     async def preflight(self,asset):
-        if not self.available or self.info is None: return {"ok":False,"error":"entropy_credentials_missing"}
+        if not self.available or self.info is None: return {"ok":False,"error":self.reason or "entropy_credentials_missing"}
         coin=self._coin(asset)
         state=await asyncio.to_thread(self.info.user_state,self.account_address,self.dex)
         for item in (state or {}).get("assetPositions",[]) or []:
@@ -323,7 +341,7 @@ class EntropyProbeExecutor:
         decimals=max(0,6-szd)
         return float(round(float(f"{float(px):.5g}"),decimals))
     async def market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
-        if not self.available or self.exchange is None: return {"ok":False,"status":"rejected","error":"entropy_credentials_missing","client_order_id":client_order_id}
+        if not self.available or self.exchange is None: return {"ok":False,"status":"rejected","error":self.reason or "entropy_credentials_missing","client_order_id":client_order_id}
         qty=self.normalize_qty(asset,qty)
         if not qty: return {"ok":False,"status":"rejected","error":"entropy_qty_below_min","client_order_id":client_order_id}
         bbo=_d(quote.get("ask" if side=="buy" else "bid"))
