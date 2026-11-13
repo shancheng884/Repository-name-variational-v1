@@ -93,12 +93,28 @@ class VariationalProbeExecutor:
                             "settlement_asset":"USDC","funding_interval_s":0}}
     def normalize_qty(self,asset,qty):
         return qty.quantize(Decimal("0.00000001"),rounding=ROUND_DOWN) if qty>0 else None
+    async def _execution_quote(self,asset,qty):
+        assert self.client is not None
+        req={"type":"VAR_API_QUOTE","requestId":uuid.uuid4().hex,"market":asset.symbol("variational"),"amount":format(qty,"f"),"instrumentType":asset.var_instrument_type,"settlementAsset":"USDC","kind":asset.var_kind,"fundingIntervalS":0,"confirm":False,"requestTimeoutMs":int(self.timeout_seconds*1000),"operationTimeoutMs":int(self.timeout_seconds*1000)}
+        started=datetime.now(timezone.utc)
+        try: message=await self.client.request(req)
+        except Exception as exc: return None,f"{type(exc).__name__}:{exc}",started,datetime.now(timezone.utc)
+        recv=datetime.now(timezone.utc); result=message.get("result") if isinstance(message,dict) else None
+        if not isinstance(result,dict) or message.get("ok") is not True or result.get("ok") is not True:
+            return None,str((result or {}).get("error") or (message or {}).get("error") or "variational_quote_unconfirmed")[:200],started,recv
+        bid=_d(result.get("bid")); ask=_d(result.get("ask")); qid=str(result.get("quoteId") or result.get("quote_id") or "") or None
+        qts=result.get("quoteTimestamp") or result.get("timestamp")
+        if not bid or not ask or ask<=bid or not qid or not qts:
+            return None,"variational_quote_shape_invalid",started,recv
+        return {"bid":str(bid),"ask":str(ask),"mid":str((bid+ask)/2),"quote_id":qid,"quote_timestamp":str(qts),"request_started_at":started.isoformat(),"received_at":recv.isoformat(),"request_latency_ms":round((recv-started).total_seconds()*1000,3)},None,started,recv
     async def market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
         assert self.client is not None
-        submitted=datetime.now(timezone.utc); quote_id=quote.get("quote_id"); quote_at=quote.get("bbo_source_at") or quote.get("source_at")
-        if not quote_id or not quote_at:
-            return {"ok":False,"status":"rejected","error":"variational_quote_identity_missing","client_order_id":client_order_id}
-        payload={"type":"VAR_API_ORDER","requestId":client_order_id,"market":asset.symbol("variational"),"instrumentType":asset.var_instrument_type,"settlementAsset":"USDC","kind":asset.var_kind,"fundingIntervalS":0,"side":side.upper(),"amount":format(qty,"f"),"confirm":True,"reuseQuoteId":quote_id,"quoteTimestamp":quote_at,"expectedQuotePrice":str(quote.get("mid") or quote.get("ask") or quote.get("bid")),"dispatchQuoteAgeLimitMs":2000,"maxSlippage":float(max_slippage_bps/BPS),"reduceOnly":bool(reduce_only),"requestTimeoutMs":int(self.timeout_seconds*1000),"operationTimeoutMs":int(self.timeout_seconds*1000)}
+        exec_quote,quote_error,submitted,quote_recv=await self._execution_quote(asset,qty)
+        if exec_quote is None:
+            return {"ok":False,"status":"rejected","error":quote_error,"client_order_id":client_order_id,"submitted_at":submitted.isoformat()}
+        quote_id=exec_quote["quote_id"]; quote_at=exec_quote["quote_timestamp"]
+        submitted=datetime.now(timezone.utc)
+        payload={"type":"VAR_API_ORDER","requestId":client_order_id,"market":asset.symbol("variational"),"instrumentType":asset.var_instrument_type,"settlementAsset":"USDC","kind":asset.var_kind,"fundingIntervalS":0,"side":side.upper(),"amount":format(qty,"f"),"confirm":True,"reuseQuoteId":quote_id,"quoteTimestamp":quote_at,"expectedQuotePrice":exec_quote["mid"],"dispatchQuoteAgeLimitMs":2000,"maxSlippage":float(max_slippage_bps/BPS),"reduceOnly":bool(reduce_only),"requestTimeoutMs":int(self.timeout_seconds*1000),"operationTimeoutMs":int(self.timeout_seconds*1000)}
         try: message=await self.client.request(payload)
         except Exception as exc:
             return {"ok":False,"status":"unknown","error":f"{type(exc).__name__}:{exc}","client_order_id":client_order_id,"submitted_at":submitted.isoformat()}
@@ -106,7 +122,9 @@ class VariationalProbeExecutor:
         if not isinstance(result,dict) or message.get("ok") is not True or result.get("ok") is not True:
             return {"ok":False,"status":"unknown","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"error":str((result or {}).get("error") or (message or {}).get("error") or "variational_order_unconfirmed")[:200]}
         rfq=str(result.get("rfqId") or result.get("rfq_id") or "") or None; oid=str(result.get("orderId") or result.get("order_id") or "") or None
-        return await self._poll(client_order_id,submitted,acked,rfq,oid,qty)
+        receipt=await self._poll(client_order_id,submitted,acked,rfq,oid,qty)
+        receipt["execution_quote"]=exec_quote
+        return receipt
     async def _poll(self,client_order_id,submitted,acked,rfq_id,order_id,qty):
         assert self.client is not None
         deadline=time.monotonic()+self.timeout_seconds
