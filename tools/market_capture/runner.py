@@ -138,7 +138,7 @@ class CaptureRunner:
             try:
                 feed = LighterBookFeed(
                     name="lighter_mainnet", rest_url=config.lighter_mainnet_rest, ws_url=config.lighter_mainnet_ws,
-                    asset_symbols={a.name: a.symbol("lighter_mainnet") for a in assets},
+                    asset_symbols={a.name: a.symbols["lighter_mainnet"] for a in assets if a.supports("lighter_mainnet")},
                     writer=self.writer, hub=self.hub, logger=self.logger,
                     max_levels=config.max_book_levels,
                 )
@@ -146,7 +146,7 @@ class CaptureRunner:
                 self.venues["lighter_mainnet"] = feed
                 self.venues["lighter_mainnet_fills"] = LighterFillFeed(
                     name="lighter_mainnet", rest_url=config.lighter_mainnet_rest,
-                    asset_symbols={a.name: a.symbol("lighter_mainnet") for a in assets},
+                    asset_symbols={a.name: a.symbols["lighter_mainnet"] for a in assets if a.supports("lighter_mainnet")},
                     markets=feed.markets, writer=self.writer, auditor=self.auditor,
                     account_index=config.lighter_mainnet_account_index,
                     api_key_index=config.lighter_mainnet_api_key_index,
@@ -160,7 +160,7 @@ class CaptureRunner:
             try:
                 feed = LighterBookFeed(
                     name="lighter_rh", rest_url=config.lighter_rh_rest, ws_url=config.lighter_rh_ws,
-                    asset_symbols={a.name: a.symbol("lighter_rh") for a in assets},
+                    asset_symbols={a.name: a.symbols["lighter_rh"] for a in assets if a.supports("lighter_rh")},
                     writer=self.writer, hub=self.hub, logger=self.logger,
                     max_levels=config.max_book_levels,
                 )
@@ -168,7 +168,7 @@ class CaptureRunner:
                 self.venues["lighter_rh"] = feed
                 self.venues["lighter_rh_fills"] = LighterFillFeed(
                     name="lighter_rh", rest_url=config.lighter_rh_rest,
-                    asset_symbols={a.name: a.symbol("lighter_rh") for a in assets},
+                    asset_symbols={a.name: a.symbols["lighter_rh"] for a in assets if a.supports("lighter_rh")},
                     markets=feed.markets, writer=self.writer, auditor=self.auditor,
                     account_index=config.lighter_rh_account_index,
                     api_key_index=config.lighter_rh_api_key_index,
@@ -182,7 +182,7 @@ class CaptureRunner:
             try:
                 feed = EntropyBookFeed(
                     info_url=config.entropy_info_url, ws_url=config.entropy_ws_url, dex=config.entropy_dex,
-                    asset_symbols={a.name: a.symbol("entropy") for a in assets},
+                    asset_symbols={a.name: a.symbols["entropy"] for a in assets if a.supports("entropy")},
                     writer=self.writer, hub=self.hub, logger=self.logger,
                     max_levels=config.max_book_levels,
                 )
@@ -190,7 +190,7 @@ class CaptureRunner:
                 self.venues["entropy"] = feed
                 self.venues["entropy_fills"] = EntropyFillFeed(
                     info_url=config.entropy_info_url, dex=config.entropy_dex,
-                    asset_symbols={a.name: a.symbol("entropy") for a in assets},
+                    asset_symbols={a.name: a.symbols["entropy"] for a in assets if a.supports("entropy")},
                     writer=self.writer, auditor=self.auditor,
                     account_address=config.entropy_account_address,
                     interval=config.fill_poll_seconds,

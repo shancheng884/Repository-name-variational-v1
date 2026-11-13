@@ -9,7 +9,7 @@ from tools.market_capture.safety import assert_no_order_submission_source
 
 def args(**overrides):
     base = dict(
-        enable_capture=True, assets="OPENAI,ANTHROPIC,NVDA,SNDK,CRCL,AAPL", output_dir="",
+        enable_capture=True, assets="OPENAI,ANTHROPIC,NVDA,SNDK,CRCL,AAPL,QQQ,DRAM,COIN", output_dir="",
         notional_usd=20, book_snapshot_seconds=5, health_seconds=5,
         latency_seconds=5, system_seconds=60, fill_poll_seconds=2,
         edge_seconds=1, var_quote_seconds=0, retention_days=14,
@@ -24,6 +24,7 @@ def args(**overrides):
 def test_default_assets_cover_four_venues():
     assert [a.name for a in DEFAULT_ASSETS] == [
         "OPENAI", "ANTHROPIC", "NVDA", "SNDK", "CRCL", "AAPL",
+        "QQQ", "DRAM", "COIN",
     ]
     assert DEFAULT_ASSETS[0].symbol("entropy") == "io:OAI"
     assert DEFAULT_ASSETS[1].symbol("entropy") == "io:ANTH"
@@ -31,7 +32,11 @@ def test_default_assets_cover_four_venues():
     assert DEFAULT_ASSETS[3].symbol("entropy") == "io:SNDK"
     assert DEFAULT_ASSETS[4].symbol("entropy") == "io:CRCL"
     assert DEFAULT_ASSETS[5].symbol("entropy") == "io:AAPL"
-    assert all(len(a.symbols) == 4 for a in DEFAULT_ASSETS)
+    assert DEFAULT_ASSETS[6].supports("entropy") is False
+    assert DEFAULT_ASSETS[7].supports("lighter_rh") is False
+    assert DEFAULT_ASSETS[8].supports("entropy") is False
+    assert all(DEFAULT_ASSETS[i].supports("variational") for i in range(9))
+    assert all(DEFAULT_ASSETS[i].supports("lighter_mainnet") for i in range(9))
 
 
 def test_config_refuses_order_submission_flag():

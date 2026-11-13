@@ -16,7 +16,7 @@ def test_subscription_shape_and_reference_tick(tmp_path):
     )
     sub = feed._subscription()
     assert sub["action"] == "subscribe"
-    assert len(sub["instruments"]) == 6
+    assert len(sub["instruments"]) == 9
     assert sub["instruments"][0] == {
         "underlying": "OPENAI", "instrument_type": "perpetual_rwa_future",
         "settlement_asset": "USDC", "kind": "equity",

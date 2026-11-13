@@ -22,6 +22,9 @@ class Asset:
     def symbol(self, venue: str) -> str:
         return self.symbols.get(venue, self.name)
 
+    def supports(self, venue: str) -> bool:
+        return venue in self.symbols
+
 
 DEFAULT_ASSETS: tuple[Asset, ...] = (
     Asset("OPENAI", {
@@ -47,6 +50,18 @@ DEFAULT_ASSETS: tuple[Asset, ...] = (
     Asset("AAPL", {
         "variational": "AAPL", "lighter_mainnet": "AAPL",
         "lighter_rh": "AAPL", "entropy": "io:AAPL",
+    }),
+    Asset("QQQ", {
+        "variational": "QQQ", "lighter_mainnet": "QQQ",
+        "lighter_rh": "QQQ",
+    }),
+    Asset("DRAM", {
+        "variational": "DRAM", "lighter_mainnet": "DRAM",
+        "entropy": "io:DRAM",
+    }),
+    Asset("COIN", {
+        "variational": "COIN", "lighter_mainnet": "COIN",
+        "lighter_rh": "COIN",
     }),
 )
 

@@ -30,14 +30,14 @@ class VariationalPriceFeed:
     ) -> None:
         self.name = "variational"
         self.ws_url = ws_url
-        self.assets = assets
+        self.assets = tuple(asset for asset in assets if asset.supports("variational"))
         self.writer = writer
         self.hub = hub
         self.logger = logger
         self.health = VenueHealth(self.name)
         self.channels: dict[str, str] = {
             f"instrument_price:P-RWA/EQY-{asset.symbol('variational')}-USDC": asset.name
-            for asset in assets
+            for asset in self.assets
         }
         self.health.subscribed = list(self.channels)
 
@@ -123,7 +123,10 @@ class VariationalFillFeed:
     ) -> None:
         self.command_url = command_url
         self.assets = assets
-        self.symbol_to_asset = {asset.symbol("variational"): asset.name for asset in assets}
+        self.symbol_to_asset = {
+            asset.symbol("variational"): asset.name
+            for asset in assets if asset.supports("variational")
+        }
         self.writer = writer
         self.auditor = auditor
         self.interval = max(2.0, interval)
