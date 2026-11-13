@@ -50,3 +50,21 @@ def test_adverse_is_positive_when_mark_moves_against_buy(tmp_path):
     point = chain["horizons"][0]["points"][0]
     assert D(point["adverse_bps"]) > 0
     writer.close()
+
+
+def test_fill_chain_uses_quote_as_of_fill_not_later_quote(tmp_path):
+    writer = TapeWriter(tmp_path).start()
+    hub = MarketHub(writer, CaptureConfig(output_dir=tmp_path))
+    t1 = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 11, 13, 10, 0, 1, tzinfo=timezone.utc)
+    hub.update_book(book_from_levels("lighter_mainnet", "NVDA",
+        [{"price": "100", "size": "1"}], [{"price": "100.2", "size": "1"}], recv_at=t1))
+    fill = Fill("lighter_mainnet", "NVDA", "buy", D("1"), D("100.2"), t2, source_at=t2)
+    hub.update_book(book_from_levels("lighter_mainnet", "NVDA",
+        [{"price": "110", "size": "1"}], [{"price": "110.2", "size": "1"}], recv_at=t2 + __import__("datetime").timedelta(seconds=1)))
+    chain = FillAuditor(hub, writer).start_chain(fill)
+    assert chain["quote_alignment"] == "causal_as_of_fill"
+    assert D(chain["fill_mid"]) == D("100.1")
+    assert D(chain["fill_vs_mid_bps"]) > 0
+    assert chain["quote_at_fill"]["mid"] == "100.1"
+    writer.close()

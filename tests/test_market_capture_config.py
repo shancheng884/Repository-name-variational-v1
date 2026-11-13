@@ -21,22 +21,17 @@ def args(**overrides):
     return Namespace(**base)
 
 
-def test_default_assets_cover_four_venues():
-    assert [a.name for a in DEFAULT_ASSETS] == [
-        "OPENAI", "ANTHROPIC", "NVDA", "SNDK", "CRCL", "AAPL",
-        "QQQ", "DRAM", "COIN",
+def test_default_assets_cover_five_probe_instruments():
+    assert [a.name for a in DEFAULT_ASSETS[:5]] == [
+        "NVDA", "SNDK", "CRCL", "AAPL", "QQQ",
     ]
-    assert DEFAULT_ASSETS[0].symbol("entropy") == "io:OAI"
-    assert DEFAULT_ASSETS[1].symbol("entropy") == "io:ANTH"
-    assert DEFAULT_ASSETS[2].symbol("entropy") == "io:NVDA"
-    assert DEFAULT_ASSETS[3].symbol("entropy") == "io:SNDK"
-    assert DEFAULT_ASSETS[4].symbol("entropy") == "io:CRCL"
-    assert DEFAULT_ASSETS[5].symbol("entropy") == "io:AAPL"
-    assert DEFAULT_ASSETS[6].supports("entropy") is False
-    assert DEFAULT_ASSETS[7].supports("lighter_rh") is False
-    assert DEFAULT_ASSETS[8].supports("entropy") is False
-    assert all(DEFAULT_ASSETS[i].supports("variational") for i in range(9))
-    assert all(DEFAULT_ASSETS[i].supports("lighter_mainnet") for i in range(9))
+    assert DEFAULT_ASSETS[0].symbol("entropy") == "io:NVDA"
+    assert DEFAULT_ASSETS[1].symbol("entropy") == "io:SNDK"
+    assert DEFAULT_ASSETS[2].symbol("entropy") == "io:CRCL"
+    assert DEFAULT_ASSETS[3].symbol("entropy") == "io:AAPL"
+    assert DEFAULT_ASSETS[4].supports("entropy") is False
+    assert all(DEFAULT_ASSETS[i].supports("variational") for i in range(5))
+    assert all(DEFAULT_ASSETS[i].supports("lighter_mainnet") for i in range(5))
 
 
 def test_config_refuses_order_submission_flag():

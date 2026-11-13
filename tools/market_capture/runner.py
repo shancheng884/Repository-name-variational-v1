@@ -21,6 +21,7 @@ from .sysmon import LoopLagMonitor, SystemSampler
 from .venues.entropy import EntropyBookFeed, EntropyFillFeed
 from .venues.lighter import LighterBookFeed, LighterFillFeed
 from .venues.variational import VariationalFillFeed, VariationalPriceFeed
+from .venues.var_indicative import VariationalIndicativeFeed
 
 
 def _acquire_lock(path: Path):
@@ -126,6 +127,16 @@ class CaptureRunner:
                 self.venues["variational"] = VariationalPriceFeed(
                     ws_url=config.var_ws_url, assets=assets, writer=self.writer, hub=self.hub, logger=self.logger,
                 )
+                if config.var_quote_seconds > 0:
+                    self.venues["variational_indicative"] = VariationalIndicativeFeed(
+                        command_url=config.var_command_url,
+                        assets=assets,
+                        notional_usd=config.notional_usd,
+                        writer=self.writer,
+                        hub=self.hub,
+                        logger=self.logger,
+                        interval_seconds=config.var_quote_seconds,
+                    )
                 self.venues["variational_fills"] = VariationalFillFeed(
                     command_url=config.var_command_url, assets=assets, writer=self.writer,
                     auditor=self.auditor, interval=max(5.0, config.fill_poll_seconds * 2),
@@ -295,6 +306,10 @@ class CaptureRunner:
             "writer": self.writer.stats(),
             "loop": self.loop_lag.snapshot(),
             "fills_audited": self.auditor.audited if self.auditor else 0,
+            "var_indicative": (
+                self.venues["variational_indicative"].public_state()
+                if hasattr(self.venues.get("variational_indicative"), "public_state") else None
+            ),
             "disk_free_gb": round(disk_free_gb(self.root), 2),
             "tasks": len(self.tasks),
         }

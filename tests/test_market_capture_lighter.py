@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from decimal import Decimal as D
 import json
 
-from tools.market_capture.config import CaptureConfig, DEFAULT_ASSETS
+from tools.market_capture.config import CaptureConfig, AVAILABLE_ASSETS
 from tools.market_capture.hub import MarketHub
 from tools.market_capture.storage import TapeWriter
 from tools.market_capture.venues.lighter import LighterBookFeed, LighterFillFeed
@@ -26,7 +26,7 @@ def make_feed(tmp_path, monkeypatch):
     hub = MarketHub(writer, CaptureConfig(output_dir=tmp_path))
     feed = LighterBookFeed(
         name="lighter_mainnet", rest_url="https://x", ws_url="wss://x",
-        asset_symbols={a.name: a.symbol("lighter_mainnet") for a in DEFAULT_ASSETS},
+        asset_symbols={a.name: a.symbol("lighter_mainnet") for a in AVAILABLE_ASSETS},
         writer=writer, hub=hub, logger=__import__("logging").getLogger("t"),
     )
     return feed, hub, writer

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 import asyncio
 
 from .hub import MarketHub, BOOK_VENUES
@@ -10,11 +10,18 @@ from .model import Fill, adverse_bps, decimal_text, edge_bps, to_iso
 from .storage import TapeWriter
 
 
+def _bps(price: Decimal | None, reference: Decimal | None, *, buy: bool) -> Decimal | None:
+    if price is None or reference is None or reference <= 0:
+        return None
+    return ((price - reference) if buy else (reference - price)) / reference * Decimal("10000")
+
+
 class FillAuditor:
     """Build a causal chain around every observed own fill.
 
-    The chain records the quote seen at the fill, the fill price, the hedge
-    venue's executable price, and adverse excursion at fixed horizons.
+    Quote lookups are strictly as-of the exchange fill timestamp when that
+    timestamp is available. Later quotes are used only in the explicit
+    post-fill horizons, so the entry measurement cannot include look-ahead.
     """
 
     def __init__(
@@ -50,22 +57,32 @@ class FillAuditor:
         self.writer.append("chains", fill.venue, fill.symbol, chain, at=fill.recv_at)
         self.audited += 1
 
+    def _quote_at(self, venue: str, symbol: str, at: datetime | None) -> dict[str, Any] | None:
+        if at is not None:
+            return self.hub.as_of(venue, symbol, at)
+        return self.hub.latest(venue, symbol, max_age=10.0)
+
     def start_chain(self, fill: Fill) -> dict[str, Any]:
-        own = self.hub.latest(fill.venue, fill.symbol, max_age=10.0)
-        fill_mid = None
-        if own is not None and own.get("mid") is not None:
-            fill_mid = Decimal(str(own["mid"]))
-        fill_vs_mid = None
-        if fill_mid is not None and fill_mid > 0:
-            if fill.side == "buy":
-                fill_vs_mid = (fill.price - fill_mid) / fill_mid * Decimal("10000")
-            else:
-                fill_vs_mid = (fill_mid - fill.price) / fill_mid * Decimal("10000")
-        hedge = self.best_hedge(fill, at_fill=True)
+        at = fill.source_at or fill.recv_at
+        own = self._quote_at(fill.venue, fill.symbol, at)
+        alignment = "causal_as_of_fill" if fill.source_at is not None else "receive_time_only"
+        fill_mid = Decimal(str(own["mid"])) if own and own.get("mid") is not None else fill.seen_mid
+        fill_vs_mid = _bps(fill.price, fill_mid, buy=fill.side == "buy")
+        seen_executable = fill.seen_executable
+        if own is not None:
+            seen_executable = (
+                Decimal(str(own["ask"])) if fill.side == "buy" and own.get("ask") is not None
+                else Decimal(str(own["bid"])) if fill.side == "sell" and own.get("bid") is not None
+                else seen_executable
+            )
+        fill_vs_seen = _bps(fill.price, seen_executable, buy=fill.side == "buy")
+        hedge = self.best_hedge(fill, at=at)
         return {
             "schema": 1,
             "event": "fill_chain",
             "chain_id": fill.event_id,
+            "pair_id": fill.pair_id,
+            "client_order_id": fill.client_order_id,
             "venue": fill.venue,
             "symbol": fill.symbol,
             "side": fill.side,
@@ -73,20 +90,32 @@ class FillAuditor:
             "fill_price": decimal_text(fill.price),
             "fill_source_at": to_iso(fill.source_at),
             "fill_recv_at": to_iso(fill.recv_at),
+            "fill_at": to_iso(fill.fill_at or fill.source_at),
+            "submit_at": to_iso(fill.submit_at),
+            "ack_at": to_iso(fill.ack_at),
+            "signal_at": to_iso(fill.signal_at),
             "fee_usd": decimal_text(fill.fee_usd),
-            "own_quote_at_fill": _jsonable(own),
+            "quote_alignment": alignment,
+            "quote_at_fill": _jsonable(own),
+            "fill_mid": decimal_text(fill_mid),
+            "seen_executable": decimal_text(seen_executable),
+            "seen_quote_id": fill.seen_quote_id or (own or {}).get("quote_id"),
             "fill_vs_mid_bps": decimal_text(fill_vs_mid),
+            "fill_vs_seen_executable_bps": decimal_text(fill_vs_seen),
             "hedge_at_fill": hedge,
             "horizons": [],
-            "stall": self.stall_snapshot(fill.recv_at.timestamp() - 1.0, fill.recv_at.timestamp() + max(self.delays) + 0.5),
+            "stall": self.stall_snapshot(
+                fill.recv_at.timestamp() - 1.0,
+                fill.recv_at.timestamp() + max(self.delays) + 0.5,
+            ),
         }
 
-    def best_hedge(self, fill: Fill, *, at_fill: bool = True) -> dict[str, Any] | None:
+    def best_hedge(self, fill: Fill, *, at: datetime | None = None) -> dict[str, Any] | None:
         candidates = []
         for venue in BOOK_VENUES:
             if venue == fill.venue:
                 continue
-            quote = self.hub.latest(venue, fill.symbol, max_age=10.0)
+            quote = self._quote_at(venue, fill.symbol, at)
             if quote is None:
                 continue
             if fill.side == "buy":
@@ -102,6 +131,8 @@ class FillAuditor:
                 "price": decimal_text(Decimal(str(price))),
                 "edge_bps": decimal_text(edge),
                 "age_s": quote.get("age_s"),
+                "quote_at": quote.get("recv_at"),
+                "quote_kind": quote.get("quote_kind"),
             })
         if not candidates:
             return None
@@ -129,13 +160,15 @@ class FillAuditor:
                 "adverse_bps": decimal_text(adverse),
                 "hedge_edge_bps": decimal_text(hedge_edge),
                 "age_s": quote.get("age_s"),
+                "quote_at": quote.get("recv_at"),
+                "quote_kind": quote.get("quote_kind"),
             }
             points.append(point)
             self.writer.append(
                 "adverse", venue, fill.symbol,
                 {
                     "schema": 1, "event": "fill_adverse", "chain_id": fill.event_id,
-                    "fill_venue": fill.venue, "fill_side": fill.side,
+                    "pair_id": fill.pair_id, "fill_venue": fill.venue, "fill_side": fill.side,
                     "fill_price": decimal_text(fill.price), "delay_s": delay,
                     **point,
                 },
@@ -156,7 +189,9 @@ class FillAuditor:
                 last = {"delay_s": point["delay_s"], "adverse_bps": point["adverse_bps"]}
         hedge = chain.get("hedge_at_fill") or {}
         return {
+            "quote_alignment": chain.get("quote_alignment"),
             "fill_vs_mid_bps": chain.get("fill_vs_mid_bps"),
+            "fill_vs_seen_executable_bps": chain.get("fill_vs_seen_executable_bps"),
             "worst_adverse_bps": worst["adverse_bps"] if worst else None,
             "worst_adverse_delay_s": worst["delay_s"] if worst else None,
             "last_adverse_bps": last["adverse_bps"] if last else None,

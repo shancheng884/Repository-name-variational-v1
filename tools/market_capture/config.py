@@ -26,15 +26,12 @@ class Asset:
         return venue in self.symbols
 
 
-DEFAULT_ASSETS: tuple[Asset, ...] = (
-    Asset("OPENAI", {
-        "variational": "OPENAI", "lighter_mainnet": "OPENAI",
-        "lighter_rh": "OPENAI", "entropy": "io:OAI",
-    }),
-    Asset("ANTHROPIC", {
-        "variational": "ANTHROPIC", "lighter_mainnet": "ANTHROPIC",
-        "lighter_rh": "ANTHROPIC", "entropy": "io:ANTH",
-    }),
+AVAILABLE_ASSETS: tuple[Asset, ...] = (
+    # Five liquid, same-symbol instruments. The first four are present on all
+    # four venues; QQQ is present on Var + both Lighter books and is retained
+    # because its spread is materially tighter. OPENAI/ANTHROPIC are excluded
+    # from executable pair probes until the Var reference/mid scale discrepancy
+    # is resolved; they remain available explicitly for read-only diagnostics.
     Asset("NVDA", {
         "variational": "NVDA", "lighter_mainnet": "NVDA",
         "lighter_rh": "NVDA", "entropy": "io:NVDA",
@@ -55,6 +52,14 @@ DEFAULT_ASSETS: tuple[Asset, ...] = (
         "variational": "QQQ", "lighter_mainnet": "QQQ",
         "lighter_rh": "QQQ",
     }, var_kind="etf"),
+    Asset("OPENAI", {
+        "variational": "OPENAI", "lighter_mainnet": "OPENAI",
+        "lighter_rh": "OPENAI", "entropy": "io:OAI",
+    }),
+    Asset("ANTHROPIC", {
+        "variational": "ANTHROPIC", "lighter_mainnet": "ANTHROPIC",
+        "lighter_rh": "ANTHROPIC", "entropy": "io:ANTH",
+    }),
     Asset("DRAM", {
         "variational": "DRAM", "lighter_mainnet": "DRAM",
         "entropy": "io:DRAM",
@@ -63,6 +68,11 @@ DEFAULT_ASSETS: tuple[Asset, ...] = (
         "variational": "COIN", "lighter_mainnet": "COIN",
         "lighter_rh": "COIN",
     }),
+)
+
+DEFAULT_ASSETS: tuple[Asset, ...] = tuple(
+    asset for asset in AVAILABLE_ASSETS
+    if asset.name in {"NVDA", "SNDK", "CRCL", "AAPL", "QQQ"}
 )
 
 
@@ -134,7 +144,7 @@ class CaptureConfig:
     system_seconds: float = 60.0
     fill_poll_seconds: float = 2.0
     edge_seconds: float = 1.0
-    var_quote_seconds: float = 15.0
+    var_quote_seconds: float = 1.0
     retention_days: int = 14
     disk_floor_gb: float = 2.0
     max_book_levels: int = 10
@@ -199,9 +209,9 @@ class ConfigError(RuntimeError):
 
 def _parse_assets(raw: str, env: dict[str, str]) -> tuple[Asset, ...]:
     names = [part.strip().upper() for part in raw.split(",") if part.strip()]
-    known = {asset.name: asset for asset in DEFAULT_ASSETS}
+    known = {asset.name: asset for asset in AVAILABLE_ASSETS}
     if not names:
-        names = ["OPENAI", "ANTHROPIC", "NVDA"]
+        names = ["NVDA", "SNDK", "CRCL", "AAPL", "QQQ"]
     out = []
     for name in names:
         if name not in known:
@@ -234,7 +244,7 @@ def load_config(args: Any | None = None, env: dict[str, str] | None = None) -> C
         system_seconds=max(10.0, float(getattr(args, "system_seconds", 60.0))),
         fill_poll_seconds=max(1.0, float(getattr(args, "fill_poll_seconds", 2.0))),
         edge_seconds=max(0.5, float(getattr(args, "edge_seconds", 1.0))),
-        var_quote_seconds=max(0.0, float(getattr(args, "var_quote_seconds", 15.0))),
+        var_quote_seconds=max(0.0, float(getattr(args, "var_quote_seconds", 1.0))),
         retention_days=max(1, int(getattr(args, "retention_days", 14))),
         disk_floor_gb=max(0.0, float(getattr(args, "disk_floor_gb", 2.0))),
         max_book_levels=max(1, int(getattr(args, "max_book_levels", 10))),

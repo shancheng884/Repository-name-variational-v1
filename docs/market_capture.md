@@ -2,7 +2,7 @@
 
 ## 目的
 
-在不影响 ETH / WTI 实盘和现有采集的前提下，记录四个平台、三个 RWA 标的的行情、价差、订单簿、本人成交、延迟、CPU/卡顿，以及成交后 0.25 / 0.5 / 1 / 3 秒的不利波动。所有写入只用于研究，不参与下单。
+在不影响 ETH / WTI 实盘和现有采集的前提下，记录四个平台、五个 RWA 标的的行情、价差、订单簿、本人成交、延迟、CPU/卡顿，以及成交后 0.25 / 0.5 / 1 / 3 秒的不利波动。所有写入只用于研究，不参与下单。
 
 ## 平台与标的
 
@@ -13,10 +13,11 @@
 | Lighter RH | `api.rh.lighter.xyz` | 同上，独立账户/API key |
 | Entropy | Hyperliquid HIP-3 `io` DEX | L2 订单簿 + 公共成交 + `userFills` |
 
-默认九个标的：`OPENAI`、`ANTHROPIC`、`NVDA`、`SNDK`、`CRCL`、`AAPL`、`QQQ`、`DRAM`、`COIN`。前六个四平台齐全；QQQ、COIN 缺 Entropy，DRAM 缺 Lighter RH：
+默认五个标的：`NVDA`、`SNDK`、`CRCL`、`AAPL`、`QQQ`。前四个四平台齐全；QQQ 缺 Entropy。OPENAI/ANTHROPIC/DRAM/COIN 仍可由 `--assets` 显式启用，但默认不参与可执行探针：
 
-- Variational / Lighter 主网：全部九个同名标的；Lighter RH 缺 `DRAM`
-- Entropy：`io:OAI`、`io:ANTH`、`io:NVDA`、`io:SNDK`、`io:CRCL`、`io:AAPL`、`io:DRAM`
+- Variational / Lighter 主网：全部同名标的
+- Lighter RH：除 `DRAM` 外的同名标的
+- Entropy：`io:NVDA`、`io:SNDK`、`io:CRCL`、`io:AAPL`
 
 ## 安全边界
 
@@ -72,7 +73,8 @@ PY
 
 ## 已知限制
 
-- Variational 公共行情只给参考价，不给 bid/ask；因此 Var 的 `spread_bps` 为空，跨平台价差对 Var 使用 `mode=reference`。要得到 Var 可执行价，需要在 Var 页面产生 RFQ，本采集器不主动发 RFQ，避免影响现有实盘。
+- Variational 公共 `/prices` 只给参考中间价。采集器同时通过本机 8768 命令桥轮询 Var indicative quote，默认每个标的每秒一次；BBO、quote id、请求延迟和 rate-limit hint 写入 `var_indicative/` 与统一的 `quotes/` 流。该 quote 是下单确认的同源报价，不是订单。
+- 若 indicative 报价过期，跨平台价差自动退回 `mode=reference`，不会把旧 BBO 当成可执行价。
 - Lighter 本人成交依赖账户 API key；未配置时该平台行情仍采集，`*_fills` 状态为 `disabled_missing_credentials`。
 - Entropy 的 `userFills` 需要真实交易账户地址；子账户请填子账户地址。
 

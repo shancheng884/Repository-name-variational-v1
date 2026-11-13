@@ -26,7 +26,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Read-only RWA market capture (no order submission).")
     parser.add_argument("--enable-capture", action="store_true", help="required unless MARKET_CAPTURE_ENABLED=true")
     parser.add_argument("--output-dir", default=str(ROOT / "log" / "market_capture"))
-    parser.add_argument("--assets", default="OPENAI,ANTHROPIC,NVDA,SNDK,CRCL,AAPL,QQQ,DRAM,COIN")
+    parser.add_argument("--assets", default="NVDA,SNDK,CRCL,AAPL,QQQ")
     parser.add_argument("--notional-usd", type=float, default=20.0)
     parser.add_argument("--book-snapshot-seconds", type=float, default=5.0)
     parser.add_argument("--health-seconds", type=float, default=5.0)
@@ -34,8 +34,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--system-seconds", type=float, default=60.0)
     parser.add_argument("--fill-poll-seconds", type=float, default=2.0)
     parser.add_argument("--edge-seconds", type=float, default=1.0)
-    parser.add_argument("--var-quote-seconds", type=float, default=0.0,
-                        help="reserved; Var RWA executable RFQ is not polled by this collector")
+    parser.add_argument("--var-quote-seconds", type=float, default=1.0,
+                        help="round-robin Variational indicative quote interval; 0 disables active quote polling")
     parser.add_argument("--retention-days", type=int, default=14)
     parser.add_argument("--disk-floor-gb", type=float, default=2.0)
     parser.add_argument("--max-book-levels", type=int, default=10)

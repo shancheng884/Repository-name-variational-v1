@@ -215,11 +215,32 @@ class ReferenceQuote:
     recv_at: datetime
     source_at: datetime | None = None
     sequence: int | None = None
+    bid: Decimal | None = None
+    ask: Decimal | None = None
+    bbo_recv_at: datetime | None = None
+    bbo_source_at: datetime | None = None
+    quote_id: str | None = None
+    quote_kind: str = "price_stream"
+    notional_usd: Decimal | None = None
+    qty: Decimal | None = None
+    request_latency_ms: float | None = None
+    rate_limit_reset_ms: int | None = None
+
+    @property
+    def has_bbo(self) -> bool:
+        return self.bid is not None and self.ask is not None and self.ask > self.bid
 
     def quote_row(self, *, recv_mono: float | None = None) -> dict[str, Any]:
         latency_ms = None
         if self.source_at is not None:
             latency_ms = (self.recv_at - self.source_at).total_seconds() * 1000.0
+        bbo_recv_at = self.bbo_recv_at or (self.recv_at if self.has_bbo else None)
+        bbo_source_at = self.bbo_source_at or (self.source_at if self.has_bbo else None)
+        bbo_latency_ms = None
+        if bbo_source_at is not None and bbo_recv_at is not None:
+            bbo_latency_ms = (bbo_recv_at - bbo_source_at).total_seconds() * 1000.0
+        executable_buy = self.ask if self.has_bbo else None
+        executable_sell = self.bid if self.has_bbo else None
         return {
             "schema": 1,
             "event": "quote",
@@ -230,17 +251,25 @@ class ReferenceQuote:
             "source_latency_ms": round(latency_ms, 3) if latency_ms is not None else None,
             "recv_mono": recv_mono,
             "book_available": False,
-            "bid": None,
-            "ask": None,
+            "bid": decimal_text(self.bid),
+            "ask": decimal_text(self.ask),
             "bid_size": None,
             "ask_size": None,
             "mid": decimal_text(self.mid),
-            "spread_bps": None,
-            "executable_buy": None,
-            "executable_sell": None,
-            "notional_usd": None,
+            "spread_bps": decimal_text(spread_bps(self.bid, self.ask)),
+            "executable_buy": decimal_text(executable_buy),
+            "executable_sell": decimal_text(executable_sell),
+            "notional_usd": decimal_text(self.notional_usd),
+            "qty": decimal_text(self.qty),
             "sequence": self.sequence,
             "continuity": True,
+            "quote_kind": self.quote_kind,
+            "quote_id": self.quote_id,
+            "bbo_recv_at": to_iso(bbo_recv_at),
+            "bbo_source_at": to_iso(bbo_source_at),
+            "bbo_source_latency_ms": round(bbo_latency_ms, 3) if bbo_latency_ms is not None else None,
+            "request_latency_ms": round(self.request_latency_ms, 3) if self.request_latency_ms is not None else None,
+            "rate_limit_reset_ms": self.rate_limit_reset_ms,
         }
 
 
@@ -259,6 +288,15 @@ class Fill:
     status: str = "filled"
     fill_quality: str = "trade_record"
     raw_ref: str | None = None
+    client_order_id: str | None = None
+    pair_id: str | None = None
+    submit_at: datetime | None = None
+    ack_at: datetime | None = None
+    fill_at: datetime | None = None
+    signal_at: datetime | None = None
+    seen_mid: Decimal | None = None
+    seen_executable: Decimal | None = None
+    seen_quote_id: str | None = None
 
     @property
     def event_id(self) -> str:
@@ -266,6 +304,7 @@ class Fill:
             part for part in (
                 self.venue,
                 self.symbol,
+                self.pair_id or "",
                 self.trade_id or self.order_id or "",
                 self.side,
                 to_iso(self.source_at) or to_iso(self.recv_at) or "",
@@ -286,10 +325,19 @@ class Fill:
             "fee_usd": decimal_text(self.fee_usd),
             "order_id": self.order_id,
             "trade_id": self.trade_id,
+            "client_order_id": self.client_order_id,
+            "pair_id": self.pair_id,
             "status": self.status,
             "fill_quality": self.fill_quality,
             "source_at": to_iso(self.source_at),
             "recv_at": to_iso(self.recv_at),
+            "submit_at": to_iso(self.submit_at),
+            "ack_at": to_iso(self.ack_at),
+            "fill_at": to_iso(self.fill_at),
+            "signal_at": to_iso(self.signal_at),
+            "seen_mid": decimal_text(self.seen_mid),
+            "seen_executable": decimal_text(self.seen_executable),
+            "seen_quote_id": self.seen_quote_id,
             "raw_ref": self.raw_ref,
         }
 

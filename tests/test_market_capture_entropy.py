@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal as D
 
-from tools.market_capture.config import CaptureConfig, DEFAULT_ASSETS
+from tools.market_capture.config import CaptureConfig, AVAILABLE_ASSETS
 from tools.market_capture.hub import MarketHub
 from tools.market_capture.storage import TapeWriter
 from tools.market_capture.venues.entropy import EntropyBookFeed, EntropyFillFeed
@@ -24,7 +24,7 @@ def test_entropy_universe_and_books(tmp_path, monkeypatch):
     hub = MarketHub(writer, CaptureConfig(output_dir=tmp_path))
     feed = EntropyBookFeed(
         info_url="https://x", ws_url="wss://x", dex="io",
-        asset_symbols={a.name: a.symbol("entropy") for a in DEFAULT_ASSETS},
+        asset_symbols={a.name: a.symbol("entropy") for a in AVAILABLE_ASSETS},
         writer=writer, hub=hub, logger=__import__("logging").getLogger("t"),
     )
     import asyncio
@@ -46,7 +46,7 @@ def test_entropy_fill_normalization(tmp_path):
     auditor = FillAuditor(hub, writer)
     feed = EntropyFillFeed(
         info_url="https://x", dex="io",
-        asset_symbols={a.name: a.symbol("entropy") for a in DEFAULT_ASSETS},
+        asset_symbols={a.name: a.symbol("entropy") for a in AVAILABLE_ASSETS},
         writer=writer, auditor=auditor, account_address="0x" + "1" * 40,
     )
     fill = feed._normalize({"coin": "io:NVDA", "side": "B", "px": "100", "sz": "1",
