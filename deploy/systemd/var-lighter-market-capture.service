@@ -21,7 +21,8 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 CPUQuota=60%
-MemoryMax=700M
+MemoryHigh=900M
+MemoryMax=1G
 NoNewPrivileges=true
 TimeoutStopSec=30
 
