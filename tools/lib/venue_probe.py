@@ -256,6 +256,8 @@ class ProbeRunner:
     async def preflight_all(self):
         out={}
         for name,ex in self.executors.items():
+            if name not in self.venues:
+                continue
             if not getattr(ex,"available",False): out[name]={"ok":False,"error":f"{name}_not_live_ready"}; continue
             for asset in self.assets:
                 if asset.supports(name): out[f"{name}:{asset.name}"]=await ex.preflight(asset)
