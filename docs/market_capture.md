@@ -23,7 +23,7 @@
 
 - 代码内没有下单调用；启动时扫描源码中的 `create_order` / `place_order` / `submit_order` / `send_tx` 等关键字，发现即退出。
 - 拒绝 `ALLOW_ORDER_SUBMISSION=true`，健康文件固定 `orders_attempted=false`、`execution_enabled=false`。
-- 独立 systemd 服务、独立文件锁、独立输出目录；不重启、不停止 ETH / WTI / 原油采集。
+- 独立 systemd 服务、独立文件锁、独立输出目录。Var indicative 需要共享的本地命令桥，因此由 `var-lighter-var-bridge.service` 占据 8766/8767/8768；同一时间不要再启动自带命令服务器的实盘进程。
 - 只使用公开行情、地址级 `userFills` 和只读 API key；密钥只从环境文件读取，不写入日志、不写进健康文件。
 
 ## 数据目录
