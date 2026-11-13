@@ -6,3 +6,4 @@ lighter-sdk==1.0.4
 rich>=13.7.1,<14.0
 tencentcloud-sdk-python>=3.0.1200,<4.0
 tzdata>=2024.1
+hyperliquid-python-sdk==0.24.0

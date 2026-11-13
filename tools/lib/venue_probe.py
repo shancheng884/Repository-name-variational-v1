@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
 from pathlib import Path
 from typing import Any, Protocol
-import asyncio, inspect, json, os, time, uuid
+import asyncio, hashlib, inspect, json, os, time, uuid
 import requests
 from tools.lib.hedge_instruments import iter_positions, lighter_position_qty
 from tools.lib.lighter_order_identity import lighter_client_order_index
@@ -25,6 +25,24 @@ def _parse(v):
     try:
         p=datetime.fromisoformat(str(v).replace("Z","+00:00")); return p.astimezone(timezone.utc) if p.tzinfo else p.replace(tzinfo=timezone.utc)
     except ValueError: return None
+def _parse_epoch_ms(v):
+    try:
+        n=float(v)
+        if n>1e11: n/=1000.0
+        return datetime.fromtimestamp(n,timezone.utc)
+    except (TypeError,ValueError,OSError):
+        return None
+
+
+class _EntropyCloid:
+    def __init__(self,raw):
+        raw=str(raw)
+        if not raw.startswith("0x") or len(raw)!=34: raise ValueError("entropy_cloid_invalid")
+        self.raw=raw
+    def to_raw(self): return self.raw
+    def __str__(self): return self.raw
+
+
 def _model_dict(v):
     if isinstance(v,dict): return v
     for n in ("to_dict","model_dump"):
@@ -237,6 +255,114 @@ class LighterProbeExecutor:
         return {"ok":False,"status":"unknown","error":"lighter_fill_timeout","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat()}
 def _int(v):
     p=_d(v); return int(p) if p is not None and p==p.to_integral_value() else None
+class EntropyProbeExecutor:
+    venue="entropy"
+    def __init__(self,*,info_url,account_address,private_key,dex="io",timeout_seconds=8.0,info=None,exchange=None):
+        self.info_url=info_url.rstrip("/") if info_url else info_url
+        self.account_address=account_address
+        self.private_key=private_key
+        self.dex=dex
+        self.timeout_seconds=timeout_seconds
+        self.info=info
+        self.exchange=exchange
+        self.available=bool(account_address and private_key)
+        self.meta=None
+        self.universe={}
+    async def start(self):
+        if not self.available: return
+        if self.info is None or self.exchange is None:
+            from eth_account import Account
+            from hyperliquid.exchange import Exchange
+            from hyperliquid.info import Info
+            from hyperliquid.utils import constants
+            base_url=self.info_url or constants.MAINNET_API_URL
+            self.info=Info(base_url,skip_ws=True,perp_dexs=[self.dex])
+            self.exchange=Exchange(Account.from_key(self.private_key),base_url,account_address=self.account_address,perp_dexs=[self.dex])
+        self.meta=await asyncio.to_thread(self.info.meta,self.dex)
+        self.universe={str(row.get("name")):dict(row) for row in (self.meta or {}).get("universe",[]) if isinstance(row,dict)}
+        if not self.universe: raise ProbeError("entropy_meta_universe_missing")
+    async def close(self): return None
+    def _coin(self,asset): return asset.symbol("entropy")
+    def _row(self,asset):
+        row=self.universe.get(self._coin(asset))
+        if row is None: raise ProbeError("entropy_market_missing")
+        return row
+    async def preflight(self,asset):
+        if not self.available or self.info is None: return {"ok":False,"error":"entropy_credentials_missing"}
+        coin=self._coin(asset)
+        state=await asyncio.to_thread(self.info.user_state,self.account_address,self.dex)
+        for item in (state or {}).get("assetPositions",[]) or []:
+            pos=item.get("position") if isinstance(item,dict) else None
+            if not isinstance(pos,dict) or pos.get("coin")!=coin: continue
+            szi=_d(pos.get("szi")) or ZERO
+            if szi!=ZERO: return {"ok":False,"error":"entropy_position_not_flat","qty":str(szi)}
+        orders=await asyncio.to_thread(self.info.open_orders,self.account_address,self.dex)
+        active=[row for row in (orders or []) if str(row.get("coin") or "")==coin]
+        if active: return {"ok":False,"error":"entropy_active_order","count":len(active)}
+        row=self._row(asset); asset_index=int(self.info.name_to_asset(coin))
+        margin=(state or {}).get("marginSummary") or {}
+        return {"ok":True,"qty":"0","active_orders":0,"account_value":margin.get("accountValue"),
+                "contract":{"venue":"entropy","symbol":coin,"asset_index":asset_index,
+                            "sz_decimals":int(row.get("szDecimals") or 0),
+                            "max_leverage":row.get("maxLeverage"),"only_isolated":bool(row.get("onlyIsolated")),
+                            "dex":self.dex,"fee_token":"USDC"}}
+    def normalize_qty(self,asset,qty):
+        if qty<=0 or not self.universe: return None
+        step=Decimal(1).scaleb(-int(self._row(asset).get("szDecimals") or 0))
+        return qty.quantize(step,rounding=ROUND_DOWN)
+    @staticmethod
+    def _cloid(client_order_id):
+        return _EntropyCloid("0x"+hashlib.sha256(client_order_id.encode()).hexdigest()[:32])
+    def _limit_price(self,asset,side,bbo,max_slippage_bps):
+        row=self._row(asset); szd=int(row.get("szDecimals") or 0)
+        direction=Decimal("-1") if side=="sell" else Decimal("1")
+        px=bbo*(Decimal("1")+direction*max_slippage_bps/BPS)
+        decimals=max(0,6-szd)
+        return float(round(float(f"{float(px):.5g}"),decimals))
+    async def market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
+        if not self.available or self.exchange is None: return {"ok":False,"status":"rejected","error":"entropy_credentials_missing","client_order_id":client_order_id}
+        qty=self.normalize_qty(asset,qty)
+        if not qty: return {"ok":False,"status":"rejected","error":"entropy_qty_below_min","client_order_id":client_order_id}
+        bbo=_d(quote.get("ask" if side=="buy" else "bid"))
+        if not bbo: return {"ok":False,"status":"rejected","error":"entropy_quote_missing","client_order_id":client_order_id}
+        limit_px=self._limit_price(asset,side,bbo,max_slippage_bps)
+        cloid=self._cloid(client_order_id); coin=self._coin(asset)
+        submitted=datetime.now(timezone.utc); start_ms=int(submitted.timestamp()*1000)-1000
+        try:
+            result=await asyncio.to_thread(self.exchange.order,coin,side=="buy",float(qty),limit_px,{"limit":{"tif":"Ioc"}},reduce_only=bool(reduce_only),cloid=cloid)
+        except Exception as exc:
+            return {"ok":False,"status":"unknown","error":f"{type(exc).__name__}:{exc}","client_order_id":client_order_id,"submitted_at":submitted.isoformat()}
+        acked=datetime.now(timezone.utc)
+        status=self._order_status(result)
+        if status=="rejected": return {"ok":True,"status":"rejected","filled_qty":"0","error":self._order_error(result),"client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat()}
+        deadline=time.monotonic()+self.timeout_seconds
+        last=None
+        while time.monotonic()<deadline:
+            fills=await asyncio.to_thread(self.info.user_fills_by_time,self.account_address,start_ms)
+            rows=[row for row in (fills or []) if str(row.get("cloid") or "").lower()==str(cloid).lower() and str(row.get("coin") or "")==coin]
+            if rows:
+                qty_sum=sum((_d(row.get("sz")) or ZERO for row in rows),ZERO); notional=sum(((_d(row.get("sz")) or ZERO)*(_d(row.get("px")) or ZERO) for row in rows),ZERO)
+                fee=sum((_d(row.get("fee")) or ZERO for row in rows),ZERO)
+                last=max((_parse_epoch_ms(row.get("time")) for row in rows),default=None)
+                return {"ok":True,"status":"filled","filled_qty":str(qty_sum),"avg_price":str(notional/qty_sum) if qty_sum else None,"fee_usd":str(fee),"order_id":str(rows[0].get("oid") or ""),"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":last.isoformat() if last else None,"source_at_epoch":last.timestamp() if last else None,"raw_status":status}
+            await asyncio.sleep(.1)
+        return {"ok":False,"status":"unknown","error":"entropy_fill_timeout","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"cloid":str(cloid)}
+    @staticmethod
+    def _order_status(result):
+        try:
+            statuses=result["response"]["data"]["statuses"]
+            if not statuses: return "unknown"
+            item=statuses[0]
+            if "filled" in item or "resting" in item: return "accepted"
+            if "error" in item: return "rejected"
+        except (TypeError,KeyError,IndexError): pass
+        return "unknown"
+    @staticmethod
+    def _order_error(result):
+        try: return str(result["response"]["data"]["statuses"][0]["error"])[:200]
+        except Exception: return "entropy_order_rejected"
+
+
 class UnavailableProbeExecutor:
     def __init__(self,venue,reason): self.venue=venue; self.reason=reason; self.available=False
     async def start(self): return None

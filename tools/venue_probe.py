@@ -10,7 +10,7 @@ ROOT=Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
 from tools.market_capture.config import DEFAULT_ASSETS, CaptureConfig, load_environment
 from tools.market_capture.runner import CaptureRunner
-from tools.lib.venue_probe import (LighterProbeExecutor, ProbeRunner, ProbeState,
+from tools.lib.venue_probe import (EntropyProbeExecutor, LighterProbeExecutor, ProbeRunner, ProbeState,
     UnavailableProbeExecutor, VariationalProbeExecutor, enumerate_probe_plan)
 
 DEFAULT_ASSETS_NAMES="NVDA,SNDK,CRCL,AAPL,QQQ"
@@ -33,9 +33,12 @@ def _executors(env):
       "lighter_mainnet":LighterProbeExecutor(name="lighter_mainnet",rest_url=env.get("LIGHTER_MAINNET_REST_URL","https://mainnet.zklighter.elliot.ai"),account_index=int(env["LIGHTER_ACCOUNT_INDEX"]) if env.get("LIGHTER_ACCOUNT_INDEX") else None,api_key_index=int(env["LIGHTER_API_KEY_INDEX"]) if env.get("LIGHTER_API_KEY_INDEX") else None,private_key=env.get("LIGHTER_PRIVATE_KEY","")),
       "lighter_rh":LighterProbeExecutor(name="lighter_rh",rest_url=env.get("LIGHTER_RH_REST_URL","https://api.rh.lighter.xyz"),account_index=int(env["LIGHTER_RH_ACCOUNT_INDEX"]) if env.get("LIGHTER_RH_ACCOUNT_INDEX") else None,api_key_index=int(env["LIGHTER_RH_API_KEY_INDEX"]) if env.get("LIGHTER_RH_API_KEY_INDEX") else None,private_key=env.get("LIGHTER_RH_API_PRIVATE_KEY","")),
     }
-    # Entropy supports public quotes but no trading adapter until a signer key is provisioned.
-    if env.get("ENTROPY_PRIVATE_KEY"):
-        ex["entropy"]=UnavailableProbeExecutor("entropy","entropy_trade_adapter_not_installed")
+    entropy_address=(env.get("ENTROPY_ACCOUNT_ADDRESS") or "").strip()
+    entropy_key=(env.get("ENTROPY_PRIVATE_KEY") or env.get("HYPERLIQUID_PRIVATE_KEY") or "").strip()
+    if entropy_address and entropy_key:
+        ex["entropy"]=EntropyProbeExecutor(info_url=env.get("ENTROPY_INFO_URL","https://api.hyperliquid.xyz/info"),account_address=entropy_address,private_key=entropy_key,dex=env.get("ENTROPY_ALLOWED_DEX","io"))
+    elif not entropy_address:
+        ex["entropy"]=UnavailableProbeExecutor("entropy","entropy_account_address_missing")
     else:
         ex["entropy"]=UnavailableProbeExecutor("entropy","entropy_private_key_missing")
     return ex
