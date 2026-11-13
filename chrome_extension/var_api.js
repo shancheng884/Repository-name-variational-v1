@@ -166,7 +166,7 @@ export function buildVariationalApiScript(action, params) {
       };
     }
     const instrumentType = String(o.instrumentType || o.instrument_type || "perpetual_future");
-    if (!["perpetual_future", "swap"].includes(instrumentType)) {
+    if (!["perpetual_future", "swap", "perpetual_rwa_future"].includes(instrumentType)) {
       return {
         ok: false,
         step: "precheck",
