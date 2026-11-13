@@ -161,7 +161,7 @@ python tools/replay_capture.py \
 分析机需要安装 DuckDB：
 
 ```bash
-pip install duckdb
+pip install duckdb pytz
 ```
 
 ### 方式 1b：手动只拉需要的分区
