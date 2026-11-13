@@ -258,7 +258,10 @@ def _int(v):
 class EntropyProbeExecutor:
     venue="entropy"
     def __init__(self,*,info_url,account_address,private_key,dex="io",timeout_seconds=8.0,info=None,exchange=None):
-        self.info_url=info_url.rstrip("/") if info_url else info_url
+        base=(info_url or "").rstrip("/")
+        if base.endswith("/info"):
+            base=base[:-5].rstrip("/")
+        self.info_url=base
         self.account_address=account_address
         self.private_key=private_key
         self.dex=dex

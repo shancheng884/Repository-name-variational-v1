@@ -96,3 +96,14 @@ def test_entropy_market_order_uses_cloid_and_aggregates_fills():
 def test_entropy_without_private_key_is_not_available():
     ex = EntropyProbeExecutor(info_url="https://x", account_address="0x" + "2" * 40, private_key="", info=FakeInfo(), exchange=FakeExchange())
     assert ex.available is False
+
+
+def test_entropy_info_url_accepts_full_info_endpoint_form():
+    ex = EntropyProbeExecutor(
+        info_url="https://api.hyperliquid.xyz/info",
+        account_address="0x" + "2" * 40,
+        private_key="0x" + "1" * 64,
+        info=FakeInfo(),
+        exchange=FakeExchange(),
+    )
+    assert ex.info_url == "https://api.hyperliquid.xyz"
