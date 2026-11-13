@@ -87,7 +87,10 @@ class VariationalProbeExecutor:
         if rows is None: return {"ok":False,"error":"variational_orders_unverifiable"}
         active=[r for r in rows if _underlying(r)==symbol]
         if active: return {"ok":False,"error":"variational_active_order","count":len(active)}
-        return {"ok":True,"qty":"0","active_orders":0}
+        return {"ok":True,"qty":"0","active_orders":0,
+                "contract":{"venue":"variational","symbol":asset.symbol("variational"),
+                            "instrument_type":asset.var_instrument_type,"kind":asset.var_kind,
+                            "settlement_asset":"USDC","funding_interval_s":0}}
     def normalize_qty(self,asset,qty):
         return qty.quantize(Decimal("0.00000001"),rounding=ROUND_DOWN) if qty>0 else None
     async def market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
@@ -159,7 +162,15 @@ class LighterProbeExecutor:
         rows=_rows(await OrderApi(self.client.api_client).account_active_orders(auth=token,account_index=int(self.account_index),market_id=int(market["market_id"]),_request_timeout=10.),"orders")
         if rows is None: return {"ok":False,"error":f"{self.venue}_active_orders_unverifiable"}
         if rows: return {"ok":False,"error":f"{self.venue}_active_order","count":len(rows)}
-        return {"ok":True,"qty":"0","active_orders":0}
+        return {"ok":True,"qty":"0","active_orders":0,
+                "contract":{"venue":self.venue,"symbol":asset.symbol(self.venue),
+                            "market_id":int(market["market_id"]),
+                            "status":market.get("status"),"market_type":market.get("market_type"),
+                            "size_decimals":int(market.get("supported_size_decimals") or 0),
+                            "price_decimals":int(market.get("supported_price_decimals") or 0),
+                            "min_base_amount":str(market.get("min_base_amount")),
+                            "min_quote_amount":str(market.get("min_quote_amount")),
+                            "multiplier":str(market.get("multiplier"))}}
     def normalize_qty(self,asset,qty):
         market=self.market(asset)
         if market is None or qty<=0: return None
@@ -248,6 +259,17 @@ class ProbeRunner:
             if not getattr(ex,"available",False): out[name]={"ok":False,"error":f"{name}_not_live_ready"}; continue
             for asset in self.assets:
                 if asset.supports(name): out[f"{name}:{asset.name}"]=await ex.preflight(asset)
+        for asset in self.assets:
+            for venue in self.venues:
+                if not asset.supports(venue):
+                    continue
+                q=self.hub.latest(venue,asset.name,max_age=self.max_quote_age_seconds)
+                key=f"{venue}:{asset.name}:market"
+                out[key]={"ok":q is not None and q.get("bid") is not None and q.get("ask") is not None,
+                          "quote_kind":(q or {}).get("quote_kind"),
+                          "age_s":(q or {}).get("age_s"),
+                          "quote_id":(q or {}).get("quote_id"),
+                          "error":None if q is not None else "quote_not_ready"}
         return out
     async def run(self,*,allow_live=False):
         plan=enumerate_probe_plan(self.assets,self.venues)

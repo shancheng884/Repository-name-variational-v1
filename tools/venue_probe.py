@@ -40,7 +40,7 @@ def _executors(env):
         ex["entropy"]=UnavailableProbeExecutor("entropy","entropy_private_key_missing")
     return ex
 
-async def _wait_ready(runner,assets,venues,timeout=18.0):
+async def _wait_ready(runner,assets,venues,timeout=35.0):
     deadline=asyncio.get_running_loop().time()+timeout
     needed=[(v,a.name) for a in assets for v in venues if a.supports(v)]
     while asyncio.get_running_loop().time()<deadline:
@@ -49,7 +49,7 @@ async def _wait_ready(runner,assets,venues,timeout=18.0):
             for v,s in needed:
                 q=runner.hub.latest(v,s,max_age=5.0)
                 if q and q.get("mid") is not None and q.get("bid") is not None and q.get("ask") is not None: ok+=1
-            if ok>=max(1,len(needed)//2): return {"ready":True,"quoted":ok,"needed":len(needed)}
+            if ok>=len(needed): return {"ready":True,"quoted":ok,"needed":len(needed)}
         await asyncio.sleep(.25)
     return {"ready":False,"quoted":0,"needed":len(needed)}
 
