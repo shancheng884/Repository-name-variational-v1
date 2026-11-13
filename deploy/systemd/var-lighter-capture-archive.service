@@ -16,6 +16,7 @@ IOSchedulingClass=idle
 IOSchedulingPriority=7
 CPUQuota=20%
 MemoryMax=300M
+TimeoutStartSec=3600
 NoNewPrivileges=true
 
 [Install]
