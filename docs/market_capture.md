@@ -129,7 +129,43 @@ market_capture/books/entropy/NVDA/20261113-05.jsonl.gz
 market_capture/edges/cross/NVDA/20261113-05.jsonl.gz
 ```
 
-### 方式 1：只拉需要的分区到本地（最稳）
+### 方式 1：用回放脚本（推荐）
+
+脚本按日期、标的、stream 从 R2 拉取到 `~/replay/var-lighter/`，再用 DuckDB 汇总：
+
+```bash
+python tools/replay_capture.py \
+  --date 2026-11-13 \
+  --symbol NVDA,SNDK \
+  --streams quotes,edges,market_trades
+```
+
+只查某个平台：
+
+```bash
+python tools/replay_capture.py \
+  --date 2026-11-13 --symbol NVDA \
+  --streams quotes --venue lighter_mainnet
+```
+
+自定义 SQL，`{files}` 会替换成当天该分区的文件通配符：
+
+```bash
+python tools/replay_capture.py \
+  --date 2026-11-13 --symbol NVDA \
+  --sql 'select count(*) as rows from {files}'
+```
+
+脚本默认使用 `nice -n 19`、`ionice -c 3` 和 `--bwlimit 50M`，只读下载，不写采集目录、不重启任何服务。
+
+分析机需要安装 DuckDB：
+
+```bash
+pip install duckdb
+```
+
+### 方式 1b：手动只拉需要的分区
+
 
 ```bash
 mkdir -p ~/replay/20261113
