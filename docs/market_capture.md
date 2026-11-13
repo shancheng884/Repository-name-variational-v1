@@ -98,3 +98,68 @@ ARCHIVE_HOT_DAYS=3
 `rclone.conf` 使用 Cloudflare R2 的 S3 endpoint。未配置 R2 时，timer 只做本地压缩，不删除任何文件。
 
 **不要**把 R2 挂载成盘给采集器追加写；对象存储只接收完整文件。
+
+
+## 磁盘、压缩和上传节奏
+
+9 个标的当前约 **10GB/天原始数据**，gzip 后约 **1.1GB/天**。
+
+建议 VPS 保留：
+
+- 当前小时原始文件：约 0.4–0.6GB
+- 最近 3 天压缩文件：约 3–4GB
+- 系统、日志、R2 缓冲：2–3GB
+- **最低保留 8GB 空闲磁盘**；低于 5GB 应告警并暂停非必要采集
+
+当前定时器：
+
+- 每 **15 分钟**检查一次
+- 只压缩 **60 分钟前**已经关闭的 `.jsonl`
+- 当前小时不动
+- 上传成功后写入 `log/capture_archive_state.json`
+- 只有 `verified` 且超过 `ARCHIVE_HOT_DAYS=3` 的文件才会删除
+
+## 回放方式
+
+R2 路径按 stream / venue / symbol / 小时分区：
+
+```text
+market_capture/quotes/lighter_mainnet/NVDA/20261113-05.jsonl.gz
+market_capture/books/entropy/NVDA/20261113-05.jsonl.gz
+market_capture/edges/cross/NVDA/20261113-05.jsonl.gz
+```
+
+### 方式 1：只拉需要的分区到本地（最稳）
+
+```bash
+mkdir -p ~/replay/20261113
+rclone copy   r2:var-lighter-capture/market_capture/quotes/lighter_mainnet/NVDA/20261113-*.jsonl.gz   ~/replay/20261113/
+```
+
+然后用 Python / DuckDB 读 gzip JSONL。
+
+### 方式 2：DuckDB 直接查 R2
+
+```sql
+INSTALL httpfs;
+LOAD httpfs;
+SET s3_endpoint='<ACCOUNT_ID>.r2.cloudflarestorage.com';
+SET s3_access_key_id='<ACCESS_KEY>';
+SET s3_secret_access_key='<SECRET_KEY>';
+SET s3_region='auto';
+SET s3_url_style='path';
+
+SELECT *
+FROM read_json_auto(
+  's3://var-lighter-capture/market_capture/quotes/lighter_mainnet/NVDA/20261113-*.jsonl.gz'
+)
+LIMIT 20;
+```
+
+凭据放在分析机的 DuckDB 配置或环境变量里，不要写进脚本或 Git。
+
+### 方式 3：以后加 Parquet
+
+如果回放变得频繁，建议把每小时 JSONL.gz 再转一份 Parquet。Parquet 列式压缩更好，DuckDB 查询会快很多；JSONL.gz 继续保留用于精确回放。
+
+不要在本交易 VPS 上跑重回放；回放放到本地或单独分析机，避免和实盘抢 CPU/内存。
