@@ -47,7 +47,7 @@ async def _wait_ready(runner,assets,venues,timeout=35.0):
         if runner.hub is not None:
             ok=0
             for v,s in needed:
-                q=runner.hub.latest(v,s,max_age=5.0)
+                q=runner.hub.latest(v,s,max_age=(12.0 if v=="entropy" else 5.0))
                 if q and q.get("mid") is not None and q.get("bid") is not None and q.get("ask") is not None: ok+=1
             if ok>=len(needed): return {"ready":True,"quoted":ok,"needed":len(needed)}
         await asyncio.sleep(.25)
@@ -77,7 +77,7 @@ async def main_async(args):
         return {"ok":True,"mode":"plan","orders_attempted":False,"assets":[a.name for a in assets],"venues":list(venues),"rounds":len(plan),"plan":[r.__dict__ for r in plan],"live_gate":"requires --mode preflight, then --mode run --execute --confirm-live-probes --confirm-flat --i-understand-live-orders"}
     cap,task,ex=await _session(args,env,assets,venues)
     try:
-        runner=ProbeRunner(hub=cap.hub,executors=ex,state=ProbeState(ROOT/"log"/"venue_probe"/"state.json"),writer_path=ROOT/"log"/"venue_probe"/"rounds.jsonl",assets=assets,venues=venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=3.0)
+        runner=ProbeRunner(hub=cap.hub,executors=ex,state=ProbeState(ROOT/"log"/"venue_probe"/"state.json"),writer_path=ROOT/"log"/"venue_probe"/"rounds.jsonl",assets=assets,venues=venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=3.0,max_quote_age_by_venue={"entropy":12.0})
         if args.mode=="preflight":
             health=await runner.preflight_all(); (ROOT/"log"/"venue_probe"/"preflight.json").write_text(json.dumps(health,ensure_ascii=False,indent=2,default=str)+"\n")
             return {"ok":all(v.get("ok") for v in health.values()),"mode":"preflight","orders_attempted":False,"health":health}

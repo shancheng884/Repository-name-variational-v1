@@ -248,8 +248,8 @@ class ProbeState:
         self.path.parent.mkdir(parents=True,exist_ok=True); tmp=self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data,ensure_ascii=False,indent=2,default=str)+"\n"); os.replace(tmp,self.path)
 class ProbeRunner:
-    def __init__(self,*,hub,executors,state,writer_path,assets,venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=2.5,hold_seconds=3.1,run_id=None,horizons=(.25,.5,1.,3.)):
-        self.hub=hub; self.executors=executors; self.state=state; self.writer_path=writer_path; self.assets=assets; self.venues=venues; self.by_name={a.name:a for a in assets}; self.notional_usd=notional_usd; self.round_interval_seconds=max(.2,round_interval_seconds); self.max_quote_age_seconds=max_quote_age_seconds; self.hold_seconds=max(.5,hold_seconds); self.horizons=tuple(horizons); self.run_id=run_id or "probe-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    def __init__(self,*,hub,executors,state,writer_path,assets,venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=2.5,hold_seconds=3.1,run_id=None,horizons=(.25,.5,1.,3.),max_quote_age_by_venue=None):
+        self.hub=hub; self.executors=executors; self.state=state; self.writer_path=writer_path; self.assets=assets; self.venues=venues; self.by_name={a.name:a for a in assets}; self.notional_usd=notional_usd; self.round_interval_seconds=max(.2,round_interval_seconds); self.max_quote_age_seconds=max_quote_age_seconds; self.max_quote_age_by_venue=dict(max_quote_age_by_venue or {}); self.hold_seconds=max(.5,hold_seconds); self.horizons=tuple(horizons); self.run_id=run_id or "probe-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     def _write(self,row):
         self.writer_path.parent.mkdir(parents=True,exist_ok=True)
         with self.writer_path.open("a",encoding="utf-8") as f: f.write(json.dumps(row,ensure_ascii=False,default=str)+"\n")
@@ -263,7 +263,8 @@ class ProbeRunner:
             for venue in self.venues:
                 if not asset.supports(venue):
                     continue
-                q=self.hub.latest(venue,asset.name,max_age=self.max_quote_age_seconds)
+                age=self.max_quote_age_by_venue.get(venue,self.max_quote_age_seconds)
+                q=self.hub.latest(venue,asset.name,max_age=age)
                 key=f"{venue}:{asset.name}:market"
                 out[key]={"ok":q is not None and q.get("bid") is not None and q.get("ask") is not None,
                           "quote_kind":(q or {}).get("quote_kind"),
@@ -293,7 +294,7 @@ class ProbeRunner:
         self.state.data["phase"]="completed" if self.state.data.get("phase")!="manual_review_required" else "manual_review_required"; self.state.save()
         return {"ok":self.state.data["phase"]=="completed","mode":"live","rounds":completed,"state":self.state.data["phase"]}
     async def _quote(self,venue,asset):
-        q=self.hub.latest(venue,asset.name,max_age=self.max_quote_age_seconds)
+        q=self.hub.latest(venue,asset.name,max_age=self.max_quote_age_by_venue.get(venue,self.max_quote_age_seconds))
         if q is None or _d(q.get("mid")) is None or _d(q.get("bid")) is None or _d(q.get("ask")) is None: return None
         return q
     async def _wait_quotes(self,item,timeout=8.0):
