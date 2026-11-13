@@ -36,7 +36,7 @@ class VariationalPriceFeed:
         self.logger = logger
         self.health = VenueHealth(self.name)
         self.channels: dict[str, str] = {
-            f"instrument_price:P-RWA/EQY-{asset.symbol('variational')}-USDC": asset.name
+            f"instrument_price:P-RWA/{'ETF' if asset.var_kind == 'etf' else 'EQY'}-{asset.symbol('variational')}-USDC": asset.name
             for asset in self.assets
         }
         self.health.subscribed = list(self.channels)
@@ -55,6 +55,13 @@ class VariationalPriceFeed:
             ],
         }
 
+    def _subscription_batches(self, size: int = 3) -> list[dict[str, Any]]:
+        instruments = self._subscription()["instruments"]
+        return [
+            {"action": "subscribe", "instruments": instruments[index:index + size]}
+            for index in range(0, len(instruments), size)
+        ]
+
     async def run(self) -> None:
         backoff = 1.0
         while True:
@@ -62,7 +69,9 @@ class VariationalPriceFeed:
                 async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20, max_size=2 ** 23) as ws:
                     self.health.status = "running"
                     self.health.connected = True
-                    await ws.send(json.dumps(self._subscription()))
+                    for batch in self._subscription_batches():
+                        await ws.send(json.dumps(batch))
+                        await asyncio.sleep(0.2)
                     backoff = 1.0
                     async for raw in ws:
                         self.health.message()
@@ -76,8 +85,10 @@ class VariationalPriceFeed:
                 self.health.reconnects += 1
                 self.health.error(f"{type(exc).__name__}:{exc}")
                 self.logger.warning("variational_capture_reconnect error=%s", exc)
+                if "429" in str(exc):
+                    backoff = max(backoff, 30.0)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2.0, 30.0)
+                backoff = min(backoff * 2.0, 300.0)
 
     def handle(self, message: dict[str, Any]) -> None:
         if not isinstance(message, dict):

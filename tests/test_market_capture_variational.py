@@ -17,6 +17,11 @@ def test_subscription_shape_and_reference_tick(tmp_path):
     sub = feed._subscription()
     assert sub["action"] == "subscribe"
     assert len(sub["instruments"]) == 9
+    batches = feed._subscription_batches()
+    assert [len(batch["instruments"]) for batch in batches] == [3, 3, 3]
+    assert sum(len(batch["instruments"]) for batch in batches) == 9
+    assert "instrument_price:P-RWA/ETF-QQQ-USDC" in feed.channels
+    assert "instrument_price:P-RWA/EQY-COIN-USDC" in feed.channels
     assert sub["instruments"][0] == {
         "underlying": "OPENAI", "instrument_type": "perpetual_rwa_future",
         "settlement_asset": "USDC", "kind": "equity",

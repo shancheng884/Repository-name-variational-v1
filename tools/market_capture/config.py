@@ -54,11 +54,11 @@ DEFAULT_ASSETS: tuple[Asset, ...] = (
     Asset("QQQ", {
         "variational": "QQQ", "lighter_mainnet": "QQQ",
         "lighter_rh": "QQQ",
-    }),
+    }, var_kind="etf"),
     Asset("DRAM", {
         "variational": "DRAM", "lighter_mainnet": "DRAM",
         "entropy": "io:DRAM",
-    }),
+    }, var_kind="etf"),
     Asset("COIN", {
         "variational": "COIN", "lighter_mainnet": "COIN",
         "lighter_rh": "COIN",
