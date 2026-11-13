@@ -1,0 +1,22 @@
+[Unit]
+Description=Compress and optionally upload capture files to Cloudflare R2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Repository-name-variational-v1
+EnvironmentFile=-/home/ubuntu/.config/market-capture/r2.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/Repository-name-variational-v1/.venv/bin/python tools/archive_capture.py --upload --prune
+Nice=19
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+CPUQuota=20%
+MemoryMax=300M
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

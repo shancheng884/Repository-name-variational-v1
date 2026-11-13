@@ -16,7 +16,7 @@ from .audit import FillAuditor
 from .config import CaptureConfig
 from .hub import MarketHub
 from .probes import LatencyProbe, entropy_probe, lighter_probe, variational_probe
-from .storage import TapeWriter, disk_free_gb, gzip_cold_files, prune_old
+from .storage import TapeWriter, disk_free_gb
 from .sysmon import LoopLagMonitor, SystemSampler
 from .venues.entropy import EntropyBookFeed, EntropyFillFeed
 from .venues.lighter import LighterBookFeed, LighterFillFeed
@@ -85,7 +85,6 @@ class CaptureRunner:
             self.tasks.append(asyncio.create_task(self._edge_loop(), name="edge-loop"))
             self.tasks.append(asyncio.create_task(self._health_loop(), name="health-loop"))
             self.tasks.append(asyncio.create_task(self._system_loop(), name="system-loop"))
-            self.tasks.append(asyncio.create_task(self._retention_loop(), name="retention-loop"))
             for venue in self.venues.values():
                 task = getattr(venue, "run", None)
                 if task is not None:
@@ -257,15 +256,6 @@ class CaptureRunner:
             except Exception as exc:
                 self.logger.warning("system_sample_failed error=%s", exc)
             await asyncio.sleep(self.config.system_seconds)
-
-    async def _retention_loop(self) -> None:
-        while True:
-            await asyncio.sleep(6 * 3600)
-            try:
-                await asyncio.to_thread(gzip_cold_files, self.root, older_than_hours=6.0)
-                await asyncio.to_thread(prune_old, self.root, retention_days=self.config.retention_days)
-            except Exception as exc:
-                self.logger.warning("retention_failed error=%s", exc)
 
     async def _health_loop(self) -> None:
         while True:

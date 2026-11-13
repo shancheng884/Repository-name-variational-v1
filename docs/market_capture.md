@@ -13,10 +13,10 @@
 | Lighter RH | `api.rh.lighter.xyz` | 同上，独立账户/API key |
 | Entropy | Hyperliquid HIP-3 `io` DEX | L2 订单簿 + 公共成交 + `userFills` |
 
-默认六个标的：`OPENAI`、`ANTHROPIC`、`NVDA`、`SNDK`、`CRCL`、`AAPL`。它们同时存在于四个平台，按 Entropy 深度和跨平台可比较性挑选：
+默认九个标的：`OPENAI`、`ANTHROPIC`、`NVDA`、`SNDK`、`CRCL`、`AAPL`、`QQQ`、`DRAM`、`COIN`。前六个四平台齐全；QQQ、COIN 缺 Entropy，DRAM 缺 Lighter RH：
 
-- Variational / Lighter 主网 / Lighter RH：同名 `OPENAI`、`ANTHROPIC`、`NVDA`、`SNDK`、`CRCL`、`AAPL`
-- Entropy：`io:OAI`、`io:ANTH`、`io:NVDA`、`io:SNDK`、`io:CRCL`、`io:AAPL`
+- Variational / Lighter 主网：全部九个同名标的；Lighter RH 缺 `DRAM`
+- Entropy：`io:OAI`、`io:ANTH`、`io:NVDA`、`io:SNDK`、`io:CRCL`、`io:AAPL`、`io:DRAM`
 
 ## 安全边界
 
@@ -75,3 +75,26 @@ PY
 - Variational 公共行情只给参考价，不给 bid/ask；因此 Var 的 `spread_bps` 为空，跨平台价差对 Var 使用 `mode=reference`。要得到 Var 可执行价，需要在 Var 页面产生 RFQ，本采集器不主动发 RFQ，避免影响现有实盘。
 - Lighter 本人成交依赖账户 API key；未配置时该平台行情仍采集，`*_fills` 状态为 `disabled_missing_credentials`。
 - Entropy 的 `userFills` 需要真实交易账户地址；子账户请填子账户地址。
+
+
+## 归档到 R2
+
+采集进程只写本地 JSONL；归档由独立的 `var-lighter-capture-archive.timer` 每 15 分钟执行：
+
+1. 把已经关闭的 `.jsonl` 压缩成 `.jsonl.gz`（当前小时不动）。
+2. 如果配置了 `R2_BUCKET`，用 `rclone copyto --checksum` 上传。
+3. 上传后校验远端字节数，写入 `log/capture_archive_state.json`。
+4. 只删除 `ARCHIVE_HOT_DAYS` 天以前、且状态为 `verified` 的本地文件。
+
+R2 配置放在 `/home/ubuntu/.config/market-capture/r2.env`，权限 600：
+
+```bash
+R2_REMOTE=r2
+R2_BUCKET=<bucket>
+R2_PREFIX=market_capture
+ARCHIVE_HOT_DAYS=3
+```
+
+`rclone.conf` 使用 Cloudflare R2 的 S3 endpoint。未配置 R2 时，timer 只做本地压缩，不删除任何文件。
+
+**不要**把 R2 挂载成盘给采集器追加写；对象存储只接收完整文件。
