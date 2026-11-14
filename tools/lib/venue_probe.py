@@ -158,6 +158,10 @@ class VariationalProbeExecutor:
                 row=matches[0]; status=str(row.get("status") or "").lower()
                 if status=="pending": await asyncio.sleep(.15); continue
                 if status in {"canceled","cancelled","rejected","expired"}:
+                    filled=_d(row.get("filled_qty") or row.get("filled_amount") or row.get("executed_qty")) or ZERO
+                    px=_d(row.get("average_price") or row.get("avg_price") or row.get("price"))
+                    if filled>0 and px:
+                        return {"ok":True,"status":"filled","partial":True,"client_order_id":client_order_id,"filled_qty":str(filled),"avg_price":str(px),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"rfq_id":rfq_id,"order_id":str(row.get("order_id") or "") or order_id}
                     return {"ok":True,"status":"rejected","client_order_id":client_order_id,"filled_qty":"0","submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"rfq_id":rfq_id,"order_id":str(row.get("order_id") or "") or order_id}
                 if status=="cleared" and str(row.get("clearing_status") or "")=="success_trades_booked_into_pool":
                     fill_at=_parse(row.get("execution_timestamp") or row.get("created_at"))
@@ -254,7 +258,11 @@ class LighterProbeExecutor:
                 if status=="filled" and filled>0 and quote>0:
                     fill_at=_parse(row.get("updated_at") or row.get("created_at"))
                     return {"ok":True,"status":"filled","client_order_id":client_order_id,"filled_qty":str(filled),"avg_price":str(quote/filled),"order_id":str(row.get("order_index") or row.get("order_id") or ""),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":_iso(fill_at),"source_at_epoch":fill_at.timestamp() if fill_at else None,"fee_usd":None}
-                if status.startswith("canceled"): return {"ok":True,"status":"rejected","client_order_id":client_order_id,"filled_qty":str(filled),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"error":status}
+                if status.startswith("canceled"):
+                    if filled>0 and quote>0:
+                        fill_at=_parse(row.get("updated_at") or row.get("created_at"))
+                        return {"ok":True,"status":"filled","partial":True,"client_order_id":client_order_id,"filled_qty":str(filled),"avg_price":str(quote/filled),"order_id":str(row.get("order_index") or row.get("order_id") or ""),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":_iso(fill_at),"source_at_epoch":fill_at.timestamp() if fill_at else None,"fee_usd":None}
+                    return {"ok":True,"status":"rejected","client_order_id":client_order_id,"filled_qty":"0","submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"error":status}
             await asyncio.sleep(.12)
         return {"ok":False,"status":"unknown","error":"lighter_fill_timeout","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat()}
 def _int(v):
