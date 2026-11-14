@@ -134,3 +134,17 @@ def test_stage_and_hedge_delay_aggregates_are_reported():
     assert out["stages"]["half_spread"]["samples"] == 4
     assert out["stages"]["signal_to_exec"]["samples"] == 0
     assert out["hedge_delay_ms"] == {"samples": 1, "p50_ms": "200", "p80_ms": "200"}
+
+def test_adverse_selection_curve_is_aggregated():
+    from tools.lib.probe_metrics import adverse_move
+    row = _round()
+    row["adverse"] = [
+        {"delay_s": 0.25, "points": {"a": {"adverse_bps": "1.0"}, "b": {"adverse_bps": "-0.5"}}},
+        {"delay_s": 3.0, "points": {"a": {"adverse_bps": "4.0"}, "b": {"adverse_bps": "2.0"}}},
+    ]
+    out = adverse_move(row)
+    assert out["a"] == {"0.25": Decimal("1.0"), "3.0": Decimal("4.0")}
+    result = calibrate([row])
+    assert result["adverse_selection"]["by_horizon"]["NVDA:3.0s"]["p50_bps"] == "3.00"
+    assert result["adverse_selection"]["by_venue"]["NVDA:a:0.25s"]["samples"] == 1
+

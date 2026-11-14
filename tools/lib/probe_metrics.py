@@ -155,6 +155,25 @@ def decompose_round(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def adverse_move(row: dict[str, Any]) -> dict[str, Any]:
+    """Post-fill adverse move per venue and horizon, adverse-positive bps.
+
+    The probe already samples the mid at 0.25/0.5/1/3 seconds after entry; this
+    turns those points into the adverse-selection curve without any new data.
+    """
+    out: dict[str, Any] = {}
+    for point in row.get("adverse") or []:
+        delay = point.get("delay_s")
+        if delay is None:
+            continue
+        for venue, sample in (point.get("points") or {}).items():
+            value = _d(sample.get("adverse_bps"))
+            if value is None:
+                continue
+            out.setdefault(venue, {})[str(delay)] = value
+    return out
+
+
 def percentile(values: Iterable[Decimal], p: int) -> Decimal | None:
     data = sorted(v for v in values if v is not None)
     if not data:
@@ -175,6 +194,8 @@ def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal
     excluded: dict[str, int] = defaultdict(int)
     stages: dict[str, list[Decimal]] = {"half_spread": [], "signal_to_exec": [], "exec_to_fill": []}
     delays: list[Decimal] = []
+    adverse: dict[tuple[str, str], list[Decimal]] = defaultdict(list)
+    adverse_by_venue: dict[tuple[str, str, str], list[Decimal]] = defaultdict(list)
     summaries = []
     for row in rounds:
         summary = decompose_round(row)
@@ -191,6 +212,10 @@ def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal
                     stages[stage].append(value)
         if summary.get("hedge_delay_ms") is not None:
             delays.append(Decimal(str(summary["hedge_delay_ms"])))
+        for venue, points in adverse_move(row).items():
+            for delay, value in points.items():
+                adverse[(summary.get("asset"), delay)].append(value)
+                adverse_by_venue[(summary.get("asset"), venue, delay)].append(value)
         for venue in (summary.get("buy_venue"), summary.get("sell_venue")):
             value = _d((summary.get("venue_roundtrip_cost_bps") or {}).get(venue))
             if venue and value is not None:
@@ -237,6 +262,10 @@ def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal
         "fees_unverified_rounds": sum(1 for s in summaries if s["complete"] and s.get("fees_status") != "verified"),
         "stages": {name: {"samples": len(values), "p50_bps": str(percentile(values, 50)), "p80_bps": str(percentile(values, 80))} for name, values in stages.items()},
         "hedge_delay_ms": {"samples": len(delays), "p50_ms": str(percentile(delays, 50)), "p80_ms": str(percentile(delays, 80))},
+        "adverse_selection": {
+            "by_horizon": {f"{asset}:{delay}s": {"samples": len(v), "p50_bps": str(percentile(v, 50)), "p80_bps": str(percentile(v, 80))} for (asset, delay), v in sorted(adverse.items())},
+            "by_venue": {f"{asset}:{venue}:{delay}s": {"samples": len(v), "p50_bps": str(percentile(v, 50)), "p80_bps": str(percentile(v, 80))} for (asset, venue, delay), v in sorted(adverse_by_venue.items())},
+        },
         "venues": venues,
         "pairs": pairs,
         "recommended_trigger_bps": venue_recommendations,
