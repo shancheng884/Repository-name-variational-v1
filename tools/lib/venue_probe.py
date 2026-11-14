@@ -381,7 +381,14 @@ class EntropyProbeExecutor:
         if not self.available or self.exchange is None: return {"ok":False,"status":"rejected","error":self.reason or "entropy_credentials_missing","client_order_id":client_order_id}
         qty=self.normalize_qty(asset,qty)
         if not qty: return {"ok":False,"status":"rejected","error":"entropy_qty_below_min","client_order_id":client_order_id}
-        bbo=_d(quote.get("ask" if side=="buy" else "bid"))
+        bbo=None
+        try:
+            mids=await asyncio.to_thread(self.info.all_mids,self.dex)
+            bbo=_d((mids or {}).get(self._coin(asset)))
+        except Exception:
+            bbo=None
+        if not bbo:
+            bbo=_d(quote.get("ask" if side=="buy" else "bid"))
         if not bbo: return {"ok":False,"status":"rejected","error":"entropy_quote_missing","client_order_id":client_order_id}
         limit_px=self._limit_price(asset,side,bbo,max_slippage_bps)
         cloid=self._cloid(client_order_id); coin=self._coin(asset)

@@ -23,6 +23,8 @@ class FakeInfo:
         return {"assetPositions": self.positions, "marginSummary": {"accountValue": "200"}}
     def open_orders(self, address, dex):
         return self.orders
+    def all_mids(self, dex):
+        return {"io:NVDA": "100"}
     def spot_user_state(self, address):
         return {"balances": [{"coin": "USDC", "total": "1055", "hold": "863"}],
                 "tokenToAvailableAfterMaintenance": [[0, "192.27"]]}
@@ -93,7 +95,7 @@ def test_entropy_market_order_uses_cloid_and_aggregates_fills():
     assert exchange.calls[0][1]["reduce_only"] is False
     assert exchange.calls[0][0][0] == "io:NVDA"
     assert exchange.calls[0][0][1] is True
-    assert exchange.calls[0][0][3] == 100.18
+    assert exchange.calls[0][0][3] == 100.08
 
 
 def test_entropy_without_private_key_is_not_available():
