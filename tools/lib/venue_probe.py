@@ -251,7 +251,7 @@ class LighterProbeExecutor:
         api=OrderApi(self.client.api_client)
         while time.monotonic()<deadline:
             rows=_rows(await api.account_inactive_orders(account_index=int(self.account_index),limit=100,auth=token,market_id=market_id,_request_timeout=5.),"orders") or []
-            matches=[r for r in rows if _int(r.get("client_order_index"))==cid]
+            matches=[r for r in rows if _int(r.get("client_order_index"))==cidx]
             if len(matches)>1: return {"ok":False,"status":"unknown","error":"lighter_identity_ambiguous","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat()}
             if matches:
                 row=matches[0]; status=str(row.get("status") or "").lower(); filled=_d(row.get("filled_base_amount")) or ZERO; quote=_d(row.get("filled_quote_amount")) or ZERO
