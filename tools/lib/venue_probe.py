@@ -557,7 +557,7 @@ class ProbeRunner:
             for v in filled:
                 original=receipts[v]; cq=await self._quote(v,asset); cid=f"{item.round_id}-rollback-{v}"
                 cs="sell" if v==item.buy_venue else "buy"
-                close=await self.executors[v].market_order(asset=asset,side=cs,qty=_d(original.get("filled_qty")) or qty,quote=cq or {},client_order_id=cid,reduce_only=True)
+                close=await self.executors[v].market_order(asset=asset,side=cs,qty=_d(original.get("filled_qty")) or qty,quote=cq or {},client_order_id=cid,reduce_only=True,max_slippage_bps=Decimal("50"))
                 rollbacks[v]=close
                 if not isinstance(close,dict) or close.get("status")!="filled":
                     row["reason"]="entry_unknown_and_rollback_not_confirmed"
@@ -568,7 +568,7 @@ class ProbeRunner:
             row["status"]="rolled_back" if filled else "no_fill"
             if filled:
                 v=filled[0]; original=receipts[v]; cq=await self._quote(v,asset); cid=f"{item.round_id}-rollback-{v}"; cs="sell" if v==item.buy_venue else "buy"
-                close=await self.executors[v].market_order(asset=asset,side=cs,qty=_d(original.get("filled_qty")) or qty,quote=cq or {},client_order_id=cid,reduce_only=True)
+                close=await self.executors[v].market_order(asset=asset,side=cs,qty=_d(original.get("filled_qty")) or qty,quote=cq or {},client_order_id=cid,reduce_only=True,max_slippage_bps=Decimal("50"))
                 row["rollback"]={"leg":v,"close":close}
                 if close.get("status")!="filled": row["status"]="manual_review_required"; row["reason"]="rollback_not_confirmed"
             self.state.data["current"]=row; self.state.save()
@@ -586,7 +586,7 @@ class ProbeRunner:
         row["adverse"]=adverse
         close_ids={item.buy_venue:f"{item.round_id}-exit-{item.buy_venue}",item.sell_venue:f"{item.round_id}-exit-{item.sell_venue}"}
         cqs={v:await self._quote(v,asset) for v in receipts}
-        closes=await asyncio.gather(self.executors[item.buy_venue].market_order(asset=asset,side="sell",qty=_d(receipts[item.buy_venue].get("filled_qty")) or qty,quote=cqs[item.buy_venue] or {},client_order_id=close_ids[item.buy_venue],reduce_only=True),self.executors[item.sell_venue].market_order(asset=asset,side="buy",qty=_d(receipts[item.sell_venue].get("filled_qty")) or qty,quote=cqs[item.sell_venue] or {},client_order_id=close_ids[item.sell_venue],reduce_only=True),return_exceptions=True)
+        closes=await asyncio.gather(self.executors[item.buy_venue].market_order(asset=asset,side="sell",qty=_d(receipts[item.buy_venue].get("filled_qty")) or qty,quote=cqs[item.buy_venue] or {},client_order_id=close_ids[item.buy_venue],reduce_only=True,max_slippage_bps=Decimal("50")),self.executors[item.sell_venue].market_order(asset=asset,side="buy",qty=_d(receipts[item.sell_venue].get("filled_qty")) or qty,quote=cqs[item.sell_venue] or {},client_order_id=close_ids[item.sell_venue],reduce_only=True,max_slippage_bps=Decimal("50")),return_exceptions=True)
         row["exit"]={"quotes_at_close":cqs,"legs":{item.buy_venue:{**(closes[0] if isinstance(closes[0],dict) else {"status":"error"}),"side":"sell","client_order_id":close_ids[item.buy_venue]},item.sell_venue:{**(closes[1] if isinstance(closes[1],dict) else {"status":"error"}),"side":"buy","client_order_id":close_ids[item.sell_venue]}}}
         closed=all(isinstance(r,dict) and r.get("status")=="filled" for r in closes)
         row["status"]="filled" if closed else "manual_review_required"; row["reason"]=None if closed else "exit_not_confirmed"; return row
