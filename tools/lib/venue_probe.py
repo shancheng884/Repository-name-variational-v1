@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
 from pathlib import Path
 from typing import Any, Protocol
-import asyncio, hashlib, inspect, json, os, time, uuid
+import asyncio, hashlib, inspect, json, math, os, time, uuid
 import requests
 from tools.lib.hedge_instruments import iter_positions, lighter_position_qty
 from tools.lib.lighter_order_identity import lighter_client_order_index
@@ -26,12 +26,96 @@ def _parse(v):
         p=datetime.fromisoformat(str(v).replace("Z","+00:00")); return p.astimezone(timezone.utc) if p.tzinfo else p.replace(tzinfo=timezone.utc)
     except ValueError: return None
 def _parse_epoch_ms(v):
+    """Parse venue timestamps expressed in seconds, ms, us or ns."""
     try:
         n=float(v)
-        if n>1e11: n/=1000.0
-        return datetime.fromtimestamp(n,timezone.utc)
-    except (TypeError,ValueError,OSError):
+    except (TypeError,ValueError):
         return None
+    if not math.isfinite(n) or n<=0: return None
+    if n>=1e17: n/=1e9
+    elif n>=1e14: n/=1e6
+    elif n>=1e11: n/=1e3
+    try:
+        return datetime.fromtimestamp(n,timezone.utc)
+    except (OSError,OverflowError,ValueError):
+        return None
+
+
+def _pid_alive(pid):
+    """Liveness probe that never signals the target process (Windows-safe)."""
+    if pid in (None,""): return False
+    try: target=int(pid)
+    except (TypeError,ValueError): return False
+    if target<=0: return False
+    if os.name=="nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel32=ctypes.WinDLL("kernel32",use_last_error=True)
+        handle=kernel32.OpenProcess(0x1000,False,target)
+        if not handle: return False
+        try:
+            code=wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle,ctypes.byref(code)):
+                return code.value==259
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(target,0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError,ValueError,TypeError):
+        return False
+    return True
+
+
+class ProbeLock:
+    """Exclusive single-run guard so two processes cannot submit the same plan."""
+
+    def __init__(self,path):
+        self.path=Path(path); self.held=False
+
+    def _read(self):
+        try: return json.loads(self.path.read_text())
+        except (OSError,ValueError): return None
+
+    def acquire(self,run_id):
+        self.path.parent.mkdir(parents=True,exist_ok=True)
+        for _ in range(2):
+            try:
+                fd=os.open(str(self.path),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o644)
+            except FileExistsError:
+                owner=self._read()
+                if owner and not _pid_alive(owner.get("pid")):
+                    try: self.path.unlink()
+                    except FileNotFoundError: pass
+                    continue
+                return False,owner or {"path":str(self.path)}
+            payload={"pid":os.getpid(),"run_id":run_id,"acquired_at":datetime.now(timezone.utc).isoformat()}
+            with os.fdopen(fd,"w") as fh: json.dump(payload,fh)
+            self.held=True
+            return True,payload
+        return False,self._read() or {"path":str(self.path)}
+
+    def release(self):
+        if not self.held: return
+        owner=self._read()
+        if isinstance(owner,dict) and owner.get("pid")==os.getpid():
+            try: self.path.unlink()
+            except FileNotFoundError: pass
+        self.held=False
+
+
+def _clock_offset_ms(execution_quote):
+    """Venue-clock offset from an execution quote echo (local recv - venue ts)."""
+    if not isinstance(execution_quote,dict): return None
+    for local_key,exchange_key in (("received_at","quote_timestamp"),("quote_recv_at","quote_source_at"),("received_at","quote_source_at")):
+        local=_parse(execution_quote.get(local_key)); exchange=_parse(execution_quote.get(exchange_key))
+        if local is not None and exchange is not None:
+            return round((local-exchange).total_seconds()*1000,3)
+    return None
 
 
 class _EntropyCloid:
@@ -80,6 +164,9 @@ def _stamp_receipt(receipt):
     completed = datetime.now(timezone.utc)
     submitted = _parse(receipt.get("submitted_at")); acked = _parse(receipt.get("acked_at"))
     receipt.setdefault("completed_at", completed.isoformat())
+    receipt.setdefault("local_fill_at", receipt["completed_at"])
+    offset=_clock_offset_ms(receipt.get("execution_quote"))
+    if offset is not None: receipt.setdefault("clock_offset_ms",offset)
     if submitted is not None:
         receipt.setdefault("submit_to_complete_ms", round((completed - submitted).total_seconds() * 1000, 3))
     if submitted is not None and acked is not None:
@@ -130,6 +217,30 @@ class VariationalProbeExecutor:
                 "contract":{"venue":"variational","symbol":asset.symbol("variational"),
                             "instrument_type":asset.var_instrument_type,"kind":asset.var_kind,
                             "settlement_asset":"USDC","funding_interval_s":0}}
+    async def positions(self,asset):
+        """Read-only position/order snapshot used for per-round reconciliation."""
+        if self.client is None: return {"ok":False,"verified":False,"error":"variational_client_not_started"}
+        try:
+            pos=await self.client.request({"type":"VAR_API_POSITIONS","requestId":uuid.uuid4().hex,"requestTimeoutMs":int(self.timeout_seconds*1000)})
+        except Exception as exc:
+            return {"ok":False,"verified":False,"error":f"variational_positions_failed:{type(exc).__name__}:{exc}"}
+        positions=iter_positions(pos.get("result") if isinstance(pos,dict) else None)
+        if positions is None: return {"ok":False,"verified":False,"error":"variational_positions_unverifiable"}
+        symbol=asset.symbol("variational"); qty=ZERO
+        for item in positions:
+            nested=item.get("position_info") if isinstance(item.get("position_info"),dict) else {}
+            ident=item.get("instrument") if isinstance(item.get("instrument"),dict) else nested.get("instrument") or item
+            if str(ident.get("underlying") or ident.get("symbol") or "").upper()!=symbol: continue
+            part=next((_d(src.get(k)) for src in (item,nested) for k in ("qty","quantity","size","position","position_size","base_amount","amount") if _d(src.get(k)) is not None),None)
+            if part is not None: qty+=part
+        try:
+            orders=await self.client.request({"type":"VAR_API_ORDERS","requestId":uuid.uuid4().hex,"status":"pending","limit":100,"offset":0,"orderBy":"created_at","order":"desc","requestTimeoutMs":int(self.timeout_seconds*1000)})
+        except Exception as exc:
+            return {"ok":False,"verified":False,"qty":str(qty),"error":f"variational_orders_failed:{type(exc).__name__}:{exc}"}
+        rows=_var_rows(orders.get("result") if isinstance(orders,dict) else None)
+        if rows is None: return {"ok":False,"verified":False,"qty":str(qty),"error":"variational_orders_unverifiable"}
+        return {"ok":True,"verified":True,"qty":str(qty),"active_orders":len([r for r in rows if _underlying(r)==symbol])}
+
     def normalize_qty(self,asset,qty):
         return qty.quantize(Decimal("0.00000001"),rounding=ROUND_DOWN) if qty>0 else None
     async def _execution_quote(self,asset,qty):
@@ -253,6 +364,28 @@ class LighterProbeExecutor:
                             "min_base_amount":str(market.get("min_base_amount")),
                             "min_quote_amount":str(market.get("min_quote_amount")),
                             "multiplier":str(market.get("multiplier"))}}
+    async def positions(self,asset):
+        """Read-only position/order snapshot used for per-round reconciliation."""
+        if not self.available or self.client is None: return {"ok":False,"verified":False,"error":f"{self.venue}_credentials_missing"}
+        market=self.market(asset)
+        if market is None: return {"ok":False,"verified":False,"error":f"{self.venue}_market_missing"}
+        from lighter import AccountApi, OrderApi
+        try:
+            account=_model_dict(await AccountApi(self.client.api_client).account(by="index",value=str(self.account_index),_request_timeout=10.))
+        except Exception as exc:
+            return {"ok":False,"verified":False,"error":f"{self.venue}_account_failed:{type(exc).__name__}:{exc}"}
+        if account is None: return {"ok":False,"verified":False,"error":f"{self.venue}_account_unverifiable"}
+        qty=lighter_position_qty(account,market_id=int(market["market_id"]),symbol=asset.symbol(self.venue))
+        if qty is None: return {"ok":False,"verified":False,"error":f"{self.venue}_position_unverifiable"}
+        token,error=self.client.create_auth_token_with_expiry(api_key_index=int(self.api_key_index))
+        if error is not None or not token: return {"ok":False,"verified":False,"qty":str(qty),"error":f"{self.venue}_auth_token_unavailable"}
+        try:
+            rows=_rows(await OrderApi(self.client.api_client).account_active_orders(auth=token,account_index=int(self.account_index),market_id=int(market["market_id"]),_request_timeout=10.),"orders")
+        except Exception as exc:
+            return {"ok":False,"verified":False,"qty":str(qty),"error":f"{self.venue}_orders_failed:{type(exc).__name__}:{exc}"}
+        if rows is None: return {"ok":False,"verified":False,"qty":str(qty),"error":f"{self.venue}_active_orders_unverifiable"}
+        return {"ok":True,"verified":True,"qty":str(qty),"active_orders":len(rows)}
+
     def normalize_qty(self,asset,qty):
         market=self.market(asset)
         if market is None or qty<=0: return None
@@ -260,7 +393,10 @@ class LighterProbeExecutor:
         out=qty.quantize(step,rounding=ROUND_DOWN); minimum=_d(market.get("min_base_amount")) or ZERO
         return out if out>0 and out>=minimum else None
     async def market_order(self,**kwargs):
-        return _stamp_receipt(await self._market_order(**kwargs))
+        receipt=await self._market_order(**kwargs)
+        if isinstance(receipt,dict) and receipt.get("execution_quote") is None:
+            receipt["execution_quote"]=getattr(self,"_last_exec_quote",None)
+        return _stamp_receipt(receipt)
     async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
         if not self.available or self.client is None: return {"ok":False,"status":"rejected","error":f"{self.venue}_credentials_missing","client_order_id":client_order_id}
         market=self.market(asset)
@@ -273,6 +409,7 @@ class LighterProbeExecutor:
         direction=Decimal("-1") if side=="sell" else Decimal("1")
         limit=(bbo*(Decimal("1")+direction*max_slippage_bps/BPS)).quantize(Decimal(1).scaleb(-pd),rounding=ROUND_CEILING if side=="buy" else ROUND_FLOOR)
         if qty*limit < (_d(market.get("min_quote_amount")) or ZERO): return {"ok":False,"status":"rejected","error":"lighter_notional_below_min","client_order_id":client_order_id}
+        self._last_exec_quote={"bid":str(_d(quote.get("bid"))) if _d(quote.get("bid")) is not None else None,"ask":str(_d(quote.get("ask"))) if _d(quote.get("ask")) is not None else None,"mid":str(_d(quote.get("mid"))) if _d(quote.get("mid")) is not None else None,"limit_price":str(limit),"quote_sequence":quote.get("sequence"),"quote_recv_at":quote.get("recv_at"),"quote_source_at":quote.get("source_at")}
         base=qty*(Decimal(10)**sd); price=limit*(Decimal(10)**pd)
         if base!=base.to_integral_value() or price!=price.to_integral_value(): return {"ok":False,"status":"rejected","error":"lighter_precision_invalid","client_order_id":client_order_id}
         cidx=lighter_client_order_index(client_order_id); submitted=datetime.now(timezone.utc)
@@ -283,7 +420,9 @@ class LighterProbeExecutor:
         acked=datetime.now(timezone.utc); body=_model_dict(response)
         if error is not None or body is None or _int(body.get("code")) not in (0,200):
             return {"ok":False,"status":"unknown","error":"lighter_sendtx_unconfirmed","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"response_code":(_int(body.get("code")) if body else None),"sdk_error":(str(error)[:300] if error is not None else None)}
-        return await self._poll(client_order_id,cidx,submitted,acked,int(market["market_id"]))
+        receipt=await self._poll(client_order_id,cidx,submitted,acked,int(market["market_id"]))
+        if isinstance(receipt,dict): receipt.setdefault("execution_quote",getattr(self,"_last_exec_quote",None))
+        return receipt
     async def _poll(self,client_order_id,cidx,submitted,acked,market_id):
         from lighter import OrderApi
         deadline=time.monotonic()+6.; token,error=self.client.create_auth_token_with_expiry(api_key_index=int(self.api_key_index))
@@ -387,6 +526,24 @@ class EntropyProbeExecutor:
                             "sz_decimals":int(row.get("szDecimals") or 0),
                             "max_leverage":row.get("maxLeverage"),"only_isolated":bool(row.get("onlyIsolated")),
                             "dex":self.dex,"fee_token":"USDC"}}
+    async def positions(self,asset):
+        """Read-only position/order snapshot used for per-round reconciliation."""
+        if not self.available or self.info is None: return {"ok":False,"verified":False,"error":self.reason or "entropy_credentials_missing"}
+        coin=self._coin(asset)
+        try:
+            state=await asyncio.to_thread(self.info.user_state,self.account_address,self.dex)
+            orders=await asyncio.to_thread(self.info.open_orders,self.account_address,self.dex)
+        except Exception as exc:
+            return {"ok":False,"verified":False,"error":f"entropy_positions_failed:{type(exc).__name__}:{exc}"}
+        if state is None or orders is None: return {"ok":False,"verified":False,"error":"entropy_positions_unverifiable"}
+        qty=ZERO
+        for item in (state or {}).get("assetPositions",[]) or []:
+            pos=item.get("position") if isinstance(item,dict) else None
+            if not isinstance(pos,dict) or pos.get("coin")!=coin: continue
+            qty+=(_d(pos.get("szi")) or ZERO)
+        active=len([row for row in (orders or []) if str(row.get("coin") or "")==coin])
+        return {"ok":True,"verified":True,"qty":str(qty),"active_orders":active}
+
     def normalize_qty(self,asset,qty):
         if qty<=0 or not self.universe: return None
         step=Decimal(1).scaleb(-int(self._row(asset).get("szDecimals") or 0))
@@ -401,7 +558,10 @@ class EntropyProbeExecutor:
         decimals=max(0,6-szd)
         return float(round(float(f"{float(px):.5g}"),decimals))
     async def market_order(self,**kwargs):
-        return _stamp_receipt(await self._market_order(**kwargs))
+        receipt=await self._market_order(**kwargs)
+        if isinstance(receipt,dict) and receipt.get("execution_quote") is None:
+            receipt["execution_quote"]=getattr(self,"_last_exec_quote",None)
+        return _stamp_receipt(receipt)
     async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
         if not self.available or self.exchange is None: return {"ok":False,"status":"rejected","error":self.reason or "entropy_credentials_missing","client_order_id":client_order_id}
         qty=self.normalize_qty(asset,qty)
@@ -416,6 +576,7 @@ class EntropyProbeExecutor:
             bbo=_d(quote.get("ask" if side=="buy" else "bid"))
         if not bbo: return {"ok":False,"status":"rejected","error":"entropy_quote_missing","client_order_id":client_order_id}
         limit_px=self._limit_price(asset,side,bbo,max_slippage_bps)
+        self._last_exec_quote={"bid":str(_d(quote.get("bid"))) if _d(quote.get("bid")) is not None else None,"ask":str(_d(quote.get("ask"))) if _d(quote.get("ask")) is not None else None,"mid":str(bbo),"limit_price":str(limit_px),"quote_recv_at":quote.get("recv_at"),"quote_source_at":quote.get("source_at")}
         cloid=self._cloid(client_order_id); coin=self._coin(asset)
         submitted=datetime.now(timezone.utc); start_ms=int(submitted.timestamp()*1000)-5000
         try:
@@ -470,6 +631,7 @@ class UnavailableProbeExecutor:
     async def start(self): return None
     async def close(self): return None
     async def preflight(self,asset): return {"ok":False,"error":self.reason}
+    async def positions(self,asset): return {"ok":False,"verified":False,"error":self.reason}
     def normalize_qty(self,asset,qty): return None
     async def market_order(self,**kwargs): return {"ok":False,"status":"rejected","error":self.reason,"client_order_id":kwargs.get("client_order_id")}
 
@@ -495,8 +657,9 @@ class ProbeState:
         tmp.write_text(json.dumps(self.data,ensure_ascii=False,indent=2,default=str)+"\n"); os.replace(tmp,self.path)
 class ProbeRunner:
     TERMINAL={"filled","rolled_back","no_fill","skipped"}
-    def __init__(self,*,hub,executors,state,writer_path,assets,venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=2.5,hold_seconds=3.1,run_id=None,horizons=(.25,.5,1.,3.),max_quote_age_by_venue=None,max_rounds=0):
+    def __init__(self,*,hub,executors,state,writer_path,assets,venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=2.5,hold_seconds=3.1,run_id=None,horizons=(.25,.5,1.,3.),max_quote_age_by_venue=None,max_rounds=0,lock_path=None):
         self.hub=hub; self.executors=executors; self.state=state; self.writer_path=writer_path; self.assets=assets; self.venues=venues; self.by_name={a.name:a for a in assets}; self.notional_usd=notional_usd; self.round_interval_seconds=max(.2,round_interval_seconds); self.max_quote_age_seconds=max_quote_age_seconds; self.max_quote_age_by_venue=dict(max_quote_age_by_venue or {}); self.hold_seconds=max(.5,hold_seconds); self.horizons=tuple(horizons); self.max_rounds=max(0,int(max_rounds)); self.run_id=run_id or "probe-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")+"-"+uuid.uuid4().hex[:4]; self.run_token=hashlib.sha256(self.run_id.encode()).hexdigest()[:8]
+        self.lock=ProbeLock(lock_path or (Path(self.state.path).parent/"run.lock"))
     def _write(self,row):
         self.writer_path.parent.mkdir(parents=True,exist_ok=True)
         with self.writer_path.open("a",encoding="utf-8") as f: f.write(json.dumps(row,ensure_ascii=False,default=str)+"\n")
@@ -542,20 +705,30 @@ class ProbeRunner:
         return f"{self.run_token}-{item.round_id}-{kind}-{venue}"
     async def run(self,*,allow_live=False):
         plan=enumerate_probe_plan(self.assets,self.venues)
-        if allow_live:
-            previous=self.state.data.get("run_id")
-            if previous and previous!=self.run_id:
-                pending=self._unresolved_round()
-                if pending is not None:
-                    blocked={"round_id":pending.get("round_id"),"status":pending.get("status"),"reason":pending.get("reason")}
-                    self.state.data["blocked_reason"]="unresolved_round_requires_review"; self.state.data["blocked_round"]=blocked; self.state.save()
-                    return {"ok":False,"mode":"live","rounds":0,"orders_attempted":False,"error":"unresolved_round_requires_review","round":blocked}
-                self.state.data.update({"cursor":0,"rounds":[],"current":None,"orders_attempted":False,"previous_run_id":previous})
-                self.state.data.pop("blocked_reason",None); self.state.data.pop("blocked_round",None)
-        self.state.data.update({"run_id":self.run_id,"planned_rounds":len(plan),"phase":"running" if allow_live else "dry_run","venues":list(self.venues),"assets":[a.name for a in self.assets]}); self.state.save()
         if not allow_live:
+            self.state.data.update({"run_id":self.run_id,"planned_rounds":len(plan),"phase":"dry_run","venues":list(self.venues),"assets":[a.name for a in self.assets]}); self.state.save()
             self._write({"schema":1,"event":"probe_plan","run_id":self.run_id,"rounds":[asdict(r) for r in plan]})
             return {"ok":True,"mode":"dry_run","rounds":len(plan),"plan":[asdict(r) for r in plan]}
+        acquired,owner=self.lock.acquire(self.run_id)
+        if not acquired:
+            self.state.data["blocked_reason"]="probe_already_running"; self.state.data["blocked_owner"]=owner; self.state.save()
+            return {"ok":False,"mode":"live","rounds":0,"orders_attempted":False,"error":"probe_already_running","owner":owner}
+        try:
+            return await self._run_live(plan)
+        finally:
+            self.lock.release()
+
+    async def _run_live(self,plan):
+        previous=self.state.data.get("run_id")
+        if previous and previous!=self.run_id:
+            pending=self._unresolved_round()
+            if pending is not None:
+                blocked={"round_id":pending.get("round_id"),"status":pending.get("status"),"reason":pending.get("reason")}
+                self.state.data["blocked_reason"]="unresolved_round_requires_review"; self.state.data["blocked_round"]=blocked; self.state.save()
+                return {"ok":False,"mode":"live","rounds":0,"orders_attempted":False,"error":"unresolved_round_requires_review","round":blocked}
+            self.state.data.update({"cursor":0,"rounds":[],"current":None,"orders_attempted":False,"previous_run_id":previous})
+            self.state.data.pop("blocked_reason",None); self.state.data.pop("blocked_round",None)
+        self.state.data.update({"run_id":self.run_id,"planned_rounds":len(plan),"phase":"running","pid":os.getpid(),"venues":list(self.venues),"assets":[a.name for a in self.assets]}); self.state.save()
         health=await self.preflight_all(); blocked={k:v for k,v in health.items() if not v.get("ok")}; self.state.data["preflight"]=health
         if blocked:
             self.state.data["phase"]="blocked"; self.state.save(); return {"ok":False,"mode":"live","rounds":0,"blocked":blocked}
@@ -601,7 +774,50 @@ class ProbeRunner:
         qty=min(vals)
         return qty if all(self.executors[v].normalize_qty(asset,qty) is not None for v in (item.buy_venue,item.sell_venue)) else None
 
+    async def reconcile(self,asset,venues):
+        """Read-only flat check on both legs, used before and after every round."""
+        out={"checked_at":datetime.now(timezone.utc).isoformat(),"flat":True,"venues":{}}
+        for venue in venues:
+            ex=self.executors.get(venue)
+            source="positions"
+            try:
+                fn=getattr(ex,"positions",None)
+                if callable(fn):
+                    result=await fn(asset)
+                elif ex is not None and hasattr(ex,"preflight"):
+                    source="preflight"; result=await ex.preflight(asset)
+                else:
+                    source="none"; result={"ok":False,"verified":False,"error":"executor_missing"}
+            except Exception as exc:
+                source="exception"; result={"ok":False,"verified":False,"error":f"{type(exc).__name__}:{exc}"}
+            payload=result if isinstance(result,dict) else {"ok":False,"error":"invalid_result"}
+            qty=_d(payload.get("qty")); active=payload.get("active_orders")
+            try: active_count=None if active in (None,"") else int(active)
+            except (TypeError,ValueError): active_count=None
+            verified=bool(payload.get("verified",payload.get("ok") is True)) and qty is not None
+            flat=bool(verified and qty==ZERO and (active_count is None or active_count==0))
+            out["venues"][venue]={"source":source,"verified":verified,"qty":None if qty is None else str(qty),"active_orders":active_count,"flat":flat,"error":payload.get("error")}
+            if not flat: out["flat"]=False
+        return out
+
     async def _run_one(self,item):
+        asset=self.by_name[item.asset]
+        pre=await self.reconcile(asset,(item.buy_venue,item.sell_venue))
+        if not pre["flat"]:
+            return {"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,
+                    "buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"manual_review_required",
+                    "reason":"pre_round_position_not_flat","orders_attempted":False,"reconcile":{"pre":pre,"post":None}}
+        row=await self._execute_round(item)
+        if row.get("status")!="skipped":
+            post=await self.reconcile(asset,(item.buy_venue,item.sell_venue))
+            row["reconcile"]={"pre":pre,"post":post}
+            if row.get("status") in self.TERMINAL and not post["flat"]:
+                row["status"]="manual_review_required"; row["reason"]="post_round_position_not_flat"
+        else:
+            row["reconcile"]={"pre":pre,"post":None}
+        return row
+
+    async def _execute_round(self,item):
         asset=self.by_name[item.asset]; pair=await self._wait_quotes(item)
         if pair is None: return {"schema":1,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"skipped","reason":"quote_unavailable"}
         buy,sell=pair; qty=self._qty(item,buy,sell)

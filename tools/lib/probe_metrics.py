@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 BPS = Decimal("10000")
 ZERO = Decimal("0")
+
+# Venues whose published fee schedule is zero for taker flow in the 20U probe
+# size.  A missing fee field there is a policy fact, not missing evidence.
+FEE_FREE_VENUES = {"variational", "lighter_mainnet", "lighter_rh"}
 
 
 def _d(value: Any) -> Decimal | None:
@@ -16,6 +21,84 @@ def _d(value: Any) -> Decimal | None:
     except (InvalidOperation, TypeError, ValueError):
         return None
     return out if out.is_finite() else None
+
+
+def _parse(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _clock_offset_ms(execution_quote: Any) -> Decimal | None:
+    """Echo-based clock offset for one venue.
+
+    Every execution quote carries the venue timestamp we were shown plus the
+    local receive time of that same message.  Their difference is the venue
+    clock offset plus one-way latency; taking the smallest sample over the run
+    leaves an offset estimate accurate to a few milliseconds.
+    """
+    if not isinstance(execution_quote, dict):
+        return None
+    pairs = (
+        ("received_at", "quote_timestamp"),
+        ("quote_recv_at", "quote_source_at"),
+        ("received_at", "quote_source_at"),
+    )
+    for local_key, exchange_key in pairs:
+        local = _parse(execution_quote.get(local_key))
+        exchange = _parse(execution_quote.get(exchange_key))
+        if local is not None and exchange is not None:
+            return Decimal(str(round((local - exchange).total_seconds() * 1000, 3)))
+    return None
+
+
+def leg_timing(leg: dict[str, Any]) -> dict[str, Any]:
+    """Align venue fill timestamps with local submit/ack/complete stamps."""
+    submitted = _parse(leg.get("submitted_at"))
+    acked = _parse(leg.get("acked_at"))
+    completed = _parse(leg.get("completed_at") or leg.get("local_fill_at"))
+    exchange_fill = _parse(leg.get("source_at"))
+    offset = _d(leg.get("clock_offset_ms"))
+    if offset is None:
+        offset = _clock_offset_ms(leg.get("execution_quote"))
+    aligned = exchange_fill + timedelta(milliseconds=float(offset)) if exchange_fill is not None and offset is not None else None
+    out: dict[str, Any] = {
+        "exchange_fill_at": exchange_fill.isoformat() if exchange_fill else None,
+        "local_fill_at": completed.isoformat() if completed else None,
+        "clock_offset_ms": None if offset is None else str(offset),
+        "aligned_fill_at": aligned.isoformat() if aligned else None,
+        "submit_to_exchange_fill_ms": round((aligned - submitted).total_seconds() * 1000, 3) if aligned is not None and submitted is not None else None,
+        "exchange_fill_to_local_ms": round((completed - aligned).total_seconds() * 1000, 3) if aligned is not None and completed is not None else None,
+        "submit_to_local_fill_ms": round((completed - submitted).total_seconds() * 1000, 3) if completed is not None and submitted is not None else None,
+        "ack_to_local_fill_ms": round((completed - acked).total_seconds() * 1000, 3) if completed is not None and acked is not None else None,
+    }
+    out["timestamp_anomaly"] = bool(exchange_fill is not None and submitted is not None and exchange_fill < submitted and offset is None)
+    return out
+
+
+def _fee_status(leg: dict[str, Any], venue: str) -> str:
+    if _d(leg.get("fee_usd")) is not None:
+        return "verified"
+    if venue in FEE_FREE_VENUES:
+        return "zero_by_policy"
+    return "unverified"
+
+
+def _fee_bps(leg: dict[str, Any], venue: str) -> Decimal | None:
+    fee = _d(leg.get("fee_usd"))
+    qty = _d(leg.get("filled_qty"))
+    price = _d(leg.get("avg_price"))
+    if fee is None:
+        return ZERO if venue in FEE_FREE_VENUES else None
+    if qty is None or price is None or qty <= 0 or price <= 0:
+        return None
+    return fee / (qty * price) * BPS
 
 
 def _leg_cost(leg: dict[str, Any], reference: dict[str, Any], *, closing: bool) -> dict[str, Any]:
@@ -71,7 +154,14 @@ def _leg_cost(leg: dict[str, Any], reference: dict[str, Any], *, closing: bool) 
 
 
 def _fill_stamp(leg: dict[str, Any]) -> Decimal | None:
-    return _d(leg.get("source_at_epoch")) or _d(leg.get("fill_at_epoch"))
+    value = _d(leg.get("source_at_epoch"))
+    if value is None:
+        value = _d(leg.get("fill_at_epoch"))
+    if value is None:
+        parsed = _parse(leg.get("source_at"))
+        if parsed is not None:
+            value = Decimal(str(parsed.timestamp()))
+    return value
 
 
 def decompose_round(row: dict[str, Any]) -> dict[str, Any]:
@@ -98,11 +188,30 @@ def decompose_round(row: dict[str, Any]) -> dict[str, Any]:
         own_exit = _d((components.get(f"exit:{venue}") or {}).get("price_cost_bps"))
         venue_costs[venue] = None if own_entry is None and own_exit is None else str((own_entry or ZERO) + (own_exit or ZERO))
 
-    legs = list(entry_legs.values()) + list(exit_legs.values())
-    fees_present = [_d(leg.get("fee_usd")) for leg in legs]
-    fees_verified = [v for v in fees_present if v is not None]
-    fees = sum(fees_verified, ZERO)
-    fees_status = "verified" if legs and len(fees_verified) == len(legs) else "unverified"
+    fees = ZERO
+    fee_bps = ZERO
+    fee_statuses: dict[str, str] = {}
+    fee_unverified: list[str] = []
+    for leg_name, legs in (("entry", entry_legs), ("exit", exit_legs)):
+        for venue, leg in legs.items():
+            status = _fee_status(leg, str(venue))
+            fee_statuses[f"{leg_name}:{venue}"] = status
+            value = _d(leg.get("fee_usd"))
+            if value is not None:
+                fees += value
+            bps = _fee_bps(leg, str(venue))
+            if bps is None:
+                fee_unverified.append(f"{leg_name}:{venue}")
+            else:
+                fee_bps += bps
+    statuses = set(fee_statuses.values())
+    if "unverified" in statuses or not statuses:
+        fees_status = "unverified"
+    elif "verified" in statuses:
+        fees_status = "verified"
+    else:
+        fees_status = "zero_by_policy"
+    net_cost = None if fee_unverified else price_cost + fee_bps
 
     buy_leg = next((leg for leg in entry_legs.values() if str(leg.get("side")).lower() == "buy"), None)
     sell_leg = next((leg for leg in entry_legs.values() if str(leg.get("side")).lower() == "sell"), None)
@@ -121,9 +230,35 @@ def decompose_round(row: dict[str, Any]) -> dict[str, Any]:
         entry_notional = (buy_entry_px * qty + sell_entry_px * qty) / 2
     pnl_bps = gross_pnl / entry_notional * BPS if gross_pnl is not None and entry_notional else None
 
-    stamps = sorted(((_fill_stamp(leg), venue) for venue, leg in entry_legs.items() if _fill_stamp(leg) is not None), key=lambda item: item[0])
-    hedge_delay_ms = int((stamps[1][0] - stamps[0][0]) * 1000) if len(stamps) == 2 else None
-    first_leg = stamps[0][1] if stamps else None
+    timing = {
+        "entry": {venue: leg_timing(leg) for venue, leg in entry_legs.items()},
+        "exit": {venue: leg_timing(leg) for venue, leg in exit_legs.items()},
+    }
+    entry_timing = timing["entry"]
+    aligned = sorted(
+        ((_parse((entry_timing[v] or {}).get("aligned_fill_at")), v) for v in entry_legs if _parse((entry_timing[v] or {}).get("aligned_fill_at"))),
+        key=lambda item: item[0],
+    )
+    raw = sorted(((_fill_stamp(leg), venue) for venue, leg in entry_legs.items() if _fill_stamp(leg) is not None), key=lambda item: item[0])
+    local = sorted(
+        ((_parse(entry_legs[v].get("completed_at") or entry_legs[v].get("acked_at")), v) for v in entry_legs if _parse(entry_legs[v].get("completed_at") or entry_legs[v].get("acked_at"))),
+        key=lambda item: item[0],
+    )
+    hedge_delay_ms = None
+    hedge_delay_source = None
+    first_leg = None
+    if len(aligned) == 2:
+        hedge_delay_ms = int((aligned[1][0] - aligned[0][0]).total_seconds() * 1000)
+        hedge_delay_source = "exchange_aligned"
+        first_leg = aligned[0][1]
+    elif len(raw) == 2:
+        hedge_delay_ms = int((raw[1][0] - raw[0][0]) * 1000)
+        hedge_delay_source = "exchange_raw"
+        first_leg = raw[0][1]
+    elif len(local) == 2:
+        hedge_delay_ms = int((local[1][0] - local[0][0]).total_seconds() * 1000)
+        hedge_delay_source = "local_completed"
+        first_leg = local[0][1]
 
     complete = (
         row.get("status") == "filled"
@@ -143,15 +278,21 @@ def decompose_round(row: dict[str, Any]) -> dict[str, Any]:
         "entry_price_cost_bps": str(entry_cost),
         "exit_price_cost_bps": str(exit_cost),
         "total_price_cost_bps": str(price_cost),
+        "fee_bps": str(fee_bps),
+        "net_cost_bps": None if net_cost is None else str(net_cost),
         "venue_roundtrip_cost_bps": venue_costs,
         "fees_usd": str(fees),
         "fees_status": fees_status,
-        "fees_unverified_legs": [f"{'entry' if leg in entry_legs.values() else 'exit'}:{venue}" for venue, leg in list(entry_legs.items()) + list(exit_legs.items()) if _d(leg.get("fee_usd")) is None],
+        "fee_leg_status": fee_statuses,
+        "fees_unverified_legs": fee_unverified,
         "gross_pnl_usd": None if gross_pnl is None else str(gross_pnl),
         "gross_pnl_bps": None if pnl_bps is None else str(pnl_bps),
         "hedge_delay_ms": hedge_delay_ms,
+        "hedge_delay_source": hedge_delay_source,
         "first_filled_venue": first_leg,
+        "timing": timing,
         "components": components,
+        "reconcile": row.get("reconcile"),
     }
 
 
@@ -174,6 +315,19 @@ def adverse_move(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def split_runs(rows: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Group probe rounds by run id, preserving first-seen order.
+
+    Rounds written before run ids existed are grouped under ``legacy`` so a
+    recompute can report them separately instead of mixing them into a run.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = str(row.get("run_id") or "legacy")
+        grouped.setdefault(key, []).append(row)
+    return grouped
+
+
 def percentile(values: Iterable[Decimal], p: int) -> Decimal | None:
     data = sorted(v for v in values if v is not None)
     if not data:
@@ -190,10 +344,13 @@ def percentile(values: Iterable[Decimal], p: int) -> Decimal | None:
 def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal("1")) -> dict[str, Any]:
     by_venue: dict[tuple[str, str], list[Decimal]] = defaultdict(list)
     by_pair_cost: dict[tuple[str, str, str], list[Decimal]] = defaultdict(list)
+    by_pair_net: dict[tuple[str, str, str], list[Decimal]] = defaultdict(list)
     by_pair_pnl: dict[tuple[str, str, str], list[Decimal]] = defaultdict(list)
     excluded: dict[str, int] = defaultdict(int)
     stages: dict[str, list[Decimal]] = {"half_spread": [], "signal_to_exec": [], "exec_to_fill": []}
     delays: list[Decimal] = []
+    delay_sources: dict[str, int] = defaultdict(int)
+    offsets: dict[str, list[Decimal]] = defaultdict(list)
     adverse: dict[tuple[str, str], list[Decimal]] = defaultdict(list)
     adverse_by_venue: dict[tuple[str, str, str], list[Decimal]] = defaultdict(list)
     summaries = []
@@ -212,6 +369,12 @@ def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal
                     stages[stage].append(value)
         if summary.get("hedge_delay_ms") is not None:
             delays.append(Decimal(str(summary["hedge_delay_ms"])))
+            delay_sources[str(summary.get("hedge_delay_source"))] += 1
+        for side_timing in (summary.get("timing") or {}).values():
+            for venue, timing in (side_timing or {}).items():
+                value = _d((timing or {}).get("clock_offset_ms"))
+                if value is not None:
+                    offsets[str(venue)].append(value)
         for venue, points in adverse_move(row).items():
             for delay, value in points.items():
                 adverse[(summary.get("asset"), delay)].append(value)
@@ -222,6 +385,9 @@ def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal
                 by_venue[(summary.get("asset"), venue)].append(value)
         key = (summary.get("asset"), summary.get("buy_venue"), summary.get("sell_venue"))
         by_pair_cost[key].append(_d(summary.get("total_price_cost_bps")) or ZERO)
+        net = _d(summary.get("net_cost_bps"))
+        if net is not None:
+            by_pair_net[key].append(net)
         pnl = _d(summary.get("gross_pnl_bps"))
         if pnl is not None:
             by_pair_pnl[key].append(pnl)
@@ -242,11 +408,15 @@ def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal
     for (asset, buy, sell), costs in by_pair_cost.items():
         key = f"{asset}:{buy}->{sell}"
         pnls = by_pair_pnl.get((asset, buy, sell), [])
+        nets = by_pair_net.get((asset, buy, sell), [])
         p80 = percentile(costs, 80)
         pairs[key] = {
             "samples": len(costs),
             "p50_total_cost_bps": str(percentile(costs, 50)),
             "p80_total_cost_bps": str(p80),
+            "p50_net_cost_bps": str(percentile(nets, 50)) if nets else None,
+            "p80_net_cost_bps": str(percentile(nets, 80)) if nets else None,
+            "net_samples": len(nets),
             "p50_pnl_bps": str(percentile(pnls, 50)) if pnls else None,
             "p20_pnl_bps": str(percentile(pnls, 20)) if pnls else None,
             "p80_pnl_bps": str(percentile(pnls, 80)) if pnls else None,
@@ -254,14 +424,16 @@ def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal
         pair_recommendations[key] = str(max(ZERO, p80 + target_bps))
 
     return {
-        "schema": 2,
+        "schema": 3,
         "target_net_bps": str(target_bps),
         "rounds": len(summaries),
         "complete_rounds": sum(1 for s in summaries if s["complete"]),
         "excluded_rounds": dict(excluded),
-        "fees_unverified_rounds": sum(1 for s in summaries if s["complete"] and s.get("fees_status") != "verified"),
+        "fees_unverified_rounds": sum(1 for s in summaries if s["complete"] and s.get("fees_status") == "unverified"),
+        "fee_status_counts": {status: sum(1 for s in summaries if s.get("fees_status") == status) for status in sorted({str(s.get("fees_status")) for s in summaries})},
         "stages": {name: {"samples": len(values), "p50_bps": str(percentile(values, 50)), "p80_bps": str(percentile(values, 80))} for name, values in stages.items()},
-        "hedge_delay_ms": {"samples": len(delays), "p50_ms": str(percentile(delays, 50)), "p80_ms": str(percentile(delays, 80))},
+        "hedge_delay_ms": {"samples": len(delays), "p50_ms": str(percentile(delays, 50)), "p80_ms": str(percentile(delays, 80)), "sources": dict(delay_sources)},
+        "clock_offset_ms": {venue: {"samples": len(values), "min_ms": str(min(values)), "median_ms": str(percentile(values, 50))} for venue, values in sorted(offsets.items())},
         "adverse_selection": {
             "by_horizon": {f"{asset}:{delay}s": {"samples": len(v), "p50_bps": str(percentile(v, 50)), "p80_bps": str(percentile(v, 80))} for (asset, delay), v in sorted(adverse.items())},
             "by_venue": {f"{asset}:{venue}:{delay}s": {"samples": len(v), "p50_bps": str(percentile(v, 50)), "p80_bps": str(percentile(v, 80))} for (asset, venue, delay), v in sorted(adverse_by_venue.items())},
@@ -270,6 +442,6 @@ def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal
         "pairs": pairs,
         "recommended_trigger_bps": venue_recommendations,
         "recommended_pair_trigger_bps": pair_recommendations,
-        "fee_policy": "fees_reported_separately_not_subtracted_from_price_cost",
+        "fee_policy": "fees_reported_separately_from_price_cost_zero_fee_venues_marked_zero_by_policy",
         "summaries": summaries,
     }

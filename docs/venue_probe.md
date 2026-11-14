@@ -32,6 +32,29 @@ flat. A round writes its deterministic client order ids to
 run to `manual_review_required`; it never retries the same round. If one leg
 fills and the other does not, the filled leg is closed reduce-only once.
 
+### Per-round position reconciliation
+
+Every round is bracketed by a read-only position/order snapshot on both legs
+(`variational` positions + pending orders, Lighter `account` +
+`account_active_orders`, Entropy `user_state` + `open_orders`):
+
+- the pre-check must prove `qty == 0` and `active_orders == 0`; an unverified
+  snapshot blocks the round with `pre_round_position_not_flat` and no order is
+  sent;
+- the post-check runs after the exit legs; any residual quantity turns the
+  round into `manual_review_required` with `post_round_position_not_flat` and
+  the rest of the plan stops.
+
+The snapshot is stored on the round as `reconcile.pre` / `reconcile.post`, so a
+later review can see exactly which venue reported which quantity.
+
+### Single-run lock
+
+`log/venue_probe/run.lock` holds `{pid, run_id, acquired_at}` for the live run.
+A second process returns `probe_already_running` with the current owner and
+sends no orders. A lock left behind by a dead pid is replaced automatically;
+the lock is released in a `finally` block, including after exceptions.
+
 The runner records entry quotes, order submit/ack timestamps, final fills,
 0.25/0.5/1/3-second adverse marks, and both exit fills. Fees are reported
 separately.
@@ -84,6 +107,19 @@ timestamp (`source_at` / `source_at_epoch`) and the derived
 `exchange_fill_to_local_ms`. `probe_report.py` aggregates the signed hedge
 landing delay (`hedge_delay_ms`) from the two entry fills.
 
+### Fill-time alignment
+
+Venue clocks are not the local clock. For each leg the execution quote echo
+(`received_at` vs `quote_timestamp`, or `quote_recv_at` vs `quote_source_at`)
+gives a per-venue offset; the leg keeps `clock_offset_ms`, and the fill is
+re-based onto the local clock as `aligned_fill_at`. `hedge_delay_ms` is
+computed from aligned exchange fills (`hedge_delay_source=exchange_aligned`),
+falls back to raw exchange stamps (`exchange_raw`) or local completion stamps
+(`local_completed`), and never mixes sources without saying so. A fill stamped
+before local submit with no offset available is flagged
+`timestamp_anomaly=true`. Lighter timestamps are accepted in seconds,
+milliseconds, microseconds or nanoseconds.
+
 ## Cost attribution
 
 Only complete four-leg rounds enter the cost distributions. Rolled-back,
@@ -93,9 +129,16 @@ into per-venue or per-pair cost.
 Per-venue cost uses that venue's own entry and exit legs; it is never half of
 the round total. Each leg is split into half-spread, `signal -> execution
 quote` (RFQ reprice where a venue publishes one) and `execution quote -> fill`.
-The three stages add up to `price_cost_bps`, so nothing is charged twice. Fees
-are reported separately; a leg whose fee is unknown makes the round
-`fees_status=unverified` instead of contributing a silent zero.
+The three stages add up to `price_cost_bps`, so nothing is charged twice.
+Lighter and Var now capture an `execution_quote` at submit, so their legs are
+`three_stage` like Var RFQ legs instead of collapsing into a single
+`signal -> fill` number.
+
+Fees stay outside the price cost. A leg with a reported `fee_usd` is
+`verified` (Entropy rebates arrive as a negative fee and reduce `net_cost_bps`);
+a leg on a zero-fee venue (`variational`, `lighter_mainnet`, `lighter_rh`)
+without a fee field is `zero_by_policy`; anything else is `unverified` and
+suppresses `net_cost_bps` rather than contributing a silent zero.
 
 The actionable floor is `recommended_pair_trigger_bps` (p80 of the pair's
 total round-trip cost plus the target net). `recommended_trigger_bps` remains

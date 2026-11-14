@@ -133,7 +133,8 @@ def test_stage_and_hedge_delay_aggregates_are_reported():
     out = calibrate([_round()])
     assert out["stages"]["half_spread"]["samples"] == 4
     assert out["stages"]["signal_to_exec"]["samples"] == 0
-    assert out["hedge_delay_ms"] == {"samples": 1, "p50_ms": "200", "p80_ms": "200"}
+    assert {k: out["hedge_delay_ms"][k] for k in ("samples", "p50_ms", "p80_ms")} == {"samples": 1, "p50_ms": "200", "p80_ms": "200"}
+    assert out["hedge_delay_ms"]["sources"] == {"exchange_raw": 1}
 
 def test_adverse_selection_curve_is_aggregated():
     from tools.lib.probe_metrics import adverse_move
