@@ -87,7 +87,7 @@ async def main_async(args):
         if args.mode!="run": raise SystemExit("mode_must_be_plan_preflight_or_run")
         if not (args.execute and args.confirm_live_probes and args.confirm_flat and args.i_understand_live_orders):
             return {"ok":False,"mode":"run","orders_attempted":False,"error":"explicit_live_confirmation_flags_required"}
-        return await runner.run(allow_live=True)
+        return await runner.run(allow_live=True,resume=args.resume)
     finally:
         await _stop(cap,task,ex)
 
@@ -101,6 +101,7 @@ def parse_args(argv=None):
     p.add_argument("--confirm-flat",action="store_true")
     p.add_argument("--i-understand-live-orders",action="store_true")
     p.add_argument("--max-rounds",type=int,default=0,help="0 means the full plan")
+    p.add_argument("--resume",action="store_true",help="continue a stalled run after both accounts prove flat")
     return p.parse_args(argv)
 
 def main():

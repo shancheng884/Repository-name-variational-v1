@@ -712,7 +712,7 @@ class ProbeRunner:
         return None
     def _cid(self,item,kind,venue):
         return f"{self.run_token}-{item.round_id}-{kind}-{venue}"
-    async def run(self,*,allow_live=False):
+    async def run(self,*,allow_live=False,resume=False):
         plan=enumerate_probe_plan(self.assets,self.venues)
         if not allow_live:
             self.state.data.update({"run_id":self.run_id,"planned_rounds":len(plan),"phase":"dry_run","venues":list(self.venues),"assets":[a.name for a in self.assets]}); self.state.save()
@@ -723,13 +723,35 @@ class ProbeRunner:
             self.state.data["blocked_reason"]="probe_already_running"; self.state.data["blocked_owner"]=owner; self.state.save()
             return {"ok":False,"mode":"live","rounds":0,"orders_attempted":False,"error":"probe_already_running","owner":owner}
         try:
-            return await self._run_live(plan)
+            return await self._run_live(plan,resume=resume)
         finally:
             self.lock.release()
 
-    async def _run_live(self,plan):
+    async def _resume_pending(self,pending):
+        """Clear a stalled round only when both accounts prove it is flat."""
+        asset=self.by_name.get(str(pending.get("asset")))
+        buy=pending.get("buy_venue"); sell=pending.get("sell_venue")
+        if asset is None or buy not in self.executors or sell not in self.executors:
+            return {"round_id":pending.get("round_id"),"error":"pending_round_unknown_venues"}
+        check=await self.reconcile(asset,(buy,sell))
+        if not check["flat"]:
+            return {"round_id":pending.get("round_id"),"error":"pending_round_not_flat","reconcile":check}
+        self.state.data.setdefault("resumed_rounds",[]).append({"round_id":pending.get("round_id"),"reason":pending.get("reason"),"reconcile":check})
+        self.state.data["current"]=None; self.state.data["orders_attempted"]=False; self.state.data["phase"]="running"
+        self.state.save()
+        return None
+
+    async def _run_live(self,plan,resume=False):
         previous=self.state.data.get("run_id")
-        if previous and previous!=self.run_id:
+        if previous and previous!=self.run_id and resume:
+            pending=self._unresolved_round(); blocked=None
+            if pending is not None:
+                blocked=await self._resume_pending(pending)
+            if blocked is not None:
+                self.state.data["blocked_reason"]="pending_round_not_flat"; self.state.data["blocked_round"]=blocked; self.state.save()
+                return {"ok":False,"mode":"live","rounds":0,"orders_attempted":False,"error":"pending_round_not_flat","round":blocked}
+            self.state.data["resumed_from"]=previous
+        elif previous and previous!=self.run_id:
             pending=self._unresolved_round()
             if pending is not None:
                 blocked={"round_id":pending.get("round_id"),"status":pending.get("status"),"reason":pending.get("reason")}

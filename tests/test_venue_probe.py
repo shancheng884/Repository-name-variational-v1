@@ -238,3 +238,40 @@ def test_lighter_poll_parses_numeric_epoch_fill_time(monkeypatch):
     assert out["status"] == "filled"
     assert out["source_at_epoch"] == 1794641842
     assert out["source_at"].startswith("2026-")
+
+def test_resume_continues_after_a_proven_flat_pending_round(tmp_path):
+    state = ProbeState(tmp_path / "s.json")
+    state.data.update({"run_id": "old-run", "cursor": 1, "phase": "manual_review_required", "orders_attempted": True,
+                       "current": {"round_id": "nvda-variational-lighter_mainnet-001", "asset": "NVDA",
+                                   "buy_venue": "variational", "sell_venue": "lighter_mainnet",
+                                   "status": "manual_review_required", "reason": "exit_not_confirmed"}})
+    state.save()
+    a, b = FakeExec(), FakeExec()
+    r = ProbeRunner(hub=FakeHub(), executors={"variational": a, "lighter_mainnet": b}, state=state,
+                    writer_path=tmp_path / "r.jsonl", assets=DEFAULT_ASSETS[:1],
+                    venues=("variational", "lighter_mainnet"), horizons=(0.0,), run_id="new-run")
+    out = asyncio.run(r.run(allow_live=True, resume=True))
+    assert out["rounds"] == 1, "the finished rounds are not repeated"
+    assert state.data["resumed_rounds"][0]["round_id"] == "nvda-variational-lighter_mainnet-001"
+    assert state.data["cursor"] == 2
+
+
+def test_resume_refuses_when_the_pending_round_still_holds_size(tmp_path):
+    state = ProbeState(tmp_path / "s.json")
+    state.data.update({"run_id": "old-run", "cursor": 1, "phase": "manual_review_required", "orders_attempted": True,
+                       "current": {"round_id": "nvda-variational-lighter_mainnet-001", "asset": "NVDA",
+                                   "buy_venue": "variational", "sell_venue": "lighter_mainnet",
+                                   "status": "manual_review_required", "reason": "exit_not_confirmed"}})
+    state.save()
+
+    class HeldExec(FakeExec):
+        async def positions(self, asset):
+            return {"ok": True, "verified": True, "qty": "0.05", "active_orders": 0}
+
+    a, b = HeldExec(), FakeExec()
+    r = ProbeRunner(hub=FakeHub(), executors={"variational": a, "lighter_mainnet": b}, state=state,
+                    writer_path=tmp_path / "r.jsonl", assets=DEFAULT_ASSETS[:1],
+                    venues=("variational", "lighter_mainnet"), horizons=(0.0,), run_id="new-run")
+    out = asyncio.run(r.run(allow_live=True, resume=True))
+    assert out["ok"] is False and out["error"] == "pending_round_not_flat"
+    assert a.calls == [] and b.calls == [], "nothing is sent while a leg still holds size"
