@@ -456,6 +456,29 @@ class LighterProbeExecutor:
         return {"ok":False,"status":"unknown","error":"lighter_fill_timeout","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat()}
 def _int(v):
     p=_d(v); return int(p) if p is not None and p==p.to_integral_value() else None
+async def _to_thread_retry(fn,*args,attempts=4,base_delay=0.4,**kwargs):
+    """Run a blocking venue call, backing off while the venue rate-limits us.
+
+    Hyperliquid answers 429 with an empty body, which surfaces as a bare
+    ClientError.  Treating that as a hard failure is what aborted a live round.
+    """
+    last=None
+    for index in range(max(1,attempts)):
+        try:
+            return await asyncio.to_thread(fn,*args,**kwargs)
+        except Exception as exc:
+            last=exc
+            if index==attempts-1:
+                break
+            await asyncio.sleep(base_delay*(2**index))
+    raise last
+
+
+def _is_rate_limit(exc):
+    text=str(exc).lower()
+    return "429" in text or "rate limit" in text or "too many" in text
+
+
 def _fill_window(*,submitted,acked,observed,exchange_at,resolution_ms):
     """Bound the true fill time instead of inventing a precise one.
 
@@ -565,8 +588,8 @@ class EntropyProbeExecutor:
         if not self.available or self.info is None: return {"ok":False,"verified":False,"error":self.reason or "entropy_credentials_missing"}
         coin=self._coin(asset)
         try:
-            state=await asyncio.to_thread(self.info.user_state,self.account_address,self.dex)
-            orders=await asyncio.to_thread(self.info.open_orders,self.account_address,self.dex)
+            state=await _to_thread_retry(self.info.user_state,self.account_address,self.dex)
+            orders=await _to_thread_retry(self.info.open_orders,self.account_address,self.dex)
         except Exception as exc:
             return {"ok":False,"verified":False,"error":f"entropy_positions_failed:{type(exc).__name__}:{exc}"}
         if state is None or orders is None: return {"ok":False,"verified":False,"error":"entropy_positions_unverifiable"}
@@ -602,7 +625,7 @@ class EntropyProbeExecutor:
         if not qty: return {"ok":False,"status":"rejected","error":"entropy_qty_below_min","client_order_id":client_order_id}
         bbo=None
         try:
-            mids=await asyncio.to_thread(self.info.all_mids,self.dex)
+            mids=await _to_thread_retry(self.info.all_mids,self.dex,attempts=3)
             bbo=_d((mids or {}).get(self._coin(asset)))
         except Exception:
             bbo=None
@@ -613,27 +636,43 @@ class EntropyProbeExecutor:
         self._last_exec_quote={"bid":str(_d(quote.get("bid"))) if _d(quote.get("bid")) is not None else None,"ask":str(_d(quote.get("ask"))) if _d(quote.get("ask")) is not None else None,"mid":str(bbo),"limit_price":str(limit_px),"quote_recv_at":quote.get("recv_at"),"quote_source_at":quote.get("source_at")}
         cloid=self._cloid(client_order_id); coin=self._coin(asset)
         submitted=datetime.now(timezone.utc); start_ms=int(submitted.timestamp()*1000)-5000
-        try:
-            result=await asyncio.to_thread(self.exchange.order,coin,side=="buy",float(qty),limit_px,{"limit":{"tif":"Ioc"}},reduce_only=bool(reduce_only),cloid=cloid)
-        except Exception as exc:
-            return {"ok":False,"status":"unknown","error":f"{type(exc).__name__}:{exc}","client_order_id":client_order_id,"submitted_at":submitted.isoformat()}
+        result=None; attempts=0
+        while True:
+            attempts+=1
+            try:
+                result=await asyncio.to_thread(self.exchange.order,coin,side=="buy",float(qty),limit_px,{"limit":{"tif":"Ioc"}},reduce_only=bool(reduce_only),cloid=cloid)
+                break
+            except Exception as exc:
+                # The cloid is the order identity: a retry either replays the
+                # same order or is rejected as a duplicate, never doubles it.
+                if _is_rate_limit(exc) and attempts<4:
+                    await asyncio.sleep(0.5*attempts)
+                    continue
+                return {"ok":False,"status":"unknown","error":f"{type(exc).__name__}:{exc}","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"submit_attempts":attempts}
         acked=datetime.now(timezone.utc)
         status=self._order_status(result)
         if status=="rejected": return {"ok":True,"status":"rejected","filled_qty":"0","error":self._order_error(result),"client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat()}
         deadline=time.monotonic()+self.timeout_seconds
-        last=None
+        last=None; delay=0.1; poll_errors=0
         while time.monotonic()<deadline:
-            fills=await asyncio.to_thread(self.info.user_fills_by_time,self.account_address,start_ms)
+            try:
+                fills=await asyncio.to_thread(self.info.user_fills_by_time,self.account_address,start_ms)
+            except Exception as exc:
+                # A rate-limited fill poll must not abort a round whose order may
+                # already have filled: keep polling until the deadline.
+                poll_errors+=1
+                await asyncio.sleep(min(delay,0.5)); delay=min(delay*2,0.5); continue
             rows=[row for row in (fills or []) if str(row.get("cloid") or "").lower()==str(cloid).lower() and str(row.get("coin") or "")==coin]
             if rows:
                 qty_sum=sum((_d(row.get("sz")) or ZERO for row in rows),ZERO); notional=sum(((_d(row.get("sz")) or ZERO)*(_d(row.get("px")) or ZERO) for row in rows),ZERO)
                 fee=sum((_d(row.get("fee")) or ZERO for row in rows),ZERO)
                 last=max((_parse_epoch_ms(row.get("time")) for row in rows),default=None)
                 return {"ok":True,"status":"filled","filled_qty":str(qty_sum),"avg_price":str(notional/qty_sum) if qty_sum else None,"fee_usd":str(fee),"order_id":str(rows[0].get("oid") or ""),"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":last.isoformat() if last else None,"source_at_epoch":last.timestamp() if last else None,"raw_status":status}
-            await asyncio.sleep(.1)
+            await asyncio.sleep(delay)
+            delay=min(delay*1.5,0.5)
         if not reduce_only:
             try:
-                state=await asyncio.to_thread(self.info.user_state,self.account_address,self.dex)
+                state=await _to_thread_retry(self.info.user_state,self.account_address,self.dex,attempts=3)
                 for item in (state or {}).get("assetPositions",[]) or []:
                     pos=item.get("position") if isinstance(item,dict) else None
                     if not isinstance(pos,dict) or pos.get("coin")!=coin: continue
@@ -917,6 +956,12 @@ class ProbeRunner:
               item.sell_venue:await self._position_qty(asset,item.sell_venue)}
         out={"position_qty":{v:(None if q is None else str(q)) for v,q in held.items()},"decision":None,"flattened":{}}
         buy=held[item.buy_venue]; sell=held[item.sell_venue]
+        if buy is None or sell is None:
+            # Never flatten against an unreadable account: the unreadable venue
+            # may be the leg that actually filled, and closing the other one
+            # turns a hedged pair into a naked position (this is exactly how a
+            # rate-limited read left a naked 0.125 NVDA long).
+            out["decision"]="unresolved"; return out
         if buy is not None and sell is not None and buy==ZERO and sell==ZERO:
             out["decision"]="flat_confirmed"; return out
         if buy is not None and sell is not None and buy>ZERO and sell<ZERO and abs(abs(buy)-abs(sell))<=_qty_tolerance(qty):
