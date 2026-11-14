@@ -326,8 +326,15 @@ class EntropyProbeExecutor:
         if active: return {"ok":False,"error":"entropy_active_order","count":len(active)}
         row=self._row(asset); asset_index=int(self.info.name_to_asset(coin))
         margin=(state or {}).get("marginSummary") or {}
+        spot=await asyncio.to_thread(self.info.spot_user_state,self.account_address)
+        available=None
+        for item in (spot or {}).get("tokenToAvailableAfterMaintenance",[]) or []:
+            if isinstance(item,(list,tuple)) and len(item)>=2 and int(item[0])==0:
+                available=item[1]; break
         return {"ok":True,"qty":"0","active_orders":0,"account_value":margin.get("accountValue"),
-                "available_margin":(state or {}).get("withdrawable"),
+                "available_margin":available,
+                "spot_usdc_total":next((row.get("total") for row in (spot or {}).get("balances",[]) if str(row.get("coin"))=="USDC"),None),
+                "spot_usdc_hold":next((row.get("hold") for row in (spot or {}).get("balances",[]) if str(row.get("coin"))=="USDC"),None),
                 "contract":{"venue":"entropy","symbol":coin,"asset_index":asset_index,
                             "sz_decimals":int(row.get("szDecimals") or 0),
                             "max_leverage":row.get("maxLeverage"),"only_isolated":bool(row.get("onlyIsolated")),

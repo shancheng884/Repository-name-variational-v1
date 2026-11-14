@@ -23,6 +23,9 @@ class FakeInfo:
         return {"assetPositions": self.positions, "marginSummary": {"accountValue": "200"}}
     def open_orders(self, address, dex):
         return self.orders
+    def spot_user_state(self, address):
+        return {"balances": [{"coin": "USDC", "total": "1055", "hold": "863"}],
+                "tokenToAvailableAfterMaintenance": [[0, "192.27"]]}
     def user_fills_by_time(self, address, start_time):
         return self.fills
 
