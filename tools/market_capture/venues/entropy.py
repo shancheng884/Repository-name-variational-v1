@@ -43,6 +43,9 @@ class EntropyBookFeed:
         self.health = VenueHealth(self.name)
         self.coin_to_asset: dict[str, str] = {}
         self.universe: dict[str, dict[str, Any]] = {}
+        self.book_messages = 0
+        self.bbo_messages = 0
+        self.trade_messages = 0
 
     async def load_universe(self) -> None:
         response = await asyncio.to_thread(
@@ -75,7 +78,11 @@ class EntropyBookFeed:
                     self.health.status = "running"
                     self.health.connected = True
                     for coin in self.coin_to_asset:
+                        # l2Book is throttled to one snapshot every ~7-12s on
+                        # Hyperliquid; bbo is the push-on-change top of book
+                        # that keeps a taker quote fresh.
                         await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}}))
+                        await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "bbo", "coin": coin}}))
                         await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "trades", "coin": coin}}))
                     backoff = 1.0
                     async for raw in ws:
@@ -109,7 +116,31 @@ class EntropyBookFeed:
                 recv_at=datetime.now(timezone.utc), source_at=parse_epoch(data.get("time")),
             )
             self.hub.update_book(book, recv_mono=time.monotonic())
+            self.book_messages += 1
             self.health.last_quote_at = book.recv_at
+        elif channel == "bbo" and isinstance(data, dict):
+            coin = str(data.get("coin") or "")
+            asset = self.coin_to_asset.get(coin)
+            if asset is None:
+                return
+            top = data.get("bbo") or []
+            if not isinstance(top, list) or len(top) < 2:
+                return
+            bid_row = top[0] if isinstance(top[0], dict) else {}
+            ask_row = top[1] if isinstance(top[1], dict) else {}
+            bid = to_decimal(bid_row.get("px"))
+            ask = to_decimal(ask_row.get("px"))
+            if bid is None or ask is None:
+                return
+            source_at = parse_epoch(data.get("time"))
+            recv_at = datetime.now(timezone.utc)
+            self.hub.update_bbo(
+                venue=self.name, symbol=asset, bid=bid, ask=ask, quote_kind="bbo",
+                recv_at=recv_at, source_at=source_at,
+                bid_size=to_decimal(bid_row.get("sz")), ask_size=to_decimal(ask_row.get("sz")),
+            )
+            self.bbo_messages += 1
+            self.health.last_quote_at = recv_at
         elif channel == "trades" and isinstance(data, list):
             for trade in data:
                 self._write_trade(trade)
@@ -120,6 +151,15 @@ class EntropyBookFeed:
         if asset is None:
             return
         at = parse_epoch(trade.get("time"))
+        self.trade_messages += 1
+        # The print is the only sound staleness proof: a trade through the
+        # quoted top means the ladder we hold is already wrong.
+        self.hub.update_trade(
+            venue=self.name, symbol=asset, price=to_decimal(trade.get("px")),
+            size=to_decimal(trade.get("sz")),
+            side="buy" if trade.get("side") == "B" else "sell",
+            at=at, recv_at=datetime.now(timezone.utc),
+        )
         self.writer.append(
             "market_trades", self.name, asset,
             {

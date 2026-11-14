@@ -160,6 +160,14 @@ class LighterBookFeed:
                 continue
             self.seen_trades.add(trade_id)
             at = parse_epoch(row.get("timestamp") or message.get("timestamp"))
+            # Feed the print into the hub so a ladder a trade has traded
+            # through is provably stale, exactly as for the entropy feed.
+            self.hub.update_trade(
+                venue=self.name, symbol=asset,
+                price=to_decimal(row.get("price")), size=to_decimal(row.get("size")),
+                side=row.get("type") if isinstance(row.get("type"), str) else None,
+                at=at, recv_at=datetime.now(timezone.utc),
+            )
             self.writer.append(
                 "market_trades", self.name, asset,
                 {

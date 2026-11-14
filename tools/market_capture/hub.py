@@ -7,8 +7,28 @@ from typing import Any
 import time
 
 from .config import CaptureConfig
-from .model import Book, ReferenceQuote, decimal_text, edge_bps, to_iso
+from .model import Book, ReferenceQuote, decimal_text, edge_bps, spread_bps, to_iso
 from .storage import TapeWriter
+
+def _dec(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        out = Decimal(str(value))
+    except Exception:
+        return None
+    return out if out.is_finite() else None
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
 
 BOOK_VENUES = ("lighter_mainnet", "lighter_rh", "entropy")
 REFERENCE_HISTORY_SECONDS = 120.0
@@ -22,6 +42,8 @@ class MarketHub:
         self.references: dict[tuple[str, str], ReferenceQuote] = {}
         self._mid_quotes: dict[tuple[str, str], ReferenceQuote] = {}
         self._bbo_quotes: dict[tuple[str, str], ReferenceQuote] = {}
+        self._bbo_tops: dict[tuple[str, str], dict[str, Any]] = {}
+        self._last_trades: dict[tuple[str, str], dict[str, Any]] = {}
         self._history: dict[tuple[str, str], deque[tuple[datetime, dict[str, Any]]]] = {}
         self._last_book_write: dict[tuple[str, str], float] = {}
         self.quote_counts: Counter[tuple[str, str]] = Counter()
@@ -86,6 +108,104 @@ class MarketHub:
         if merged is not None:
             self.references[key] = merged
             self._remember(key, merged.recv_at, self._reference_snapshot(key, merged))
+
+    def update_bbo(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        bid: Decimal,
+        ask: Decimal,
+        quote_kind: str = "bbo",
+        recv_at: datetime | None = None,
+        source_at: datetime | None = None,
+        bid_size: Decimal | None = None,
+        ask_size: Decimal | None = None,
+        sequence: int | None = None,
+    ) -> None:
+        """Fast top-of-book channel.
+
+        Hyperliquid publishes `l2Book` ladders every ~7-12s, but pushes `bbo` on
+        every top-of-book change.  Without the fast channel every entropy round
+        is priced off a ladder that is already seconds old.
+        """
+        now = recv_at or datetime.now(timezone.utc)
+        key = (venue, symbol)
+        self._bbo_tops[key] = {
+            "bid": bid, "ask": ask, "bid_size": bid_size, "ask_size": ask_size,
+            "recv_at": now, "source_at": source_at, "quote_kind": quote_kind,
+            "sequence": sequence,
+        }
+        if bid is None or ask is None:
+            return
+        self.update_reference(
+            ReferenceQuote(
+                venue=venue, symbol=symbol, mid=(bid + ask) / 2, recv_at=now,
+                source_at=source_at, sequence=sequence, bid=bid, ask=ask,
+                bbo_recv_at=now, bbo_source_at=source_at, quote_kind=quote_kind,
+                notional_usd=self.notional,
+            )
+        )
+
+    def update_trade(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        price: Decimal | None,
+        size: Decimal | None = None,
+        side: str | None = None,
+        at: datetime | None = None,
+        recv_at: datetime | None = None,
+    ) -> None:
+        """Remember the last print so a stale ladder can be proven stale."""
+        if price is None:
+            return
+        self._last_trades[(venue, symbol)] = {
+            "price": price, "size": size, "side": side,
+            "at": at or datetime.now(timezone.utc),
+            "recv_at": recv_at or datetime.now(timezone.utc),
+        }
+
+    def _trade_staleness(
+        self,
+        venue: str,
+        symbol: str,
+        bid: Decimal | None,
+        ask: Decimal | None,
+        quote_at: datetime | None,
+        quote_source_at: datetime | None = None,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Prove a quote stale only when a later print traded through its top.
+
+        A quiet book is not a stale book: if nothing has printed since the
+        snapshot, the quoted top is still the live top.  A print above the ask
+        (or below the bid) after the snapshot is proof the ladder moved.
+        """
+        if bid is None or ask is None or quote_at is None:
+            return False, None
+        trade = self._last_trades.get((venue, symbol))
+        if not trade:
+            return False, None
+        at = trade.get("at")
+        price = trade.get("price")
+        received = trade.get("recv_at")
+        if at is None or price is None:
+            return False, None
+        # The print has to have been delivered after we snapshotted, and its own
+        # venue timestamp has to be at or after the snapshot's, or it is a
+        # delayed print that cannot carry information about the current top.
+        if received is not None and received <= quote_at:
+            return False, None
+        if quote_source_at is not None and at < quote_source_at:
+            return False, None
+        if price > ask:
+            return True, {"reason": "trade_above_ask", "trade_price": decimal_text(price),
+                          "trade_at": to_iso(at), "ask": decimal_text(ask)}
+        if price < bid:
+            return True, {"reason": "trade_below_bid", "trade_price": decimal_text(price),
+                          "trade_at": to_iso(at), "bid": decimal_text(bid)}
+        return False, None
 
     def _merge_reference(self, key: tuple[str, str]) -> ReferenceQuote | None:
         mid = self._mid_quotes.get(key)
@@ -178,25 +298,70 @@ class MarketHub:
             history.popleft()
 
     def latest(self, venue: str, symbol: str, *, max_age: float = 10.0) -> dict[str, Any] | None:
+        """Freshest tradeable quote: book ladder overlaid with the fast BBO.
+
+        The book still supplies depth-aware executable prices; the BBO supplies
+        the true top whenever it is newer.  `provably_stale` is set only when a
+        later print traded through the quoted top, which is the sound way to
+        call a quiet ladder wrong without inventing a staleness timer.
+        """
         now = datetime.now(timezone.utc)
-        book = self.books.get((venue, symbol))
-        if book is not None and (now - book.recv_at).total_seconds() <= max_age:
+        key = (venue, symbol)
+        book = self.books.get(key)
+        book_age = round((now - book.recv_at).total_seconds(), 3) if book is not None else None
+        bbo = self._bbo_tops.get(key)
+        bbo_age = round((now - bbo["recv_at"]).total_seconds(), 3) if bbo is not None else None
+        snap: dict[str, Any] | None = None
+        if book is not None and book_age is not None and book_age <= max_age:
             snap = self._book_snapshot(book)
-            snap["age_s"] = round((now - book.recv_at).total_seconds(), 3)
+            snap["age_s"] = book_age
             snap["recv_at"] = book.recv_at.isoformat()
             snap["source_at"] = book.source_at.isoformat() if book.source_at else None
-            return snap
-        key = (venue, symbol)
-        ref = self.references.get(key)
-        if ref is None:
-            return None
-        snap = self._reference_snapshot(key, ref)
-        if snap["age_s"] > max_age:
-            return None
-        snap["recv_at"] = ref.recv_at.isoformat()
-        snap["source_at"] = ref.source_at.isoformat() if ref.source_at else None
-        snap["bbo_recv_at"] = snap["bbo_recv_at"].isoformat() if snap["bbo_recv_at"] else None
-        snap["bbo_source_at"] = snap["bbo_source_at"].isoformat() if snap["bbo_source_at"] else None
+            snap["depth_source"] = "book"
+        if bbo is not None and bbo_age is not None and bbo_age <= max_age:
+            book_at = book.recv_at if book is not None else None
+            if snap is None or book_at is None or bbo["recv_at"] >= book_at:
+                if snap is None:
+                    snap = {
+                        "venue": venue, "symbol": symbol, "book_available": True,
+                        "continuity": True, "sequence": bbo.get("sequence"),
+                        "depth_source": "bbo_only",
+                    }
+                bid, ask = bbo.get("bid"), bbo.get("ask")
+                snap["bid"] = bid
+                snap["ask"] = ask
+                if bid is not None and ask is not None:
+                    snap["mid"] = (bid + ask) / 2
+                    snap["spread_bps"] = spread_bps(bid, ask)
+                    snap["executable_buy"] = ask
+                    snap["executable_sell"] = bid
+                snap["bid_size"] = bbo.get("bid_size")
+                snap["ask_size"] = bbo.get("ask_size")
+                snap["age_s"] = bbo_age
+                snap["recv_at"] = bbo["recv_at"].isoformat()
+                snap["source_at"] = bbo["source_at"].isoformat() if bbo.get("source_at") else snap.get("source_at")
+                snap["quote_kind"] = "book+bbo" if book is not None else "bbo"
+                if snap.get("depth_source") == "book":
+                    snap["depth_source"] = "bbo_overlay"
+        if snap is None:
+            ref = self.references.get(key)
+            if ref is None:
+                return None
+            snap = self._reference_snapshot(key, ref)
+            if snap["age_s"] > max_age:
+                return None
+            snap["recv_at"] = ref.recv_at.isoformat()
+            snap["source_at"] = ref.source_at.isoformat() if ref.source_at else None
+            snap["bbo_recv_at"] = snap["bbo_recv_at"].isoformat() if snap["bbo_recv_at"] else None
+            snap["bbo_source_at"] = snap["bbo_source_at"].isoformat() if snap["bbo_source_at"] else None
+        snap["book_age_s"] = book_age
+        snap["bbo_age_s"] = bbo_age
+        stale, evidence = self._trade_staleness(
+            venue, symbol, _dec(snap.get("bid")), _dec(snap.get("ask")),
+            _parse_iso(snap.get("recv_at")), _parse_iso(snap.get("source_at")),
+        )
+        snap["provably_stale"] = stale
+        snap["staleness_evidence"] = evidence
         return snap
 
     def as_of(self, venue: str, symbol: str, at: datetime | None) -> dict[str, Any] | None:

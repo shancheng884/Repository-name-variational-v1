@@ -80,7 +80,7 @@ async def main_async(args):
         return {"ok":True,"mode":"plan","orders_attempted":False,"assets":[a.name for a in assets],"venues":list(venues),"rounds":len(plan),"plan":[r.__dict__ for r in plan],"live_gate":"requires --mode preflight, then --mode run --execute --confirm-live-probes --confirm-flat --i-understand-live-orders"}
     cap,task,ex=await _session(args,env,assets,venues)
     try:
-        runner=ProbeRunner(hub=cap.hub,executors=ex,state=ProbeState(ROOT/"log"/"venue_probe"/"state.json"),writer_path=ROOT/"log"/"venue_probe"/"rounds.jsonl",assets=assets,venues=venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=3.0,max_quote_age_by_venue={"entropy":12.0},max_rounds=args.max_rounds)
+        runner=ProbeRunner(hub=cap.hub,executors=ex,state=ProbeState(ROOT/"log"/"venue_probe"/"state.json"),writer_path=ROOT/"log"/"venue_probe"/"rounds.jsonl",assets=assets,venues=venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=3.0,max_quote_age_by_venue={"entropy":6.0},horizons=(.25,.5,1.,3.,5.,10.),max_rounds=args.max_rounds)
         if args.mode=="preflight":
             health=await runner.preflight_all(); (ROOT/"log"/"venue_probe"/"preflight.json").write_text(json.dumps(health,ensure_ascii=False,indent=2,default=str)+"\n")
             return {"ok":all(v.get("ok") for v in health.values()),"mode":"preflight","orders_attempted":False,"health":health}

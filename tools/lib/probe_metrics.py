@@ -81,7 +81,12 @@ def _clock_offset_ms(execution_quote: Any) -> Decimal | None:
 
 
 def leg_timing(leg: dict[str, Any]) -> dict[str, Any]:
-    """Align venue fill timestamps with local submit/ack/complete stamps."""
+    """Align venue fill stamps with local submit/ack/complete stamps.
+
+    Venues stamp fills at a fixed resolution (Lighter: whole seconds).  When the
+    resolution is coarser than the round trip a point estimate is pure noise, so
+    the only honest output is the window the stamps actually support.
+    """
     submitted = _parse(leg.get("submitted_at"))
     acked = _parse(leg.get("acked_at"))
     completed = _parse(leg.get("completed_at") or leg.get("local_fill_at"))
@@ -89,16 +94,25 @@ def leg_timing(leg: dict[str, Any]) -> dict[str, Any]:
     offset = _d(leg.get("clock_offset_ms"))
     if offset is None:
         offset = _clock_offset_ms(leg.get("execution_quote"))
+    window = leg.get("fill_window") if isinstance(leg.get("fill_window"), dict) else {}
+    resolution = _d(window.get("resolution_ms")) or _d(leg.get("timestamp_resolution_ms"))
+    coarse = bool(resolution is not None and resolution >= 100)
     aligned = exchange_fill + timedelta(milliseconds=float(offset)) if exchange_fill is not None and offset is not None else None
+    bounds = None
+    if window.get("lower_ms") is not None and window.get("upper_ms") is not None:
+        bounds = {"lower_ms": window.get("lower_ms"), "upper_ms": window.get("upper_ms"),
+                  "capped_by_poll": bool(window.get("capped_by_poll"))}
     out: dict[str, Any] = {
         "exchange_fill_at": exchange_fill.isoformat() if exchange_fill else None,
         "local_fill_at": completed.isoformat() if completed else None,
         "clock_offset_ms": None if offset is None else str(offset),
-        "aligned_fill_at": aligned.isoformat() if aligned else None,
-        "submit_to_exchange_fill_ms": round((aligned - submitted).total_seconds() * 1000, 3) if aligned is not None and submitted is not None else None,
-        "exchange_fill_to_local_ms": round((completed - aligned).total_seconds() * 1000, 3) if aligned is not None and completed is not None else None,
+        "timestamp_resolution_ms": None if resolution is None else int(resolution),
+        "aligned_fill_at": None if coarse else (aligned.isoformat() if aligned else None),
+        "submit_to_exchange_fill_ms": None if coarse else (round((aligned - submitted).total_seconds() * 1000, 3) if aligned is not None and submitted is not None else None),
+        "exchange_fill_to_local_ms": None if coarse else (round((completed - aligned).total_seconds() * 1000, 3) if aligned is not None and completed is not None else None),
         "submit_to_local_fill_ms": round((completed - submitted).total_seconds() * 1000, 3) if completed is not None and submitted is not None else None,
         "ack_to_local_fill_ms": round((completed - acked).total_seconds() * 1000, 3) if completed is not None and acked is not None else None,
+        "fill_latency_bounds_ms": bounds,
     }
     out["timestamp_anomaly"] = bool(exchange_fill is not None and submitted is not None and exchange_fill < submitted and offset is None)
     return out
@@ -202,6 +216,30 @@ def _fill_stamp(leg: dict[str, Any]) -> Decimal | None:
         if parsed is not None:
             value = Decimal(str(parsed.timestamp()))
     return value
+
+
+def _entry_quote_audit(quotes: dict[str, Any], venues: list[str]) -> dict[str, Any]:
+    """How fresh the ladders behind the decision were, and whether they were disproved."""
+    by_venue: dict[str, Any] = {}
+    ages: list[Decimal] = []
+    for venue in venues:
+        q = quotes.get(venue) or {}
+        age = _d(q.get("age_s"))
+        if age is not None:
+            ages.append(age)
+        by_venue[venue] = {
+            "age_s": q.get("age_s"),
+            "book_age_s": q.get("book_age_s"),
+            "bbo_age_s": q.get("bbo_age_s"),
+            "quote_kind": q.get("quote_kind"),
+            "depth_source": q.get("depth_source"),
+            "provably_stale": bool(q.get("provably_stale")),
+        }
+    return {
+        "max_age_s": None if not ages else str(max(ages)),
+        "provably_stale": any(v["provably_stale"] for v in by_venue.values()),
+        "by_venue": by_venue,
+    }
 
 
 def decompose_round(row: dict[str, Any]) -> dict[str, Any]:
@@ -337,6 +375,7 @@ def decompose_round(row: dict[str, Any]) -> dict[str, Any]:
         "fees_unverified_legs": fee_unverified,
         "gross_pnl_usd": None if gross_pnl is None else str(gross_pnl),
         "gross_pnl_bps": None if pnl_bps is None else str(pnl_bps),
+        "entry_quote": _entry_quote_audit(entry_quotes, venues),
         "hedge_delay_ms": hedge_delay_ms,
         "hedge_delay_source": hedge_delay_source,
         "first_filled_venue": first_leg,
@@ -346,18 +385,41 @@ def decompose_round(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def adverse_move(row: dict[str, Any]) -> dict[str, Any]:
+def _entry_fill_at(row: dict[str, Any]) -> datetime | None:
+    """Latest local fill completion across the entry legs."""
+    stamps = []
+    for leg in ((row.get("entry") or {}).get("legs") or {}).values():
+        if not isinstance(leg, dict):
+            continue
+        at = _parse(leg.get("completed_at") or leg.get("local_fill_at"))
+        if at is not None:
+            stamps.append(at)
+    return max(stamps) if stamps else None
+
+
+def adverse_move(row: dict[str, Any], *, rejected: list[str] | None = None) -> dict[str, Any]:
     """Post-fill adverse move per venue and horizon, adverse-positive bps.
 
-    The probe already samples the mid at 0.25/0.5/1/3 seconds after entry; this
-    turns those points into the adverse-selection curve without any new data.
+    A markout only measures adverse selection when the quote was published
+    after the fill.  Reusing the pre-fill ladder silently reports "no adverse
+    move" for exactly the venues that lag most, so those samples are dropped
+    and counted instead of averaged in.
     """
     out: dict[str, Any] = {}
+    fill_at = _entry_fill_at(row)
     for point in row.get("adverse") or []:
         delay = point.get("delay_s")
         if delay is None:
             continue
         for venue, sample in (point.get("points") or {}).items():
+            valid = sample.get("valid")
+            if valid is None:
+                quote_at = _parse(sample.get("quote_at"))
+                valid = not (fill_at is not None and quote_at is not None and quote_at < fill_at)
+            if not valid:
+                if rejected is not None:
+                    rejected.append(f"{venue}:{delay}")
+                continue
             value = _d(sample.get("adverse_bps"))
             if value is None:
                 continue
@@ -403,6 +465,10 @@ def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal
     offsets: dict[str, list[Decimal]] = defaultdict(list)
     adverse: dict[tuple[str, str], list[Decimal]] = defaultdict(list)
     adverse_by_venue: dict[tuple[str, str, str], list[Decimal]] = defaultdict(list)
+    quote_ages: list[Decimal] = []
+    stale_entries = 0
+    latency_mid: dict[str, list[Decimal]] = defaultdict(list)
+    adverse_rejected = 0
     summaries = []
     for row in rounds:
         summary = decompose_round(row)
@@ -425,7 +491,21 @@ def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal
                 value = _d((timing or {}).get("clock_offset_ms"))
                 if value is not None:
                     offsets[str(venue)].append(value)
-        for venue, points in adverse_move(row).items():
+        quote_meta = summary.get("entry_quote") or {}
+        age = _d(quote_meta.get("max_age_s"))
+        if age is not None:
+            quote_ages.append(age)
+        if quote_meta.get("provably_stale"):
+            stale_entries += 1
+        for venue, timing in ((summary.get("timing") or {}).get("entry") or {}).items():
+            bounds = (timing or {}).get("fill_latency_bounds_ms") or {}
+            lower, upper = _d(bounds.get("lower_ms")), _d(bounds.get("upper_ms"))
+            if lower is not None and upper is not None:
+                latency_mid[str(venue)].append((lower + upper) / 2)
+        rejected: list[str] = []
+        points_by_venue = adverse_move(row, rejected=rejected)
+        adverse_rejected += len(rejected)
+        for venue, points in points_by_venue.items():
             for delay, value in points.items():
                 adverse[(summary.get("asset"), delay)].append(value)
                 adverse_by_venue[(summary.get("asset"), venue, delay)].append(value)
@@ -484,6 +564,10 @@ def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal
         "stages": {name: {"samples": len(values), "p50_bps": str(percentile(values, 50)), "p80_bps": str(percentile(values, 80))} for name, values in stages.items()},
         "hedge_delay_ms": {"samples": len(delays), "p50_ms": str(percentile(delays, 50)), "p80_ms": str(percentile(delays, 80)), "sources": dict(delay_sources)},
         "clock_offset_ms": {venue: {"samples": len(values), "min_ms": str(min(values)), "median_ms": str(percentile(values, 50))} for venue, values in sorted(offsets.items())},
+        "entry_quote_age_s": {"samples": len(quote_ages), "p50_s": str(percentile(quote_ages, 50)), "p80_s": str(percentile(quote_ages, 80))},
+        "entry_quote_stale_rounds": stale_entries,
+        "adverse_samples_rejected": adverse_rejected,
+        "fill_latency_ms": {venue: {"samples": len(v), "p50_ms": str(percentile(v, 50)), "p80_ms": str(percentile(v, 80)), "basis": "window_midpoint"} for venue, v in sorted(latency_mid.items())},
         "adverse_selection": {
             "by_horizon": {f"{asset}:{delay}s": {"samples": len(v), "p50_bps": str(percentile(v, 50)), "p80_bps": str(percentile(v, 80))} for (asset, delay), v in sorted(adverse.items())},
             "by_venue": {f"{asset}:{venue}:{delay}s": {"samples": len(v), "p50_bps": str(percentile(v, 50)), "p80_bps": str(percentile(v, 80))} for (asset, venue, delay), v in sorted(adverse_by_venue.items())},

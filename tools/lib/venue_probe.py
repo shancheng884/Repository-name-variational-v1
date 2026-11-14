@@ -1,7 +1,7 @@
 """Small-size, two-venue live probe rounds with idempotent order identities."""
 from __future__ import annotations
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
 from pathlib import Path
 from typing import Any, Protocol
@@ -194,7 +194,7 @@ class ProbeRound:
     round_id:str; asset:str; buy_venue:str; sell_venue:str; sequence:int
 
 class VariationalProbeExecutor:
-    venue="variational"; available=True
+    venue="variational"; available=True; timestamp_resolution_ms=1
     def __init__(self, command_url:str, *, timeout_seconds:float=8.0):
         self.command_url=command_url; self.timeout_seconds=timeout_seconds; self.client=None
     async def start(self):
@@ -324,6 +324,7 @@ def lighter_signing_chain_id(rest_url: str) -> int:
 
 
 class LighterProbeExecutor:
+    timestamp_resolution_ms=1000  # Lighter fill stamps are whole seconds
     def __init__(self,*,name,rest_url,account_index,api_key_index,private_key):
         self.venue=name; self.rest_url=rest_url.rstrip("/"); self.account_index=account_index; self.api_key_index=api_key_index; self.private_key=private_key
         self.available=bool(account_index is not None and api_key_index is not None and private_key); self.client=None; self.markets={}
@@ -455,8 +456,32 @@ class LighterProbeExecutor:
         return {"ok":False,"status":"unknown","error":"lighter_fill_timeout","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat()}
 def _int(v):
     p=_d(v); return int(p) if p is not None and p==p.to_integral_value() else None
+def _fill_window(*,submitted,acked,observed,exchange_at,resolution_ms):
+    """Bound the true fill time instead of inventing a precise one.
+
+    Venues stamp fills at a fixed resolution (Lighter: whole seconds).  A point
+    estimate built from a truncated stamp is wrong by up to a full tick, which
+    is why a 70ms round trip used to read as 1.1s.  The truth is the overlap of
+    ``[exchange_at, exchange_at+resolution)`` with ``[ack, observed]``.
+    """
+    out={"resolution_ms":None if resolution_ms is None else int(resolution_ms),"lower_ms":None,"upper_ms":None,
+         "exchange_at":_iso(exchange_at),"ack_at":_iso(acked),"observed_at":_iso(observed),"capped_by_poll":False}
+    if submitted is None or observed is None: return out
+    lower=acked or submitted
+    if exchange_at is not None and resolution_ms:
+        ex_lo=exchange_at; ex_hi=exchange_at+timedelta(milliseconds=float(resolution_ms))
+        if ex_hi>lower: lower=max(lower,ex_lo)
+        upper=min(observed,ex_hi)
+        if upper<lower:
+            lower=min(max(ex_lo,acked or submitted),observed); upper=observed
+            out["capped_by_poll"]=True
+    else:
+        upper=observed
+    out["lower_ms"]=round(max(0.,(lower-submitted).total_seconds()*1000),3)
+    out["upper_ms"]=round(max(0.,(upper-submitted).total_seconds()*1000),3)
+    return out
 class EntropyProbeExecutor:
-    venue="entropy"
+    venue="entropy"; timestamp_resolution_ms=1
     def __init__(self,*,info_url,account_address,private_key,dex="io",timeout_seconds=15.0,info=None,exchange=None):
         base=(info_url or "").rstrip("/")
         if base.endswith("/info"):
@@ -669,6 +694,7 @@ class ProbeRunner:
     def __init__(self,*,hub,executors,state,writer_path,assets,venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=2.5,hold_seconds=3.1,run_id=None,horizons=(.25,.5,1.,3.),max_quote_age_by_venue=None,max_rounds=0,lock_path=None):
         self.hub=hub; self.executors=executors; self.state=state; self.writer_path=writer_path; self.assets=assets; self.venues=venues; self.by_name={a.name:a for a in assets}; self.notional_usd=notional_usd; self.round_interval_seconds=max(.2,round_interval_seconds); self.max_quote_age_seconds=max_quote_age_seconds; self.max_quote_age_by_venue=dict(max_quote_age_by_venue or {}); self.hold_seconds=max(.5,hold_seconds); self.horizons=tuple(horizons); self.max_rounds=max(0,int(max_rounds)); self.run_id=run_id or "probe-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")+"-"+uuid.uuid4().hex[:4]; self.run_token=hashlib.sha256(self.run_id.encode()).hexdigest()[:8]
         self.lock=ProbeLock(lock_path or (Path(self.state.path).parent/"run.lock"))
+        self._last_quote_reject=None
     def _write(self,row):
         self.writer_path.parent.mkdir(parents=True,exist_ok=True)
         with self.writer_path.open("a",encoding="utf-8") as f: f.write(json.dumps(row,ensure_ascii=False,default=str)+"\n")
@@ -783,9 +809,21 @@ class ProbeRunner:
             await asyncio.sleep(self.round_interval_seconds)
         self.state.data["phase"]="completed" if self.state.data.get("phase")!="manual_review_required" else "manual_review_required"; self.state.save()
         return {"ok":self.state.data["phase"]=="completed","mode":"live","rounds":completed,"state":self.state.data["phase"]}
-    async def _quote(self,venue,asset):
+    async def _quote(self,venue,asset,*,allow_stale=False):
+        """Latest quote for a venue, rejecting ladders a print has disproved.
+
+        `provably_stale` comes from the capture hub: a trade printed through the
+        quoted top after the snapshot.  Trading on that ladder is a guaranteed
+        adverse fill, so it is treated exactly like a missing quote.
+        """
         q=self.hub.latest(venue,asset.name,max_age=self.max_quote_age_by_venue.get(venue,self.max_quote_age_seconds))
-        if q is None or _d(q.get("mid")) is None or _d(q.get("bid")) is None or _d(q.get("ask")) is None: return None
+        if q is None or _d(q.get("mid")) is None or _d(q.get("bid")) is None or _d(q.get("ask")) is None:
+            self._last_quote_reject={"venue":venue,"asset":asset.name,"reason":"quote_unavailable"}
+            return None
+        if q.get("provably_stale") and not allow_stale:
+            self._last_quote_reject={"venue":venue,"asset":asset.name,"reason":"quote_provably_stale","evidence":q.get("staleness_evidence")}
+            return None
+        self._last_quote_reject=None
         return q
     async def _wait_quotes(self,item,timeout=8.0):
         asset=self.by_name[item.asset]; deadline=time.monotonic()+timeout
@@ -892,7 +930,7 @@ class ProbeRunner:
 
     async def _execute_round(self,item):
         asset=self.by_name[item.asset]; pair=await self._wait_quotes(item)
-        if pair is None: return {"schema":1,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"skipped","reason":"quote_unavailable"}
+        if pair is None: return {"schema":1,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"skipped","reason":(self._last_quote_reject or {}).get("reason") or "quote_unavailable","quote_reject":self._last_quote_reject}
         buy,sell=pair; qty=self._qty(item,buy,sell)
         if qty is None: return {"schema":1,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"skipped","reason":"qty_below_venue_minimum"}
         # Decision quotes are the signal; submit quotes are what each order was
@@ -901,13 +939,32 @@ class ProbeRunner:
         submit={}
         for venue,decision_quote in ((item.buy_venue,buy),(item.sell_venue,sell)):
             fresh=await self._quote(venue,asset)
+            if fresh is None and (self._last_quote_reject or {}).get("reason")=="quote_provably_stale":
+                return {"schema":1,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,
+                        "asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,
+                        "status":"skipped","reason":"quote_provably_stale_before_submit",
+                        "quote_reject":self._last_quote_reject}
             submit[venue]=fresh or decision_quote
         ids={item.buy_venue:self._cid(item,"entry",item.buy_venue),item.sell_venue:self._cid(item,"entry",item.sell_venue)}
         signal_edge=((_d(sell["bid"])-_d(buy["ask"]))/((_d(sell["bid"])+_d(buy["ask"]))/2)*BPS) if _d(sell["bid"]) and _d(buy["ask"]) else ZERO
-        row={"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"submitting","notional_usd":str(self.notional_usd),"target_qty":str(qty),"decision":{"at":datetime.now(timezone.utc).isoformat(),"quotes":{item.buy_venue:buy,item.sell_venue:sell},"submit_quotes":submit,"signal_edge_bps":str(signal_edge),"entry_client_order_ids":ids}}
+        row={"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"submitting","notional_usd":str(self.notional_usd),"target_qty":str(qty),"decision":{"at":datetime.now(timezone.utc).isoformat(),"quotes":{item.buy_venue:buy,item.sell_venue:sell},"submit_quotes":submit,"signal_edge_bps":str(signal_edge),"entry_client_order_ids":ids,
+                "quote_audit":{v:{"age_s":(buy if v==item.buy_venue else sell).get("age_s"),
+                                  "book_age_s":(buy if v==item.buy_venue else sell).get("book_age_s"),
+                                  "bbo_age_s":(buy if v==item.buy_venue else sell).get("bbo_age_s"),
+                                  "quote_kind":(buy if v==item.buy_venue else sell).get("quote_kind"),
+                                  "provably_stale":bool((buy if v==item.buy_venue else sell).get("provably_stale"))}
+                            for v in (item.buy_venue,item.sell_venue)}}}
         self.state.data["current"]=row; self.state.data["orders_attempted"]=True; self.state.save()
         results=await asyncio.gather(self.executors[item.buy_venue].market_order(asset=asset,side="buy",qty=qty,quote=submit[item.buy_venue],client_order_id=ids[item.buy_venue]),self.executors[item.sell_venue].market_order(asset=asset,side="sell",qty=qty,quote=submit[item.sell_venue],client_order_id=ids[item.sell_venue]),return_exceptions=True)
         receipts={item.buy_venue:results[0],item.sell_venue:results[1]}
+        for venue,receipt in receipts.items():
+            if not isinstance(receipt,dict): continue
+            receipt["timestamp_resolution_ms"]=getattr(self.executors[venue],"timestamp_resolution_ms",None)
+            receipt["fill_window"]=_fill_window(submitted=_parse(receipt.get("submitted_at")),
+                                                acked=_parse(receipt.get("acked_at")),
+                                                observed=_parse(receipt.get("completed_at")),
+                                                exchange_at=_parse(receipt.get("source_at")),
+                                                resolution_ms=getattr(self.executors[venue],"timestamp_resolution_ms",None))
         row["entry"]={"legs":{v:{**(r if isinstance(r,dict) else {"ok":False,"status":"error","error":str(r)}),"side":"buy" if v==item.buy_venue else "sell","client_order_id":ids[v]} for v,r in receipts.items()},"quotes":{item.buy_venue:buy,item.sell_venue:sell},"submit_quotes":submit}
         self.state.data["current"]=row; self.state.save()
         unknown=[v for v,r in receipts.items() if not isinstance(r,dict) or r.get("status") in ("unknown","error")]
@@ -970,14 +1027,26 @@ class ProbeRunner:
             receipts[bigger]["resized_qty"]=str(normalized)
             row["entry"]["legs"][bigger]={**receipts[bigger],"side":"buy" if bigger==item.buy_venue else "sell","client_order_id":ids[bigger]}
         adverse=[]; start=time.monotonic()
+        first_fill=next((_parse(r.get("completed_at")) for r in receipts.values() if isinstance(r,dict) and r.get("completed_at")),None)
         for delay in self.horizons:
             await asyncio.sleep(max(0.,delay-(time.monotonic()-start))); pts={}
             for v,r in receipts.items():
-                q=await self._quote(v,asset)
+                q=await self._quote(v,asset,allow_stale=True)
                 if q is None: continue
                 mid=_d(q.get("mid")); fill=_d(r.get("avg_price")); side="buy" if v==item.buy_venue else "sell"
                 if mid is None or fill is None: continue
-                pts[v]={"mid":str(mid),"adverse_bps":str(((fill-mid) if side=="buy" else (mid-fill))/fill*BPS),"quote_at":q.get("recv_at")}
+                quote_at=_parse(q.get("recv_at"))
+                # A markout is only a measurement when the quote was published
+                # after the fill.  Reusing the pre-fill ladder would report a
+                # fake "no adverse move" for exactly the venues that lag most.
+                predates=bool(first_fill is not None and quote_at is not None and quote_at<first_fill)
+                stale=bool(q.get("provably_stale"))
+                pts[v]={"mid":str(mid),"adverse_bps":str(((fill-mid) if side=="buy" else (mid-fill))/fill*BPS),
+                        "quote_at":q.get("recv_at"),"quote_age_s":q.get("age_s"),
+                        "book_age_s":q.get("book_age_s"),"bbo_age_s":q.get("bbo_age_s"),
+                        "quote_kind":q.get("quote_kind"),
+                        "valid":not predates and not stale,
+                        "invalid_reason":("quote_predates_fill" if predates else ("quote_provably_stale" if stale else None))}
             adverse.append({"delay_s":delay,"points":pts})
         row["adverse"]=adverse
         close_ids={v:self._cid(item,"exit",v) for v in receipts}
