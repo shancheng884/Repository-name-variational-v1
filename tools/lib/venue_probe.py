@@ -129,18 +129,17 @@ class VariationalProbeExecutor:
         return {"bid":str(bid),"ask":str(ask),"mid":str((bid+ask)/2),"quote_id":qid,"quote_timestamp":str(qts),"request_started_at":started.isoformat(),"received_at":recv.isoformat(),"request_latency_ms":round((recv-started).total_seconds()*1000,3)},None,started,recv
     async def market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
         assert self.client is not None
-        exec_quote,quote_error,submitted,quote_recv=await self._execution_quote(asset,qty)
-        if exec_quote is None:
-            return {"ok":False,"status":"rejected","error":quote_error,"client_order_id":client_order_id,"submitted_at":submitted.isoformat()}
-        quote_id=exec_quote["quote_id"]; quote_at=exec_quote["quote_timestamp"]
         submitted=datetime.now(timezone.utc)
-        payload={"type":"VAR_API_ORDER","requestId":client_order_id,"market":asset.symbol("variational"),"instrumentType":asset.var_instrument_type,"settlementAsset":"USDC","kind":asset.var_kind,"fundingIntervalS":0,"side":side.upper(),"amount":format(qty,"f"),"confirm":True,"reuseQuoteId":quote_id,"quoteTimestamp":quote_at,"expectedQuotePrice":exec_quote["mid"],"dispatchQuoteAgeLimitMs":2000,"maxSlippage":float(max_slippage_bps/BPS),"reduceOnly":bool(reduce_only),"requestTimeoutMs":int(self.timeout_seconds*1000),"operationTimeoutMs":int(self.timeout_seconds*1000)}
+        payload={"type":"VAR_API_ORDER","requestId":client_order_id,"market":asset.symbol("variational"),"instrumentType":asset.var_instrument_type,"settlementAsset":"USDC","kind":asset.var_kind,"fundingIntervalS":0,"side":side.upper(),"amount":format(qty,"f"),"confirm":True,"maxSlippage":float(max_slippage_bps/BPS),"reduceOnly":bool(reduce_only),"requestTimeoutMs":int(self.timeout_seconds*1000),"operationTimeoutMs":int(self.timeout_seconds*1000)}
         try: message=await self.client.request(payload)
         except Exception as exc:
             return {"ok":False,"status":"unknown","error":f"{type(exc).__name__}:{exc}","client_order_id":client_order_id,"submitted_at":submitted.isoformat()}
         acked=datetime.now(timezone.utc); result=message.get("result") if isinstance(message,dict) else None
         if not isinstance(result,dict) or message.get("ok") is not True or result.get("ok") is not True:
             return {"ok":False,"status":"unknown","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"error":str((result or {}).get("error") or (message or {}).get("error") or "variational_order_unconfirmed")[:200]}
+        bid=_d(result.get("bid")); ask=_d(result.get("ask")); qid=str(result.get("quoteId") or result.get("quote_id") or "") or None
+        qts=str(result.get("quoteTimestamp") or result.get("timestamp") or "") or None
+        exec_quote={"bid":str(bid) if bid is not None else None,"ask":str(ask) if ask is not None else None,"mid":str((bid+ask)/2) if bid is not None and ask is not None else None,"quote_id":qid,"quote_timestamp":qts}
         rfq=str(result.get("rfqId") or result.get("rfq_id") or "") or None; oid=str(result.get("orderId") or result.get("order_id") or "") or None
         receipt=await self._poll(client_order_id,submitted,acked,rfq,oid,qty)
         receipt["execution_quote"]=exec_quote
@@ -242,7 +241,7 @@ class LighterProbeExecutor:
             return {"ok":False,"status":"unknown","error":f"{type(exc).__name__}:{exc}","client_order_id":client_order_id,"submitted_at":submitted.isoformat()}
         acked=datetime.now(timezone.utc); body=_model_dict(response)
         if error is not None or body is None or _int(body.get("code")) not in (0,200):
-            return {"ok":False,"status":"unknown","error":"lighter_sendtx_unconfirmed","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat()}
+            return {"ok":False,"status":"unknown","error":"lighter_sendtx_unconfirmed","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"response_code":(_int(body.get("code")) if body else None),"sdk_error":(str(error)[:300] if error is not None else None)}
         return await self._poll(client_order_id,cidx,submitted,acked,int(market["market_id"]))
     async def _poll(self,client_order_id,cidx,submitted,acked,market_id):
         from lighter import OrderApi
@@ -526,7 +525,18 @@ class ProbeRunner:
         row["entry"]={"legs":{v:{**(r if isinstance(r,dict) else {"ok":False,"status":"error","error":str(r)}),"side":"buy" if v==item.buy_venue else "sell","client_order_id":ids[v]} for v,r in receipts.items()},"quotes":{item.buy_venue:buy,item.sell_venue:sell}}
         filled=[v for v,r in receipts.items() if isinstance(r,dict) and r.get("status")=="filled"]
         unknown=[v for v,r in receipts.items() if not isinstance(r,dict) or r.get("status")=="unknown"]
-        if unknown: row["status"]="manual_review_required"; row["reason"]="entry_terminal_status_unknown"; return row
+        if unknown:
+            row["status"]="manual_review_required"; row["reason"]="entry_terminal_status_unknown"
+            rollbacks={}
+            for v in filled:
+                original=receipts[v]; cq=await self._quote(v,asset); cid=f"{item.round_id}-rollback-{v}"
+                cs="sell" if v==item.buy_venue else "buy"
+                close=await self.executors[v].market_order(asset=asset,side=cs,qty=_d(original.get("filled_qty")) or qty,quote=cq or {},client_order_id=cid,reduce_only=True)
+                rollbacks[v]=close
+                if not isinstance(close,dict) or close.get("status")!="filled":
+                    row["reason"]="entry_unknown_and_rollback_not_confirmed"
+            if rollbacks: row["rollback"]=rollbacks
+            return row
         if len(filled)!=2:
             row["status"]="rolled_back" if filled else "no_fill"
             if filled:

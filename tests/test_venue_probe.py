@@ -75,7 +75,8 @@ def test_unknown_entry_blocks_exit_and_requires_review(tmp_path):
     item = ProbeRound("r1", "NVDA", "a", "b", 1)
     row = asyncio.run(runner._run_one(item))
     assert row["status"] == "manual_review_required"
-    assert len(a.calls) + len(b.calls) == 2
+    assert len(a.calls) + len(b.calls) == 3
+    assert sum(1 for call in a.calls + b.calls if call[2]) == 1
 
 
 def test_preflight_rejects_insufficient_margin(tmp_path):
