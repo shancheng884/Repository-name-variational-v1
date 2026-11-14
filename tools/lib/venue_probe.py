@@ -168,6 +168,20 @@ class VariationalProbeExecutor:
             await asyncio.sleep(.15)
         return {"ok":False,"status":"unknown","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"rfq_id":rfq_id,"order_id":order_id,"error":"variational_fill_timeout"}
 
+LIGHTER_MAINNET_CHAIN_ID=304
+LIGHTER_TESTNET_CHAIN_ID=300
+LIGHTER_RH_MAINNET_CHAIN_ID=466324
+
+
+def lighter_signing_chain_id(rest_url: str) -> int:
+    url=(rest_url or "").lower()
+    if "api.rh.lighter.xyz" in url:
+        return LIGHTER_RH_MAINNET_CHAIN_ID
+    if "testnet" in url or "rh-testnet" in url:
+        return LIGHTER_TESTNET_CHAIN_ID
+    return LIGHTER_MAINNET_CHAIN_ID
+
+
 class LighterProbeExecutor:
     def __init__(self,*,name,rest_url,account_index,api_key_index,private_key):
         self.venue=name; self.rest_url=rest_url.rstrip("/"); self.account_index=account_index; self.api_key_index=api_key_index; self.private_key=private_key
@@ -179,6 +193,10 @@ class LighterProbeExecutor:
         rows=r.json().get("order_books") or []
         self.markets={str(x.get("symbol") or "").upper():x for x in rows if isinstance(x,dict)}
         self.client=SignerClient(url=self.rest_url,account_index=int(self.account_index),api_private_keys={int(self.api_key_index):self.private_key})
+        chain_id=lighter_signing_chain_id(self.rest_url)
+        if int(getattr(self.client,"chain_id",0))!=chain_id:
+            self.client.chain_id=chain_id
+            self.client.create_client(int(self.api_key_index))
         if self.client.check_client() is not None: raise ProbeError(f"{self.venue}_sdk_preflight_failed")
     async def close(self):
         if self.client is not None:

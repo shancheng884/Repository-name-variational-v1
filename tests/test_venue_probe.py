@@ -5,7 +5,7 @@ import asyncio, json
 
 from tools.market_capture.config import DEFAULT_ASSETS
 from tools.lib.probe_metrics import calibrate, decompose_round
-from tools.lib.venue_probe import ProbeRound, ProbeRunner, ProbeState, enumerate_probe_plan
+from tools.lib.venue_probe import ProbeRound, ProbeRunner, ProbeState, enumerate_probe_plan, lighter_signing_chain_id
 
 
 class FakeHub:
@@ -120,3 +120,10 @@ def test_lighter_poll_matches_saved_client_index(monkeypatch):
     assert out["status"] == "filled"
     assert out["filled_qty"] == "0.1"
     assert out["avg_price"] == "100"
+
+
+def test_lighter_signing_chain_id_matches_deployment():
+    assert lighter_signing_chain_id("https://mainnet.zklighter.elliot.ai") == 304
+    assert lighter_signing_chain_id("https://testnet.zklighter.elliot.ai") == 300
+    assert lighter_signing_chain_id("https://api.rh.lighter.xyz") == 466324
+    assert lighter_signing_chain_id("https://api.rh-testnet.lighter.xyz") == 300
