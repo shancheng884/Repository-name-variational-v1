@@ -91,3 +91,31 @@ def test_preflight_rejects_insufficient_margin(tmp_path):
     assert out["variational:NVDA"]["ok"] is False
     assert out["variational:NVDA"]["error"] == "variational_insufficient_margin"
     assert out["lighter_mainnet:NVDA"]["ok"] is True
+
+
+def test_lighter_poll_matches_saved_client_index(monkeypatch):
+    import sys, types
+    from datetime import datetime, timezone
+    from tools.lib.venue_probe import LighterProbeExecutor
+
+    class Resp:
+        def to_dict(self):
+            return {"code": 200, "orders": [{
+                "client_order_index": 123, "status": "filled",
+                "filled_base_amount": "0.1", "filled_quote_amount": "10",
+                "order_index": "9", "updated_at": "2026-11-14T02:00:00Z",
+            }]}
+    class Api:
+        def __init__(self, _client): pass
+        async def account_inactive_orders(self, **kwargs): return Resp()
+    class Client:
+        api_client = object()
+        def create_auth_token_with_expiry(self, **kwargs): return "token", None
+    monkeypatch.setitem(sys.modules, "lighter", types.SimpleNamespace(OrderApi=Api))
+    ex = LighterProbeExecutor(name="lighter_mainnet", rest_url="https://x", account_index=1, api_key_index=2, private_key="x")
+    ex.client = Client()
+    now = datetime.now(timezone.utc)
+    out = asyncio.run(ex._poll("cid", 123, now, now, 110))
+    assert out["status"] == "filled"
+    assert out["filled_qty"] == "0.1"
+    assert out["avg_price"] == "100"

@@ -257,11 +257,11 @@ class LighterProbeExecutor:
                 row=matches[0]; status=str(row.get("status") or "").lower(); filled=_d(row.get("filled_base_amount")) or ZERO; quote=_d(row.get("filled_quote_amount")) or ZERO
                 if status=="filled" and filled>0 and quote>0:
                     fill_at=_parse(row.get("updated_at") or row.get("created_at"))
-                    return {"ok":True,"status":"filled","client_order_id":client_order_id,"filled_qty":str(filled),"avg_price":str(quote/filled),"order_id":str(row.get("order_index") or row.get("order_id") or ""),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":_iso(fill_at),"source_at_epoch":fill_at.timestamp() if fill_at else None,"fee_usd":None}
+                    return {"ok":True,"status":"filled","client_order_id":client_order_id,"filled_qty":str(filled),"avg_price":format(quote/filled,"f"),"order_id":str(row.get("order_index") or row.get("order_id") or ""),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":_iso(fill_at),"source_at_epoch":fill_at.timestamp() if fill_at else None,"fee_usd":None}
                 if status.startswith("canceled"):
                     if filled>0 and quote>0:
                         fill_at=_parse(row.get("updated_at") or row.get("created_at"))
-                        return {"ok":True,"status":"filled","partial":True,"client_order_id":client_order_id,"filled_qty":str(filled),"avg_price":str(quote/filled),"order_id":str(row.get("order_index") or row.get("order_id") or ""),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":_iso(fill_at),"source_at_epoch":fill_at.timestamp() if fill_at else None,"fee_usd":None}
+                        return {"ok":True,"status":"filled","partial":True,"client_order_id":client_order_id,"filled_qty":str(filled),"avg_price":format(quote/filled,"f"),"order_id":str(row.get("order_index") or row.get("order_id") or ""),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":_iso(fill_at),"source_at_epoch":fill_at.timestamp() if fill_at else None,"fee_usd":None}
                     return {"ok":True,"status":"rejected","client_order_id":client_order_id,"filled_qty":"0","submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"error":status}
             await asyncio.sleep(.12)
         return {"ok":False,"status":"unknown","error":"lighter_fill_timeout","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat()}
@@ -433,8 +433,8 @@ class ProbeState:
         self.path.parent.mkdir(parents=True,exist_ok=True); tmp=self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data,ensure_ascii=False,indent=2,default=str)+"\n"); os.replace(tmp,self.path)
 class ProbeRunner:
-    def __init__(self,*,hub,executors,state,writer_path,assets,venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=2.5,hold_seconds=3.1,run_id=None,horizons=(.25,.5,1.,3.),max_quote_age_by_venue=None):
-        self.hub=hub; self.executors=executors; self.state=state; self.writer_path=writer_path; self.assets=assets; self.venues=venues; self.by_name={a.name:a for a in assets}; self.notional_usd=notional_usd; self.round_interval_seconds=max(.2,round_interval_seconds); self.max_quote_age_seconds=max_quote_age_seconds; self.max_quote_age_by_venue=dict(max_quote_age_by_venue or {}); self.hold_seconds=max(.5,hold_seconds); self.horizons=tuple(horizons); self.run_id=run_id or "probe-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    def __init__(self,*,hub,executors,state,writer_path,assets,venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=2.5,hold_seconds=3.1,run_id=None,horizons=(.25,.5,1.,3.),max_quote_age_by_venue=None,max_rounds=0):
+        self.hub=hub; self.executors=executors; self.state=state; self.writer_path=writer_path; self.assets=assets; self.venues=venues; self.by_name={a.name:a for a in assets}; self.notional_usd=notional_usd; self.round_interval_seconds=max(.2,round_interval_seconds); self.max_quote_age_seconds=max_quote_age_seconds; self.max_quote_age_by_venue=dict(max_quote_age_by_venue or {}); self.hold_seconds=max(.5,hold_seconds); self.horizons=tuple(horizons); self.max_rounds=max(0,int(max_rounds)); self.run_id=run_id or "probe-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     def _write(self,row):
         self.writer_path.parent.mkdir(parents=True,exist_ok=True)
         with self.writer_path.open("a",encoding="utf-8") as f: f.write(json.dumps(row,ensure_ascii=False,default=str)+"\n")
@@ -481,6 +481,7 @@ class ProbeRunner:
         completed=0
         for idx,item in enumerate(plan):
             if idx<int(self.state.data.get("cursor") or 0): continue
+            if self.max_rounds and completed>=self.max_rounds: break
             if self.state.data.get("phase")=="manual_review_required": break
             row=await self._run_one(item); self._write(row)
             if row.get("status") in {"filled","rolled_back","no_fill"}:
