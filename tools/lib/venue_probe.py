@@ -500,7 +500,14 @@ class ProbeRunner:
             if idx<int(self.state.data.get("cursor") or 0): continue
             if self.max_rounds and completed>=self.max_rounds: break
             if self.state.data.get("phase")=="manual_review_required": break
-            row=await self._run_one(item); self._write(row)
+            try:
+                row=await self._run_one(item)
+            except Exception as exc:
+                current=self.state.data.get("current") or {"schema":1,"event":"probe_round","round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue}
+                current["status"]="manual_review_required"; current["reason"]=f"runtime_exception:{type(exc).__name__}:{exc}"
+                self.state.data["current"]=current; self.state.data["phase"]="manual_review_required"; self.state.save(); self._write(current)
+                return {"ok":False,"mode":"live","rounds":completed,"state":"manual_review_required","error":current["reason"]}
+            self._write(row)
             if row.get("status") in {"filled","rolled_back","no_fill"}:
                 self.state.data["rounds"].append(row); self.state.data["cursor"]=idx+1; self.state.data["current"]=None; completed+=1; self.state.save()
             else:
@@ -541,6 +548,7 @@ class ProbeRunner:
         results=await asyncio.gather(self.executors[item.buy_venue].market_order(asset=asset,side="buy",qty=qty,quote=buy,client_order_id=ids[item.buy_venue]),self.executors[item.sell_venue].market_order(asset=asset,side="sell",qty=qty,quote=sell,client_order_id=ids[item.sell_venue]),return_exceptions=True)
         receipts={item.buy_venue:results[0],item.sell_venue:results[1]}
         row["entry"]={"legs":{v:{**(r if isinstance(r,dict) else {"ok":False,"status":"error","error":str(r)}),"side":"buy" if v==item.buy_venue else "sell","client_order_id":ids[v]} for v,r in receipts.items()},"quotes":{item.buy_venue:buy,item.sell_venue:sell}}
+        self.state.data["current"]=row; self.state.save()
         filled=[v for v,r in receipts.items() if isinstance(r,dict) and r.get("status")=="filled"]
         unknown=[v for v,r in receipts.items() if not isinstance(r,dict) or r.get("status")=="unknown"]
         if unknown:
@@ -554,6 +562,7 @@ class ProbeRunner:
                 if not isinstance(close,dict) or close.get("status")!="filled":
                     row["reason"]="entry_unknown_and_rollback_not_confirmed"
             if rollbacks: row["rollback"]=rollbacks
+            self.state.data["current"]=row; self.state.save()
             return row
         if len(filled)!=2:
             row["status"]="rolled_back" if filled else "no_fill"
@@ -562,6 +571,7 @@ class ProbeRunner:
                 close=await self.executors[v].market_order(asset=asset,side=cs,qty=_d(original.get("filled_qty")) or qty,quote=cq or {},client_order_id=cid,reduce_only=True)
                 row["rollback"]={"leg":v,"close":close}
                 if close.get("status")!="filled": row["status"]="manual_review_required"; row["reason"]="rollback_not_confirmed"
+            self.state.data["current"]=row; self.state.save()
             return row
         adverse=[]; start=time.monotonic()
         for delay in self.horizons:
