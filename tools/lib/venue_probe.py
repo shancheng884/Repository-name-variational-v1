@@ -730,8 +730,8 @@ class ProbeState:
         tmp.write_text(json.dumps(self.data,ensure_ascii=False,indent=2,default=str)+"\n"); os.replace(tmp,self.path)
 class ProbeRunner:
     TERMINAL={"filled","rolled_back","no_fill","skipped"}
-    def __init__(self,*,hub,executors,state,writer_path,assets,venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=2.5,hold_seconds=3.1,run_id=None,horizons=(.25,.5,1.,3.),max_quote_age_by_venue=None,max_rounds=0,lock_path=None):
-        self.hub=hub; self.executors=executors; self.state=state; self.writer_path=writer_path; self.assets=assets; self.venues=venues; self.by_name={a.name:a for a in assets}; self.notional_usd=notional_usd; self.round_interval_seconds=max(.2,round_interval_seconds); self.max_quote_age_seconds=max_quote_age_seconds; self.max_quote_age_by_venue=dict(max_quote_age_by_venue or {}); self.hold_seconds=max(.5,hold_seconds); self.horizons=tuple(horizons); self.max_rounds=max(0,int(max_rounds)); self.run_id=run_id or "probe-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")+"-"+uuid.uuid4().hex[:4]; self.run_token=hashlib.sha256(self.run_id.encode()).hexdigest()[:8]
+    def __init__(self,*,hub,executors,state,writer_path,assets,venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=2.5,hold_seconds=3.1,run_id=None,horizons=(.25,.5,1.,3.),max_quote_age_by_venue=None,max_rounds=0,lock_path=None,market_quote_wait_seconds=15.0):
+        self.hub=hub; self.executors=executors; self.state=state; self.writer_path=writer_path; self.assets=assets; self.venues=venues; self.by_name={a.name:a for a in assets}; self.notional_usd=notional_usd; self.round_interval_seconds=max(.2,round_interval_seconds); self.max_quote_age_seconds=max_quote_age_seconds; self.max_quote_age_by_venue=dict(max_quote_age_by_venue or {}); self.market_quote_wait_seconds=float(market_quote_wait_seconds); self.hold_seconds=max(.5,hold_seconds); self.horizons=tuple(horizons); self.max_rounds=max(0,int(max_rounds)); self.run_id=run_id or "probe-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")+"-"+uuid.uuid4().hex[:4]; self.run_token=hashlib.sha256(self.run_id.encode()).hexdigest()[:8]
         self.lock=ProbeLock(lock_path or (Path(self.state.path).parent/"run.lock"))
         self._last_quote_reject=None
     def _write(self,row):
@@ -760,8 +760,19 @@ class ProbeRunner:
                 if not asset.supports(venue):
                     continue
                 age=self.max_quote_age_by_venue.get(venue,self.max_quote_age_seconds)
-                q=self.hub.latest(venue,asset.name,max_age=age)
                 key=f"{venue}:{asset.name}:market"
+                q=None
+                # A quiet or reconnecting venue needs a moment to publish its
+                # first quote.  Failing preflight on the very first look turns
+                # a cold feed into a blocked run.
+                deadline=time.monotonic()+self.market_quote_wait_seconds
+                while True:
+                    q=self.hub.latest(venue,asset.name,max_age=age)
+                    if q is not None and q.get("bid") is not None and q.get("ask") is not None:
+                        break
+                    if time.monotonic()>=deadline:
+                        break
+                    await asyncio.sleep(0.75)
                 out[key]={"ok":q is not None and q.get("bid") is not None and q.get("ask") is not None,
                           "quote_kind":(q or {}).get("quote_kind"),
                           "age_s":(q or {}).get("age_s"),

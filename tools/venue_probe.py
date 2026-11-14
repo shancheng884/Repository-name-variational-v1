@@ -50,7 +50,7 @@ async def _wait_ready(runner,assets,venues,timeout=35.0):
         if runner.hub is not None:
             ok=0
             for v,s in needed:
-                q=runner.hub.latest(v,s,max_age=(12.0 if v=="entropy" else 5.0))
+                q=runner.hub.latest(v,s,max_age=(6.0 if v=="entropy" else 5.0))
                 if q and q.get("mid") is not None and q.get("bid") is not None and q.get("ask") is not None: ok+=1
             if ok>=len(needed): return {"ready":True,"quoted":ok,"needed":len(needed)}
         await asyncio.sleep(.25)
