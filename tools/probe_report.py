@@ -18,7 +18,7 @@ def main():
   for line in path.read_text(errors="ignore").splitlines():
    try:
     r=json.loads(line)
-    if r.get("event")=="probe_round" and r.get("status") in {"filled","rolled_back","no_fill"}: rows.append(r)
+    if r.get("event")=="probe_round" and r.get("status") in {"filled","rolled_back","no_fill","skipped"}: rows.append(r)
    except ValueError: pass
  result=calibrate(rows,target_bps=Decimal(str(a.target_bps)))
  Path(a.output).parent.mkdir(parents=True,exist_ok=True); Path(a.output).write_text(json.dumps(result,ensure_ascii=False,indent=2))

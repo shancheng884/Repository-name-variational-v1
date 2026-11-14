@@ -57,3 +57,46 @@ The suggestion is research output. It does not change live thresholds.
 Entropy quotes and public fills are captured. Live Entropy orders are blocked
 until a trading signer private key is provisioned; `ENTROPY_ACCOUNT_ADDRESS`
 alone is only sufficient for read-only `userFills`.
+
+## Recovery between runs
+
+`log/venue_probe/state.json` is scoped to one run id. A new run starts with a
+fresh cursor; it never inherits the finished cursor of an earlier run. Client
+order ids are prefixed with a token derived from the run id, so round 2 cannot
+collide with round 1 ids at any venue.
+
+If the previous run left an unresolved round (`current` with a non-terminal
+status, or `phase=manual_review_required`), a new live run refuses to start and
+returns `unresolved_round_requires_review` with that round id. Reconcile both
+venue accounts and clear the round before re-running; the runner will not place
+any order while that state is present.
+
+A round that produces no usable quote, or whose size falls under a venue
+minimum, is recorded as `skipped` with a reason and the run continues. Skips
+never place orders. Only an unknown order status escalates to
+`manual_review_required`.
+
+## Instrumentation
+
+Each leg records `submitted_at`, `acked_at`, `completed_at`, the venue fill
+timestamp (`source_at` / `source_at_epoch`) and the derived
+`submit_to_ack_ms`, `submit_to_complete_ms`, `ack_to_complete_ms` and
+`exchange_fill_to_local_ms`. `probe_report.py` aggregates the signed hedge
+landing delay (`hedge_delay_ms`) from the two entry fills.
+
+## Cost attribution
+
+Only complete four-leg rounds enter the cost distributions. Rolled-back,
+partial and skipped rounds are counted in `excluded_rounds` and never averaged
+into per-venue or per-pair cost.
+
+Per-venue cost uses that venue's own entry and exit legs; it is never half of
+the round total. Each leg is split into half-spread, `signal -> execution
+quote` (RFQ reprice where a venue publishes one) and `execution quote -> fill`.
+The three stages add up to `price_cost_bps`, so nothing is charged twice. Fees
+are reported separately; a leg whose fee is unknown makes the round
+`fees_status=unverified` instead of contributing a silent zero.
+
+The actionable floor is `recommended_pair_trigger_bps` (p80 of the pair's
+total round-trip cost plus the target net). `recommended_trigger_bps` remains
+the per-venue round-trip view used for attribution only.

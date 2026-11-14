@@ -74,6 +74,25 @@ def _underlying(row):
         for k in ("underlying","symbol","market","asset"):
             if src.get(k) not in (None,""): return str(src[k]).strip().upper()
     return ""
+def _stamp_receipt(receipt):
+    """Attach local completion time and per-stage latency to an order receipt."""
+    if not isinstance(receipt, dict): return receipt
+    completed = datetime.now(timezone.utc)
+    submitted = _parse(receipt.get("submitted_at")); acked = _parse(receipt.get("acked_at"))
+    receipt.setdefault("completed_at", completed.isoformat())
+    if submitted is not None:
+        receipt.setdefault("submit_to_complete_ms", round((completed - submitted).total_seconds() * 1000, 3))
+    if submitted is not None and acked is not None:
+        receipt.setdefault("submit_to_ack_ms", round((acked - submitted).total_seconds() * 1000, 3))
+    if acked is not None:
+        receipt.setdefault("ack_to_complete_ms", round((completed - acked).total_seconds() * 1000, 3))
+    source = receipt.get("source_at_epoch")
+    if source is not None:
+        try: receipt.setdefault("exchange_fill_to_local_ms", round((completed.timestamp() - float(source)) * 1000, 3))
+        except (TypeError, ValueError): pass
+    return receipt
+
+
 @dataclass(frozen=True)
 class ProbeRound:
     round_id:str; asset:str; buy_venue:str; sell_venue:str; sequence:int
@@ -127,7 +146,9 @@ class VariationalProbeExecutor:
         if not bid or not ask or ask<=bid or not qid or not qts:
             return None,"variational_quote_shape_invalid",started,recv
         return {"bid":str(bid),"ask":str(ask),"mid":str((bid+ask)/2),"quote_id":qid,"quote_timestamp":str(qts),"request_started_at":started.isoformat(),"received_at":recv.isoformat(),"request_latency_ms":round((recv-started).total_seconds()*1000,3)},None,started,recv
-    async def market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
+    async def market_order(self,**kwargs):
+        return _stamp_receipt(await self._market_order(**kwargs))
+    async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
         assert self.client is not None
         submitted=datetime.now(timezone.utc)
         payload={"type":"VAR_API_ORDER","requestId":client_order_id,"market":asset.symbol("variational"),"instrumentType":asset.var_instrument_type,"settlementAsset":"USDC","kind":asset.var_kind,"fundingIntervalS":0,"side":side.upper(),"amount":format(qty,"f"),"confirm":True,"maxSlippage":float(max_slippage_bps/BPS),"reduceOnly":bool(reduce_only),"requestTimeoutMs":int(self.timeout_seconds*1000),"operationTimeoutMs":int(self.timeout_seconds*1000)}
@@ -238,7 +259,9 @@ class LighterProbeExecutor:
         d=int(market.get("supported_size_decimals") or 0); step=Decimal(1).scaleb(-d)
         out=qty.quantize(step,rounding=ROUND_DOWN); minimum=_d(market.get("min_base_amount")) or ZERO
         return out if out>0 and out>=minimum else None
-    async def market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
+    async def market_order(self,**kwargs):
+        return _stamp_receipt(await self._market_order(**kwargs))
+    async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
         if not self.available or self.client is None: return {"ok":False,"status":"rejected","error":f"{self.venue}_credentials_missing","client_order_id":client_order_id}
         market=self.market(asset)
         if market is None: return {"ok":False,"status":"rejected","error":f"{self.venue}_market_missing","client_order_id":client_order_id}
@@ -377,7 +400,9 @@ class EntropyProbeExecutor:
         px=bbo*(Decimal("1")+direction*max_slippage_bps/BPS)
         decimals=max(0,6-szd)
         return float(round(float(f"{float(px):.5g}"),decimals))
-    async def market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
+    async def market_order(self,**kwargs):
+        return _stamp_receipt(await self._market_order(**kwargs))
+    async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
         if not self.available or self.exchange is None: return {"ok":False,"status":"rejected","error":self.reason or "entropy_credentials_missing","client_order_id":client_order_id}
         qty=self.normalize_qty(asset,qty)
         if not qty: return {"ok":False,"status":"rejected","error":"entropy_qty_below_min","client_order_id":client_order_id}
@@ -469,8 +494,9 @@ class ProbeState:
         self.path.parent.mkdir(parents=True,exist_ok=True); tmp=self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data,ensure_ascii=False,indent=2,default=str)+"\n"); os.replace(tmp,self.path)
 class ProbeRunner:
+    TERMINAL={"filled","rolled_back","no_fill","skipped"}
     def __init__(self,*,hub,executors,state,writer_path,assets,venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=2.5,hold_seconds=3.1,run_id=None,horizons=(.25,.5,1.,3.),max_quote_age_by_venue=None,max_rounds=0):
-        self.hub=hub; self.executors=executors; self.state=state; self.writer_path=writer_path; self.assets=assets; self.venues=venues; self.by_name={a.name:a for a in assets}; self.notional_usd=notional_usd; self.round_interval_seconds=max(.2,round_interval_seconds); self.max_quote_age_seconds=max_quote_age_seconds; self.max_quote_age_by_venue=dict(max_quote_age_by_venue or {}); self.hold_seconds=max(.5,hold_seconds); self.horizons=tuple(horizons); self.max_rounds=max(0,int(max_rounds)); self.run_id=run_id or "probe-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        self.hub=hub; self.executors=executors; self.state=state; self.writer_path=writer_path; self.assets=assets; self.venues=venues; self.by_name={a.name:a for a in assets}; self.notional_usd=notional_usd; self.round_interval_seconds=max(.2,round_interval_seconds); self.max_quote_age_seconds=max_quote_age_seconds; self.max_quote_age_by_venue=dict(max_quote_age_by_venue or {}); self.hold_seconds=max(.5,hold_seconds); self.horizons=tuple(horizons); self.max_rounds=max(0,int(max_rounds)); self.run_id=run_id or "probe-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")+"-"+uuid.uuid4().hex[:4]; self.run_token=hashlib.sha256(self.run_id.encode()).hexdigest()[:8]
     def _write(self,row):
         self.writer_path.parent.mkdir(parents=True,exist_ok=True)
         with self.writer_path.open("a",encoding="utf-8") as f: f.write(json.dumps(row,ensure_ascii=False,default=str)+"\n")
@@ -505,8 +531,27 @@ class ProbeRunner:
                           "quote_id":(q or {}).get("quote_id"),
                           "error":None if q is not None else "quote_not_ready"}
         return out
+    def _unresolved_round(self):
+        state=self.state.data; current=state.get("current")
+        if isinstance(current,dict) and state.get("orders_attempted") and current.get("status") not in self.TERMINAL:
+            return current
+        if state.get("phase")=="manual_review_required":
+            return current if isinstance(current,dict) else {"status":"manual_review_required"}
+        return None
+    def _cid(self,item,kind,venue):
+        return f"{self.run_token}-{item.round_id}-{kind}-{venue}"
     async def run(self,*,allow_live=False):
         plan=enumerate_probe_plan(self.assets,self.venues)
+        if allow_live:
+            previous=self.state.data.get("run_id")
+            if previous and previous!=self.run_id:
+                pending=self._unresolved_round()
+                if pending is not None:
+                    blocked={"round_id":pending.get("round_id"),"status":pending.get("status"),"reason":pending.get("reason")}
+                    self.state.data["blocked_reason"]="unresolved_round_requires_review"; self.state.data["blocked_round"]=blocked; self.state.save()
+                    return {"ok":False,"mode":"live","rounds":0,"orders_attempted":False,"error":"unresolved_round_requires_review","round":blocked}
+                self.state.data.update({"cursor":0,"rounds":[],"current":None,"orders_attempted":False,"previous_run_id":previous})
+                self.state.data.pop("blocked_reason",None); self.state.data.pop("blocked_round",None)
         self.state.data.update({"run_id":self.run_id,"planned_rounds":len(plan),"phase":"running" if allow_live else "dry_run","venues":list(self.venues),"assets":[a.name for a in self.assets]}); self.state.save()
         if not allow_live:
             self._write({"schema":1,"event":"probe_plan","run_id":self.run_id,"rounds":[asdict(r) for r in plan]})
@@ -527,7 +572,7 @@ class ProbeRunner:
                 self.state.data["current"]=current; self.state.data["phase"]="manual_review_required"; self.state.save(); self._write(current)
                 return {"ok":False,"mode":"live","rounds":completed,"state":"manual_review_required","error":current["reason"]}
             self._write(row)
-            if row.get("status") in {"filled","rolled_back","no_fill"}:
+            if row.get("status") in self.TERMINAL:
                 self.state.data["rounds"].append(row); self.state.data["cursor"]=idx+1; self.state.data["current"]=None; completed+=1; self.state.save()
             else:
                 self.state.data["current"]=row; self.state.data["phase"]="manual_review_required"; self.state.save(); break
@@ -558,11 +603,11 @@ class ProbeRunner:
 
     async def _run_one(self,item):
         asset=self.by_name[item.asset]; pair=await self._wait_quotes(item)
-        if pair is None: return {"schema":1,"event":"probe_round","round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"no_quote"}
+        if pair is None: return {"schema":1,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"skipped","reason":"quote_unavailable"}
         buy,sell=pair; qty=self._qty(item,buy,sell)
-        if qty is None: return {"schema":1,"event":"probe_round","round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"blocked","reason":"qty_below_venue_minimum"}
-        ids={item.buy_venue:f"{item.round_id}-entry-{item.buy_venue}",item.sell_venue:f"{item.round_id}-entry-{item.sell_venue}"}
-        row={"schema":1,"event":"probe_round","round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"submitting","notional_usd":str(self.notional_usd),"target_qty":str(qty),"decision":{"at":datetime.now(timezone.utc).isoformat(),"quotes":{item.buy_venue:buy,item.sell_venue:sell},"signal_edge_bps":str(((_d(sell["bid"])-_d(buy["ask"]))/((_d(sell["bid"])+_d(buy["ask"]))/2)*BPS) if _d(sell["bid"]) and _d(buy["ask"]) else ZERO),"entry_client_order_ids":ids}}
+        if qty is None: return {"schema":1,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"skipped","reason":"qty_below_venue_minimum"}
+        ids={item.buy_venue:self._cid(item,"entry",item.buy_venue),item.sell_venue:self._cid(item,"entry",item.sell_venue)}
+        row={"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"submitting","notional_usd":str(self.notional_usd),"target_qty":str(qty),"decision":{"at":datetime.now(timezone.utc).isoformat(),"quotes":{item.buy_venue:buy,item.sell_venue:sell},"signal_edge_bps":str(((_d(sell["bid"])-_d(buy["ask"]))/((_d(sell["bid"])+_d(buy["ask"]))/2)*BPS) if _d(sell["bid"]) and _d(buy["ask"]) else ZERO),"entry_client_order_ids":ids}}
         self.state.data["current"]=row; self.state.data["orders_attempted"]=True; self.state.save()
         results=await asyncio.gather(self.executors[item.buy_venue].market_order(asset=asset,side="buy",qty=qty,quote=buy,client_order_id=ids[item.buy_venue]),self.executors[item.sell_venue].market_order(asset=asset,side="sell",qty=qty,quote=sell,client_order_id=ids[item.sell_venue]),return_exceptions=True)
         receipts={item.buy_venue:results[0],item.sell_venue:results[1]}
@@ -574,7 +619,7 @@ class ProbeRunner:
             row["status"]="manual_review_required"; row["reason"]="entry_terminal_status_unknown"
             rollbacks={}
             for v in filled:
-                original=receipts[v]; cq=await self._quote(v,asset); cid=f"{item.round_id}-rollback-{v}"
+                original=receipts[v]; cq=await self._quote(v,asset); cid=self._cid(item,"rollback",v)
                 cs="sell" if v==item.buy_venue else "buy"
                 close=await self.executors[v].market_order(asset=asset,side=cs,qty=_d(original.get("filled_qty")) or qty,quote=cq or {},client_order_id=cid,reduce_only=True,max_slippage_bps=Decimal("50"))
                 rollbacks[v]=close
@@ -586,7 +631,7 @@ class ProbeRunner:
         if len(filled)!=2:
             row["status"]="rolled_back" if filled else "no_fill"
             if filled:
-                v=filled[0]; original=receipts[v]; cq=await self._quote(v,asset); cid=f"{item.round_id}-rollback-{v}"; cs="sell" if v==item.buy_venue else "buy"
+                v=filled[0]; original=receipts[v]; cq=await self._quote(v,asset); cid=self._cid(item,"rollback",v); cs="sell" if v==item.buy_venue else "buy"
                 close=await self.executors[v].market_order(asset=asset,side=cs,qty=_d(original.get("filled_qty")) or qty,quote=cq or {},client_order_id=cid,reduce_only=True,max_slippage_bps=Decimal("50"))
                 row["rollback"]={"leg":v,"close":close}
                 if close.get("status")!="filled": row["status"]="manual_review_required"; row["reason"]="rollback_not_confirmed"
@@ -603,7 +648,7 @@ class ProbeRunner:
                 pts[v]={"mid":str(mid),"adverse_bps":str(((fill-mid) if side=="buy" else (mid-fill))/fill*BPS),"quote_at":q.get("recv_at")}
             adverse.append({"delay_s":delay,"points":pts})
         row["adverse"]=adverse
-        close_ids={item.buy_venue:f"{item.round_id}-exit-{item.buy_venue}",item.sell_venue:f"{item.round_id}-exit-{item.sell_venue}"}
+        close_ids={v:self._cid(item,"exit",v) for v in receipts}
         cqs={v:await self._quote(v,asset) for v in receipts}
         closes=await asyncio.gather(self.executors[item.buy_venue].market_order(asset=asset,side="sell",qty=_d(receipts[item.buy_venue].get("filled_qty")) or qty,quote=cqs[item.buy_venue] or {},client_order_id=close_ids[item.buy_venue],reduce_only=True,max_slippage_bps=Decimal("50")),self.executors[item.sell_venue].market_order(asset=asset,side="buy",qty=_d(receipts[item.sell_venue].get("filled_qty")) or qty,quote=cqs[item.sell_venue] or {},client_order_id=close_ids[item.sell_venue],reduce_only=True,max_slippage_bps=Decimal("50")),return_exceptions=True)
         row["exit"]={"quotes_at_close":cqs,"legs":{item.buy_venue:{**(closes[0] if isinstance(closes[0],dict) else {"status":"error"}),"side":"sell","client_order_id":close_ids[item.buy_venue]},item.sell_venue:{**(closes[1] if isinstance(closes[1],dict) else {"status":"error"}),"side":"buy","client_order_id":close_ids[item.sell_venue]}}}

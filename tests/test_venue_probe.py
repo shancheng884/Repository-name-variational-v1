@@ -127,3 +127,86 @@ def test_lighter_signing_chain_id_matches_deployment():
     assert lighter_signing_chain_id("https://testnet.zklighter.elliot.ai") == 300
     assert lighter_signing_chain_id("https://api.rh.lighter.xyz") == 466324
     assert lighter_signing_chain_id("https://api.rh-testnet.lighter.xyz") == 300
+
+# --- recovery / instrumentation regressions (round 2 safety) -----------------
+
+def _runner(tmp_path, *, state=None, execs=None, run_id=None, venues=("variational", "lighter_mainnet")):
+    execs = execs or {v: FakeExec() for v in venues}
+    st = ProbeState(tmp_path / "s.json")
+    if state:
+        st.data.update(state)
+    return ProbeRunner(hub=FakeHub(), executors=execs, state=st, writer_path=tmp_path / "r.jsonl",
+                       assets=DEFAULT_ASSETS[:1], venues=venues, horizons=(0.0,), run_id=run_id), execs
+
+
+def test_new_run_resets_cursor_instead_of_skipping_every_round(tmp_path):
+    runner, execs = _runner(tmp_path, run_id="run-two",
+                            state={"run_id": "run-one", "phase": "completed", "cursor": 2,
+                                   "rounds": [], "current": None, "orders_attempted": True})
+    result = asyncio.run(runner.run(allow_live=True))
+    assert result["state"] == "completed"
+    assert result["rounds"] == 2, "a second run must not inherit the finished cursor"
+    assert runner.state.data["cursor"] == 2 and runner.state.data["run_id"] == "run-two"
+    assert len(execs["variational"].calls) + len(execs["lighter_mainnet"].calls) == 8
+
+
+def test_new_run_refuses_when_previous_round_is_unresolved(tmp_path):
+    runner, execs = _runner(tmp_path, run_id="run-two",
+                            state={"run_id": "run-one", "phase": "running", "cursor": 0, "rounds": [],
+                                   "current": {"round_id": "nvda-a-b-001", "status": "submitting"},
+                                   "orders_attempted": True})
+    result = asyncio.run(runner.run(allow_live=True))
+    assert result["ok"] is False
+    assert result["error"] == "unresolved_round_requires_review"
+    assert result["round"] == {"round_id": "nvda-a-b-001", "status": "submitting", "reason": None}
+    assert execs["variational"].calls == [] and execs["lighter_mainnet"].calls == [], "no order may be sent before review"
+
+
+def test_manual_review_state_without_current_round_blocks_new_run(tmp_path):
+    runner, execs = _runner(tmp_path, run_id="run-two",
+                            state={"run_id": "run-one", "phase": "manual_review_required",
+                                   "cursor": 3, "rounds": [], "current": None, "orders_attempted": True})
+    result = asyncio.run(runner.run(allow_live=True))
+    assert result["error"] == "unresolved_round_requires_review"
+    assert execs["variational"].calls == []
+
+
+def test_skipped_round_is_terminal_and_does_not_stop_the_run(tmp_path):
+    runner, _ = _runner(tmp_path, run_id="run-one")
+    seen = []
+
+    async def fake_run_one(item):
+        seen.append(item.round_id)
+        if len(seen) == 1:
+            return {"event": "probe_round", "round_id": item.round_id, "asset": item.asset,
+                    "buy_venue": item.buy_venue, "sell_venue": item.sell_venue,
+                    "status": "skipped", "reason": "quote_unavailable"}
+        return {"event": "probe_round", "round_id": item.round_id, "asset": item.asset,
+                "buy_venue": item.buy_venue, "sell_venue": item.sell_venue, "status": "filled"}
+
+    runner._run_one = fake_run_one
+    result = asyncio.run(runner.run(allow_live=True))
+    assert result["state"] == "completed"
+    assert result["rounds"] == 2 and len(seen) == 2
+    assert runner.state.data["phase"] == "completed"
+
+
+def test_client_order_ids_are_scoped_to_the_run(tmp_path):
+    one, _ = _runner(tmp_path / "one", run_id="probe-A")
+    two, _ = _runner(tmp_path / "two", run_id="probe-B")
+    item = ProbeRound("nvda-a-b-001", "NVDA", "a", "b", 1)
+    assert one._cid(item, "entry", "a") != two._cid(item, "entry", "a")
+    assert one._cid(item, "entry", "a").startswith(one.run_token)
+    assert one._cid(item, "entry", "a") == one._cid(item, "entry", "a")
+
+
+def test_receipt_records_stage_latencies():
+    from tools.lib.venue_probe import _stamp_receipt
+    out = _stamp_receipt({"status": "filled", "submitted_at": "2026-11-14T01:00:00+00:00",
+                          "acked_at": "2026-11-14T01:00:00.120000+00:00",
+                          "source_at_epoch": datetime(2026, 11, 14, 1, 0, 0, 400000, tzinfo=timezone.utc).timestamp()})
+    assert out["submit_to_ack_ms"] == 120.0
+    assert out["submit_to_complete_ms"] >= 0
+    assert out["ack_to_complete_ms"] is not None
+    assert out["exchange_fill_to_local_ms"] is not None
+    assert out["completed_at"]
