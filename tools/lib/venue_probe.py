@@ -286,7 +286,7 @@ def _int(v):
     p=_d(v); return int(p) if p is not None and p==p.to_integral_value() else None
 class EntropyProbeExecutor:
     venue="entropy"
-    def __init__(self,*,info_url,account_address,private_key,dex="io",timeout_seconds=8.0,info=None,exchange=None):
+    def __init__(self,*,info_url,account_address,private_key,dex="io",timeout_seconds=15.0,info=None,exchange=None):
         base=(info_url or "").rstrip("/")
         if base.endswith("/info"):
             base=base[:-5].rstrip("/")
@@ -392,7 +392,7 @@ class EntropyProbeExecutor:
         if not bbo: return {"ok":False,"status":"rejected","error":"entropy_quote_missing","client_order_id":client_order_id}
         limit_px=self._limit_price(asset,side,bbo,max_slippage_bps)
         cloid=self._cloid(client_order_id); coin=self._coin(asset)
-        submitted=datetime.now(timezone.utc); start_ms=int(submitted.timestamp()*1000)-1000
+        submitted=datetime.now(timezone.utc); start_ms=int(submitted.timestamp()*1000)-5000
         try:
             result=await asyncio.to_thread(self.exchange.order,coin,side=="buy",float(qty),limit_px,{"limit":{"tif":"Ioc"}},reduce_only=bool(reduce_only),cloid=cloid)
         except Exception as exc:
@@ -411,6 +411,18 @@ class EntropyProbeExecutor:
                 last=max((_parse_epoch_ms(row.get("time")) for row in rows),default=None)
                 return {"ok":True,"status":"filled","filled_qty":str(qty_sum),"avg_price":str(notional/qty_sum) if qty_sum else None,"fee_usd":str(fee),"order_id":str(rows[0].get("oid") or ""),"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":last.isoformat() if last else None,"source_at_epoch":last.timestamp() if last else None,"raw_status":status}
             await asyncio.sleep(.1)
+        if not reduce_only:
+            try:
+                state=await asyncio.to_thread(self.info.user_state,self.account_address,self.dex)
+                for item in (state or {}).get("assetPositions",[]) or []:
+                    pos=item.get("position") if isinstance(item,dict) else None
+                    if not isinstance(pos,dict) or pos.get("coin")!=coin: continue
+                    szi=_d(pos.get("szi")) or ZERO
+                    entry=_d(pos.get("entryPx"))
+                    if szi!=ZERO and entry:
+                        return {"ok":True,"status":"filled","filled_qty":str(abs(szi)),"avg_price":str(entry),"fee_usd":None,"order_id":None,"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":None,"source_at_epoch":None,"raw_status":"position_reconciled","partial":True}
+            except Exception:
+                pass
         return {"ok":False,"status":"unknown","error":"entropy_fill_timeout","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"cloid":str(cloid)}
     @staticmethod
     def _order_status(result):
