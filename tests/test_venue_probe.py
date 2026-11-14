@@ -75,8 +75,9 @@ def test_unknown_entry_blocks_exit_and_requires_review(tmp_path):
     item = ProbeRound("r1", "NVDA", "a", "b", 1)
     row = asyncio.run(runner._run_one(item))
     assert row["status"] == "manual_review_required"
-    assert len(a.calls) + len(b.calls) == 3
-    assert sum(1 for call in a.calls + b.calls if call[2]) == 1
+    assert row["reason"] == "entry_unknown_position_unresolved"
+    assert len(a.calls) + len(b.calls) == 2, "an unverifiable peer blocks every follow-up order"
+    assert sum(1 for call in a.calls + b.calls if call[2]) == 0
 
 
 def test_preflight_rejects_insufficient_margin(tmp_path):

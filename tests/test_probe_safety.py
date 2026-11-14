@@ -14,6 +14,8 @@ class Hub:
             "variational": {"mid": "100.1", "bid": "100.0", "ask": "100.2", "recv_at": now, "quote_id": "qa"},
             "lighter_mainnet": {"mid": "100.3", "bid": "100.2", "ask": "100.4", "recv_at": now, "quote_id": "qb"},
         }
+        self.quotes["a"] = dict(self.quotes["variational"])
+        self.quotes["b"] = dict(self.quotes["lighter_mainnet"])
 
     def latest(self, venue, symbol, max_age=10):
         return dict(self.quotes[venue])
@@ -255,3 +257,158 @@ def test_probe_report_by_run_writes_per_run_summaries(tmp_path, monkeypatch):
     assert set(payload["runs"]) == {"probe-A", "probe-B"}
     assert payload["runs"]["probe-A"]["rounds"] == 1
     assert payload["runs"]["probe-A"]["pairs"]["NVDA:variational->lighter_mainnet"]["samples"] == 1
+
+class LedgerExec:
+    """Venue that keeps a position ledger and can fail a chosen order."""
+
+    available = True
+
+    def __init__(self, *, entry_status="filled", filled_qty=None, exit_statuses=None, verify=True, omit_filled_qty=False,
+                 unknown_qty=None, verify_after=999):
+        self.qty = D("0")
+        self.calls = []
+        self.entry_status = entry_status
+        self.filled_qty = filled_qty
+        self.exit_statuses = list(exit_statuses or [])
+        self.verify = verify
+        self.omit_filled_qty = omit_filled_qty
+        self.unknown_qty = unknown_qty
+        self.verify_after = verify_after
+        self.position_calls = 0
+
+    async def positions(self, asset):
+        self.position_calls += 1
+        if not self.verify or self.position_calls > self.verify_after:
+            return {"ok": False, "verified": False, "error": "venue_unreachable"}
+        return {"ok": True, "verified": True, "qty": str(self.qty), "active_orders": 0}
+
+    async def preflight(self, asset):
+        return {"ok": True, "qty": "0", "active_orders": 0}
+
+    def normalize_qty(self, asset, qty):
+        return qty.quantize(D("0.01"))
+
+    async def market_order(self, *, asset, side, qty, quote, client_order_id, reduce_only=False, max_slippage_bps=D("8")):
+        self.calls.append((client_order_id, side, reduce_only, qty))
+        if reduce_only:
+            status = self.exit_statuses.pop(0) if self.exit_statuses else "filled"
+            if status == "filled":
+                held = abs(self.qty) or qty
+                self.qty = D("0")
+                return {"ok": True, "status": "filled", "client_order_id": client_order_id,
+                        "filled_qty": str(held), "avg_price": "100.1",
+                        "source_at_epoch": datetime.now(timezone.utc).timestamp()}
+            return {"ok": False, "status": status, "client_order_id": client_order_id}
+        if self.entry_status != "filled":
+            if self.unknown_qty is not None:
+                self.qty = self.unknown_qty
+            return {"ok": False, "status": self.entry_status, "client_order_id": client_order_id}
+        filled = self.filled_qty if self.filled_qty is not None else qty
+        self.qty += filled if side == "buy" else -filled
+        receipt = {"ok": True, "status": "filled", "client_order_id": client_order_id,
+                   "avg_price": "100.3" if side == "buy" else "100.1",
+                   "source_at_epoch": datetime.now(timezone.utc).timestamp()}
+        if not self.omit_filled_qty:
+            receipt["filled_qty"] = str(filled)
+        return receipt
+
+
+def test_unknown_entry_flattens_only_the_leg_that_really_filled(tmp_path):
+    a, b = LedgerExec(), LedgerExec(entry_status="unknown")
+    r, _, _ = runner(tmp_path, execs={"a": a, "b": b}, run_id="run-one")
+    row = asyncio.run(r._run_one(ProbeRound("r1", "NVDA", "a", "b", 1)))
+    assert row["status"] == "manual_review_required"
+    assert row["reason"] == "entry_unknown_flatten_confirmed"
+    assert row["entry"]["recovery"]["decision"] == "flattened"
+    assert [call[1] for call in a.calls] == ["buy", "sell"], "the filled leg is flattened, not the unknown one"
+    assert len(b.calls) == 1, "an unproven leg never receives a second order"
+
+
+def test_unknown_entry_with_both_positions_keeps_the_round_alive(tmp_path):
+    a, b = LedgerExec(), LedgerExec(entry_status="unknown", unknown_qty=D("-0.2"))
+    r, _, _ = runner(tmp_path, execs={"a": a, "b": b}, run_id="run-one")
+    row = asyncio.run(r._run_one(ProbeRound("r1", "NVDA", "a", "b", 1)))
+    assert row["entry"]["recovery"]["decision"] == "both_legs_confirmed"
+    assert row["status"] == "filled", "a lost ack on a leg that did fill must not abandon the hedge"
+    assert row["entry"]["legs"]["b"]["price_inferred"] is True
+
+
+def test_entry_size_mismatch_reduces_the_larger_leg(tmp_path):
+    a, b = LedgerExec(filled_qty=D("0.20")), LedgerExec(filled_qty=D("0.18"))
+    r, _, _ = runner(tmp_path, execs={"a": a, "b": b}, run_id="run-one")
+    row = asyncio.run(r._run_one(ProbeRound("r1", "NVDA", "a", "b", 1)))
+    assert row["status"] == "filled"
+    assert row["entry"]["resize"]["qty"] == "0.02"
+    assert [call[1] for call in a.calls] == ["buy", "sell", "sell"]
+
+
+def test_exit_leg_retries_only_after_the_account_shows_the_position(tmp_path):
+    a, b = LedgerExec(exit_statuses=["unknown", "filled"]), LedgerExec()
+    r, _, _ = runner(tmp_path, execs={"a": a, "b": b}, run_id="run-one")
+    row = asyncio.run(r._run_one(ProbeRound("r1", "NVDA", "a", "b", 1)))
+    assert row["status"] == "filled"
+    assert row["exit"]["recovery"]["a"]["resolution"] == "retry_confirmed"
+    assert len(a.calls) == 3
+
+
+def test_rollback_is_skipped_when_the_filled_size_cannot_be_proven(tmp_path):
+    a, b = LedgerExec(omit_filled_qty=True, verify_after=1), LedgerExec(entry_status="rejected")
+    r, _, _ = runner(tmp_path, execs={"a": a, "b": b}, run_id="run-one")
+    row = asyncio.run(r._run_one(ProbeRound("r1", "NVDA", "a", "b", 1)))
+    assert row["status"] == "manual_review_required"
+    assert row["reason"] == "known_leg_size_unknown_no_rollback"
+    assert len(a.calls) == 1, "no opposite order without a proven size"
+
+
+def test_clock_offset_accepts_numeric_epoch_quote_timestamps():
+    leg = {"status": "filled", "side": "buy", "submitted_at": "2026-11-14T07:32:43.400000+00:00",
+           "completed_at": "2026-11-14T07:32:43.600000+00:00", "source_at": "2026-11-14T07:32:43.000000+00:00",
+           "execution_quote": {"bid": "100.0", "ask": "100.2", "quote_timestamp": 1794641563000,
+                               "received_at": "2026-11-14T07:32:43.500000+00:00"}}
+    timing = leg_timing(leg)
+    assert D(timing["clock_offset_ms"]) == D("500")
+    assert timing["aligned_fill_at"] == "2026-11-14T07:32:43.500000+00:00"
+
+
+def test_entropy_fee_is_rebated_at_110_percent():
+    ref = {"bid": "100.0", "ask": "100.2", "mid": "100.1"}
+    stamp = {"submitted_at": "2026-11-14T07:31:44.400000+00:00", "completed_at": "2026-11-14T07:31:44.700000+00:00",
+             "source_at": "2026-11-14T07:31:44.500000+00:00"}
+    row = {"event": "probe_round", "round_id": "e1", "run_id": "run-e", "asset": "NVDA",
+           "buy_venue": "entropy", "sell_venue": "variational", "status": "filled",
+           "decision": {"quotes": {"entropy": ref, "variational": ref}, "signal_edge_bps": "3"},
+           "entry": {"legs": {
+               "entropy": dict(stamp, status="filled", side="buy", filled_qty="0.2", avg_price="100.1", fee_usd="0.04"),
+               "variational": dict(stamp, status="filled", side="sell", filled_qty="0.2", avg_price="100.1"),
+           }, "quotes": {"entropy": ref, "variational": ref}},
+           "exit": {"legs": {
+               "entropy": dict(stamp, status="filled", side="sell", filled_qty="0.2", avg_price="100.1", fee_usd="0.04"),
+               "variational": dict(stamp, status="filled", side="buy", filled_qty="0.2", avg_price="100.1"),
+           }, "quotes_at_close": {"entropy": ref, "variational": ref}}}
+    summary = decompose_round(row)
+    gross = D(summary["gross_fee_bps"])
+    assert gross > D("0")
+    assert D(summary["fee_bps"]) == gross * D("-0.1"), "110% rebate turns a paid fee into a 10% credit"
+    assert D(summary["rebate_bps"]) == D(summary["fee_bps"]) - gross
+    assert D(summary["net_fees_usd"]) == D("-0.008")
+
+
+def test_submit_quotes_are_refreshed_before_the_order(tmp_path):
+    class SeqHub:
+        def __init__(self):
+            now = datetime.now(timezone.utc).isoformat()
+            self.seq = {"a": [{"mid": "100.1", "bid": "100.0", "ask": "100.2", "recv_at": now},
+                              {"mid": "100.4", "bid": "100.3", "ask": "100.5", "recv_at": now}],
+                        "b": [{"mid": "100.3", "bid": "100.2", "ask": "100.4", "recv_at": now}]}
+
+        def latest(self, venue, symbol, max_age=10):
+            stack = self.seq[venue]
+            return dict(stack.pop(0) if len(stack) > 1 else stack[0])
+
+    r = ProbeRunner(hub=SeqHub(), executors={"a": LedgerExec(), "b": LedgerExec()},
+                    state=ProbeState(tmp_path / "s.json"), writer_path=tmp_path / "r.jsonl",
+                    assets=DEFAULT_ASSETS[:1], venues=("a", "b"), horizons=(0.0,), run_id="run-one")
+    row = asyncio.run(r._run_one(ProbeRound("r1", "NVDA", "a", "b", 1)))
+    assert row["decision"]["quotes"]["a"]["ask"] == "100.2"
+    assert row["decision"]["submit_quotes"]["a"]["ask"] == "100.5"
+    assert row["entry"]["submit_quotes"]["a"]["ask"] == "100.5", "the leg must record the quote it was priced against"

@@ -55,9 +55,31 @@ A second process returns `probe_already_running` with the current owner and
 sends no orders. A lock left behind by a dead pid is replaced automatically;
 the lock is released in a `finally` block, including after exceptions.
 
-The runner records entry quotes, order submit/ack timestamps, final fills,
-0.25/0.5/1/3-second adverse marks, and both exit fills. Fees are reported
-separately.
+The runner records the decision quote, the submit-time quote (both books are
+re-read immediately before the orders go out), order submit/ack timestamps,
+final fills, 0.25/0.5/1/3-second adverse marks, and both exit fills. Fees are
+reported separately.
+
+## Account-proven recovery
+
+An `unknown` order status is never treated as a miss, and never as a fill:
+
+- **entry unknown** - both venue positions are read first. Both flat means the
+  round is `no_fill`. Two opposite legs of matching size mean the fills are
+  real and the round continues with `recovered_from=position_snapshot` (the
+  price is flagged `price_inferred` when the venue never returned one). Any
+  other shape flattens only the legs that actually hold size, one reduce-only
+  order per venue, and stops for review. No order is sent while a peer position
+  cannot be verified.
+- **leg size mismatch** - if the two entry fills differ by more than 0.2% of
+  the round size, the larger leg is reduced by the excess with a reduce-only
+  order (`entry-resize`) before the exit legs. An unhedgeable residue stops the
+  round.
+- **exit leg not confirmed** - the venue position is re-read before any retry.
+  Flat means the exit landed; a remaining quantity gets exactly one reduce-only
+  retry (`exit-retry`); an unverifiable position stops the round. A rollback
+  only runs when the filled size is proven, so a probe cannot open an opposite
+  position from an unknown fill.
 
 ## Cost decomposition
 
@@ -135,10 +157,15 @@ Lighter and Var now capture an `execution_quote` at submit, so their legs are
 `signal -> fill` number.
 
 Fees stay outside the price cost. A leg with a reported `fee_usd` is
-`verified` (Entropy rebates arrive as a negative fee and reduce `net_cost_bps`);
-a leg on a zero-fee venue (`variational`, `lighter_mainnet`, `lighter_rh`)
-without a fee field is `zero_by_policy`; anything else is `unverified` and
-suppresses `net_cost_bps` rather than contributing a silent zero.
+`verified`; a leg on a zero-fee venue (`variational`, `lighter_mainnet`,
+`lighter_rh`) without a fee field is `zero_by_policy`; anything else is
+`unverified` and suppresses `net_cost_bps` rather than contributing a silent
+zero.
+
+Entropy reports the gross taker fee and returns 110% of it, so the net fee is
+`-10%` of the gross fee. `gross_fee_bps`, `rebate_bps` and the net `fee_bps`
+are reported separately: a 2 bps gross fee becomes a 0.2 bps credit instead of
+a 2 bps cost. Entropy legs without a reported fee stay `unverified`.
 
 The actionable floor is `recommended_pair_trigger_bps` (p80 of the pair's
 total round-trip cost plus the target net). `recommended_trigger_bps` remains

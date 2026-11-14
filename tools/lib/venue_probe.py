@@ -173,11 +173,20 @@ def _stamp_receipt(receipt):
         receipt.setdefault("submit_to_ack_ms", round((acked - submitted).total_seconds() * 1000, 3))
     if acked is not None:
         receipt.setdefault("ack_to_complete_ms", round((completed - acked).total_seconds() * 1000, 3))
+    if receipt.get("status") == "filled" and receipt.get("source_at_epoch") is None and receipt.get("source_at") is None:
+        receipt.setdefault("source_at_missing", True)
     source = receipt.get("source_at_epoch")
     if source is not None:
         try: receipt.setdefault("exchange_fill_to_local_ms", round((completed.timestamp() - float(source)) * 1000, 3))
         except (TypeError, ValueError): pass
     return receipt
+
+
+def _qty_tolerance(qty):
+    """Half-percent band: the smallest size gap worth correcting on a leg."""
+    if qty is None or qty <= 0:
+        return ZERO
+    return max(abs(qty) * Decimal("0.002"), Decimal("0.00000001"))
 
 
 @dataclass(frozen=True)
@@ -817,42 +826,127 @@ class ProbeRunner:
             row["reconcile"]={"pre":pre,"post":None}
         return row
 
+    async def _position_qty(self,asset,venue):
+        """Verified position quantity, or None when the venue cannot prove it."""
+        executor=self.executors.get(venue)
+        fn=getattr(executor,"positions",None)
+        if not callable(fn): return None
+        try:
+            result=await fn(asset)
+        except Exception:
+            return None
+        if not isinstance(result,dict): return None
+        verified=bool(result.get("verified",result.get("ok") is True))
+        qty=_d(result.get("qty"))
+        return qty if verified and qty is not None else None
+
+    async def _close_leg(self,asset,item,venue,side,qty,tag):
+        """One reduce-only flatten leg with its own deterministic client id."""
+        cid=self._cid(item,tag,venue); quote=await self._quote(venue,asset)
+        receipt=await self.executors[venue].market_order(asset=asset,side=side,qty=qty,quote=quote or {},client_order_id=cid,reduce_only=True,max_slippage_bps=Decimal("50"))
+        return cid,receipt
+
+    async def _resolve_unknown_entry(self,asset,item,qty):
+        """Prove an unknown entry leg on the exchange before touching anything.
+
+        An unknown status is not proof of a miss.  Reading both accounts first
+        is what stops a recovery from closing the good leg while the unknown
+        leg is actually open, which is how a probe becomes a naked position.
+        """
+        held={item.buy_venue:await self._position_qty(asset,item.buy_venue),
+              item.sell_venue:await self._position_qty(asset,item.sell_venue)}
+        out={"position_qty":{v:(None if q is None else str(q)) for v,q in held.items()},"decision":None,"flattened":{}}
+        buy=held[item.buy_venue]; sell=held[item.sell_venue]
+        if buy is not None and sell is not None and buy==ZERO and sell==ZERO:
+            out["decision"]="flat_confirmed"; return out
+        if buy is not None and sell is not None and buy>ZERO and sell<ZERO and abs(abs(buy)-abs(sell))<=_qty_tolerance(qty):
+            out["decision"]="both_legs_confirmed"; return out
+        for venue,position in held.items():
+            if position is None or position==ZERO: continue
+            side="sell" if position>ZERO else "buy"
+            cid,receipt=await self._close_leg(asset,item,venue,side,abs(position),"entry-unknown-flatten")
+            out["flattened"][venue]={"client_order_id":cid,"receipt":receipt}
+        out["decision"]="flattened"; return out
+
     async def _execute_round(self,item):
         asset=self.by_name[item.asset]; pair=await self._wait_quotes(item)
         if pair is None: return {"schema":1,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"skipped","reason":"quote_unavailable"}
         buy,sell=pair; qty=self._qty(item,buy,sell)
         if qty is None: return {"schema":1,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"skipped","reason":"qty_below_venue_minimum"}
+        # Decision quotes are the signal; submit quotes are what each order was
+        # actually priced against.  Keeping both is what makes the cost split
+        # half_spread / signal->exec / exec->fill complete instead of empty.
+        submit={}
+        for venue,decision_quote in ((item.buy_venue,buy),(item.sell_venue,sell)):
+            fresh=await self._quote(venue,asset)
+            submit[venue]=fresh or decision_quote
         ids={item.buy_venue:self._cid(item,"entry",item.buy_venue),item.sell_venue:self._cid(item,"entry",item.sell_venue)}
-        row={"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"submitting","notional_usd":str(self.notional_usd),"target_qty":str(qty),"decision":{"at":datetime.now(timezone.utc).isoformat(),"quotes":{item.buy_venue:buy,item.sell_venue:sell},"signal_edge_bps":str(((_d(sell["bid"])-_d(buy["ask"]))/((_d(sell["bid"])+_d(buy["ask"]))/2)*BPS) if _d(sell["bid"]) and _d(buy["ask"]) else ZERO),"entry_client_order_ids":ids}}
+        signal_edge=((_d(sell["bid"])-_d(buy["ask"]))/((_d(sell["bid"])+_d(buy["ask"]))/2)*BPS) if _d(sell["bid"]) and _d(buy["ask"]) else ZERO
+        row={"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"submitting","notional_usd":str(self.notional_usd),"target_qty":str(qty),"decision":{"at":datetime.now(timezone.utc).isoformat(),"quotes":{item.buy_venue:buy,item.sell_venue:sell},"submit_quotes":submit,"signal_edge_bps":str(signal_edge),"entry_client_order_ids":ids}}
         self.state.data["current"]=row; self.state.data["orders_attempted"]=True; self.state.save()
-        results=await asyncio.gather(self.executors[item.buy_venue].market_order(asset=asset,side="buy",qty=qty,quote=buy,client_order_id=ids[item.buy_venue]),self.executors[item.sell_venue].market_order(asset=asset,side="sell",qty=qty,quote=sell,client_order_id=ids[item.sell_venue]),return_exceptions=True)
+        results=await asyncio.gather(self.executors[item.buy_venue].market_order(asset=asset,side="buy",qty=qty,quote=submit[item.buy_venue],client_order_id=ids[item.buy_venue]),self.executors[item.sell_venue].market_order(asset=asset,side="sell",qty=qty,quote=submit[item.sell_venue],client_order_id=ids[item.sell_venue]),return_exceptions=True)
         receipts={item.buy_venue:results[0],item.sell_venue:results[1]}
-        row["entry"]={"legs":{v:{**(r if isinstance(r,dict) else {"ok":False,"status":"error","error":str(r)}),"side":"buy" if v==item.buy_venue else "sell","client_order_id":ids[v]} for v,r in receipts.items()},"quotes":{item.buy_venue:buy,item.sell_venue:sell}}
+        row["entry"]={"legs":{v:{**(r if isinstance(r,dict) else {"ok":False,"status":"error","error":str(r)}),"side":"buy" if v==item.buy_venue else "sell","client_order_id":ids[v]} for v,r in receipts.items()},"quotes":{item.buy_venue:buy,item.sell_venue:sell},"submit_quotes":submit}
         self.state.data["current"]=row; self.state.save()
-        filled=[v for v,r in receipts.items() if isinstance(r,dict) and r.get("status")=="filled"]
-        unknown=[v for v,r in receipts.items() if not isinstance(r,dict) or r.get("status")=="unknown"]
+        unknown=[v for v,r in receipts.items() if not isinstance(r,dict) or r.get("status") in ("unknown","error")]
         if unknown:
-            row["status"]="manual_review_required"; row["reason"]="entry_terminal_status_unknown"
-            rollbacks={}
-            for v in filled:
-                original=receipts[v]; cq=await self._quote(v,asset); cid=self._cid(item,"rollback",v)
-                cs="sell" if v==item.buy_venue else "buy"
-                close=await self.executors[v].market_order(asset=asset,side=cs,qty=_d(original.get("filled_qty")) or qty,quote=cq or {},client_order_id=cid,reduce_only=True,max_slippage_bps=Decimal("50"))
-                rollbacks[v]=close
-                if not isinstance(close,dict) or close.get("status")!="filled":
-                    row["reason"]="entry_unknown_and_rollback_not_confirmed"
-            if rollbacks: row["rollback"]=rollbacks
-            self.state.data["current"]=row; self.state.save()
-            return row
+            resolution=await self._resolve_unknown_entry(asset,item,qty)
+            row["entry"]["recovery"]=resolution
+            if resolution["decision"]=="both_legs_confirmed":
+                for venue in list(receipts):
+                    if venue not in unknown: continue
+                    held=abs(_d(resolution["position_qty"].get(venue)) or qty)
+                    receipt=receipts[venue] if isinstance(receipts[venue],dict) else {}
+                    price=_d(receipt.get("avg_price")) or _d(submit[venue].get("mid")) or _d(buy.get("mid") if venue==item.buy_venue else sell.get("mid"))
+                    receipts[venue]={**receipt,"ok":True,"status":"filled","filled_qty":str(held),"avg_price":str(price) if price is not None else None,"recovered_from":"position_snapshot","price_inferred":True}
+                    row["entry"]["legs"][venue]={**receipts[venue],"side":"buy" if venue==item.buy_venue else "sell","client_order_id":ids[venue]}
+                unknown=[]
+            elif resolution["decision"]=="flat_confirmed":
+                row["status"]="no_fill"; row["reason"]="entry_unknown_but_accounts_flat"
+                self.state.data["current"]=row; self.state.save(); return row
+            else:
+                confirmed=all((detail.get("receipt") or {}).get("status")=="filled" for detail in resolution["flattened"].values()) if resolution["flattened"] else False
+                row["status"]="manual_review_required"
+                row["reason"]="entry_unknown_flatten_confirmed" if confirmed and resolution["flattened"] else "entry_unknown_position_unresolved"
+                self.state.data["current"]=row; self.state.save(); return row
+        filled=[v for v,r in receipts.items() if isinstance(r,dict) and r.get("status")=="filled"]
         if len(filled)!=2:
             row["status"]="rolled_back" if filled else "no_fill"
             if filled:
-                v=filled[0]; original=receipts[v]; cq=await self._quote(v,asset); cid=self._cid(item,"rollback",v); cs="sell" if v==item.buy_venue else "buy"
-                close=await self.executors[v].market_order(asset=asset,side=cs,qty=_d(original.get("filled_qty")) or qty,quote=cq or {},client_order_id=cid,reduce_only=True,max_slippage_bps=Decimal("50"))
-                row["rollback"]={"leg":v,"close":close}
-                if close.get("status")!="filled": row["status"]="manual_review_required"; row["reason"]="rollback_not_confirmed"
-            self.state.data["current"]=row; self.state.save()
-            return row
+                v=filled[0]; held=await self._position_qty(asset,v); size=_d(receipts[v].get("filled_qty"))
+                if held is not None and held==ZERO:
+                    row["rollback"]={"leg":v,"resolution":"position_flat_confirmed"}
+                elif size is None and held is None:
+                    row["status"]="manual_review_required"; row["reason"]="known_leg_size_unknown_no_rollback"
+                else:
+                    close_qty=abs(held) if held is not None else size
+                    side="sell" if v==item.buy_venue else "buy"
+                    cid,close=await self._close_leg(asset,item,v,side,close_qty,"rollback")
+                    row["rollback"]={"leg":v,"client_order_id":cid,"close":close}
+                    if not isinstance(close,dict) or close.get("status")!="filled":
+                        row["status"]="manual_review_required"; row["reason"]="rollback_not_confirmed"
+            self.state.data["current"]=row; self.state.save(); return row
+        buy_qty=_d(receipts[item.buy_venue].get("filled_qty")); sell_qty=_d(receipts[item.sell_venue].get("filled_qty"))
+        if buy_qty is None or sell_qty is None:
+            row["status"]="manual_review_required"; row["reason"]="entry_fill_size_unknown"
+            self.state.data["current"]=row; self.state.save(); return row
+        if abs(buy_qty-sell_qty)>_qty_tolerance(qty):
+            bigger=item.buy_venue if buy_qty>sell_qty else item.sell_venue
+            excess=abs(buy_qty-sell_qty)
+            normalized=self.executors[bigger].normalize_qty(asset,excess)
+            if normalized is None or normalized<=0:
+                row["status"]="manual_review_required"; row["reason"]="entry_leg_size_mismatch_unhedgeable"
+                self.state.data["current"]=row; self.state.save(); return row
+            side="sell" if bigger==item.buy_venue else "buy"
+            cid,resize=await self._close_leg(asset,item,bigger,side,normalized,"entry-resize")
+            row["entry"]["resize"]={"venue":bigger,"qty":str(normalized),"client_order_id":cid,"receipt":resize}
+            if not isinstance(resize,dict) or resize.get("status")!="filled":
+                row["status"]="manual_review_required"; row["reason"]="entry_leg_size_mismatch_resize_failed"
+                self.state.data["current"]=row; self.state.save(); return row
+            if bigger==item.buy_venue: buy_qty-=normalized; receipts[bigger]["filled_qty"]=str(buy_qty)
+            else: sell_qty-=normalized; receipts[bigger]["filled_qty"]=str(sell_qty)
+            receipts[bigger]["resized_qty"]=str(normalized)
+            row["entry"]["legs"][bigger]={**receipts[bigger],"side":"buy" if bigger==item.buy_venue else "sell","client_order_id":ids[bigger]}
         adverse=[]; start=time.monotonic()
         for delay in self.horizons:
             await asyncio.sleep(max(0.,delay-(time.monotonic()-start))); pts={}
@@ -867,6 +961,25 @@ class ProbeRunner:
         close_ids={v:self._cid(item,"exit",v) for v in receipts}
         cqs={v:await self._quote(v,asset) for v in receipts}
         closes=await asyncio.gather(self.executors[item.buy_venue].market_order(asset=asset,side="sell",qty=_d(receipts[item.buy_venue].get("filled_qty")) or qty,quote=cqs[item.buy_venue] or {},client_order_id=close_ids[item.buy_venue],reduce_only=True,max_slippage_bps=Decimal("50")),self.executors[item.sell_venue].market_order(asset=asset,side="buy",qty=_d(receipts[item.sell_venue].get("filled_qty")) or qty,quote=cqs[item.sell_venue] or {},client_order_id=close_ids[item.sell_venue],reduce_only=True,max_slippage_bps=Decimal("50")),return_exceptions=True)
-        row["exit"]={"quotes_at_close":cqs,"legs":{item.buy_venue:{**(closes[0] if isinstance(closes[0],dict) else {"status":"error"}),"side":"sell","client_order_id":close_ids[item.buy_venue]},item.sell_venue:{**(closes[1] if isinstance(closes[1],dict) else {"status":"error"}),"side":"buy","client_order_id":close_ids[item.sell_venue]}}}
-        closed=all(isinstance(r,dict) and r.get("status")=="filled" for r in closes)
+        row["exit"]={"quotes_at_close":cqs,"legs":{item.buy_venue:{**(closes[0] if isinstance(closes[0],dict) else {"status":"error"}),"side":"sell","client_order_id":close_ids[item.buy_venue]},item.sell_venue:{**(closes[1] if isinstance(closes[1],dict) else {"status":"error"}),"side":"buy","client_order_id":close_ids[item.sell_venue]}},"recovery":{}}
+        closed=True
+        for index,venue in enumerate((item.buy_venue,item.sell_venue)):
+            leg=row["exit"]["legs"][venue]
+            if leg.get("status")=="filled": continue
+            held=await self._position_qty(asset,venue)
+            detail={"first_status":leg.get("status"),"position_after":None if held is None else str(held)}
+            if held==ZERO:
+                leg.update({"status":"filled","recovered_from":"position_snapshot"}); detail["resolution"]="position_flat_confirmed"
+                row["exit"]["recovery"][venue]=detail; continue
+            if held is None:
+                detail["resolution"]="position_unverifiable"; row["exit"]["recovery"][venue]=detail; closed=False; continue
+            side="sell" if venue==item.buy_venue else "buy"
+            cid,retry=await self._close_leg(asset,item,venue,side,abs(held),"exit-retry")
+            detail["retry"]={"client_order_id":cid,"receipt":retry}
+            if isinstance(retry,dict) and retry.get("status")=="filled":
+                row["exit"]["legs"][venue]={**retry,"side":side,"client_order_id":cid,"retried":True}
+                detail["resolution"]="retry_confirmed"
+            else:
+                detail["resolution"]="retry_unconfirmed"; closed=False
+            row["exit"]["recovery"][venue]=detail
         row["status"]="filled" if closed else "manual_review_required"; row["reason"]=None if closed else "exit_not_confirmed"; return row

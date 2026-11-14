@@ -12,6 +12,10 @@ ZERO = Decimal("0")
 # size.  A missing fee field there is a policy fact, not missing evidence.
 FEE_FREE_VENUES = {"variational", "lighter_mainnet", "lighter_rh"}
 
+# Entropy returns 110% of the taker fee it charges, so a 2 bps gross fee is a
+# 0.2 bps credit.  Every other venue reports an already-net fee.
+FEE_REBATE_MULTIPLIER = {"entropy": Decimal("1.10")}
+
 
 def _d(value: Any) -> Decimal | None:
     if value in (None, ""):
@@ -35,6 +39,24 @@ def _parse(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _parse_epoch(value: Any) -> datetime | None:
+    """Venue timestamps arrive as seconds, milliseconds, microseconds or ns."""
+    number = _d(value)
+    if number is None:
+        return None
+    seconds = float(number)
+    if abs(seconds) >= 1e17:
+        seconds /= 1e9
+    elif abs(seconds) >= 1e14:
+        seconds /= 1e6
+    elif abs(seconds) >= 1e11:
+        seconds /= 1e3
+    try:
+        return datetime.fromtimestamp(seconds, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _clock_offset_ms(execution_quote: Any) -> Decimal | None:
     """Echo-based clock offset for one venue.
 
@@ -52,7 +74,7 @@ def _clock_offset_ms(execution_quote: Any) -> Decimal | None:
     )
     for local_key, exchange_key in pairs:
         local = _parse(execution_quote.get(local_key))
-        exchange = _parse(execution_quote.get(exchange_key))
+        exchange = _parse(execution_quote.get(exchange_key)) or _parse_epoch(execution_quote.get(exchange_key))
         if local is not None and exchange is not None:
             return Decimal(str(round((local - exchange).total_seconds() * 1000, 3)))
     return None
@@ -99,6 +121,24 @@ def _fee_bps(leg: dict[str, Any], venue: str) -> Decimal | None:
     if qty is None or price is None or qty <= 0 or price <= 0:
         return None
     return fee / (qty * price) * BPS
+
+
+def _net_fee_bps(gross: Decimal | None, venue: str) -> Decimal | None:
+    if gross is None:
+        return None
+    multiplier = FEE_REBATE_MULTIPLIER.get(venue)
+    if multiplier is None or gross <= ZERO:
+        return gross
+    return gross * (Decimal("1") - multiplier)
+
+
+def _net_fee_usd(fee: Decimal | None, venue: str) -> Decimal | None:
+    if fee is None:
+        return None
+    multiplier = FEE_REBATE_MULTIPLIER.get(venue)
+    if multiplier is None or fee <= ZERO:
+        return fee
+    return fee * (Decimal("1") - multiplier)
 
 
 def _leg_cost(leg: dict[str, Any], reference: dict[str, Any], *, closing: bool) -> dict[str, Any]:
@@ -189,7 +229,10 @@ def decompose_round(row: dict[str, Any]) -> dict[str, Any]:
         venue_costs[venue] = None if own_entry is None and own_exit is None else str((own_entry or ZERO) + (own_exit or ZERO))
 
     fees = ZERO
+    net_fees = ZERO
     fee_bps = ZERO
+    gross_fee_bps = ZERO
+    rebate_bps = ZERO
     fee_statuses: dict[str, str] = {}
     fee_unverified: list[str] = []
     for leg_name, legs in (("entry", entry_legs), ("exit", exit_legs)):
@@ -199,11 +242,15 @@ def decompose_round(row: dict[str, Any]) -> dict[str, Any]:
             value = _d(leg.get("fee_usd"))
             if value is not None:
                 fees += value
+                net_fees += _net_fee_usd(value, str(venue))
             bps = _fee_bps(leg, str(venue))
             if bps is None:
                 fee_unverified.append(f"{leg_name}:{venue}")
             else:
-                fee_bps += bps
+                gross_fee_bps += bps
+                net = _net_fee_bps(bps, str(venue))
+                fee_bps += net
+                rebate_bps += net - bps
     statuses = set(fee_statuses.values())
     if "unverified" in statuses or not statuses:
         fees_status = "unverified"
@@ -279,9 +326,12 @@ def decompose_round(row: dict[str, Any]) -> dict[str, Any]:
         "exit_price_cost_bps": str(exit_cost),
         "total_price_cost_bps": str(price_cost),
         "fee_bps": str(fee_bps),
+        "gross_fee_bps": str(gross_fee_bps),
+        "rebate_bps": str(rebate_bps),
         "net_cost_bps": None if net_cost is None else str(net_cost),
         "venue_roundtrip_cost_bps": venue_costs,
         "fees_usd": str(fees),
+        "net_fees_usd": str(net_fees),
         "fees_status": fees_status,
         "fee_leg_status": fee_statuses,
         "fees_unverified_legs": fee_unverified,
@@ -442,6 +492,6 @@ def calibrate(rounds: Iterable[dict[str, Any]], *, target_bps: Decimal = Decimal
         "pairs": pairs,
         "recommended_trigger_bps": venue_recommendations,
         "recommended_pair_trigger_bps": pair_recommendations,
-        "fee_policy": "fees_reported_separately_from_price_cost_zero_fee_venues_marked_zero_by_policy",
+        "fee_policy": "fees_reported_separately_from_price_cost_zero_fee_venues_marked_zero_by_policy_entropy_rebate_110pct",
         "summaries": summaries,
     }
