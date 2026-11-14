@@ -210,3 +210,30 @@ def test_receipt_records_stage_latencies():
     assert out["ack_to_complete_ms"] is not None
     assert out["exchange_fill_to_local_ms"] is not None
     assert out["completed_at"]
+
+def test_lighter_poll_parses_numeric_epoch_fill_time(monkeypatch):
+    import sys, types
+    from datetime import datetime, timezone
+    from tools.lib.venue_probe import LighterProbeExecutor
+
+    class Resp:
+        def to_dict(self):
+            return {"code": 200, "orders": [{
+                "client_order_index": 321, "status": "filled",
+                "filled_base_amount": "0.05", "filled_quote_amount": "10",
+                "order_index": "7", "updated_at": 1794641842, "created_at": 1794641842,
+            }]}
+    class Api:
+        def __init__(self, _client): pass
+        async def account_inactive_orders(self, **kwargs): return Resp()
+    class Client:
+        api_client = object()
+        def create_auth_token_with_expiry(self, **kwargs): return "token", None
+    monkeypatch.setitem(sys.modules, "lighter", types.SimpleNamespace(OrderApi=Api))
+    ex = LighterProbeExecutor(name="lighter_mainnet", rest_url="https://x", account_index=1, api_key_index=2, private_key="x")
+    ex.client = Client()
+    now = datetime.now(timezone.utc)
+    out = asyncio.run(ex._poll("cid", 321, now, now, 110))
+    assert out["status"] == "filled"
+    assert out["source_at_epoch"] == 1794641842
+    assert out["source_at"].startswith("2026-")

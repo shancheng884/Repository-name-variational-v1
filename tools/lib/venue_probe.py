@@ -296,11 +296,11 @@ class LighterProbeExecutor:
             if matches:
                 row=matches[0]; status=str(row.get("status") or "").lower(); filled=_d(row.get("filled_base_amount")) or ZERO; quote=_d(row.get("filled_quote_amount")) or ZERO
                 if status=="filled" and filled>0 and quote>0:
-                    fill_at=_parse(row.get("updated_at") or row.get("created_at"))
+                    fill_at=_parse_epoch_ms(row.get("updated_at") or row.get("created_at") or row.get("transaction_time"))
                     return {"ok":True,"status":"filled","client_order_id":client_order_id,"filled_qty":str(filled),"avg_price":format(quote/filled,"f"),"order_id":str(row.get("order_index") or row.get("order_id") or ""),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":_iso(fill_at),"source_at_epoch":fill_at.timestamp() if fill_at else None,"fee_usd":None}
                 if status.startswith("canceled"):
                     if filled>0 and quote>0:
-                        fill_at=_parse(row.get("updated_at") or row.get("created_at"))
+                        fill_at=_parse_epoch_ms(row.get("updated_at") or row.get("created_at") or row.get("transaction_time"))
                         return {"ok":True,"status":"filled","partial":True,"client_order_id":client_order_id,"filled_qty":str(filled),"avg_price":format(quote/filled,"f"),"order_id":str(row.get("order_index") or row.get("order_id") or ""),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":_iso(fill_at),"source_at_epoch":fill_at.timestamp() if fill_at else None,"fee_usd":None}
                     return {"ok":True,"status":"rejected","client_order_id":client_order_id,"filled_qty":"0","submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"error":status}
             await asyncio.sleep(.12)
