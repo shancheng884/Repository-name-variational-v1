@@ -271,7 +271,7 @@ class VariationalProbeExecutor:
             return {"ok":False,"status":"unknown","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"error":str((result or {}).get("error") or (message or {}).get("error") or "variational_order_unconfirmed")[:200]}
         bid=_d(result.get("bid")); ask=_d(result.get("ask")); qid=str(result.get("quoteId") or result.get("quote_id") or "") or None
         qts=str(result.get("quoteTimestamp") or result.get("timestamp") or "") or None
-        exec_quote={"bid":str(bid) if bid is not None else None,"ask":str(ask) if ask is not None else None,"mid":str((bid+ask)/2) if bid is not None and ask is not None else None,"quote_id":qid,"quote_timestamp":qts}
+        exec_quote={"bid":str(bid) if bid is not None else None,"ask":str(ask) if ask is not None else None,"mid":str((bid+ask)/2) if bid is not None and ask is not None else None,"quote_id":qid,"quote_timestamp":qts,"received_at":acked.isoformat(),"submitted_at":submitted.isoformat()}
         rfq=str(result.get("rfqId") or result.get("rfq_id") or "") or None; oid=str(result.get("orderId") or result.get("order_id") or "") or None
         receipt=await self._poll(client_order_id,submitted,acked,rfq,oid,qty)
         receipt["execution_quote"]=exec_quote
