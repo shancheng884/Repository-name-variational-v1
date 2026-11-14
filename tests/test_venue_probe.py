@@ -10,10 +10,9 @@ from tools.lib.venue_probe import ProbeRound, ProbeRunner, ProbeState, enumerate
 
 class FakeHub:
     def __init__(self):
-        self.quotes = {
-            "a": {"mid": "100.1", "bid": "100.0", "ask": "100.2", "recv_at": datetime.now(timezone.utc).isoformat(), "quote_id": "qa", "bbo_source_at": "2026-11-13T10:00:00Z"},
-            "b": {"mid": "100.3", "bid": "100.2", "ask": "100.4", "recv_at": datetime.now(timezone.utc).isoformat(), "quote_id": "qb", "bbo_source_at": "2026-11-13T10:00:00Z"},
-        }
+        qa={"mid": "100.1", "bid": "100.0", "ask": "100.2", "recv_at": datetime.now(timezone.utc).isoformat(), "quote_id": "qa", "bbo_source_at": "2026-11-13T10:00:00Z"}
+        qb={"mid": "100.3", "bid": "100.2", "ask": "100.4", "recv_at": datetime.now(timezone.utc).isoformat(), "quote_id": "qb", "bbo_source_at": "2026-11-13T10:00:00Z"}
+        self.quotes = {"a": qa, "b": qb, "variational": qa, "lighter_mainnet": qb}
     def latest(self, venue, symbol, max_age=10):
         return dict(self.quotes[venue])
 
@@ -77,3 +76,18 @@ def test_unknown_entry_blocks_exit_and_requires_review(tmp_path):
     row = asyncio.run(runner._run_one(item))
     assert row["status"] == "manual_review_required"
     assert len(a.calls) + len(b.calls) == 2
+
+
+def test_preflight_rejects_insufficient_margin(tmp_path):
+    class MarginExec(FakeExec):
+        def __init__(self, margin):
+            super().__init__(); self.margin=margin
+        async def preflight(self, asset):
+            return {"ok": True, "qty": "0", "active_orders": 0, "available_margin": self.margin}
+    runner = ProbeRunner(hub=FakeHub(), executors={"variational": MarginExec("0.0"), "lighter_mainnet": MarginExec("100")},
+                         state=ProbeState(tmp_path / "s.json"), writer_path=tmp_path / "r.jsonl",
+                         assets=DEFAULT_ASSETS[:1], venues=("variational", "lighter_mainnet"))
+    out = asyncio.run(runner.preflight_all())
+    assert out["variational:NVDA"]["ok"] is False
+    assert out["variational:NVDA"]["error"] == "variational_insufficient_margin"
+    assert out["lighter_mainnet:NVDA"]["ok"] is True

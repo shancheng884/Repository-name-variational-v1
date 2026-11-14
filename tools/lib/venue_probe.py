@@ -105,7 +105,9 @@ class VariationalProbeExecutor:
         if rows is None: return {"ok":False,"error":"variational_orders_unverifiable"}
         active=[r for r in rows if _underlying(r)==symbol]
         if active: return {"ok":False,"error":"variational_active_order","count":len(active)}
-        return {"ok":True,"qty":"0","active_orders":0,
+        portfolio=await self.client.request({"type":"VAR_API_PORTFOLIO","requestId":uuid.uuid4().hex,"requestTimeoutMs":int(self.timeout_seconds*1000)})
+        p=(portfolio.get("result") or {}).get("portfolio") or {}
+        return {"ok":True,"qty":"0","active_orders":0,"available_margin":p.get("balance"),
                 "contract":{"venue":"variational","symbol":asset.symbol("variational"),
                             "instrument_type":asset.var_instrument_type,"kind":asset.var_kind,
                             "settlement_asset":"USDC","funding_interval_s":0}}
@@ -198,7 +200,9 @@ class LighterProbeExecutor:
         rows=_rows(await OrderApi(self.client.api_client).account_active_orders(auth=token,account_index=int(self.account_index),market_id=int(market["market_id"]),_request_timeout=10.),"orders")
         if rows is None: return {"ok":False,"error":f"{self.venue}_active_orders_unverifiable"}
         if rows: return {"ok":False,"error":f"{self.venue}_active_order","count":len(rows)}
+        acc=(account.get("accounts") or [{}])[0] if isinstance(account.get("accounts"),list) and account.get("accounts") else {}
         return {"ok":True,"qty":"0","active_orders":0,
+                "available_margin":acc.get("available_balance"),
                 "contract":{"venue":self.venue,"symbol":asset.symbol(self.venue),
                             "market_id":int(market["market_id"]),
                             "status":market.get("status"),"market_type":market.get("market_type"),
@@ -323,6 +327,7 @@ class EntropyProbeExecutor:
         row=self._row(asset); asset_index=int(self.info.name_to_asset(coin))
         margin=(state or {}).get("marginSummary") or {}
         return {"ok":True,"qty":"0","active_orders":0,"account_value":margin.get("accountValue"),
+                "available_margin":(state or {}).get("withdrawable"),
                 "contract":{"venue":"entropy","symbol":coin,"asset_index":asset_index,
                             "sz_decimals":int(row.get("szDecimals") or 0),
                             "max_leverage":row.get("maxLeverage"),"only_isolated":bool(row.get("onlyIsolated")),
@@ -428,6 +433,14 @@ class ProbeRunner:
                 continue
             for asset in self.assets:
                 if asset.supports(name): out[f"{name}:{asset.name}"]=await ex.preflight(asset)
+        required=self.notional_usd/Decimal("5")
+        for key,value in list(out.items()):
+            if not value.get("ok") or key.endswith(":market"):
+                continue
+            margin=_d(value.get("available_margin"))
+            if margin is not None and margin < required:
+                value.update({"ok":False,"error":f"{key.split(':')[0]}_insufficient_margin",
+                              "required_margin":str(required)})
         for asset in self.assets:
             for venue in self.venues:
                 if not asset.supports(venue):
