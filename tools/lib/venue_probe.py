@@ -744,9 +744,13 @@ class ProbeState:
         tmp.write_text(json.dumps(self.data,ensure_ascii=False,indent=2,default=str)+"\n"); os.replace(tmp,self.path)
 class ProbeRunner:
     TERMINAL={"filled","rolled_back","no_fill","skipped"}
-    def __init__(self,*,hub,executors,state,writer_path,assets,venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=2.5,hold_seconds=3.1,run_id=None,horizons=(.25,.5,1.,3.),max_quote_age_by_venue=None,max_rounds=0,lock_path=None,market_quote_wait_seconds=15.0,min_edge_bps=None,exit_on_revert=False,exit_edge_bps=0.0,max_hold_seconds=600.0,exit_poll_seconds=2.0,min_edge_by_pair=None):
+    def __init__(self,*,hub,executors,state,writer_path,assets,venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=2.5,hold_seconds=3.1,run_id=None,horizons=(.25,.5,1.,3.),max_quote_age_by_venue=None,max_rounds=0,lock_path=None,market_quote_wait_seconds=15.0,min_edge_bps=None,exit_on_revert=False,exit_edge_bps=0.0,max_hold_seconds=600.0,exit_poll_seconds=2.0,min_edge_by_pair=None,baseline_entry=False,baseline_minutes=30.0,min_baseline_samples=240,max_loss_usd=None):
         self.hub=hub; self.executors=executors; self.state=state; self.writer_path=writer_path; self.assets=assets; self.venues=venues; self.by_name={a.name:a for a in assets}; self.notional_usd=notional_usd; self.round_interval_seconds=max(.2,round_interval_seconds); self.max_quote_age_seconds=max_quote_age_seconds; self.max_quote_age_by_venue=dict(max_quote_age_by_venue or {}); self.market_quote_wait_seconds=float(market_quote_wait_seconds); self.min_edge_bps=None if min_edge_bps is None else Decimal(str(min_edge_bps)); self.exit_on_revert=bool(exit_on_revert); self.exit_edge_bps=Decimal(str(exit_edge_bps)); self.max_hold_seconds=max(5.0,float(max_hold_seconds)); self.exit_poll_seconds=max(0.5,float(exit_poll_seconds));
-        self.min_edge_by_pair={k:Decimal(str(v)) for k,v in (min_edge_by_pair or {}).items()}; self.hold_seconds=max(.5,hold_seconds); self.horizons=tuple(horizons); self.max_rounds=max(0,int(max_rounds)); self.run_id=run_id or "probe-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")+"-"+uuid.uuid4().hex[:4]; self.run_token=hashlib.sha256(self.run_id.encode()).hexdigest()[:8]
+        self.min_edge_by_pair={k:Decimal(str(v)) for k,v in (min_edge_by_pair or {}).items()};
+        self.baseline_entry=bool(baseline_entry); self.baseline_seconds=max(60.0,float(baseline_minutes)*60.0);
+        self.min_baseline_samples=max(2,int(min_baseline_samples));
+        self.max_loss_usd=None if max_loss_usd is None else Decimal(str(max_loss_usd));
+        self._edge_history={}; self._realized_usd=Decimal("0"); self.stopped_reason=None; self.hold_seconds=max(.5,hold_seconds); self.horizons=tuple(horizons); self.max_rounds=max(0,int(max_rounds)); self.run_id=run_id or "probe-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")+"-"+uuid.uuid4().hex[:4]; self.run_token=hashlib.sha256(self.run_id.encode()).hexdigest()[:8]
         self.lock=ProbeLock(lock_path or (Path(self.state.path).parent/"run.lock"))
         self._last_quote_reject=None
     def _write(self,row):
@@ -868,12 +872,20 @@ class ProbeRunner:
                 self.state.data["current"]=current; self.state.data["phase"]="manual_review_required"; self.state.save(); self._write(current)
                 return {"ok":False,"mode":"live","rounds":completed,"state":"manual_review_required","error":current["reason"]}
             self._write(row)
+            if row.get("status")=="filled":
+                self._realized_usd+=self._round_pnl_usd(row)
+                if self.max_loss_usd is not None and self._realized_usd<=-abs(self.max_loss_usd):
+                    self.state.data["current"]=row; self.state.data["realized_usd"]=str(self._realized_usd)
+                    self.state.data["phase"]="stopped_max_loss"; self.state.data["stopped_reason"]="max_loss_reached"
+                    self.state.save(); self.stopped_reason="max_loss_reached"
+                    return {"ok":False,"mode":"live","rounds":completed,"state":"stopped_max_loss","realized_usd":str(self._realized_usd)}
             if row.get("status") in self.TERMINAL:
                 self.state.data["rounds"].append(row); self.state.data["cursor"]=idx+1; self.state.data["current"]=None; completed+=1; self.state.save()
             else:
                 self.state.data["current"]=row; self.state.data["phase"]="manual_review_required"; self.state.save(); break
             await asyncio.sleep(self.round_interval_seconds)
-        self.state.data["phase"]="completed" if self.state.data.get("phase")!="manual_review_required" else "manual_review_required"; self.state.save()
+        self.state.data["realized_usd"]=str(self._realized_usd)
+        self.state.data["phase"]="completed" if self.state.data.get("phase") not in ("manual_review_required","stopped_max_loss") else self.state.data.get("phase"); self.state.save()
         return {"ok":self.state.data["phase"]=="completed","mode":"live","rounds":completed,"state":self.state.data["phase"]}
     async def _quote(self,venue,asset,*,allow_stale=False):
         """Latest quote for a venue, rejecting ladders a print has disproved.
@@ -898,6 +910,33 @@ class ProbeRunner:
             if b is not None and s is not None: return b,s
             await asyncio.sleep(.1)
         return None
+    @staticmethod
+    def _round_pnl_usd(row):
+        """Realised round-trip P&L in dollars, from the fills themselves."""
+        try:
+            buy=(row.get("entry") or {}).get("legs",{})
+            sell=(row.get("exit") or {}).get("legs",{})
+            bv=row.get("buy_venue"); sv=row.get("sell_venue")
+            q=min(_d(buy[bv]["filled_qty"]),_d(buy[sv]["filled_qty"]))
+            return ( _d(sell[bv]["avg_price"])-_d(buy[bv]["avg_price"]) )*q + ( _d(buy[sv]["avg_price"])-_d(sell[sv]["avg_price"]) )*q
+        except Exception:
+            return ZERO
+
+    def _remember_edge(self,key,value,now_ts):
+        from collections import deque
+        history=self._edge_history.setdefault(key,deque())
+        history.append((now_ts,float(value)))
+        cutoff=now_ts-self.baseline_seconds*2
+        while history and history[0][0]<cutoff: history.popleft()
+
+    def _baseline(self,key,now_ts):
+        """Rolling median of the pair's own edge: the level, not the dislocation."""
+        history=self._edge_history.get(key) or ()
+        window=[v for t,v in history if now_ts-t<=self.baseline_seconds]
+        if len(window)<self.min_baseline_samples: return None
+        ordered=sorted(window)
+        return ordered[len(ordered)//2]
+
     @staticmethod
     def _cross_edge(asset,buy_quote,sell_quote):
         """Executable cross-venue edge in bps: sell at bid, buy at ask."""
@@ -1018,14 +1057,24 @@ class ProbeRunner:
         # half_spread / signal->exec / exec->fill complete instead of empty.
         signal_edge=((_d(sell["bid"])-_d(buy["ask"]))/((_d(sell["bid"])+_d(buy["ask"]))/2)*BPS) if _d(sell["bid"]) and _d(buy["ask"]) else ZERO
         threshold=self.min_edge_by_pair.get((item.asset,item.buy_venue,item.sell_venue),self.min_edge_bps) if self.min_edge_by_pair else self.min_edge_bps
-        if threshold is not None and signal_edge<threshold:
+        now_ts=time.time(); key=(item.asset,item.buy_venue,item.sell_venue)
+        self._remember_edge(key,signal_edge,now_ts)
+        baseline=self._baseline(key,now_ts) if self.baseline_entry else None
+        if self.baseline_entry and baseline is None:
+            return {"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,
+                    "asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,
+                    "status":"skipped","reason":"baseline_warming_up","orders_attempted":False,
+                    "signal_edge_bps":str(signal_edge),"notional_usd":str(self.notional_usd)}
+        measured=(signal_edge-Decimal(str(baseline))) if self.baseline_entry else signal_edge
+        if threshold is not None and measured<threshold:
             # Conditional entry: a validation run must only spend money when the
             # dislocation clears the entry bar, and must record what it saw on
             # the passes it skipped so the skip rate stays auditable.
             return {"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,
                     "asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,
                     "status":"skipped","reason":"edge_below_threshold","orders_attempted":False,
-                    "signal_edge_bps":str(signal_edge),"threshold_bps":str(threshold),
+                    "signal_edge_bps":str(signal_edge),"measured_bps":str(measured),
+                    "baseline_bps":None if baseline is None else str(baseline),"threshold_bps":str(threshold),
                     "notional_usd":str(self.notional_usd),
                     "decision":{"at":datetime.now(timezone.utc).isoformat(),
                                 "quotes":{item.buy_venue:buy,item.sell_venue:sell},
@@ -1056,7 +1105,8 @@ class ProbeRunner:
                                 "submit_quotes":submit,"signal_edge_bps":str(signal_edge)}}
         ids={item.buy_venue:self._cid(item,"entry",item.buy_venue),item.sell_venue:self._cid(item,"entry",item.sell_venue)}
 
-        row={"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"submitting","notional_usd":str(self.notional_usd),"target_qty":str(qty),"decision":{"at":datetime.now(timezone.utc).isoformat(),"quotes":{item.buy_venue:buy,item.sell_venue:sell},"submit_quotes":submit,"signal_edge_bps":str(signal_edge),"entry_client_order_ids":ids,
+        row={"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"submitting","notional_usd":str(self.notional_usd),"target_qty":str(qty),"decision":{"at":datetime.now(timezone.utc).isoformat(),"quotes":{item.buy_venue:buy,item.sell_venue:sell},"submit_quotes":submit,"signal_edge_bps":str(signal_edge),"baseline_bps":None if baseline is None else str(baseline),
+                "entry_client_order_ids":ids,
                 "quote_audit":{v:{"age_s":(buy if v==item.buy_venue else sell).get("age_s"),
                                   "book_age_s":(buy if v==item.buy_venue else sell).get("book_age_s"),
                                   "bbo_age_s":(buy if v==item.buy_venue else sell).get("bbo_age_s"),
@@ -1165,7 +1215,8 @@ class ProbeRunner:
             exit_edge=self._cross_edge(asset,cqs.get(item.buy_venue),cqs.get(item.sell_venue))
             if not self.exit_on_revert:
                 break
-            if exit_edge is not None and exit_edge<=self.exit_edge_bps:
+            target=self.exit_edge_bps if baseline is None else Decimal(str(baseline))+self.exit_edge_bps
+            if exit_edge is not None and exit_edge<=target:
                 exit_reason="reverted"; break
             if time.monotonic()-held_from>=self.max_hold_seconds:
                 exit_reason="deadline"; break

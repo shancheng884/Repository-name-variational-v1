@@ -109,7 +109,7 @@ async def main_async(args):
         return {"ok":True,"mode":"plan","orders_attempted":False,"assets":[a.name for a in assets],"venues":list(venues),"rounds":len(plan),"plan":[r.__dict__ for r in plan],"live_gate":"requires --mode preflight, then --mode run --execute --confirm-live-probes --confirm-flat --i-understand-live-orders"}
     cap,task,ex=await _session(args,env,assets,venues)
     try:
-        runner=ProbeRunner(hub=cap.hub,executors=ex,state=ProbeState(ROOT/"log"/"venue_probe"/"state.json"),writer_path=ROOT/"log"/"venue_probe"/"rounds.jsonl",assets=assets,venues=venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=3.0,max_quote_age_by_venue={"entropy":6.0},horizons=(.25,.5,1.,3.,5.,10.),max_rounds=args.max_rounds,min_edge_bps=args.min_edge_bps,exit_on_revert=args.exit_on_revert,exit_edge_bps=args.exit_edge_bps,max_hold_seconds=args.max_hold_seconds,exit_poll_seconds=args.exit_poll_seconds,min_edge_by_pair=thresholds)
+        runner=ProbeRunner(hub=cap.hub,executors=ex,state=ProbeState(ROOT/"log"/"venue_probe"/"state.json"),writer_path=ROOT/"log"/"venue_probe"/"rounds.jsonl",assets=assets,venues=venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=3.0,max_quote_age_by_venue={"entropy":6.0},horizons=(.25,.5,1.,3.,5.,10.),max_rounds=args.max_rounds,min_edge_bps=args.min_edge_bps,exit_on_revert=args.exit_on_revert,exit_edge_bps=args.exit_edge_bps,max_hold_seconds=args.max_hold_seconds,exit_poll_seconds=args.exit_poll_seconds,min_edge_by_pair=thresholds,baseline_entry=args.baseline_entry,baseline_minutes=args.baseline_minutes,min_baseline_samples=args.min_baseline_samples,max_loss_usd=args.max_loss_usd)
         runner.pairs=pairs; runner.rounds_per_pair=args.rounds_per_pair
         if args.mode=="preflight":
             health=await runner.preflight_all(); (ROOT/"log"/"venue_probe"/"preflight.json").write_text(json.dumps(health,ensure_ascii=False,indent=2,default=str)+"\n")
@@ -136,6 +136,10 @@ def parse_args(argv=None):
     p.add_argument("--exit-edge-bps",type=float,default=0.0,help="edge level that counts as reverted for --exit-on-revert")
     p.add_argument("--max-hold-seconds",type=float,default=600.0,help="hard cap on holding time for --exit-on-revert")
     p.add_argument("--exit-poll-seconds",type=float,default=2.0,help="how often to re-read the edge while holding")
+    p.add_argument("--baseline-entry",action="store_true",help="enter on the deviation from the pair rolling median instead of the raw edge")
+    p.add_argument("--baseline-minutes",type=float,default=30.0)
+    p.add_argument("--min-baseline-samples",type=int,default=240)
+    p.add_argument("--max-loss-usd",type=float,default=None,help="hard stop after this much realised loss")
     p.add_argument("--pairs",default="",help="comma list of ASSET:buy>sell; restricts the plan to these combinations only")
     p.add_argument("--rounds-per-pair",type=int,default=1,help="repeat each requested pair this many times, round-robin")
     p.add_argument("--resume",action="store_true",help="continue a stalled run after both accounts prove flat")
