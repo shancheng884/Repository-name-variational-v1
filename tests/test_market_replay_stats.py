@@ -31,19 +31,37 @@ def test_a_spike_that_clears_the_trigger_is_one_event():
 
 
 def test_the_rolling_median_absorbs_a_permanent_level_shift():
-    """A level that simply moves is not a stream of opportunities."""
     values = [0.0] * (2 * 3600) + [10.0] * (6 * 3600)
     stats = analyse_pair(series(values), window_minutes=30, slippage_bps=1.0, target_bps=1.0)
-    # Only the transition counts; the settled 10bps level is the new normal.
     assert stats["hit_share"] < 0.05
     assert stats["dev_p50_bps"] < 0.5
+
+
+def test_reversion_time_is_measured_and_priced():
+    """A dislocation that clears in 120s is bankable; its speed is bps/hour held."""
+    values = [0.0] * 600 + [8.0] * 120 + [0.0] * 600
+    stats = analyse_pair(series(values), window_minutes=10, slippage_bps=1.0, target_bps=1.0,
+                         max_hold_seconds=600)
+    assert stats["reversion_median_s"] is not None
+    assert 100 <= stats["reversion_median_s"] <= 140
+    assert stats["timeout_share"] == 0
+    assert stats["net_at_entry_bps"] is not None and 4.5 < stats["net_at_entry_bps"] < 5.5
+    assert stats["bps_per_hour_held"] and stats["bps_per_hour_held"] > 100
+
+
+def test_an_unreverted_dislocation_is_counted_as_timeout():
+    values = [0.0] * 600 + [8.0] * 3000
+    stats = analyse_pair(series(values), window_minutes=10, slippage_bps=1.0, target_bps=1.0,
+                         max_hold_seconds=600, revert_bps=0.0)
+    assert stats["timeout_share"] == 1.0
+    assert stats["reversion_median_s"] is None
+    assert stats["bps_per_day_serial"] is None
 
 
 def test_bps_per_day_scales_with_events():
     values = [0.0] * 600 + [10.0] * 10
     stats = analyse_pair(series(values), window_minutes=10, slippage_bps=1.0, target_bps=1.0)
-    assert stats["bps_per_day"] is not None
-    assert stats["bps_per_day"] > 0
+    assert stats["bps_per_day"] is not None and stats["bps_per_day"] > 0
 
 
 def test_loader_filters_by_time_and_skips_bad_rows(tmp_path):
@@ -61,3 +79,4 @@ def test_loader_filters_by_time_and_skips_bad_rows(tmp_path):
     assert len(grid) == 1
     only = next(iter(grid.values()))
     assert only[0] == 101.1
+

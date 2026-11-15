@@ -83,7 +83,7 @@ def load_quotes(output_dir, asset, venue, since, until=None):
 
 
 def analyse_pair(samples, *, window_minutes=30, slippage_bps=1.3, target_bps=1.0, gap_seconds=60,
-                 hours=None):
+                 hours=None, revert_bps=0.0, max_hold_seconds=900, overhead_seconds=30):
     """Score one ordered pair.
 
     ``samples`` is an iterable of ``(timestamp, edge_bps, spread_cost_bps)`` in
@@ -109,16 +109,18 @@ def analyse_pair(samples, *, window_minutes=30, slippage_bps=1.3, target_bps=1.0
     median_vol = st.pstdev(medians) if len(medians) > 2 else 0.0
 
     trigger = cost + target_bps
+    raw_edges = [edge for _, edge, _ in samples]
     deviations = [(stamp, edge - baseline[int(stamp) // 60]) for stamp, edge, _ in samples]
     events = []
     current = None
     last = None
-    for stamp, dev in deviations:
+    for index, (stamp, dev) in enumerate(deviations):
         if dev >= trigger:
             if current is None or (last is not None and stamp - last > gap_seconds):
                 if current:
                     events.append(current)
-                current = {"peak": dev}
+                current = {"start": index, "peak": dev, "entry": dev,
+                           "base": baseline[int(stamp) // 60]}
             else:
                 current["peak"] = max(current["peak"], dev)
             last = stamp
@@ -128,12 +130,43 @@ def analyse_pair(samples, *, window_minutes=30, slippage_bps=1.3, target_bps=1.0
     if current:
         events.append(current)
 
+    # How long until the dislocation is gone (and therefore how fast the bps can
+    # actually be banked), not just how large it got.
+    for event in events:
+        start = event["start"]
+        stamp0, dev0 = deviations[start]
+        event["entry"] = dev0
+        event["reverted_s"] = None
+        # Reversion is measured against the baseline frozen at entry: the level
+        # this pair sat at when we traded it. Measuring against a moving median
+        # would let the baseline drift chase the price and fake a reversion.
+        frozen = event.get("base", 0.0)
+        for index in range(start + 1, len(deviations)):
+            stamp, _dev = deviations[index]
+            if stamp - stamp0 > max_hold_seconds:
+                break
+            if raw_edges[index] - frozen <= revert_bps:
+                event["reverted_s"] = stamp - stamp0
+                break
+
     if hours is None:
         hours = max((samples[-1][0] - samples[0][0]) / 3600.0, 1e-9)
     peaks = [event["peak"] for event in events]
     per_day = len(events) / hours * 24.0 if hours else 0.0
     median_peak = percentile(peaks, 0.5) if peaks else float("nan")
     net = (median_peak - cost) if peaks else float("nan")
+    entries = [event["entry"] for event in events]
+    reverts = [event["reverted_s"] for event in events if event["reverted_s"] is not None]
+    median_entry = percentile(entries, 0.5) if entries else float("nan")
+    net_entry = (median_entry - cost) if entries else float("nan")
+    med_rev = percentile(reverts, 0.5) if reverts else None
+    timeout_share = (1.0 - len(reverts) / len(events)) if events else None
+    speed = None
+    speed_day = None
+    if reverts and med_rev and med_rev > 0 and net_entry == net_entry:
+        speed = net_entry / (med_rev / 3600.0)
+        serial = 86400.0 / (med_rev + max(1, overhead_seconds))
+        speed_day = net_entry * serial
     return {
         "samples": len(samples),
         "hours": round(hours, 2),
@@ -147,6 +180,12 @@ def analyse_pair(samples, *, window_minutes=30, slippage_bps=1.3, target_bps=1.0
         "median_peak_bps": None if median_peak != median_peak else round(median_peak, 3),
         "net_per_event_bps": None if net != net else round(net, 3),
         "bps_per_day": None if net != net else round(net * per_day, 1),
+        "entry_dev_bps": None if median_entry != median_entry else round(median_entry, 3),
+        "net_at_entry_bps": None if net_entry != net_entry else round(net_entry, 3),
+        "reversion_median_s": None if med_rev is None else round(med_rev, 1),
+        "timeout_share": None if timeout_share is None else round(timeout_share, 4),
+        "bps_per_hour_held": None if speed is None else round(speed, 1),
+        "bps_per_day_serial": None if speed_day is None else round(speed_day, 1),
     }
 
 
@@ -174,6 +213,9 @@ def main(argv=None):
     parser.add_argument("--slippage-bps", type=float, default=1.3)
     parser.add_argument("--target-bps", type=float, default=1.0)
     parser.add_argument("--gap-seconds", type=int, default=60)
+    parser.add_argument("--revert-bps", type=float, default=0.0, help="deviation level that counts as reverted")
+    parser.add_argument("--max-hold-seconds", type=float, default=900.0, help="give up counting a reversion after this")
+    parser.add_argument("--overhead-seconds", type=float, default=30.0, help="per-trade overhead used for serial throughput")
     parser.add_argument("--max-spread-bps", type=float, default=10.0, help="drop venues whose p90 spread exceeds this")
     parser.add_argument("--min-samples", type=int, default=1000)
     parser.add_argument("--json", default="")
@@ -211,22 +253,28 @@ def main(argv=None):
                     continue
                 stats = analyse_pair(samples, window_minutes=args.window_minutes,
                                      slippage_bps=args.slippage_bps, target_bps=args.target_bps,
-                                     gap_seconds=args.gap_seconds)
+                                     gap_seconds=args.gap_seconds, revert_bps=args.revert_bps,
+                                     max_hold_seconds=args.max_hold_seconds,
+                                     overhead_seconds=args.overhead_seconds)
                 if stats is None:
                     continue
                 stats.update({"asset": asset, "buy_venue": buy, "sell_venue": sell})
                 rows.append(stats)
 
-    rows.sort(key=lambda r: -(r["bps_per_day"] if r["bps_per_day"] is not None else -1))
-    header = ("%-5s %-16s -> %-16s %6s %8s %8s %8s %6s %6s %8s %8s" %
-              ("asset", "buy", "sell", "cost", "medVol", "devP90", "devP99", "ev/day", "hit%", "medPeak", "bps/day"))
+    rows.sort(key=lambda r: -(r["bps_per_day_serial"] if r["bps_per_day_serial"] is not None else -1))
+    header = ("%-5s %-16s -> %-16s %6s %6s %6s %7s %7s %6s %7s %7s" %
+              ("asset", "buy", "sell", "cost", "entry", "net", "rev_s", "timeout", "ev/day", "bps/h", "bps/day"))
     print(header)
     for row in rows:
-        print("%-5s %-16s -> %-16s %6.2f %8.2f %8.2f %8.2f %6.1f %5.1f%% %8s %8s" % (
-            row["asset"], row["buy_venue"], row["sell_venue"], row["cost_bps"], row["median_vol_bps"],
-            row["dev_p90_bps"], row["dev_p99_bps"], row["events_per_day"], row["hit_share"] * 100,
-            "-" if row["median_peak_bps"] is None else "%.2f" % row["median_peak_bps"],
-            "-" if row["bps_per_day"] is None else "%.1f" % row["bps_per_day"]))
+        print("%-5s %-16s -> %-16s %6.2f %6s %6s %7s %6s %6.1f %7s %7s" % (
+            row["asset"], row["buy_venue"], row["sell_venue"], row["cost_bps"],
+            "-" if row["entry_dev_bps"] is None else "%.2f" % row["entry_dev_bps"],
+            "-" if row["net_at_entry_bps"] is None else "%.2f" % row["net_at_entry_bps"],
+            "-" if row["reversion_median_s"] is None else "%.0f" % row["reversion_median_s"],
+            "-" if row["timeout_share"] is None else "%.0f%%" % (row["timeout_share"] * 100),
+            row["events_per_day"],
+            "-" if row["bps_per_hour_held"] is None else "%.1f" % row["bps_per_hour_held"],
+            "-" if row["bps_per_day_serial"] is None else "%.1f" % row["bps_per_day_serial"]))
     if args.json:
         Path(args.json).write_text(json.dumps({
             "since": args.since, "until": args.until, "assets": assets, "venues": venues,
