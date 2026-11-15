@@ -708,8 +708,22 @@ class UnavailableProbeExecutor:
     def normalize_qty(self,asset,qty): return None
     async def market_order(self,**kwargs): return {"ok":False,"status":"rejected","error":self.reason,"client_order_id":kwargs.get("client_order_id")}
 
-def enumerate_probe_plan(assets,venues):
+def enumerate_probe_plan(assets,venues,pairs=None,rounds_per_pair=1):
+    """Round-robin a plan.
+
+    The default sweeps every ordered venue pair once.  ``pairs`` restricts the
+    plan to explicit ``(asset,buy,sell)`` combinations and repeats them
+    round-robin, so a targeted validation never touches a combination the
+    operator did not ask for and never stacks ten identical rounds in a row.
+    """
     plan=[]; seq=0
+    if pairs is not None:
+        repeats=max(1,int(rounds_per_pair or 1))
+        for _ in range(repeats):
+            for asset_name,buy,sell in pairs:
+                seq+=1
+                plan.append(ProbeRound(f"{asset_name.lower()}-{buy}-{sell}-{seq:03d}",asset_name,buy,sell,seq))
+        return plan
     for asset in assets:
         supported=[v for v in venues if asset.supports(v)]
         for i,left in enumerate(supported):
@@ -789,7 +803,8 @@ class ProbeRunner:
     def _cid(self,item,kind,venue):
         return f"{self.run_token}-{item.round_id}-{kind}-{venue}"
     async def run(self,*,allow_live=False,resume=False):
-        plan=enumerate_probe_plan(self.assets,self.venues)
+        plan=enumerate_probe_plan(self.assets,self.venues,pairs=getattr(self,"pairs",None),
+                                  rounds_per_pair=getattr(self,"rounds_per_pair",1))
         if not allow_live:
             self.state.data.update({"run_id":self.run_id,"planned_rounds":len(plan),"phase":"dry_run","venues":list(self.venues),"assets":[a.name for a in self.assets]}); self.state.save()
             self._write({"schema":1,"event":"probe_plan","run_id":self.run_id,"rounds":[asdict(r) for r in plan]})

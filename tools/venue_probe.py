@@ -24,6 +24,28 @@ def _assets(raw):
         out.append(selected[name])
     return tuple(out)
 
+def _pairs(raw,assets,venues):
+    """Parse ``ASSET:buy>sell`` items and prove they are tradeable."""
+    by_name={a.name:a for a in assets}
+    out=[]
+    for item in [x.strip() for x in (raw or "").split(",") if x.strip()]:
+        try:
+            head,rest=item.split(":",1)
+            buy,sell=rest.split(">",1)
+        except ValueError:
+            raise SystemExit(f"bad_pair_syntax:{item}")
+        name=head.strip().upper(); buy=buy.strip(); sell=sell.strip()
+        asset=by_name.get(name)
+        if asset is None: raise SystemExit(f"pair_asset_not_selected:{name}")
+        if buy==sell: raise SystemExit(f"pair_same_venue:{item}")
+        for venue in (buy,sell):
+            if venue not in venues: raise SystemExit(f"pair_venue_not_selected:{venue}")
+            if not asset.supports(venue): raise SystemExit(f"pair_asset_unsupported:{name}:{venue}")
+        out.append((name,buy,sell))
+    if not out: raise SystemExit("pair_list_empty")
+    return out
+
+
 def _config(assets,output):
     return CaptureConfig(output_dir=output,assets=assets,var_quote_seconds=1.0,book_snapshot_seconds=5.0,health_seconds=2.0,latency_seconds=5.0,system_seconds=60.0,fill_poll_seconds=2.0,edge_seconds=1.0,notional_usd=Decimal("20"),max_book_levels=20)
 
@@ -75,12 +97,14 @@ async def _stop(cap,task,ex):
 async def main_async(args):
     assets=_assets(args.assets); venues=tuple(x.strip() for x in args.venues.split(",") if x.strip())
     env=load_environment()
+    pairs=_pairs(args.pairs,assets,venues) if args.pairs else None
     if args.mode=="plan":
-        plan=enumerate_probe_plan(assets,venues)
+        plan=enumerate_probe_plan(assets,venues,pairs=pairs,rounds_per_pair=args.rounds_per_pair)
         return {"ok":True,"mode":"plan","orders_attempted":False,"assets":[a.name for a in assets],"venues":list(venues),"rounds":len(plan),"plan":[r.__dict__ for r in plan],"live_gate":"requires --mode preflight, then --mode run --execute --confirm-live-probes --confirm-flat --i-understand-live-orders"}
     cap,task,ex=await _session(args,env,assets,venues)
     try:
         runner=ProbeRunner(hub=cap.hub,executors=ex,state=ProbeState(ROOT/"log"/"venue_probe"/"state.json"),writer_path=ROOT/"log"/"venue_probe"/"rounds.jsonl",assets=assets,venues=venues,notional_usd=Decimal("20"),round_interval_seconds=1.0,max_quote_age_seconds=3.0,max_quote_age_by_venue={"entropy":6.0},horizons=(.25,.5,1.,3.,5.,10.),max_rounds=args.max_rounds)
+        runner.pairs=pairs; runner.rounds_per_pair=args.rounds_per_pair
         if args.mode=="preflight":
             health=await runner.preflight_all(); (ROOT/"log"/"venue_probe"/"preflight.json").write_text(json.dumps(health,ensure_ascii=False,indent=2,default=str)+"\n")
             return {"ok":all(v.get("ok") for v in health.values()),"mode":"preflight","orders_attempted":False,"health":health}
@@ -101,6 +125,8 @@ def parse_args(argv=None):
     p.add_argument("--confirm-flat",action="store_true")
     p.add_argument("--i-understand-live-orders",action="store_true")
     p.add_argument("--max-rounds",type=int,default=0,help="0 means the full plan")
+    p.add_argument("--pairs",default="",help="comma list of ASSET:buy>sell; restricts the plan to these combinations only")
+    p.add_argument("--rounds-per-pair",type=int,default=1,help="repeat each requested pair this many times, round-robin")
     p.add_argument("--resume",action="store_true",help="continue a stalled run after both accounts prove flat")
     return p.parse_args(argv)
 
