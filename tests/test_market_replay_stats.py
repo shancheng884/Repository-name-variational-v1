@@ -1,7 +1,6 @@
 from __future__ import annotations
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 
 from tools.market_replay_stats import analyse_pair, load_quotes
 
@@ -22,7 +21,15 @@ def test_cost_includes_the_slippage_allowance():
     assert abs(stats["cost_bps"] - 3.3) < 1e-9
 
 
-def test_a_spike_that_clears_the_trigger_is_one_event():
+def test_a_one_second_blip_is_ignored():
+    """Quotes flicker; an execution takes about a second, so a 1s spike is noise."""
+    values = [0.0] * 600 + [9.0] + [0.0] * 600
+    stats = analyse_pair(series(values), window_minutes=10, slippage_bps=1.0, target_bps=1.0,
+                         min_event_seconds=2)
+    assert stats["events_per_day"] == 0
+
+
+def test_a_persistent_spike_is_one_event():
     values = [0.0] * 1800 + [8.0] * 30 + [0.0] * 1800
     stats = analyse_pair(series(values), window_minutes=30, slippage_bps=1.0, target_bps=1.0)
     assert stats["events_per_day"] >= 1
@@ -38,7 +45,6 @@ def test_the_rolling_median_absorbs_a_permanent_level_shift():
 
 
 def test_reversion_time_is_measured_and_priced():
-    """A dislocation that clears in 120s is bankable; its speed is bps/hour held."""
     values = [0.0] * 600 + [8.0] * 120 + [0.0] * 600
     stats = analyse_pair(series(values), window_minutes=10, slippage_bps=1.0, target_bps=1.0,
                          max_hold_seconds=600)
@@ -77,6 +83,4 @@ def test_loader_filters_by_time_and_skips_bad_rows(tmp_path):
     since = datetime(2026, 11, 14, 18, 0, tzinfo=timezone.utc).timestamp()
     grid = load_quotes(tmp_path, "NVDA", "lighter_mainnet", since)
     assert len(grid) == 1
-    only = next(iter(grid.values()))
-    assert only[0] == 101.1
-
+    assert next(iter(grid.values()))[0] == 101.1

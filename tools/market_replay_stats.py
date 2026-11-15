@@ -83,7 +83,8 @@ def load_quotes(output_dir, asset, venue, since, until=None):
 
 
 def analyse_pair(samples, *, window_minutes=30, slippage_bps=1.3, target_bps=1.0, gap_seconds=60,
-                 hours=None, revert_bps=0.0, max_hold_seconds=900, overhead_seconds=30):
+                 hours=None, revert_bps=0.0, max_hold_seconds=900, overhead_seconds=30,
+                 min_event_seconds=2):
     """Score one ordered pair.
 
     ``samples`` is an iterable of ``(timestamp, edge_bps, spread_cost_bps)`` in
@@ -120,15 +121,20 @@ def analyse_pair(samples, *, window_minutes=30, slippage_bps=1.3, target_bps=1.0
                 if current:
                     events.append(current)
                 current = {"start": index, "peak": dev, "entry": dev,
-                           "base": baseline[int(stamp) // 60]}
+                           "base": baseline[int(stamp) // 60], "first": stamp}
             else:
                 current["peak"] = max(current["peak"], dev)
+                current["last"] = stamp
             last = stamp
         elif current is not None and last is not None and stamp - last > gap_seconds:
             events.append(current)
             current = None
     if current:
         events.append(current)
+
+    # A one-second blip is a quote artefact, not a dislocation you can trade:
+    # executions take about a second, so require the level to persist first.
+    events = [e for e in events if (e.get("last", e.get("first", 0)) - e.get("first", 0)) >= min_event_seconds]
 
     # How long until the dislocation is gone (and therefore how fast the bps can
     # actually be banked), not just how large it got.
@@ -216,6 +222,7 @@ def main(argv=None):
     parser.add_argument("--revert-bps", type=float, default=0.0, help="deviation level that counts as reverted")
     parser.add_argument("--max-hold-seconds", type=float, default=900.0, help="give up counting a reversion after this")
     parser.add_argument("--overhead-seconds", type=float, default=30.0, help="per-trade overhead used for serial throughput")
+    parser.add_argument("--min-event-seconds", type=float, default=2.0, help="ignore dislocations that last less than this (quote artefacts)")
     parser.add_argument("--max-spread-bps", type=float, default=10.0, help="drop venues whose p90 spread exceeds this")
     parser.add_argument("--min-samples", type=int, default=1000)
     parser.add_argument("--json", default="")
@@ -255,7 +262,8 @@ def main(argv=None):
                                      slippage_bps=args.slippage_bps, target_bps=args.target_bps,
                                      gap_seconds=args.gap_seconds, revert_bps=args.revert_bps,
                                      max_hold_seconds=args.max_hold_seconds,
-                                     overhead_seconds=args.overhead_seconds)
+                                     overhead_seconds=args.overhead_seconds,
+                                     min_event_seconds=args.min_event_seconds)
                 if stats is None:
                     continue
                 stats.update({"asset": asset, "buy_venue": buy, "sell_venue": sell})
