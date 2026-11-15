@@ -1016,16 +1016,6 @@ class ProbeRunner:
         # Decision quotes are the signal; submit quotes are what each order was
         # actually priced against.  Keeping both is what makes the cost split
         # half_spread / signal->exec / exec->fill complete instead of empty.
-        submit={}
-        for venue,decision_quote in ((item.buy_venue,buy),(item.sell_venue,sell)):
-            fresh=await self._quote(venue,asset)
-            if fresh is None and (self._last_quote_reject or {}).get("reason")=="quote_provably_stale":
-                return {"schema":1,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,
-                        "asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,
-                        "status":"skipped","reason":"quote_provably_stale_before_submit",
-                        "quote_reject":self._last_quote_reject}
-            submit[venue]=fresh or decision_quote
-        ids={item.buy_venue:self._cid(item,"entry",item.buy_venue),item.sell_venue:self._cid(item,"entry",item.sell_venue)}
         signal_edge=((_d(sell["bid"])-_d(buy["ask"]))/((_d(sell["bid"])+_d(buy["ask"]))/2)*BPS) if _d(sell["bid"]) and _d(buy["ask"]) else ZERO
         threshold=self.min_edge_by_pair.get((item.asset,item.buy_venue,item.sell_venue),self.min_edge_bps) if self.min_edge_by_pair else self.min_edge_bps
         if threshold is not None and signal_edge<threshold:
@@ -1041,6 +1031,31 @@ class ProbeRunner:
                                 "quotes":{item.buy_venue:buy,item.sell_venue:sell},
                                 "submit_quotes":{item.buy_venue:buy,item.sell_venue:sell},
                                 "signal_edge_bps":str(signal_edge)}}
+        submit={}
+        for venue,decision_quote in ((item.buy_venue,buy),(item.sell_venue,sell)):
+            fresh=await self._quote(venue,asset)
+            if fresh is None and (self._last_quote_reject or {}).get("reason")=="quote_provably_stale":
+                return {"schema":1,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,
+                        "asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,
+                        "status":"skipped","reason":"quote_provably_stale_before_submit",
+                        "quote_reject":self._last_quote_reject}
+            submit[venue]=fresh or decision_quote
+        # The decision quote and the submit quote are ~1s apart.  Re-prove the
+        # edge on the prices the orders will actually be priced against, or a
+        # dislocation that closed in that second is bought at a loss.
+        submit_edge=self._cross_edge(asset,submit.get(item.buy_venue),submit.get(item.sell_venue))
+        if threshold is not None and (submit_edge is None or submit_edge<threshold):
+            return {"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,
+                    "asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,
+                    "status":"skipped","reason":"edge_below_threshold_at_submit","orders_attempted":False,
+                    "signal_edge_bps":str(signal_edge),
+                    "submit_edge_bps":None if submit_edge is None else str(submit_edge),
+                    "threshold_bps":str(threshold),"notional_usd":str(self.notional_usd),
+                    "decision":{"at":datetime.now(timezone.utc).isoformat(),
+                                "quotes":{item.buy_venue:buy,item.sell_venue:sell},
+                                "submit_quotes":submit,"signal_edge_bps":str(signal_edge)}}
+        ids={item.buy_venue:self._cid(item,"entry",item.buy_venue),item.sell_venue:self._cid(item,"entry",item.sell_venue)}
+
         row={"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"submitting","notional_usd":str(self.notional_usd),"target_qty":str(qty),"decision":{"at":datetime.now(timezone.utc).isoformat(),"quotes":{item.buy_venue:buy,item.sell_venue:sell},"submit_quotes":submit,"signal_edge_bps":str(signal_edge),"entry_client_order_ids":ids,
                 "quote_audit":{v:{"age_s":(buy if v==item.buy_venue else sell).get("age_s"),
                                   "book_age_s":(buy if v==item.buy_venue else sell).get("book_age_s"),
