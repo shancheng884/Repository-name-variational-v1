@@ -59,7 +59,9 @@ def test_pair_parser_rejects_the_same_venue_twice():
 
 def test_pair_parser_accepts_a_valid_list():
     from tools.venue_probe import _pairs
-    got = _pairs("SNDK:entropy>lighter_rh, NVDA:lighter_mainnet>entropy",
-                 assets("SNDK", "NVDA"), ("entropy", "lighter_rh", "lighter_mainnet"))
+    got, thresholds = _pairs("SNDK:entropy>lighter_rh, NVDA:lighter_mainnet>entropy",
+                             assets("SNDK", "NVDA"), ("entropy", "lighter_rh", "lighter_mainnet"))
     assert got == [("SNDK", "entropy", "lighter_rh"), ("NVDA", "lighter_mainnet", "entropy")]
+    assert thresholds == {}
+
 
