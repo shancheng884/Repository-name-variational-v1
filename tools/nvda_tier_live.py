@@ -46,11 +46,12 @@ def build_executors(env):
     }
 
 
-def snapshot(ex, asset, venues):
+async def snapshot(ex, asset, venues):
+    """Real broker positions. Only a verified read counts as known."""
     out = {}
     for venue in venues:
         try:
-            result = ex[venue].positions(asset)
+            result = await ex[venue].positions(asset)
             out[venue] = _d(result.get("qty")) if result.get("verified") else None
         except Exception:
             out[venue] = None
@@ -101,7 +102,8 @@ async def main_async(args):
     history: deque = deque(maxlen=3600)
     dev_window: deque = deque(maxlen=3)
     realized = Decimal("0")
-    exchange = snapshot(ex, asset, venues)
+    exchange = await snapshot(ex, asset, venues)
+    snap_at = time.time()
     try:
         while True:
             await asyncio.sleep(max(0.5, args.poll_seconds))
@@ -123,13 +125,17 @@ async def main_async(args):
             ordered = sorted(history)
             baseline = ordered[len(ordered) // 2]
             dev_window.append(edge - baseline)
+            if time.time() - snap_at >= 5.0:
+                exchange = await snapshot(ex, asset, venues)
+                snap_at = time.time()
             actions = engine.on_sample(stamp=time.time(), edge=edge, baseline=baseline,
                                        price_hint=float(mid), window=list(dev_window),
-                                       exchange=lambda: (exchange if exchange is not None else snapshot(ex, asset, venues)))
+                                       exchange=exchange or {})
             if actions and args.mode == "live":
                 for action in actions:
                     if action.get("action") == "open":
-                        exchange = snapshot(ex, asset, venues)
+                        exchange = await snapshot(ex, asset, venues)
+                        snap_at = time.time()
                         qty = Decimal(str(action["qty"]))
                         receipts = await place_pair(ex, asset, buy, sell, qty, opening=True,
                                                      quotes={buy: qb, sell: qs})
