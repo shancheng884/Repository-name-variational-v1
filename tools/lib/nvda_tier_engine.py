@@ -218,6 +218,20 @@ class TierEngine:
                             "notional_usd": increment})
         return actions
 
+    def drop_tier(self, index: int) -> None:
+        """Undo a tier whose paired order was never sent.
+
+        The engine books a tier before the runner places it; when the order is
+        refused (margin, leverage, a failed leg) both the tier and its ledger
+        legs have to disappear or every later reconciliation sees a phantom
+        position.
+        """
+        pos = self.open_tiers.pop(index, None)
+        if pos is None:
+            return
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -pos.qty)
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, +pos.qty)
+
     def summary(self) -> list[dict[str, Any]]:
         by_tier: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for trade in self.trades:

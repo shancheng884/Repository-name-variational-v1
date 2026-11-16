@@ -17,7 +17,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.lib.nvda_tier_engine import PositionLedger, TierConfig, TierEngine, TierSpec
-from tools.lib.venue_probe import EntropyProbeExecutor, LighterProbeExecutor, _d
+from tools.lib.venue_probe import (EntropyProbeExecutor, LighterProbeExecutor, _d,
+                                  required_margin_usd)
 from tools.market_capture.config import DEFAULT_ASSETS, CaptureConfig, load_environment
 from tools.market_capture.runner import CaptureRunner
 
@@ -59,13 +60,18 @@ async def snapshot(ex, asset, venues):
 
 
 async def venue_equity(ex, asset, venues):
-    """Verified free margin per venue, read before any order goes out."""
+    """Verified free margin per venue, read before any order goes out.
+
+    Uses the account read rather than preflight: preflight refuses to answer
+    while a position is open, and equity has to stay readable across restarts
+    with tiers already filled.
+    """
     out = {}
     for venue in venues:
         value = None
         try:
-            result = await ex[venue].preflight(asset)
-            if isinstance(result, dict):
+            result = await ex[venue].account_state(asset)
+            if isinstance(result, dict) and result.get("ok"):
                 raw = result.get("available_margin")
                 if raw not in (None, ""):
                     value = float(raw)
@@ -73,6 +79,37 @@ async def venue_equity(ex, asset, venues):
             value = None
         out[venue] = value
     return out
+
+
+async def margin_for_pair(ex, asset, venues, notional_usd, buffer_pct):
+    """Per-leg margin gate: both legs must fit before either order is sent."""
+    legs = {}
+    for venue in venues:
+        try:
+            state = await ex[venue].account_state(asset)
+        except Exception as exc:
+            state = {"ok": False, "error": "%s:%s" % (type(exc).__name__, exc)}
+        if not state.get("ok"):
+            legs[venue] = {"ok": False, "error": state.get("error") or "account_unreadable"}
+            continue
+        required = required_margin_usd(notional_usd, state.get("leverage"), buffer_pct)
+        available = _d(state.get("available_margin"))
+        leg = {"available_margin": str(available) if available is not None else None,
+               "required_margin": (str(required.quantize(Decimal("0.01"))) if required is not None else None),
+               "leverage": state.get("leverage"), "position": state.get("position")}
+        if required is None:
+            leg["ok"] = False
+            leg["error"] = "leverage_unknown"
+        elif available is None:
+            leg["ok"] = False
+            leg["error"] = "margin_unreadable"
+        else:
+            leg["ok"] = available >= required
+            if not leg["ok"]:
+                leg["error"] = "insufficient_margin"
+        legs[venue] = leg
+    return {"ok": bool(legs) and all(v.get("ok") for v in legs.values()),
+            "legs": legs, "buffer_pct": buffer_pct, "notional_usd": notional_usd}
 
 
 async def place_pair(ex, asset, buy, sell, qty, *, opening, quotes):
@@ -121,6 +158,13 @@ async def main_async(args):
     ex = build_executors(env)
     for executor in ex.values():
         await executor.start()
+    leverage = {}
+    if args.mode == "live" and args.rh_leverage > 0 and "lighter_rh" in venues:
+        leverage["lighter_rh"] = await ex["lighter_rh"].ensure_leverage(asset, args.rh_leverage)
+        if not leverage["lighter_rh"].get("ok"):
+            write_state({"status": "blocked_leverage", "pair": args.pair, "leverage": leverage,
+                         "updated_at": datetime.now(timezone.utc).isoformat()})
+            return {"ok": False, "error": "leverage_not_confirmed", "leverage": leverage}
     equity = await venue_equity(ex, asset, venues)
     ledger = PositionLedger()
     cfg_forward, engine_forward = _build_engine(args.asset, buy, sell, tiers_forward, equity, args, ledger)
@@ -130,7 +174,8 @@ async def main_async(args):
     ladder = [cfg_forward.tier_target_notional_usd(i) for i in range(1, len(tiers_forward) + 1)]
     write_state({"status": "starting", "pair": args.pair, "equity": equity,
                  "slot_caps": caps, "cumulative_notional": ladder, "tiers": tiers,
-                 "child_notional": args.child_notional,
+                 "child_notional": args.child_notional, "leverage": leverage,
+                 "margin_buffer_pct": args.margin_buffer_pct,
                  "updated_at": datetime.now(timezone.utc).isoformat()})
     if caps is None:
         print("warning: venue equity unavailable, falling back to %.0fU per tier" % args.notional)
@@ -205,6 +250,17 @@ async def main_async(args):
                     side_buy, side_sell = (buy, sell) if action.get("direction") == "forward" else (sell, buy)
                     ob, os_ = (q_buy, q_sell) if action.get("direction") == "forward" else (q_sell, q_buy)
                     if action.get("action") == "open":
+                        margin = await margin_for_pair(
+                            ex, asset, (side_buy, side_sell),
+                            action.get("notional_usd") or args.notional, args.margin_buffer_pct)
+                        if not margin["ok"]:
+                            engine = engine_forward if action.get("direction") == "forward" else engine_reverse
+                            engine.drop_tier(action["tier"])
+                            write_state({"status": "blocked_margin", "pair": args.pair,
+                                         "direction": action.get("direction"), "tier": action["tier"],
+                                         "margin": margin, "leverage": leverage,
+                                         "updated_at": datetime.now(timezone.utc).isoformat()})
+                            continue
                         exchange = await snapshot(ex, asset, venues)
                         snap_at = time.time()
                         qty = Decimal(str(action["qty"]))
@@ -220,7 +276,7 @@ async def main_async(args):
                                 except Exception:
                                     pass
                             engine = engine_forward if action.get("direction") == "forward" else engine_reverse
-                            engine.open_tiers.pop(action["tier"], None)
+                            engine.drop_tier(action["tier"])
                             write_state({"status": "manual_review", "reason": "leg_not_filled",
                                          "receipts": receipts, "updated_at": datetime.now(timezone.utc).isoformat()})
                             return {"ok": False, "error": "leg_not_filled"}
@@ -278,6 +334,10 @@ def main(argv=None):
     parser.add_argument("--baseline-minutes", type=float, default=30.0)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     parser.add_argument("--max-loss-usd", type=float, default=3.0)
+    parser.add_argument("--rh-leverage", type=float, default=20.0,
+                        help="leverage to set and verify on lighter_rh before any order")
+    parser.add_argument("--margin-buffer-pct", type=float, default=25.0,
+                        help="extra margin headroom required on each leg before an open")
     parser.add_argument("--mode", choices=("observe", "live"), default="observe")
     parser.add_argument("--confirm-flat", action="store_true")
     parser.add_argument("--i-understand-live-orders", action="store_true")

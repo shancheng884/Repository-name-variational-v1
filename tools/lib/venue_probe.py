@@ -314,6 +314,28 @@ LIGHTER_TESTNET_CHAIN_ID=300
 LIGHTER_RH_MAINNET_CHAIN_ID=466324
 
 
+def leverage_from_imf_percent(value) -> float | None:
+    """Translate Lighter's rendered margin fraction into leverage.
+
+    The account endpoint reports the on-chain initial margin fraction as a
+    percent of notional: ``50.00`` is 50% margin (2x), ``5.00`` is 20x.
+    """
+    imf = _d(value)
+    if imf is None or imf <= 0:
+        return None
+    return float(Decimal("100") / imf)
+
+
+def required_margin_usd(notional_usd, leverage, buffer_pct=0.0) -> Decimal | None:
+    """Margin a single leg needs at the venue's leverage, plus a safety buffer."""
+    notional = _d(notional_usd)
+    lev = _d(leverage)
+    buffer = _d(buffer_pct) or ZERO
+    if notional is None or lev is None or notional <= 0 or lev <= 0:
+        return None
+    return notional / lev * (Decimal("1") + buffer / Decimal("100"))
+
+
 def lighter_signing_chain_id(rest_url: str) -> int:
     url=(rest_url or "").lower()
     if "api.rh.lighter.xyz" in url:
@@ -395,6 +417,75 @@ class LighterProbeExecutor:
             return {"ok":False,"verified":False,"qty":str(qty),"error":f"{self.venue}_orders_failed:{type(exc).__name__}:{exc}"}
         if rows is None: return {"ok":False,"verified":False,"qty":str(qty),"error":f"{self.venue}_active_orders_unverifiable"}
         return {"ok":True,"verified":True,"qty":str(qty),"active_orders":len(rows)}
+
+    async def _account(self):
+        from lighter import AccountApi
+        account = _model_dict(await AccountApi(self.client.api_client).account(
+            by="index", value=str(self.account_index), _request_timeout=10.0))
+        if account is None:
+            raise ProbeError(f"{self.venue}_account_unverifiable")
+        accounts = account.get("accounts") or []
+        return accounts[0] if accounts and isinstance(accounts[0], dict) else {}
+
+    async def account_state(self, asset):
+        """Available margin and this market's margin setting, with no flat requirement."""
+        if not self.available or self.client is None:
+            return {"ok": False, "error": f"{self.venue}_credentials_missing"}
+        market = self.market(asset)
+        if market is None:
+            return {"ok": False, "error": f"{self.venue}_market_missing"}
+        try:
+            account = await self._account()
+        except Exception as exc:
+            return {"ok": False, "error": f"{self.venue}_account_failed:{type(exc).__name__}:{exc}"}
+        row = next((p for p in (account.get("positions") or [])
+                    if str(p.get("market_id")) == str(market["market_id"])), None)
+        if row is None:
+            return {"ok": False, "error": f"{self.venue}_position_unverifiable"}
+        imf = row.get("initial_margin_fraction")
+        return {"ok": True, "available_margin": account.get("available_balance"),
+                "position": row.get("position"), "initial_margin_fraction": imf,
+                "leverage": leverage_from_imf_percent(imf),
+                "margin_mode": row.get("margin_mode"),
+                "margin_set_flag": row.get("margin_set_flag")}
+
+    async def ensure_leverage(self, asset, leverage, *, margin_mode=0, attempts=12, delay=0.7):
+        """Raise the market's leverage and prove it from a fresh account read.
+
+        Returns ok only when the venue reports the requested leverage back; a
+        submitted transaction that never shows up in the account is a failure.
+        """
+        target = float(leverage)
+        market = self.market(asset)
+        if market is None:
+            return {"ok": False, "error": f"{self.venue}_market_missing"}
+        before = await self.account_state(asset)
+        if before.get("ok") and before.get("leverage") and abs(before["leverage"] - target) < 0.05:
+            return {"ok": True, "changed": False, "leverage": before["leverage"],
+                    "initial_margin_fraction": before.get("initial_margin_fraction")}
+        if not self.available or self.client is None:
+            return {"ok": False, "error": f"{self.venue}_credentials_missing"}
+        try:
+            _tx, response, error = await self.client.update_leverage(
+                market_index=int(market["market_id"]), margin_mode=int(margin_mode),
+                leverage=target, api_key_index=int(self.api_key_index))
+        except Exception as exc:
+            return {"ok": False, "error": f"lighter_update_leverage_failed:{type(exc).__name__}:{exc}"}
+        if error is not None:
+            return {"ok": False, "error": f"lighter_update_leverage_error:{error}"}
+        code = _int(getattr(response, "code", None)) if response is not None else None
+        if response is not None and code not in (0, 200):
+            return {"ok": False, "error": "lighter_update_leverage_rejected", "response_code": code}
+        last = None
+        for _ in range(max(1, attempts)):
+            await asyncio.sleep(delay)
+            last = await self.account_state(asset)
+            if last.get("ok") and last.get("leverage") and abs(last["leverage"] - target) < 0.05:
+                return {"ok": True, "changed": True, "leverage": last["leverage"],
+                        "initial_margin_fraction": last.get("initial_margin_fraction")}
+        return {"ok": False, "error": "leverage_readback_mismatch", "target": target,
+                "readback": (last or {}).get("leverage"),
+                "initial_margin_fraction": (last or {}).get("initial_margin_fraction")}
 
     def normalize_qty(self,asset,qty):
         market=self.market(asset)
@@ -606,6 +697,45 @@ class EntropyProbeExecutor:
         result={"ok":True,"verified":True,"qty":str(qty),"active_orders":active}
         self._positions_cache[coin]=(time.monotonic(),result)
         return dict(result)
+
+    async def account_state(self, asset):
+        """Available margin, position and per-asset leverage without a flat requirement."""
+        if not self.available or self.info is None:
+            return {"ok": False, "error": self.reason or "entropy_credentials_missing"}
+        coin = self._coin(asset)
+        try:
+            state = await _to_thread_retry(self.info.user_state, self.account_address, self.dex,
+                                           attempts=4, base_delay=0.5)
+            spot = await _to_thread_retry(self.info.spot_user_state, self.account_address,
+                                          attempts=4, base_delay=0.5)
+        except Exception as exc:
+            return {"ok": False, "error": f"entropy_account_failed:{type(exc).__name__}:{exc}"}
+        if state is None:
+            return {"ok": False, "error": "entropy_account_unverifiable"}
+        qty = ZERO
+        leverage = None
+        for item in (state or {}).get("assetPositions", []) or []:
+            pos = item.get("position") if isinstance(item, dict) else None
+            if not isinstance(pos, dict) or pos.get("coin") != coin:
+                continue
+            qty += _d(pos.get("szi")) or ZERO
+            raw = pos.get("leverage")
+            if isinstance(raw, dict) and _d(raw.get("value")):
+                leverage = float(_d(raw.get("value")))
+        if leverage is None:
+            try:
+                max_lev = _d(self._row(asset).get("maxLeverage"))
+            except ProbeError:
+                max_lev = None
+            leverage = float(max_lev) if max_lev else None
+        available = None
+        for item in (spot or {}).get("tokenToAvailableAfterMaintenance", []) or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2 and int(item[0]) == 0:
+                available = item[1]
+                break
+        return {"ok": True, "available_margin": available, "position": str(qty),
+                "leverage": leverage}
+
 
     def normalize_qty(self,asset,qty):
         if qty<=0 or not self.universe: return None
