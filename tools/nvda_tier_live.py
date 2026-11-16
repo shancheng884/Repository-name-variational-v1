@@ -217,7 +217,8 @@ async def main_async(args):
                              "samples": min(len(history["forward"]), len(history["reverse"])),
                              "need": need, "pair": args.pair, "equity": equity,
                              "slot_caps": caps, "cumulative_notional": ladder, "tiers": tiers,
-                             "child_notional": args.child_notional,
+                             "child_notional": args.child_notional, "leverage": leverage,
+                             "margin_buffer_pct": args.margin_buffer_pct,
                              "updated_at": datetime.now(timezone.utc).isoformat()})
                 continue
             baseline = {}
