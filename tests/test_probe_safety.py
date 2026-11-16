@@ -96,8 +96,8 @@ def test_unverified_position_snapshot_blocks_the_round_before_ordering(tmp_path)
     execs = {"variational": Exec(), "lighter_mainnet": Exec(fail_positions=True)}
     r, execs, _ = runner(tmp_path, execs=execs, run_id="run-one")
     row = asyncio.run(r._run_one(ProbeRound("r1", "NVDA", "variational", "lighter_mainnet", 1)))
-    assert row["status"] == "manual_review_required"
-    assert row["reason"] == "pre_round_position_not_flat"
+    assert row["status"] == "skipped"
+    assert row["reason"] == "pre_round_account_unverified"
     assert row["reconcile"]["pre"]["venues"]["lighter_mainnet"]["verified"] is False
     assert execs["variational"].calls == [] and execs["lighter_mainnet"].calls == [], "no order before a verified flat snapshot"
 

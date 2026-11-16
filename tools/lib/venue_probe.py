@@ -537,6 +537,7 @@ class EntropyProbeExecutor:
         self.available=bool(address_ok and key_ok)
         self.meta=None
         self.universe={}
+        self._positions_cache={}
     async def start(self):
         if not self.available: return
         if self.info is None or self.exchange is None:
@@ -587,8 +588,11 @@ class EntropyProbeExecutor:
         """Read-only position/order snapshot used for per-round reconciliation."""
         if not self.available or self.info is None: return {"ok":False,"verified":False,"error":self.reason or "entropy_credentials_missing"}
         coin=self._coin(asset)
+        cached=self._positions_cache.get(coin)
+        if cached and time.monotonic()-cached[0]<2.0:
+            return dict(cached[1])
         try:
-            state=await _to_thread_retry(self.info.user_state,self.account_address,self.dex)
+            state=await _to_thread_retry(self.info.user_state,self.account_address,self.dex,attempts=6,base_delay=0.6)
             orders=await _to_thread_retry(self.info.open_orders,self.account_address,self.dex)
         except Exception as exc:
             return {"ok":False,"verified":False,"error":f"entropy_positions_failed:{type(exc).__name__}:{exc}"}
@@ -599,7 +603,9 @@ class EntropyProbeExecutor:
             if not isinstance(pos,dict) or pos.get("coin")!=coin: continue
             qty+=(_d(pos.get("szi")) or ZERO)
         active=len([row for row in (orders or []) if str(row.get("coin") or "")==coin])
-        return {"ok":True,"verified":True,"qty":str(qty),"active_orders":active}
+        result={"ok":True,"verified":True,"qty":str(qty),"active_orders":active}
+        self._positions_cache[coin]=(time.monotonic(),result)
+        return dict(result)
 
     def normalize_qty(self,asset,qty):
         if qty<=0 or not self.universe: return None
@@ -986,6 +992,14 @@ class ProbeRunner:
         asset=self.by_name[item.asset]
         pre=await self.reconcile(asset,(item.buy_venue,item.sell_venue))
         if not pre["flat"]:
+            unverified=any((v or {}).get("qty") is None for v in (pre.get("venues") or {}).values())
+            if unverified:
+                # A rate-limited read is not a position: pause this round and try
+                # again next time instead of stopping an unattended run.
+                return {"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,
+                        "asset":item.asset,"buy_venue":item.buy_venue,"sell_venue":item.sell_venue,
+                        "status":"skipped","reason":"pre_round_account_unverified","orders_attempted":False,
+                        "reconcile":{"pre":pre,"post":None}}
             return {"schema":2,"event":"probe_round","run_id":self.run_id,"round_id":item.round_id,"asset":item.asset,
                     "buy_venue":item.buy_venue,"sell_venue":item.sell_venue,"status":"manual_review_required",
                     "reason":"pre_round_position_not_flat","orders_attempted":False,"reconcile":{"pre":pre,"post":None}}
