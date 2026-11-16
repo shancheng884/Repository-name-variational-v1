@@ -96,107 +96,159 @@ def write_state(payload):
     os.replace(tmp, STATE)
 
 
+def _tier_list(text):
+    return [float(value) for value in text.split(",") if value.strip()]
+
+
+def _build_engine(asset_name, buy_venue, sell_venue, tiers, equity, args, ledger):
+    cfg = TierConfig(asset=asset_name, buy_venue=buy_venue, sell_venue=sell_venue,
+                     tiers=tuple(TierSpec(i, t) for i, t in enumerate(tiers, start=1)),
+                     child_notional_usd=args.child_notional,
+                     equity_usd=equity, notional_usd=args.notional,
+                     timeout_seconds=None, slippage_bps=args.slippage_bps)
+    return cfg, TierEngine(config=cfg, ledger=ledger)
+
+
 async def main_async(args):
     env = load_environment()
     asset = next(a for a in DEFAULT_ASSETS if a.name == args.asset)
     buy, sell = args.pair.split(">")
     venues = (buy, sell)
-    thresholds = [float(x) for x in args.tiers.split(",") if x.strip()]
+    tiers_forward = _tier_list(args.tiers)
+    tiers_reverse = _tier_list(args.tiers_reverse) if args.tiers_reverse else list(tiers_forward)
     ex = build_executors(env)
     for executor in ex.values():
         await executor.start()
     equity = await venue_equity(ex, asset, venues)
-    cfg = TierConfig(asset=args.asset, buy_venue=buy, sell_venue=sell,
-                     tiers=tuple(TierSpec(i, t) for i, t in enumerate(thresholds, start=1)),
-                     child_notional_usd=args.child_notional,
-                     equity_usd=equity, notional_usd=args.notional,
-                     timeout_seconds=None, slippage_bps=args.slippage_bps)
-    caps = cfg.slot_caps()
-    ladder = [cfg.tier_target_notional_usd(i) for i in range(1, len(thresholds) + 1)]
+    ledger = PositionLedger()
+    cfg_forward, engine_forward = _build_engine(args.asset, buy, sell, tiers_forward, equity, args, ledger)
+    cfg_reverse, engine_reverse = _build_engine(args.asset, sell, buy, tiers_reverse, equity, args, ledger)
+    tiers = {"forward": tiers_forward, "reverse": tiers_reverse}
+    caps = cfg_forward.slot_caps()
+    ladder = [cfg_forward.tier_target_notional_usd(i) for i in range(1, len(tiers_forward) + 1)]
     write_state({"status": "starting", "pair": args.pair, "equity": equity,
-                 "slot_caps": caps, "cumulative_notional": ladder,
+                 "slot_caps": caps, "cumulative_notional": ladder, "tiers": tiers,
                  "child_notional": args.child_notional,
                  "updated_at": datetime.now(timezone.utc).isoformat()})
     if caps is None:
         print("warning: venue equity unavailable, falling back to %.0fU per tier" % args.notional)
-    ledger = PositionLedger()
-    engine = TierEngine(config=cfg, ledger=ledger)
     out_dir = ROOT / "log" / "nvda_tier_live_capture"
     cap = CaptureRunner(CaptureConfig(output_dir=out_dir, assets=(asset,), var_quote_seconds=1.0,
                                       book_snapshot_seconds=5.0, health_seconds=2.0, latency_seconds=5.0,
                                       system_seconds=60.0, fill_poll_seconds=2.0, edge_seconds=1.0,
                                       notional_usd=Decimal(str(args.notional)), max_book_levels=20))
     task = asyncio.create_task(cap.run(), name="nvda-tier-capture")
-    history: deque = deque(maxlen=3600)
-    dev_window: deque = deque(maxlen=3)
+    history = {"forward": deque(maxlen=3600), "reverse": deque(maxlen=3600)}
+    dev_window = {"forward": deque(maxlen=3), "reverse": deque(maxlen=3)}
     realized = Decimal("0")
     exchange = await snapshot(ex, asset, venues)
     snap_at = time.time()
+    need = max(120, int(args.baseline_minutes * 60 / max(1.0, args.poll_seconds) * 0.5))
     try:
         while True:
             await asyncio.sleep(max(0.5, args.poll_seconds))
-            qb = cap.hub.latest(buy, asset.name, max_age=6.0 if buy == "entropy" else 3.0)
-            qs = cap.hub.latest(sell, asset.name, max_age=6.0 if sell == "entropy" else 3.0)
-            if not qb or not qs:
+            q_buy = cap.hub.latest(buy, asset.name, max_age=6.0 if buy == "entropy" else 3.0)
+            q_sell = cap.hub.latest(sell, asset.name, max_age=6.0 if sell == "entropy" else 3.0)
+            if not q_buy or not q_sell:
                 continue
-            eb = _d(qb.get("executable_buy")); es = _d(qs.get("executable_sell"))
-            if not eb or not es or eb <= 0:
+            buy_ask = _d(q_buy.get("executable_buy"))
+            buy_bid = _d(q_buy.get("executable_sell"))
+            sell_ask = _d(q_sell.get("executable_buy"))
+            sell_bid = _d(q_sell.get("executable_sell"))
+            if not buy_ask or not buy_bid or not sell_ask or not sell_bid:
                 continue
-            mid = (eb + es) / 2
-            edge = float((es - eb) / mid * Decimal("10000"))
-            history.append(edge)
-            need = max(120, int(args.baseline_minutes * 60 / max(1.0, args.poll_seconds) * 0.5))
-            if len(history) < need:
-                write_state({"status": "warming", "samples": len(history), "need": need,
-                             "pair": args.pair, "equity": equity,
-                             "slot_caps": caps, "cumulative_notional": ladder,
+            if buy_ask <= 0 or buy_bid <= 0 or sell_ask <= 0 or sell_bid <= 0:
+                continue
+            forward_mid = (buy_ask + sell_bid) / 2
+            reverse_mid = (sell_ask + buy_bid) / 2
+            edge_forward = float((sell_bid - buy_ask) / forward_mid * Decimal("10000"))
+            edge_reverse = float((buy_bid - sell_ask) / reverse_mid * Decimal("10000"))
+            history["forward"].append(edge_forward)
+            history["reverse"].append(edge_reverse)
+            if len(history["forward"]) < need or len(history["reverse"]) < need:
+                write_state({"status": "warming",
+                             "samples": min(len(history["forward"]), len(history["reverse"])),
+                             "need": need, "pair": args.pair, "equity": equity,
+                             "slot_caps": caps, "cumulative_notional": ladder, "tiers": tiers,
                              "child_notional": args.child_notional,
                              "updated_at": datetime.now(timezone.utc).isoformat()})
                 continue
-            ordered = sorted(history)
-            baseline = ordered[len(ordered) // 2]
-            dev_window.append(edge - baseline)
+            baseline = {}
+            for key in ("forward", "reverse"):
+                ordered = sorted(history[key])
+                baseline[key] = ordered[len(ordered) // 2]
+            dev_window["forward"].append(edge_forward - baseline["forward"])
+            dev_window["reverse"].append(edge_reverse - baseline["reverse"])
             if time.time() - snap_at >= 5.0:
                 exchange = await snapshot(ex, asset, venues)
                 snap_at = time.time()
-            actions = engine.on_sample(stamp=time.time(), edge=edge, baseline=baseline,
-                                       price_hint=float(mid), window=list(dev_window),
-                                       exchange=exchange or {})
+            stamp = time.time()
+            # Both directions always evaluate exits; only the flat side may open,
+            # which is the ETH gradient's direction lock until fully flat.
+            acts_forward = engine_forward.on_sample(
+                stamp=stamp, edge=edge_forward, baseline=baseline["forward"],
+                price_hint=float(forward_mid), window=list(dev_window["forward"]),
+                exchange=exchange or {}, allow_entry=not engine_reverse.open_tiers)
+            acts_reverse = engine_reverse.on_sample(
+                stamp=stamp, edge=edge_reverse, baseline=baseline["reverse"],
+                price_hint=float(reverse_mid), window=list(dev_window["reverse"]),
+                exchange=exchange or {}, allow_entry=not engine_forward.open_tiers)
+            for action in acts_forward:
+                action["direction"] = "forward"
+            for action in acts_reverse:
+                action["direction"] = "reverse"
+            actions = acts_forward + acts_reverse
             if actions and args.mode == "live":
                 for action in actions:
+                    side_buy, side_sell = (buy, sell) if action.get("direction") == "forward" else (sell, buy)
+                    ob, os_ = (q_buy, q_sell) if action.get("direction") == "forward" else (q_sell, q_buy)
                     if action.get("action") == "open":
                         exchange = await snapshot(ex, asset, venues)
                         snap_at = time.time()
                         qty = Decimal(str(action["qty"]))
-                        receipts = await place_pair(ex, asset, buy, sell, qty, opening=True,
-                                                     quotes={buy: qb, sell: qs})
+                        receipts = await place_pair(ex, asset, side_buy, side_sell, qty, opening=True,
+                                                     quotes={side_buy: ob, side_sell: os_})
                         if not all(isinstance(r, dict) and r.get("status") == "filled" for r in receipts.values()):
                             for venue in receipts:
-                                side = "sell" if venue == buy else "buy"
+                                side = "sell" if venue == side_buy else "buy"
                                 try:
                                     await ex[venue].market_order(asset=asset, side=side, qty=qty, quote={},
                                                                  client_order_id="nvda-tier-flat-" + uuid.uuid4().hex[:10],
                                                                  reduce_only=True, max_slippage_bps=Decimal("30"))
                                 except Exception:
                                     pass
+                            engine = engine_forward if action.get("direction") == "forward" else engine_reverse
                             engine.open_tiers.pop(action["tier"], None)
                             write_state({"status": "manual_review", "reason": "leg_not_filled",
                                          "receipts": receipts, "updated_at": datetime.now(timezone.utc).isoformat()})
                             return {"ok": False, "error": "leg_not_filled"}
-                    if action.get("action") == "close":
+                    elif action.get("action") == "close":
                         notional = Decimal(str(action.get("notional_usd") or args.notional))
-                        qty = Decimal(str(action.get("qty") or 0)) or notional / mid
-                        await place_pair(ex, asset, buy, sell, qty, opening=False, quotes={buy: qb, sell: qs})
+                        qty = Decimal(str(action.get("qty") or 0))
+                        if qty <= 0:
+                            continue
+                        await place_pair(ex, asset, side_buy, side_sell, qty, opening=False,
+                                         quotes={side_buy: ob, side_sell: os_})
                         realized += Decimal(str(action["net_bps"])) / Decimal("10000") * notional
             if realized <= -abs(Decimal(str(args.max_loss_usd))):
                 write_state({"status": "stopped_max_loss", "realized": str(realized)})
                 return {"ok": False, "error": "max_loss"}
             write_state({"status": "running" if args.mode == "live" else "observe",
                          "pair": args.pair, "equity": equity,
-                         "slot_caps": caps, "cumulative_notional": ladder,
-                         "edge_bps": round(edge, 2), "baseline_bps": round(baseline, 2),
-                         "dev_bps": round(edge - baseline, 2), "open_tiers": sorted(engine.open_tiers),
-                         "trades": len(engine.trades), "realized_usd": str(realized),
+                         "slot_caps": caps, "cumulative_notional": ladder, "tiers": tiers,
+                         "directions": {
+                             "forward": {"pair": "%s>%s" % (buy, sell),
+                                         "edge_bps": round(edge_forward, 2),
+                                         "baseline_bps": round(baseline["forward"], 2),
+                                         "dev_bps": round(edge_forward - baseline["forward"], 2),
+                                         "open_tiers": sorted(engine_forward.open_tiers)},
+                             "reverse": {"pair": "%s>%s" % (sell, buy),
+                                         "edge_bps": round(edge_reverse, 2),
+                                         "baseline_bps": round(baseline["reverse"], 2),
+                                         "dev_bps": round(edge_reverse - baseline["reverse"], 2),
+                                         "open_tiers": sorted(engine_reverse.open_tiers)}},
+                         "trades": len(engine_forward.trades) + len(engine_reverse.trades),
+                         "realized_usd": str(realized),
                          "exchange": {k: (None if v is None else str(v)) for k, v in (exchange or {}).items()},
                          "updated_at": datetime.now(timezone.utc).isoformat()})
     finally:
@@ -217,6 +269,7 @@ def main(argv=None):
     parser.add_argument("--asset", default="NVDA")
     parser.add_argument("--pair", default="entropy>lighter_mainnet")
     parser.add_argument("--tiers", default="7.77,8.36,9.60,11.21,13.84")
+    parser.add_argument("--tiers-reverse", default="")
     parser.add_argument("--notional", type=float, default=20.0)
     parser.add_argument("--child-notional", type=float, default=20.0)
     parser.add_argument("--slippage-bps", type=float, default=1.3)

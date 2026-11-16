@@ -132,3 +132,47 @@ def test_unknown_equity_falls_back_to_the_fixed_child_notional():
     actions = engine.on_sample(stamp=0, edge=8.0, baseline=0.0, price_hint=160.0,
                                window=[8.0, 8.0, 8.0], exchange=exchange_from(ledger))
     assert all(a["notional_usd"] == 20.0 for a in actions if a["action"] == "open")
+
+
+def test_entry_is_blocked_while_the_other_direction_owns_the_book():
+    ledger = PositionLedger()
+    engine = TierEngine(config=_cfg_with_equity(200.0, 100.0), ledger=ledger)
+    actions = engine.on_sample(stamp=0, edge=11.0, baseline=0.0, price_hint=100.0,
+                               window=[11.0, 11.0, 11.0], exchange=exchange_from(ledger),
+                               allow_entry=False)
+    assert actions == []
+    assert not engine.open_tiers
+    assert engine._open_notional() == 0.0
+
+
+def test_exits_still_run_when_entry_is_locked():
+    ledger = PositionLedger()
+    engine = TierEngine(config=_cfg_with_equity(200.0, 100.0), ledger=ledger)
+    engine.on_sample(stamp=0, edge=11.0, baseline=0.0, price_hint=100.0,
+                     window=[11.0, 11.0, 11.0], exchange=exchange_from(ledger))
+    assert engine.open_tiers
+    actions = engine.on_sample(stamp=5, edge=0.0, baseline=0.0, price_hint=100.0,
+                               window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger),
+                               allow_entry=False)
+    assert len(actions) == 5
+    assert all(a["action"] == "close" for a in actions)
+    assert not engine.open_tiers
+    assert engine._open_notional() == 0.0
+
+
+def test_two_directions_share_one_ledger_and_net_out():
+    ledger = PositionLedger()
+    c1 = _cfg_with_equity(200.0, 100.0)
+    c2 = TierConfig(asset="NVDA", buy_venue="lighter_mainnet", sell_venue="entropy",
+                    tiers=tuple(TierSpec(i, t) for i, t in enumerate([7.0, 8.0, 9.0, 10.0, 11.0], start=1)),
+                    child_notional_usd=20.0, timeout_seconds=None,
+                    equity_usd={"entropy": 200.0, "lighter_mainnet": 100.0})
+    forward = TierEngine(config=c1, ledger=ledger, strategy_id="nvda-forward")
+    reverse = TierEngine(config=c2, ledger=ledger, strategy_id="nvda-reverse")
+    forward.on_sample(stamp=0, edge=11.0, baseline=0.0, price_hint=100.0,
+                      window=[11.0, 11.0, 11.0], exchange=exchange_from(ledger))
+    reverse.on_sample(stamp=0, edge=11.0, baseline=0.0, price_hint=100.0,
+                      window=[11.0, 11.0, 11.0], exchange=exchange_from(ledger))
+    assert ledger.net("NVDA", "entropy") == 0
+    assert ledger.net("NVDA", "lighter_mainnet") == 0
+    assert ledger.reconcile("NVDA", ("entropy", "lighter_mainnet"), exchange_from(ledger))["ok"] is True

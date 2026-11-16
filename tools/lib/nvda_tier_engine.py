@@ -146,7 +146,14 @@ class TierEngine:
         return target - self._open_notional()
 
     def on_sample(self, *, stamp: float, edge: float, baseline: float, price_hint: float,
-                  window: list[float], exchange: dict[str, Decimal | float | None]) -> list[dict[str, Any]]:
+                  window: list[float], exchange: dict[str, Decimal | float | None],
+                  allow_entry: bool = True) -> list[dict[str, Any]]:
+        """Decide closes (always) and entries (only while this direction owns the book).
+
+        The ETH gradient runs bidirectionally but locks the active direction
+        until the book is fully flat, so the caller passes allow_entry=False
+        when the opposite direction still holds a tier.
+        """
         actions: list[dict[str, Any]] = []
         dev = edge - baseline
 
@@ -185,6 +192,9 @@ class TierEngine:
             if eligible:
                 actions.append({"action": "blocked", "tier": eligible[0].index,
                                 "reason": "position_mismatch", "diffs": check["diffs"]})
+            return actions
+
+        if not allow_entry:
             return actions
 
         for tier in self.config.tiers:
