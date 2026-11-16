@@ -58,6 +58,23 @@ async def snapshot(ex, asset, venues):
     return out
 
 
+async def venue_equity(ex, asset, venues):
+    """Verified free margin per venue, read before any order goes out."""
+    out = {}
+    for venue in venues:
+        value = None
+        try:
+            result = await ex[venue].preflight(asset)
+            if isinstance(result, dict):
+                raw = result.get("available_margin")
+                if raw not in (None, ""):
+                    value = float(raw)
+        except Exception:
+            value = None
+        out[venue] = value
+    return out
+
+
 async def place_pair(ex, asset, buy, sell, qty, *, opening, quotes):
     async def one(venue, side):
         cid = "nvda-tier-" + uuid.uuid4().hex[:12]
@@ -85,14 +102,25 @@ async def main_async(args):
     buy, sell = args.pair.split(">")
     venues = (buy, sell)
     thresholds = [float(x) for x in args.tiers.split(",") if x.strip()]
-    cfg = TierConfig(asset=args.asset, buy_venue=buy, sell_venue=sell,
-                     tiers=tuple(TierSpec(i, t) for i, t in enumerate(thresholds, start=1)),
-                     notional_usd=args.notional, timeout_seconds=None, slippage_bps=args.slippage_bps)
-    ledger = PositionLedger()
-    engine = TierEngine(config=cfg, ledger=ledger)
     ex = build_executors(env)
     for executor in ex.values():
         await executor.start()
+    equity = await venue_equity(ex, asset, venues)
+    cfg = TierConfig(asset=args.asset, buy_venue=buy, sell_venue=sell,
+                     tiers=tuple(TierSpec(i, t) for i, t in enumerate(thresholds, start=1)),
+                     child_notional_usd=args.child_notional,
+                     equity_usd=equity, notional_usd=args.notional,
+                     timeout_seconds=None, slippage_bps=args.slippage_bps)
+    caps = cfg.slot_caps()
+    ladder = [cfg.tier_target_notional_usd(i) for i in range(1, len(thresholds) + 1)]
+    write_state({"status": "starting", "pair": args.pair, "equity": equity,
+                 "slot_caps": caps, "cumulative_notional": ladder,
+                 "child_notional": args.child_notional,
+                 "updated_at": datetime.now(timezone.utc).isoformat()})
+    if caps is None:
+        print("warning: venue equity unavailable, falling back to %.0fU per tier" % args.notional)
+    ledger = PositionLedger()
+    engine = TierEngine(config=cfg, ledger=ledger)
     out_dir = ROOT / "log" / "nvda_tier_live_capture"
     cap = CaptureRunner(CaptureConfig(output_dir=out_dir, assets=(asset,), var_quote_seconds=1.0,
                                       book_snapshot_seconds=5.0, health_seconds=2.0, latency_seconds=5.0,
@@ -153,14 +181,17 @@ async def main_async(args):
                                          "receipts": receipts, "updated_at": datetime.now(timezone.utc).isoformat()})
                             return {"ok": False, "error": "leg_not_filled"}
                     if action.get("action") == "close":
-                        qty = Decimal(str(action.get("qty") or 0)) or Decimal(str(args.notional)) / mid
+                        notional = Decimal(str(action.get("notional_usd") or args.notional))
+                        qty = Decimal(str(action.get("qty") or 0)) or notional / mid
                         await place_pair(ex, asset, buy, sell, qty, opening=False, quotes={buy: qb, sell: qs})
-                        realized += Decimal(str(action["net_bps"])) / Decimal("10000") * Decimal(str(args.notional))
+                        realized += Decimal(str(action["net_bps"])) / Decimal("10000") * notional
             if realized <= -abs(Decimal(str(args.max_loss_usd))):
                 write_state({"status": "stopped_max_loss", "realized": str(realized)})
                 return {"ok": False, "error": "max_loss"}
             write_state({"status": "running" if args.mode == "live" else "observe",
-                         "pair": args.pair, "edge_bps": round(edge, 2), "baseline_bps": round(baseline, 2),
+                         "pair": args.pair, "equity": equity,
+                         "slot_caps": caps, "cumulative_notional": ladder,
+                         "edge_bps": round(edge, 2), "baseline_bps": round(baseline, 2),
                          "dev_bps": round(edge - baseline, 2), "open_tiers": sorted(engine.open_tiers),
                          "trades": len(engine.trades), "realized_usd": str(realized),
                          "exchange": {k: (None if v is None else str(v)) for k, v in (exchange or {}).items()},
@@ -184,6 +215,7 @@ def main(argv=None):
     parser.add_argument("--pair", default="entropy>lighter_mainnet")
     parser.add_argument("--tiers", default="7.77,8.36,9.60,11.21,13.84")
     parser.add_argument("--notional", type=float, default=20.0)
+    parser.add_argument("--child-notional", type=float, default=20.0)
     parser.add_argument("--slippage-bps", type=float, default=1.3)
     parser.add_argument("--baseline-minutes", type=float, default=30.0)
     parser.add_argument("--poll-seconds", type=float, default=1.0)

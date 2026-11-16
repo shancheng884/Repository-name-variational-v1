@@ -3,6 +3,12 @@
 Deliberately standalone: it does not import or modify main.py. The ETH
 strategy keeps running untouched; this module is the NVDA-shaped equivalent of
 its gradient, plus the reconciliation the shared entropy account needs.
+
+Sizing follows the ETH / CL ladder verbatim: a fixed child order, cumulative
+capacity of tier k equal to k x the smaller verified venue equity, hard capped
+at max_equity_multiple x equity. Tier 1 opens 1x equity and tier 5 tops the
+position out at 5x -- the same numbers main.py produces through
+``v4_real_gradient_slot_caps``.
 """
 from __future__ import annotations
 
@@ -24,11 +30,41 @@ class TierConfig:
     buy_venue: str
     sell_venue: str
     tiers: tuple[TierSpec, ...]
+    child_notional_usd: float = 20.0
+    max_equity_multiple: float = 5.0
+    equity_usd: dict[str, float | None] | None = None
+    # Fallback size per tier when venue equity is not supplied (paper runs).
     notional_usd: float = 20.0
     timeout_seconds: float | None = None
     confirm_window: int = 3
     confirm_min: int = 2
     slippage_bps: float = 1.3
+
+    def slot_caps(self) -> tuple[int, ...] | None:
+        """Cumulative child slots per tier, mirroring main.py's 5x hard cap."""
+        if not self.equity_usd:
+            return None
+        values = [
+            self.equity_usd.get(self.buy_venue),
+            self.equity_usd.get(self.sell_venue),
+        ]
+        if any(value is None or not (value > 0) for value in values):
+            return None
+        smaller = min(values)
+        hard_slots = int(
+            smaller * self.max_equity_multiple / self.child_notional_usd
+        )
+        return tuple(
+            min(hard_slots, int(smaller * index / self.child_notional_usd))
+            for index in range(1, len(self.tiers) + 1)
+        )
+
+    def tier_target_notional_usd(self, tier_index: int) -> float | None:
+        """Cumulative notional the ladder should hold once this tier is open."""
+        caps = self.slot_caps()
+        if caps is None or tier_index <= 0:
+            return None
+        return caps[min(tier_index, len(caps)) - 1] * self.child_notional_usd
 
 
 class PositionLedger:
@@ -85,6 +121,7 @@ class OpenTier:
     frozen_baseline: float
     opened_at: float
     qty: float
+    notional_usd: float = 0.0
 
 
 @dataclass
@@ -95,11 +132,18 @@ class TierEngine:
     open_tiers: dict[int, OpenTier] = field(default_factory=dict)
     trades: list[dict[str, Any]] = field(default_factory=list)
 
-    def _qty(self, price: float) -> float:
-        return self.config.notional_usd / price if price > 0 else 0.0
-
     def _confirmed(self, window: list[float], threshold: float) -> bool:
         return sum(1 for value in window if value >= threshold) >= self.config.confirm_min
+
+    def _open_notional(self) -> float:
+        return sum(position.notional_usd for position in self.open_tiers.values())
+
+    def _entry_notional(self, tier_index: int) -> float:
+        """Increment needed to reach the cumulative tier capacity."""
+        target = self.config.tier_target_notional_usd(tier_index)
+        if target is None:
+            return self.config.notional_usd
+        return target - self._open_notional()
 
     def on_sample(self, *, stamp: float, edge: float, baseline: float, price_hint: float,
                   window: list[float], exchange: dict[str, Decimal | float | None]) -> list[dict[str, Any]]:
@@ -116,12 +160,16 @@ class TierEngine:
                 continue
             net_bps = (pos.entry_edge - edge) - self.config.slippage_bps
             self.trades.append({"tier": index, "net_bps": net_bps, "hold_s": stamp - pos.opened_at,
-                                "reason": "reverted" if reverted else "timeout", "entry_dev": pos.entry_dev})
+                                "reason": "reverted" if reverted else "timeout",
+                                "entry_dev": pos.entry_dev,
+                                "notional_usd": pos.notional_usd})
             self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -pos.qty)
             self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, +pos.qty)
             self.open_tiers.pop(index)
             actions.append({"action": "close", "tier": index,
-                            "reason": "reverted" if reverted else "timeout", "net_bps": net_bps})
+                            "reason": "reverted" if reverted else "timeout",
+                            "net_bps": net_bps, "qty": pos.qty,
+                            "notional_usd": pos.notional_usd})
 
         # One reconciliation per decision step: the account is checked before the
         # batch of orders goes out, not after every child order we just queued.
@@ -144,14 +192,20 @@ class TierEngine:
                 continue
             if not self._confirmed(window, tier.threshold_bps):
                 continue
-            qty = self._qty(price_hint)
+            increment = self._entry_notional(tier.index)
+            if increment <= 0:
+                # Cumulative capacity already reached; nothing left to add.
+                continue
+            qty = increment / price_hint if price_hint > 0 else 0.0
             if qty <= 0:
                 continue
             self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, +qty)
             self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, -qty)
             self.open_tiers[tier.index] = OpenTier(index=tier.index, entry_edge=edge, entry_dev=dev,
-                                                   frozen_baseline=baseline, opened_at=stamp, qty=qty)
-            actions.append({"action": "open", "tier": tier.index, "dev_bps": dev, "qty": qty})
+                                                   frozen_baseline=baseline, opened_at=stamp, qty=qty,
+                                                   notional_usd=increment)
+            actions.append({"action": "open", "tier": tier.index, "dev_bps": dev, "qty": qty,
+                            "notional_usd": increment})
         return actions
 
     def summary(self) -> list[dict[str, Any]]:
@@ -166,7 +220,7 @@ class TierEngine:
                 "tier": index, "fills": len(items),
                 "win_rate": sum(1 for n in nets if n > 0) / len(nets),
                 "median_net_bps": sorted(nets)[len(nets) // 2],
-                "total_usd": sum(n / 10000.0 * self.config.notional_usd for n in nets),
+                "total_usd": sum(i["net_bps"] / 10000.0 * i.get("notional_usd", 0.0) for i in items),
                 "median_hold_s": sorted(i["hold_s"] for i in items)[len(items) // 2],
                 "timeout_share": sum(1 for i in items if i["reason"] == "timeout") / len(items),
             })

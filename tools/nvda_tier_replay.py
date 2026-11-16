@@ -102,7 +102,25 @@ def fit_tiers(series, cost_bps, window_minutes=30):
     return base, spaced, dev
 
 
-def replay(series, base, tiers, *, notional=20.0, slippage_bps=1.3, timeout_s=900,
+def slot_caps(equity_buy, equity_sell, child_notional=20.0, max_multiple=5.0, tier_count=None):
+    """Cumulative child slots per tier, mirroring main.py's gradient capacity."""
+    if not equity_buy or not equity_sell or equity_buy <= 0 or equity_sell <= 0:
+        return None
+    smaller = min(equity_buy, equity_sell)
+    hard = int(smaller * max_multiple / child_notional)
+    count = tier_count or len(PERCENTILES)
+    return [min(hard, int(smaller * k / child_notional)) for k in range(1, count + 1)]
+
+
+def tier_increments(caps, child_notional=20.0):
+    """Notional each tier adds on top of the previous cumulative target."""
+    if not caps:
+        return None
+    targets = [c * child_notional for c in caps]
+    return [targets[0]] + [targets[i] - targets[i - 1] for i in range(1, len(targets))]
+
+
+def replay(series, base, tiers, *, notional=20.0, tier_notional=None, slippage_bps=1.3, timeout_s=900,
            confirm_window=3, confirm_min=2):
     open_tiers = {}
     trades = []
@@ -115,7 +133,8 @@ def replay(series, base, tiers, *, notional=20.0, slippage_bps=1.3, timeout_s=90
                 net = (pos["entry_edge"] - edge) - slippage_bps
                 trades.append({"tier": tier, "net_bps": net, "hold_s": stamp - pos["opened_at"],
                                "reason": "reverted" if edge <= pos["frozen"] else "timeout",
-                               "entry_dev": pos["entry_dev"], "entry_edge": pos["entry_edge"]})
+                               "entry_dev": pos["entry_dev"], "entry_edge": pos["entry_edge"],
+                               "notional": pos["notional"]})
                 open_tiers.pop(tier)
         # entries: 2-of-3 confirmation like the ETH gradient
         if index + 1 < confirm_window:
@@ -126,12 +145,15 @@ def replay(series, base, tiers, *, notional=20.0, slippage_bps=1.3, timeout_s=90
                 continue
             if sum(1 for value in window if value >= threshold) < confirm_min:
                 continue
+            size = tier_notional[tier_index - 1] if tier_notional else notional
             open_tiers[tier_index] = {"entry_edge": edge, "entry_dev": dev,
-                                      "frozen": base[int(stamp) // 60], "opened_at": stamp}
+                                      "frozen": base[int(stamp) // 60], "opened_at": stamp,
+                                      "notional": size}
     for tier, pos in open_tiers.items():
         net = -slippage_bps
         trades.append({"tier": tier, "net_bps": net, "hold_s": 0, "reason": "open_at_end",
-                       "entry_dev": pos["entry_dev"], "entry_edge": pos["entry_edge"]})
+                       "entry_dev": pos["entry_dev"], "entry_edge": pos["entry_edge"],
+                       "notional": pos["notional"]})
     return trades
 
 
@@ -143,7 +165,7 @@ def summarise(trades, notional=20.0):
     for tier in sorted(by_tier):
         items = by_tier[tier]
         nets = [t["net_bps"] for t in items]
-        usd = sum(n / BPS * notional for n in nets)
+        usd = sum(t["net_bps"] / BPS * t.get("notional", notional) for t in items)
         rows.append({
             "tier": tier, "fills": len(items),
             "win_rate": sum(1 for n in nets if n > 0) / len(nets),
@@ -165,6 +187,10 @@ def main(argv=None):
     parser.add_argument("--slippage-bps", type=float, default=1.3)
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--notional", type=float, default=20.0)
+    parser.add_argument("--child-notional", type=float, default=20.0)
+    parser.add_argument("--equity-buy", type=float, default=None)
+    parser.add_argument("--equity-sell", type=float, default=None)
+    parser.add_argument("--max-equity-multiple", type=float, default=5.0)
     args = parser.parse_args(argv)
 
     since = parse_ts(args.since).timestamp()
@@ -185,7 +211,14 @@ def main(argv=None):
         print("%-6s %-10s %-10s" % ("tier", "threshold", "pctile"))
         for i, (t, p) in enumerate(zip(tiers, PERCENTILES), start=1):
             print("%-6d %-10.2f p%.2f" % (i, t, p))
-        trades = replay(series, base, tiers, notional=args.notional,
+        caps = slot_caps(args.equity_buy, args.equity_sell, args.child_notional,
+                         args.max_equity_multiple, len(tiers))
+        increments = tier_increments(caps, args.child_notional)
+        if increments:
+            print("sizing: cumulative %s USD, per tier %s USD (child %.0fU, cap %.0fx)"
+                  % ([round(sum(increments[:i + 1]), 1) for i in range(len(increments))],
+                     [round(v, 1) for v in increments], args.child_notional, args.max_equity_multiple))
+        trades = replay(series, base, tiers, notional=args.notional, tier_notional=increments,
                         slippage_bps=args.slippage_bps, timeout_s=args.timeout)
         print("trades %d over %.1f h (%.1f/day)" % (len(trades), hours, len(trades) / hours * 24 if hours else 0))
         print("%-5s %6s %8s %12s %10s %9s %8s" % ("tier", "fills", "win%", "median_net", "usd", "hold_s", "timeout"))
