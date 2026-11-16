@@ -57,15 +57,15 @@ def main(argv=None):
     for row in rows:
         groups[(row.get("asset"), row.get("buy_venue"), row.get("sell_venue"))].append(row)
 
-    total_usd = D("0")
+    total_usd = D("0"); total_fee = D("0")
     print("")
-    print("%-5s %-16s -> %-16s %6s %7s %6s %8s %8s %7s" % (
-        "asset", "buy", "sell", "tries", "filled", "warm", "net_p50", "usd", "rev_s"))
+    print("%-5s %-16s -> %-16s %6s %7s %6s %8s %9s %8s %6s" % (
+        "asset", "buy", "sell", "tries", "filled", "warm", "net_p50", "usd", "fee_usd", "rev_s"))
     for key in sorted(groups):
         items = groups[key]
         filled = [r for r in items if r.get("status") == "filled"]
         warm = sum(1 for r in items if r.get("reason") == "baseline_warming_up")
-        nets = []; usd = D("0"); holds = []
+        nets = []; usd = D("0"); holds = []; fee = D("0")
         for row in filled:
             net_bps, pnl = leg_pnl(row)
             if net_bps is None:
@@ -74,13 +74,21 @@ def main(argv=None):
             hold = (row.get("exit") or {}).get("hold_seconds")
             if hold is not None:
                 holds.append(hold)
-        total_usd += usd
-        print("%-5s %-16s -> %-16s %6d %7d %6d %8s %8.4f %7s" % (
+            for side in ("entry", "exit"):
+                for leg in ((row.get(side) or {}).get("legs") or {}).values():
+                    if leg.get("fee_usd") not in (None, ""):
+                        try:
+                            fee += D(str(leg["fee_usd"]))
+                        except Exception:
+                            pass
+        total_usd += usd; total_fee += fee
+        print("%-5s %-16s -> %-16s %6d %7d %6d %8s %9.4f %8.4f %6s" % (
             key[0], key[1], key[2], len(items), len(filled), warm,
-            "-" if not nets else "%.2f" % st.median(nets), usd,
+            "-" if not nets else "%.2f" % st.median(nets), usd, fee,
             "-" if not holds else "%.0f" % st.median(holds)))
     print("")
-    print("total realised %.4f USD over %d fills" % (total_usd, sum(1 for r in rows if r.get("status") == "filled")))
+    print("total realised %.4f USD, gross fees %.4f USD, over %d fills" % (
+        total_usd, total_fee, sum(1 for r in rows if r.get("status") == "filled")))
     return 0
 
 
