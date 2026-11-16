@@ -326,16 +326,6 @@ def leverage_from_imf_percent(value) -> float | None:
     return float(Decimal("100") / imf)
 
 
-def required_margin_usd(notional_usd, leverage, buffer_pct=0.0) -> Decimal | None:
-    """Margin a single leg needs at the venue's leverage, plus a safety buffer."""
-    notional = _d(notional_usd)
-    lev = _d(leverage)
-    buffer = _d(buffer_pct) or ZERO
-    if notional is None or lev is None or notional <= 0 or lev <= 0:
-        return None
-    return notional / lev * (Decimal("1") + buffer / Decimal("100"))
-
-
 def lighter_signing_chain_id(rest_url: str) -> int:
     url=(rest_url or "").lower()
     if "api.rh.lighter.xyz" in url:
