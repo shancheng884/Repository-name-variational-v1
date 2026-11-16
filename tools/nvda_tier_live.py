@@ -148,7 +148,10 @@ async def main_async(args):
             need = max(120, int(args.baseline_minutes * 60 / max(1.0, args.poll_seconds) * 0.5))
             if len(history) < need:
                 write_state({"status": "warming", "samples": len(history), "need": need,
-                             "pair": args.pair, "updated_at": datetime.now(timezone.utc).isoformat()})
+                             "pair": args.pair, "equity": equity,
+                             "slot_caps": caps, "cumulative_notional": ladder,
+                             "child_notional": args.child_notional,
+                             "updated_at": datetime.now(timezone.utc).isoformat()})
                 continue
             ordered = sorted(history)
             baseline = ordered[len(ordered) // 2]
