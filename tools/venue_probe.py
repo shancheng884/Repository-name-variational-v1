@@ -138,7 +138,7 @@ def parse_args(argv=None):
     p.add_argument("--exit-poll-seconds",type=float,default=2.0,help="how often to re-read the edge while holding")
     p.add_argument("--baseline-entry",action="store_true",help="enter on the deviation from the pair rolling median instead of the raw edge")
     p.add_argument("--baseline-minutes",type=float,default=30.0)
-    p.add_argument("--min-baseline-samples",type=int,default=240)
+    p.add_argument("--min-baseline-samples",type=int,default=120)
     p.add_argument("--max-loss-usd",type=float,default=None,help="hard stop after this much realised loss")
     p.add_argument("--pairs",default="",help="comma list of ASSET:buy>sell; restricts the plan to these combinations only")
     p.add_argument("--rounds-per-pair",type=int,default=1,help="repeat each requested pair this many times, round-robin")
