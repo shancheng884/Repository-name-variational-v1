@@ -85,7 +85,9 @@ async def place_pair(ex, asset, buy, sell, qty, *, opening, quotes):
                                                        max_slippage_bps=Decimal("12"))
         except Exception as exc:
             return venue, {"ok": False, "status": "error", "error": "%s:%s" % (type(exc).__name__, exc)}
-    tasks = [one(buy, "sell" if opening else "buy"), one(sell, "buy" if opening else "sell")]
+    # Opening: buy on the buy venue, sell on the sell venue.
+    # Closing: the reverse, so each leg reduces what it opened.
+    tasks = [one(buy, "buy" if opening else "sell"), one(sell, "sell" if opening else "buy")]
     return dict(await asyncio.gather(*tasks))
 
 
