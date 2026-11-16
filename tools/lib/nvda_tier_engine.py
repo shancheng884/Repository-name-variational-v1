@@ -25,7 +25,7 @@ class TierConfig:
     sell_venue: str
     tiers: tuple[TierSpec, ...]
     notional_usd: float = 20.0
-    timeout_seconds: float = 900.0
+    timeout_seconds: float | None = None
     confirm_window: int = 3
     confirm_min: int = 2
     slippage_bps: float = 1.3
@@ -109,7 +109,9 @@ class TierEngine:
         for index in sorted(self.open_tiers):
             pos = self.open_tiers[index]
             reverted = edge <= pos.frozen_baseline
-            expired = stamp - pos.opened_at >= self.config.timeout_seconds
+            # timeout_seconds=None keeps the tier open until it reverts.
+            expired = (self.config.timeout_seconds is not None
+                       and stamp - pos.opened_at >= self.config.timeout_seconds)
             if not (reverted or expired):
                 continue
             net_bps = (pos.entry_edge - edge) - self.config.slippage_bps
