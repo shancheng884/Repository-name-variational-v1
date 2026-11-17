@@ -96,6 +96,55 @@ async def place_pair(ex, asset, buy, sell, qty, *, opening, quotes):
     return dict(await asyncio.gather(*tasks))
 
 
+QTY_TOL = Decimal("0.002")
+
+
+async def position_qty(ex, asset, venue):
+    """Verified position size, or None when the venue could not be read."""
+    try:
+        result = await ex[venue].positions(asset)
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not result.get("verified"):
+        return None
+    return _d(result.get("qty"))
+
+
+async def settle_positions(ex, asset, venues, expected, *, attempts=3):
+    """Force the venues to match the ledger and prove it from a fresh read.
+
+    Any difference is closed with a reduce-only order, which can shrink a
+    position but never open one, so a correction cannot create a naked leg.
+    """
+    legs = {}
+    for _ in range(max(1, attempts)):
+        residual = {}
+        for venue in venues:
+            qty = await position_qty(ex, asset, venue)
+            want = expected[venue]
+            if qty is None:
+                legs[venue] = {"expected": str(want), "actual": None, "error": "position_unreadable"}
+                return {"ok": False, "error": "position_unreadable", "legs": legs}
+            delta = qty - want
+            legs[venue] = {"expected": str(want), "actual": str(qty), "residual": str(delta)}
+            if abs(delta) > QTY_TOL:
+                residual[venue] = delta
+        if not residual:
+            return {"ok": True, "legs": legs}
+        for venue, delta in residual.items():
+            side = "sell" if delta > 0 else "buy"
+            try:
+                receipt = await ex[venue].market_order(
+                    asset=asset, side=side, qty=abs(delta), quote={},
+                    client_order_id="nvda-tier-settle-" + uuid.uuid4().hex[:10],
+                    reduce_only=True, max_slippage_bps=Decimal("30"))
+                legs[venue]["fix"] = (receipt or {}).get("status")
+            except Exception as exc:
+                legs[venue]["fix_error"] = "%s:%s" % (type(exc).__name__, exc)
+        await asyncio.sleep(0.8)
+    return {"ok": False, "error": "position_mismatch", "legs": legs}
+
+
 def write_state(payload):
     STATE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE.with_suffix(".tmp")
@@ -155,6 +204,8 @@ async def main_async(args):
     history = {"forward": deque(maxlen=3600), "reverse": deque(maxlen=3600)}
     dev_window = {"forward": deque(maxlen=3), "reverse": deque(maxlen=3)}
     realized = Decimal("0")
+    close_failures = {}
+    open_block_until = 0.0
     exchange = await snapshot(ex, asset, venues)
     snap_at = time.time()
     need = max(120, int(args.baseline_minutes * 60 / max(1.0, args.poll_seconds) * 0.5))
@@ -216,34 +267,69 @@ async def main_async(args):
                 for action in actions:
                     side_buy, side_sell = (buy, sell) if action.get("direction") == "forward" else (sell, buy)
                     ob, os_ = (q_buy, q_sell) if action.get("direction") == "forward" else (q_sell, q_buy)
+                    engine = engine_forward if action.get("direction") == "forward" else engine_reverse
+                    if action.get("action") == "blocked":
+                        write_state({"status": "blocked_position_mismatch", "stage": "enter",
+                                     "direction": action.get("direction"), "tier": action.get("tier"),
+                                     "reason": action.get("reason"), "diffs": action.get("diffs"),
+                                     "updated_at": datetime.now(timezone.utc).isoformat()})
+                        continue
                     if action.get("action") == "open":
+                        if time.time() < open_block_until:
+                            engine.drop_tier(action["tier"])
+                            continue
                         exchange = await snapshot(ex, asset, venues)
                         snap_at = time.time()
                         qty = Decimal(str(action["qty"]))
                         receipts = await place_pair(ex, asset, side_buy, side_sell, qty, opening=True,
                                                      quotes={side_buy: ob, side_sell: os_})
-                        if not all(isinstance(r, dict) and r.get("status") == "filled" for r in receipts.values()):
-                            for venue in receipts:
-                                side = "sell" if venue == side_buy else "buy"
-                                try:
-                                    await ex[venue].market_order(asset=asset, side=side, qty=qty, quote={},
-                                                                 client_order_id="nvda-tier-flat-" + uuid.uuid4().hex[:10],
-                                                                 reduce_only=True, max_slippage_bps=Decimal("30"))
-                                except Exception:
-                                    pass
-                            engine = engine_forward if action.get("direction") == "forward" else engine_reverse
+                        filled = all(isinstance(r, dict) and r.get("status") == "filled"
+                                     for r in receipts.values())
+                        check = None
+                        if filled:
+                            check = await settle_positions(ex, asset, venues,
+                                                           {v: engine.ledger.net(asset, v) for v in venues})
+                        if not filled or not check["ok"]:
+                            # A tier only exists if both legs are really on the book.
                             engine.drop_tier(action["tier"])
-                            write_state({"status": "manual_review", "reason": "leg_not_filled",
-                                         "receipts": receipts, "updated_at": datetime.now(timezone.utc).isoformat()})
-                            return {"ok": False, "error": "leg_not_filled"}
+                            recovery = await settle_positions(ex, asset, venues,
+                                                              {v: engine.ledger.net(asset, v) for v in venues})
+                            open_block_until = time.time() + 30.0
+                            write_state({"status": "open_not_hedged" if recovery["ok"] else "blocked_position_mismatch",
+                                         "stage": "open", "direction": action.get("direction"),
+                                         "tier": action["tier"], "receipts": receipts,
+                                         "settle": check, "recovery": recovery,
+                                         "updated_at": datetime.now(timezone.utc).isoformat()})
+                            if not recovery["ok"]:
+                                return {"ok": False, "error": "open_position_mismatch"}
                     elif action.get("action") == "close":
                         notional = Decimal(str(action.get("notional_usd") or args.notional))
                         qty = Decimal(str(action.get("qty") or 0))
                         if qty <= 0:
+                            engine.cancel_close(action["tier"])
                             continue
-                        await place_pair(ex, asset, side_buy, side_sell, qty, opening=False,
-                                         quotes={side_buy: ob, side_sell: os_})
-                        realized += Decimal(str(action["net_bps"])) / Decimal("10000") * notional
+                        receipts = await place_pair(ex, asset, side_buy, side_sell, qty, opening=False,
+                                                    quotes={side_buy: ob, side_sell: os_})
+                        expected = {v: engine.ledger.net(asset, v) + (-qty if v == side_buy else qty)
+                                    for v in venues}
+                        check = await settle_positions(ex, asset, venues, expected)
+                        if check["ok"]:
+                            trade = engine.confirm_close(action)
+                            close_failures.pop(action["tier"], None)
+                            if trade:
+                                realized += Decimal(str(trade["net_bps"])) / Decimal("10000") * notional
+                        else:
+                            # Keep the tier: the next sample retries the close and
+                            # the residual is measured against the real position.
+                            engine.cancel_close(action["tier"])
+                            close_failures[action["tier"]] = close_failures.get(action["tier"], 0) + 1
+                            write_state({"status": "blocked_position_mismatch", "stage": "close",
+                                         "direction": action.get("direction"), "tier": action["tier"],
+                                         "receipts": receipts, "settle": check,
+                                         "attempts": close_failures[action["tier"]],
+                                         "updated_at": datetime.now(timezone.utc).isoformat()})
+                            if close_failures[action["tier"]] >= 3:
+                                return {"ok": False, "error": "close_position_mismatch"}
             if realized <= -abs(Decimal(str(args.max_loss_usd))):
                 write_state({"status": "stopped_max_loss", "realized": str(realized)})
                 return {"ok": False, "error": "max_loss"}

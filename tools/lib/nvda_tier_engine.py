@@ -122,6 +122,9 @@ class OpenTier:
     opened_at: float
     qty: float
     notional_usd: float = 0.0
+    # A close is only booked once the venue confirms both legs; until then the
+    # tier stays open here so a failed leg is retried instead of forgotten.
+    closing: bool = False
 
 
 @dataclass
@@ -159,6 +162,9 @@ class TierEngine:
 
         for index in sorted(self.open_tiers):
             pos = self.open_tiers[index]
+            if pos.closing:
+                # Already waiting on a venue fill; do not queue a second close.
+                continue
             reverted = edge <= pos.frozen_baseline
             # timeout_seconds=None keeps the tier open until it reverts.
             expired = (self.config.timeout_seconds is not None
@@ -166,17 +172,13 @@ class TierEngine:
             if not (reverted or expired):
                 continue
             net_bps = (pos.entry_edge - edge) - self.config.slippage_bps
-            self.trades.append({"tier": index, "net_bps": net_bps, "hold_s": stamp - pos.opened_at,
-                                "reason": "reverted" if reverted else "timeout",
-                                "entry_dev": pos.entry_dev,
-                                "notional_usd": pos.notional_usd})
-            self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -pos.qty)
-            self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, +pos.qty)
-            self.open_tiers.pop(index)
+            pos.closing = True
             actions.append({"action": "close", "tier": index,
                             "reason": "reverted" if reverted else "timeout",
                             "net_bps": net_bps, "qty": pos.qty,
-                            "notional_usd": pos.notional_usd})
+                            "notional_usd": pos.notional_usd,
+                            "entry_edge": pos.entry_edge, "exit_edge": edge,
+                            "hold_s": stamp - pos.opened_at})
 
         # One reconciliation per decision step: the account is checked before the
         # batch of orders goes out, not after every child order we just queued.
@@ -217,6 +219,27 @@ class TierEngine:
             actions.append({"action": "open", "tier": tier.index, "dev_bps": dev, "qty": qty,
                             "notional_usd": increment})
         return actions
+
+    def confirm_close(self, action: dict[str, Any]) -> dict[str, Any] | None:
+        """Book a close only after the venue confirmed both legs filled."""
+        index = int(action.get("tier"))
+        pos = self.open_tiers.pop(index, None)
+        if pos is None:
+            return None
+        trade = {"tier": index, "net_bps": float(action.get("net_bps") or 0.0),
+                 "hold_s": float(action.get("hold_s") or 0.0),
+                 "reason": action.get("reason") or "reverted",
+                 "entry_dev": pos.entry_dev, "notional_usd": pos.notional_usd}
+        self.trades.append(trade)
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -pos.qty)
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, +pos.qty)
+        return trade
+
+    def cancel_close(self, index: int) -> None:
+        """Release the close lock so the next sample can try again."""
+        pos = self.open_tiers.get(int(index))
+        if pos is not None:
+            pos.closing = False
 
     def drop_tier(self, index: int) -> None:
         """Undo a tier whose paired order was never sent.

@@ -47,7 +47,12 @@ def test_engine_opens_each_tier_once_and_closes_on_revert():
     assert again == []
     closed = engine.on_sample(stamp=10, edge=0.0, baseline=0.0, price_hint=160.0,
                               window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger))
-    assert len([a for a in closed if a["action"] == "close"]) == 2
+    closes = [a for a in closed if a["action"] == "close"]
+    assert len(closes) == 2
+    # The books only move once the venue confirms the fills.
+    assert ledger.net("NVDA", "entropy") != 0
+    for action in closes:
+        engine.confirm_close(action)
     assert raw_net(ledger) == 0
 
 
@@ -156,6 +161,8 @@ def test_exits_still_run_when_entry_is_locked():
                                allow_entry=False)
     assert len(actions) == 5
     assert all(a["action"] == "close" for a in actions)
+    for action in actions:
+        engine.confirm_close(action)
     assert not engine.open_tiers
     assert engine._open_notional() == 0.0
 
@@ -176,3 +183,44 @@ def test_two_directions_share_one_ledger_and_net_out():
     assert ledger.net("NVDA", "entropy") == 0
     assert ledger.net("NVDA", "lighter_mainnet") == 0
     assert ledger.reconcile("NVDA", ("entropy", "lighter_mainnet"), exchange_from(ledger))["ok"] is True
+
+
+def test_a_close_is_not_booked_and_not_repeated_while_it_waits():
+    ledger = PositionLedger()
+    engine = TierEngine(config=CFG, ledger=ledger)
+    engine.on_sample(stamp=0, edge=8.0, baseline=0.0, price_hint=160.0,
+                     window=[8.0, 8.0, 8.0], exchange=exchange_from(ledger))
+    first = engine.on_sample(stamp=10, edge=0.0, baseline=0.0, price_hint=160.0,
+                             window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger))
+    assert [a["tier"] for a in first if a["action"] == "close"] == [1, 2]
+    again = engine.on_sample(stamp=11, edge=0.0, baseline=0.0, price_hint=160.0,
+                             window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger))
+    assert [a for a in again if a["action"] == "close"] == []
+    assert len(engine.open_tiers) == 2
+
+
+def test_cancel_close_lets_the_same_tier_be_closed_again():
+    ledger = PositionLedger()
+    engine = TierEngine(config=CFG, ledger=ledger)
+    engine.on_sample(stamp=0, edge=8.0, baseline=0.0, price_hint=160.0,
+                     window=[8.0, 8.0, 8.0], exchange=exchange_from(ledger))
+    actions = engine.on_sample(stamp=10, edge=0.0, baseline=0.0, price_hint=160.0,
+                               window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger))
+    engine.cancel_close(actions[0]["tier"])
+    retry = engine.on_sample(stamp=12, edge=0.0, baseline=0.0, price_hint=160.0,
+                             window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger))
+    assert any(a["action"] == "close" and a["tier"] == actions[0]["tier"] for a in retry)
+
+
+def test_confirm_close_books_the_trade_once():
+    ledger = PositionLedger()
+    engine = TierEngine(config=CFG, ledger=ledger)
+    engine.on_sample(stamp=0, edge=8.0, baseline=0.0, price_hint=160.0,
+                     window=[8.0, 8.0, 8.0], exchange=exchange_from(ledger))
+    actions = engine.on_sample(stamp=10, edge=0.0, baseline=0.0, price_hint=160.0,
+                               window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger))
+    action = actions[0]
+    assert engine.confirm_close(action)["tier"] == action["tier"]
+    assert len(engine.trades) == 1
+    assert engine.confirm_close(action) is None
+    assert len(engine.trades) == 1

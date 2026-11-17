@@ -6,7 +6,7 @@ from decimal import Decimal
 
 from tools.lib.nvda_tier_engine import PositionLedger, TierConfig, TierEngine, TierSpec
 from tools.lib.venue_probe import leverage_from_imf_percent
-from tools.nvda_tier_live import place_pair
+from tools.nvda_tier_live import place_pair, position_qty, settle_positions
 
 
 class FakeExecutor:
@@ -60,3 +60,63 @@ def test_dropping_a_refused_tier_reverses_its_ledger_legs():
     assert engine.open_tiers == {}
     assert ledger.net("NVDA", "entropy") == 0
     assert ledger.net("NVDA", "lighter_rh") == 0
+
+
+class BookExecutor:
+    """A venue whose position only moves when a reduce-only order is filled."""
+
+    def __init__(self, qty, fill=True):
+        self.qty = Decimal(str(qty))
+        self.fill = fill
+        self.orders = []
+
+    async def positions(self, asset):
+        return {"ok": True, "verified": True, "qty": str(self.qty), "active_orders": 0}
+
+    async def market_order(self, **kwargs):
+        self.orders.append(kwargs)
+        if not self.fill:
+            return {"ok": False, "status": "rejected"}
+        delta = Decimal(str(kwargs["qty"]))
+        self.qty += -delta if kwargs["side"] == "sell" else delta
+        return {"ok": True, "status": "filled"}
+
+
+def test_settle_closes_a_residual_with_a_reduce_only_order():
+    ex = {"rh": BookExecutor("0"), "ent": BookExecutor("0.897")}
+    result = asyncio.run(settle_positions(ex, None, ("rh", "ent"),
+                                          {"rh": Decimal("0"), "ent": Decimal("0")}))
+    assert result["ok"] is True
+    assert ex["ent"].orders[0]["side"] == "sell"
+    assert ex["ent"].orders[0]["reduce_only"] is True
+    assert ex["ent"].qty == 0
+    assert ex["rh"].orders == []
+
+
+def test_settle_reports_a_leg_it_cannot_correct():
+    ex = {"rh": BookExecutor("0"), "ent": BookExecutor("0.897", fill=False)}
+    result = asyncio.run(settle_positions(ex, None, ("rh", "ent"),
+                                          {"rh": Decimal("0"), "ent": Decimal("0")}, attempts=1))
+    assert result["ok"] is False
+    assert result["error"] == "position_mismatch"
+    assert result["legs"]["ent"]["residual"] != "0"
+
+
+def test_settle_refuses_to_treat_an_unreadable_venue_as_flat():
+    class Blind:
+        async def positions(self, asset):
+            return {"ok": False, "verified": False, "error": "unreachable"}
+
+    result = asyncio.run(settle_positions({"rh": Blind()}, None, ("rh",),
+                                          {"rh": Decimal("0")}, attempts=1))
+    assert result["ok"] is False
+    assert result["error"] == "position_unreadable"
+
+
+def test_position_qty_needs_a_verified_read():
+    class Blind:
+        async def positions(self, asset):
+            return {"ok": False, "verified": False}
+
+    assert asyncio.run(position_qty({"rh": Blind()}, None, "rh")) is None
+    assert asyncio.run(position_qty({"rh": BookExecutor("1.5")}, None, "rh")) == Decimal("1.5")
