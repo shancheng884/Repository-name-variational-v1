@@ -20,11 +20,17 @@ def report(path):
     known_net = Decimal("0")
     missing = []
     latency = {}
+    rows = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         try:
-            row = json.loads(line)
+            rows.append(json.loads(line))
         except ValueError:
             continue
+    finalized = {r["execution_token"]: r for r in rows if r.get("event") == "cost_finalized"}
+    for row in rows:
+        final = finalized.get(row.get("execution_token"))
+        if final:
+            row = {**row, "excess_pnl" if final["category"] == "excess" else "pnl": final["pnl"]}
         event = row.get("event")
         receipts = row.get("receipts") or {}
         if event not in ("opened", "open_failed", "open_unverified", "closed", "close_failed", "closed_reconciled"):

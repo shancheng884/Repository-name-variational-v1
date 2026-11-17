@@ -9,7 +9,7 @@ persisted and reconciled against the real account before any order can go out.
 """
 from __future__ import annotations
 
-import argparse, asyncio, json, os, sys, time, uuid
+import argparse, asyncio, copy, json, os, sys, time, uuid
 from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -21,6 +21,8 @@ if str(ROOT) not in sys.path:
 
 from tools.lib.nvda_tier_engine import PositionLedger, TierConfig, TierEngine, TierSpec, asset_symbol
 from tools.lib.venue_probe import EntropyProbeExecutor, LighterProbeExecutor, _d
+from tools.lib.nvda_quote_alignment import BASIS, seed_aligned_history
+from tools.lib.nvda_fee_updates import finalize_costs, refresh_open_fees
 from tools.lib.nvda_execution_stats import (closed_child_result, failed_entry_result, hedged_entry_result,
                                           new_execution_stats, record_attempt)
 from tools.market_capture.config import DEFAULT_ASSETS, VENUES, CaptureConfig, load_environment
@@ -66,7 +68,9 @@ def build_executors(env):
     return {
         "entropy": EntropyProbeExecutor(
             info_url=env.get("ENTROPY_INFO_URL", "https://api.hyperliquid.xyz/info"),
-            account_address=address, private_key=key, dex=env.get("ENTROPY_ALLOWED_DEX", "io")),
+            account_address=address, private_key=key, dex=env.get("ENTROPY_ALLOWED_DEX", "io"),
+            fill_ws_url=env.get("ENTROPY_WS_URL", "wss://api.hyperliquid.xyz/ws"),
+            enable_fill_stream=True),
         "lighter_mainnet": LighterProbeExecutor(
             name="lighter_mainnet",
             rest_url=env.get("LIGHTER_MAINNET_REST_URL", "https://mainnet.zklighter.elliot.ai"),
@@ -171,6 +175,8 @@ async def place_pair(ex, asset, buy, sell, qty, *, opening, quotes,
                                                        max_slippage_bps=Decimal("12"), **extra)
             receipt["requested_qty"] = str(qty)
             receipt["dispatch_started_at"] = _iso(dispatched)
+            receipt.setdefault("execution_quote", {}).update(
+                {k: (quotes.get(venue) or {}).get(k) for k in ("bid_size", "ask_size", "depth_audit", "time_alignment")})
             if decision_at is not None:
                 receipt["signal_to_dispatch_ms"] = round(max(0, dispatched - decision_at) * 1000, 3)
             return venue, receipt
@@ -470,6 +476,7 @@ def save_engine_state(*, asset, pair, tiers, engines, realized, rebate, equity, 
         "rebate_usd": str(rebate),
         "equity": equity,
         "execution_stats": execution_stats or new_execution_stats(),
+        "quote_basis": BASIS,
         "engines": {key: engine.dump_state() for key, engine in engines.items()},
         "history": {key: [[round(ts, 3), value] for ts, value in list(samples)][-2000:]
                     for key, samples in history.items()},
@@ -517,6 +524,8 @@ async def main_async(args):
     window_seconds = max(60.0, args.baseline_minutes * 60.0)
     min_samples = 120
     history = {"forward": deque(maxlen=20000), "reverse": deque(maxlen=20000)}
+    history.update(aligned_forward=deque(maxlen=20000), aligned_reverse=deque(maxlen=20000))
+    aligned_history = {key: history["aligned_" + key] for key in ("forward", "reverse")}
     out_dir = ROOT / "log" / "nvda_tier_live_capture"
     saved = load_engine_state(ENGINE_STATE)
     execution_stats = new_execution_stats((saved or {}).get("execution_stats"))
@@ -532,7 +541,9 @@ async def main_async(args):
         except Exception:
             realized, rebate = Decimal("0"), Decimal("0")
         cutoff = time.time() - window_seconds
-        for key in ("forward", "reverse"):
+        for key in history:
+            if key.startswith("aligned_") and saved.get("quote_basis") != BASIS:
+                continue
             for row in (saved.get("history") or {}).get(key) or []:
                 if isinstance(row, (list, tuple)) and len(row) >= 2:
                     try:
@@ -544,6 +555,8 @@ async def main_async(args):
         restored = bool(engine_forward.open_tiers or engine_reverse.open_tiers)
     if not history["forward"] and not history["reverse"]:
         seed_history_from_edges(history, out_dir, args.pair, asset.name, window_seconds)
+    if not all(aligned_history.values()):
+        seed_aligned_history(aligned_history, out_dir, venues, symbol, window_seconds, now=time.time())
 
     # A restart must start from the real account, never from an assumed flat book.
     startup = await position_snapshot(ex, asset, venues)
@@ -582,13 +595,15 @@ async def main_async(args):
                                       venue_enabled={name: name in venues for name in VENUES},
                                       var_quote_seconds=1.0,
                                       var_bridge_enabled=("variational" in venues),
-                                      book_snapshot_seconds=5.0, health_seconds=2.0, latency_seconds=5.0,
+                                      book_snapshot_seconds=.5, entropy_fast_depth=True, quote_alignment=True,
+                                      health_seconds=2.0, latency_seconds=5.0,
                                       system_seconds=60.0, fill_poll_seconds=2.0, edge_seconds=1.0,
                                       notional_usd=Decimal(str(args.notional)), max_book_levels=20))
     task = asyncio.create_task(cap.run(), name="nvda-tier-capture")
     dev_window = {"forward": deque(maxlen=cfg_forward.confirm_window),
                   "reverse": deque(maxlen=cfg_reverse.confirm_window)}
     last_version = None
+    last_alignment_version = None
     close_failures = {}
     last_save = 0.0
     last_baseline_second = -1
@@ -615,6 +630,12 @@ async def main_async(args):
             cap.hub.quote_event.clear()
             if cap.stop_event.is_set():
                 break
+            rebate += refresh_open_fees(engines, ex, asset)
+            cost_delta, rebate_delta, cost_events = finalize_costs(execution_stats, ex, asset, engines)
+            realized += cost_delta
+            rebate += rebate_delta
+            for event in cost_events:
+                append_jsonl(ORDER_LOG, {"ts": _iso(), **event})
             if reconcile_task is not None and reconcile_task.done():
                 checked = reconcile_task.result()
                 reconcile_task = None
@@ -646,44 +667,71 @@ async def main_async(args):
                 continue
             forward_mid = (buy_ask + sell_bid) / 2
             reverse_mid = (sell_ask + buy_bid) / 2
-            edge_forward = float((sell_bid - buy_ask) / forward_mid * Decimal("10000"))
-            edge_reverse = float((buy_bid - sell_ask) / reverse_mid * Decimal("10000"))
+            raw_forward = float((sell_bid - buy_ask) / forward_mid * Decimal("10000"))
+            raw_reverse = float((buy_bid - sell_ask) / reverse_mid * Decimal("10000"))
             stamp = time.time()
+            aligned = cap.hub.quote_clock.align(q_buy, q_sell, now=stamp)
+            legacy = any(pos.signal_basis != BASIS for engine in engines.values()
+                         for pos in engine.open_tiers.values())
+            if aligned is None and not legacy:
+                record_block("alignment_unavailable", min_interval=30,
+                             buy_source_at=q_buy.get("source_at"), sell_source_at=q_sell.get("source_at"))
+                continue
+            edge_forward = aligned["edges"]["forward"] if aligned else raw_forward
+            edge_reverse = aligned["edges"]["reverse"] if aligned else raw_reverse
             if int(stamp) != last_baseline_second:
-                history["forward"].append((stamp, edge_forward))
-                history["reverse"].append((stamp, edge_reverse))
+                history["forward"].append((stamp, raw_forward))
+                history["reverse"].append((stamp, raw_reverse))
+                if aligned:
+                    aligned_history["forward"].append((stamp, edge_forward))
+                    aligned_history["reverse"].append((stamp, edge_reverse))
                 last_baseline_second = int(stamp)
             cutoff = stamp - window_seconds
-            trim_history(history["forward"], cutoff)
-            trim_history(history["reverse"], cutoff)
-            ready = {key: window_ready(history[key], window_seconds, min_samples=min_samples)
-                     for key in history}
-            if not all(ready.values()):
-                coverage = {key: round(history[key][-1][0] - history[key][0][0], 1)
-                            if len(history[key]) > 1 else 0.0 for key in history}
-                write_state({"status": "warming", "samples": min(len(history["forward"]), len(history["reverse"])),
+            for samples in history.values():
+                trim_history(samples, cutoff)
+            ready = {key: window_ready(aligned_history[key], window_seconds, min_samples=min_samples)
+                     for key in aligned_history}
+            if not all(ready.values()) and not any(engine.open_tiers for engine in engines.values()):
+                coverage = {key: round(samples[-1][0] - samples[0][0], 1) if len(samples)>1 else 0.0
+                            for key, samples in aligned_history.items()}
+                write_state({"status": "warming", "samples": min(map(len, aligned_history.values())),
                              "need": min_samples, "window_seconds": window_seconds,
                              "coverage_seconds": coverage, "pair": args.pair, "equity": equity,
                              "slot_caps": caps, "cumulative_notional": ladder, "tiers": tiers,
                              "child_notional": args.child_notional, "leverage": leverage,
                              "restored": restored, "realized_usd": str(realized),
                              "rebate_usd": str(rebate)})
-                record_block("warming", min_interval=60, samples=len(history["forward"]),
+                record_block("warming", min_interval=60, samples=len(aligned_history["forward"]),
                              need=min_samples, coverage_seconds=coverage)
                 continue
-            baseline = {key: median_of(history[key]) for key in history}
-            dev_window["forward"].append(edge_forward - baseline["forward"])
-            dev_window["reverse"].append(edge_reverse - baseline["reverse"])
+            baseline = {key: median_of(samples) if samples else 0.0 for key, samples in aligned_history.items()}
+            independent = aligned is not None and aligned["version"] != last_alignment_version
+            if independent:
+                dev_window["forward"].append(edge_forward - baseline["forward"])
+                dev_window["reverse"].append(edge_reverse - baseline["reverse"])
+                last_alignment_version = aligned["version"]
+            alignment_audit = ({k: v for k, v in aligned.items() if k != "version"} if aligned else {})
+            alignment_audit.update(raw_edges={"forward": raw_forward, "reverse": raw_reverse},
+                                   baseline=baseline, independent_confirmation=independent,
+                                   confirmation_counts={k: sum(v >= tiers[k][0] for v in w)
+                                                        for k, w in dev_window.items()})
+            for quote in (q_buy, q_sell):
+                quote["time_alignment"] = alignment_audit
+            if independent and cap.writer is not None:
+                cap.writer.append("quote_alignment", "strategy", symbol,
+                                  {"event": "quote_alignment", "at": _iso(stamp), **alignment_audit})
             # Both directions always evaluate exits; only the flat side may open,
             # which is the ETH gradient's direction lock until fully flat.
             acts_forward = engine_forward.on_sample(
                 stamp=stamp, edge=edge_forward, baseline=baseline["forward"],
                 price_hint=float(max(buy_ask, sell_bid)), window=list(dev_window["forward"]),
-                exchange=exchange or {}, allow_entry=not engine_reverse.open_tiers)
+                exchange=exchange or {}, raw_edge=raw_forward,
+                allow_entry=all(ready.values()) and aligned is not None and not legacy and not engine_reverse.open_tiers)
             acts_reverse = engine_reverse.on_sample(
                 stamp=stamp, edge=edge_reverse, baseline=baseline["reverse"],
                 price_hint=float(max(sell_ask, buy_bid)), window=list(dev_window["reverse"]),
-                exchange=exchange or {}, allow_entry=not engine_forward.open_tiers)
+                exchange=exchange or {}, raw_edge=raw_reverse,
+                allow_entry=all(ready.values()) and aligned is not None and not legacy and not engine_forward.open_tiers)
             for action in acts_forward:
                 action["direction"] = "forward"
             for action in acts_reverse:
@@ -733,6 +781,8 @@ async def main_async(args):
                             record_block("quantity_below_minimum", min_interval=30)
                             continue
                         action["qty"] = float(requested)
+                        for venue, quote in ((side_buy, ob), (side_sell, os_)):
+                            quote["depth_audit"] = cap.hub.depth_audit(venue, symbol, requested)
                         engine.pending_action = dict(action)
                         order_epoch += 1
                         save_engine_state(asset=symbol, pair=args.pair, tiers=tiers, engines=engines,
@@ -775,7 +825,7 @@ async def main_async(args):
                                                                        side_buy, side_sell)
                             prices = {venue: receipt_price(receipts.get(venue)) for venue in venues}
                             pos = engine.confirm_open(action, qty=hedge_qty, entry_prices=prices,
-                                                      fee_usd=receipts_fee(retained))
+                                                      fee_usd=receipts_fee(retained), entry_receipts=retained)
                             rebate += Decimal(str(entropy_rebate(receipts)))
                             rebate += sum((Decimal(str(entropy_rebate({row["venue"]: row.get("receipt")})))
                                            for row in check.get("corrections", [])), Decimal("0"))
@@ -784,9 +834,15 @@ async def main_async(args):
                             record_attempt(execution_stats, receipts, opening=True, hedged=True,
                                            recovery=check if check.get("corrections") else None,
                                            pnl=excess_pnl if check.get("corrections") else None)
+                            if not excess_pnl["complete"] and check.get("corrections"):
+                                execution_stats.setdefault("pending_costs", []).append(copy.deepcopy({
+                                    "category": "excess", "execution_token": action["token"],
+                                    "receipts": receipts, "recovery": check, "buy": side_buy, "sell": side_sell,
+                                    "hedge_qty": str(hedge_qty), "rebate_credited": excess_pnl["rebate_usd"]}))
                             exchange = {v: ledger.net(symbol, v) for v in venues}
                             snap_at = time.time()
                             append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "opened",
+                                                     "execution_token": action["token"],
                                                      "pair": args.pair, "direction": action.get("direction"),
                                                      "tier": action.get("tier"), "qty": str(hedge_qty),
                                                      "notional_usd": action.get("notional_usd"),
@@ -813,6 +869,11 @@ async def main_async(args):
                             if failure_pnl["complete"]:
                                 realized += Decimal(failure_pnl["net_usd"])
                                 rebate += Decimal(failure_pnl["rebate_usd"])
+                            else:
+                                execution_stats.setdefault("pending_costs", []).append(copy.deepcopy({
+                                    "category": "failed", "execution_token": action["token"],
+                                    "receipts": receipts, "recovery": recovery, "buy": side_buy, "sell": side_sell,
+                                    "rebate_credited": "0"}))
                             terminal = (all(r.get("status") in ("filled", "rejected")
                                             for r in receipts.values())
                                         and all(row.get("receipt", {}).get("status") in ("filled", "rejected")
@@ -831,6 +892,7 @@ async def main_async(args):
                                          direction=action.get("direction"), tier=action.get("tier"),
                                          receipts=receipts, settle=check, recovery=recovery)
                             append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "open_failed",
+                                                     "execution_token": action["token"],
                                                      "pair": args.pair, "direction": action.get("direction"),
                                                      "tier": action.get("tier"), "requested_qty": str(requested),
                                                      "receipts": receipts, "settle": check,
@@ -852,6 +914,8 @@ async def main_async(args):
                         if qty <= 0:
                             engine.cancel_close(action["tier"])
                             continue
+                        for venue, quote in ((side_buy, ob), (side_sell, os_)):
+                            quote["depth_audit"] = cap.hub.depth_audit(venue, symbol, qty)
                         order_epoch += 1
                         engine.pending_action = dict(action)
                         save_engine_state(asset=symbol, pair=args.pair, tiers=tiers, engines=engines,
@@ -895,9 +959,18 @@ async def main_async(args):
                                 realized += Decimal(pnl["net_usd"])
                             else:
                                 execution_stats["unresolved_cost_events"] += 1
+                                credited = Decimal(str(action.get("entry_fee_usd") or 0)) * Decimal("1.1")
+                                credited += Decimal(str(entropy_rebate(receipts)))
+                                credited += sum((Decimal(str(entropy_rebate({row["venue"]: row.get("receipt")})))
+                                                 for row in check.get("corrections", [])), Decimal("0"))
+                                execution_stats.setdefault("pending_costs", []).append(copy.deepcopy({
+                                    "category": "closed", "execution_token": action["token"],
+                                    "action": action, "receipts": receipts, "recovery": check,
+                                    "buy": side_buy, "sell": side_sell, "rebate_credited": str(credited)}))
                             if trade is not None:
                                 trade.update(pnl)
                             append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "closed",
+                                                     "execution_token": action["token"],
                                                      "pair": args.pair, "direction": action.get("direction"),
                                                      "tier": action.get("tier"), "qty": str(qty),
                                                      "notional_usd": action.get("notional_usd"),
@@ -964,19 +1037,28 @@ async def main_async(args):
             status = "running" if args.mode == "live" else "observe"
             if degraded["status"] and time.time() < degraded["until"]:
                 status = degraded["status"]
+            fill_stream = getattr(ex.get("entropy"), "_fill_stream", None)
             write_state({"status": status,
                          "pair": args.pair, "equity": equity,
                          "slot_caps": caps, "cumulative_notional": ladder, "tiers": tiers,
                          "child_notional": args.child_notional, "leverage": leverage,
+                         "quote_basis": BASIS, "time_alignment": alignment_audit,
+                         "legacy_exit_only": legacy,
+                         "entropy_fill_stream": ({"connected": fill_stream.connected,
+                                                   "messages": fill_stream.messages,
+                                                   "last_received_at": fill_stream.last_received_at,
+                                                   "last_error": fill_stream.last_error} if fill_stream else None),
                          "restored": restored,
                          "directions": {
                              "forward": {"pair": "%s>%s" % (buy, sell),
                                          "edge_bps": round(edge_forward, 2),
+                                         "raw_edge_bps": round(raw_forward, 2),
                                          "baseline_bps": round(baseline["forward"], 2),
                                          "dev_bps": round(edge_forward - baseline["forward"], 2),
                                          "open_tiers": sorted(engine_forward.open_tiers)},
                              "reverse": {"pair": "%s>%s" % (sell, buy),
                                          "edge_bps": round(edge_reverse, 2),
+                                         "raw_edge_bps": round(raw_reverse, 2),
                                          "baseline_bps": round(baseline["reverse"], 2),
                                          "dev_bps": round(edge_reverse - baseline["reverse"], 2),
                                          "open_tiers": sorted(engine_reverse.open_tiers)}},

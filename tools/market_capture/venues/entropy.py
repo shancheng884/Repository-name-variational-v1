@@ -30,6 +30,7 @@ class EntropyBookFeed:
         hub: MarketHub,
         logger: logging.Logger,
         max_levels: int = 50,
+        fast_depth: bool = False,
     ) -> None:
         self.name = "entropy"
         self.info_url = info_url
@@ -40,6 +41,7 @@ class EntropyBookFeed:
         self.hub = hub
         self.logger = logger
         self.max_levels = max_levels
+        self.fast_depth = fast_depth
         self.health = VenueHealth(self.name)
         self.coin_to_asset: dict[str, str] = {}
         self.universe: dict[str, dict[str, Any]] = {}
@@ -81,7 +83,10 @@ class EntropyBookFeed:
                         # l2Book is throttled to one snapshot every ~7-12s on
                         # Hyperliquid; bbo is the push-on-change top of book
                         # that keeps a taker quote fresh.
-                        await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}}))
+                        subscription = {"type": "l2Book", "coin": coin}
+                        if self.fast_depth:
+                            subscription["fast"] = True
+                        await ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
                         await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "bbo", "coin": coin}}))
                         await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "trades", "coin": coin}}))
                     backoff = 1.0

@@ -83,6 +83,7 @@ def hedged_entry_result(receipts, recovery, hedge_qty, buy, sell):
         ratio = hedge_qty / filled
         fee = receipt.get("fee_usd")
         retained[venue] = {**receipt, "filled_qty": str(hedge_qty),
+                           "fee_allocation_ratio": str(ratio),
                            "fee_usd": str(Decimal(str(fee)) * ratio) if fee is not None else None}
         if filled > hedge_qty:
             excess.append((venue, "buy" if venue == buy else "sell",

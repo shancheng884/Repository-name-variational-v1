@@ -183,19 +183,29 @@ def test_live_loop_submits_one_20_usd_child_without_a_pre_order_position_read(tm
 
     class Hub:
         def __init__(self):
+            from tools.lib.nvda_quote_alignment import QuoteClock
             self.quote_event = asyncio.Event()
             self.version = 0
+            self.quote_clock = QuoteClock()
 
         def latest(self, venue, asset, max_age):
+            from datetime import datetime, timezone
             bid = 99.99 if venue == "entropy" else 100.2
-            return {"bid": str(bid), "ask": str(bid + .01),
+            at = datetime.now(timezone.utc).isoformat()
+            row = {"venue": venue, "symbol": asset, "bid": str(bid), "ask": str(bid + .01),
                     "executable_buy": str(bid + .01), "executable_sell": str(bid),
-                    "sequence": self.version, "recv_at": str(self.version)}
+                    "sequence": self.version, "recv_at": at, "source_at": at}
+            self.quote_clock.record(row)
+            return row
+
+        def depth_audit(self, *args):
+            return {"audit_only": True}
 
     class Capture:
         def __init__(self, config):
             self.hub = Hub()
             self.stop_event = asyncio.Event()
+            self.writer = SimpleNamespace(append=lambda *args, **kwargs: None)
 
         async def run(self):
             for _ in range(100):

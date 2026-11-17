@@ -225,6 +225,8 @@ class ReferenceQuote:
     qty: Decimal | None = None
     request_latency_ms: float | None = None
     rate_limit_reset_ms: int | None = None
+    bid_size: Decimal | None = None
+    ask_size: Decimal | None = None
 
     @property
     def has_bbo(self) -> bool:
@@ -253,8 +255,8 @@ class ReferenceQuote:
             "book_available": False,
             "bid": decimal_text(self.bid),
             "ask": decimal_text(self.ask),
-            "bid_size": None,
-            "ask_size": None,
+            "bid_size": decimal_text(self.bid_size),
+            "ask_size": decimal_text(self.ask_size),
             "mid": decimal_text(self.mid),
             "spread_bps": decimal_text(spread_bps(self.bid, self.ask)),
             "executable_buy": decimal_text(executable_buy),

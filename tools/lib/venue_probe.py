@@ -615,7 +615,8 @@ def _fill_window(*,submitted,acked,observed,exchange_at,resolution_ms):
     return out
 class EntropyProbeExecutor:
     venue="entropy"; timestamp_resolution_ms=1
-    def __init__(self,*,info_url,account_address,private_key,dex="io",timeout_seconds=15.0,info=None,exchange=None):
+    def __init__(self,*,info_url,account_address,private_key,dex="io",timeout_seconds=15.0,info=None,exchange=None,
+                 fill_ws_url=None, enable_fill_stream=False):
         base=(info_url or "").rstrip("/")
         if base.endswith("/info"):
             base=base[:-5].rstrip("/")
@@ -648,6 +649,9 @@ class EntropyProbeExecutor:
         self.meta=None
         self.universe={}
         self._positions_cache={}
+        self._fill_stream = None
+        self._fill_ws_url = fill_ws_url or "wss://api.hyperliquid.xyz/ws"
+        self._enable_fill_stream = enable_fill_stream
     async def start(self):
         if not self.available: return
         if self.info is None or self.exchange is None:
@@ -661,8 +665,27 @@ class EntropyProbeExecutor:
         self.meta=await asyncio.to_thread(self.info.meta,self.dex)
         self.universe={str(row.get("name")):dict(row) for row in (self.meta or {}).get("universe",[]) if isinstance(row,dict)}
         if not self.universe: raise ProbeError("entropy_meta_universe_missing")
-    async def close(self): return None
+        if self._enable_fill_stream:
+            from tools.lib.entropy_fill_stream import EntropyFillStream
+            self._fill_stream = EntropyFillStream(self._fill_ws_url, self.account_address)
+            self._fill_stream.start()
+    async def close(self):
+        if getattr(self, "_fill_stream", None):
+            await self._fill_stream.close()
     def _coin(self,asset): return asset.symbol("entropy")
+    def enrich_receipt(self, receipt, asset):
+        stream = getattr(self, "_fill_stream", None)
+        if not stream or receipt.get("fee_usd") is not None:
+            return receipt
+        ratio = Decimal(receipt.get("fee_allocation_ratio") or "1")
+        expected = _d(receipt.get("filled_qty"))
+        rows = stream.rows(receipt.get("order_id"), self._coin(asset), expected / ratio if expected else None)
+        if rows and all(row.get("fee") is not None for row in rows):
+            receipt = dict(receipt)
+            fee = sum((_d(row.get("fee")) or ZERO for row in rows), ZERO)
+            receipt["fee_usd"] = str(fee * Decimal(receipt.get("fee_allocation_ratio") or "1"))
+            receipt["fee_pending"] = False
+        return receipt
     def _row(self,asset):
         row=self.universe.get(self._coin(asset))
         if row is None: raise ProbeError("entropy_market_missing")
@@ -790,6 +813,7 @@ class EntropyProbeExecutor:
         if not bbo: return {"ok":False,"status":"rejected","error":"entropy_quote_missing","client_order_id":client_order_id}
         limit_px=self._limit_price(asset,side,bbo,max_slippage_bps)
         self._last_exec_quote={"bid":str(_d(quote.get("bid"))) if _d(quote.get("bid")) is not None else None,"ask":str(_d(quote.get("ask"))) if _d(quote.get("ask")) is not None else None,"mid":str(bbo),"limit_price":str(limit_px),"quote_recv_at":quote.get("recv_at"),"quote_source_at":quote.get("source_at")}
+        self._last_exec_quote.update({k: quote.get(k) for k in ("bid_size", "ask_size", "depth_audit", "time_alignment")})
         cloid=self._cloid(client_order_id); coin=self._coin(asset)
         before_qty=_d(known_position_before)
         if known_position_before is None:
@@ -815,24 +839,64 @@ class EntropyProbeExecutor:
         acked=datetime.now(timezone.utc)
         status=self._order_status(result)
         if status=="rejected": return {"ok":True,"status":"rejected","filled_qty":"0","error":self._order_error(result),"client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat()}
+        ack_fill = self._ack_fill(result, qty)
+        oid = (ack_fill or {}).get("order_id")
+        stream = getattr(self, "_fill_stream", None)
+        async def rest_rows():
+            while time.monotonic() < deadline:
+                fills = await asyncio.to_thread(self.info.user_fills_by_time, self.account_address, start_ms)
+                rows = [row for row in (fills or []) if str(row.get("coin") or "") == coin
+                        and ((oid and str(row.get("oid")) == oid)
+                             or str(row.get("cloid") or "").lower() == str(cloid).lower())]
+                if rows and (not ack_fill or sum((_d(r.get("sz")) or ZERO for r in rows), ZERO) >= _d(ack_fill["filled_qty"])):
+                    return rows
+                await asyncio.sleep(.1)
+            return []
         deadline=time.monotonic()+self.timeout_seconds
         last=None; delay=0.1; poll_errors=0
         while time.monotonic()<deadline:
             try:
-                fills=await asyncio.to_thread(self.info.user_fills_by_time,self.account_address,start_ms)
+                rows = stream.rows(oid, coin, _d(ack_fill["filled_qty"])) if stream and ack_fill else None
+                details_source = "user_fills_ws" if rows else "rest_fallback"
+                if not rows:
+                    tasks = [asyncio.create_task(rest_rows())]
+                    if stream and ack_fill:
+                        tasks.append(asyncio.create_task(stream.wait(oid, coin, _d(ack_fill["filled_qty"]))))
+                    try:
+                        done, _ = await asyncio.wait(tasks, timeout=max(0, deadline-time.monotonic()),
+                                                     return_when=asyncio.FIRST_COMPLETED)
+                        if not done:
+                            break
+                        winner = next(iter(done))
+                        rows = winner.result()
+                        details_source = "user_fills_ws" if len(tasks)>1 and winner is tasks[1] else "rest_fallback"
+                    finally:
+                        for task in tasks:
+                            task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
             except Exception as exc:
                 # A rate-limited fill poll must not abort a round whose order may
                 # already have filled: keep polling until the deadline.
                 poll_errors+=1
                 await asyncio.sleep(min(delay,0.5)); delay=min(delay*2,0.5); continue
-            rows=[row for row in (fills or []) if str(row.get("cloid") or "").lower()==str(cloid).lower() and str(row.get("coin") or "")==coin]
             if rows:
                 qty_sum=sum((_d(row.get("sz")) or ZERO for row in rows),ZERO); notional=sum(((_d(row.get("sz")) or ZERO)*(_d(row.get("px")) or ZERO) for row in rows),ZERO)
-                fee=sum((_d(row.get("fee")) or ZERO for row in rows),ZERO)
+                if ack_fill and qty_sum < _d(ack_fill["filled_qty"]):
+                    await asyncio.sleep(.05)
+                    continue
+                fee=(sum((_d(row.get("fee")) or ZERO for row in rows),ZERO)
+                     if all(row.get("fee") is not None for row in rows) else None)
                 last=max((_parse_epoch_ms(row.get("time")) for row in rows),default=None)
-                return {"ok":True,"status":"filled","filled_qty":str(qty_sum),"avg_price":str(notional/qty_sum) if qty_sum else None,"fee_usd":str(fee),"order_id":str(rows[0].get("oid") or ""),"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":last.isoformat() if last else None,"source_at_epoch":last.timestamp() if last else None,"raw_status":status}
+                return {"ok":True,"status":"filled","filled_qty":str(qty_sum),"avg_price":str(notional/qty_sum) if qty_sum else None,"fee_usd":str(fee) if fee is not None else None,"order_id":str(rows[0].get("oid") or ""),"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":last.isoformat() if last else None,"source_at_epoch":last.timestamp() if last else None,"raw_status":status,
+                        "confirmation_source":"exchange_ack" if ack_fill else details_source,
+                        "fill_details_source":details_source, "ack_fill":ack_fill, "fee_pending":fee is None}
             await asyncio.sleep(delay)
             delay=min(delay*1.5,0.5)
+        if ack_fill:
+            return {"ok": True, "status": "filled", **ack_fill, "fee_usd": None,
+                    "fee_pending": True, "cloid": str(cloid), "submitted_at": submitted.isoformat(),
+                    "acked_at": acked.isoformat(), "source_at": None, "source_at_epoch": None,
+                    "confirmation_source": "exchange_ack", "fill_details_source": "unavailable"}
         if not reduce_only and before_qty is not None and known_position_before is None:
             # A pre-existing position is not evidence that THIS order filled.
             # Only the signed change between the pre-order and post-timeout reads
@@ -854,6 +918,20 @@ class EntropyProbeExecutor:
             if delta!=ZERO and (delta>0)==(expected_sign>0) and abs(delta)<=abs(qty)*Decimal("1.5"):
                 return {"ok":True,"status":"filled","filled_qty":str(abs(delta)),"avg_price":str(entry) if entry else None,"fee_usd":None,"order_id":None,"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":None,"source_at_epoch":None,"raw_status":"position_delta","partial":True,"position_before":str(before_qty),"position_after":str(qty_now)}
         return {"ok":False,"status":"unknown","error":"entropy_fill_timeout","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"cloid":str(cloid)}
+    @staticmethod
+    def _ack_fill(result, requested):
+        try:
+            row = result["response"]["data"]["statuses"][0]["filled"]
+            qty, price = _d(row["totalSz"]), _d(row["avgPx"])
+            if qty is None or price is None or not qty.is_finite() or not price.is_finite():
+                return None
+            if qty <= 0 or qty > requested or price <= 0 or row.get("oid") is None:
+                return None
+            return {"filled_qty": str(qty), "avg_price": str(price), "order_id": str(row["oid"]),
+                    "partial": qty < requested}
+        except (KeyError, TypeError, IndexError):
+            return None
+
     @staticmethod
     def _order_status(result):
         try:

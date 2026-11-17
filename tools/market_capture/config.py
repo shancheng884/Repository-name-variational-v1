@@ -160,6 +160,8 @@ class CaptureConfig:
     entropy_info_url: str = "https://api.hyperliquid.xyz/info"
     entropy_ws_url: str = "wss://api.hyperliquid.xyz/ws"
     entropy_dex: str = "io"
+    entropy_fast_depth: bool = False
+    quote_alignment: bool = False
     lighter_mainnet_account_index: int | None = None
     lighter_mainnet_api_key_index: int | None = None
     lighter_mainnet_private_key: str = field(default="", repr=False)
@@ -177,6 +179,8 @@ class CaptureConfig:
             },
             "venues": dict(self.venue_enabled),
             "notional_usd": str(self.notional_usd),
+            "strategy_audit": {"quote_alignment": self.quote_alignment,
+                               "entropy_fast_depth": self.entropy_fast_depth},
             "intervals": {
                 "book_snapshot_seconds": self.book_snapshot_seconds,
                 "health_seconds": self.health_seconds,

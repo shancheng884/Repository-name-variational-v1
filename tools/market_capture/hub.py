@@ -10,6 +10,7 @@ import time
 from .config import CaptureConfig
 from .model import Book, ReferenceQuote, decimal_text, edge_bps, spread_bps, to_iso
 from .storage import TapeWriter
+from ..lib.nvda_quote_alignment import QuoteClock
 
 def _dec(value: Any) -> Decimal | None:
     if value in (None, ""):
@@ -51,6 +52,7 @@ class MarketHub:
         self.book_counts: Counter[tuple[str, str]] = Counter()
         self.edge_counts: Counter[str] = Counter()
         self.quote_event = asyncio.Event()
+        self.quote_clock = QuoteClock() if config.quote_alignment else None
 
     @property
     def notional(self) -> Decimal:
@@ -59,6 +61,8 @@ class MarketHub:
     def update_book(self, book: Book, *, recv_mono: float | None = None) -> None:
         key = (book.venue, book.symbol)
         self.books[key] = book
+        if self.quote_clock is not None:
+            self.quote_clock.record(self._book_snapshot(book))
         self.quote_event.set()
         self.quote_counts[key] += 1
         self.writer.append(
@@ -142,12 +146,18 @@ class MarketHub:
         }
         if bid is None or ask is None:
             return
+        if self.quote_clock is not None:
+            self.quote_clock.record({"venue": venue, "symbol": symbol, "bid": bid, "ask": ask,
+                                 "executable_buy": ask, "executable_sell": bid,
+                                 "source_at": source_at, "recv_at": now, "sequence": sequence,
+                                 "quote_kind": quote_kind})
         self.update_reference(
             ReferenceQuote(
                 venue=venue, symbol=symbol, mid=(bid + ask) / 2, recv_at=now,
                 source_at=source_at, sequence=sequence, bid=bid, ask=ask,
                 bbo_recv_at=now, bbo_source_at=source_at, quote_kind=quote_kind,
                 notional_usd=self.notional,
+                bid_size=bid_size, ask_size=ask_size,
             )
         )
 
@@ -237,6 +247,7 @@ class MarketHub:
             qty=bbo.qty,
             request_latency_ms=bbo.request_latency_ms,
             rate_limit_reset_ms=bbo.rate_limit_reset_ms,
+            bid_size=bbo.bid_size, ask_size=bbo.ask_size,
         )
 
     def _book_snapshot(self, book: Book) -> dict[str, Any]:
@@ -388,6 +399,34 @@ class MarketHub:
                 out["bbo_source_at"] = bbo_source_at.isoformat() if isinstance(bbo_source_at, datetime) else bbo_source_at
                 return out
         return None
+
+    def depth_audit(self, venue, symbol, qty):
+        book = self.books.get((venue, symbol))
+        bbo = self._bbo_tops.get((venue, symbol)) or {}
+        now = datetime.now(timezone.utc)
+        result = {"requested_qty": decimal_text(qty), "audit_only": True,
+                  "bbo_source_at": to_iso(bbo.get("source_at")),
+                  "bbo_recv_at": to_iso(bbo.get("recv_at")),
+                  "bid_size": decimal_text(bbo.get("bid_size")),
+                  "ask_size": decimal_text(bbo.get("ask_size")),
+                  "bid_covers_qty": bbo["bid_size"] >= qty if bbo.get("bid_size") is not None else None,
+                  "ask_covers_qty": bbo["ask_size"] >= qty if bbo.get("ask_size") is not None else None}
+        if book is not None:
+            result.update(book.top(5))
+            result.update({"book_source_at": to_iso(book.source_at), "book_recv_at": to_iso(book.recv_at),
+                           "book_age_ms": round((now - book.recv_at).total_seconds() * 1000, 3),
+                           "same_source_time": book.source_at == bbo.get("source_at")})
+            for side, levels in (("buy", book.asks), ("sell", book.bids)):
+                remaining, amount = qty, Decimal("0")
+                for price, size in levels:
+                    take = min(remaining, size)
+                    amount += take * price
+                    remaining -= take
+                    if remaining <= 0:
+                        break
+                result[side + "_vwap"] = decimal_text(amount / qty) if remaining <= 0 else None
+                result[side + "_visible_qty_shortfall"] = decimal_text(max(remaining, Decimal("0")))
+        return result
 
     def edge_rows(self, symbol: str) -> list[dict[str, Any]]:
         now = datetime.now(timezone.utc).isoformat()

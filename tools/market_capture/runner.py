@@ -196,6 +196,7 @@ class CaptureRunner:
                     asset_symbols={a.name: a.symbols["entropy"] for a in assets if a.supports("entropy")},
                     writer=self.writer, hub=self.hub, logger=self.logger,
                     max_levels=config.max_book_levels,
+                    fast_depth=config.entropy_fast_depth,
                 )
                 await feed.load_universe()
                 self.venues["entropy"] = feed

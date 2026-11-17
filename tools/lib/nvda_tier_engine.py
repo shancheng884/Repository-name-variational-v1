@@ -150,6 +150,9 @@ class OpenTier:
     entry_sell_price: float | None = None
     entry_fee_usd: float = 0.0
     children: list[dict[str, Any]] = field(default_factory=list)
+    signal_basis: str = "raw_v1"
+    entry_fee_pending: bool = False
+    entry_receipts: dict[str, Any] = field(default_factory=dict)
 
     def to_state(self) -> dict[str, Any]:
         return {
@@ -165,6 +168,9 @@ class OpenTier:
             "entry_sell_price": self.entry_sell_price,
             "entry_fee_usd": self.entry_fee_usd,
             "children": self.children,
+            "signal_basis": self.signal_basis,
+            "entry_fee_pending": self.entry_fee_pending,
+            "entry_receipts": self.entry_receipts,
         }
 
     @classmethod
@@ -182,6 +188,9 @@ class OpenTier:
             entry_sell_price=_float_or_none(row.get("entry_sell_price")),
             entry_fee_usd=float(row.get("entry_fee_usd") or 0.0),
             children=list(row.get("children") or []),
+            signal_basis=str(row.get("signal_basis") or "raw_v1"),
+            entry_fee_pending=bool(row.get("entry_fee_pending")),
+            entry_receipts=dict(row.get("entry_receipts") or {}),
         )
 
 
@@ -221,6 +230,8 @@ class TierEngine:
                              "opened_at": pos.opened_at, "entry_buy_price": pos.entry_buy_price,
                              "entry_sell_price": pos.entry_sell_price,
                              "entry_fee_usd": pos.entry_fee_usd}]
+            pos.children[0].update(entry_fee_pending=pos.entry_fee_pending,
+                                   entry_receipts=pos.entry_receipts)
         return pos.children
 
     def _refresh(self, pos: OpenTier) -> None:
@@ -228,6 +239,7 @@ class TierEngine:
         pos.qty = sum(row["qty"] for row in lots)
         pos.notional_usd = sum(row["notional_usd"] for row in lots)
         pos.entry_fee_usd = sum(row["entry_fee_usd"] for row in lots)
+        pos.entry_fee_pending = any(row.get("entry_fee_pending") for row in lots)
         for key in ("entry_edge", "entry_dev", "entry_buy_price", "entry_sell_price"):
             if all(row.get(key) is not None for row in lots):
                 setattr(pos, key, sum(row[key] * row["qty"] for row in lots) / pos.qty)
@@ -238,7 +250,7 @@ class TierEngine:
 
     def on_sample(self, *, stamp: float, edge: float, baseline: float, price_hint: float,
                   window: list[float], exchange: dict[str, Decimal | float | None],
-                  allow_entry: bool = True) -> list[dict[str, Any]]:
+                  allow_entry: bool = True, raw_edge: float | None = None) -> list[dict[str, Any]]:
         """Decide closes (always) and at most one entry for this direction.
 
         The ETH gradient runs bidirectionally but locks the active direction
@@ -258,13 +270,14 @@ class TierEngine:
             if pos.closing:
                 # Already waiting on a venue fill; do not queue a second close.
                 continue
-            reverted = edge <= pos.frozen_baseline
+            exit_edge = raw_edge if pos.signal_basis == "raw_v1" and raw_edge is not None else edge
+            reverted = exit_edge <= pos.frozen_baseline
             # timeout_seconds=None keeps the tier open until it reverts.
             expired = (self.config.timeout_seconds is not None
                        and stamp - pos.opened_at >= self.config.timeout_seconds)
             if not (reverted or expired):
                 continue
-            net_bps = (pos.entry_edge - edge) - self.config.slippage_bps
+            net_bps = (pos.entry_edge - exit_edge) - self.config.slippage_bps
             lot = self._lots(pos)[0]
             fraction = min(1.0, self.config.child_notional_usd / lot["notional_usd"])
             pos.closing = True
@@ -275,8 +288,10 @@ class TierEngine:
                             "notional_usd": lot["notional_usd"] * fraction,
                             "entry_buy_price": lot.get("entry_buy_price"),
                             "entry_sell_price": lot.get("entry_sell_price"),
-                            "entry_fee_usd": lot["entry_fee_usd"] * fraction,
-                            "entry_edge": lot["entry_edge"], "exit_edge": edge,
+                            "entry_fee_usd": None if lot.get("entry_fee_pending") else lot["entry_fee_usd"] * fraction,
+                            "entry_receipts": lot.get("entry_receipts") or {},
+                            "entry_fee_fraction": fraction,
+                            "entry_edge": lot["entry_edge"], "exit_edge": exit_edge,
                             "hold_s": stamp - pos.opened_at})
 
         # One reconciliation per decision step: the account is checked before the
@@ -307,6 +322,8 @@ class TierEngine:
                 continue
             if dev < tier.threshold_bps:
                 continue
+            if raw_edge is not None and raw_edge - baseline < tier.threshold_bps:
+                continue
             if not self._confirmed(window, tier.threshold_bps):
                 continue
             increment = self._entry_notional(tier.index)
@@ -318,6 +335,7 @@ class TierEngine:
                 continue
             actions.append({"action": "open", "tier": tier.index, "dev_bps": dev,
                             "token": uuid.uuid4().hex,
+                            "signal_basis": "source_time_aligned_v1" if raw_edge is not None else "raw_v1",
                             "qty": qty, "notional_usd": increment,
                             "threshold_bps": tier.threshold_bps,
                             "edge": edge, "baseline": baseline, "stamp": stamp})
@@ -327,7 +345,7 @@ class TierEngine:
 
     def confirm_open(self, action: dict[str, Any], *, qty: Decimal | float | None = None,
                      entry_prices: dict[str, Any] | None = None,
-                     fee_usd: float = 0.0) -> OpenTier | None:
+                     fee_usd: float = 0.0, entry_receipts=None) -> OpenTier | None:
         """Book a tier after the venue proved both legs are really on the book."""
         index = int(action.get("tier"))
         token = action.get("token")
@@ -350,6 +368,10 @@ class TierEngine:
             entry_buy_price=_float_or_none(prices.get(self.config.buy_venue)),
             entry_sell_price=_float_or_none(prices.get(self.config.sell_venue)),
             entry_fee_usd=float(fee_usd or 0.0),
+            signal_basis=action.get("signal_basis") or "raw_v1",
+            entry_receipts=dict(entry_receipts or {}),
+            entry_fee_pending=any(v == "entropy" and r.get("fee_usd") is None
+                                  for v, r in (entry_receipts or {}).items()),
         )
         pos = self.open_tiers.get(index)
         if pos is None:
@@ -378,6 +400,7 @@ class TierEngine:
         fraction = qty / lot["qty"]
         notional = lot["notional_usd"] * fraction
         trade = {"tier": index, "net_bps": float(action.get("net_bps") or 0.0),
+                 "execution_token": token,
                  "hold_s": float(action.get("hold_s") or 0.0),
                  "reason": action.get("reason") or "reverted",
                  "entry_dev": lot["entry_dev"], "notional_usd": notional,
