@@ -169,11 +169,12 @@ def test_engine_sizes_each_tier_to_the_cumulative_target():
     cfg = _cfg_with_equity(200.0, 100.0)
     engine = TierEngine(config=cfg, ledger=ledger)
     sizes = []
-    for index in range(5):
+    for index in range(25):
         action = open_one(engine, ledger, stamp=index, edge=11.0, price_hint=100.0)
         sizes.append(action["notional_usd"])
     # 1x equity per tier, 5x total at full ladder
-    assert sizes == [100.0, 100.0, 100.0, 100.0, 100.0]
+    assert sizes == [20.0] * 25
+    assert len(engine.open_tiers) == 5
     assert engine._open_notional() == 500.0
 
 
@@ -182,11 +183,12 @@ def test_engine_tops_out_at_the_hard_cap_when_the_last_tier_overshoots():
     cfg = _cfg_with_equity(200.0, 105.0)
     engine = TierEngine(config=cfg, ledger=ledger)
     sizes = []
-    for index in range(5):
+    for index in range(26):
         sizes.append(open_one(engine, ledger, stamp=index, edge=11.0, price_hint=100.0)["notional_usd"])
     assert sum(sizes) == 520.0
     assert engine._open_notional() == 520.0
-    assert sizes[-1] == 100.0
+    assert sizes[-1] == 20.0
+    assert all(size <= 20 for size in sizes)
 
 
 def test_unknown_equity_falls_back_to_the_fixed_child_notional():
@@ -210,15 +212,21 @@ def test_entry_is_blocked_while_the_other_direction_owns_the_book():
 def test_exits_still_run_when_entry_is_locked():
     ledger = PositionLedger()
     engine = TierEngine(config=_cfg_with_equity(200.0, 100.0), ledger=ledger)
-    for index in range(5):
+    for index in range(25):
         open_one(engine, ledger, stamp=index, edge=11.0, price_hint=100.0)
     actions = engine.on_sample(stamp=6, edge=0.0, baseline=0.0, price_hint=100.0,
                                window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger),
                                allow_entry=False)
     assert len(actions) == 5
     assert all(a["action"] == "close" for a in actions)
-    for action in actions:
-        engine.confirm_close(action)
+    for step in range(5):
+        if step:
+            actions = engine.on_sample(stamp=30 + step, edge=0, baseline=0,
+                                       price_hint=100, window=[0, 0, 0],
+                                       exchange=exchange_from(ledger), allow_entry=False)
+        for action in actions:
+            assert action["notional_usd"] <= 20
+            engine.confirm_close(action)
     assert not engine.open_tiers
     assert engine._open_notional() == 0.0
 
@@ -291,3 +299,71 @@ def test_engine_state_restores_tiers_and_ledger():
     assert revived.open_tiers[1].frozen_baseline == 0.0
     assert fresh_ledger.net("NVDA", "entropy") == D(str(engine.open_tiers[1].qty))
     assert fresh_ledger.net("NVDA", "lighter_mainnet") == -D(str(engine.open_tiers[1].qty))
+
+
+def test_pending_child_reserves_the_capacity_without_booking_a_fill():
+    ledger = PositionLedger()
+    engine = TierEngine(config=_cfg_with_equity(200, 100), ledger=ledger)
+    kwargs = dict(stamp=0, edge=10, baseline=0, price_hint=100,
+                  window=[10, 10], exchange=exchange_from(ledger))
+    action = engine.on_sample(**kwargs)[0]
+    assert action["notional_usd"] == 20
+    assert engine.on_sample(**kwargs) == []
+    assert ledger.net("NVDA", "entropy") == 0
+    engine.cancel_open(action)
+    assert engine.on_sample(**kwargs)
+
+
+def test_old_confirmations_do_not_open_after_the_current_edge_falls_back():
+    engine = TierEngine(config=CFG, ledger=PositionLedger())
+    actions = engine.on_sample(stamp=0, edge=1, baseline=0, price_hint=100,
+                               window=[10, 10, 1], exchange={"entropy": 0, "lighter_mainnet": 0})
+    assert actions == []
+
+
+def test_children_preserve_the_first_tier_anchor_and_charge_each_entry_fee_once():
+    ledger = PositionLedger()
+    engine = TierEngine(config=_cfg_with_equity(200, 100), ledger=ledger)
+    a = engine.on_sample(stamp=0, edge=10, baseline=1, price_hint=100,
+                         window=[9, 9], exchange=exchange_from(ledger))[0]
+    engine.confirm_open(a, entry_prices={"entropy": 100, "lighter_mainnet": 101}, fee_usd=.01)
+    b = engine.on_sample(stamp=1, edge=12, baseline=2, price_hint=100,
+                         window=[10, 10], exchange=exchange_from(ledger))[0]
+    engine.confirm_open(b, entry_prices={"entropy": 102, "lighter_mainnet": 103}, fee_usd=.02)
+    assert engine.open_tiers[1].frozen_baseline == 1
+    assert engine.open_tiers[1].notional_usd == 40
+    close = engine.on_sample(stamp=2, edge=1, baseline=2, price_hint=100,
+                             window=[0, 0], exchange=exchange_from(ledger))[0]
+    assert close["entry_fee_usd"] == .01
+    assert close["entry_buy_price"] == 100
+    engine.confirm_close(close)
+    assert engine.confirm_close(close) is None
+    assert engine.open_tiers[1].notional_usd == 20
+    assert engine.open_tiers[1].entry_fee_usd == .02
+    assert ledger.net("NVDA", "entropy") == D("0.2")
+
+
+def test_legacy_large_tier_is_unwound_in_children_after_restore():
+    ledger = PositionLedger()
+    engine = TierEngine(config=_cfg_with_equity(200, 100), ledger=ledger)
+    engine.restore_state({"open_tiers": [{"index": 1, "qty": 1, "notional_usd": 100,
+                                         "frozen_baseline": 0, "entry_fee_usd": .05}]})
+    for i in range(5):
+        action = engine.on_sample(stamp=i, edge=0, baseline=0, price_hint=100,
+                                  window=[0, 0], exchange=exchange_from(ledger))[0]
+        assert action["notional_usd"] <= 20.00000001
+        engine.confirm_close(action)
+    assert not engine.open_tiers
+    assert abs(ledger.net("NVDA", "entropy")) < D("0.0000001")
+
+
+def test_pending_child_survives_restart_and_prevents_a_duplicate():
+    ledger = PositionLedger()
+    engine = TierEngine(config=CFG, ledger=ledger)
+    engine.on_sample(stamp=0, edge=10, baseline=0, price_hint=100,
+                     window=[10, 10], exchange=exchange_from(ledger))
+    other = TierEngine(config=CFG, ledger=PositionLedger())
+    other.restore_state(engine.dump_state())
+    assert other.pending_action == engine.pending_action
+    assert other.on_sample(stamp=1, edge=10, baseline=0, price_hint=100,
+                           window=[10, 10], exchange=exchange_from(ledger)) == []

@@ -4,6 +4,7 @@ from collections import Counter, deque
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
+import asyncio
 import time
 
 from .config import CaptureConfig
@@ -49,6 +50,7 @@ class MarketHub:
         self.quote_counts: Counter[tuple[str, str]] = Counter()
         self.book_counts: Counter[tuple[str, str]] = Counter()
         self.edge_counts: Counter[str] = Counter()
+        self.quote_event = asyncio.Event()
 
     @property
     def notional(self) -> Decimal:
@@ -57,6 +59,7 @@ class MarketHub:
     def update_book(self, book: Book, *, recv_mono: float | None = None) -> None:
         key = (book.venue, book.symbol)
         self.books[key] = book
+        self.quote_event.set()
         self.quote_counts[key] += 1
         self.writer.append(
             "quotes", book.venue, book.symbol,
@@ -94,6 +97,7 @@ class MarketHub:
         self, quote: ReferenceQuote, *, recv_mono: float | None = None
     ) -> None:
         key = (quote.venue, quote.symbol)
+        self.quote_event.set()
         self.quote_counts[key] += 1
         self.writer.append(
             "quotes", quote.venue, quote.symbol,

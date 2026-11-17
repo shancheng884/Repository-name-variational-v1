@@ -774,28 +774,30 @@ class EntropyProbeExecutor:
         if isinstance(receipt,dict) and receipt.get("execution_quote") is None:
             receipt["execution_quote"]=getattr(self,"_last_exec_quote",None)
         return _stamp_receipt(receipt)
-    async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
+    async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8"),known_position_before=None):
         if not self.available or self.exchange is None: return {"ok":False,"status":"rejected","error":self.reason or "entropy_credentials_missing","client_order_id":client_order_id}
         qty=self.normalize_qty(asset,qty)
         if not qty: return {"ok":False,"status":"rejected","error":"entropy_qty_below_min","client_order_id":client_order_id}
-        bbo=None
-        try:
-            mids=await _to_thread_retry(self.info.all_mids,self.dex,attempts=3)
-            bbo=_d((mids or {}).get(self._coin(asset)))
-        except Exception:
-            bbo=None
+        bbo=_d(quote.get("ask" if side=="buy" else "bid"))
         if not bbo:
-            bbo=_d(quote.get("ask" if side=="buy" else "bid"))
+            try:
+                book=await _to_thread_retry(self.info.l2_snapshot,self._coin(asset),attempts=3)
+                levels=(book or {}).get("levels") or [[],[]]
+                side_levels=levels[1 if side=="buy" else 0]
+                bbo=_d(side_levels[0].get("px")) if side_levels else None
+            except Exception:
+                bbo=None
         if not bbo: return {"ok":False,"status":"rejected","error":"entropy_quote_missing","client_order_id":client_order_id}
         limit_px=self._limit_price(asset,side,bbo,max_slippage_bps)
         self._last_exec_quote={"bid":str(_d(quote.get("bid"))) if _d(quote.get("bid")) is not None else None,"ask":str(_d(quote.get("ask"))) if _d(quote.get("ask")) is not None else None,"mid":str(bbo),"limit_price":str(limit_px),"quote_recv_at":quote.get("recv_at"),"quote_source_at":quote.get("source_at")}
         cloid=self._cloid(client_order_id); coin=self._coin(asset)
-        before_qty=None
-        try:
-            before=await self.positions(asset,fresh=True)
-            if before.get("verified"): before_qty=_d(before.get("qty"))
-        except Exception:
-            before_qty=None
+        before_qty=_d(known_position_before)
+        if known_position_before is None:
+            try:
+                before=await self.positions(asset,fresh=True)
+                if before.get("verified"): before_qty=_d(before.get("qty"))
+            except Exception:
+                before_qty=None
         submitted=datetime.now(timezone.utc); start_ms=int(submitted.timestamp()*1000)-5000
         result=None; attempts=0
         while True:
@@ -831,7 +833,7 @@ class EntropyProbeExecutor:
                 return {"ok":True,"status":"filled","filled_qty":str(qty_sum),"avg_price":str(notional/qty_sum) if qty_sum else None,"fee_usd":str(fee),"order_id":str(rows[0].get("oid") or ""),"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":last.isoformat() if last else None,"source_at_epoch":last.timestamp() if last else None,"raw_status":status}
             await asyncio.sleep(delay)
             delay=min(delay*1.5,0.5)
-        if not reduce_only and before_qty is not None:
+        if not reduce_only and before_qty is not None and known_position_before is None:
             # A pre-existing position is not evidence that THIS order filled.
             # Only the signed change between the pre-order and post-timeout reads
             # can be attributed to it, and never more than the order allowed.

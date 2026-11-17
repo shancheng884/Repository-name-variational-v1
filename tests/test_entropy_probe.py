@@ -95,7 +95,8 @@ def test_entropy_market_order_uses_cloid_and_aggregates_fills():
     assert exchange.calls[0][1]["reduce_only"] is False
     assert exchange.calls[0][0][0] == "io:NVDA"
     assert exchange.calls[0][0][1] is True
-    assert exchange.calls[0][0][3] == 100.08
+    # Buy IOC is priced from the executable ask, not a separate allMids read.
+    assert exchange.calls[0][0][3] == 100.18
 
 
 def test_entropy_without_private_key_is_not_available():

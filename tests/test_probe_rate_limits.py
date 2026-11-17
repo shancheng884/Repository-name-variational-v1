@@ -93,6 +93,9 @@ class FakeInfo:
     def all_mids(self, dex):
         return {"io:NVDA": "159.5"}
 
+    def l2_snapshot(self, coin):
+        return {"levels": [[{"px": "159.5"}], [{"px": "159.5"}]]}
+
     def user_fills_by_time(self, address, start_ms):
         self.fill_poll_calls += 1
         if self.fail_fills:

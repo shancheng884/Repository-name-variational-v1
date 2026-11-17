@@ -16,6 +16,7 @@ Execution contract:
 from __future__ import annotations
 
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -148,6 +149,7 @@ class OpenTier:
     entry_buy_price: float | None = None
     entry_sell_price: float | None = None
     entry_fee_usd: float = 0.0
+    children: list[dict[str, Any]] = field(default_factory=list)
 
     def to_state(self) -> dict[str, Any]:
         return {
@@ -162,6 +164,7 @@ class OpenTier:
             "entry_buy_price": self.entry_buy_price,
             "entry_sell_price": self.entry_sell_price,
             "entry_fee_usd": self.entry_fee_usd,
+            "children": self.children,
         }
 
     @classmethod
@@ -178,6 +181,7 @@ class OpenTier:
             entry_buy_price=_float_or_none(row.get("entry_buy_price")),
             entry_sell_price=_float_or_none(row.get("entry_sell_price")),
             entry_fee_usd=float(row.get("entry_fee_usd") or 0.0),
+            children=list(row.get("children") or []),
         )
 
 
@@ -188,6 +192,14 @@ class TierEngine:
     strategy_id: str = "nvda-tier"
     open_tiers: dict[int, OpenTier] = field(default_factory=dict)
     trades: list[dict[str, Any]] = field(default_factory=list)
+    pending_action: dict[str, Any] | None = None
+    completed_actions: list[str] = field(default_factory=list)
+    targets: tuple[float, ...] | None = field(init=False, default=None)
+
+    def __post_init__(self):
+        caps = self.config.slot_caps()
+        if caps is not None:
+            self.targets = tuple(value * self.config.child_notional_usd for value in caps)
 
     def _confirmed(self, window: list[float], threshold: float) -> bool:
         return sum(1 for value in window if value >= threshold) >= self.config.confirm_min
@@ -197,10 +209,32 @@ class TierEngine:
 
     def _entry_notional(self, tier_index: int) -> float:
         """Increment needed to reach the cumulative tier capacity."""
-        target = self.config.tier_target_notional_usd(tier_index)
+        target = self.targets[tier_index - 1] if self.targets is not None else None
         if target is None:
-            return self.config.notional_usd
-        return target - self._open_notional()
+            return min(self.config.notional_usd, self.config.child_notional_usd)
+        return min(self.config.child_notional_usd, target - self._open_notional())
+
+    def _lots(self, pos: OpenTier) -> list[dict[str, Any]]:
+        if not pos.children:
+            pos.children = [{"qty": pos.qty, "notional_usd": pos.notional_usd,
+                             "entry_edge": pos.entry_edge, "entry_dev": pos.entry_dev,
+                             "opened_at": pos.opened_at, "entry_buy_price": pos.entry_buy_price,
+                             "entry_sell_price": pos.entry_sell_price,
+                             "entry_fee_usd": pos.entry_fee_usd}]
+        return pos.children
+
+    def _refresh(self, pos: OpenTier) -> None:
+        lots = self._lots(pos)
+        pos.qty = sum(row["qty"] for row in lots)
+        pos.notional_usd = sum(row["notional_usd"] for row in lots)
+        pos.entry_fee_usd = sum(row["entry_fee_usd"] for row in lots)
+        for key in ("entry_edge", "entry_dev", "entry_buy_price", "entry_sell_price"):
+            if all(row.get(key) is not None for row in lots):
+                setattr(pos, key, sum(row[key] * row["qty"] for row in lots) / pos.qty)
+
+    def cancel_open(self, action: dict[str, Any]) -> None:
+        if self.pending_action and self.pending_action.get("token") == action.get("token"):
+            self.pending_action = None
 
     def on_sample(self, *, stamp: float, edge: float, baseline: float, price_hint: float,
                   window: list[float], exchange: dict[str, Decimal | float | None],
@@ -216,6 +250,8 @@ class TierEngine:
         """
         actions: list[dict[str, Any]] = []
         dev = edge - baseline
+        if self.pending_action is not None:
+            return actions
 
         for index in sorted(self.open_tiers):
             pos = self.open_tiers[index]
@@ -229,12 +265,18 @@ class TierEngine:
             if not (reverted or expired):
                 continue
             net_bps = (pos.entry_edge - edge) - self.config.slippage_bps
+            lot = self._lots(pos)[0]
+            fraction = min(1.0, self.config.child_notional_usd / lot["notional_usd"])
             pos.closing = True
             actions.append({"action": "close", "tier": index,
+                            "token": uuid.uuid4().hex,
                             "reason": "reverted" if reverted else "timeout",
-                            "net_bps": net_bps, "qty": pos.qty,
-                            "notional_usd": pos.notional_usd,
-                            "entry_edge": pos.entry_edge, "exit_edge": edge,
+                            "net_bps": net_bps, "qty": lot["qty"] * fraction,
+                            "notional_usd": lot["notional_usd"] * fraction,
+                            "entry_buy_price": lot.get("entry_buy_price"),
+                            "entry_sell_price": lot.get("entry_sell_price"),
+                            "entry_fee_usd": lot["entry_fee_usd"] * fraction,
+                            "entry_edge": lot["entry_edge"], "exit_edge": edge,
                             "hold_s": stamp - pos.opened_at})
 
         # One reconciliation per decision step: the account is checked before the
@@ -253,13 +295,17 @@ class TierEngine:
                                 "reason": "position_mismatch", "diffs": check["diffs"]})
             return actions
 
-        if not allow_entry:
+        if not allow_entry or actions:
             return actions
 
         # Exactly one new tier per sample.  The runner sends it, proves both
         # legs landed, books it, and only then may the next tier be proposed.
         for tier in self.config.tiers:
-            if tier.index in self.open_tiers:
+            if tier.index in self.open_tiers and self.open_tiers[tier.index].closing:
+                continue
+            if self.targets is None and tier.index in self.open_tiers:
+                continue
+            if dev < tier.threshold_bps:
                 continue
             if not self._confirmed(window, tier.threshold_bps):
                 continue
@@ -271,9 +317,11 @@ class TierEngine:
             if qty <= 0:
                 continue
             actions.append({"action": "open", "tier": tier.index, "dev_bps": dev,
+                            "token": uuid.uuid4().hex,
                             "qty": qty, "notional_usd": increment,
                             "threshold_bps": tier.threshold_bps,
                             "edge": edge, "baseline": baseline, "stamp": stamp})
+            self.pending_action = dict(actions[-1])
             break
         return actions
 
@@ -282,7 +330,8 @@ class TierEngine:
                      fee_usd: float = 0.0) -> OpenTier | None:
         """Book a tier after the venue proved both legs are really on the book."""
         index = int(action.get("tier"))
-        if index in self.open_tiers:
+        token = action.get("token")
+        if token and token in self.completed_actions:
             return None
         amount = Decimal(str(qty if qty is not None else action.get("qty") or 0))
         if amount <= 0:
@@ -290,7 +339,7 @@ class TierEngine:
         prices = entry_prices or {}
         self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, amount)
         self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, -amount)
-        pos = OpenTier(
+        child = OpenTier(
             index=index,
             entry_edge=float(action.get("edge") or 0.0),
             entry_dev=float(action.get("dev_bps") or 0.0),
@@ -302,24 +351,56 @@ class TierEngine:
             entry_sell_price=_float_or_none(prices.get(self.config.sell_venue)),
             entry_fee_usd=float(fee_usd or 0.0),
         )
-        self.open_tiers[index] = pos
+        pos = self.open_tiers.get(index)
+        if pos is None:
+            pos = child
+            self.open_tiers[index] = pos
+            self._lots(pos)
+        else:
+            self._lots(pos).extend(self._lots(child))
+            self._refresh(pos)
+        if token:
+            self.completed_actions = (self.completed_actions + [token])[-2000:]
+        self.cancel_open(action)
         return pos
 
     def confirm_close(self, action: dict[str, Any]) -> dict[str, Any] | None:
         """Book a close only after the venue confirmed both legs filled."""
         index = int(action.get("tier"))
-        pos = self.open_tiers.pop(index, None)
+        token = action.get("token")
+        if token and token in self.completed_actions:
+            return None
+        pos = self.open_tiers.get(index)
         if pos is None:
             return None
+        lot = self._lots(pos)[0]
+        qty = min(float(action.get("qty") or pos.qty), lot["qty"])
+        fraction = qty / lot["qty"]
+        notional = lot["notional_usd"] * fraction
         trade = {"tier": index, "net_bps": float(action.get("net_bps") or 0.0),
                  "hold_s": float(action.get("hold_s") or 0.0),
                  "reason": action.get("reason") or "reverted",
-                 "entry_dev": pos.entry_dev, "notional_usd": pos.notional_usd,
-                 "entry_edge": pos.entry_edge, "exit_edge": float(action.get("exit_edge") or 0.0),
-                 "entry_buy_price": pos.entry_buy_price, "entry_sell_price": pos.entry_sell_price}
+                 "entry_dev": lot["entry_dev"], "notional_usd": notional,
+                 "entry_edge": lot["entry_edge"], "exit_edge": float(action.get("exit_edge") or 0.0),
+                 "entry_buy_price": lot.get("entry_buy_price"), "entry_sell_price": lot.get("entry_sell_price")}
         self.trades.append(trade)
-        self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -Decimal(str(pos.qty)))
-        self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, Decimal(str(pos.qty)))
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -Decimal(str(qty)))
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, Decimal(str(qty)))
+        if fraction >= 1.0 - 1e-10:
+            pos.children.pop(0)
+        else:
+            lot["qty"] -= qty
+            lot["notional_usd"] -= notional
+            lot["entry_fee_usd"] *= 1.0 - fraction
+        if not pos.children:
+            self.open_tiers.pop(index)
+        else:
+            self._refresh(pos)
+            pos.closing = False
+        if token:
+            self.completed_actions = (self.completed_actions + [token])[-2000:]
+        if self.pending_action and self.pending_action.get("token") == token:
+            self.pending_action = None
         return trade
 
     def cancel_close(self, index: int) -> None:
@@ -327,6 +408,8 @@ class TierEngine:
         pos = self.open_tiers.get(int(index))
         if pos is not None:
             pos.closing = False
+        if self.pending_action and self.pending_action.get("action") == "close":
+            self.pending_action = None
 
     def drop_tier(self, index: int) -> None:
         """Undo a booked tier (used when a close had to be abandoned)."""
@@ -339,6 +422,8 @@ class TierEngine:
     def dump_state(self) -> dict[str, Any]:
         return {"strategy_id": self.strategy_id,
                 "open_tiers": [pos.to_state() for pos in self.open_tiers.values()],
+                "pending_action": self.pending_action,
+                "completed_actions": self.completed_actions[-2000:],
                 "trades": self.trades[-200:]}
 
     def restore_state(self, data: dict[str, Any] | None) -> None:
@@ -356,6 +441,8 @@ class TierEngine:
             self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, Decimal(str(pos.qty)))
             self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, -Decimal(str(pos.qty)))
         self.trades = list(data.get("trades") or [])[-200:]
+        self.completed_actions = list(data.get("completed_actions") or [])[-2000:]
+        self.pending_action = data.get("pending_action")
 
     def summary(self) -> list[dict[str, Any]]:
         by_tier: dict[int, list[dict[str, Any]]] = defaultdict(list)

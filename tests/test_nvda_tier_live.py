@@ -215,6 +215,9 @@ class _EntropyInfo:
     def all_mids(self, dex):
         return {"NVDA": "100"}
 
+    def l2_snapshot(self, coin):
+        return {"levels": [[{"px": "100", "sz": "100"}], [{"px": "100", "sz": "100"}]]}
+
     def user_fills_by_time(self, address, start_ms):
         return list(self.fills)
 
