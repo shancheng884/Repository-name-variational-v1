@@ -12,12 +12,35 @@ def exchange_from(ledger, asset="NVDA", venues=("entropy", "lighter_mainnet")):
     return {v: ledger.net(asset, v) for v in venues}
 
 
+def open_one(engine, ledger, *, stamp=0, edge=8.0, baseline=0.0, price_hint=160.0):
+    """Propose, then book, exactly one tier the way the runner does."""
+    actions = engine.on_sample(stamp=stamp, edge=edge, baseline=baseline, price_hint=price_hint,
+                               window=[edge, edge, edge], exchange=exchange_from(ledger))
+    opens = [a for a in actions if a["action"] == "open"]
+    assert len(opens) == 1
+    engine.confirm_open(opens[0], qty=D(str(opens[0]["qty"])))
+    return opens[0]
+
+
 def test_two_strategies_net_to_zero_on_a_shared_account():
     ledger = PositionLedger()
     ledger.add("a", "NVDA", "entropy", D("0.125"))
     ledger.add("b", "NVDA", "entropy", D("-0.125"))
     assert ledger.net("NVDA", "entropy") == 0
     assert ledger.reconcile("NVDA", ("entropy",), {"entropy": 0})["ok"] is True
+
+
+def test_ledger_accepts_an_asset_object_instead_of_a_name():
+    """Regression: passing the asset object used to read the expected size as zero."""
+    class Asset:
+        name = "NVDA"
+
+    ledger = PositionLedger()
+    ledger.add("a", Asset(), "entropy", D("0.9"))
+    assert ledger.net("NVDA", "entropy") == D("0.9")
+    assert ledger.net(Asset(), "entropy") == D("0.9")
+    check = ledger.reconcile(Asset(), ("entropy",), {"entropy": D("0.9")})
+    assert check["ok"] is True
 
 
 def test_reconcile_flags_a_real_difference():
@@ -35,21 +58,55 @@ def test_reconcile_treats_an_unreadable_venue_as_not_ok():
     assert check["diffs"]["entropy"]["error"] == "unreadable"
 
 
-def test_engine_opens_each_tier_once_and_closes_on_revert():
+def test_a_tier_is_not_booked_before_it_is_confirmed():
+    """Regression: five tiers used to reach the ledger before a single order was sent."""
     ledger = PositionLedger()
     engine = TierEngine(config=CFG, ledger=ledger)
-    exchange = exchange_from(ledger)
-    opened = engine.on_sample(stamp=0, edge=8.0, baseline=0.0, price_hint=160.0,
-                              window=[8.0, 8.0, 8.0], exchange=exchange)
-    assert [a["tier"] for a in opened if a["action"] == "open"] == [1, 2]
-    again = engine.on_sample(stamp=1, edge=8.0, baseline=0.0, price_hint=160.0,
+    actions = engine.on_sample(stamp=0, edge=8.0, baseline=0.0, price_hint=160.0,
+                               window=[8.0, 8.0, 8.0], exchange=exchange_from(ledger))
+    assert [a["tier"] for a in actions if a["action"] == "open"] == [1]
+    assert engine.open_tiers == {}
+    assert ledger.net("NVDA", "entropy") == 0
+    assert ledger.net("NVDA", "lighter_mainnet") == 0
+
+
+def test_the_engine_offers_one_tier_per_sample():
+    """A burst through every threshold must not send five orders at once."""
+    ledger = PositionLedger()
+    cfg = TierConfig(asset="NVDA", buy_venue="entropy", sell_venue="lighter_mainnet",
+                     tiers=tuple(TierSpec(i, t) for i, t in enumerate([1, 2, 3, 4, 5], start=1)),
+                     notional_usd=20.0, timeout_seconds=None)
+    engine = TierEngine(config=cfg, ledger=ledger)
+    first = engine.on_sample(stamp=0, edge=9.0, baseline=0.0, price_hint=100.0,
+                             window=[9.0, 9.0, 9.0], exchange=exchange_from(ledger))
+    assert len([a for a in first if a["action"] == "open"]) == 1
+    assert first[0]["notional_usd"] == 20.0
+
+
+def test_confirm_open_books_the_tier_once():
+    ledger = PositionLedger()
+    engine = TierEngine(config=CFG, ledger=ledger)
+    action = open_one(engine, ledger)
+    assert engine.open_tiers[1].qty == action["qty"]
+    assert ledger.net("NVDA", "entropy") > 0
+    assert engine.confirm_open(action, qty=action["qty"]) is None
+    assert len(engine.open_tiers) == 1
+
+
+def test_engine_opens_each_tier_once_then_closes_on_revert():
+    ledger = PositionLedger()
+    engine = TierEngine(config=CFG, ledger=ledger)
+    open_one(engine, ledger, edge=8.0)
+    open_one(engine, ledger, stamp=1, edge=8.0)
+    assert sorted(engine.open_tiers) == [1, 2]
+    again = engine.on_sample(stamp=2, edge=8.0, baseline=0.0, price_hint=160.0,
                              window=[8.0, 8.0, 8.0], exchange=exchange_from(ledger))
-    assert again == []
+    assert [a for a in again if a["action"] == "open"] == []
     closed = engine.on_sample(stamp=10, edge=0.0, baseline=0.0, price_hint=160.0,
                               window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger))
     closes = [a for a in closed if a["action"] == "close"]
     assert len(closes) == 2
-    # The books only move once the venue confirms the fills.
+    # The books only move once the venue confirms the closing fills.
     assert ledger.net("NVDA", "entropy") != 0
     for action in closes:
         engine.confirm_close(action)
@@ -63,8 +120,7 @@ def raw_net(ledger):
 def test_engine_times_out_an_unreverted_tier():
     ledger = PositionLedger()
     engine = TierEngine(config=CFG, ledger=ledger)
-    engine.on_sample(stamp=0, edge=8.0, baseline=0.0, price_hint=160.0,
-                     window=[8.0, 8.0, 8.0], exchange=exchange_from(ledger))
+    open_one(engine, ledger, edge=8.0)
     actions = engine.on_sample(stamp=61, edge=8.0, baseline=0.0, price_hint=160.0,
                                window=[8.0, 8.0, 8.0], exchange=exchange_from(ledger))
     assert any(a["action"] == "close" and a["reason"] == "timeout" for a in actions)
@@ -112,11 +168,12 @@ def test_engine_sizes_each_tier_to_the_cumulative_target():
     ledger = PositionLedger()
     cfg = _cfg_with_equity(200.0, 100.0)
     engine = TierEngine(config=cfg, ledger=ledger)
-    actions = engine.on_sample(stamp=0, edge=11.0, baseline=0.0, price_hint=100.0,
-                               window=[11.0, 11.0, 11.0], exchange=exchange_from(ledger))
-    sizes = {a["tier"]: a["notional_usd"] for a in actions if a["action"] == "open"}
-    assert sizes == {1: 100.0, 2: 100.0, 3: 100.0, 4: 100.0, 5: 100.0}
+    sizes = []
+    for index in range(5):
+        action = open_one(engine, ledger, stamp=index, edge=11.0, price_hint=100.0)
+        sizes.append(action["notional_usd"])
     # 1x equity per tier, 5x total at full ladder
+    assert sizes == [100.0, 100.0, 100.0, 100.0, 100.0]
     assert engine._open_notional() == 500.0
 
 
@@ -124,19 +181,19 @@ def test_engine_tops_out_at_the_hard_cap_when_the_last_tier_overshoots():
     ledger = PositionLedger()
     cfg = _cfg_with_equity(200.0, 105.0)
     engine = TierEngine(config=cfg, ledger=ledger)
-    actions = engine.on_sample(stamp=0, edge=11.0, baseline=0.0, price_hint=100.0,
-                               window=[11.0, 11.0, 11.0], exchange=exchange_from(ledger))
-    sizes = {a["tier"]: a["notional_usd"] for a in actions if a["action"] == "open"}
-    assert sum(sizes.values()) == 520.0
-    assert sizes[4] == 120.0
+    sizes = []
+    for index in range(5):
+        sizes.append(open_one(engine, ledger, stamp=index, edge=11.0, price_hint=100.0)["notional_usd"])
+    assert sum(sizes) == 520.0
+    assert engine._open_notional() == 520.0
+    assert sizes[-1] == 100.0
 
 
 def test_unknown_equity_falls_back_to_the_fixed_child_notional():
     ledger = PositionLedger()
     engine = TierEngine(config=CFG, ledger=ledger)
-    actions = engine.on_sample(stamp=0, edge=8.0, baseline=0.0, price_hint=160.0,
-                               window=[8.0, 8.0, 8.0], exchange=exchange_from(ledger))
-    assert all(a["notional_usd"] == 20.0 for a in actions if a["action"] == "open")
+    action = open_one(engine, ledger, edge=8.0)
+    assert action["notional_usd"] == 20.0
 
 
 def test_entry_is_blocked_while_the_other_direction_owns_the_book():
@@ -153,10 +210,9 @@ def test_entry_is_blocked_while_the_other_direction_owns_the_book():
 def test_exits_still_run_when_entry_is_locked():
     ledger = PositionLedger()
     engine = TierEngine(config=_cfg_with_equity(200.0, 100.0), ledger=ledger)
-    engine.on_sample(stamp=0, edge=11.0, baseline=0.0, price_hint=100.0,
-                     window=[11.0, 11.0, 11.0], exchange=exchange_from(ledger))
-    assert engine.open_tiers
-    actions = engine.on_sample(stamp=5, edge=0.0, baseline=0.0, price_hint=100.0,
+    for index in range(5):
+        open_one(engine, ledger, stamp=index, edge=11.0, price_hint=100.0)
+    actions = engine.on_sample(stamp=6, edge=0.0, baseline=0.0, price_hint=100.0,
                                window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger),
                                allow_entry=False)
     assert len(actions) == 5
@@ -176,10 +232,8 @@ def test_two_directions_share_one_ledger_and_net_out():
                     equity_usd={"entropy": 200.0, "lighter_mainnet": 100.0})
     forward = TierEngine(config=c1, ledger=ledger, strategy_id="nvda-forward")
     reverse = TierEngine(config=c2, ledger=ledger, strategy_id="nvda-reverse")
-    forward.on_sample(stamp=0, edge=11.0, baseline=0.0, price_hint=100.0,
-                      window=[11.0, 11.0, 11.0], exchange=exchange_from(ledger))
-    reverse.on_sample(stamp=0, edge=11.0, baseline=0.0, price_hint=100.0,
-                      window=[11.0, 11.0, 11.0], exchange=exchange_from(ledger))
+    open_one(forward, ledger, edge=11.0, price_hint=100.0)
+    open_one(reverse, ledger, edge=11.0, price_hint=100.0)
     assert ledger.net("NVDA", "entropy") == 0
     assert ledger.net("NVDA", "lighter_mainnet") == 0
     assert ledger.reconcile("NVDA", ("entropy", "lighter_mainnet"), exchange_from(ledger))["ok"] is True
@@ -188,22 +242,20 @@ def test_two_directions_share_one_ledger_and_net_out():
 def test_a_close_is_not_booked_and_not_repeated_while_it_waits():
     ledger = PositionLedger()
     engine = TierEngine(config=CFG, ledger=ledger)
-    engine.on_sample(stamp=0, edge=8.0, baseline=0.0, price_hint=160.0,
-                     window=[8.0, 8.0, 8.0], exchange=exchange_from(ledger))
+    open_one(engine, ledger, edge=8.0)
     first = engine.on_sample(stamp=10, edge=0.0, baseline=0.0, price_hint=160.0,
                              window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger))
-    assert [a["tier"] for a in first if a["action"] == "close"] == [1, 2]
+    assert [a["tier"] for a in first if a["action"] == "close"] == [1]
     again = engine.on_sample(stamp=11, edge=0.0, baseline=0.0, price_hint=160.0,
                              window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger))
     assert [a for a in again if a["action"] == "close"] == []
-    assert len(engine.open_tiers) == 2
+    assert len(engine.open_tiers) == 1
 
 
 def test_cancel_close_lets_the_same_tier_be_closed_again():
     ledger = PositionLedger()
     engine = TierEngine(config=CFG, ledger=ledger)
-    engine.on_sample(stamp=0, edge=8.0, baseline=0.0, price_hint=160.0,
-                     window=[8.0, 8.0, 8.0], exchange=exchange_from(ledger))
+    open_one(engine, ledger, edge=8.0)
     actions = engine.on_sample(stamp=10, edge=0.0, baseline=0.0, price_hint=160.0,
                                window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger))
     engine.cancel_close(actions[0]["tier"])
@@ -215,8 +267,7 @@ def test_cancel_close_lets_the_same_tier_be_closed_again():
 def test_confirm_close_books_the_trade_once():
     ledger = PositionLedger()
     engine = TierEngine(config=CFG, ledger=ledger)
-    engine.on_sample(stamp=0, edge=8.0, baseline=0.0, price_hint=160.0,
-                     window=[8.0, 8.0, 8.0], exchange=exchange_from(ledger))
+    open_one(engine, ledger, edge=8.0)
     actions = engine.on_sample(stamp=10, edge=0.0, baseline=0.0, price_hint=160.0,
                                window=[0.0, 0.0, 0.0], exchange=exchange_from(ledger))
     action = actions[0]
@@ -224,3 +275,19 @@ def test_confirm_close_books_the_trade_once():
     assert len(engine.trades) == 1
     assert engine.confirm_close(action) is None
     assert len(engine.trades) == 1
+
+
+def test_engine_state_restores_tiers_and_ledger():
+    """Regression: a restart used to come back with an empty book."""
+    ledger = PositionLedger()
+    engine = TierEngine(config=CFG, ledger=ledger)
+    open_one(engine, ledger, edge=9.5)
+    saved = engine.dump_state()
+
+    fresh_ledger = PositionLedger()
+    revived = TierEngine(config=CFG, ledger=fresh_ledger)
+    revived.restore_state(saved)
+    assert sorted(revived.open_tiers) == [1]
+    assert revived.open_tiers[1].frozen_baseline == 0.0
+    assert fresh_ledger.net("NVDA", "entropy") == D(str(engine.open_tiers[1].qty))
+    assert fresh_ledger.net("NVDA", "lighter_mainnet") == -D(str(engine.open_tiers[1].qty))

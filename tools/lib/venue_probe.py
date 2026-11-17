@@ -226,7 +226,7 @@ class VariationalProbeExecutor:
                 "contract":{"venue":"variational","symbol":asset.symbol("variational"),
                             "instrument_type":asset.var_instrument_type,"kind":asset.var_kind,
                             "settlement_asset":"USDC","funding_interval_s":0}}
-    async def positions(self,asset):
+    async def positions(self,asset,fresh=False):
         """Read-only position/order snapshot used for per-round reconciliation."""
         if self.client is None: return {"ok":False,"verified":False,"error":"variational_client_not_started"}
         try:
@@ -395,7 +395,7 @@ class LighterProbeExecutor:
                             "min_base_amount":str(market.get("min_base_amount")),
                             "min_quote_amount":str(market.get("min_quote_amount")),
                             "multiplier":str(market.get("multiplier"))}}
-    async def positions(self,asset):
+    async def positions(self,asset,fresh=False):
         """Read-only position/order snapshot used for per-round reconciliation."""
         if not self.available or self.client is None: return {"ok":False,"verified":False,"error":f"{self.venue}_credentials_missing"}
         market=self.market(asset)
@@ -694,12 +694,12 @@ class EntropyProbeExecutor:
                             "sz_decimals":int(row.get("szDecimals") or 0),
                             "max_leverage":row.get("maxLeverage"),"only_isolated":bool(row.get("onlyIsolated")),
                             "dex":self.dex,"fee_token":"USDC"}}
-    async def positions(self,asset):
+    async def positions(self,asset,fresh=False):
         """Read-only position/order snapshot used for per-round reconciliation."""
         if not self.available or self.info is None: return {"ok":False,"verified":False,"error":self.reason or "entropy_credentials_missing"}
         coin=self._coin(asset)
         cached=self._positions_cache.get(coin)
-        if cached and time.monotonic()-cached[0]<2.0:
+        if not fresh and cached and time.monotonic()-cached[0]<2.0:
             return dict(cached[1])
         try:
             state=await _to_thread_retry(self.info.user_state,self.account_address,self.dex,attempts=6,base_delay=0.6)
@@ -790,6 +790,12 @@ class EntropyProbeExecutor:
         limit_px=self._limit_price(asset,side,bbo,max_slippage_bps)
         self._last_exec_quote={"bid":str(_d(quote.get("bid"))) if _d(quote.get("bid")) is not None else None,"ask":str(_d(quote.get("ask"))) if _d(quote.get("ask")) is not None else None,"mid":str(bbo),"limit_price":str(limit_px),"quote_recv_at":quote.get("recv_at"),"quote_source_at":quote.get("source_at")}
         cloid=self._cloid(client_order_id); coin=self._coin(asset)
+        before_qty=None
+        try:
+            before=await self.positions(asset,fresh=True)
+            if before.get("verified"): before_qty=_d(before.get("qty"))
+        except Exception:
+            before_qty=None
         submitted=datetime.now(timezone.utc); start_ms=int(submitted.timestamp()*1000)-5000
         result=None; attempts=0
         while True:
@@ -825,18 +831,26 @@ class EntropyProbeExecutor:
                 return {"ok":True,"status":"filled","filled_qty":str(qty_sum),"avg_price":str(notional/qty_sum) if qty_sum else None,"fee_usd":str(fee),"order_id":str(rows[0].get("oid") or ""),"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":last.isoformat() if last else None,"source_at_epoch":last.timestamp() if last else None,"raw_status":status}
             await asyncio.sleep(delay)
             delay=min(delay*1.5,0.5)
-        if not reduce_only:
+        if not reduce_only and before_qty is not None:
+            # A pre-existing position is not evidence that THIS order filled.
+            # Only the signed change between the pre-order and post-timeout reads
+            # can be attributed to it, and never more than the order allowed.
+            state=None
             try:
                 state=await _to_thread_retry(self.info.user_state,self.account_address,self.dex,attempts=3)
-                for item in (state or {}).get("assetPositions",[]) or []:
-                    pos=item.get("position") if isinstance(item,dict) else None
-                    if not isinstance(pos,dict) or pos.get("coin")!=coin: continue
-                    szi=_d(pos.get("szi")) or ZERO
-                    entry=_d(pos.get("entryPx"))
-                    if szi!=ZERO and entry:
-                        return {"ok":True,"status":"filled","filled_qty":str(abs(szi)),"avg_price":str(entry),"fee_usd":None,"order_id":None,"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":None,"source_at_epoch":None,"raw_status":"position_reconciled","partial":True}
             except Exception:
-                pass
+                state=None
+            qty_now=ZERO
+            entry=None
+            for item in (state or {}).get("assetPositions",[]) or []:
+                pos=item.get("position") if isinstance(item,dict) else None
+                if not isinstance(pos,dict) or pos.get("coin")!=coin: continue
+                qty_now+=(_d(pos.get("szi")) or ZERO)
+                entry=_d(pos.get("entryPx")) or entry
+            delta=qty_now-before_qty
+            expected_sign=Decimal("1") if side=="buy" else Decimal("-1")
+            if delta!=ZERO and (delta>0)==(expected_sign>0) and abs(delta)<=abs(qty)*Decimal("1.5"):
+                return {"ok":True,"status":"filled","filled_qty":str(abs(delta)),"avg_price":str(entry) if entry else None,"fee_usd":None,"order_id":None,"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":None,"source_at_epoch":None,"raw_status":"position_delta","partial":True,"position_before":str(before_qty),"position_after":str(qty_now)}
         return {"ok":False,"status":"unknown","error":"entropy_fill_timeout","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"cloid":str(cloid)}
     @staticmethod
     def _order_status(result):
@@ -859,7 +873,7 @@ class UnavailableProbeExecutor:
     async def start(self): return None
     async def close(self): return None
     async def preflight(self,asset): return {"ok":False,"error":self.reason}
-    async def positions(self,asset): return {"ok":False,"verified":False,"error":self.reason}
+    async def positions(self,asset,fresh=False): return {"ok":False,"verified":False,"error":self.reason}
     def normalize_qty(self,asset,qty): return None
     async def market_order(self,**kwargs): return {"ok":False,"status":"rejected","error":self.reason,"client_order_id":kwargs.get("client_order_id")}
 

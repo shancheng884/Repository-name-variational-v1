@@ -1,21 +1,39 @@
 """NVDA five-tier basis engine with net-position reconciliation.
 
-Deliberately standalone: it does not import or modify main.py. The ETH
-strategy keeps running untouched; this module is the NVDA-shaped equivalent of
-its gradient, plus the reconciliation the shared entropy account needs.
+Deliberately standalone: it does not import or modify main.py.  Sizing follows
+the ETH / CL ladder verbatim: a fixed child order, cumulative capacity of tier k
+equal to k x the smaller verified venue equity, hard capped at
+max_equity_multiple x equity.
 
-Sizing follows the ETH / CL ladder verbatim: a fixed child order, cumulative
-capacity of tier k equal to k x the smaller verified venue equity, hard capped
-at max_equity_multiple x equity. Tier 1 opens 1x equity and tier 5 tops the
-position out at 5x -- the same numbers main.py produces through
-``v4_real_gradient_slot_caps``.
+Execution contract:
+* ``on_sample`` only *proposes* one entry per direction; nothing is booked until
+  the runner has proved both legs filled and the venue positions match;
+* ``confirm_open`` is the only place an entry reaches the ledger;
+* a close is booked only after both closing legs were confirmed;
+* every ledger lookup accepts either the asset name or the asset object, so a
+  caller can no longer turn the expected position into zero by accident.
 """
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
+
+
+def asset_symbol(asset: Any) -> str:
+    """Ledger key for an asset name or an asset definition object."""
+    return getattr(asset, "name", asset)
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -74,23 +92,25 @@ class PositionLedger:
         self._by_strategy: dict[tuple[str, str, str], Decimal] = defaultdict(lambda: Decimal("0"))
 
     def set(self, strategy: str, asset: str, venue: str, qty: Decimal | float) -> None:
-        self._by_strategy[(strategy, asset, venue)] = Decimal(str(qty))
+        self._by_strategy[(strategy, asset_symbol(asset), venue)] = Decimal(str(qty))
 
     def add(self, strategy: str, asset: str, venue: str, qty: Decimal | float) -> None:
-        key = (strategy, asset, venue)
+        key = (strategy, asset_symbol(asset), venue)
         self._by_strategy[key] = self._by_strategy.get(key, Decimal("0")) + Decimal(str(qty))
 
     def net(self, asset: str, venue: str) -> Decimal:
+        symbol = asset_symbol(asset)
         total = Decimal("0")
         for (strat, sym, ven), qty in self._by_strategy.items():
-            if sym == asset and ven == venue:
+            if sym == symbol and ven == venue:
                 total += qty
         return total
 
     def by_strategy(self, asset: str) -> dict[str, dict[str, Decimal]]:
+        symbol = asset_symbol(asset)
         out: dict[str, dict[str, Decimal]] = defaultdict(dict)
         for (strat, sym, ven), qty in self._by_strategy.items():
-            if sym == asset:
+            if sym == symbol:
                 out[strat][ven] = qty
         return out
 
@@ -125,6 +145,40 @@ class OpenTier:
     # A close is only booked once the venue confirms both legs; until then the
     # tier stays open here so a failed leg is retried instead of forgotten.
     closing: bool = False
+    entry_buy_price: float | None = None
+    entry_sell_price: float | None = None
+    entry_fee_usd: float = 0.0
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "entry_edge": self.entry_edge,
+            "entry_dev": self.entry_dev,
+            "frozen_baseline": self.frozen_baseline,
+            "opened_at": self.opened_at,
+            "qty": self.qty,
+            "notional_usd": self.notional_usd,
+            "closing": False,
+            "entry_buy_price": self.entry_buy_price,
+            "entry_sell_price": self.entry_sell_price,
+            "entry_fee_usd": self.entry_fee_usd,
+        }
+
+    @classmethod
+    def from_state(cls, row: dict[str, Any]) -> "OpenTier":
+        return cls(
+            index=int(row["index"]),
+            entry_edge=float(row.get("entry_edge") or 0.0),
+            entry_dev=float(row.get("entry_dev") or 0.0),
+            frozen_baseline=float(row.get("frozen_baseline") or 0.0),
+            opened_at=float(row.get("opened_at") or time.time()),
+            qty=float(row.get("qty") or 0.0),
+            notional_usd=float(row.get("notional_usd") or 0.0),
+            closing=False,
+            entry_buy_price=_float_or_none(row.get("entry_buy_price")),
+            entry_sell_price=_float_or_none(row.get("entry_sell_price")),
+            entry_fee_usd=float(row.get("entry_fee_usd") or 0.0),
+        )
 
 
 @dataclass
@@ -151,11 +205,14 @@ class TierEngine:
     def on_sample(self, *, stamp: float, edge: float, baseline: float, price_hint: float,
                   window: list[float], exchange: dict[str, Decimal | float | None],
                   allow_entry: bool = True) -> list[dict[str, Any]]:
-        """Decide closes (always) and entries (only while this direction owns the book).
+        """Decide closes (always) and at most one entry for this direction.
 
         The ETH gradient runs bidirectionally but locks the active direction
         until the book is fully flat, so the caller passes allow_entry=False
         when the opposite direction still holds a tier.
+
+        Nothing is written to the ledger here: the caller books the tier with
+        ``confirm_open`` only after both legs and the venue positions agree.
         """
         actions: list[dict[str, Any]] = []
         dev = edge - baseline
@@ -199,6 +256,8 @@ class TierEngine:
         if not allow_entry:
             return actions
 
+        # Exactly one new tier per sample.  The runner sends it, proves both
+        # legs landed, books it, and only then may the next tier be proposed.
         for tier in self.config.tiers:
             if tier.index in self.open_tiers:
                 continue
@@ -211,14 +270,40 @@ class TierEngine:
             qty = increment / price_hint if price_hint > 0 else 0.0
             if qty <= 0:
                 continue
-            self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, +qty)
-            self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, -qty)
-            self.open_tiers[tier.index] = OpenTier(index=tier.index, entry_edge=edge, entry_dev=dev,
-                                                   frozen_baseline=baseline, opened_at=stamp, qty=qty,
-                                                   notional_usd=increment)
-            actions.append({"action": "open", "tier": tier.index, "dev_bps": dev, "qty": qty,
-                            "notional_usd": increment})
+            actions.append({"action": "open", "tier": tier.index, "dev_bps": dev,
+                            "qty": qty, "notional_usd": increment,
+                            "threshold_bps": tier.threshold_bps,
+                            "edge": edge, "baseline": baseline, "stamp": stamp})
+            break
         return actions
+
+    def confirm_open(self, action: dict[str, Any], *, qty: Decimal | float | None = None,
+                     entry_prices: dict[str, Any] | None = None,
+                     fee_usd: float = 0.0) -> OpenTier | None:
+        """Book a tier after the venue proved both legs are really on the book."""
+        index = int(action.get("tier"))
+        if index in self.open_tiers:
+            return None
+        amount = Decimal(str(qty if qty is not None else action.get("qty") or 0))
+        if amount <= 0:
+            return None
+        prices = entry_prices or {}
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, amount)
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, -amount)
+        pos = OpenTier(
+            index=index,
+            entry_edge=float(action.get("edge") or 0.0),
+            entry_dev=float(action.get("dev_bps") or 0.0),
+            frozen_baseline=float(action.get("baseline") or 0.0),
+            opened_at=float(action["stamp"] if action.get("stamp") is not None else time.time()),
+            qty=float(amount),
+            notional_usd=float(action.get("notional_usd") or self.config.notional_usd),
+            entry_buy_price=_float_or_none(prices.get(self.config.buy_venue)),
+            entry_sell_price=_float_or_none(prices.get(self.config.sell_venue)),
+            entry_fee_usd=float(fee_usd or 0.0),
+        )
+        self.open_tiers[index] = pos
+        return pos
 
     def confirm_close(self, action: dict[str, Any]) -> dict[str, Any] | None:
         """Book a close only after the venue confirmed both legs filled."""
@@ -229,10 +314,12 @@ class TierEngine:
         trade = {"tier": index, "net_bps": float(action.get("net_bps") or 0.0),
                  "hold_s": float(action.get("hold_s") or 0.0),
                  "reason": action.get("reason") or "reverted",
-                 "entry_dev": pos.entry_dev, "notional_usd": pos.notional_usd}
+                 "entry_dev": pos.entry_dev, "notional_usd": pos.notional_usd,
+                 "entry_edge": pos.entry_edge, "exit_edge": float(action.get("exit_edge") or 0.0),
+                 "entry_buy_price": pos.entry_buy_price, "entry_sell_price": pos.entry_sell_price}
         self.trades.append(trade)
-        self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -pos.qty)
-        self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, +pos.qty)
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -Decimal(str(pos.qty)))
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, Decimal(str(pos.qty)))
         return trade
 
     def cancel_close(self, index: int) -> None:
@@ -242,18 +329,33 @@ class TierEngine:
             pos.closing = False
 
     def drop_tier(self, index: int) -> None:
-        """Undo a tier whose paired order was never sent.
-
-        The engine books a tier before the runner places it; when the order is
-        refused (margin, leverage, a failed leg) both the tier and its ledger
-        legs have to disappear or every later reconciliation sees a phantom
-        position.
-        """
+        """Undo a booked tier (used when a close had to be abandoned)."""
         pos = self.open_tiers.pop(index, None)
         if pos is None:
             return
-        self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -pos.qty)
-        self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, +pos.qty)
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -Decimal(str(pos.qty)))
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, Decimal(str(pos.qty)))
+
+    def dump_state(self) -> dict[str, Any]:
+        return {"strategy_id": self.strategy_id,
+                "open_tiers": [pos.to_state() for pos in self.open_tiers.values()],
+                "trades": self.trades[-200:]}
+
+    def restore_state(self, data: dict[str, Any] | None) -> None:
+        """Rebuild booked tiers (and their ledger legs) from a saved run."""
+        if not data:
+            return
+        for row in data.get("open_tiers") or []:
+            try:
+                pos = OpenTier.from_state(row)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if pos.index in self.open_tiers or pos.qty <= 0:
+                continue
+            self.open_tiers[pos.index] = pos
+            self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, Decimal(str(pos.qty)))
+            self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, -Decimal(str(pos.qty)))
+        self.trades = list(data.get("trades") or [])[-200:]
 
     def summary(self) -> list[dict[str, Any]]:
         by_tier: dict[int, list[dict[str, Any]]] = defaultdict(list)
