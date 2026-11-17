@@ -314,6 +314,15 @@ LIGHTER_TESTNET_CHAIN_ID=300
 LIGHTER_RH_MAINNET_CHAIN_ID=466324
 
 
+def best_bid_ask(book: dict) -> tuple:
+    """Best bid/ask out of a Lighter orderBookOrders payload."""
+    bids = [_d(o.get("price")) for o in ((book or {}).get("bids") or []) if isinstance(o, dict)]
+    asks = [_d(o.get("price")) for o in ((book or {}).get("asks") or []) if isinstance(o, dict)]
+    bid = max([b for b in bids if b is not None], default=None)
+    ask = min([a for a in asks if a is not None], default=None)
+    return bid, ask
+
+
 def leverage_from_imf_percent(value) -> float | None:
     """Translate Lighter's rendered margin fraction into leverage.
 
@@ -488,6 +497,16 @@ class LighterProbeExecutor:
         if isinstance(receipt,dict) and receipt.get("execution_quote") is None:
             receipt["execution_quote"]=getattr(self,"_last_exec_quote",None)
         return _stamp_receipt(receipt)
+    async def _bbo(self, market):
+        try:
+            response = await asyncio.to_thread(
+                requests.get, f"{self.rest_url}/api/v1/orderBookOrders",
+                params={"market_id": int(market["market_id"]), "limit": 5}, timeout=10)
+            response.raise_for_status()
+            return best_bid_ask(response.json() or {})
+        except Exception:
+            return None, None
+
     async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
         if not self.available or self.client is None: return {"ok":False,"status":"rejected","error":f"{self.venue}_credentials_missing","client_order_id":client_order_id}
         market=self.market(asset)
@@ -496,6 +515,16 @@ class LighterProbeExecutor:
         if not qty: return {"ok":False,"status":"rejected","error":"lighter_qty_below_min","client_order_id":client_order_id}
         sd=int(market.get("supported_size_decimals") or 0); pd=int(market.get("supported_price_decimals") or 0)
         bbo=_d(quote.get("ask" if side=="buy" else "bid"))
+        if not bbo:
+            # Flattening and settling pass no quote; fetch the live book instead of
+            # refusing, otherwise a rescue order can never be sent.
+            bid, ask = await self._bbo(market)
+            bbo = ask if side == "buy" else bid
+            if bbo is not None:
+                quote = dict(quote or {})
+                quote.setdefault("bid", str(bid) if bid is not None else "")
+                quote.setdefault("ask", str(ask) if ask is not None else "")
+                quote.setdefault("mid", str((bid + ask) / 2) if bid is not None and ask is not None else "")
         if not bbo: return {"ok":False,"status":"rejected","error":"lighter_quote_missing","client_order_id":client_order_id}
         direction=Decimal("-1") if side=="sell" else Decimal("1")
         limit=(bbo*(Decimal("1")+direction*max_slippage_bps/BPS)).quantize(Decimal(1).scaleb(-pd),rounding=ROUND_CEILING if side=="buy" else ROUND_FLOOR)

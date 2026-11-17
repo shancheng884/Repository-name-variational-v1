@@ -5,7 +5,7 @@ import asyncio
 from decimal import Decimal
 
 from tools.lib.nvda_tier_engine import PositionLedger, TierConfig, TierEngine, TierSpec
-from tools.lib.venue_probe import leverage_from_imf_percent
+from tools.lib.venue_probe import best_bid_ask, leverage_from_imf_percent
 from tools.nvda_tier_live import place_pair, position_qty, settle_positions
 
 
@@ -120,3 +120,11 @@ def test_position_qty_needs_a_verified_read():
 
     assert asyncio.run(position_qty({"rh": Blind()}, None, "rh")) is None
     assert asyncio.run(position_qty({"rh": BookExecutor("1.5")}, None, "rh")) == Decimal("1.5")
+
+
+def test_best_bid_ask_uses_the_outermost_prices():
+    book = {"bids": [{"price": "154.90"}, {"price": "154.95"}],
+            "asks": [{"price": "155.00"}, {"price": "154.98"}]}
+    assert best_bid_ask(book) == (Decimal("154.95"), Decimal("154.98"))
+    assert best_bid_ask({}) == (None, None)
+    assert best_bid_ask({"bids": [{"price": "x"}], "asks": []}) == (None, None)
