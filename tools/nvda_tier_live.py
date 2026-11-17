@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 
 from tools.lib.nvda_tier_engine import PositionLedger, TierConfig, TierEngine, TierSpec
 from tools.lib.venue_probe import EntropyProbeExecutor, LighterProbeExecutor, _d
-from tools.market_capture.config import DEFAULT_ASSETS, CaptureConfig, load_environment
+from tools.market_capture.config import DEFAULT_ASSETS, VENUES, CaptureConfig, load_environment
 from tools.market_capture.runner import CaptureRunner
 
 STATE = ROOT / "log" / "nvda_tier_live_state.json"
@@ -196,7 +196,9 @@ async def main_async(args):
     if caps is None:
         print("warning: venue equity unavailable, falling back to %.0fU per tier" % args.notional)
     out_dir = ROOT / "log" / "nvda_tier_live_capture"
-    cap = CaptureRunner(CaptureConfig(output_dir=out_dir, assets=(asset,), var_quote_seconds=1.0,
+    cap = CaptureRunner(CaptureConfig(output_dir=out_dir, assets=(asset,),
+                                      venue_enabled={name: name in venues for name in VENUES},
+                                      var_quote_seconds=1.0,
                                       book_snapshot_seconds=5.0, health_seconds=2.0, latency_seconds=5.0,
                                       system_seconds=60.0, fill_poll_seconds=2.0, edge_seconds=1.0,
                                       notional_usd=Decimal(str(args.notional)), max_book_levels=20))
