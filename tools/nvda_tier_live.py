@@ -196,7 +196,8 @@ async def position_qty(ex, asset, venue):
     return _d(result.get("qty"))
 
 
-async def settle_positions(ex, asset, venues, expected, *, attempts=3):
+async def settle_positions(ex, asset, venues, expected, *, attempts=3,
+                           settlement_grace=0.0, allow_corrections=True):
     """Force the venues to match the ledger and prove it from a fresh read.
 
     Any difference is closed with a reduce-only order, which can shrink a
@@ -204,6 +205,16 @@ async def settle_positions(ex, asset, venues, expected, *, attempts=3):
     """
     legs = {}
     corrections = []
+    deadline = time.monotonic() + settlement_grace
+    while settlement_grace > 0:
+        actual = dict(zip(venues, await asyncio.gather(*(position_qty(ex, asset, v) for v in venues))))
+        if all(actual[v] is not None and abs(actual[v] - expected[v]) <= QTY_TOL for v in venues):
+            return {"ok": True, "legs": {v: {"expected": str(expected[v]), "actual": str(actual[v]),
+                                               "residual": str(actual[v] - expected[v])} for v in venues},
+                    "corrections": []}
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(min(.5, max(0, deadline - time.monotonic())))
     for _ in range(max(1, attempts)):
         residual = {}
         for venue in venues:
@@ -219,8 +230,15 @@ async def settle_positions(ex, asset, venues, expected, *, attempts=3):
                 residual[venue] = delta
         if not residual:
             return {"ok": True, "legs": legs, "corrections": corrections}
+        if not allow_corrections:
+            return {"ok": False, "error": "settlement_not_reflected", "legs": legs,
+                    "corrections": corrections}
         for venue, delta in residual.items():
             side = "sell" if delta > 0 else "buy"
+            actual = _d(legs[venue]["actual"])
+            if actual is None or actual * delta <= 0 or abs(delta) > abs(actual):
+                return {"ok": False, "error": "correction_would_increase_position", "legs": legs,
+                        "corrections": corrections}
             try:
                 extra = {"known_position_before": _d(legs[venue]["actual"])} if venue == "entropy" else {}
                 receipt = await ex[venue].market_order(
@@ -243,6 +261,40 @@ async def settle_positions(ex, asset, venues, expected, *, attempts=3):
         await asyncio.sleep(0.8)
     return {"ok": False, "error": "position_mismatch", "legs": legs,
             "corrections": corrections}
+
+
+async def rollback_entry(ex, asset, venues, before, receipts, buy, sell, *, token, previous=None):
+    """Unwind confirmed fills, not a possibly lagging account snapshot."""
+    corrections = list((previous or {}).get("corrections", []))
+    if any(row.get("receipt", {}).get("status") not in ("filled", "rejected") for row in corrections):
+        return {"ok": False, "error": "unresolved_correction", "corrections": corrections}
+    deltas = {v: Decimal("0") for v in venues}
+    for venue, receipt in receipts.items():
+        filled = plausible_fill(receipt, Decimal(receipt.get("requested_qty") or "1e20"))
+        if filled:
+            deltas[venue] += filled * (1 if venue == buy else -1)
+    for row in corrections:
+        receipt = row.get("receipt") or {}
+        if receipt.get("status") == "filled":
+            deltas[row["venue"]] += Decimal(receipt["filled_qty"]) * (1 if row["side"] == "buy" else -1)
+    async def unwind(venue, delta):
+        side = "sell" if delta > 0 else "buy"
+        extra = {"known_position_before": before[venue] + delta} if venue == "entropy" else {}
+        try:
+            receipt = await ex[venue].market_order(
+                asset=asset, side=side, qty=abs(delta), quote={},
+                client_order_id="nvda-tier-rollback-" + token[:16] + "-" + venue,
+                reduce_only=True, max_slippage_bps=Decimal("30"), **extra)
+        except Exception as exc:
+            receipt = {"status": "unknown", "error": str(exc)}
+        return {"venue": venue, "side": side, "qty": str(abs(delta)), "receipt": receipt}
+    corrections.extend(await asyncio.gather(*(unwind(v, q) for v, q in deltas.items() if q)))
+    if any(row.get("receipt", {}).get("status") not in ("filled", "rejected") for row in corrections):
+        return {"ok": False, "error": "unresolved_correction", "corrections": corrections}
+    check = await settle_positions(ex, asset, venues, before, settlement_grace=3.0,
+                                   allow_corrections=False)
+    check["corrections"] = corrections
+    return check
 
 
 def write_state(payload):
@@ -702,7 +754,21 @@ async def main_async(args):
                             expected = {v: ledger.net(symbol, v) for v in venues}
                             expected[side_buy] += hedge_qty
                             expected[side_sell] -= hedge_qty
-                            check = await settle_positions(ex, asset, venues, expected)
+                            balanced = all(q == hedge_qty for q in leg_qty.values())
+                            check = await settle_positions(ex, asset, venues, expected,
+                                                           settlement_grace=3.0,
+                                                           allow_corrections=not balanced)
+                            if balanced and not check.get("ok"):
+                                record_attempt(execution_stats, receipts, opening=True, hedged=None)
+                                engine.pending_action["receipts"] = receipts
+                                engine.pending_action["expected"] = {v: str(q) for v, q in expected.items()}
+                                append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "open_unverified",
+                                                         "pair": args.pair, "direction": action["direction"],
+                                                         "tier": action["tier"], "receipts": receipts,
+                                                         "settle": check})
+                                write_state({"status": "blocked_settlement_lag", "stage": "open",
+                                             "receipts": receipts, "settle": check})
+                                return {"ok": False, "error": "settlement_not_reflected"}
                         if hedge_qty and hedge_qty > 0 and check and check.get("ok"):
                             action["notional_usd"] *= float(hedge_qty / requested)
                             retained, excess_pnl = hedged_entry_result(receipts, check, hedge_qty,
@@ -738,18 +804,19 @@ async def main_async(args):
                                              direction=action.get("direction"), tier=action.get("tier"))
                         else:
                             # A tier only exists if both legs are really on the book.
-                            recovery = await settle_positions(
-                                ex, asset, venues, {v: ledger.net(symbol, v) for v in venues})
-                            recovery["corrections"] = ((check or {}).get("corrections", [])
-                                                       + recovery.get("corrections", []))
+                            recovery = await rollback_entry(
+                                ex, asset, venues, {v: ledger.net(symbol, v) for v in venues}, receipts,
+                                side_buy, side_sell, token=action["token"], previous=check)
                             failure_pnl = failed_entry_result(receipts, recovery, side_buy, side_sell)
                             record_attempt(execution_stats, receipts, opening=True, hedged=False,
                                            recovery=recovery, pnl=failure_pnl)
                             if failure_pnl["complete"]:
                                 realized += Decimal(failure_pnl["net_usd"])
                                 rebate += Decimal(failure_pnl["rebate_usd"])
-                            terminal = all(r.get("status") in ("filled", "rejected")
-                                           for r in receipts.values())
+                            terminal = (all(r.get("status") in ("filled", "rejected")
+                                            for r in receipts.values())
+                                        and all(row.get("receipt", {}).get("status") in ("filled", "rejected")
+                                                for row in recovery.get("corrections", [])))
                             if recovery.get("ok") and terminal:
                                 engine.cancel_open(action)
                                 exchange = {v: ledger.net(symbol, v) for v in venues}
@@ -797,7 +864,10 @@ async def main_async(args):
                         expected = {v: ledger.net(symbol, v) for v in venues}
                         expected[side_buy] -= qty
                         expected[side_sell] += qty
-                        check = await settle_positions(ex, asset, venues, expected)
+                        all_filled = all(plausible_fill(r, qty) == qty for r in receipts.values())
+                        check = await settle_positions(ex, asset, venues, expected,
+                                                       settlement_grace=3.0,
+                                                       allow_corrections=not all_filled)
                         record_attempt(execution_stats, receipts, opening=False,
                                        hedged=bool(check.get("ok")),
                                        recovery=check if check.get("corrections") else None)
@@ -808,6 +878,9 @@ async def main_async(args):
                                                      "pnl": {"complete": False, "missing": ["unresolved_order"]}})
                             record_block("unresolved_order", stage="close", receipts=receipts,
                                          settle=check)
+                            write_state({"status": "blocked_unresolved_order", "stage": "close",
+                                         "receipts": receipts, "settle": check,
+                                         "execution_stats": execution_stats})
                             return {"ok": False, "error": "unresolved_order"}
                         if check.get("ok"):
                             trade = engine.confirm_close(action)
@@ -834,6 +907,18 @@ async def main_async(args):
                                               realized=realized, rebate=rebate, equity=equity, history=history,
                                               execution_stats=execution_stats)
                         else:
+                            if check.get("error") in ("unresolved_correction", "settlement_not_reflected"):
+                                engine.pending_action["receipts"] = receipts
+                                engine.pending_action["expected"] = {v: str(q) for v, q in expected.items()}
+                                write_state({"status": "blocked_settlement_lag", "stage": "close",
+                                             "receipts": receipts, "settle": check})
+                                append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "close_failed",
+                                                         "pair": args.pair, "direction": action["direction"],
+                                                         "tier": action["tier"], "receipts": receipts,
+                                                         "settle": check,
+                                                         "pnl": {"complete": False,
+                                                                 "missing": [check["error"]]}})
+                                return {"ok": False, "error": check["error"]}
                             # Keep the tier: the next sample retries the close and
                             # the residual is measured against the real position.
                             engine.cancel_close(action["tier"])

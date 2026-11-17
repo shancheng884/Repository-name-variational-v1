@@ -10,6 +10,15 @@ by the decision. Startup, periodic background reconciliation and post-fill
 verification still read the venues. A background result from before a trade is
 discarded rather than overwriting a newer verified position.
 
+Post-fill verification allows up to three seconds for account endpoints to
+reflect the confirmed fills, returning immediately when they already match.
+Equal, confirmed paired fills are never corrected with another order just
+because a position endpoint lags. A correction must strictly reduce absolute
+exposure. Failed entries unwind confirmed fill quantities directly, so a stale
+flat account response cannot hide a leg that needs unwinding. An unknown
+correction is not re-sent. This grace period is after submission, not an entry
+confirmation or a delay in front of the order.
+
 The rolling median remains sampled once per wall-clock second. Event-driven
 decisions do not overweight venues with faster message rates. Duplicate quote
 versions do not count again, and the current deviation must still clear the
@@ -49,3 +58,9 @@ Read-only report:
 Old journals without unwind fill receipts remain incomplete. The report does
 not overwrite strategy state or send orders. ANTH, INTC, the capture service,
 watchdogs and auto-rotation are outside this change.
+
+`tools/nvda_reconcile_flat.py` is read-only by default. Its explicit `--apply`
+mode can repair a stale single-child close ledger only after two verified flat
+account reads, no active orders, and exactly matching paired closing fill
+receipts. It makes a backup and never sends an order. It does not guess the
+outcome of an unresolved opening order.

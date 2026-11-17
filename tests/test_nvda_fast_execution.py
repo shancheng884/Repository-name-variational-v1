@@ -5,7 +5,7 @@ from decimal import Decimal as D
 
 from tools.lib.nvda_execution_stats import (closed_child_result, failed_entry_result,
                                            hedged_entry_result, new_execution_stats, record_attempt)
-from tools.nvda_tier_live import common_qty, place_pair
+from tools.nvda_tier_live import common_qty, place_pair, rollback_entry, settle_positions
 from tests.test_nvda_tier_live import _EntropyAsset, _EntropyInfo, _entropy_executor
 
 
@@ -251,3 +251,116 @@ def test_read_only_report_counts_legacy_rejections_but_does_not_invent_unwind_pn
     assert result["execution_stats"]["failed_entries"] == 1
     assert result["verified_net_usd"] == "0"
     assert len(result["missing_cost_events"]) == 1
+
+
+def test_post_fill_read_lag_is_waited_out_without_a_second_order():
+    class Lagging:
+        def __init__(self):
+            self.reads = 0
+
+        async def positions(self, asset, fresh=False):
+            self.reads += 1
+            return {"verified": True, "qty": "0" if self.reads == 1 else ".2", "active_orders": 0}
+
+        async def market_order(self, **kwargs):
+            raise AssertionError("a stale account read must not send a correction")
+
+    venue = Lagging()
+    result = asyncio.run(settle_positions({"rh": venue}, None, ("rh",), {"rh": D(".2")},
+                                          settlement_grace=.01, allow_corrections=False))
+    assert result["ok"]
+    assert result["corrections"] == []
+
+
+def test_a_correction_never_tries_to_increase_a_position():
+    class Lagging:
+        async def positions(self, asset, fresh=False):
+            return {"verified": True, "qty": ".13", "active_orders": 0}
+
+        async def market_order(self, **kwargs):
+            raise AssertionError("buying more of a long is not a reduce-only correction")
+
+    result = asyncio.run(settle_positions({"rh": Lagging()}, None, ("rh",), {"rh": D(".259")}))
+    assert result["error"] == "correction_would_increase_position"
+
+
+def test_fully_filled_close_with_lag_does_not_send_a_duplicate_close():
+    class Lagging:
+        async def positions(self, asset, fresh=False):
+            return {"verified": True, "qty": ".13", "active_orders": 0}
+
+        async def market_order(self, **kwargs):
+            raise AssertionError("a confirmed filled close must not be sent twice")
+
+    result = asyncio.run(settle_positions({"rh": Lagging()}, None, ("rh",), {"rh": D("0")},
+                                          settlement_grace=.01, allow_corrections=False))
+    assert result["error"] == "settlement_not_reflected"
+
+
+def test_rollback_unwinds_the_confirmed_fill_even_if_account_reads_would_still_show_flat():
+    class Venue:
+        def __init__(self, qty):
+            self.qty = D(qty)
+            self.reads = 0
+            self.orders = []
+
+        async def positions(self, asset, fresh=False):
+            self.reads += 1
+            return {"verified": True, "qty": str(self.qty), "active_orders": 0}
+
+        async def market_order(self, **kwargs):
+            assert self.reads == 0
+            assert kwargs["reduce_only"]
+            self.orders.append(kwargs)
+            self.qty -= kwargs["qty"]
+            return fill(kwargs["qty"], 100)
+
+    ex = {"entropy": Venue("0"), "lighter_rh": Venue(".2")}
+    receipts = {"entropy": {"status": "rejected"}, "lighter_rh": fill(".2", 100)}
+    result = asyncio.run(rollback_entry(ex, None, tuple(ex), {v: D("0") for v in ex}, receipts,
+                                       "lighter_rh", "entropy", token="failure"))
+    assert result["ok"]
+    assert len(ex["lighter_rh"].orders) == 1
+    assert len(result["corrections"]) == 1
+
+
+def test_unresolved_correction_is_not_retried_or_blindly_unwound():
+    result = asyncio.run(rollback_entry({}, None, (), {}, {}, "a", "b", token="unknown",
+                                       previous={"corrections": [{"receipt": {"status": "unknown"}}]}))
+    assert not result["ok"]
+    assert result["error"] == "unresolved_correction"
+
+
+def test_flat_ledger_recovery_requires_exact_paired_closing_fills_and_is_idempotent():
+    from tools.nvda_reconcile_flat import recovery_plan
+
+    saved = {"asset": "NVDA", "pair": "entropy>lighter_rh", "realized_usd": "0",
+             "rebate_usd": "0", "engines": {"reverse": {
+                 "pending_action": {"action": "close"}, "open_tiers": [{
+                     "index": 1, "qty": .2, "notional_usd": 20, "opened_at": 1,
+                     "entry_buy_price": 100, "entry_sell_price": 101, "entry_fee_usd": .01}]}}}
+    rows = [{"event": "close_failed", "direction": "reverse", "tier": 1,
+             "ts": "2026-11-18T00:00:00+00:00", "receipts": {
+                 "lighter_rh": fill(".2", 100), "entropy": fill(".2", 100, ".01")}}]
+    positions = {v: {"verified": True, "qty": "0", "active_orders": 0}
+                 for v in ("entropy", "lighter_rh")}
+    state, recovered = recovery_plan(saved, rows, positions)
+    assert len(recovered) == 1
+    assert D(state["realized_usd"]) == D(".18")
+    assert D(recovered[0]["pnl"]["rebate_usd"]) == D(".022")
+    assert not state["engines"]["reverse"]["open_tiers"]
+    assert state["engines"]["reverse"]["pending_action"] is None
+    again, actions = recovery_plan(state, rows, positions)
+    assert not actions
+    assert again["realized_usd"] == state["realized_usd"]
+
+
+def test_flat_ledger_recovery_refuses_to_discard_an_unclosed_position():
+    import pytest
+    from tools.nvda_reconcile_flat import recovery_plan
+
+    saved = {"asset": "NVDA", "pair": "entropy>lighter_rh", "engines": {}}
+    positions = {v: {"verified": True, "qty": ".1", "active_orders": 0}
+                 for v in ("entropy", "lighter_rh")}
+    with pytest.raises(ValueError, match="verified_flat"):
+        recovery_plan(saved, [], positions)

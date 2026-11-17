@@ -46,10 +46,11 @@ def execution_cashflows(legs):
 
 def closed_child_result(action, receipts, recovery, buy, sell):
     entry = {"status": "filled", "filled_qty": str(action["qty"])}
+    fee_venue = "entropy" if "entropy" in (buy, sell) else buy
     legs = [(buy, "buy", {**entry, "avg_price": action.get("entry_buy_price"),
-                           "fee_usd": action.get("entry_fee_usd")}),
+                           "fee_usd": action.get("entry_fee_usd") if fee_venue == buy else "0"}),
             (sell, "sell", {**entry, "avg_price": action.get("entry_sell_price"),
-                             "fee_usd": "0"})]
+                             "fee_usd": action.get("entry_fee_usd") if fee_venue == sell else "0"})]
     legs.extend((venue, "sell" if venue == buy else "buy", receipt)
                 for venue, receipt in receipts.items())
     legs.extend((row["venue"], row["side"], row.get("receipt"))
@@ -97,7 +98,8 @@ def hedged_entry_result(receipts, recovery, hedge_qty, buy, sell):
 def record_attempt(stats, receipts, *, opening, hedged, recovery=None, pnl=None):
     stats["entry_attempts" if opening else "exit_attempts"] += 1
     if opening:
-        stats["hedged_entries" if hedged else "failed_entries"] += 1
+        key = "unverified_entries" if hedged is None else ("hedged_entries" if hedged else "failed_entries")
+        stats[key] = stats.get(key, 0) + 1
     for venue, receipt in receipts.items():
         row = stats["venues"].setdefault(venue, {"attempts": 0, "rejected": 0,
                                                  "filled": 0, "unknown": 0, "partial": 0})
@@ -119,6 +121,7 @@ def record_attempt(stats, receipts, *, opening, hedged, recovery=None, pnl=None)
 
 def new_execution_stats(saved=None):
     result = {"entry_attempts": 0, "exit_attempts": 0, "hedged_entries": 0,
+              "unverified_entries": 0,
               "failed_entries": 0, "rollback_orders": 0, "rollback_failures": 0,
               "rollback_net_usd": "0", "unresolved_cost_events": 0, "venues": {}}
     if saved:

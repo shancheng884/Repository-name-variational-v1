@@ -27,7 +27,7 @@ def report(path):
             continue
         event = row.get("event")
         receipts = row.get("receipts") or {}
-        if event not in ("opened", "open_failed", "closed", "close_failed"):
+        if event not in ("opened", "open_failed", "open_unverified", "closed", "close_failed", "closed_reconciled"):
             continue
         recovery = row.get("recovery") or row.get("settle")
         pnl = row.get("pnl")
@@ -36,9 +36,10 @@ def report(path):
             if row.get("direction") == "reverse":
                 buy, sell = sell, buy
             pnl = failed_entry_result(receipts, recovery, buy, sell)
-        record_attempt(stats, receipts, opening=event in ("opened", "open_failed"),
-                       hedged=event != "open_failed", recovery=recovery,
-                       pnl=pnl if event == "open_failed" else None)
+        if event != "closed_reconciled":
+            record_attempt(stats, receipts, opening=event in ("opened", "open_failed", "open_unverified"),
+                           hedged=None if event == "open_unverified" else event != "open_failed", recovery=recovery,
+                           pnl=pnl if event == "open_failed" else None)
         for result in (pnl, row.get("excess_pnl")):
             if result is None:
                 continue
