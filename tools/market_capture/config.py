@@ -145,6 +145,9 @@ class CaptureConfig:
     fill_poll_seconds: float = 2.0
     edge_seconds: float = 1.0
     var_quote_seconds: float = 1.0
+    # The indicative quotes and the fills feed need the local Chrome bridge;
+    # without it the public price feed is the only Variational source.
+    var_bridge_enabled: bool = True
     retention_days: int = 14
     disk_floor_gb: float = 2.0
     max_book_levels: int = 10
@@ -182,6 +185,7 @@ class CaptureConfig:
                 "fill_poll_seconds": self.fill_poll_seconds,
                 "edge_seconds": self.edge_seconds,
                 "var_quote_seconds": self.var_quote_seconds,
+        "var_bridge_enabled": self.var_bridge_enabled,
             },
             "retention_days": self.retention_days,
             "disk_floor_gb": self.disk_floor_gb,
@@ -245,6 +249,7 @@ def load_config(args: Any | None = None, env: dict[str, str] | None = None) -> C
         fill_poll_seconds=max(1.0, float(getattr(args, "fill_poll_seconds", 2.0))),
         edge_seconds=max(0.5, float(getattr(args, "edge_seconds", 1.0))),
         var_quote_seconds=max(0.0, float(getattr(args, "var_quote_seconds", 1.0))),
+    var_bridge_enabled=not bool(getattr(args, "no_var_bridge", False)),
         retention_days=max(1, int(getattr(args, "retention_days", 14))),
         disk_floor_gb=max(0.0, float(getattr(args, "disk_floor_gb", 2.0))),
         max_book_levels=max(1, int(getattr(args, "max_book_levels", 10))),

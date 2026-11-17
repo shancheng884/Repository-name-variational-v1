@@ -127,7 +127,7 @@ class CaptureRunner:
                 self.venues["variational"] = VariationalPriceFeed(
                     ws_url=config.var_ws_url, assets=assets, writer=self.writer, hub=self.hub, logger=self.logger,
                 )
-                if config.var_quote_seconds > 0:
+                if config.var_bridge_enabled and config.var_quote_seconds > 0:
                     self.venues["variational_indicative"] = VariationalIndicativeFeed(
                         command_url=config.var_command_url,
                         assets=assets,
@@ -137,11 +137,12 @@ class CaptureRunner:
                         logger=self.logger,
                         interval_seconds=config.var_quote_seconds,
                     )
-                self.venues["variational_fills"] = VariationalFillFeed(
-                    command_url=config.var_command_url, assets=assets, writer=self.writer,
-                    auditor=self.auditor, interval=max(5.0, config.fill_poll_seconds * 2),
-                    accept_after=self.started_at - timedelta(seconds=30), logger=self.logger,
-                )
+                if config.var_bridge_enabled:
+                    self.venues["variational_fills"] = VariationalFillFeed(
+                        command_url=config.var_command_url, assets=assets, writer=self.writer,
+                        auditor=self.auditor, interval=max(5.0, config.fill_poll_seconds * 2),
+                        accept_after=self.started_at - timedelta(seconds=30), logger=self.logger,
+                    )
             except Exception as exc:
                 self._venue_error("variational", exc)
         if config.venue_enabled.get("lighter_mainnet"):

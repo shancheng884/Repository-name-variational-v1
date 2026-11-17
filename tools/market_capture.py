@@ -40,6 +40,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--disk-floor-gb", type=float, default=2.0)
     parser.add_argument("--max-book-levels", type=int, default=10)
     parser.add_argument("--duration-seconds", type=float, default=0.0)
+    parser.add_argument("--no-var-bridge", action="store_true",
+                        help="skip the Variational indicative/fills feeds that need the local Chrome bridge")
     parser.add_argument("--no-variational", action="store_true")
     parser.add_argument("--no-lighter-mainnet", action="store_true")
     parser.add_argument("--no-lighter-rh", action="store_true")
