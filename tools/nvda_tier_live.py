@@ -491,6 +491,9 @@ async def main_async(args):
     close_failures = {}
     open_block_until = 0.0
     last_save = 0.0
+    # Keep a recent incident visible instead of letting the next sample's
+    # "running" overwrite it; last_block keeps the detail for the journal.
+    degraded = {"status": None, "until": 0.0}
     exchange = await snapshot(ex, asset, venues)
     snap_at = time.time()
     try:
@@ -637,6 +640,8 @@ async def main_async(args):
                                          "tier": action.get("tier"), "receipts": receipts,
                                          "settle": check, "recovery": recovery,
                                          "realized_usd": str(realized), "rebate_usd": str(rebate)})
+                            degraded = {"status": "open_not_hedged" if recovery.get("ok") else "blocked_position_mismatch",
+                                        "until": time.time() + 60.0}
                             record_block("open_not_hedged" if recovery.get("ok") else "open_position_mismatch",
                                          direction=action.get("direction"), tier=action.get("tier"),
                                          receipts=receipts, settle=check, recovery=recovery)
@@ -705,6 +710,7 @@ async def main_async(args):
                                          "receipts": receipts, "settle": check,
                                          "attempts": close_failures[action["tier"]],
                                          "realized_usd": str(realized), "rebate_usd": str(rebate)})
+                            degraded = {"status": "blocked_position_mismatch", "until": time.time() + 60.0}
                             record_block("close_position_mismatch", direction=action.get("direction"),
                                          tier=action["tier"], settle=check,
                                          attempts=close_failures[action["tier"]])
@@ -731,7 +737,10 @@ async def main_async(args):
                 save_engine_state(asset=symbol, pair=args.pair, tiers=tiers, engines=engines,
                                   realized=realized, rebate=rebate, equity=equity, history=history)
                 last_save = time.time()
-            write_state({"status": "running" if args.mode == "live" else "observe",
+            status = "running" if args.mode == "live" else "observe"
+            if degraded["status"] and time.time() < degraded["until"]:
+                status = degraded["status"]
+            write_state({"status": status,
                          "pair": args.pair, "equity": equity,
                          "slot_caps": caps, "cumulative_notional": ladder, "tiers": tiers,
                          "child_notional": args.child_notional, "leverage": leverage,
