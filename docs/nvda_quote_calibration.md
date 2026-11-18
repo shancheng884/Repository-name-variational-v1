@@ -58,3 +58,18 @@ Order receipts keep `time_alignment`, `depth_audit`, `confirmation_source` and
 `fill_details_source`. The state exposes stream connectivity and raw versus
 aligned edges. These changes do not imply the measured IOC execution delay or
 adverse selection has disappeared; real P&L must still be evaluated separately.
+
+## Stale packet and rollback recovery
+
+The existing receive-age budgets also apply to source time (RH 3 seconds,
+Entropy 6 seconds), including historical legs selected during alignment.
+Missing or inconsistent timestamps are rejected; invalid raw packets clear
+the confirmation window. Transport backlog cannot turn an old packet into a
+fresh signal merely by giving it a recent receive time.
+
+An unsuccessful emergency unwind can submit at most three reduce-only orders
+per leg with the existing 30 bps limit. Each retry uses a new book and order
+ID, and requires a verified, order-free position matching the remaining
+confirmed exposure. A partial fill reduces the next quantity. Unknown order
+results, inconsistent quantities or a failed recovery keep the strategy
+blocked instead of replaying the paired order.

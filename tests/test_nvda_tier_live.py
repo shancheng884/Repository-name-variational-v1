@@ -139,9 +139,14 @@ def test_position_qty_needs_a_verified_read():
 
     class Plain:
         async def positions(self, asset):
+            return {"ok": True, "verified": True, "qty": "1.5", "active_orders": 0}
+
+    class OrdersUnknown:
+        async def positions(self, asset, fresh=False):
             return {"ok": True, "verified": True, "qty": "1.5"}
 
     assert asyncio.run(position_qty({"rh": Blind()}, None, "rh")) is None
+    assert asyncio.run(position_qty({"rh": OrdersUnknown()}, None, "rh")) is None
     # A legacy executor without the fresh flag still works.
     assert asyncio.run(position_qty({"rh": Plain()}, None, "rh")) == Decimal("1.5")
 

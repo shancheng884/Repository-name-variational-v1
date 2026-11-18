@@ -797,7 +797,7 @@ class EntropyProbeExecutor:
         if isinstance(receipt,dict) and receipt.get("execution_quote") is None:
             receipt["execution_quote"]=getattr(self,"_last_exec_quote",None)
         return _stamp_receipt(receipt)
-    async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8"),known_position_before=None):
+    async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8"),known_position_before=None,retry_rate_limit=True):
         if not self.available or self.exchange is None: return {"ok":False,"status":"rejected","error":self.reason or "entropy_credentials_missing","client_order_id":client_order_id}
         qty=self.normalize_qty(asset,qty)
         if not qty: return {"ok":False,"status":"rejected","error":"entropy_qty_below_min","client_order_id":client_order_id}
@@ -832,7 +832,7 @@ class EntropyProbeExecutor:
             except Exception as exc:
                 # The cloid is the order identity: a retry either replays the
                 # same order or is rejected as a duplicate, never doubles it.
-                if _is_rate_limit(exc) and attempts<4:
+                if retry_rate_limit and _is_rate_limit(exc) and attempts<4:
                     await asyncio.sleep(0.5*attempts)
                     continue
                 return {"ok":False,"status":"unknown","error":f"{type(exc).__name__}:{exc}","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"submit_attempts":attempts}

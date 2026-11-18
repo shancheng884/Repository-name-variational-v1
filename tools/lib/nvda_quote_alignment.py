@@ -2,21 +2,44 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
 from pathlib import Path
 
 BASIS = "source_time_aligned_v1"
+MAX_FUTURE_SKEW_SECONDS = 0.25
+
+
+def quote_max_age(venue):
+    return 6.0 if venue == "entropy" else 3.0
+
+
+def quote_clock_issue(quote, now):
+    """Receipt recency cannot make an old venue timestamp fresh."""
+    source, received = epoch(quote.get("source_at")), epoch(quote.get("recv_at"))
+    max_age = quote_max_age(quote.get("venue"))
+    if source is None or received is None:
+        return {"reason": "timestamp_missing", "source_at": quote.get("source_at"), "recv_at": quote.get("recv_at")}
+    if min(now - received, received - source) < -MAX_FUTURE_SKEW_SECONDS:
+        reason = "timestamp_in_future"
+    elif now - received > max_age:
+        reason = "receive_time_expired"
+    elif now - source > max_age:
+        reason = "source_time_expired"
+    else:
+        return None
+    return {"reason": reason, "source_age_ms": round((now-source)*1000, 3),
+            "recv_age_ms": round((now-received)*1000, 3), "max_age_ms": int(max_age*1000)}
 
 
 def epoch(value):
     if isinstance(value, datetime):
-        return value.timestamp()
+        return value.timestamp() if value.tzinfo is not None else None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
-    except (ValueError, TypeError):
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.timestamp() if parsed.tzinfo is not None else None
+    except (ValueError, TypeError, OverflowError, OSError):
         return None
 
 
@@ -70,13 +93,15 @@ class QuoteClock:
         return None
 
     def align(self, left, right, *, now):
+        if any(quote_clock_issue(q, now) for q in (left, right)):
+            return None
         sources = [epoch(q.get("source_at")) for q in (left, right)]
         if any(t is None for t in sources):
             return None
         target = min(sources)
         pair = [self.as_of(q["venue"], q["symbol"], target, received_by=now)
                 for q in (left, right)]
-        if any(q is None for q in pair):
+        if any(q is None or quote_clock_issue(q, now) for q in pair):
             return None
         version = tuple((epoch(q.get("source_at")), q.get("sequence"),
                          Decimal(str(q["executable_buy"])), Decimal(str(q["executable_sell"]))) for q in pair)
@@ -115,8 +140,6 @@ def seed_aligned_history(history, out_dir, venues, asset, window_seconds, *, now
         if previous is None or (epoch(row.get("source_at")) or 0) >= (epoch(previous.get("source_at")) or 0):
             latest[row["venue"]] = row
         if received < cutoff or any(v not in latest for v in venues) or int(received) == last_second:
-            continue
-        if any(received - epoch(latest[v]["recv_at"]) > (6 if v == "entropy" else 3) for v in venues):
             continue
         aligned = clock.align(*(latest[v] for v in venues), now=received)
         if aligned is None:
