@@ -450,17 +450,18 @@ def test_1735_nvda_trade_is_not_closed_by_a_signal_only_edge():
     ledger = PositionLedger()
     engine = TierEngine(config=_cfg_real_exit(), ledger=ledger)
     _book_reverse(engine)
-    mark = ExitMark(buy_price=161.28, sell_price=161.38, source="latest")
+    # The executable close book at the decision was entropy 161.17 / RH 161.38.
+    mark = ExitMark(buy_price=161.17, sell_price=161.38, source="aligned")
     actions = engine.on_sample(stamp=11.0, edge=-16.740552438230463, baseline=-9.950248756218905,
                                price_hint=161.3, window=[-16.7, -16.7, -16.7],
                                exchange=exchange_from(ledger, venues=("lighter_rh", "entropy")),
                                raw_edge=-16.121031746031747, exit_marks={1: [mark]})
     assert [a for a in actions if a["action"] == "close"] == []
     audit = engine.last_exit_eval[1]
-    assert round(audit["gross_bps"], 2) == -3.10
+    assert round(audit["gross_bps"], 2) == 3.72
     assert round(audit["entry_fee_bps"], 2) == 0.89
     assert round(audit["exit_fee_bps"], 2) == 0.89
-    assert round(audit["net_bps"], 2) < -10.0
+    assert round(audit["net_bps"], 2) == -4.04
 
 
 def test_exit_cost_breakdown_charges_each_item_exactly_once():
