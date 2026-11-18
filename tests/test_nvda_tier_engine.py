@@ -367,3 +367,41 @@ def test_pending_child_survives_restart_and_prevents_a_duplicate():
     assert other.pending_action == engine.pending_action
     assert other.on_sample(stamp=1, edge=10, baseline=0, price_hint=100,
                            window=[10, 10], exchange=exchange_from(ledger)) == []
+
+def _cfg_exit_gate(exit_cost=5.14, target=1.0):
+    return TierConfig(asset="NVDA", buy_venue="entropy", sell_venue="lighter_mainnet",
+                      tiers=(TierSpec(1, 6.14),), notional_usd=20.0, child_notional_usd=20.0,
+                      timeout_seconds=None, exit_cost_bps=exit_cost,
+                      profit_target_bps=target)
+
+
+def test_a_reverted_spread_is_not_enough_when_exit_costs_are_locked():
+    """The new exit needs convergence that pays P80 slippage plus the target."""
+    ledger = PositionLedger()
+    engine = TierEngine(config=_cfg_exit_gate(), ledger=ledger)
+    first = engine.on_sample(stamp=0, edge=12.0, baseline=5.0, price_hint=160.0,
+                             window=[12.0, 12.0, 12.0], exchange=exchange_from(ledger))
+    action = [a for a in first if a["action"] == "open"][0]
+    engine.confirm_open(action, qty=D(str(action["qty"])))
+    # Only 4.8 bps of convergence: the exit cost is not covered yet.
+    early = engine.on_sample(stamp=1, edge=7.2, baseline=5.0, price_hint=160.0,
+                             window=[7.2, 7.2, 7.2], exchange=exchange_from(ledger))
+    assert [a for a in early if a["action"] == "close"] == []
+    # 6.5 bps of convergence pays 5.14 exit slippage plus 1 bps profit, even
+    # though the spread has not fully reverted to the anchor.
+    paid = engine.on_sample(stamp=2, edge=5.5, baseline=5.0, price_hint=160.0,
+                            window=[5.5, 5.5, 5.5], exchange=exchange_from(ledger))
+    closes = [a for a in paid if a["action"] == "close"]
+    assert len(closes) == 1
+    assert closes[0]["reason"] == "target"
+    assert round(closes[0]["net_bps"], 2) == 1.36
+
+
+def test_fixed_margin_150_gives_the_same_ladder_on_both_venues():
+    cfg = TierConfig(asset="NVDA", buy_venue="entropy", sell_venue="lighter_rh",
+                     tiers=tuple(TierSpec(i, 6.0 + i) for i in range(1, 6)),
+                     child_notional_usd=20.0, max_equity_multiple=5.0,
+                     equity_usd={"entropy": 150.0, "lighter_rh": 150.0})
+    assert cfg.slot_caps() == (7, 15, 22, 30, 37)
+    assert [cfg.tier_target_notional_usd(i) for i in range(1, 6)] == [140.0, 300.0, 440.0, 600.0, 740.0]
+

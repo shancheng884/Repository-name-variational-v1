@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NVDA five-tier live runner (entropy vs one Lighter book).
+"""Five-tier live runner (entropy vs one Lighter book).
 
 Standalone: main.py is untouched. Observe mode is the default; live orders need
 explicit flags.  A failed leg is flattened immediately instead of leaving a
@@ -32,10 +32,20 @@ STATE = ROOT / "log" / "nvda_tier_live_state.json"
 ENGINE_STATE = ROOT / "log" / "nvda_tier_live_engine.json"
 BLOCK_LOG = ROOT / "log" / "nvda_tier_blockers.jsonl"
 ORDER_LOG = ROOT / "log" / "nvda_tier_orders.jsonl"
+CAPTURE_DIR = ROOT / "log" / "nvda_tier_live_capture"
 ENGINE_STATE_VERSION = 2
 
 LAST_BLOCK: dict = {}
 _BLOCK_WRITTEN_AT: dict = {}
+
+
+def configure_run_paths(run_dir: Path) -> None:
+    global STATE, ENGINE_STATE, BLOCK_LOG, ORDER_LOG, CAPTURE_DIR
+    STATE = run_dir / "state.json"
+    ENGINE_STATE = run_dir / "engine.json"
+    BLOCK_LOG = run_dir / "blockers.jsonl"
+    ORDER_LOG = run_dir / "orders.jsonl"
+    CAPTURE_DIR = run_dir / "capture"
 
 
 def _iso(ts: float | None = None) -> str:
@@ -147,6 +157,16 @@ async def venue_equity(ex, asset, venues):
             value = None
         out[venue] = value
     return out
+
+
+async def verify_leverage(executor, asset, expected):
+    observed = await executor.account_state(asset)
+    actual = _d(observed.get("leverage"))
+    target = _d(expected)
+    if not observed.get("ok") or actual is None or target is None or abs(actual - target) >= Decimal("0.05"):
+        return {"ok": False, "leverage": observed.get("leverage"), "expected": expected,
+                "error": observed.get("error") or "leverage_mismatch"}
+    return {"ok": True, "changed": False, "leverage": float(actual), "expected": expected}
 
 
 def common_qty(ex, asset, venues, qty):
@@ -371,7 +391,9 @@ def _build_engine(asset_name, buy_venue, sell_venue, tiers, equity, args, ledger
                      tiers=tuple(TierSpec(i, t) for i, t in enumerate(tiers, start=1)),
                      child_notional_usd=args.child_notional,
                      equity_usd=equity, notional_usd=args.notional,
-                     timeout_seconds=None, slippage_bps=args.slippage_bps)
+                     timeout_seconds=None, slippage_bps=args.slippage_bps,
+                     exit_cost_bps=getattr(args, "exit_cost_bps", None),
+                     profit_target_bps=getattr(args, "profit_target_bps", 1.0))
     return cfg, TierEngine(config=cfg, ledger=ledger)
 
 
@@ -552,13 +574,31 @@ async def main_async(args):
     for executor in ex.values():
         await executor.start()
     leverage = {}
-    if args.mode == "live" and args.rh_leverage > 0 and "lighter_rh" in venues:
-        leverage["lighter_rh"] = await ex["lighter_rh"].ensure_leverage(asset, args.rh_leverage)
+    required_leverage = getattr(args, "verify_rh_leverage", None)
+    if args.mode == "live" and "lighter_rh" in venues and (required_leverage or args.rh_leverage > 0):
+        if required_leverage:
+            leverage["lighter_rh"] = await verify_leverage(ex["lighter_rh"], asset, required_leverage)
+        else:
+            leverage["lighter_rh"] = await ex["lighter_rh"].ensure_leverage(asset, args.rh_leverage)
         if not leverage["lighter_rh"].get("ok"):
             write_state({"status": "blocked_leverage", "pair": args.pair, "leverage": leverage})
             record_block("leverage_not_confirmed", leverage=leverage)
             return {"ok": False, "error": "leverage_not_confirmed", "leverage": leverage}
-    equity = await venue_equity(ex, asset, venues)
+    equity_actual = await venue_equity(ex, asset, venues)
+    equity = dict(equity_actual)
+    # The two control groups run on a fixed per-venue margin instead of the
+    # live account balance, so both ladders are directly comparable.
+    margin_usd = getattr(args, "margin_usd", None)
+    if margin_usd is not None:
+        fixed = float(margin_usd)
+        short = {v: equity_actual.get(v) for v in venues
+                 if not (equity_actual.get(v) or 0) >= fixed}
+        if short:
+            write_state({"status": "blocked_margin", "pair": args.pair,
+                         "margin_usd": fixed, "equity_actual": equity_actual})
+            record_block("fixed_margin_unavailable", margin_usd=fixed, equity=equity_actual)
+            return {"ok": False, "error": "fixed_margin_unavailable", "equity": equity_actual}
+        equity = {v: fixed for v in venues}
     ledger = PositionLedger()
     cfg_forward, engine_forward = _build_engine(symbol, buy, sell, tiers_forward, equity, args, ledger)
     cfg_reverse, engine_reverse = _build_engine(symbol, sell, buy, tiers_reverse, equity, args, ledger)
@@ -574,7 +614,7 @@ async def main_async(args):
     history = {"forward": deque(maxlen=20000), "reverse": deque(maxlen=20000)}
     history.update(aligned_forward=deque(maxlen=20000), aligned_reverse=deque(maxlen=20000))
     aligned_history = {key: history["aligned_" + key] for key in ("forward", "reverse")}
-    out_dir = ROOT / "log" / "nvda_tier_live_capture"
+    out_dir = CAPTURE_DIR
     saved = load_engine_state(ENGINE_STATE)
     execution_stats = new_execution_stats((saved or {}).get("execution_stats"))
     restored = False
@@ -601,10 +641,13 @@ async def main_async(args):
                     if ts >= cutoff:
                         history[key].append((ts, float(row[1])))
         restored = bool(engine_forward.open_tiers or engine_reverse.open_tiers)
-    if not history["forward"] and not history["reverse"]:
-        seed_history_from_edges(history, out_dir, args.pair, asset.name, window_seconds)
-    if not all(aligned_history.values()):
-        seed_aligned_history(aligned_history, out_dir, venues, symbol, window_seconds, now=time.time())
+    for seed_dir in (out_dir, getattr(args, "seed_capture_dir", None)):
+        if seed_dir is None:
+            continue
+        if not history["forward"] and not history["reverse"]:
+            seed_history_from_edges(history, seed_dir, args.pair, asset.name, window_seconds)
+        if not all(aligned_history.values()):
+            seed_aligned_history(aligned_history, seed_dir, venues, symbol, window_seconds, now=time.time())
 
     # A restart must start from the real account, never from an assumed flat book.
     startup = await position_snapshot(ex, asset, venues)
@@ -628,6 +671,10 @@ async def main_async(args):
             problems.append({"venue": venue, "error": "ledger_mismatch",
                              "expected": str(expected), "actual": str(actual)})
     write_state({"status": "starting", "pair": args.pair, "equity": equity,
+                 "equity_actual": equity_actual,
+                 "equity_source": "fixed_margin" if margin_usd is not None else "live",
+                 "exit_rule": {"exit_cost_bps": getattr(args, "exit_cost_bps", None),
+                               "profit_target_bps": getattr(args, "profit_target_bps", 1.0)},
                  "slot_caps": caps, "cumulative_notional": ladder, "tiers": tiers,
                  "child_notional": args.child_notional, "leverage": leverage,
                  "restored": restored, "realized_usd": str(realized),
@@ -1107,6 +1154,10 @@ async def main_async(args):
                          "pair": args.pair, "equity": equity,
                          "slot_caps": caps, "cumulative_notional": ladder, "tiers": tiers,
                          "child_notional": args.child_notional, "leverage": leverage,
+                         "equity_actual": equity_actual,
+                         "equity_source": "fixed_margin" if getattr(args, "margin_usd", None) is not None else "live",
+                         "exit_rule": {"exit_cost_bps": getattr(args, "exit_cost_bps", None),
+                                       "profit_target_bps": getattr(args, "profit_target_bps", 1.0)},
                          "quote_basis": BASIS, "time_alignment": alignment_audit,
                          "legacy_exit_only": legacy,
                          "entropy_fill_stream": ({"connected": fill_stream.connected,
@@ -1154,24 +1205,44 @@ async def main_async(args):
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--asset", default="NVDA")
+    parser.add_argument("--run-dir", type=Path, help="isolated state, order journal and capture directory")
+    parser.add_argument("--seed-capture-dir", type=Path, help="optional read-only public quote history")
     parser.add_argument("--pair", default="entropy>lighter_mainnet")
     parser.add_argument("--tiers", default="7.77,8.36,9.60,11.21,13.84")
     parser.add_argument("--tiers-reverse", default="")
     parser.add_argument("--notional", type=float, default=20.0)
     parser.add_argument("--child-notional", type=float, default=20.0)
     parser.add_argument("--slippage-bps", type=float, default=1.3)
+    parser.add_argument("--exit-cost-bps", type=float, default=None,
+                        help="locked exit slippage (P80); closes need this plus the profit target")
+    parser.add_argument("--profit-target-bps", type=float, default=1.0)
+    parser.add_argument("--margin-usd", type=float, default=None,
+                        help="fixed per-venue margin for capacity sizing, verified against the account")
     parser.add_argument("--baseline-minutes", type=float, default=30.0)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     parser.add_argument("--max-loss-usd", type=float, default=3.0)
     parser.add_argument("--rh-leverage", type=float, default=20.0,
                         help="leverage to set and verify on lighter_rh before any order")
+    parser.add_argument("--verify-rh-leverage", type=float,
+                        help="verify existing leverage without changing it (requires --rh-leverage 0)")
     parser.add_argument("--mode", choices=("observe", "live"), default="observe")
     parser.add_argument("--confirm-flat", action="store_true")
     parser.add_argument("--i-understand-live-orders", action="store_true")
     args = parser.parse_args(argv)
+    if args.asset != "NVDA" and args.run_dir is None:
+        parser.error("--run-dir is required for non-NVDA assets")
+    if args.verify_rh_leverage is not None and not (args.verify_rh_leverage > 0 and args.rh_leverage == 0):
+        parser.error("--verify-rh-leverage needs a positive value and --rh-leverage 0")
     if args.mode == "live" and not (args.confirm_flat and args.i_understand_live_orders):
         raise SystemExit("live mode needs --confirm-flat and --i-understand-live-orders")
-    guard = _acquire_lock(ROOT / "log" / "nvda_tier_live.lock")
+    run_dir = args.run_dir.resolve() if args.run_dir is not None else None
+    if run_dir is not None:
+        configure_run_paths(run_dir)
+        # One lock per run directory: NVDA and SNDK are independent strategies.
+        lock_path = run_dir / "live.lock"
+    else:
+        lock_path = ROOT / "log" / "nvda_tier_live.lock"
+    guard = _acquire_lock(lock_path)
     try:
         result = asyncio.run(main_async(args))
     finally:

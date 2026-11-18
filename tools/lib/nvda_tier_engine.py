@@ -58,6 +58,11 @@ class TierConfig:
     confirm_window: int = 3
     confirm_min: int = 2
     slippage_bps: float = 1.3
+    # When set, a position only closes after the spread has converged far
+    # enough to pay the measured exit slippage and still keep the profit
+    # target.  ``None`` keeps the legacy "back to the frozen anchor" exit.
+    exit_cost_bps: float | None = None
+    profit_target_bps: float = 1.0
 
     def slot_caps(self) -> tuple[int, ...] | None:
         """Cumulative child slots per tier, mirroring main.py's 5x hard cap."""
@@ -271,19 +276,29 @@ class TierEngine:
                 # Already waiting on a venue fill; do not queue a second close.
                 continue
             exit_edge = raw_edge if pos.signal_basis == "raw_v1" and raw_edge is not None else edge
-            reverted = exit_edge <= pos.frozen_baseline
-            # timeout_seconds=None keeps the tier open until it reverts.
+            converged = pos.entry_edge - exit_edge
+            if self.config.exit_cost_bps is None:
+                # Legacy rule: wait for the spread to come back to its anchor.
+                target_hit = exit_edge <= pos.frozen_baseline
+                net_bps = converged - self.config.slippage_bps
+            else:
+                # Pay the locked exit slippage out of the convergence and keep
+                # the profit target; a merely "reverted" spread is not enough.
+                target_hit = converged >= (self.config.exit_cost_bps
+                                           + self.config.profit_target_bps)
+                net_bps = converged - self.config.exit_cost_bps
+            # timeout_seconds=None keeps the tier open until it pays.
             expired = (self.config.timeout_seconds is not None
                        and stamp - pos.opened_at >= self.config.timeout_seconds)
-            if not (reverted or expired):
+            if not (target_hit or expired):
                 continue
-            net_bps = (pos.entry_edge - exit_edge) - self.config.slippage_bps
             lot = self._lots(pos)[0]
             fraction = min(1.0, self.config.child_notional_usd / lot["notional_usd"])
             pos.closing = True
             actions.append({"action": "close", "tier": index,
                             "token": uuid.uuid4().hex,
-                            "reason": "reverted" if reverted else "timeout",
+                            "reason": ("reverted" if self.config.exit_cost_bps is None
+                                       else "target") if target_hit else "timeout",
                             "net_bps": net_bps, "qty": lot["qty"] * fraction,
                             "notional_usd": lot["notional_usd"] * fraction,
                             "entry_buy_price": lot.get("entry_buy_price"),
