@@ -73,3 +73,13 @@ ID, and requires a verified, order-free position matching the remaining
 confirmed exposure. A partial fill reduces the next quantity. Unknown order
 results, inconsistent quantities or a failed recovery keep the strategy
 blocked instead of replaying the paired order.
+
+## Entropy write timing
+
+Each SDK order attempt logs worker start, completed signing, HTTP write-path
+entry, completed local TLS request write and decoded SDK response. The local
+markers also have monotonic nanoseconds for measuring durations. The write
+timestamp does not establish exchange ingress or block ordering. A failed or
+uninstrumented transport does not receive a fabricated successful write time.
+Matched fill details carry the exchange's first and last fill timestamps
+separately; missing exchange timestamps are never replaced with ACK time.

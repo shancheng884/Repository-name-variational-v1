@@ -8,6 +8,7 @@ from typing import Any, Protocol
 import asyncio, hashlib, inspect, json, math, os, time, uuid
 import requests
 from tools.lib.hedge_instruments import iter_positions, lighter_position_qty
+from tools.lib.entropy_order_timing import instrumented_exchange, timed_order
 from tools.lib.lighter_order_identity import lighter_client_order_index
 from tools.lib.wti_readonly_adapter import VariationalForwarderClient
 ZERO=Decimal("0"); BPS=Decimal("10000")
@@ -661,7 +662,7 @@ class EntropyProbeExecutor:
             from hyperliquid.utils import constants
             base_url=self.info_url or constants.MAINNET_API_URL
             self.info=Info(base_url,skip_ws=True,perp_dexs=[self.dex])
-            self.exchange=Exchange(Account.from_key(self.private_key),base_url,account_address=self.account_address,perp_dexs=[self.dex])
+            self.exchange=instrumented_exchange(Exchange,Account.from_key(self.private_key),base_url,account_address=self.account_address,perp_dexs=[self.dex])
         self.meta=await asyncio.to_thread(self.info.meta,self.dex)
         self.universe={str(row.get("name")):dict(row) for row in (self.meta or {}).get("universe",[]) if isinstance(row,dict)}
         if not self.universe: raise ProbeError("entropy_meta_universe_missing")
@@ -685,6 +686,7 @@ class EntropyProbeExecutor:
             fee = sum((_d(row.get("fee")) or ZERO for row in rows), ZERO)
             receipt["fee_usd"] = str(fee * Decimal(receipt.get("fee_allocation_ratio") or "1"))
             receipt["fee_pending"] = False
+            receipt.update({k: v for k, v in self._exchange_fill_times(rows).items() if v is not None})
         return receipt
     def _row(self,asset):
         row=self.universe.get(self._coin(asset))
@@ -793,11 +795,14 @@ class EntropyProbeExecutor:
         decimals=max(0,6-szd)
         return float(round(float(f"{float(px):.5g}"),decimals))
     async def market_order(self,**kwargs):
-        receipt=await self._market_order(**kwargs)
+        attempts = []
+        receipt=await self._market_order(**kwargs, timing_attempts=attempts)
+        if attempts:
+            receipt["order_timing_attempts"] = attempts
         if isinstance(receipt,dict) and receipt.get("execution_quote") is None:
             receipt["execution_quote"]=getattr(self,"_last_exec_quote",None)
         return _stamp_receipt(receipt)
-    async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8"),known_position_before=None,retry_rate_limit=True):
+    async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8"),known_position_before=None,retry_rate_limit=True,timing_attempts=None):
         if not self.available or self.exchange is None: return {"ok":False,"status":"rejected","error":self.reason or "entropy_credentials_missing","client_order_id":client_order_id}
         qty=self.normalize_qty(asset,qty)
         if not qty: return {"ok":False,"status":"rejected","error":"entropy_qty_below_min","client_order_id":client_order_id}
@@ -826,10 +831,14 @@ class EntropyProbeExecutor:
         result=None; attempts=0
         while True:
             attempts+=1
+            timing = {"attempt": attempts}
+            if timing_attempts is not None:
+                timing_attempts.append(timing)
             try:
-                result=await asyncio.to_thread(self.exchange.order,coin,side=="buy",float(qty),limit_px,{"limit":{"tif":"Ioc"}},reduce_only=bool(reduce_only),cloid=cloid)
+                result=await asyncio.to_thread(timed_order,timing,self.exchange.order,coin,side=="buy",float(qty),limit_px,{"limit":{"tif":"Ioc"}},reduce_only=bool(reduce_only),cloid=cloid)
                 break
             except Exception as exc:
+                timing["error_type"] = type(exc).__name__
                 # The cloid is the order identity: a retry either replays the
                 # same order or is rejected as a duplicate, never doubles it.
                 if retry_rate_limit and _is_rate_limit(exc) and attempts<4:
@@ -886,9 +895,11 @@ class EntropyProbeExecutor:
                     continue
                 fee=(sum((_d(row.get("fee")) or ZERO for row in rows),ZERO)
                      if all(row.get("fee") is not None for row in rows) else None)
-                last=max((_parse_epoch_ms(row.get("time")) for row in rows),default=None)
+                exchange_times = self._exchange_fill_times(rows)
+                last = _parse(exchange_times["exchange_last_fill_at"])
                 return {"ok":True,"status":"filled","filled_qty":str(qty_sum),"avg_price":str(notional/qty_sum) if qty_sum else None,"fee_usd":str(fee) if fee is not None else None,"order_id":str(rows[0].get("oid") or ""),"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":last.isoformat() if last else None,"source_at_epoch":last.timestamp() if last else None,"raw_status":status,
                         "confirmation_source":"exchange_ack" if ack_fill else details_source,
+                        **exchange_times,
                         "fill_details_source":details_source, "ack_fill":ack_fill, "fee_pending":fee is None}
             await asyncio.sleep(delay)
             delay=min(delay*1.5,0.5)
@@ -896,6 +907,7 @@ class EntropyProbeExecutor:
             return {"ok": True, "status": "filled", **ack_fill, "fee_usd": None,
                     "fee_pending": True, "cloid": str(cloid), "submitted_at": submitted.isoformat(),
                     "acked_at": acked.isoformat(), "source_at": None, "source_at_epoch": None,
+                    "exchange_first_fill_at": None, "exchange_last_fill_at": None,
                     "confirmation_source": "exchange_ack", "fill_details_source": "unavailable"}
         if not reduce_only and before_qty is not None and known_position_before is None:
             # A pre-existing position is not evidence that THIS order filled.
@@ -918,6 +930,13 @@ class EntropyProbeExecutor:
             if delta!=ZERO and (delta>0)==(expected_sign>0) and abs(delta)<=abs(qty)*Decimal("1.5"):
                 return {"ok":True,"status":"filled","filled_qty":str(abs(delta)),"avg_price":str(entry) if entry else None,"fee_usd":None,"order_id":None,"cloid":str(cloid),"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"source_at":None,"source_at_epoch":None,"raw_status":"position_delta","partial":True,"position_before":str(before_qty),"position_after":str(qty_now)}
         return {"ok":False,"status":"unknown","error":"entropy_fill_timeout","client_order_id":client_order_id,"submitted_at":submitted.isoformat(),"acked_at":acked.isoformat(),"cloid":str(cloid)}
+    @staticmethod
+    def _exchange_fill_times(rows):
+        times = [_parse_epoch_ms(row.get("time")) for row in rows]
+        if not times or any(t is None for t in times):
+            return {"exchange_first_fill_at": None, "exchange_last_fill_at": None}
+        return {"exchange_first_fill_at": _iso(min(times)), "exchange_last_fill_at": _iso(max(times))}
+
     @staticmethod
     def _ack_fill(result, requested):
         try:
