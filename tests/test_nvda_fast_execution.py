@@ -5,7 +5,9 @@ from decimal import Decimal as D
 
 from tools.lib.nvda_execution_stats import (closed_child_result, failed_entry_result,
                                            hedged_entry_result, new_execution_stats, record_attempt)
-from tools.nvda_tier_live import common_qty, place_pair, rollback_entry, settle_positions
+from tools.lib.venue_probe import EntropyProbeExecutor
+from tools.nvda_tier_live import (close_repair_id, common_qty, pair_order_id, place_pair,
+                                 rollback_entry, settle_close, settle_positions)
 from tests.test_nvda_tier_live import _EntropyAsset, _EntropyInfo, _entropy_executor
 
 
@@ -130,6 +132,96 @@ def test_close_recovery_is_included_in_child_pnl_and_rebate_is_separate():
     assert pnl["complete"]
     assert D(pnl["gross_usd"]) == D(".2")
     assert D(pnl["net_usd"]) == D(".18")
+
+
+def test_close_rejection_repairs_entropy_before_any_rate_limited_rh_read():
+    events = []
+    token = "single-leg"
+    pending = {}
+    class Entropy:
+        def normalize_qty(self, asset, qty):
+            return qty
+
+        async def market_order(self, **kw):
+            events.append("entropy-order")
+            assert kw["reduce_only"] and kw["qty"] == D(".126")
+            assert kw["known_position_before"] == D("-.126")
+            assert kw["retry_rate_limit"] is False
+            cid = close_repair_id(token, "buy", 1)
+            assert kw["client_order_id"] == cid
+            assert pending["close_corrections"][0]["receipt"]["status"] == "unknown"
+            return {**fill(".126", "154.5", ".001752"), "order_id": "ent-fix",
+                    "cloid": str(EntropyProbeExecutor._cloid(cid))}
+
+        async def positions(self, asset, fresh=False):
+            events.append("entropy-read")
+            return {"verified": True, "qty": "0", "active_orders": 0}
+
+    class RH:
+        async def positions(self, asset, fresh=False):
+            events.append("rh-read")
+            if events.count("rh-read") == 1:
+                raise RuntimeError("429")
+            return {"verified": True, "qty": "0", "active_orders": 0}
+
+    rh_fill = {**fill(".126", "158.32"), "order_id": "rh-fill", "is_ask": True,
+               "reduce_only": True, "client_order_id": pair_order_id(token, "sell")}
+    result = asyncio.run(settle_close(
+        {"entropy": Entropy(), "lighter_rh": RH()}, None, "lighter_rh", "entropy", D(".126"),
+        {"lighter_rh": D(".126"), "entropy": D("-.126")},
+        {"entropy": {"status": "rejected", "filled_qty": "0"}, "lighter_rh": rh_fill},
+        token=token, pending=pending, persist=lambda: events.append("persist")))
+    assert result["ok"]
+    assert events[:3] == ["persist", "entropy-order", "persist"]
+    assert events.count("rh-read") == 2
+    assert events.count("entropy-read") == 1
+
+
+def test_unknown_rh_receipt_only_queries_existing_order():
+    token = "rh-unclear"
+    class RH:
+        async def lookup_ioc(self, asset, cid, **kw):
+            assert cid == pair_order_id(token, "buy") and kw["retry_read"]
+            return {**fill(".0244", "808.07"), "order_id": "rh-close", "is_ask": False,
+                    "reduce_only": True, "client_order_id": cid}
+
+        async def positions(self, asset, fresh=False):
+            return {"verified": True, "qty": "-.0491", "active_orders": 0}
+
+    class Entropy:
+        async def positions(self, asset, fresh=False):
+            return {"verified": True, "qty": ".0491", "active_orders": 0}
+
+    ent = {**fill(".0244", "807.22"), "order_id": "ent-close",
+           "cloid": str(EntropyProbeExecutor._cloid(pair_order_id(token, "sell")))}
+    receipts = {"lighter_rh": {"status": "unknown"}, "entropy": ent}
+    result = asyncio.run(settle_close(
+        {"lighter_rh": RH(), "entropy": Entropy()}, None, "entropy", "lighter_rh", D(".0244"),
+        {"lighter_rh": D("-.0735"), "entropy": D(".0735")}, receipts,
+        token=token, pending={}, persist=lambda: None))
+    assert result["ok"] and not result["corrections"]
+    assert receipts["lighter_rh"]["recovered_by"] == "read_only_order_lookup"
+
+
+def test_unknown_repair_never_resubmits_or_reconciles_by_position_alone():
+    token = "pending-repair"
+    class Entropy:
+        def normalize_qty(self, asset, qty):
+            return qty
+
+        async def market_order(self, **kw):
+            assert kw["client_order_id"] == close_repair_id(token, "buy", 1)
+            return {"status": "unknown"}
+
+    rh = {**fill(".126", "158.32"), "order_id": "rh-fill", "is_ask": True,
+          "reduce_only": True, "client_order_id": pair_order_id(token, "sell")}
+    result = asyncio.run(settle_close(
+        {"lighter_rh": object(), "entropy": Entropy()}, None, "lighter_rh", "entropy", D(".126"),
+        {"lighter_rh": D(".126"), "entropy": D("-.126")},
+        {"lighter_rh": rh, "entropy": {"status": "rejected", "filled_qty": "0"}},
+        token=token, pending={}, persist=lambda: None))
+    assert result["error"] == "unresolved_correction"
+    assert len(result["corrections"]) == 1
 
 
 def test_unknown_fill_and_unknown_fee_are_not_reported_as_zero_cost():

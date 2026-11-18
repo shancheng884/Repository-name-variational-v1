@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
 
 from tools.lib.nvda_tier_engine import (ExitMark, PositionLedger, TierConfig, TierEngine,
                                           TierSpec, asset_symbol)
-from tools.lib.venue_probe import EntropyProbeExecutor, LighterProbeExecutor, _d
+from tools.lib.venue_probe import EntropyProbeExecutor, LighterProbeExecutor, _d, _is_rate_limit
 from tools.lib.nvda_quote_alignment import BASIS, quote_clock_issue, quote_max_age, seed_aligned_history
 from tools.lib.nvda_fee_updates import finalize_costs, refresh_open_fees
 from tools.lib.nvda_execution_stats import (closed_child_result, failed_entry_result, hedged_entry_result,
@@ -189,6 +189,8 @@ async def place_pair(ex, asset, buy, sell, qty, *, opening, quotes,
         extra = {}
         if venue == "entropy" and before_positions is not None:
             extra["known_position_before"] = before_positions[venue]
+            if not opening:
+                extra["retry_rate_limit"] = False
         try:
             dispatched = time.time()
             receipt = await ex[venue].market_order(asset=asset, side=side, qty=qty,
@@ -228,6 +230,129 @@ async def position_qty(ex, asset, venue):
     if not isinstance(result, dict) or not result.get("verified") or result.get("active_orders") != 0:
         return None
     return _d(result.get("qty"))
+
+
+def terminal_close_qty(receipt, requested):
+    status = receipt.get("status")
+    qty = _d(receipt.get("filled_qty"))
+    if status == "rejected" and (receipt.get("filled_qty") is None or qty == 0):
+        return Decimal(0)
+    if (status == "filled" and receipt.get("order_id") and receipt_price(receipt) is not None
+            and qty is not None and 0 < qty <= requested):
+        return qty
+    return None
+
+
+def close_repair_id(token, side, attempt):
+    return f"nvda-close-fix-{token[:20]}-{side}-{attempt}"
+
+
+def matches_close_identity(venue, side, receipt, cid):
+    if venue == "entropy" and receipt.get("status") == "filled":
+        return receipt.get("cloid") == str(EntropyProbeExecutor._cloid(cid))
+    if venue == "entropy":
+        return receipt.get("client_order_id") == cid
+    return (receipt.get("client_order_id") == cid and receipt.get("is_ask") is (side == "sell")
+            and receipt.get("reduce_only") is True)
+
+
+async def verify_close_positions(ex, asset, expected):
+    async def one(venue, want):
+        actual, read_error = None, None
+        for delay in (0, .5, 1., 2.):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                row = await asyncio.wait_for(_positions(ex, venue, asset), timeout=2.5)
+                actual = (_d(row.get("qty")) if row.get("verified")
+                          and row.get("active_orders") == 0 else None)
+                read_error = ("rate_limited" if _is_rate_limit(row.get("error"))
+                              else "position_or_orders_unverified") if actual is None else None
+            except Exception as exc:
+                actual, read_error = None, ("rate_limited" if _is_rate_limit(exc) else type(exc).__name__)
+            if actual is not None and abs(actual - want) <= QTY_TOL:
+                break
+        return {"expected": str(want), "actual": None if actual is None else str(actual),
+                "residual": None if actual is None else str(actual - want),
+                "read_error": read_error}
+
+    legs = dict(zip(expected, await asyncio.gather(*(one(v, q) for v, q in expected.items()))))
+    if any(row["actual"] is None for row in legs.values()):
+        return {"ok": False, "error": "position_unreadable", "legs": legs}
+    if any(abs(Decimal(row["residual"])) > QTY_TOL for row in legs.values()):
+        return {"ok": False, "error": "settlement_not_reflected", "legs": legs}
+    return {"ok": True, "legs": legs}
+
+
+async def settle_close(ex, asset, buy, sell, qty, before, receipts, *, token, pending, persist):
+    """Complete only the proven IOC residual; another venue's 429 cannot block it."""
+    sides = {buy: "sell", sell: "buy"}
+    fills = {}
+    corrections = []
+    pending["close_corrections"] = corrections
+    for venue, side in sides.items():
+        receipt = receipts.get(venue) or {}
+        cid = pair_order_id(token, side)
+        filled = terminal_close_qty(receipt, qty)
+        if filled and not matches_close_identity(venue, side, receipt, cid):
+            filled = None
+        if filled is None and venue.startswith("lighter"):
+            try:
+                looked_up = await ex[venue].lookup_ioc(asset, cid, retry_read=True)
+            except Exception:
+                looked_up = {}
+            if matches_close_identity(venue, side, looked_up, cid):
+                proved = terminal_close_qty(looked_up, qty)
+                if proved is not None:
+                    receipts[venue] = {**receipt, **looked_up,
+                                       "recovered_by": "read_only_order_lookup"}
+                    persist()
+                    filled = proved
+        if filled is None:
+            return {"ok": False, "error": "unresolved_order", "corrections": corrections}
+        fills[venue] = filled
+    if not any(fills.values()):
+        return {"ok": False, "error": "close_both_rejected", "corrections": corrections}
+    for venue in sides:
+        actual = before[venue]
+        sign = 1 if venue == buy else -1
+        if actual * sign < qty:
+            return {"ok": False, "error": "close_outside_local_position", "corrections": corrections}
+
+    for venue, side in sides.items():
+        sign = 1 if venue == buy else -1
+        for attempt in (1, 2):
+            remaining = qty - fills[venue]
+            if not remaining:
+                break
+            if ex[venue].normalize_qty(asset, remaining) != remaining:
+                return {"ok": False, "error": "correction_qty_not_tradeable", "corrections": corrections}
+            cid = close_repair_id(token, side, attempt)
+            row = {"venue": venue, "side": side, "qty": str(remaining),
+                   "client_order_id": cid, "receipt": {"status": "unknown"}}
+            corrections.append(row)
+            persist()  # Never replay an intent after a crash.
+            extra = {"known_position_before": before[venue] - sign * fills[venue],
+                     "retry_rate_limit": False} if venue == "entropy" else {}
+            try:
+                receipt = await ex[venue].market_order(
+                    asset=asset, side=side, qty=remaining, quote={}, client_order_id=cid,
+                    reduce_only=True, max_slippage_bps=Decimal("30"), **extra)
+            except Exception as exc:
+                receipt = {"status": "unknown", "error": type(exc).__name__}
+            row["receipt"] = receipt or {"status": "unknown"}
+            persist()
+            filled = terminal_close_qty(row["receipt"], remaining)
+            if filled and not matches_close_identity(venue, side, row["receipt"], cid):
+                filled = None
+            if filled is None:
+                return {"ok": False, "error": "unresolved_correction", "corrections": corrections}
+            fills[venue] += filled
+        if fills[venue] != qty:
+            return {"ok": False, "error": "correction_incomplete", "corrections": corrections}
+
+    expected = {buy: before[buy] - qty, sell: before[sell] + qty}
+    return {**await verify_close_positions(ex, asset, expected), "corrections": corrections}
 
 
 async def settle_positions(ex, asset, venues, expected, *, attempts=3,
@@ -629,26 +754,56 @@ async def recover_pending_close(engine, ex, asset, startup, journal):
             return None
     receipts = dict(action.get("receipts") or logged_close_receipts(
         journal, action, "sell" if buy == "entropy" else "buy"))
-    for venue, side in ((buy, "sell"), (sell, "buy")):
+    corrections = action.get("close_corrections") or []
+    sides = {buy: "sell", sell: "buy"}
+    fills = {}
+    for venue, side in sides.items():
         cid = pair_order_id(action["token"], side)
         receipt = receipts.get(venue) or {}
-        if venue == "entropy":
-            if receipt.get("cloid") != str(EntropyProbeExecutor._cloid(cid)):
+        filled = terminal_close_qty(receipt, qty)
+        if venue.startswith("lighter") and filled is None:
+            try:
+                receipt = await ex[venue].lookup_ioc(asset, cid)
+            except Exception:
                 return None
-        else:
-            if receipt.get("status") != "filled":
-                try:
-                    receipt = await ex[venue].lookup_ioc(asset, cid)
-                except Exception:
-                    return None
-                receipts[venue] = receipt
-            if (receipt.get("client_order_id") != cid or receipt.get("is_ask") is not (side == "sell")
-                    or receipt.get("reduce_only") is not True):
-                return None
-        if (receipt.get("status") != "filled" or not receipt.get("order_id")
-                or plausible_fill(receipt, qty) != qty or receipt_price(receipt) is None):
+            filled = terminal_close_qty(receipt, qty)
+            receipts[venue] = receipt
+        if filled is None or not matches_close_identity(venue, side, receipt, cid):
             return None
-    pnl = closed_child_result(action, receipts, {}, buy, sell)
+        fills[venue] = filled
+    attempts = dict.fromkeys(sides, 0)
+    fill_ids = {(v, str(r.get("order_id"))) for v, r in receipts.items() if r.get("order_id")}
+    verified_corrections = []
+    for row in corrections:
+        venue, side = row.get("venue"), row.get("side")
+        if venue not in sides or side != sides[venue]:
+            return None
+        attempts[venue] += 1
+        cid = close_repair_id(action["token"], side, attempts[venue])
+        remaining = qty - fills[venue]
+        if remaining <= 0 or _d(row.get("qty")) != remaining or row.get("client_order_id") != cid:
+            return None
+        receipt = row.get("receipt") or {}
+        filled = terminal_close_qty(receipt, remaining)
+        if filled is None and venue.startswith("lighter"):
+            try:
+                receipt = await ex[venue].lookup_ioc(asset, cid)
+            except Exception:
+                return None
+            filled = terminal_close_qty(receipt, remaining)
+        if filled is None or not matches_close_identity(venue, side, receipt, cid):
+            return None
+        if filled:
+            identity = (venue, str(receipt["order_id"]))
+            if identity in fill_ids:
+                return None
+            fill_ids.add(identity)
+        fills[venue] += filled
+        verified_corrections.append({**row, "receipt": receipt})
+    if any(filled != qty for filled in fills.values()):
+        return None
+    settle = {"ok": True, "corrections": verified_corrections}
+    pnl = closed_child_result(action, receipts, settle, buy, sell)
     if not pnl["complete"]:
         return None
     trade = engine.confirm_close(action)
@@ -658,8 +813,10 @@ async def recover_pending_close(engine, ex, asset, startup, journal):
     return {"ts": _iso(), "event": "closed", "recovered": True, "execution_token": action["token"],
             "direction": action["direction"], "tier": action["tier"], "qty": str(qty),
             "notional_usd": action["notional_usd"], "exit_eval": action.get("exit_eval"),
-            "receipts": receipts, "pnl": pnl, "rebate_usd": entropy_rebate(receipts),
-            "settle": {"ok": True, "corrections": []}}
+            "receipts": receipts, "pnl": pnl,
+            "rebate_usd": entropy_rebate(receipts) + sum(
+                entropy_rebate({row["venue"]: row["receipt"]}) for row in verified_corrections),
+            "settle": settle}
 
 
 def save_engine_state(*, asset, pair, tiers, engines, realized, rebate, equity, history,
@@ -1179,7 +1336,6 @@ async def main_async(args):
                                              "execution_stats": execution_stats})
                                 return {"ok": False, "error": "unresolved_order"}
                     elif action.get("action") == "close":
-                        pos = engine.open_tiers.get(action["tier"])
                         qty = Decimal(str(action.get("qty") or 0))
                         if qty <= 0 or common_qty(ex, asset, venues, qty) != qty:
                             engine.cancel_close(action["tier"])
@@ -1190,29 +1346,26 @@ async def main_async(args):
                             quote["depth_audit"] = cap.hub.depth_audit(venue, symbol, qty)
                         order_epoch += 1
                         engine.pending_action = dict(action)
-                        save_engine_state(asset=symbol, pair=args.pair, tiers=tiers, engines=engines,
-                                          realized=realized, rebate=rebate, equity=equity, history=history,
-                                          execution_stats=execution_stats, strict=True)
+                        def persist_close():
+                            save_engine_state(asset=symbol, pair=args.pair, tiers=tiers, engines=engines,
+                                              realized=realized, rebate=rebate, equity=equity, history=history,
+                                              execution_stats=execution_stats, strict=True)
+                        persist_close()
+                        before = {v: ledger.net(symbol, v) for v in venues}
                         receipts = await place_pair(ex, asset, side_buy, side_sell, qty, opening=False,
                                                     quotes={side_buy: ob, side_sell: os_},
-                                                    before_positions={v: ledger.net(symbol, v) for v in venues},
+                                                    before_positions=before,
                                                     token=action["token"], decision_at=stamp)
                         engine.pending_action["receipts"] = receipts
-                        save_engine_state(asset=symbol, pair=args.pair, tiers=tiers, engines=engines,
-                                          realized=realized, rebate=rebate, equity=equity, history=history,
-                                          execution_stats=execution_stats, strict=True)
-                        expected = {v: ledger.net(symbol, v) for v in venues}
-                        expected[side_buy] -= qty
-                        expected[side_sell] += qty
-                        close_terminal = all(r.get("status") in ("filled", "rejected") for r in receipts.values())
-                        all_filled = all(plausible_fill(r, qty) == qty for r in receipts.values())
-                        check = await settle_positions(ex, asset, venues, expected,
-                                                       settlement_grace=3.0,
-                                                       allow_corrections=close_terminal and not all_filled)
+                        persist_close()
+                        check = await settle_close(ex, asset, side_buy, side_sell, qty, before, receipts,
+                                                   token=action["token"], pending=engine.pending_action,
+                                                   persist=persist_close)
+                        next_reconcile = time.monotonic() + 5.0
                         record_attempt(execution_stats, receipts, opening=False,
                                        hedged=bool(check.get("ok")),
                                        recovery=check if check.get("corrections") else None)
-                        if any(r.get("status") not in ("filled", "rejected") for r in receipts.values()):
+                        if check.get("error") == "unresolved_order":
                             append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "close_failed", "pair": args.pair,
                                                      "execution_token": action["token"],
                                                      "direction": action.get("direction"), "tier": action["tier"],
@@ -1259,26 +1412,23 @@ async def main_async(args):
                                               realized=realized, rebate=rebate, equity=equity, history=history,
                                               execution_stats=execution_stats)
                         else:
-                            if (check.get("corrections") or any(r.get("status") == "filled" for r in receipts.values())
-                                    or check.get("error") in ("unresolved_correction", "settlement_not_reflected")):
-                                engine.pending_action["receipts"] = receipts
-                                engine.pending_action["expected"] = {v: str(q) for v, q in expected.items()}
+                            if check.get("error") != "close_both_rejected":
                                 write_state({"status": "blocked_settlement_lag", "stage": "close",
                                              "receipts": receipts, "settle": check})
                                 append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "close_failed",
+                                                         "execution_token": action["token"],
                                                          "pair": args.pair, "direction": action["direction"],
                                                          "tier": action["tier"], "receipts": receipts,
                                                          "settle": check,
                                                          "pnl": {"complete": False,
                                                                  "missing": [check["error"]]}})
                                 return {"ok": False, "error": check["error"]}
-                            # Keep the tier: the next sample retries the close and
-                            # the residual is measured against the real position.
+                            # Both IOC orders definitively rejected, so no child changed.
                             engine.cancel_close(action["tier"])
                             append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "close_failed", "pair": args.pair,
                                                      "direction": action.get("direction"), "tier": action["tier"],
                                                      "receipts": receipts, "settle": check,
-                                                     "pnl": {"complete": False, "missing": ["position_mismatch"]}})
+                                                     "pnl": {"complete": False, "missing": [check["error"]]}})
                             close_failures[action["tier"]] = close_failures.get(action["tier"], 0) + 1
                             write_state({"status": "blocked_position_mismatch", "stage": "close",
                                          "direction": action.get("direction"), "tier": action["tier"],

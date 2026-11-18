@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from tools.lib.nvda_tier_engine import PositionLedger, TierConfig, TierEngine, TierSpec
 from tools.lib.venue_probe import (EntropyProbeExecutor, LighterProbeExecutor,
                                    best_bid_ask, leverage_from_imf_percent)
-from tools.nvda_tier_live import (build_exit_marks, pair_order_id, place_pair, position_qty,
+from tools.nvda_tier_live import (build_exit_marks, close_repair_id, pair_order_id, place_pair, position_qty,
                                   quote_version, receipt_price, recover_pending_close,
                                   receipts_fee, seed_history_from_edges, settle_positions,
                                   trade_result_bps, trim_history, window_ready)
@@ -108,6 +108,33 @@ def test_recover_old_429_close_only_from_matched_fills_and_zero_orders(tmp_path)
     assert event["recovered"] and rh.reads == 1
     assert not engine.pending_action and not engine.open_tiers
     assert asyncio.run(recover_pending_close(engine, {"lighter_rh": rh}, None, startup, journal)) is None
+
+
+def test_restart_books_placed_repair_only_after_order_identity_and_position_match(tmp_path):
+    engine = _recovery_engine()
+    action = engine.pending_action
+    token = action["token"]
+    repair = close_repair_id(token, "buy", 1)
+    action["receipts"] = {
+        "entropy": {"status": "rejected", "client_order_id": pair_order_id(token, "buy")},
+        "lighter_rh": {"status": "filled", "client_order_id": pair_order_id(token, "sell"),
+                       "order_id": "rh", "is_ask": True, "reduce_only": True,
+                       "filled_qty": ".1240", "avg_price": "161.32"},
+    }
+    receipt = {"status": "filled", "cloid": "not-the-repair", "order_id": "ent-repair",
+               "filled_qty": ".124", "avg_price": "161.21", "fee_usd": ".001799"}
+    action["close_corrections"] = [{"venue": "entropy", "side": "buy", "qty": ".124",
+                                    "client_order_id": repair, "receipt": receipt}]
+    startup = {v: {"qty": "0", "verified": True, "active_orders": 0}
+               for v in ("entropy", "lighter_rh")}
+    journal = tmp_path / "not-needed"
+    assert asyncio.run(recover_pending_close(engine, {}, None, startup, journal)) is None
+    assert engine.pending_action is action
+    receipt["cloid"] = str(EntropyProbeExecutor._cloid(repair))
+    event = asyncio.run(recover_pending_close(engine, {}, None, startup, journal))
+    assert event["settle"]["corrections"][0]["receipt"]["order_id"] == "ent-repair"
+    assert event["pnl"]["net_usd"] == "0.002603"
+    assert engine.pending_action is None
 
 
 def test_close_vwap_requires_both_fresh_size_qualified_snapshots():

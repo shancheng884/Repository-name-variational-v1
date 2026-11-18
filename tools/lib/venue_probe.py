@@ -544,12 +544,12 @@ class LighterProbeExecutor:
         receipt=await self._poll(client_order_id,cidx,submitted,acked,int(market["market_id"]))
         if isinstance(receipt,dict): receipt.setdefault("execution_quote",getattr(self,"_last_exec_quote",None))
         return receipt
-    async def lookup_ioc(self, asset, client_order_id):
+    async def lookup_ioc(self, asset, client_order_id, *, retry_read=False):
         market = self.market(asset)
         if market is None or self.client is None:
             return {"status": "unknown"}
         return await self._poll(client_order_id, lighter_client_order_index(client_order_id),
-                                None, None, int(market["market_id"]), single_read=True)
+                                None, None, int(market["market_id"]), single_read=not retry_read)
 
     async def _poll(self,client_order_id,cidx,submitted,acked,market_id,*,single_read=False):
         from lighter import OrderApi
@@ -565,7 +565,7 @@ class LighterProbeExecutor:
                 limited+=1
                 if single_read or not _is_rate_limit(exc) or limited>=4:
                     return {**identity,"ok":False,"status":"unknown","error":"lighter_receipt_rate_limited" if _is_rate_limit(exc) else "lighter_receipt_unavailable"}
-                await asyncio.sleep(min(.35*2**(limited-1),max(0,deadline-time.monotonic())))
+                await asyncio.sleep(min(.65*2**(limited-1),max(0,deadline-time.monotonic())))
                 continue
             matches=[r for r in rows if _int(r.get("client_order_index"))==cidx]
             if len(matches)>1: return {**identity,"ok":False,"status":"unknown","error":"lighter_identity_ambiguous"}
@@ -575,7 +575,8 @@ class LighterProbeExecutor:
                     fill_at=_parse_epoch_ms(row.get("updated_at") or row.get("created_at") or row.get("transaction_time"))
                     return {**identity,"ok":True,"status":"filled","partial":status!="filled","filled_qty":str(filled),"avg_price":format(quote/filled,"f"),"order_id":str(row.get("order_index") or row.get("order_id") or ""),"source_at":_iso(fill_at),"source_at_epoch":fill_at.timestamp() if fill_at else None,"fee_usd":None,"is_ask":row.get("is_ask"),"reduce_only":row.get("reduce_only")}
                 if status.startswith("canceled") and filled==0:
-                    return {**identity,"ok":True,"status":"rejected","filled_qty":"0","error":status}
+                    return {**identity,"ok":True,"status":"rejected","filled_qty":"0","error":status,
+                            "is_ask":row.get("is_ask"),"reduce_only":row.get("reduce_only")}
             if single_read:
                 break
             await asyncio.sleep(.12)
