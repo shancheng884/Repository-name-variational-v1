@@ -518,3 +518,25 @@ def test_live_exit_is_blocked_when_no_executable_close_book_exists():
                                raw_edge=-40.0, exit_marks={})
     assert [a for a in actions if a["action"] == "close"] == []
     assert engine.last_exit_eval == {}
+
+
+def test_exit_uses_the_specific_child_lot_not_the_tier_average():
+    ledger = PositionLedger()
+    engine = TierEngine(config=_cfg_real_exit(), ledger=ledger)
+    first = {"tier": 1, "token": "lot-a", "edge": 0.0, "dev_bps": 6.5,
+             "baseline": 0.0, "stamp": 0.0, "notional_usd": 20.0,
+             "qty": 0.2, "signal_basis": "raw_v1"}
+    engine.confirm_open(first, qty=0.2, entry_prices={"lighter_rh": 100.0, "entropy": 100.10},
+                        fee_usd=0.00179)
+    second = dict(first, token="lot-b")
+    engine.confirm_open(second, qty=0.2, entry_prices={"lighter_rh": 100.5, "entropy": 100.70},
+                        fee_usd=0.00200)
+    assert round(engine.open_tiers[1].entry_buy_price, 4) == 100.25
+    mark = ExitMark(buy_price=100.03, sell_price=100.07, source="latest")
+    engine.on_sample(stamp=1, edge=0.0, baseline=0.0, price_hint=100.0,
+                     window=[0.0, 0.0, 0.0],
+                     exchange=exchange_from(ledger, venues=("lighter_rh", "entropy")),
+                     exit_marks={1: [mark]})
+    audit = engine.last_exit_eval[1]
+    assert round(audit["gross_bps"], 2) == 13.99
+    assert round(audit["entry_fee_bps"], 2) == 0.89

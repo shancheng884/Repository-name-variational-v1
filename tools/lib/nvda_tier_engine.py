@@ -351,22 +351,25 @@ class TierEngine:
                 # slippage and the two fees are charged, each exactly once.
                 marks = (exit_marks or {}).get(index) or []
                 best: tuple[float, ExitMark] | None = None
+                entry_buy = lot.get("entry_buy_price")
+                entry_sell = lot.get("entry_sell_price")
                 for mark in marks:
-                    gross = exit_gross_bps(entry_buy=pos.entry_buy_price,
-                                           entry_sell=pos.entry_sell_price,
+                    gross = exit_gross_bps(entry_buy=entry_buy,
+                                           entry_sell=entry_sell,
                                            exit_buy=mark.buy_price,
                                            exit_sell=mark.sell_price)
                     if gross is not None and (best is None or gross < best[0]):
                         best = (gross, mark)
-                if best is not None and pos.entry_buy_price and pos.entry_sell_price:
-                    entry_fee_bps = (pos.entry_fee_usd / lot["notional_usd"] * 10000.0
+                if best is not None and entry_buy and entry_sell:
+                    lot_fee = float(lot.get("entry_fee_usd") or 0.0)
+                    entry_fee_bps = (lot_fee / lot["notional_usd"] * 10000.0
                                      if lot["notional_usd"] > 0 else 0.0)
-                    exit_fee_bps = (entry_fee_bps if pos.entry_fee_usd > 0
+                    exit_fee_bps = (entry_fee_bps if lot_fee > 0
                                     else (self.config.entropy_fee_bps
                                           if "entropy" in (self.config.buy_venue, self.config.sell_venue)
                                           else 0.0))
                     exit_eval = exit_cost_breakdown(
-                        entry_buy=pos.entry_buy_price, entry_sell=pos.entry_sell_price,
+                        entry_buy=entry_buy, entry_sell=entry_sell,
                         exit_buy=best[1].buy_price, exit_sell=best[1].sell_price,
                         exit_slippage_bps=self.config.exit_cost_bps,
                         entry_fee_bps=entry_fee_bps, exit_fee_bps=exit_fee_bps,
