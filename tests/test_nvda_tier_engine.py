@@ -405,3 +405,19 @@ def test_fixed_margin_150_gives_the_same_ladder_on_both_venues():
     assert cfg.slot_caps() == (7, 15, 22, 30, 37)
     assert [cfg.tier_target_notional_usd(i) for i in range(1, 6)] == [140.0, 300.0, 440.0, 600.0, 740.0]
 
+
+def test_exit_is_gated_on_the_realized_entry_edge_not_the_signal():
+    """A bad entry fill cannot be closed on convergence the signal only imagined."""
+    ledger = PositionLedger()
+    engine = TierEngine(config=_cfg_exit_gate(), ledger=ledger)
+    first = engine.on_sample(stamp=0, edge=12.0, baseline=5.0, price_hint=100.0,
+                             window=[12.0, 12.0, 12.0], exchange=exchange_from(ledger))
+    action = [a for a in first if a["action"] == "open"][0]
+    # Signal said 12 bps, the two fills only delivered 2 bps.
+    engine.confirm_open(action, qty=D(str(action["qty"])),
+                        entry_prices={"entropy": 100.00, "lighter_mainnet": 100.02})
+    assert abs(engine.open_tiers[1].entry_realized_edge - 2.0) < 0.01
+    # Signal convergence is 6.5 bps, but from the real fills it is -3.5 bps.
+    actions = engine.on_sample(stamp=1, edge=5.5, baseline=5.0, price_hint=100.0,
+                               window=[5.5, 5.5, 5.5], exchange=exchange_from(ledger))
+    assert [a for a in actions if a["action"] == "close"] == []

@@ -158,6 +158,9 @@ class OpenTier:
     signal_basis: str = "raw_v1"
     entry_fee_pending: bool = False
     entry_receipts: dict[str, Any] = field(default_factory=dict)
+    # Cross-venue edge actually obtained by the two entry fills.  The exit
+    # gate measures convergence from this, not from the pre-trade signal.
+    entry_realized_edge: float | None = None
 
     def to_state(self) -> dict[str, Any]:
         return {
@@ -176,6 +179,7 @@ class OpenTier:
             "signal_basis": self.signal_basis,
             "entry_fee_pending": self.entry_fee_pending,
             "entry_receipts": self.entry_receipts,
+            "entry_realized_edge": self.entry_realized_edge,
         }
 
     @classmethod
@@ -196,6 +200,7 @@ class OpenTier:
             signal_basis=str(row.get("signal_basis") or "raw_v1"),
             entry_fee_pending=bool(row.get("entry_fee_pending")),
             entry_receipts=dict(row.get("entry_receipts") or {}),
+            entry_realized_edge=_float_or_none(row.get("entry_realized_edge")),
         )
 
 
@@ -234,6 +239,7 @@ class TierEngine:
                              "entry_edge": pos.entry_edge, "entry_dev": pos.entry_dev,
                              "opened_at": pos.opened_at, "entry_buy_price": pos.entry_buy_price,
                              "entry_sell_price": pos.entry_sell_price,
+                             "entry_realized_edge": pos.entry_realized_edge,
                              "entry_fee_usd": pos.entry_fee_usd}]
             pos.children[0].update(entry_fee_pending=pos.entry_fee_pending,
                                    entry_receipts=pos.entry_receipts)
@@ -245,7 +251,8 @@ class TierEngine:
         pos.notional_usd = sum(row["notional_usd"] for row in lots)
         pos.entry_fee_usd = sum(row["entry_fee_usd"] for row in lots)
         pos.entry_fee_pending = any(row.get("entry_fee_pending") for row in lots)
-        for key in ("entry_edge", "entry_dev", "entry_buy_price", "entry_sell_price"):
+        for key in ("entry_edge", "entry_dev", "entry_buy_price", "entry_sell_price",
+                    "entry_realized_edge"):
             if all(row.get(key) is not None for row in lots):
                 setattr(pos, key, sum(row[key] * row["qty"] for row in lots) / pos.qty)
 
@@ -276,7 +283,9 @@ class TierEngine:
                 # Already waiting on a venue fill; do not queue a second close.
                 continue
             exit_edge = raw_edge if pos.signal_basis == "raw_v1" and raw_edge is not None else edge
-            converged = pos.entry_edge - exit_edge
+            entry_reference = (pos.entry_realized_edge if pos.entry_realized_edge is not None
+                               else pos.entry_edge)
+            converged = entry_reference - exit_edge
             if self.config.exit_cost_bps is None:
                 # Legacy rule: wait for the spread to come back to its anchor.
                 target_hit = exit_edge <= pos.frozen_baseline
@@ -370,6 +379,12 @@ class TierEngine:
         if amount <= 0:
             return None
         prices = entry_prices or {}
+        buy_fill = _float_or_none(prices.get(self.config.buy_venue))
+        sell_fill = _float_or_none(prices.get(self.config.sell_venue))
+        realized_edge = None
+        if buy_fill and sell_fill and buy_fill > 0 and sell_fill > 0:
+            fill_mid = (buy_fill + sell_fill) / 2
+            realized_edge = (sell_fill - buy_fill) / fill_mid * 10000.0
         self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, amount)
         self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, -amount)
         child = OpenTier(
@@ -387,6 +402,7 @@ class TierEngine:
             entry_receipts=dict(entry_receipts or {}),
             entry_fee_pending=any(v == "entropy" and r.get("fee_usd") is None
                                   for v, r in (entry_receipts or {}).items()),
+            entry_realized_edge=realized_edge,
         )
         pos = self.open_tiers.get(index)
         if pos is None:
@@ -420,6 +436,7 @@ class TierEngine:
                  "reason": action.get("reason") or "reverted",
                  "entry_dev": lot["entry_dev"], "notional_usd": notional,
                  "entry_edge": lot["entry_edge"], "exit_edge": float(action.get("exit_edge") or 0.0),
+                 "entry_realized_edge": lot.get("entry_realized_edge"),
                  "entry_buy_price": lot.get("entry_buy_price"), "entry_sell_price": lot.get("entry_sell_price")}
         self.trades.append(trade)
         self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -Decimal(str(qty)))
