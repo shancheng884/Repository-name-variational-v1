@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from decimal import Decimal as D
 import asyncio
+import sys
+from types import SimpleNamespace
 
 from tools.lib.venue_probe import EntropyProbeExecutor
 from tools.market_capture.config import DEFAULT_ASSETS
@@ -58,6 +60,31 @@ def test_entropy_preflight_checks_only_selected_asset_contract():
     assert out["ok"] is True
     assert out["contract"]["asset_index"] == 200014
     assert out["contract"]["sz_decimals"] == 3
+
+
+def test_perp_start_reuses_sdk_info_and_backs_off_on_429(monkeypatch):
+    from tools.lib import venue_probe
+
+    info = FakeInfo()
+    calls = []
+    monkeypatch.setitem(sys.modules, "eth_account", SimpleNamespace(
+        Account=SimpleNamespace(from_key=lambda key: object())))
+    monkeypatch.setitem(sys.modules, "hyperliquid.exchange", SimpleNamespace(Exchange=object))
+    monkeypatch.setitem(sys.modules, "hyperliquid.utils", SimpleNamespace(constants=object()))
+
+    def make_exchange(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError("429")
+        return SimpleNamespace(info=info)
+
+    monkeypatch.setattr(venue_probe, "instrumented_exchange", make_exchange)
+    ex = make_executor(None, None)
+    asyncio.run(ex.start())
+    assert len(calls) == 2
+    assert calls[-1]["spot_meta"] == {"tokens": [], "universe": []}
+    assert calls[-1]["perp_dexs"] == ["io"]
+    assert ex.info is info and "io:NVDA" in ex.universe
 
 
 def test_entropy_preflight_blocks_open_position_and_order():

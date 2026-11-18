@@ -673,12 +673,16 @@ class EntropyProbeExecutor:
         if self.info is None or self.exchange is None:
             from eth_account import Account
             from hyperliquid.exchange import Exchange
-            from hyperliquid.info import Info
             from hyperliquid.utils import constants
             base_url=self.info_url or constants.MAINNET_API_URL
-            self.info=Info(base_url,skip_ws=True,perp_dexs=[self.dex])
-            self.exchange=instrumented_exchange(Exchange,Account.from_key(self.private_key),base_url,account_address=self.account_address,perp_dexs=[self.dex])
-        self.meta=await asyncio.to_thread(self.info.meta,self.dex)
+            # The SDK already initializes an Info client for this perp DEX.
+            # Skip the unused spot market catalogue, not the spot balance API.
+            self.exchange=await _to_thread_retry(
+                instrumented_exchange, Exchange, Account.from_key(self.private_key), base_url,
+                account_address=self.account_address, perp_dexs=[self.dex],
+                spot_meta={"tokens": [], "universe": []}, timeout=5, attempts=5, base_delay=.8)
+            self.info=self.exchange.info
+        self.meta=await _to_thread_retry(self.info.meta,self.dex,attempts=4,base_delay=.8)
         self.universe={str(row.get("name")):dict(row) for row in (self.meta or {}).get("universe",[]) if isinstance(row,dict)}
         if not self.universe: raise ProbeError("entropy_meta_universe_missing")
         if self._enable_fill_stream:
