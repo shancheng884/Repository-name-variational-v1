@@ -71,7 +71,8 @@ class QuoteClock:
         stamps, rows = self.tapes.setdefault(key, ([], []))
         i = bisect_left(stamps, source)
         row = {k: quote.get(k) for k in ("venue", "symbol", "bid", "ask", "executable_buy",
-                                        "executable_sell", "recv_at", "source_at", "sequence", "quote_kind")}
+                                        "executable_sell", "recv_at", "source_at", "sequence", "quote_kind",
+                                        "depth_bids", "depth_asks")}
         if i < len(stamps) and stamps[i] == source:
             if received >= epoch(rows[i]["recv_at"]):
                 rows[i] = row

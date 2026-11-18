@@ -6,10 +6,13 @@ import json
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 from tools.lib.nvda_tier_engine import PositionLedger, TierConfig, TierEngine, TierSpec
-from tools.lib.venue_probe import EntropyProbeExecutor, best_bid_ask, leverage_from_imf_percent
-from tools.nvda_tier_live import (place_pair, position_qty, quote_version, receipt_price,
+from tools.lib.venue_probe import (EntropyProbeExecutor, LighterProbeExecutor,
+                                   best_bid_ask, leverage_from_imf_percent)
+from tools.nvda_tier_live import (build_exit_marks, pair_order_id, place_pair, position_qty,
+                                  quote_version, receipt_price, recover_pending_close,
                                   receipts_fee, seed_history_from_edges, settle_positions,
                                   trade_result_bps, trim_history, window_ready)
 
@@ -46,6 +49,106 @@ def test_closing_sells_the_buy_leg_and_buys_the_sell_leg():
     assert sell.calls[0]["side"] == "buy"
     assert buy.calls[0]["reduce_only"] is True
     assert sell.calls[0]["reduce_only"] is True
+
+
+def test_filled_receipt_with_null_execution_quote_is_not_discarded():
+    class Executor(FakeExecutor):
+        async def market_order(self, **kwargs):
+            return {"status": "filled", "execution_quote": None}
+
+    result = asyncio.run(place_pair({"buy": Executor("buy"), "sell": Executor("sell")},
+                                    None, "buy", "sell", Decimal("1"), opening=False,
+                                    quotes={"buy": {"bid_size": "2"}}))
+    assert result["buy"]["status"] == "filled"
+    assert result["buy"]["execution_quote"]["bid_size"] == "2"
+
+
+def _recovery_engine():
+    engine = TierEngine(config=TierConfig(asset="NVDA", buy_venue="lighter_rh",
+                                        sell_venue="entropy", tiers=(TierSpec(2, 7.14),)),
+                        ledger=PositionLedger())
+    entry = {"tier": 2, "qty": .124, "notional_usd": 20, "token": "entry"}
+    engine.confirm_open(entry, entry_prices={"lighter_rh": 161.24, "entropy": 161.18},
+                        fee_usd=.001798)
+    engine.pending_action = {"action": "close", "direction": "reverse", "tier": 2,
+                             "token": "2b0165a898b24b8aaad4a37b6f28cc61", "qty": .124,
+                             "notional_usd": 20, "entry_buy_price": 161.24,
+                             "entry_sell_price": 161.18, "entry_fee_usd": .001798}
+    return engine
+
+
+def test_recover_old_429_close_only_from_matched_fills_and_zero_orders(tmp_path):
+    engine = _recovery_engine()
+    token = engine.pending_action["token"]
+    ent_cloid = str(EntropyProbeExecutor._cloid(pair_order_id(token, "buy")))
+    ent = {"status": "filled", "cloid": ent_cloid, "order_id": "609077701462",
+           "filled_qty": "0.124", "avg_price": "161.21", "fee_usd": ".001799"}
+    journal = tmp_path / "orders.jsonl"
+    journal.write_text(json.dumps({"event": "close_failed", "direction": "reverse", "tier": 2,
+                                   "receipts": {"entropy": ent, "lighter_rh": {"status": "error"}}}))
+
+    class Lighter:
+        reads = 0
+        async def lookup_ioc(self, asset, cid):
+            self.reads += 1
+            assert cid == pair_order_id(token, "sell")
+            return {"status": "filled", "client_order_id": cid, "is_ask": True,
+                    "reduce_only": True, "order_id": "4503599684083173",
+                    "filled_qty": "0.1240", "avg_price": "161.32"}
+
+    rh = Lighter()
+    startup = {"entropy": {"qty": "0", "verified": True, "active_orders": 0},
+               "lighter_rh": {"qty": "0", "verified": True, "active_orders": None}}
+    assert asyncio.run(recover_pending_close(engine, {"lighter_rh": rh}, None, startup, journal)) is None
+    assert not rh.reads
+    assert engine.pending_action
+    startup["lighter_rh"]["active_orders"] = 0
+    event = asyncio.run(recover_pending_close(engine, {"lighter_rh": rh}, None, startup, journal))
+    assert event["pnl"]["net_usd"] == "0.002603"
+    assert event["recovered"] and rh.reads == 1
+    assert not engine.pending_action and not engine.open_tiers
+    assert asyncio.run(recover_pending_close(engine, {"lighter_rh": rh}, None, startup, journal)) is None
+
+
+def test_close_vwap_requires_both_fresh_size_qualified_snapshots():
+    engine = _recovery_engine()
+    stamp = datetime(2026, 11, 18, 9, 35, tzinfo=timezone.utc)
+    def quote(venue, **fields):
+        return {"venue": venue, "source_at": stamp, "recv_at": stamp, **fields}
+    rh = quote("lighter_rh", depth_bids=(("161.38", ".024"), ("161.30", ".100")))
+    ent = quote("entropy", depth_asks=(("161.17", ".124"),))
+    latest = {"lighter_rh": rh, "entropy": ent}
+    aligned = {"left": dict(rh, depth_bids=(("161.38", ".123"),)), "right": ent}
+    assert build_exit_marks(engine, latest, aligned, stamp.timestamp()) == {}
+    aligned["left"]["depth_bids"] = (("161.38", ".124"),)
+    marks = build_exit_marks(engine, latest, aligned, stamp.timestamp())[2]
+    assert [(m.source, m.buy_price) for m in marks] == [("latest", 161.17), ("aligned", 161.17)]
+    assert round(marks[0].sell_price, 5) == 161.31548
+    assert build_exit_marks(engine, latest, aligned, stamp.timestamp() + 3.1) == {}
+
+
+def test_lighter_429_receipt_retries_only_the_read(monkeypatch):
+    import lighter
+
+    queries = []
+    class Api:
+        def __init__(self, client):
+            pass
+        async def account_inactive_orders(self, **kwargs):
+            queries.append(kwargs["market_id"])
+            if len(queries) == 1:
+                raise RuntimeError("429 Too Many Requests")
+            return {"orders": [{"client_order_index": 123, "status": "filled", "is_ask": True,
+                                "reduce_only": True, "filled_base_amount": ".124",
+                                "filled_quote_amount": "20.003680", "order_index": 99}]}
+    monkeypatch.setattr(lighter, "OrderApi", Api)
+    ex = object.__new__(LighterProbeExecutor)
+    ex.api_key_index, ex.account_index = 1, 2
+    ex.client = SimpleNamespace(api_client=None, create_auth_token_with_expiry=lambda **kw: ("test", None))
+    result = asyncio.run(ex._poll("pending-sell", 123, None, None, 7))
+    assert result["status"] == "filled" and result["filled_qty"] == "0.124"
+    assert result["client_order_id"] == "pending-sell"
+    assert queries == [7, 7]
 
 def test_a_percent_margin_fraction_reads_back_as_leverage():
     assert leverage_from_imf_percent("5.00") == 20.0

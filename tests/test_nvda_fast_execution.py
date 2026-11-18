@@ -206,14 +206,19 @@ def test_live_loop_submits_one_20_usd_child_without_a_pre_order_position_read(tm
             self.hub = Hub()
             self.stop_event = asyncio.Event()
             self.writer = SimpleNamespace(append=lambda *args, **kwargs: None)
+            append = live.append_jsonl
+
+            def stop_after_first_open(path, row):
+                append(path, row)
+                if path == order_log and row.get("event") == "opened":
+                    self.stop_event.set()
+                    self.hub.quote_event.set()
+
+            monkeypatch.setattr(live, "append_jsonl", stop_after_first_open)
 
         async def run(self):
             for _ in range(100):
                 if self.stop_event.is_set():
-                    return
-                if order_log.exists() and '"event": "opened"' in order_log.read_text():
-                    self.stop_event.set()
-                    self.hub.quote_event.set()
                     return
                 self.hub.version += 1
                 self.hub.quote_event.set()

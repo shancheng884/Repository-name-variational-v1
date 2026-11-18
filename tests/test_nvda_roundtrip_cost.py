@@ -1,4 +1,19 @@
-from tools.nvda_roundtrip_cost import percentile, roundtrip_slippage
+from tools.nvda_roundtrip_cost import executable_close_price, percentile, roundtrip_slippage
+
+
+def test_residual_exit_uses_matched_qty_vwap_and_excludes_corrections():
+    def receipt(bid, fill, book_at):
+        return {"status": "filled", "filled_qty": ".2", "avg_price": fill,
+                "execution_quote": {"bid": bid, "ask": "101", "ask_size": ".2", "quote_recv_at": "t1",
+                                    "depth_audit": {"requested_qty": ".2", "book_recv_at": book_at,
+                                                    "sell_visible_qty_shortfall": "0", "sell_vwap": "100"}}}
+    rh = receipt("100.1", "100", "t1")
+    ent = receipt("100.9", "101", "t1")
+    closed = _row("closed", qty=".2", receipts={"lighter_rh": rh, "entropy": ent})
+    assert roundtrip_slippage([closed])["exit_after_executable_book_bps"]["p80"] == 0
+    assert roundtrip_slippage([dict(closed, settle={"corrections": [{}]})])[
+        "exit_after_executable_book_bps"]["n"] == 0
+    assert executable_close_price(receipt("100.1", "100", "older"), .2, "sell") is None
 
 
 def _row(event, **extra):

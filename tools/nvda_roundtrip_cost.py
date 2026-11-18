@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import defaultdict, deque
 from pathlib import Path
 
 
 def _num(value):
     try:
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
     except (TypeError, ValueError):
         return None
 
@@ -36,6 +38,19 @@ def percentile(values: list[float], q: float) -> float | None:
     return ordered[index]
 
 
+def executable_close_price(receipt, qty, side):
+    quote = receipt.get("execution_quote") or {}
+    depth = quote.get("depth_audit") or {}
+    touch = "ask" if side == "buy" else "bid"
+    if (_num(quote.get(touch + "_size")) or 0) >= qty:
+        return _num(quote.get(touch))
+    at = quote.get("quote_recv_at")
+    if at and depth.get("book_recv_at") == at and _num(depth.get("requested_qty")) == qty:
+        if _num(depth.get(side + "_visible_qty_shortfall")) == 0:
+            return _num(depth.get(side + "_vwap"))
+    return None
+
+
 def roundtrip_slippage(rows: list[dict]) -> dict:
     pending: dict[tuple[str, int], deque] = defaultdict(deque)
     pairs = []
@@ -46,6 +61,25 @@ def roundtrip_slippage(rows: list[dict]) -> dict:
             pending[key].append(row)
         elif event == "closed" and pending[key]:
             pairs.append((pending[key].popleft(), row))
+
+    residual = []
+    for row in rows:
+        qty = _num(row.get("qty"))
+        if row.get("event") != "closed" or not qty or qty <= 0 or (row.get("settle") or {}).get("corrections"):
+            continue
+        long, short = (("lighter_rh", "entropy") if row.get("direction") == "reverse"
+                       else ("entropy", "lighter_rh"))
+        receipts = row.get("receipts") or {}
+        close_long, close_short = receipts.get(long) or {}, receipts.get(short) or {}
+        if not all(r.get("status") == "filled" and _num(r.get("filled_qty")) == qty
+                   for r in (close_long, close_short)):
+            continue
+        prices = (executable_close_price(close_long, qty, "sell"),
+                  executable_close_price(close_short, qty, "buy"),
+                  _fill(close_long), _fill(close_short))
+        if all(p is not None and p > 0 for p in prices):
+            sell, buy, fill_sell, fill_buy = prices
+            residual.append(((sell - fill_sell) + (fill_buy - buy)) / ((sell + buy) / 2) * 1e4)
 
     entries, exits, total = [], [], []
     for opened, closed in pairs:
@@ -82,7 +116,8 @@ def roundtrip_slippage(rows: list[dict]) -> dict:
                 "p95": percentile(values, 0.95)}
 
     return {"roundtrips": len(total), "entry_slip_bps": stats(entries),
-            "exit_slip_bps": stats(exits), "roundtrip_slip_bps": stats(total)}
+            "exit_slip_bps": stats(exits), "roundtrip_slip_bps": stats(total),
+            "exit_after_executable_book_bps": stats(residual)}
 
 
 def main(argv=None) -> int:

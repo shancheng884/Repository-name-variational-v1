@@ -443,12 +443,11 @@ def _book_reverse(engine, *, buy=161.32, sell=161.17, qty=0.123, fee=0.001784):
 def test_1735_nvda_trade_is_not_closed_by_a_signal_only_edge():
     """Regression for 2026-11-18 17:35 Beijing (09:35 UTC), NVDA reverse tier 1.
 
-    The signal edge reached -16.7 bps, but the real four fills were -3.1 bps
-    gross.  Charging the SNDK-style P80 exit slippage and both fees once must
-    keep the position open: a paper convergence is not a realized profit.
+    The executable prices gave just 3.72 bps gross. NVDA's own P80 and the
+    two fees keep the position open despite the signal's apparent convergence.
     """
     ledger = PositionLedger()
-    engine = TierEngine(config=_cfg_real_exit(), ledger=ledger)
+    engine = TierEngine(config=_cfg_real_exit(exit_slippage=6.82), ledger=ledger)
     _book_reverse(engine)
     # The executable close book at the decision was entropy 161.17 / RH 161.38.
     mark = ExitMark(buy_price=161.17, sell_price=161.38, source="aligned")
@@ -461,7 +460,7 @@ def test_1735_nvda_trade_is_not_closed_by_a_signal_only_edge():
     assert round(audit["gross_bps"], 2) == 3.72
     assert round(audit["entry_fee_bps"], 2) == 0.89
     assert round(audit["exit_fee_bps"], 2) == 0.89
-    assert round(audit["net_bps"], 2) == -4.04
+    assert round(audit["net_bps"], 2) == -4.88
 
 
 def test_exit_cost_breakdown_charges_each_item_exactly_once():

@@ -9,8 +9,9 @@ persisted and reconciled against the real account before any order can go out.
 """
 from __future__ import annotations
 
-import argparse, asyncio, copy, json, os, sys, time, uuid
+import argparse, asyncio, copy, json, math, os, signal, sys, time, uuid
 from collections import deque
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -113,7 +114,7 @@ async def snapshot(ex, asset, venues):
         try:
             result = await _positions(ex, venue, asset)
             out[venue] = (_d(result.get("qty")) if result.get("verified")
-                          and not result.get("active_orders") else None)
+                          and result.get("active_orders") == 0 else None)
         except Exception:
             out[venue] = None
     await asyncio.gather(*(read(venue) for venue in venues))
@@ -184,7 +185,7 @@ def common_qty(ex, asset, venues, qty):
 async def place_pair(ex, asset, buy, sell, qty, *, opening, quotes,
                      before_positions=None, token=None, decision_at=None):
     async def one(venue, side):
-        cid = "nvda-tier-" + (token or uuid.uuid4().hex)[:20] + "-" + side
+        cid = pair_order_id(token or uuid.uuid4().hex, side)
         extra = {}
         if venue == "entropy" and before_positions is not None:
             extra["known_position_before"] = before_positions[venue]
@@ -196,17 +197,23 @@ async def place_pair(ex, asset, buy, sell, qty, *, opening, quotes,
                                                        max_slippage_bps=Decimal("12"), **extra)
             receipt["requested_qty"] = str(qty)
             receipt["dispatch_started_at"] = _iso(dispatched)
-            receipt.setdefault("execution_quote", {}).update(
+            receipt["execution_quote"] = dict(receipt.get("execution_quote") or {})
+            receipt["execution_quote"].update(
                 {k: (quotes.get(venue) or {}).get(k) for k in ("bid_size", "ask_size", "depth_audit", "time_alignment")})
             if decision_at is not None:
                 receipt["signal_to_dispatch_ms"] = round(max(0, dispatched - decision_at) * 1000, 3)
             return venue, receipt
         except Exception as exc:
-            return venue, {"ok": False, "status": "error", "error": "%s:%s" % (type(exc).__name__, exc)}
+            return venue, {"ok": False, "status": "unknown", "client_order_id": cid,
+                           "error": "%s:%s" % (type(exc).__name__, exc)}
     # Opening: buy on the buy venue, sell on the sell venue.
     # Closing: the reverse, so each leg reduces what it opened.
     tasks = [one(buy, "buy" if opening else "sell"), one(sell, "sell" if opening else "buy")]
     return dict(await asyncio.gather(*tasks))
+
+
+def pair_order_id(token, side):
+    return "nvda-tier-" + token[:20] + "-" + side
 
 
 QTY_TOL = Decimal("0.0000001")
@@ -387,65 +394,44 @@ def _tier_list(text):
     return [float(value) for value in text.split(",") if value.strip()]
 
 
-def _quote_price(quote, side):
-    key = "executable_buy" if side == "buy" else "executable_sell"
-    value = _d((quote or {}).get(key))
-    return float(value) if value is not None and value > 0 else None
-
-
-def _depth_price(hub, venue, symbol, qty, side):
-    """Executable VWAP for this exact child, not the 20U display quote.
-
-    A visible-size shortfall means the book cannot absorb the whole child, so
-    the mark is refused instead of pretending the top levels are enough.
-    """
-    try:
-        audit = hub.depth_audit(venue, symbol, qty) or {}
-    except Exception:
+def _depth_price(quote, qty, side, stamp):
+    if not quote or quote.get("provably_stale") or quote_clock_issue(quote, stamp):
         return None
-    shortfall_key = "buy_visible_qty_shortfall" if side == "buy" else "sell_visible_qty_shortfall"
-    shortfall = _d(audit.get(shortfall_key))
-    if shortfall is not None and shortfall > 0:
-        return None
-    key = "buy_vwap" if side == "buy" else "sell_vwap"
-    value = _d(audit.get(key))
-    return float(value) if value is not None and value > 0 else None
+    key = "depth_asks" if side == "buy" else "depth_bids"
+    remaining, value = qty, Decimal("0")
+    for price, size in quote.get(key) or ():
+        price, size = _d(price), _d(size)
+        if price is None or size is None or not price.is_finite() or not size.is_finite():
+            return None
+        if price <= 0 or size <= 0:
+            return None
+        take = min(remaining, size)
+        value += take * price
+        remaining -= take
+        if remaining == 0:
+            return float(value / qty)
+    return None
 
 
-def build_exit_marks(engine, quotes_by_venue, aligned, hub, symbol):
-    """Two executable close marks per open child: aligned quote and latest book.
-
-    The engine keeps the worse of them, so an exit is never authorized by a
-    stale quote that the current book no longer supports.
-    """
+def build_exit_marks(engine, quotes_by_venue, aligned, stamp):
+    """Require two size-qualified prices from the actual quote snapshots."""
     marks = {}
+    if not aligned:
+        return marks
+    by_venue = {row["venue"]: row for row in (aligned.get("left"), aligned.get("right")) if row}
+    buy_venue, sell_venue = engine.config.buy_venue, engine.config.sell_venue
     for index in engine.open_tiers:
         lot, _fraction, qty = engine.close_child(index)
         if not (qty > 0) or lot.get("entry_buy_price") is None or lot.get("entry_sell_price") is None:
             continue
-        buy_venue, sell_venue = engine.config.buy_venue, engine.config.sell_venue
+        qty = Decimal(str(qty))
         rows = []
-        latest_buy = quotes_by_venue.get(buy_venue)
-        latest_sell = quotes_by_venue.get(sell_venue)
-        latest_ok = latest_buy is not None and latest_sell is not None
-        if latest_ok:
-            sell_price = _depth_price(hub, buy_venue, symbol, qty, "sell")
-            buy_price = _depth_price(hub, sell_venue, symbol, qty, "buy")
+        for source, quotes in (("latest", quotes_by_venue), ("aligned", by_venue)):
+            sell_price = _depth_price(quotes.get(buy_venue), qty, "sell", stamp)
+            buy_price = _depth_price(quotes.get(sell_venue), qty, "buy", stamp)
             if buy_price and sell_price:
-                rows.append(ExitMark(buy_price=buy_price, sell_price=sell_price,
-                                     source="latest"))
-        if rows and aligned:
-            by_venue = {row.get("venue"): row for row in
-                        (aligned.get("left"), aligned.get("right")) if row}
-            aligned_buy = by_venue.get(buy_venue)
-            aligned_sell = by_venue.get(sell_venue)
-            if aligned_buy is not None and aligned_sell is not None:
-                sell_price = _quote_price(aligned_buy, "sell")
-                buy_price = _quote_price(aligned_sell, "buy")
-                if buy_price and sell_price:
-                    rows.append(ExitMark(buy_price=buy_price, sell_price=sell_price,
-                                         source="aligned"))
-        if rows:
+                rows.append(ExitMark(buy_price=buy_price, sell_price=sell_price, source=source))
+        if len(rows) == 2:
             marks[index] = rows
     return marks
 
@@ -514,7 +500,7 @@ def receipt_price(receipt) -> float | None:
         value = float(receipt.get("avg_price"))
     except (TypeError, ValueError):
         return None
-    return value if value > 0 else None
+    return value if math.isfinite(value) and value > 0 else None
 
 
 def plausible_fill(receipt, requested: Decimal) -> Decimal | None:
@@ -525,7 +511,7 @@ def plausible_fill(receipt, requested: Decimal) -> Decimal | None:
         filled = _d(receipt.get("filled_qty"))
     except Exception:
         return None
-    if not filled or filled <= 0 or filled > requested * Decimal("1.5"):
+    if filled is None or not filled.is_finite() or filled <= 0 or filled > requested:
         return None
     return filled
 
@@ -598,6 +584,82 @@ def load_engine_state(path: Path) -> dict | None:
     except Exception:
         return None
     return data if isinstance(data, dict) else None
+
+
+def logged_close_receipts(path, action, entropy_side):
+    """Older state can lack receipts; recover only an exact Entropy cloid."""
+    cloid = str(EntropyProbeExecutor._cloid(pair_order_id(action["token"], entropy_side)))
+    matches = []
+    if path.is_file():
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                receipts = row.get("receipts") or {}
+                if (row.get("event") in ("close_failed", "closed")
+                        and row.get("direction") == action.get("direction")
+                        and row.get("tier") == action.get("tier")
+                        and (receipts.get("entropy") or {}).get("cloid") == cloid):
+                    matches.append(receipts)
+    return matches[0] if len(matches) == 1 else {}
+
+
+async def recover_pending_close(engine, ex, asset, startup, journal):
+    """Book a fully proven paired close without sending or canceling orders."""
+    action = engine.pending_action
+    if not action or action.get("action") != "close" or not action.get("token"):
+        return None
+    buy, sell = engine.config.buy_venue, engine.config.sell_venue
+    qty = _d(action.get("qty"))
+    if (qty is None or not qty.is_finite() or qty <= 0
+            or action.get("tier") not in engine.open_tiers or "entropy" not in (buy, sell)):
+        return None
+    _, _, child_qty = engine.close_child(action["tier"])
+    if qty != Decimal(str(child_qty)):
+        return None
+    expected = {buy: engine.ledger.net(engine.config.asset, buy) - qty,
+                sell: engine.ledger.net(engine.config.asset, sell) + qty}
+    for venue, want in expected.items():
+        row = startup.get(venue) or {}
+        actual = _d(row.get("qty"))
+        if (not row.get("verified") or row.get("active_orders") != 0 or actual is None
+                or not actual.is_finite() or abs(actual - want) > QTY_TOL):
+            return None
+    receipts = dict(action.get("receipts") or logged_close_receipts(
+        journal, action, "sell" if buy == "entropy" else "buy"))
+    for venue, side in ((buy, "sell"), (sell, "buy")):
+        cid = pair_order_id(action["token"], side)
+        receipt = receipts.get(venue) or {}
+        if venue == "entropy":
+            if receipt.get("cloid") != str(EntropyProbeExecutor._cloid(cid)):
+                return None
+        else:
+            if receipt.get("status") != "filled":
+                try:
+                    receipt = await ex[venue].lookup_ioc(asset, cid)
+                except Exception:
+                    return None
+                receipts[venue] = receipt
+            if (receipt.get("client_order_id") != cid or receipt.get("is_ask") is not (side == "sell")
+                    or receipt.get("reduce_only") is not True):
+                return None
+        if (receipt.get("status") != "filled" or not receipt.get("order_id")
+                or plausible_fill(receipt, qty) != qty or receipt_price(receipt) is None):
+            return None
+    pnl = closed_child_result(action, receipts, {}, buy, sell)
+    if not pnl["complete"]:
+        return None
+    trade = engine.confirm_close(action)
+    if trade is None:
+        return None
+    trade.update(pnl)
+    return {"ts": _iso(), "event": "closed", "recovered": True, "execution_token": action["token"],
+            "direction": action["direction"], "tier": action["tier"], "qty": str(qty),
+            "notional_usd": action["notional_usd"], "exit_eval": action.get("exit_eval"),
+            "receipts": receipts, "pnl": pnl, "rebate_usd": entropy_rebate(receipts),
+            "settle": {"ok": True, "corrections": []}}
 
 
 def save_engine_state(*, asset, pair, tiers, engines, realized, rebate, equity, history,
@@ -716,6 +778,16 @@ async def main_async(args):
 
     # A restart must start from the real account, never from an assumed flat book.
     startup = await position_snapshot(ex, asset, venues)
+    if args.mode == "live" and sum(bool(e.pending_action) for e in engines.values()) == 1:
+        for engine in engines.values():
+            recovered = await recover_pending_close(engine, ex, asset, startup, ORDER_LOG)
+            if recovered:
+                realized += Decimal(recovered["pnl"]["net_usd"])
+                rebate += Decimal(str(recovered["rebate_usd"]))
+                save_engine_state(asset=symbol, pair=args.pair, tiers=tiers, engines=engines,
+                                  realized=realized, rebate=rebate, equity=equity, history=history,
+                                  execution_stats=execution_stats, strict=True)
+                append_jsonl(ORDER_LOG, {**recovered, "pair": args.pair})
     problems = []
     if args.mode == "live" and caps is None:
         problems.append({"error": "equity_unverified", "equity": equity})
@@ -727,10 +799,10 @@ async def main_async(args):
         row = startup.get(venue) or {}
         expected = ledger.net(symbol, venue)
         actual = _d(row.get("qty")) if row.get("verified") else None
-        if not row.get("verified") or actual is None:
+        if not row.get("verified") or actual is None or not actual.is_finite():
             problems.append({"venue": venue, "error": row.get("error") or "position_unreadable"})
             continue
-        if row.get("active_orders"):
+        if row.get("active_orders") != 0:
             problems.append({"venue": venue, "error": "active_orders", "count": row.get("active_orders")})
         if abs(actual - expected) > QTY_TOL:
             problems.append({"venue": venue, "error": "ledger_mismatch",
@@ -762,6 +834,14 @@ async def main_async(args):
                                       system_seconds=60.0, fill_poll_seconds=2.0, edge_seconds=1.0,
                                       notional_usd=Decimal(str(args.notional)), max_book_levels=20))
     task = asyncio.create_task(cap.run(), name="nvda-tier-capture")
+    loop = asyncio.get_running_loop()
+    shutdown = asyncio.Event()
+    signal_hook = False
+    try:
+        loop.add_signal_handler(signal.SIGTERM, shutdown.set)
+        signal_hook = True
+    except NotImplementedError:
+        pass
     dev_window = {"forward": deque(maxlen=cfg_forward.confirm_window),
                   "reverse": deque(maxlen=cfg_reverse.confirm_window)}
     last_version = None
@@ -780,7 +860,7 @@ async def main_async(args):
     snap_at = time.time()
     try:
         while True:
-            if cap.stop_event.is_set():
+            if cap.stop_event.is_set() or shutdown.is_set():
                 break
             if cap.hub is None:
                 await asyncio.sleep(0.01)
@@ -790,7 +870,7 @@ async def main_async(args):
             except asyncio.TimeoutError:
                 pass
             cap.hub.quote_event.clear()
-            if cap.stop_event.is_set():
+            if cap.stop_event.is_set() or shutdown.is_set():
                 break
             rebate += refresh_open_fees(engines, ex, asset)
             cost_delta, rebate_delta, cost_events = finalize_costs(execution_stats, ex, asset, engines)
@@ -888,6 +968,10 @@ async def main_async(args):
                 dev_window["reverse"].append(edge_reverse - baseline["reverse"])
                 last_alignment_version = aligned["version"]
             alignment_audit = ({k: v for k, v in aligned.items() if k != "version"} if aligned else {})
+            for side in ("left", "right"):
+                if side in alignment_audit:
+                    alignment_audit[side] = {k: v for k, v in alignment_audit[side].items()
+                                             if k not in ("depth_bids", "depth_asks")}
             alignment_audit.update(raw_edges={"forward": raw_forward, "reverse": raw_reverse},
                                    baseline=baseline, independent_confirmation=independent,
                                    confirmation_counts={k: sum(v >= tiers[k][0] for v in w)
@@ -899,10 +983,15 @@ async def main_async(args):
                                   {"event": "quote_alignment", "at": _iso(stamp), **alignment_audit})
             # Both directions always evaluate exits; only the flat side may open,
             # which is the ETH gradient's direction lock until fully flat.
-            marks_forward = build_exit_marks(engine_forward, {buy: q_buy, sell: q_sell},
-                                             aligned, cap.hub, symbol)
-            marks_reverse = build_exit_marks(engine_reverse, {sell: q_sell, buy: q_buy},
-                                             aligned, cap.hub, symbol)
+            if args.mode == "live":
+                check = ledger.reconcile(symbol, venues, exchange or {})
+                if not check["ok"]:
+                    record_block("position_mismatch", min_interval=30, diffs=check["diffs"])
+                    write_state({"status": "blocked_position_mismatch", "pair": args.pair,
+                                 "diffs": check["diffs"]})
+                    continue
+            marks_forward = build_exit_marks(engine_forward, {buy: q_buy, sell: q_sell}, aligned, stamp)
+            marks_reverse = build_exit_marks(engine_reverse, {sell: q_sell, buy: q_buy}, aligned, stamp)
             acts_forward = engine_forward.on_sample(
                 stamp=stamp, edge=edge_forward, baseline=baseline["forward"],
                 price_hint=float(max(buy_ask, sell_bid)), window=list(dev_window["forward"]),
@@ -933,7 +1022,7 @@ async def main_async(args):
                     owner.cancel_close(discarded["tier"])
             actions = [chosen] if chosen is not None else []
             block_before = (LAST_BLOCK or {}).get("at")
-            if args.mode == "live":
+            if args.mode == "live" and not shutdown.is_set():
                 for action in actions:
                     side_buy, side_sell = (buy, sell) if action.get("direction") == "forward" else (sell, buy)
                     ob, os_ = (q_buy, q_sell) if action.get("direction") == "forward" else (q_sell, q_buy)
@@ -1092,8 +1181,10 @@ async def main_async(args):
                     elif action.get("action") == "close":
                         pos = engine.open_tiers.get(action["tier"])
                         qty = Decimal(str(action.get("qty") or 0))
-                        if qty <= 0:
+                        if qty <= 0 or common_qty(ex, asset, venues, qty) != qty:
                             engine.cancel_close(action["tier"])
+                            record_block("close_quantity_not_tradeable", min_interval=30,
+                                         tier=action["tier"], qty=str(qty))
                             continue
                         for venue, quote in ((side_buy, ob), (side_sell, os_)):
                             quote["depth_audit"] = cap.hub.depth_audit(venue, symbol, qty)
@@ -1106,6 +1197,10 @@ async def main_async(args):
                                                     quotes={side_buy: ob, side_sell: os_},
                                                     before_positions={v: ledger.net(symbol, v) for v in venues},
                                                     token=action["token"], decision_at=stamp)
+                        engine.pending_action["receipts"] = receipts
+                        save_engine_state(asset=symbol, pair=args.pair, tiers=tiers, engines=engines,
+                                          realized=realized, rebate=rebate, equity=equity, history=history,
+                                          execution_stats=execution_stats, strict=True)
                         expected = {v: ledger.net(symbol, v) for v in venues}
                         expected[side_buy] -= qty
                         expected[side_sell] += qty
@@ -1119,6 +1214,7 @@ async def main_async(args):
                                        recovery=check if check.get("corrections") else None)
                         if any(r.get("status") not in ("filled", "rejected") for r in receipts.values()):
                             append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "close_failed", "pair": args.pair,
+                                                     "execution_token": action["token"],
                                                      "direction": action.get("direction"), "tier": action["tier"],
                                                      "receipts": receipts, "settle": check,
                                                      "pnl": {"complete": False, "missing": ["unresolved_order"]}})
@@ -1260,6 +1356,8 @@ async def main_async(args):
                          "execution_stats": execution_stats,
                          "exchange": {k: (None if v is None else str(v)) for k, v in (exchange or {}).items()}})
     finally:
+        if signal_hook:
+            loop.remove_signal_handler(signal.SIGTERM)
         if reconcile_task is not None:
             reconcile_task.cancel()
             await asyncio.gather(reconcile_task, return_exceptions=True)
@@ -1309,6 +1407,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.asset != "NVDA" and args.run_dir is None:
         parser.error("--run-dir is required for non-NVDA assets")
+    pair = args.pair.split(">")
+    if len(pair) != 2 or len(set(pair)) != 2 or not all(v in VENUES for v in pair):
+        parser.error("--pair must contain two distinct supported venues")
+    if not any(asset.name == args.asset for asset in DEFAULT_ASSETS):
+        parser.error("--asset is not configured")
     if args.verify_rh_leverage is not None and not (args.verify_rh_leverage > 0 and args.rh_leverage == 0):
         parser.error("--verify-rh-leverage needs a positive value and --rh-leverage 0")
     if args.mode == "live" and not (args.confirm_flat and args.i_understand_live_orders):
@@ -1320,13 +1423,15 @@ def main(argv=None):
         lock_path = run_dir / "live.lock"
     else:
         lock_path = ROOT / "log" / "nvda_tier_live.lock"
-    guard = _acquire_lock(lock_path)
-    try:
+    with ExitStack() as guards:
+        if args.mode == "live":
+            for venue in sorted(pair):
+                guards.enter_context(_acquire_lock(ROOT / "log" / "live_asset_locks" /
+                                                   f"{args.asset}-{venue}.lock"))
+        guards.enter_context(_acquire_lock(lock_path))
         result = asyncio.run(main_async(args))
-    finally:
-        guard.close()
     print(json.dumps(result or {"ok": True}, ensure_ascii=False))
-    return 0
+    return 1 if result and result.get("ok") is False else 0
 
 
 if __name__ == "__main__":

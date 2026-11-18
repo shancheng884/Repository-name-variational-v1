@@ -59,6 +59,9 @@ def exit_gross_bps(*, entry_buy: float, entry_sell: float,
     executable book for the size being closed.  Spread is therefore embedded
     once in the prices and must not be charged again as a fee.
     """
+    if not all(p is not None and 0 < p < float("inf")
+               for p in (entry_buy, entry_sell, exit_buy, exit_sell)):
+        return None
     mid = (entry_buy + entry_sell) / 2.0
     if mid <= 0:
         return None
@@ -325,6 +328,7 @@ class TierEngine:
         ``confirm_open`` only after both legs and the venue positions agree.
         """
         actions: list[dict[str, Any]] = []
+        self.last_exit_eval.clear()
         dev = edge - baseline
         if self.pending_action is not None:
             return actions
@@ -362,6 +366,10 @@ class TierEngine:
                         best = (gross, mark)
                 if best is not None and entry_buy and entry_sell:
                     lot_fee = float(lot.get("entry_fee_usd") or 0.0)
+                    entropy = "entropy" in (self.config.buy_venue, self.config.sell_venue)
+                    if entropy and lot.get("entry_fee_pending"):
+                        ref = entry_buy if self.config.buy_venue == "entropy" else entry_sell
+                        lot_fee = lot["qty"] * ref * self.config.entropy_fee_bps / 10000.0
                     entry_fee_bps = (lot_fee / lot["notional_usd"] * 10000.0
                                      if lot["notional_usd"] > 0 else 0.0)
                     exit_fee_bps = (entry_fee_bps if lot_fee > 0

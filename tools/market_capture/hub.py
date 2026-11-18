@@ -62,7 +62,9 @@ class MarketHub:
         key = (book.venue, book.symbol)
         self.books[key] = book
         if self.quote_clock is not None:
-            self.quote_clock.record(self._book_snapshot(book))
+            self.quote_clock.record({**self._book_snapshot(book),
+                                     "depth_bids": tuple(book.bids) if book.continuity else (),
+                                     "depth_asks": tuple(book.asks) if book.continuity else ()})
         self.quote_event.set()
         self.quote_counts[key] += 1
         self.writer.append(
@@ -150,6 +152,7 @@ class MarketHub:
             self.quote_clock.record({"venue": venue, "symbol": symbol, "bid": bid, "ask": ask,
                                  "executable_buy": ask, "executable_sell": bid,
                                  "source_at": source_at, "recv_at": now, "sequence": sequence,
+                                 "depth_bids": ((bid, bid_size),), "depth_asks": ((ask, ask_size),),
                                  "quote_kind": quote_kind})
         self.update_reference(
             ReferenceQuote(
@@ -333,6 +336,8 @@ class MarketHub:
             snap["recv_at"] = book.recv_at.isoformat()
             snap["source_at"] = book.source_at.isoformat() if book.source_at else None
             snap["depth_source"] = "book"
+            if self.quote_clock is not None and book.continuity:
+                snap.update(depth_bids=book.bids, depth_asks=book.asks)
         if bbo is not None and bbo_age is not None and bbo_age <= max_age:
             book_at = book.recv_at if book is not None else None
             if snap is None or book_at is None or bbo["recv_at"] >= book_at:
@@ -352,6 +357,9 @@ class MarketHub:
                     snap["executable_sell"] = bid
                 snap["bid_size"] = bbo.get("bid_size")
                 snap["ask_size"] = bbo.get("ask_size")
+                if self.quote_clock is not None:
+                    snap.update(depth_bids=((bid, bbo.get("bid_size")),),
+                                depth_asks=((ask, bbo.get("ask_size")),))
                 snap["age_s"] = bbo_age
                 snap["recv_at"] = bbo["recv_at"].isoformat()
                 snap["source_at"] = bbo["source_at"].isoformat() if bbo.get("source_at") else snap.get("source_at")

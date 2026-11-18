@@ -10,7 +10,7 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/repo
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/ubuntu/repo/.venv/bin/python tools/nvda_tier_live.py --asset SNDK --pair entropy>lighter_rh --run-dir log/sndk_tier_live_v2 --seed-capture-dir log/market_capture/high_frequency --tiers 6.14,7.14,8.14,9.14,10.14 --exit-cost-bps 5.98 --profit-target-bps 1.0 --entropy-fee-bps 0.9 --margin-usd 150 --rh-leverage 0 --verify-rh-leverage 5 --mode live --confirm-flat --i-understand-live-orders
+ExecStart=/home/ubuntu/repo/.venv/bin/python tools/nvda_tier_live.py --asset SNDK --pair entropy>lighter_rh --run-dir log/sndk_tier_live_v2 --seed-capture-dir log/market_capture/high_frequency --tiers 6.14,7.14,8.14,9.14,10.14 --exit-cost-bps 5.91 --profit-target-bps 1.0 --entropy-fee-bps 0.9 --margin-usd 150 --rh-leverage 0 --verify-rh-leverage 5 --mode live --confirm-flat --i-understand-live-orders
 Restart=no
 NoNewPrivileges=true
 TimeoutStopSec=30
