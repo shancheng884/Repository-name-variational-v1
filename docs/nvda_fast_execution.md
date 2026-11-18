@@ -2,13 +2,20 @@
 
 ## Normal path
 
-New BBO/book event -> existing two-of-three distinct quote confirmation -> one
-reserved child -> concurrent paired IOC orders -> fill/position verification.
+New BBO/book event -> existing two-of-three distinct quote confirmation -> local
+exact-size depth check -> one reserved child -> concurrent paired IOC orders ->
+fill/position verification.
 No REST position, order, equity or allMids request runs in front of a normal
 paired submission. Entropy prices its IOC from the same side-specific BBO used
-by the decision. Startup, periodic background reconciliation and post-fill
+by the final depth check. Startup, periodic background reconciliation and post-fill
 verification still read the venues. A background result from before a trade is
 discarded rather than overwriting a newer verified position.
+
+The final entry check uses each venue's latest local snapshot and the actual
+rounded child quantity. Both sides must cover the child inside the existing
+rounded IOC limits, and their depth-weighted edge must still clear the original
+tier deviation threshold. A thin fast BBO is not filled in with older ladder
+levels. This check does not wait, query an API, or apply to closes or recovery.
 
 Post-fill verification allows up to three seconds for account endpoints to
 reflect the confirmed fills, returning immediately when they already match.

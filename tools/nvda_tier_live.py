@@ -36,6 +36,7 @@ BLOCK_LOG = ROOT / "log" / "nvda_tier_blockers.jsonl"
 ORDER_LOG = ROOT / "log" / "nvda_tier_orders.jsonl"
 CAPTURE_DIR = ROOT / "log" / "nvda_tier_live_capture"
 ENGINE_STATE_VERSION = 2
+PAIR_IOC_SLIPPAGE_BPS = Decimal("12")
 
 LAST_BLOCK: dict = {}
 _BLOCK_WRITTEN_AT: dict = {}
@@ -196,7 +197,7 @@ async def place_pair(ex, asset, buy, sell, qty, *, opening, quotes,
             receipt = await ex[venue].market_order(asset=asset, side=side, qty=qty,
                                                        quote=quotes.get(venue) or {},
                                                        client_order_id=cid, reduce_only=not opening,
-                                                       max_slippage_bps=Decimal("12"), **extra)
+                                                       max_slippage_bps=PAIR_IOC_SLIPPAGE_BPS, **extra)
             receipt["requested_qty"] = str(qty)
             receipt["dispatch_started_at"] = _iso(dispatched)
             receipt["execution_quote"] = dict(receipt.get("execution_quote") or {})
@@ -536,6 +537,59 @@ def _depth_price(quote, qty, side, stamp):
         if remaining == 0:
             return float(value / qty)
     return None
+
+
+def check_entry_depth(ex, asset, buy, sell, qty, quotes, *, baseline, threshold, stamp):
+    """Recheck the existing gate at the exact child size using local quotes only."""
+    marks = {}
+    result = {"ok": False, "qty": str(qty), "baseline_bps": baseline,
+              "threshold_bps": threshold, "legs": marks}
+    for venue, side in ((buy, "buy"), (sell, "sell")):
+        quote = quotes.get(venue) or {}
+        leg = marks[venue] = {"side": side, "source_at": quote.get("source_at"),
+                             "recv_at": quote.get("recv_at")}
+        if not quote or quote.get("provably_stale") or quote.get("continuity") is False:
+            return {**result, "reason": "entry_depth_unavailable", "venue": venue}
+        clock_issue = quote_clock_issue(quote, stamp)
+        if clock_issue:
+            return {**result, "reason": "entry_depth_unavailable", "venue": venue,
+                    "clock_issue": clock_issue}
+        touch = _d(quote.get("ask" if side == "buy" else "bid"))
+        if touch is None or touch <= 0:
+            return {**result, "reason": "entry_depth_unavailable", "venue": venue}
+        limit = _d(ex[venue].ioc_limit_price(asset, side, touch, PAIR_IOC_SLIPPAGE_BPS))
+        if limit is None or limit <= 0:
+            return {**result, "reason": "entry_depth_unavailable", "venue": venue}
+        leg.update(touch=str(touch), limit_price=str(limit))
+        levels = quote.get("depth_asks" if side == "buy" else "depth_bids") or ()
+        remaining, cost = qty, Decimal(0)
+        previous = touch
+        for price, size in levels:
+            price, size = _d(price), _d(size)
+            if (price is None or size is None or price <= 0 or size <= 0
+                    or (price < previous if side == "buy" else price > previous)):
+                return {**result, "reason": "entry_depth_unavailable", "venue": venue}
+            within_limit = price <= limit if side == "buy" else price >= limit
+            if not within_limit:
+                break
+            take = min(remaining, size)
+            remaining -= take
+            cost += price * take
+            previous = price
+            if not remaining:
+                break
+        leg["covered_qty"] = str(qty - remaining)
+        if remaining:
+            return {**result, "reason": "entry_depth_insufficient", "venue": venue}
+        leg["vwap"] = str(cost / qty)
+
+    buy_price, sell_price = (Decimal(marks[v]["vwap"]) for v in (buy, sell))
+    edge = float((sell_price - buy_price) / ((buy_price + sell_price) / 2) * 10000)
+    dev = edge - baseline
+    result.update(edge_bps=edge, dev_bps=dev, gap_bps=threshold - dev)
+    if dev < threshold:
+        return {**result, "reason": "entry_depth_below_threshold"}
+    return {**result, "ok": True}
 
 
 def build_exit_marks(engine, quotes_by_venue, aligned, stamp):
@@ -1208,8 +1262,21 @@ async def main_async(args):
                             record_block("quantity_below_minimum", min_interval=30)
                             continue
                         action["qty"] = float(requested)
+                        entry_quotes = {v: cap.hub.latest(v, symbol, max_age=quote_max_age(v))
+                                        for v in (side_buy, side_sell)}
+                        depth = check_entry_depth(ex, asset, side_buy, side_sell, requested, entry_quotes,
+                                                  baseline=action["baseline"], threshold=action["threshold_bps"],
+                                                  stamp=time.time())
+                        if not depth["ok"]:
+                            engine.cancel_open(action)
+                            record_block(depth["reason"], min_interval=10, direction=action["direction"],
+                                         tier=action["tier"], entry_depth=depth)
+                            continue
+                        action["entry_depth"] = depth
+                        ob, os_ = entry_quotes[side_buy], entry_quotes[side_sell]
                         for venue, quote in ((side_buy, ob), (side_sell, os_)):
                             quote["depth_audit"] = cap.hub.depth_audit(venue, symbol, requested)
+                            quote["time_alignment"] = alignment_audit
                         engine.pending_action = dict(action)
                         order_epoch += 1
                         save_engine_state(asset=symbol, pair=args.pair, tiers=tiers, engines=engines,
@@ -1242,6 +1309,7 @@ async def main_async(args):
                                 append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "open_unverified",
                                                          "pair": args.pair, "direction": action["direction"],
                                                          "tier": action["tier"], "receipts": receipts,
+                                                         "entry_depth": depth,
                                                          "settle": check})
                                 write_state({"status": "blocked_settlement_lag", "stage": "open",
                                              "receipts": receipts, "settle": check})
@@ -1277,6 +1345,7 @@ async def main_async(args):
                                                      "fee_usd": receipts_fee(retained),
                                                      "rebate_usd": entropy_rebate(receipts),
                                                      "dev_bps": action.get("dev_bps"),
+                                                     "entry_depth": depth,
                                                      "receipts": receipts, "settle": check,
                                                      "excess_pnl": excess_pnl})
                             save_engine_state(asset=symbol, pair=args.pair, tiers=tiers, engines=engines,
@@ -1322,6 +1391,7 @@ async def main_async(args):
                                                      "execution_token": action["token"],
                                                      "pair": args.pair, "direction": action.get("direction"),
                                                      "tier": action.get("tier"), "requested_qty": str(requested),
+                                                     "entry_depth": depth,
                                                      "receipts": receipts, "settle": check,
                                                      "recovery": recovery, "pnl": failure_pnl})
                             save_engine_state(asset=symbol, pair=args.pair, tiers=tiers, engines=engines,

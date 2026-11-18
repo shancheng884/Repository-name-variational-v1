@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal as D
 
+import pytest
+
 from tools.lib.nvda_execution_stats import (closed_child_result, failed_entry_result,
                                            hedged_entry_result, new_execution_stats, record_attempt)
 from tools.lib.venue_probe import EntropyProbeExecutor
-from tools.nvda_tier_live import (close_repair_id, common_qty, pair_order_id, place_pair,
+from tools.nvda_tier_live import (check_entry_depth, close_repair_id, common_qty, pair_order_id, place_pair,
                                  rollback_entry, settle_close, settle_positions)
 from tests.test_nvda_tier_live import _EntropyAsset, _EntropyInfo, _entropy_executor
 
@@ -231,7 +233,8 @@ def test_unknown_fill_and_unknown_fee_are_not_reported_as_zero_cost():
         assert not pnl["complete"]
 
 
-def test_live_loop_submits_one_20_usd_child_without_a_pre_order_position_read(tmp_path, monkeypatch):
+@pytest.mark.parametrize("thin", [False, True])
+def test_live_loop_entry_depth_is_local_and_does_not_send_either_leg_when_thin(tmp_path, monkeypatch, thin):
     from types import SimpleNamespace
     import json
     import tools.nvda_tier_live as live
@@ -264,6 +267,9 @@ def test_live_loop_submits_one_20_usd_child_without_a_pre_order_position_read(tm
         def normalize_qty(self, asset, qty):
             return qty.quantize(D(".001"), rounding="ROUND_DOWN")
 
+        def ioc_limit_price(self, asset, side, bbo, bps):
+            return bbo * (1 + (1 if side == "buy" else -1) * bps / D(10000))
+
         async def market_order(self, **kwargs):
             assert self.reads == 1, "only startup may query before the first submit"
             qty = kwargs["qty"]
@@ -286,6 +292,8 @@ def test_live_loop_submits_one_20_usd_child_without_a_pre_order_position_read(tm
             at = datetime.now(timezone.utc).isoformat()
             row = {"venue": venue, "symbol": asset, "bid": str(bid), "ask": str(bid + .01),
                     "executable_buy": str(bid + .01), "executable_sell": str(bid),
+                    "depth_bids": ((str(bid), "1"),),
+                    "depth_asks": ((str(bid + .01), ".019" if thin and venue == "entropy" else "1"),),
                     "sequence": self.version, "recv_at": at, "source_at": at}
             self.quote_clock.record(row)
             return row
@@ -302,7 +310,8 @@ def test_live_loop_submits_one_20_usd_child_without_a_pre_order_position_read(tm
 
             def stop_after_first_open(path, row):
                 append(path, row)
-                if path == order_log and row.get("event") == "opened":
+                if ((path == order_log and row.get("event") == "opened")
+                        or row.get("reason") == "entry_depth_insufficient"):
                     self.stop_event.set()
                     self.hub.quote_event.set()
 
@@ -338,11 +347,63 @@ def test_live_loop_submits_one_20_usd_child_without_a_pre_order_position_read(tm
                            notional=20, slippage_bps=1.3, baseline_minutes=30, poll_seconds=1,
                            max_loss_usd=3)
     asyncio.run(live.main_async(args))
-    assert len(submitted) == 2
     state = json.loads((tmp_path / "engine.json").read_text())
+    assert state["engines"]["forward"]["pending_action"] is None
+    if thin:
+        assert not submitted and not order_log.exists()
+        assert all(e.reads == 1 for e in ex.values())
+        assert '"entry_depth_insufficient"' in (tmp_path / "blockers.jsonl").read_text()
+        return
+    assert len(submitted) == 2
     assert state["execution_stats"]["hedged_entries"] == 1
     assert state["engines"]["forward"]["open_tiers"][0]["notional_usd"] == 20
-    assert state["engines"]["forward"]["pending_action"] is None
+    assert json.loads(order_log.read_text())["entry_depth"]["ok"]
+
+
+@pytest.mark.parametrize("buy,sell", [("entropy", "lighter_rh"), ("lighter_rh", "entropy")])
+def test_exact_size_prices_must_clear_existing_tier_and_ioc_limit(buy, sell):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    def calc(asset, side, touch, bps):
+        return touch * (1 + (1 if side == "buy" else -1) * bps / D(10000))
+
+    ex = {v: SimpleNamespace(ioc_limit_price=calc) for v in (buy, sell)}
+    now = datetime(2026, 11, 18, 15, 46, 34, tzinfo=timezone.utc)
+    q = {v: {"venue": v, "source_at": now, "recv_at": now} for v in (buy, sell)}
+    q[buy].update(ask="100", depth_asks=(("100", ".05"), ("100.1", ".15")))
+    q[sell].update(bid="100.10", depth_bids=(("100.10", ".3"),))
+    args = dict(baseline=0, threshold=6.14, stamp=now.timestamp())
+    checked = check_entry_depth(ex, None, buy, sell, D(".2"), q, **args)
+    assert checked["reason"] == "entry_depth_below_threshold"
+    assert checked["legs"][buy]["vwap"] == "100.075"
+    assert check_entry_depth(ex, None, buy, sell, D(".05"), q, **args)["ok"]
+    q[buy]["depth_asks"] = (("100", ".05"), ("100.13", "20"))
+    checked = check_entry_depth(ex, None, buy, sell, D(".2"), q, **args)
+    assert checked["reason"] == "entry_depth_insufficient"
+    assert checked["legs"][buy]["covered_qty"] == "0.05"
+    q[buy]["provably_stale"] = True
+    assert check_entry_depth(ex, None, buy, sell, D(".05"), q, **args)["reason"] == "entry_depth_unavailable"
+
+
+def test_sndk_2346_thin_bbo_rejects_before_rh_can_open():
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    now = datetime.fromisoformat("2026-11-18T15:46:34.014+00:00")
+    quotes = {
+        "entropy": {"venue": "entropy", "ask": "768.50", "depth_asks": (("768.50", ".019"),),
+                    "source_at": "2026-11-18T15:46:33.612+00:00",
+                    "recv_at": "2026-11-18T15:46:33.980+00:00"},
+        "lighter_rh": {"venue": "lighter_rh", "bid": "770.16",
+                       "depth_bids": (("770.16", "1"),), "source_at": now, "recv_at": now},
+    }
+    ex = {"entropy": SimpleNamespace(ioc_limit_price=lambda *args: D("769.42"))}
+    checked = check_entry_depth(ex, None, "entropy", "lighter_rh", D(".0259"), quotes,
+                                baseline=0, threshold=6.14, stamp=now.timestamp())
+    assert checked["reason"] == "entry_depth_insufficient"
+    assert checked["venue"] == "entropy"
+    assert D(checked["legs"]["entropy"]["covered_qty"]) == D(".019")
 
 
 def test_read_only_report_counts_legacy_rejections_but_does_not_invent_unwind_pnl(tmp_path):

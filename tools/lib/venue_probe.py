@@ -508,6 +508,15 @@ class LighterProbeExecutor:
         except Exception:
             return None, None
 
+    def ioc_limit_price(self, asset, side, bbo, max_slippage_bps):
+        market = self.market(asset)
+        if market is None:
+            return None
+        pd = int(market.get("supported_price_decimals") or 0)
+        direction = -1 if side == "sell" else 1
+        return (bbo * (1 + direction * max_slippage_bps / BPS)).quantize(
+            Decimal(1).scaleb(-pd), rounding=ROUND_CEILING if side == "buy" else ROUND_FLOOR)
+
     async def _market_order(self,*,asset,side,qty,quote,client_order_id,reduce_only=False,max_slippage_bps=Decimal("8")):
         if not self.available or self.client is None: return {"ok":False,"status":"rejected","error":f"{self.venue}_credentials_missing","client_order_id":client_order_id}
         market=self.market(asset)
@@ -527,8 +536,7 @@ class LighterProbeExecutor:
                 quote.setdefault("ask", str(ask) if ask is not None else "")
                 quote.setdefault("mid", str((bid + ask) / 2) if bid is not None and ask is not None else "")
         if not bbo: return {"ok":False,"status":"rejected","error":"lighter_quote_missing","client_order_id":client_order_id}
-        direction=Decimal("-1") if side=="sell" else Decimal("1")
-        limit=(bbo*(Decimal("1")+direction*max_slippage_bps/BPS)).quantize(Decimal(1).scaleb(-pd),rounding=ROUND_CEILING if side=="buy" else ROUND_FLOOR)
+        limit=self.ioc_limit_price(asset,side,bbo,max_slippage_bps)
         if qty*limit < (_d(market.get("min_quote_amount")) or ZERO): return {"ok":False,"status":"rejected","error":"lighter_notional_below_min","client_order_id":client_order_id}
         self._last_exec_quote={"bid":str(_d(quote.get("bid"))) if _d(quote.get("bid")) is not None else None,"ask":str(_d(quote.get("ask"))) if _d(quote.get("ask")) is not None else None,"mid":str(_d(quote.get("mid"))) if _d(quote.get("mid")) is not None else None,"limit_price":str(limit),"quote_sequence":quote.get("sequence"),"quote_recv_at":quote.get("recv_at"),"quote_source_at":quote.get("source_at")}
         base=qty*(Decimal(10)**sd); price=limit*(Decimal(10)**pd)
@@ -808,7 +816,7 @@ class EntropyProbeExecutor:
     @staticmethod
     def _cloid(client_order_id):
         return _EntropyCloid("0x"+hashlib.sha256(client_order_id.encode()).hexdigest()[:32])
-    def _limit_price(self,asset,side,bbo,max_slippage_bps):
+    def ioc_limit_price(self,asset,side,bbo,max_slippage_bps):
         row=self._row(asset); szd=int(row.get("szDecimals") or 0)
         direction=Decimal("-1") if side=="sell" else Decimal("1")
         px=bbo*(Decimal("1")+direction*max_slippage_bps/BPS)
@@ -836,7 +844,7 @@ class EntropyProbeExecutor:
             except Exception:
                 bbo=None
         if not bbo: return {"ok":False,"status":"rejected","error":"entropy_quote_missing","client_order_id":client_order_id}
-        limit_px=self._limit_price(asset,side,bbo,max_slippage_bps)
+        limit_px=self.ioc_limit_price(asset,side,bbo,max_slippage_bps)
         self._last_exec_quote={"bid":str(_d(quote.get("bid"))) if _d(quote.get("bid")) is not None else None,"ask":str(_d(quote.get("ask"))) if _d(quote.get("ask")) is not None else None,"mid":str(bbo),"limit_price":str(limit_px),"quote_recv_at":quote.get("recv_at"),"quote_source_at":quote.get("source_at")}
         self._last_exec_quote.update({k: quote.get(k) for k in ("bid_size", "ask_size", "depth_audit", "time_alignment")})
         cloid=self._cloid(client_order_id); coin=self._coin(asset)
