@@ -44,6 +44,45 @@ class TierSpec:
 
 
 @dataclass(frozen=True)
+class ExitMark:
+    """One executable way to close a child: buy back the short, sell the long."""
+    buy_price: float
+    sell_price: float
+    source: str = "latest"
+
+
+def exit_gross_bps(*, entry_buy: float, entry_sell: float,
+                   exit_buy: float, exit_sell: float) -> float | None:
+    """Realized child edge from four fills, not from the pre-trade signal.
+
+    The entry side uses the actual average fill prices; the exit side uses the
+    executable book for the size being closed.  Spread is therefore embedded
+    once in the prices and must not be charged again as a fee.
+    """
+    mid = (entry_buy + entry_sell) / 2.0
+    if mid <= 0:
+        return None
+    # Long leg: exit_sell - entry_buy.  Short leg: entry_sell - exit_buy.
+    return ((entry_sell - entry_buy) + (exit_sell - exit_buy)) / mid * 10000.0
+
+
+def exit_cost_breakdown(*, entry_buy: float, entry_sell: float,
+                        exit_buy: float, exit_sell: float,
+                        exit_slippage_bps: float, entry_fee_bps: float,
+                        exit_fee_bps: float, profit_target_bps: float) -> dict[str, float] | None:
+    """One exit decision with every cost counted exactly once."""
+    gross = exit_gross_bps(entry_buy=entry_buy, entry_sell=entry_sell,
+                           exit_buy=exit_buy, exit_sell=exit_sell)
+    if gross is None:
+        return None
+    cost = float(exit_slippage_bps) + float(entry_fee_bps) + float(exit_fee_bps)
+    return {"gross_bps": gross, "exit_slippage_bps": float(exit_slippage_bps),
+            "entry_fee_bps": float(entry_fee_bps), "exit_fee_bps": float(exit_fee_bps),
+            "cost_bps": cost, "net_bps": gross - cost,
+            "profit_target_bps": float(profit_target_bps)}
+
+
+@dataclass(frozen=True)
 class TierConfig:
     asset: str
     buy_venue: str
@@ -61,8 +100,12 @@ class TierConfig:
     # When set, a position only closes after the spread has converged far
     # enough to pay the measured exit slippage and still keep the profit
     # target.  ``None`` keeps the legacy "back to the frozen anchor" exit.
+    # Measured exit slippage (P80), deliberately excluding fees: the exit
+    # prices already embed the spread, and the two fees are charged below.
     exit_cost_bps: float | None = None
     profit_target_bps: float = 1.0
+    # Fallback Entropy taker fee when the entry receipt has not arrived yet.
+    entropy_fee_bps: float = 0.9
 
     def slot_caps(self) -> tuple[int, ...] | None:
         """Cumulative child slots per tier, mirroring main.py's 5x hard cap."""
@@ -213,6 +256,7 @@ class TierEngine:
     trades: list[dict[str, Any]] = field(default_factory=list)
     pending_action: dict[str, Any] | None = None
     completed_actions: list[str] = field(default_factory=list)
+    last_exit_eval: dict[int, dict[str, Any]] = field(default_factory=dict)
     targets: tuple[float, ...] | None = field(init=False, default=None)
 
     def __post_init__(self):
@@ -245,6 +289,13 @@ class TierEngine:
                                    entry_receipts=pos.entry_receipts)
         return pos.children
 
+    def close_child(self, index: int) -> tuple[dict[str, Any], float, float]:
+        """The next 20U sub-order to close, with its share of the tier."""
+        pos = self.open_tiers[index]
+        lot = self._lots(pos)[0]
+        fraction = min(1.0, self.config.child_notional_usd / lot["notional_usd"])
+        return lot, fraction, lot["qty"] * fraction
+
     def _refresh(self, pos: OpenTier) -> None:
         lots = self._lots(pos)
         pos.qty = sum(row["qty"] for row in lots)
@@ -262,7 +313,8 @@ class TierEngine:
 
     def on_sample(self, *, stamp: float, edge: float, baseline: float, price_hint: float,
                   window: list[float], exchange: dict[str, Decimal | float | None],
-                  allow_entry: bool = True, raw_edge: float | None = None) -> list[dict[str, Any]]:
+                  allow_entry: bool = True, raw_edge: float | None = None,
+                  exit_marks: dict[int, list[ExitMark]] | None = None) -> list[dict[str, Any]]:
         """Decide closes (always) and at most one entry for this direction.
 
         The ETH gradient runs bidirectionally but locks the active direction
@@ -286,37 +338,77 @@ class TierEngine:
             entry_reference = (pos.entry_realized_edge if pos.entry_realized_edge is not None
                                else pos.entry_edge)
             converged = entry_reference - exit_edge
+            lot = self._lots(pos)[0]
+            fraction = min(1.0, self.config.child_notional_usd / lot["notional_usd"])
+            exit_eval: dict[str, Any] | None = None
             if self.config.exit_cost_bps is None:
                 # Legacy rule: wait for the spread to come back to its anchor.
                 target_hit = exit_edge <= pos.frozen_baseline
                 net_bps = converged - self.config.slippage_bps
             else:
-                # Pay the locked exit slippage out of the convergence and keep
-                # the profit target; a merely "reverted" spread is not enough.
-                target_hit = converged >= (self.config.exit_cost_bps
-                                           + self.config.profit_target_bps)
-                net_bps = converged - self.config.exit_cost_bps
+                # Prefer a real four-fill check: actual entry fills against the
+                # executable close book.  This is the only place the P80 exit
+                # slippage and the two fees are charged, each exactly once.
+                marks = (exit_marks or {}).get(index) or []
+                best: tuple[float, ExitMark] | None = None
+                for mark in marks:
+                    gross = exit_gross_bps(entry_buy=pos.entry_buy_price,
+                                           entry_sell=pos.entry_sell_price,
+                                           exit_buy=mark.buy_price,
+                                           exit_sell=mark.sell_price)
+                    if gross is not None and (best is None or gross < best[0]):
+                        best = (gross, mark)
+                if best is not None and pos.entry_buy_price and pos.entry_sell_price:
+                    entry_fee_bps = (pos.entry_fee_usd / lot["notional_usd"] * 10000.0
+                                     if lot["notional_usd"] > 0 else 0.0)
+                    exit_fee_bps = (entry_fee_bps if pos.entry_fee_usd > 0
+                                    else (self.config.entropy_fee_bps
+                                          if "entropy" in (self.config.buy_venue, self.config.sell_venue)
+                                          else 0.0))
+                    exit_eval = exit_cost_breakdown(
+                        entry_buy=pos.entry_buy_price, entry_sell=pos.entry_sell_price,
+                        exit_buy=best[1].buy_price, exit_sell=best[1].sell_price,
+                        exit_slippage_bps=self.config.exit_cost_bps,
+                        entry_fee_bps=entry_fee_bps, exit_fee_bps=exit_fee_bps,
+                        profit_target_bps=self.config.profit_target_bps)
+                if exit_eval is not None:
+                    exit_eval["mark_source"] = best[1].source
+                    self.last_exit_eval[index] = dict(exit_eval)
+                    target_hit = exit_eval["net_bps"] >= self.config.profit_target_bps
+                    net_bps = exit_eval["net_bps"]
+                elif exit_marks is not None:
+                    # Live call without a fully executable close book: hold the
+                    # tier rather than authorize an exit from the signal alone.
+                    target_hit = False
+                    net_bps = float("-inf")
+                else:
+                    # Paper/legacy call: keep the old convergence gate rather
+                    # than invent prices.
+                    target_hit = converged >= (self.config.exit_cost_bps
+                                               + self.config.profit_target_bps)
+                    net_bps = converged - self.config.exit_cost_bps
             # timeout_seconds=None keeps the tier open until it pays.
             expired = (self.config.timeout_seconds is not None
                        and stamp - pos.opened_at >= self.config.timeout_seconds)
             if not (target_hit or expired):
                 continue
-            lot = self._lots(pos)[0]
-            fraction = min(1.0, self.config.child_notional_usd / lot["notional_usd"])
             pos.closing = True
-            actions.append({"action": "close", "tier": index,
-                            "token": uuid.uuid4().hex,
-                            "reason": ("reverted" if self.config.exit_cost_bps is None
-                                       else "target") if target_hit else "timeout",
-                            "net_bps": net_bps, "qty": lot["qty"] * fraction,
-                            "notional_usd": lot["notional_usd"] * fraction,
-                            "entry_buy_price": lot.get("entry_buy_price"),
-                            "entry_sell_price": lot.get("entry_sell_price"),
-                            "entry_fee_usd": None if lot.get("entry_fee_pending") else lot["entry_fee_usd"] * fraction,
-                            "entry_receipts": lot.get("entry_receipts") or {},
-                            "entry_fee_fraction": fraction,
-                            "entry_edge": lot["entry_edge"], "exit_edge": exit_edge,
-                            "hold_s": stamp - pos.opened_at})
+            action = {"action": "close", "tier": index,
+                      "token": uuid.uuid4().hex,
+                      "reason": ("reverted" if self.config.exit_cost_bps is None
+                                 else "target") if target_hit else "timeout",
+                      "net_bps": net_bps, "qty": lot["qty"] * fraction,
+                      "notional_usd": lot["notional_usd"] * fraction,
+                      "entry_buy_price": lot.get("entry_buy_price"),
+                      "entry_sell_price": lot.get("entry_sell_price"),
+                      "entry_fee_usd": None if lot.get("entry_fee_pending") else lot["entry_fee_usd"] * fraction,
+                      "entry_receipts": lot.get("entry_receipts") or {},
+                      "entry_fee_fraction": fraction,
+                      "entry_edge": lot["entry_edge"], "exit_edge": exit_edge,
+                      "hold_s": stamp - pos.opened_at}
+            if exit_eval is not None:
+                action["exit_eval"] = exit_eval
+            actions.append(action)
 
         # One reconciliation per decision step: the account is checked before the
         # batch of orders goes out, not after every child order we just queued.

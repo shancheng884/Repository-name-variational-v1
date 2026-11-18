@@ -1,7 +1,8 @@
 from __future__ import annotations
 from decimal import Decimal as D
 
-from tools.lib.nvda_tier_engine import PositionLedger, TierConfig, TierEngine, TierSpec
+from tools.lib.nvda_tier_engine import (ExitMark, PositionLedger, TierConfig, TierEngine,
+                                          TierSpec, exit_cost_breakdown, exit_gross_bps)
 
 CFG = TierConfig(asset="NVDA", buy_venue="entropy", sell_venue="lighter_mainnet",
                  tiers=tuple(TierSpec(i, t) for i, t in enumerate([7.0, 8.0, 9.0, 10.0, 11.0], start=1)),
@@ -421,3 +422,98 @@ def test_exit_is_gated_on_the_realized_entry_edge_not_the_signal():
     actions = engine.on_sample(stamp=1, edge=5.5, baseline=5.0, price_hint=100.0,
                                window=[5.5, 5.5, 5.5], exchange=exchange_from(ledger))
     assert [a for a in actions if a["action"] == "close"] == []
+
+
+def _cfg_real_exit(exit_slippage=5.98, target=1.0):
+    return TierConfig(asset="NVDA", buy_venue="lighter_rh", sell_venue="entropy",
+                      tiers=(TierSpec(1, 6.14),), notional_usd=20.0, child_notional_usd=20.0,
+                      timeout_seconds=None, exit_cost_bps=exit_slippage,
+                      profit_target_bps=target)
+
+
+def _book_reverse(engine, *, buy=161.32, sell=161.17, qty=0.123, fee=0.001784):
+    action = {"tier": 1, "token": "t-1735", "edge": 0.0, "dev_bps": 6.85,
+              "baseline": -9.95, "stamp": 0.0, "notional_usd": 20.0,
+              "qty": qty, "signal_basis": "raw_v1"}
+    engine.confirm_open(action, qty=qty,
+                        entry_prices={"lighter_rh": buy, "entropy": sell}, fee_usd=fee)
+    return action
+
+
+def test_1735_nvda_trade_is_not_closed_by_a_signal_only_edge():
+    """Regression for 2026-11-18 17:35 Beijing (09:35 UTC), NVDA reverse tier 1.
+
+    The signal edge reached -16.7 bps, but the real four fills were -3.1 bps
+    gross.  Charging the SNDK-style P80 exit slippage and both fees once must
+    keep the position open: a paper convergence is not a realized profit.
+    """
+    ledger = PositionLedger()
+    engine = TierEngine(config=_cfg_real_exit(), ledger=ledger)
+    _book_reverse(engine)
+    mark = ExitMark(buy_price=161.28, sell_price=161.38, source="latest")
+    actions = engine.on_sample(stamp=11.0, edge=-16.740552438230463, baseline=-9.950248756218905,
+                               price_hint=161.3, window=[-16.7, -16.7, -16.7],
+                               exchange=exchange_from(ledger, venues=("lighter_rh", "entropy")),
+                               raw_edge=-16.121031746031747, exit_marks={1: [mark]})
+    assert [a for a in actions if a["action"] == "close"] == []
+    audit = engine.last_exit_eval[1]
+    assert round(audit["gross_bps"], 2) == -3.10
+    assert round(audit["entry_fee_bps"], 2) == 0.89
+    assert round(audit["exit_fee_bps"], 2) == 0.89
+    assert round(audit["net_bps"], 2) < -10.0
+
+
+def test_exit_cost_breakdown_charges_each_item_exactly_once():
+    result = exit_cost_breakdown(entry_buy=161.32, entry_sell=161.17,
+                                 exit_buy=161.28, exit_sell=161.38,
+                                 exit_slippage_bps=5.98,
+                                 entry_fee_bps=0.892, exit_fee_bps=0.892,
+                                 profit_target_bps=1.0)
+    assert round(result["gross_bps"], 2) == -3.10
+    assert round(result["cost_bps"], 2) == 7.76
+    assert round(result["net_bps"], 2) == -10.86
+
+
+def test_exit_is_allowed_only_when_the_real_book_clears_costs_and_one_bps():
+    ledger = PositionLedger()
+    engine = TierEngine(config=_cfg_real_exit(), ledger=ledger)
+    _book_reverse(engine, buy=100.0, sell=100.10, qty=0.2, fee=0.00179)
+    exchange = exchange_from(ledger, venues=("lighter_rh", "entropy"))
+    # 8.0 bps gross, 7.76 bps of costs: 0.24 bps is not the 1 bps target.
+    thin = ExitMark(buy_price=100.06, sell_price=100.04, source="latest")
+    assert [a for a in engine.on_sample(stamp=1, edge=0.0, baseline=0.0, price_hint=100.0,
+                                        window=[0.0, 0.0, 0.0], exchange=exchange,
+                                        exit_marks={1: [thin]}) if a["action"] == "close"] == []
+    # A fully converged book leaves about 2.2 bps net.
+    paid = ExitMark(buy_price=100.05, sell_price=100.05, source="latest")
+    closes = [a for a in engine.on_sample(stamp=2, edge=0.0, baseline=0.0, price_hint=100.0,
+                                          window=[0.0, 0.0, 0.0], exchange=exchange,
+                                          exit_marks={1: [paid]}) if a["action"] == "close"]
+    assert len(closes) == 1
+    assert round(closes[0]["exit_eval"]["net_bps"], 2) == 2.23
+
+
+def test_the_worse_of_aligned_and_latest_marks_wins():
+    ledger = PositionLedger()
+    engine = TierEngine(config=_cfg_real_exit(), ledger=ledger)
+    _book_reverse(engine, buy=100.0, sell=100.10, qty=0.2, fee=0.00179)
+    exchange = exchange_from(ledger, venues=("lighter_rh", "entropy"))
+    aligned = ExitMark(buy_price=100.03, sell_price=100.07, source="aligned")
+    latest = ExitMark(buy_price=100.09, sell_price=100.01, source="latest")
+    actions = engine.on_sample(stamp=1, edge=0.0, baseline=0.0, price_hint=100.0,
+                               window=[0.0, 0.0, 0.0], exchange=exchange,
+                               exit_marks={1: [aligned, latest]})
+    assert [a for a in actions if a["action"] == "close"] == []
+    assert engine.last_exit_eval[1]["mark_source"] == "latest"
+
+
+def test_live_exit_is_blocked_when_no_executable_close_book_exists():
+    ledger = PositionLedger()
+    engine = TierEngine(config=_cfg_real_exit(), ledger=ledger)
+    _book_reverse(engine)
+    exchange = exchange_from(ledger, venues=("lighter_rh", "entropy"))
+    actions = engine.on_sample(stamp=11, edge=-40.0, baseline=-9.9, price_hint=161.3,
+                               window=[-40.0, -40.0, -40.0], exchange=exchange,
+                               raw_edge=-40.0, exit_marks={})
+    assert [a for a in actions if a["action"] == "close"] == []
+    assert engine.last_exit_eval == {}

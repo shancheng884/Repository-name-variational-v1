@@ -19,7 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.lib.nvda_tier_engine import PositionLedger, TierConfig, TierEngine, TierSpec, asset_symbol
+from tools.lib.nvda_tier_engine import (ExitMark, PositionLedger, TierConfig, TierEngine,
+                                          TierSpec, asset_symbol)
 from tools.lib.venue_probe import EntropyProbeExecutor, LighterProbeExecutor, _d
 from tools.lib.nvda_quote_alignment import BASIS, quote_clock_issue, quote_max_age, seed_aligned_history
 from tools.lib.nvda_fee_updates import finalize_costs, refresh_open_fees
@@ -386,6 +387,69 @@ def _tier_list(text):
     return [float(value) for value in text.split(",") if value.strip()]
 
 
+def _quote_price(quote, side):
+    key = "executable_buy" if side == "buy" else "executable_sell"
+    value = _d((quote or {}).get(key))
+    return float(value) if value is not None and value > 0 else None
+
+
+def _depth_price(hub, venue, symbol, qty, side):
+    """Executable VWAP for this exact child, not the 20U display quote.
+
+    A visible-size shortfall means the book cannot absorb the whole child, so
+    the mark is refused instead of pretending the top levels are enough.
+    """
+    try:
+        audit = hub.depth_audit(venue, symbol, qty) or {}
+    except Exception:
+        return None
+    shortfall_key = "buy_visible_qty_shortfall" if side == "buy" else "sell_visible_qty_shortfall"
+    shortfall = _d(audit.get(shortfall_key))
+    if shortfall is not None and shortfall > 0:
+        return None
+    key = "buy_vwap" if side == "buy" else "sell_vwap"
+    value = _d(audit.get(key))
+    return float(value) if value is not None and value > 0 else None
+
+
+def build_exit_marks(engine, quotes_by_venue, aligned, hub, symbol):
+    """Two executable close marks per open child: aligned quote and latest book.
+
+    The engine keeps the worse of them, so an exit is never authorized by a
+    stale quote that the current book no longer supports.
+    """
+    marks = {}
+    for index in engine.open_tiers:
+        lot, _fraction, qty = engine.close_child(index)
+        if not (qty > 0) or lot.get("entry_buy_price") is None or lot.get("entry_sell_price") is None:
+            continue
+        buy_venue, sell_venue = engine.config.buy_venue, engine.config.sell_venue
+        rows = []
+        latest_buy = quotes_by_venue.get(buy_venue)
+        latest_sell = quotes_by_venue.get(sell_venue)
+        latest_ok = latest_buy is not None and latest_sell is not None
+        if latest_ok:
+            sell_price = _depth_price(hub, buy_venue, symbol, qty, "sell")
+            buy_price = _depth_price(hub, sell_venue, symbol, qty, "buy")
+            if buy_price and sell_price:
+                rows.append(ExitMark(buy_price=buy_price, sell_price=sell_price,
+                                     source="latest"))
+        if rows and aligned:
+            by_venue = {row.get("venue"): row for row in
+                        (aligned.get("left"), aligned.get("right")) if row}
+            aligned_buy = by_venue.get(buy_venue)
+            aligned_sell = by_venue.get(sell_venue)
+            if aligned_buy is not None and aligned_sell is not None:
+                sell_price = _quote_price(aligned_buy, "sell")
+                buy_price = _quote_price(aligned_sell, "buy")
+                if buy_price and sell_price:
+                    rows.append(ExitMark(buy_price=buy_price, sell_price=sell_price,
+                                         source="aligned"))
+        if rows:
+            marks[index] = rows
+    return marks
+
+
 def _build_engine(asset_name, buy_venue, sell_venue, tiers, equity, args, ledger):
     cfg = TierConfig(asset=asset_name, buy_venue=buy_venue, sell_venue=sell_venue,
                      tiers=tuple(TierSpec(i, t) for i, t in enumerate(tiers, start=1)),
@@ -393,7 +457,8 @@ def _build_engine(asset_name, buy_venue, sell_venue, tiers, equity, args, ledger
                      equity_usd=equity, notional_usd=args.notional,
                      timeout_seconds=None, slippage_bps=args.slippage_bps,
                      exit_cost_bps=getattr(args, "exit_cost_bps", None),
-                     profit_target_bps=getattr(args, "profit_target_bps", 1.0))
+                     profit_target_bps=getattr(args, "profit_target_bps", 1.0),
+                     entropy_fee_bps=getattr(args, "entropy_fee_bps", 0.9))
     return cfg, TierEngine(config=cfg, ledger=ledger)
 
 
@@ -674,7 +739,9 @@ async def main_async(args):
                  "equity_actual": equity_actual,
                  "equity_source": "fixed_margin" if margin_usd is not None else "live",
                  "exit_rule": {"exit_cost_bps": getattr(args, "exit_cost_bps", None),
-                               "profit_target_bps": getattr(args, "profit_target_bps", 1.0)},
+                               "profit_target_bps": getattr(args, "profit_target_bps", 1.0),
+                               "entropy_fee_bps": getattr(args, "entropy_fee_bps", 0.9),
+                               "basis": "actual_entry_fill_vs_executable_close_book_v1"},
                  "slot_caps": caps, "cumulative_notional": ladder, "tiers": tiers,
                  "child_notional": args.child_notional, "leverage": leverage,
                  "restored": restored, "realized_usd": str(realized),
@@ -832,15 +899,19 @@ async def main_async(args):
                                   {"event": "quote_alignment", "at": _iso(stamp), **alignment_audit})
             # Both directions always evaluate exits; only the flat side may open,
             # which is the ETH gradient's direction lock until fully flat.
+            marks_forward = build_exit_marks(engine_forward, {buy: q_buy, sell: q_sell},
+                                             aligned, cap.hub, symbol)
+            marks_reverse = build_exit_marks(engine_reverse, {sell: q_sell, buy: q_buy},
+                                             aligned, cap.hub, symbol)
             acts_forward = engine_forward.on_sample(
                 stamp=stamp, edge=edge_forward, baseline=baseline["forward"],
                 price_hint=float(max(buy_ask, sell_bid)), window=list(dev_window["forward"]),
-                exchange=exchange or {}, raw_edge=raw_forward,
+                exchange=exchange or {}, raw_edge=raw_forward, exit_marks=marks_forward,
                 allow_entry=all(ready.values()) and aligned is not None and not legacy and not engine_reverse.open_tiers)
             acts_reverse = engine_reverse.on_sample(
                 stamp=stamp, edge=edge_reverse, baseline=baseline["reverse"],
                 price_hint=float(max(sell_ask, buy_bid)), window=list(dev_window["reverse"]),
-                exchange=exchange or {}, raw_edge=raw_reverse,
+                exchange=exchange or {}, raw_edge=raw_reverse, exit_marks=marks_reverse,
                 allow_entry=all(ready.values()) and aligned is not None and not legacy and not engine_forward.open_tiers)
             for action in acts_forward:
                 action["direction"] = "forward"
@@ -1085,6 +1156,7 @@ async def main_async(args):
                                                      "pair": args.pair, "direction": action.get("direction"),
                                                      "tier": action.get("tier"), "qty": str(qty),
                                                      "notional_usd": action.get("notional_usd"),
+                                                     "exit_eval": action.get("exit_eval"),
                                                      "pnl": pnl, "rebate_usd": entropy_rebate(receipts),
                                                      "receipts": receipts, "settle": check})
                             save_engine_state(asset=symbol, pair=args.pair, tiers=tiers, engines=engines,
@@ -1157,7 +1229,9 @@ async def main_async(args):
                          "equity_actual": equity_actual,
                          "equity_source": "fixed_margin" if getattr(args, "margin_usd", None) is not None else "live",
                          "exit_rule": {"exit_cost_bps": getattr(args, "exit_cost_bps", None),
-                                       "profit_target_bps": getattr(args, "profit_target_bps", 1.0)},
+                                       "profit_target_bps": getattr(args, "profit_target_bps", 1.0),
+                                       "entropy_fee_bps": getattr(args, "entropy_fee_bps", 0.9),
+                                       "basis": "actual_entry_fill_vs_executable_close_book_v1"},
                          "quote_basis": BASIS, "time_alignment": alignment_audit,
                          "legacy_exit_only": legacy,
                          "entropy_fill_stream": ({"connected": fill_stream.connected,
@@ -1171,13 +1245,15 @@ async def main_async(args):
                                          "raw_edge_bps": round(raw_forward, 2),
                                          "baseline_bps": round(baseline["forward"], 2),
                                          "dev_bps": round(edge_forward - baseline["forward"], 2),
-                                         "open_tiers": sorted(engine_forward.open_tiers)},
+                                         "open_tiers": sorted(engine_forward.open_tiers),
+                                         "exit_evals": engine_forward.last_exit_eval},
                              "reverse": {"pair": "%s>%s" % (sell, buy),
                                          "edge_bps": round(edge_reverse, 2),
                                          "raw_edge_bps": round(raw_reverse, 2),
                                          "baseline_bps": round(baseline["reverse"], 2),
                                          "dev_bps": round(edge_reverse - baseline["reverse"], 2),
-                                         "open_tiers": sorted(engine_reverse.open_tiers)}},
+                                         "open_tiers": sorted(engine_reverse.open_tiers),
+                                         "exit_evals": engine_reverse.last_exit_eval}},
                          "trades": len(engine_forward.trades) + len(engine_reverse.trades),
                          "realized_usd": str(realized),
                          "rebate_usd": str(rebate),
@@ -1214,7 +1290,9 @@ def main(argv=None):
     parser.add_argument("--child-notional", type=float, default=20.0)
     parser.add_argument("--slippage-bps", type=float, default=1.3)
     parser.add_argument("--exit-cost-bps", type=float, default=None,
-                        help="locked exit slippage (P80); closes need this plus the profit target")
+                        help="measured exit slippage P80 in bps; fees are charged separately")
+    parser.add_argument("--entropy-fee-bps", type=float, default=0.9,
+                        help="fallback Entropy fee per side when the receipt is still pending")
     parser.add_argument("--profit-target-bps", type=float, default=1.0)
     parser.add_argument("--margin-usd", type=float, default=None,
                         help="fixed per-venue margin for capacity sizing, verified against the account")
