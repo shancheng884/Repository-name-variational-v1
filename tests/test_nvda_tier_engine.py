@@ -564,6 +564,33 @@ def _both_marks(buy, sell):
     return [ExitMark(buy, sell, source) for source in ("aligned", "latest")]
 
 
+def test_nvda_live_593_budget_keeps_the_one_bps_net_gate():
+    from dataclasses import replace
+    from pathlib import Path
+    from shlex import split
+
+    unit = Path(__file__).resolve().parents[1] / "deploy/systemd/nvda-tier-live-v2.service"
+    cmd = split(next(line for line in unit.read_text().splitlines() if line.startswith("ExecStart=")))
+    budget = float(cmd[cmd.index("--exit-cost-bps") + 1])
+    target = float(cmd[cmd.index("--profit-target-bps") + 1])
+    assert (budget, target) == (5.93, 1.0)
+
+    def decide(cost, latest_sell):
+        config = replace(_cfg_real_exit(exit_slippage=cost, target=target), select_eligible_child=True)
+        engine = TierEngine(config=config, ledger=PositionLedger())
+        _book_reverse(engine, buy=100.0, sell=100.0, qty=0.2, fee=0.0018)
+        marks = [ExitMark(100.0, 100.1, "aligned"), ExitMark(100.0, latest_sell, "latest")]
+        actions = _sample_child_exit(engine, {"t-1735": marks})
+        return actions, engine.last_exit_eval[1]["net_bps"]
+
+    assert decide(6.82, 100.089)[0] == []
+    assert decide(budget, 100.084)[0] == []
+    actions, net = decide(budget, 100.089)
+    assert len(actions) == 1 and actions[0]["action"] == "close"
+    assert actions[0]["exit_eval"]["mark_source"] == "latest"
+    assert round(net, 2) == 1.17
+
+
 def test_fifo_head_wins_when_eligible_even_if_a_later_child_pays_more():
     engine = _child_exit_case()
     actions = _sample_child_exit(engine, {lot: _both_marks(100, 100.6)
