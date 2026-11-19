@@ -109,6 +109,7 @@ class TierConfig:
     profit_target_bps: float = 1.0
     # Fallback Entropy taker fee when the entry receipt has not arrived yet.
     entropy_fee_bps: float = 0.9
+    select_eligible_child: bool = False
 
     def slot_caps(self) -> tuple[int, ...] | None:
         """Cumulative child slots per tier, mirroring main.py's 5x hard cap."""
@@ -290,14 +291,53 @@ class TierEngine:
                              "entry_fee_usd": pos.entry_fee_usd}]
             pos.children[0].update(entry_fee_pending=pos.entry_fee_pending,
                                    entry_receipts=pos.entry_receipts)
+        for offset, lot in enumerate(pos.children):
+            if not lot.get("child_id"):
+                lot["child_id"] = f"legacy-{pos.index}-{offset}-{lot.get('opened_at', pos.opened_at)}"
         return pos.children
 
-    def close_child(self, index: int) -> tuple[dict[str, Any], float, float]:
-        """The next 20U sub-order to close, with its share of the tier."""
+    def close_child(self, index: int, child_id: str | None = None) -> tuple[dict[str, Any], float, float]:
+        """The named child, or the FIFO head for pre-migration actions."""
         pos = self.open_tiers[index]
-        lot = self._lots(pos)[0]
+        lots = self._lots(pos)
+        matches = lots[:1] if child_id is None else [x for x in lots if x["child_id"] == child_id]
+        if len(matches) != 1:
+            raise KeyError(child_id)
+        lot = matches[0]
+        fraction, qty = self.child_close_size(lot)
+        return lot, fraction, qty
+
+    def child_close_size(self, lot: dict[str, Any]) -> tuple[float, float]:
         fraction = min(1.0, self.config.child_notional_usd / lot["notional_usd"])
-        return lot, fraction, lot["qty"] * fraction
+        return fraction, lot["qty"] * fraction
+
+    def exit_children(self, index: int) -> list[dict[str, Any]]:
+        lots = self._lots(self.open_tiers[index])
+        return lots if self.config.select_eligible_child else lots[:1]
+
+    def _child_exit_eval(self, lot, marks) -> dict[str, Any] | None:
+        best = None
+        entry_buy, entry_sell = lot.get("entry_buy_price"), lot.get("entry_sell_price")
+        for mark in marks:
+            gross = exit_gross_bps(entry_buy=entry_buy, entry_sell=entry_sell,
+                                   exit_buy=mark.buy_price, exit_sell=mark.sell_price)
+            if gross is not None and (best is None or gross < best[0]):
+                best = (gross, mark)
+        if best is None:
+            return None
+        entropy = "entropy" in (self.config.buy_venue, self.config.sell_venue)
+        lot_fee = float(lot.get("entry_fee_usd") or 0.0)
+        if entropy and lot.get("entry_fee_pending"):
+            ref = entry_buy if self.config.buy_venue == "entropy" else entry_sell
+            lot_fee = lot["qty"] * ref * self.config.entropy_fee_bps / 10000.0
+        entry_fee = lot_fee / lot["notional_usd"] * 10000.0
+        exit_fee = entry_fee if lot_fee > 0 else (self.config.entropy_fee_bps if entropy else 0.0)
+        result = exit_cost_breakdown(entry_buy=entry_buy, entry_sell=entry_sell,
+                                     exit_buy=best[1].buy_price, exit_sell=best[1].sell_price,
+                                     exit_slippage_bps=self.config.exit_cost_bps,
+                                     entry_fee_bps=entry_fee, exit_fee_bps=exit_fee,
+                                     profit_target_bps=self.config.profit_target_bps)
+        return {**result, "mark_source": best[1].source, "child_id": lot["child_id"]}
 
     def _refresh(self, pos: OpenTier) -> None:
         lots = self._lots(pos)
@@ -317,7 +357,7 @@ class TierEngine:
     def on_sample(self, *, stamp: float, edge: float, baseline: float, price_hint: float,
                   window: list[float], exchange: dict[str, Decimal | float | None],
                   allow_entry: bool = True, raw_edge: float | None = None,
-                  exit_marks: dict[int, list[ExitMark]] | None = None) -> list[dict[str, Any]]:
+                  exit_marks: dict[int | str, list[ExitMark]] | None = None) -> list[dict[str, Any]]:
         """Decide closes (always) and at most one entry for this direction.
 
         The ETH gradient runs bidirectionally but locks the active direction
@@ -342,48 +382,29 @@ class TierEngine:
             entry_reference = (pos.entry_realized_edge if pos.entry_realized_edge is not None
                                else pos.entry_edge)
             converged = entry_reference - exit_edge
-            lot = self._lots(pos)[0]
-            fraction = min(1.0, self.config.child_notional_usd / lot["notional_usd"])
+            lot, fraction, qty = self.close_child(index)
             exit_eval: dict[str, Any] | None = None
             if self.config.exit_cost_bps is None:
                 # Legacy rule: wait for the spread to come back to its anchor.
                 target_hit = exit_edge <= pos.frozen_baseline
                 net_bps = converged - self.config.slippage_bps
             else:
-                # Prefer a real four-fill check: actual entry fills against the
-                # executable close book.  This is the only place the P80 exit
-                # slippage and the two fees are charged, each exactly once.
-                marks = (exit_marks or {}).get(index) or []
-                best: tuple[float, ExitMark] | None = None
-                entry_buy = lot.get("entry_buy_price")
-                entry_sell = lot.get("entry_sell_price")
-                for mark in marks:
-                    gross = exit_gross_bps(entry_buy=entry_buy,
-                                           entry_sell=entry_sell,
-                                           exit_buy=mark.buy_price,
-                                           exit_sell=mark.sell_price)
-                    if gross is not None and (best is None or gross < best[0]):
-                        best = (gross, mark)
-                if best is not None and entry_buy and entry_sell:
-                    lot_fee = float(lot.get("entry_fee_usd") or 0.0)
-                    entropy = "entropy" in (self.config.buy_venue, self.config.sell_venue)
-                    if entropy and lot.get("entry_fee_pending"):
-                        ref = entry_buy if self.config.buy_venue == "entropy" else entry_sell
-                        lot_fee = lot["qty"] * ref * self.config.entropy_fee_bps / 10000.0
-                    entry_fee_bps = (lot_fee / lot["notional_usd"] * 10000.0
-                                     if lot["notional_usd"] > 0 else 0.0)
-                    exit_fee_bps = (entry_fee_bps if lot_fee > 0
-                                    else (self.config.entropy_fee_bps
-                                          if "entropy" in (self.config.buy_venue, self.config.sell_venue)
-                                          else 0.0))
-                    exit_eval = exit_cost_breakdown(
-                        entry_buy=entry_buy, entry_sell=entry_sell,
-                        exit_buy=best[1].buy_price, exit_sell=best[1].sell_price,
-                        exit_slippage_bps=self.config.exit_cost_bps,
-                        entry_fee_bps=entry_fee_bps, exit_fee_bps=exit_fee_bps,
-                        profit_target_bps=self.config.profit_target_bps)
+                marks = exit_marks or {}
+                # Scan FIFO order; the first eligible child wins. Tier marks
+                # from old callers are valid for the head only.
+                for offset, child in enumerate(self.exit_children(index)):
+                    child_marks = marks.get(child["child_id"], marks.get(index, []) if offset == 0 else [])
+                    if self.config.select_eligible_child and {m.source for m in child_marks} != {"aligned", "latest"}:
+                        continue
+                    evaluated = self._child_exit_eval(child, child_marks)
+                    if offset == 0:
+                        exit_eval = evaluated
+                    if evaluated and evaluated["net_bps"] >= self.config.profit_target_bps:
+                        lot = child
+                        fraction, qty = self.child_close_size(child)
+                        exit_eval = {**evaluated, "queue_offset": offset}
+                        break
                 if exit_eval is not None:
-                    exit_eval["mark_source"] = best[1].source
                     self.last_exit_eval[index] = dict(exit_eval)
                     target_hit = exit_eval["net_bps"] >= self.config.profit_target_bps
                     net_bps = exit_eval["net_bps"]
@@ -406,9 +427,10 @@ class TierEngine:
             pos.closing = True
             action = {"action": "close", "tier": index,
                       "token": uuid.uuid4().hex,
+                      "child_id": lot["child_id"],
                       "reason": ("reverted" if self.config.exit_cost_bps is None
                                  else "target") if target_hit else "timeout",
-                      "net_bps": net_bps, "qty": lot["qty"] * fraction,
+                      "net_bps": net_bps, "qty": qty,
                       "notional_usd": lot["notional_usd"] * fraction,
                       "entry_buy_price": lot.get("entry_buy_price"),
                       "entry_sell_price": lot.get("entry_sell_price"),
@@ -416,10 +438,13 @@ class TierEngine:
                       "entry_receipts": lot.get("entry_receipts") or {},
                       "entry_fee_fraction": fraction,
                       "entry_edge": lot["entry_edge"], "exit_edge": exit_edge,
-                      "hold_s": stamp - pos.opened_at}
+                      "hold_s": stamp - lot.get("opened_at", pos.opened_at)}
             if exit_eval is not None:
                 action["exit_eval"] = exit_eval
             actions.append(action)
+            if self.config.select_eligible_child:
+                self.pending_action = dict(action)
+                break
 
         # One reconciliation per decision step: the account is checked before the
         # batch of orders goes out, not after every child order we just queued.
@@ -507,6 +532,7 @@ class TierEngine:
                                   for v, r in (entry_receipts or {}).items()),
             entry_realized_edge=realized_edge,
         )
+        self._lots(child)[0]["child_id"] = token or uuid.uuid4().hex
         pos = self.open_tiers.get(index)
         if pos is None:
             pos = child
@@ -520,21 +546,36 @@ class TierEngine:
         self.cancel_open(action)
         return pos
 
+    def match_close(self, action: dict[str, Any]) -> tuple[dict[str, Any], float, float] | None:
+        locked = self.pending_action
+        if ((self.config.select_eligible_child and locked is None)
+                or (locked is not None and (
+                    locked.get("action") != "close"
+                    or any(locked.get(k) != action.get(k) for k in ("token", "tier", "child_id", "qty"))
+                ))):
+            return None
+        try:
+            lot, fraction, planned_qty = self.close_child(int(action["tier"]), action.get("child_id"))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            return None
+        if action.get("qty") != planned_qty or planned_qty <= 0:
+            return None
+        return lot, fraction, planned_qty
+
     def confirm_close(self, action: dict[str, Any]) -> dict[str, Any] | None:
         """Book a close only after the venue confirmed both legs filled."""
         index = int(action.get("tier"))
         token = action.get("token")
         if token and token in self.completed_actions:
             return None
-        pos = self.open_tiers.get(index)
-        if pos is None:
+        matched = self.match_close(action)
+        if matched is None:
             return None
-        lot = self._lots(pos)[0]
-        qty = min(float(action.get("qty") or pos.qty), lot["qty"])
-        fraction = qty / lot["qty"]
+        pos = self.open_tiers[index]
+        lot, fraction, qty = matched
         notional = lot["notional_usd"] * fraction
         trade = {"tier": index, "net_bps": float(action.get("net_bps") or 0.0),
-                 "execution_token": token,
+                 "execution_token": token, "child_id": lot["child_id"],
                  "hold_s": float(action.get("hold_s") or 0.0),
                  "reason": action.get("reason") or "reverted",
                  "entry_dev": lot["entry_dev"], "notional_usd": notional,
@@ -545,7 +586,7 @@ class TierEngine:
         self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -Decimal(str(qty)))
         self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, Decimal(str(qty)))
         if fraction >= 1.0 - 1e-10:
-            pos.children.pop(0)
+            pos.children.remove(lot)
         else:
             lot["qty"] -= qty
             lot["notional_usd"] -= notional
@@ -561,21 +602,25 @@ class TierEngine:
             self.pending_action = None
         return trade
 
-    def cancel_close(self, index: int) -> None:
+    def cancel_close(self, index: int, *, token: str | None = None) -> None:
         """Release the close lock so the next sample can try again."""
+        locked = self.pending_action
+        if locked and locked.get("action") == "close":
+            if locked.get("tier") != int(index) or (token is not None and locked.get("token") != token):
+                return
+            self.pending_action = None
         pos = self.open_tiers.get(int(index))
         if pos is not None:
             pos.closing = False
-        if self.pending_action and self.pending_action.get("action") == "close":
-            self.pending_action = None
 
     def drop_tier(self, index: int) -> None:
         """Undo a booked tier (used when a close had to be abandoned)."""
         pos = self.open_tiers.pop(index, None)
         if pos is None:
             return
-        self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -Decimal(str(pos.qty)))
-        self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, Decimal(str(pos.qty)))
+        qty = sum((Decimal(str(lot["qty"])) for lot in self._lots(pos)), Decimal(0))
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, -qty)
+        self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, qty)
 
     def dump_state(self) -> dict[str, Any]:
         return {"strategy_id": self.strategy_id,
@@ -588,6 +633,7 @@ class TierEngine:
         """Rebuild booked tiers (and their ledger legs) from a saved run."""
         if not data:
             return
+        child_ids = set()
         for row in data.get("open_tiers") or []:
             try:
                 pos = OpenTier.from_state(row)
@@ -595,9 +641,17 @@ class TierEngine:
                 continue
             if pos.index in self.open_tiers or pos.qty <= 0:
                 continue
+            lots = self._lots(pos)
+            for lot in lots:
+                if lot["child_id"] in child_ids:
+                    raise ValueError("duplicate_child_id")
+                child_ids.add(lot["child_id"])
+            qty = sum((Decimal(str(lot["qty"])) for lot in lots), Decimal(0))
+            if abs(qty - Decimal(str(pos.qty))) > Decimal("0.0000001"):
+                raise ValueError("child_quantity_mismatch")
             self.open_tiers[pos.index] = pos
-            self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, Decimal(str(pos.qty)))
-            self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, -Decimal(str(pos.qty)))
+            self.ledger.add(self.strategy_id, self.config.asset, self.config.buy_venue, qty)
+            self.ledger.add(self.strategy_id, self.config.asset, self.config.sell_venue, -qty)
         self.trades = list(data.get("trades") or [])[-200:]
         self.completed_actions = list(data.get("completed_actions") or [])[-2000:]
         self.pending_action = data.get("pending_action")

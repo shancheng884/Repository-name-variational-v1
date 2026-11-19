@@ -26,7 +26,7 @@ from tools.lib.venue_probe import EntropyProbeExecutor, LighterProbeExecutor, _d
 from tools.lib.nvda_quote_alignment import BASIS, quote_clock_issue, quote_max_age, seed_aligned_history
 from tools.lib.nvda_fee_updates import finalize_costs, refresh_open_fees
 from tools.lib.nvda_execution_stats import (closed_child_result, failed_entry_result, hedged_entry_result,
-                                          new_execution_stats, record_attempt)
+                                          new_execution_stats, receipt_order_ids, record_attempt)
 from tools.market_capture.config import DEFAULT_ASSETS, VENUES, CaptureConfig, load_environment
 from tools.market_capture.runner import CaptureRunner, _acquire_lock
 
@@ -599,19 +599,24 @@ def build_exit_marks(engine, quotes_by_venue, aligned, stamp):
         return marks
     by_venue = {row["venue"]: row for row in (aligned.get("left"), aligned.get("right")) if row}
     buy_venue, sell_venue = engine.config.buy_venue, engine.config.sell_venue
+    by_size = {}
     for index in engine.open_tiers:
-        lot, _fraction, qty = engine.close_child(index)
-        if not (qty > 0) or lot.get("entry_buy_price") is None or lot.get("entry_sell_price") is None:
-            continue
-        qty = Decimal(str(qty))
-        rows = []
-        for source, quotes in (("latest", quotes_by_venue), ("aligned", by_venue)):
-            sell_price = _depth_price(quotes.get(buy_venue), qty, "sell", stamp)
-            buy_price = _depth_price(quotes.get(sell_venue), qty, "buy", stamp)
-            if buy_price and sell_price:
-                rows.append(ExitMark(buy_price=buy_price, sell_price=sell_price, source=source))
-        if len(rows) == 2:
-            marks[index] = rows
+        for lot in engine.exit_children(index):
+            _, amount = engine.child_close_size(lot)
+            if amount <= 0 or lot.get("entry_buy_price") is None or lot.get("entry_sell_price") is None:
+                continue
+            qty = Decimal(str(amount))
+            if qty not in by_size:
+                rows = []
+                for source, quotes in (("latest", quotes_by_venue), ("aligned", by_venue)):
+                    sell_price = _depth_price(quotes.get(buy_venue), qty, "sell", stamp)
+                    buy_price = _depth_price(quotes.get(sell_venue), qty, "buy", stamp)
+                    if buy_price and sell_price:
+                        rows.append(ExitMark(buy_price=buy_price, sell_price=sell_price, source=source))
+                by_size[qty] = rows
+            if len(by_size[qty]) == 2:
+                key = lot["child_id"] if engine.config.select_eligible_child else index
+                marks[key] = by_size[qty]
     return marks
 
 
@@ -623,7 +628,8 @@ def _build_engine(asset_name, buy_venue, sell_venue, tiers, equity, args, ledger
                      timeout_seconds=None, slippage_bps=args.slippage_bps,
                      exit_cost_bps=getattr(args, "exit_cost_bps", None),
                      profit_target_bps=getattr(args, "profit_target_bps", 1.0),
-                     entropy_fee_bps=getattr(args, "entropy_fee_bps", 0.9))
+                     entropy_fee_bps=getattr(args, "entropy_fee_bps", 0.9),
+                     select_eligible_child=asset_name == "NVDA" and getattr(args, "exit_cost_bps", None) is not None)
     return cfg, TierEngine(config=cfg, ledger=ledger)
 
 
@@ -795,7 +801,10 @@ async def recover_pending_close(engine, ex, asset, startup, journal):
     if (qty is None or not qty.is_finite() or qty <= 0
             or action.get("tier") not in engine.open_tiers or "entropy" not in (buy, sell)):
         return None
-    _, _, child_qty = engine.close_child(action["tier"])
+    selected = engine.match_close(action)
+    if selected is None:
+        return None
+    lot, _, child_qty = selected
     if qty != Decimal(str(child_qty)):
         return None
     expected = {buy: engine.ledger.net(engine.config.asset, buy) - qty,
@@ -866,6 +875,8 @@ async def recover_pending_close(engine, ex, asset, startup, journal):
     trade.update(pnl)
     return {"ts": _iso(), "event": "closed", "recovered": True, "execution_token": action["token"],
             "direction": action["direction"], "tier": action["tier"], "qty": str(qty),
+            "child_id": lot["child_id"],
+            "entry_order_ids": receipt_order_ids(action.get("entry_receipts") or lot.get("entry_receipts") or {}),
             "notional_usd": action["notional_usd"], "exit_eval": action.get("exit_eval"),
             "receipts": receipts, "pnl": pnl,
             "rebate_usd": entropy_rebate(receipts) + sum(
@@ -1230,7 +1241,7 @@ async def main_async(args):
                 if discarded.get("action") == "open":
                     owner.cancel_open(discarded)
                 elif discarded.get("action") == "close":
-                    owner.cancel_close(discarded["tier"])
+                    owner.cancel_close(discarded["tier"], token=discarded["token"])
             actions = [chosen] if chosen is not None else []
             block_before = (LAST_BLOCK or {}).get("at")
             if args.mode == "live" and not shutdown.is_set():
@@ -1338,6 +1349,7 @@ async def main_async(args):
                             snap_at = time.time()
                             append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "opened",
                                                      "execution_token": action["token"],
+                                                     "child_id": action["token"],
                                                      "pair": args.pair, "direction": action.get("direction"),
                                                      "tier": action.get("tier"), "qty": str(hedge_qty),
                                                      "notional_usd": action.get("notional_usd"),
@@ -1407,8 +1419,13 @@ async def main_async(args):
                                 return {"ok": False, "error": "unresolved_order"}
                     elif action.get("action") == "close":
                         qty = Decimal(str(action.get("qty") or 0))
+                        if engine.match_close(action) is None:
+                            record_block("close_child_lock_mismatch", tier=action["tier"],
+                                         child_id=action.get("child_id"), token=action["token"])
+                            write_state({"status": "blocked_close_child_lock", "stage": "before_submit"})
+                            return {"ok": False, "error": "close_child_lock_mismatch"}
                         if qty <= 0 or common_qty(ex, asset, venues, qty) != qty:
-                            engine.cancel_close(action["tier"])
+                            engine.cancel_close(action["tier"], token=action["token"])
                             record_block("close_quantity_not_tradeable", min_interval=30,
                                          tier=action["tier"], qty=str(qty))
                             continue
@@ -1438,6 +1455,7 @@ async def main_async(args):
                         if check.get("error") == "unresolved_order":
                             append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "close_failed", "pair": args.pair,
                                                      "execution_token": action["token"],
+                                                     "child_id": action.get("child_id"),
                                                      "direction": action.get("direction"), "tier": action["tier"],
                                                      "receipts": receipts, "settle": check,
                                                      "pnl": {"complete": False, "missing": ["unresolved_order"]}})
@@ -1449,6 +1467,12 @@ async def main_async(args):
                             return {"ok": False, "error": "unresolved_order"}
                         if check.get("ok"):
                             trade = engine.confirm_close(action)
+                            if trade is None:
+                                record_block("close_child_lock_mismatch", tier=action["tier"],
+                                             child_id=action.get("child_id"), token=action["token"],
+                                             receipts=receipts, settle=check)
+                                write_state({"status": "blocked_close_child_lock", "stage": "after_fill"})
+                                return {"ok": False, "error": "close_child_lock_mismatch"}
                             close_failures.pop(action["tier"], None)
                             exchange = {v: ledger.net(symbol, v) for v in venues}
                             snap_at = time.time()
@@ -1474,6 +1498,8 @@ async def main_async(args):
                                                      "execution_token": action["token"],
                                                      "pair": args.pair, "direction": action.get("direction"),
                                                      "tier": action.get("tier"), "qty": str(qty),
+                                                     "child_id": action.get("child_id"),
+                                                     "entry_order_ids": receipt_order_ids(action.get("entry_receipts") or {}),
                                                      "notional_usd": action.get("notional_usd"),
                                                      "exit_eval": action.get("exit_eval"),
                                                      "pnl": pnl, "rebate_usd": entropy_rebate(receipts),
@@ -1487,6 +1513,7 @@ async def main_async(args):
                                              "receipts": receipts, "settle": check})
                                 append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "close_failed",
                                                          "execution_token": action["token"],
+                                                         "child_id": action.get("child_id"),
                                                          "pair": args.pair, "direction": action["direction"],
                                                          "tier": action["tier"], "receipts": receipts,
                                                          "settle": check,
@@ -1494,8 +1521,9 @@ async def main_async(args):
                                                                  "missing": [check["error"]]}})
                                 return {"ok": False, "error": check["error"]}
                             # Both IOC orders definitively rejected, so no child changed.
-                            engine.cancel_close(action["tier"])
+                            engine.cancel_close(action["tier"], token=action["token"])
                             append_jsonl(ORDER_LOG, {"ts": _iso(), "event": "close_failed", "pair": args.pair,
+                                                     "execution_token": action["token"], "child_id": action.get("child_id"),
                                                      "direction": action.get("direction"), "tier": action["tier"],
                                                      "receipts": receipts, "settle": check,
                                                      "pnl": {"complete": False, "missing": [check["error"]]}})

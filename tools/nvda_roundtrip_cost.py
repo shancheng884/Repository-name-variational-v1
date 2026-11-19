@@ -9,9 +9,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from collections import defaultdict, deque
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tools.lib.nvda_execution_stats import receipt_order_ids
 
 def _num(value):
     try:
@@ -60,7 +66,18 @@ def roundtrip_slippage(rows: list[dict]) -> dict:
         if event == "opened":
             pending[key].append(row)
         elif event == "closed" and pending[key]:
-            pairs.append((pending[key].popleft(), row))
+            queue = pending[key]
+            child, order_ids = row.get("child_id"), row.get("entry_order_ids") or {}
+            if not child and not order_ids:
+                pairs.append((queue.popleft(), row))
+                continue
+            candidates = [r for r in queue
+                          if (child is not None and child == (r.get("child_id") or r.get("execution_token")))
+                          or (order_ids and order_ids == receipt_order_ids(r.get("receipts") or {}))]
+            if len(candidates) == 1:
+                opened = candidates[0]
+                queue.remove(opened)
+                pairs.append((opened, row))
 
     residual = []
     for row in rows:

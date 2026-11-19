@@ -539,3 +539,80 @@ def test_exit_uses_the_specific_child_lot_not_the_tier_average():
     audit = engine.last_exit_eval[1]
     assert round(audit["gross_bps"], 2) == 13.99
     assert round(audit["entry_fee_bps"], 2) == 0.89
+
+
+def _child_exit_case():
+    from dataclasses import replace
+
+    engine = TierEngine(config=replace(_cfg_real_exit(), select_eligible_child=True),
+                        ledger=PositionLedger())
+    for token, buy, sell, qty in (("head", 100.4, 100.0, .197),
+                                  ("next", 100.0, 100.3, .2),
+                                  ("third", 100.0, 100.4, .199)):
+        engine.confirm_open({"tier": 1, "token": token, "qty": qty, "stamp": 1, "notional_usd": 20},
+                            entry_prices={"lighter_rh": buy, "entropy": sell}, fee_usd=.0018)
+    return engine
+
+
+def _sample_child_exit(engine, marks):
+    return engine.on_sample(stamp=10, edge=0, baseline=0, price_hint=100, window=[],
+                            exchange=exchange_from(engine.ledger, venues=("lighter_rh", "entropy")),
+                            allow_entry=False, exit_marks=marks)
+
+
+def _both_marks(buy, sell):
+    return [ExitMark(buy, sell, source) for source in ("aligned", "latest")]
+
+
+def test_fifo_head_wins_when_eligible_even_if_a_later_child_pays_more():
+    engine = _child_exit_case()
+    actions = _sample_child_exit(engine, {lot: _both_marks(100, 100.6)
+                                         for lot in ("head", "next", "third")})
+    assert len(actions) == 1
+    assert actions[0]["child_id"] == "head" and actions[0]["exit_eval"]["queue_offset"] == 0
+    assert engine.pending_action["token"] == actions[0]["token"]
+
+
+def test_non_head_recovery_only_releases_the_locked_child_after_confirmation():
+    engine = _child_exit_case()
+    marks = {lot: _both_marks(100, 100) for lot in ("head", "next", "third")}
+    actions = _sample_child_exit(engine, marks)
+    assert len(actions) == 1
+    action = actions[0]
+    assert action["child_id"] == "next" and action["exit_eval"]["queue_offset"] == 1
+    assert engine.ledger.net("NVDA", "lighter_rh") == D(".596")
+    assert _sample_child_exit(engine, marks) == []
+    restored = TierEngine(config=engine.config, ledger=PositionLedger())
+    restored.restore_state(engine.dump_state())
+    restored.cancel_close(1, token="wrong-token")
+    assert restored.pending_action["child_id"] == "next"
+    assert restored.confirm_close(dict(action, child_id="third")) is None
+    assert restored.confirm_close(dict(action, qty=.199)) is None
+    assert restored.confirm_close(action)["child_id"] == "next"
+    assert restored.confirm_close(action) is None
+    assert [x["child_id"] for x in restored.open_tiers[1].children] == ["head", "third"]
+    assert restored.ledger.net("NVDA", "lighter_rh") == D(".396")
+    assert restored.pending_action is None
+
+
+def test_no_bypass_with_single_book_or_with_a_worse_book_below_target():
+    engine = _child_exit_case()
+    marks = {"head": _both_marks(100, 100),
+             "next": [ExitMark(100, 100.2, "aligned")],
+             "third": [ExitMark(100, 100.2, "aligned"), ExitMark(100.4, 100, "latest")]}
+    assert _sample_child_exit(engine, marks) == []
+    assert engine.pending_action is None
+
+
+def test_old_child_ids_are_deterministic_across_restore():
+    engine = _child_exit_case()
+    old = engine.dump_state()
+    for lot in old["open_tiers"][0]["children"]:
+        lot.pop("child_id")
+    left = TierEngine(config=engine.config, ledger=PositionLedger())
+    right = TierEngine(config=engine.config, ledger=PositionLedger())
+    left.restore_state(old)
+    right.restore_state(left.dump_state())
+    keys = [c["child_id"] for c in left.open_tiers[1].children]
+    assert keys == [c["child_id"] for c in right.open_tiers[1].children]
+    assert len(set(keys)) == 3

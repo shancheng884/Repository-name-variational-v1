@@ -40,6 +40,12 @@ capacity; the aggregate ladder remains capped at five times the smaller equity.
 The first frozen anchor of a tier is retained across its children. Entry costs
 are retained per child and allocated once when that child closes.
 
+NVDA checks the head of each tier first. If it cannot exit, its oldest eligible
+child may exit instead. Each child must pass both size-qualified books and the
+unchanged net-profit target. The close intent binds the child ID, quantity and
+order token; settlement and restart recovery verify that same child before
+removing it. SNDK keeps FIFO selection.
+
 One in-flight reservation is persisted before submission, and client IDs are
 stable for that reservation. An unresolved reservation blocks restart recovery;
 it is not silently re-sent. A confirmed reject with a verified unwind does not

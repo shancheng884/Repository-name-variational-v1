@@ -4,6 +4,11 @@ from __future__ import annotations
 from decimal import Decimal
 
 
+def receipt_order_ids(receipts):
+    return {venue: str(receipt["order_id"]) for venue, receipt in receipts.items()
+            if isinstance(receipt, dict) and receipt.get("order_id")}
+
+
 def execution_cashflows(legs):
     cash = Decimal("0")
     fees = Decimal("0")

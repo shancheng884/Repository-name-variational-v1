@@ -1,6 +1,25 @@
 from tools.nvda_roundtrip_cost import executable_close_price, percentile, roundtrip_slippage
 
 
+def test_non_fifo_close_pairs_by_child_or_legacy_entry_order_ids_only():
+    def make_open(token, rh_px):
+        return _row("opened", execution_token=token, receipts={
+            "lighter_rh": {"order_id": token + "-rh", "avg_price": rh_px,
+                           "execution_quote": {"bid": "100", "ask": "100"}},
+            "entropy": {"order_id": token + "-ent", "avg_price": "100",
+                        "execution_quote": {"bid": "100", "ask": "100"}},
+        })
+    old, new = make_open("old", "100.5"), make_open("new", "100.02")
+    close = _row("closed", child_id="new", receipts={
+        v: {"avg_price": "100", "execution_quote": {"bid": "100", "ask": "100"}}
+        for v in ("lighter_rh", "entropy")
+    })
+    assert round(roundtrip_slippage([old, new, close])["entry_slip_bps"]["p50"], 2) == 2.0
+    assert roundtrip_slippage([old, dict(close, child_id="unknown")])["roundtrips"] == 0
+    legacy = dict(close, child_id="legacy-1-1-1", entry_order_ids={"lighter_rh": "new-rh", "entropy": "new-ent"})
+    assert round(roundtrip_slippage([old, new, legacy])["entry_slip_bps"]["p50"], 2) == 2.0
+
+
 def test_residual_exit_uses_matched_qty_vwap_and_excludes_corrections():
     def receipt(bid, fill, book_at):
         return {"status": "filled", "filled_qty": ".2", "avg_price": fill,

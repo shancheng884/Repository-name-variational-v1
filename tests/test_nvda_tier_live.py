@@ -154,6 +154,51 @@ def test_close_vwap_requires_both_fresh_size_qualified_snapshots():
     assert build_exit_marks(engine, latest, aligned, stamp.timestamp() + 3.1) == {}
 
 
+def test_non_fifo_marks_use_each_child_size_and_reject_thin_snapshots():
+    from dataclasses import replace
+
+    engine = _recovery_engine()
+    engine.config = replace(engine.config, select_eligible_child=True)
+    later = {"tier": 2, "qty": .100, "notional_usd": 20, "token": "small"}
+    engine.confirm_open(later, entry_prices={"lighter_rh": 161.24, "entropy": 161.25})
+    stamp = datetime(2026, 11, 18, 9, 35, tzinfo=timezone.utc)
+    common = {"source_at": stamp, "recv_at": stamp}
+    rh = {**common, "venue": "lighter_rh", "depth_bids": (("161.38", ".10"),)}
+    ent = {**common, "venue": "entropy", "depth_asks": (("161.17", ".124"),)}
+    marks = build_exit_marks(engine, {"lighter_rh": rh, "entropy": ent},
+                             {"left": rh, "right": ent}, stamp.timestamp())
+    assert list(marks) == ["small"]
+    assert {m.source for m in marks["small"]} == {"aligned", "latest"}
+
+
+def test_restart_recovers_new_non_fifo_close_without_consuming_the_head(tmp_path):
+    from dataclasses import replace
+
+    engine = _recovery_engine()
+    engine.config = replace(engine.config, select_eligible_child=True)
+    engine.confirm_open({"tier": 2, "qty": .10, "notional_usd": 20, "token": "later"},
+                        entry_prices={"lighter_rh": 100, "entropy": 101}, fee_usd=.0018)
+    action = engine.pending_action
+    action.update(child_id="later", qty=.10, entry_buy_price=100,
+                  entry_sell_price=101, entry_fee_usd=.0018)
+    token = action["token"]
+    action["receipts"] = {
+        "entropy": {"status": "filled", "order_id": "ent", "filled_qty": ".10", "avg_price": "100",
+                    "fee_usd": ".0018", "cloid": str(EntropyProbeExecutor._cloid(pair_order_id(token, "buy")))},
+        "lighter_rh": {"status": "filled", "order_id": "rh", "filled_qty": ".10", "avg_price": "100",
+                       "client_order_id": pair_order_id(token, "sell"), "is_ask": True, "reduce_only": True},
+    }
+    restored = TierEngine(config=engine.config, ledger=PositionLedger())
+    restored.restore_state(engine.dump_state())
+    startup = {"entropy": {"qty": "-.124", "verified": True, "active_orders": 0},
+               "lighter_rh": {"qty": ".124", "verified": True, "active_orders": 0}}
+    event = asyncio.run(recover_pending_close(restored, {}, None, startup, tmp_path / "not-needed"))
+    assert event["child_id"] == "later"
+    assert [lot["child_id"] for lot in restored.open_tiers[2].children] == ["entry"]
+    assert restored.ledger.net("NVDA", "lighter_rh") == Decimal(".124")
+    assert restored.pending_action is None
+
+
 def test_lighter_429_receipt_retries_only_the_read(monkeypatch):
     import lighter
 
