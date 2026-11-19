@@ -44,9 +44,11 @@ def _acquire_lock(path: Path):
 
 
 class CaptureRunner:
-    def __init__(self, config: CaptureConfig, *, entropy_race_bbo: bool = False) -> None:
+    def __init__(self, config: CaptureConfig, *, entropy_race_bbo: bool = False,
+                 rh_ticker_audit: bool = False) -> None:
         self.config = config
         self.entropy_race_bbo = entropy_race_bbo
+        self.rh_ticker_audit = rh_ticker_audit
         self.root = config.output_dir
         self.run_id = "capture-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
         self.started_at = datetime.now(timezone.utc)
@@ -175,6 +177,7 @@ class CaptureRunner:
                     asset_symbols={a.name: a.symbols["lighter_rh"] for a in assets if a.supports("lighter_rh")},
                     writer=self.writer, hub=self.hub, logger=self.logger,
                     max_levels=config.max_book_levels,
+                    ticker_audit=self.rh_ticker_audit,
                 )
                 await feed.load_markets()
                 self.venues["lighter_rh"] = feed
@@ -290,6 +293,11 @@ class CaptureRunner:
                 venues[name] = health.public(now)
                 if isinstance(venue, EntropyBookFeed) and venue.race_bbo:
                     venues[name]["bbo_race"] = venue.bbo_race_health(now)
+                if isinstance(venue, LighterBookFeed) and venue.ticker_audit:
+                    venues[name]["ticker_audit"] = {
+                        "messages": venue.ticker_messages,
+                        "last_at": venue.ticker_last_at.isoformat() if venue.ticker_last_at else None,
+                    }
             elif hasattr(venue, "samples"):
                 venues[name] = {
                     "status": "running" if venue.last_error is None else "degraded",

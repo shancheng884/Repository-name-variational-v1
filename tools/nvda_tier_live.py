@@ -1055,7 +1055,8 @@ async def main_async(args):
                                       health_seconds=2.0, latency_seconds=5.0,
                                       system_seconds=60.0, fill_poll_seconds=2.0, edge_seconds=1.0,
                                       notional_usd=Decimal(str(args.notional)), max_book_levels=20),
-                        entropy_race_bbo=asset.name in {"NVDA", "SNDK"})
+                        entropy_race_bbo=asset.name in {"NVDA", "SNDK"},
+                        rh_ticker_audit=asset.name in {"NVDA", "SNDK"})
     task = asyncio.create_task(cap.run(), name="nvda-tier-capture")
     loop = asyncio.get_running_loop()
     shutdown = asyncio.Event()

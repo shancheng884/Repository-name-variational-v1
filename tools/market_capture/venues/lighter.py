@@ -30,6 +30,7 @@ class LighterBookFeed:
         hub: MarketHub,
         logger: logging.Logger,
         max_levels: int = 50,
+        ticker_audit: bool = False,
     ) -> None:
         self.name = name
         self.rest_url = rest_url.rstrip("/")
@@ -39,6 +40,10 @@ class LighterBookFeed:
         self.hub = hub
         self.logger = logger
         self.max_levels = max_levels
+        self.ticker_audit = ticker_audit
+        self.ticker_messages = 0
+        self.ticker_last_at: datetime | None = None
+        self._ticker_sequences: dict[int, int] = {}
         self.health = VenueHealth(name)
         self.markets: dict[str, dict[str, Any]] = {}
         self.market_to_asset: dict[int, str] = {}
@@ -88,8 +93,12 @@ class LighterBookFeed:
             else:
                 target.pop(price, None)
 
-    def _handle(self, message: dict[str, Any]) -> bool:
+    def _handle(self, message: dict[str, Any], *, recv_at: datetime | None = None,
+                recv_mono: float | None = None) -> bool:
         channel = str(message.get("channel") or "")
+        if self.ticker_audit and channel.startswith(("ticker:", "ticker/")):
+            self._handle_ticker(channel[7:], message, recv_at=recv_at, recv_mono=recv_mono)
+            return False
         if channel.startswith("trade:"):
             self._handle_trades(channel, message)
             return False
@@ -136,12 +145,44 @@ class LighterBookFeed:
         source_at = parse_epoch(payload.get("last_updated_at") or message.get("timestamp"))
         book = book_from_levels(
             self.name, asset, bids, asks,
-            recv_at=datetime.now(timezone.utc), source_at=source_at,
+            recv_at=recv_at or datetime.now(timezone.utc), source_at=source_at,
             sequence=state["nonce"], continuity=True,
         )
-        self.hub.update_book(book, recv_mono=time.monotonic())
+        self.hub.update_book(book, recv_mono=recv_mono if recv_mono is not None else time.monotonic())
         self.health.last_quote_at = book.recv_at
         return False
+
+    def _handle_ticker(self, market: str, message: dict[str, Any], *,
+                       recv_at: datetime | None, recv_mono: float | None) -> None:
+        if message.get("type") not in ("subscribed/ticker", "update/ticker"):
+            return
+        try:
+            market_id = int(market)
+            sequence = message.get("nonce")
+            if type(sequence) is not int or sequence <= self._ticker_sequences.get(market_id, -1):
+                return
+            asset = self.market_to_asset[market_id]
+            ticker = message["ticker"]
+            bid, ask = (to_decimal(ticker[k]["price"]) for k in ("b", "a"))
+            bid_size, ask_size = (to_decimal(ticker[k]["size"]) for k in ("b", "a"))
+            source_at = parse_epoch(ticker.get("last_updated_at") or message.get("last_updated_at"))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return
+        if (source_at is None or bid is None or ask is None or not 0 < bid <= ask
+                or bid_size is None or ask_size is None or min(bid_size, ask_size) <= 0):
+            return
+        now = recv_at or datetime.now(timezone.utc)
+        self._ticker_sequences[market_id] = sequence
+        self.ticker_messages += 1
+        self.ticker_last_at = now
+        # Keep ticker out of the executable quote hub and historical quote seeds.
+        self.writer.append("ticker", self.name, asset, {
+            "schema": 1, "event": "book_ticker", "venue": self.name, "symbol": asset,
+            "sequence": sequence, "source_at": source_at.isoformat(), "recv_at": now.isoformat(),
+            "recv_mono": recv_mono, "snapshot": message["type"] == "subscribed/ticker",
+            "bid": decimal_text(bid), "ask": decimal_text(ask),
+            "bid_size": decimal_text(bid_size), "ask_size": decimal_text(ask_size),
+        }, at=now)
 
     def _handle_trades(self, channel: str, message: dict[str, Any]) -> None:
         try:
@@ -193,19 +234,25 @@ class LighterBookFeed:
                 async with websockets.connect(self.ws_url, ping_interval=25, ping_timeout=25, max_size=None) as ws:
                     self.health.status = "running"
                     self.health.connected = True
+                    self._ticker_sequences.clear()
                     for market_id in self.books:
                         await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{market_id}"}))
+                        if self.ticker_audit:
+                            await ws.send(json.dumps({"type": "subscribe", "channel": f"ticker/{market_id}"}))
                         await ws.send(json.dumps({"type": "subscribe", "channel": f"trade/{market_id}"}))
                     backoff = 1.0
                     async for raw in ws:
-                        self.health.message()
+                        recv_mono = time.monotonic() if self.ticker_audit else None
+                        recv_at = datetime.now(timezone.utc) if self.ticker_audit else None
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8", errors="replace")
                         message = json.loads(raw)
+                        if not (self.ticker_audit and str(message.get("channel") or "").startswith(("ticker:", "ticker/"))):
+                            self.health.message()
                         if message.get("type") == "ping":
                             await ws.send(json.dumps({"type": "pong"}))
                             continue
-                        needs_resubscribe = self._handle(message)
+                        needs_resubscribe = self._handle(message, recv_at=recv_at, recv_mono=recv_mono)
                         if needs_resubscribe:
                             for market_id in self.books:
                                 await ws.send(json.dumps({"type": "unsubscribe", "channel": f"order_book/{market_id}"}))

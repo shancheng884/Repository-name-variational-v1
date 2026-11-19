@@ -816,6 +816,41 @@ class EntropyProbeExecutor:
     @staticmethod
     def _cloid(client_order_id):
         return _EntropyCloid("0x"+hashlib.sha256(client_order_id.encode()).hexdigest()[:32])
+
+    async def cancel_order(self, asset, *, trigger_order: bool, oid: int | None = None,
+                           client_order_id: str | None = None):
+        """Cancel one identified order. Trigger orders must take the standard path."""
+        if not self.available or self.exchange is None:
+            raise ProbeError("entropy_cancel_unavailable")
+        if type(trigger_order) is not bool or (oid is None) == (client_order_id is None):
+            raise ValueError("entropy_cancel_requires_order_type_and_one_id")
+        if oid is not None and (type(oid) is not int or oid <= 0):
+            raise ValueError("entropy_cancel_invalid_oid")
+        if client_order_id is not None and not client_order_id.strip():
+            raise ValueError("entropy_cancel_invalid_client_order_id")
+        coin = self._coin(asset)
+        cloid = self._cloid(client_order_id) if client_order_id is not None else None
+        exchange = self.exchange
+        if trigger_order:
+            if oid is not None:
+                return await asyncio.to_thread(exchange.cancel, coin, oid)
+            return await asyncio.to_thread(exchange.cancel_by_cloid, coin, cloid)
+
+        def send_fast_cancel():
+            from hyperliquid.utils.constants import MAINNET_API_URL
+            from hyperliquid.utils.signing import get_timestamp_ms, sign_l1_action
+
+            index = exchange.info.name_to_asset(coin)
+            action = ({"type": "cancel", "cancels": [{"a": index, "o": oid}], "f": True}
+                      if oid is not None else
+                      {"type": "cancelByCloid", "cancels": [{"asset": index, "cloid": cloid.to_raw()}], "f": True})
+            nonce = get_timestamp_ms()
+            signature = sign_l1_action(exchange.wallet, action, exchange.vault_address, nonce,
+                                       exchange.expires_after, exchange.base_url == MAINNET_API_URL)
+            return exchange._post_action(action, signature, nonce)
+
+        return await asyncio.to_thread(send_fast_cancel)
+
     def ioc_limit_price(self,asset,side,bbo,max_slippage_bps):
         row=self._row(asset); szd=int(row.get("szDecimals") or 0)
         direction=Decimal("-1") if side=="sell" else Decimal("1")

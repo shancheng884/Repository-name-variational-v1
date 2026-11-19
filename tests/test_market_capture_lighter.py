@@ -1,11 +1,70 @@
 from datetime import datetime, timezone
 from decimal import Decimal as D
+import asyncio
 import json
+import logging
+from unittest.mock import Mock
 
 from tools.market_capture.config import CaptureConfig, AVAILABLE_ASSETS
 from tools.market_capture.hub import MarketHub
 from tools.market_capture.storage import TapeWriter
 from tools.market_capture.venues.lighter import LighterBookFeed, LighterFillFeed
+
+
+def test_rh_ticker_and_book_share_socket_but_only_book_reaches_hub(monkeypatch):
+    async def run():
+        hub, writer = Mock(), Mock()
+        feed = LighterBookFeed(name="lighter_rh", rest_url="https://x", ws_url="wss://x",
+                               asset_symbols={"NVDA": "NVDA"}, writer=writer, hub=hub,
+                               logger=logging.getLogger(__name__), ticker_audit=True)
+        feed.books[15] = {"ready": False, "nonce": None, "bids": {}, "asks": {}}
+        feed.market_to_asset[15] = "NVDA"
+        ticker = {"type": "update/ticker", "channel": "ticker:15", "nonce": 11,
+                  "last_updated_at": 1700000000000000, "ticker": {
+                      "b": {"price": "100", "size": "1"}, "a": {"price": "101", "size": "2"}}}
+        book = {"type": "subscribed/order_book", "channel": "order_book:15", "order_book": {
+            "nonce": 11, "bids": [{"price": "100", "size": "1"}],
+            "asks": [{"price": "101", "size": "2"}]}}
+        subscribed = []
+        handled = asyncio.Event()
+
+        class Socket:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                pass
+
+            async def send(self, raw):
+                subscribed.append(json.loads(raw)["channel"])
+
+            async def __aiter__(self):
+                for message in (ticker, ticker, {**ticker, "nonce": 12, "ticker": []}, book):
+                    yield json.dumps(message)
+                handled.set()
+                await asyncio.Event().wait()
+
+        connect = Mock(return_value=Socket())
+        monkeypatch.setattr("tools.market_capture.venues.lighter.websockets.connect", connect)
+        task = asyncio.create_task(feed.run())
+        try:
+            await asyncio.wait_for(handled.wait(), timeout=1)
+            assert connect.call_count == 1
+            assert subscribed == ["order_book/15", "ticker/15", "trade/15"]
+            assert feed.ticker_messages == 1
+            assert writer.append.call_count == 1
+            stream, venue, symbol, row = writer.append.call_args.args
+            assert (stream, venue, symbol) == ("ticker", "lighter_rh", "NVDA")
+            assert (row["sequence"], row["bid"], row["ask_size"]) == (11, "100", "2")
+            assert hub.update_book.call_count == 1
+            assert len(hub.mock_calls) == 1
+            assert row["recv_mono"] <= hub.update_book.call_args.kwargs["recv_mono"]
+            assert feed.books[15]["nonce"] == 11
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
 
 
 class FakeResponse:
