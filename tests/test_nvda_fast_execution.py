@@ -302,7 +302,8 @@ def test_live_loop_entry_depth_is_local_and_does_not_send_either_leg_when_thin(t
             return {"audit_only": True}
 
     class Capture:
-        def __init__(self, config):
+        def __init__(self, config, *, entropy_race_bbo=False):
+            assert entropy_race_bbo
             self.hub = Hub()
             self.stop_event = asyncio.Event()
             self.writer = SimpleNamespace(append=lambda *args, **kwargs: None)

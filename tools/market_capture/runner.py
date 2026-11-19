@@ -44,8 +44,9 @@ def _acquire_lock(path: Path):
 
 
 class CaptureRunner:
-    def __init__(self, config: CaptureConfig) -> None:
+    def __init__(self, config: CaptureConfig, *, entropy_race_bbo: bool = False) -> None:
         self.config = config
+        self.entropy_race_bbo = entropy_race_bbo
         self.root = config.output_dir
         self.run_id = "capture-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
         self.started_at = datetime.now(timezone.utc)
@@ -197,6 +198,7 @@ class CaptureRunner:
                     writer=self.writer, hub=self.hub, logger=self.logger,
                     max_levels=config.max_book_levels,
                     fast_depth=config.entropy_fast_depth,
+                    race_bbo=self.entropy_race_bbo,
                 )
                 await feed.load_universe()
                 self.venues["entropy"] = feed
@@ -286,6 +288,8 @@ class CaptureRunner:
             health = getattr(venue, "health", None)
             if health is not None:
                 venues[name] = health.public(now)
+                if isinstance(venue, EntropyBookFeed) and venue.race_bbo:
+                    venues[name]["bbo_race"] = venue.bbo_race_health(now)
             elif hasattr(venue, "samples"):
                 venues[name] = {
                     "status": "running" if venue.last_error is None else "degraded",

@@ -11,6 +11,7 @@ import time
 import requests
 import websockets
 
+from ...lib.nvda_quote_alignment import quote_clock_issue
 from ..audit import FillAuditor
 from ..hub import MarketHub
 from ..model import Fill, book_from_levels, decimal_text, parse_epoch, to_decimal
@@ -31,6 +32,7 @@ class EntropyBookFeed:
         logger: logging.Logger,
         max_levels: int = 50,
         fast_depth: bool = False,
+        race_bbo: bool = False,
     ) -> None:
         self.name = "entropy"
         self.info_url = info_url
@@ -42,7 +44,12 @@ class EntropyBookFeed:
         self.logger = logger
         self.max_levels = max_levels
         self.fast_depth = fast_depth
+        self.race_bbo = race_bbo
         self.health = VenueHealth(self.name)
+        self.backup_health = VenueHealth(f"{self.name}:bbo_backup") if race_bbo else None
+        self.bbo_wins = {"primary": 0, "backup": 0}
+        self.bbo_drops = {"duplicate": 0, "older": 0, "conflict": 0, "invalid": 0}
+        self._last_bbo: dict[str, tuple[datetime, tuple[Decimal, ...]]] = {}
         self.coin_to_asset: dict[str, str] = {}
         self.universe: dict[str, dict[str, Any]] = {}
         self.book_messages = 0
@@ -73,39 +80,95 @@ class EntropyBookFeed:
             raise RuntimeError("entropy_no_supported_markets")
 
     async def run(self) -> None:
-        backoff = 1.0
+        if self.race_bbo:
+            await asyncio.gather(self._run_lane(primary=True), self._run_lane(primary=False))
+        else:
+            await self._run_lane(primary=True)
+
+    def bbo_race_health(self, now: datetime) -> dict[str, Any]:
+        assert self.backup_health is not None
+        return {"backup": self.backup_health.public(now), "wins": dict(self.bbo_wins),
+                "drops": dict(self.bbo_drops)}
+
+    async def _run_lane(self, *, primary: bool) -> None:
+        lane = "primary" if primary else "backup"
+        health = self.health if primary else self.backup_health
+        assert health is not None
+        health.subscribed = list(self.health.subscribed)
+        retry_floor = 5.0 if self.race_bbo else 1.0
+        backoff = retry_floor
         while True:
+            started = time.monotonic()
             try:
                 async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20, max_size=None) as ws:
-                    self.health.status = "running"
-                    self.health.connected = True
                     for coin in self.coin_to_asset:
-                        # l2Book is throttled to one snapshot every ~7-12s on
-                        # Hyperliquid; bbo is the push-on-change top of book
-                        # that keeps a taker quote fresh.
-                        subscription = {"type": "l2Book", "coin": coin}
-                        if self.fast_depth:
-                            subscription["fast"] = True
-                        await ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
+                        if primary:
+                            subscription = {"type": "l2Book", "coin": coin}
+                            if self.fast_depth:
+                                subscription["fast"] = True
+                            await ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
                         await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "bbo", "coin": coin}}))
-                        await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "trades", "coin": coin}}))
-                    backoff = 1.0
-                    async for raw in ws:
-                        self.health.message()
+                        if primary:
+                            await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "trades", "coin": coin}}))
+                    health.status = "running"
+                    health.connected = True
+                    if not self.race_bbo:
+                        backoff = retry_floor
+                    async for raw in self._messages(ws, keepalive=not primary):
+                        recv_at = datetime.now(timezone.utc)
+                        health.message()
                         message = json.loads(raw)
-                        self.handle(message)
+                        if primary or message.get("channel") == "bbo":
+                            self.handle(message, lane=lane, recv_at=recv_at)
+                    raise ConnectionError("entropy_ws_closed")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.health.connected = False
-                self.health.status = "reconnecting"
-                self.health.reconnects += 1
-                self.health.error(f"{type(exc).__name__}:{exc}")
-                self.logger.warning("entropy_capture_reconnect error=%s", exc)
+                health.connected = False
+                health.status = "reconnecting"
+                health.reconnects += 1
+                health.error(f"{type(exc).__name__}:{exc}")
+                self.logger.warning("entropy_capture_reconnect lane=%s error=%s", lane, exc)
+                if time.monotonic() - started >= 60.0:
+                    backoff = retry_floor
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, 30.0)
 
-    def handle(self, message: dict[str, Any]) -> None:
+    @staticmethod
+    async def _messages(ws: Any, *, keepalive: bool):
+        if not keepalive:
+            async for raw in ws:
+                yield raw
+            return
+        while True:
+            try:
+                async with asyncio.timeout(40.0):
+                    raw = await ws.recv()
+            except TimeoutError:
+                await ws.send('{"method":"ping"}')
+                async with asyncio.timeout(15.0):
+                    raw = await ws.recv()
+            yield raw
+
+    def _accept_bbo(self, coin: str, source_at: datetime | None, recv_at: datetime,
+                    bid: Decimal, ask: Decimal,
+                    bid_size: Decimal | None, ask_size: Decimal | None) -> bool:
+        if (source_at is None or not 0 < bid <= ask or bid_size is None or ask_size is None
+                or min(bid_size, ask_size) <= 0 or quote_clock_issue(
+                    {"venue": self.name, "source_at": source_at, "recv_at": recv_at}, recv_at.timestamp())):
+            self.bbo_drops["invalid"] += 1
+            return False
+        top = (bid, ask, bid_size, ask_size)
+        previous = self._last_bbo.get(coin)
+        if previous is not None and source_at <= previous[0]:
+            kind = "older" if source_at < previous[0] else "duplicate" if top == previous[1] else "conflict"
+            self.bbo_drops[kind] += 1
+            return False
+        self._last_bbo[coin] = (source_at, top)
+        return True
+
+    def handle(self, message: dict[str, Any], *, lane: str = "primary",
+               recv_at: datetime | None = None) -> None:
         channel = message.get("channel")
         data = message.get("data")
         if channel == "l2Book" and isinstance(data, dict):
@@ -138,14 +201,23 @@ class EntropyBookFeed:
             if bid is None or ask is None:
                 return
             source_at = parse_epoch(data.get("time"))
-            recv_at = datetime.now(timezone.utc)
+            bid_size = to_decimal(bid_row.get("sz"))
+            ask_size = to_decimal(ask_row.get("sz"))
+            recv_at = recv_at or datetime.now(timezone.utc)
+            if self.race_bbo:
+                # Both readers run on this loop. Publish once without awaiting the other lane.
+                if not self._accept_bbo(coin, source_at, recv_at, bid, ask, bid_size, ask_size):
+                    return
+                self.bbo_wins[lane] += 1
             self.hub.update_bbo(
                 venue=self.name, symbol=asset, bid=bid, ask=ask, quote_kind="bbo",
                 recv_at=recv_at, source_at=source_at,
-                bid_size=to_decimal(bid_row.get("sz")), ask_size=to_decimal(ask_row.get("sz")),
+                bid_size=bid_size, ask_size=ask_size,
             )
             self.bbo_messages += 1
             self.health.last_quote_at = recv_at
+            if lane == "backup" and self.backup_health is not None:
+                self.backup_health.last_quote_at = recv_at
         elif channel == "trades" and isinstance(data, list):
             for trade in data:
                 self._write_trade(trade)
